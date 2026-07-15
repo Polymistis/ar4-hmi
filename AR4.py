@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 ############################################################################
-## Version AR4 6.3.1 #########################################################
+## Version AR4 6.7 CA LC                                        ############
 ############################################################################
 """ AR4 - robot control software
     Copyright (c) 2024, Chris Annin
@@ -67,7 +67,11 @@
   VERSION 6.2 9/12/25 changed bootstrap theme, xbox upgrade
   VERSION 6.2.1 9/24/25 fixed slider position update
   VERSION 6.3 10/8/25 changed COM entry to dropdown, added beta Linux support, added basic config module
-  VERSIOM 6.3.1 11/4/25 linux camera fixes
+  VERSION 6.4 1/3/26 MK4 update, fixed tool jog, re-added 2 step calibration, add servo amp test
+  VERSION 6.4.1 1/24/26 added path resolve for sys.executable
+  VERSION 6.5 2/15/26 - gcode bug fix / update program flow with run once and run program loop
+  VERSION 6.6 2/22/26 - update kinematic solver to reduce J4/6 wrap | reimplement wrist N/F config
+  VERSION 6.7 3/11/26 - fix MB read hold reg bug
 '''
 ##########################################################################
 
@@ -191,13 +195,20 @@ if CE['Platform']['IS_WINDOWS']:
 
 robot.robot_set()
 
-DIR = pathlib.Path(__file__).parent.resolve()
-os.chdir(DIR)
+#DIR = pathlib.Path(__file__).parent.resolve()
+#os.chdir(DIR)
+
+if getattr(sys, "frozen", False):
+    DIR = pathlib.Path(sys.executable).resolve().parent   # folder containing the .exe
+else:
+    DIR = pathlib.Path(__file__).resolve().parent         # folder containing AR4.py
+
+os.chdir(DIR)    
 
 RUN['cropping'] = False
 
 root = Tk()
-root.wm_title("AR4 Software Ver 6.3.1")
+root.wm_title("AR4 Software Ver 6.7")
 root.iconphoto(True, tk.PhotoImage(file="AR.png"))
 
 # Make headless RPi fit app on screen better
@@ -277,121 +288,7 @@ root.wm_protocol("WM_DELETE_WINDOW", on_closing)
 root.runTrue = 0
 root.GCrunTrue = 0
 
-#global JogStepsStat
-#JogStepsStat = IntVar()
-#RUN['JogStepsStat'] = IntVar()
-#global J1OpenLoopStat
-#J1OpenLoopStat = IntVar()
-#global J2OpenLoopStat
-#J2OpenLoopStat = IntVar()
-#global J3OpenLoopStat
-#J3OpenLoopStat = IntVar()
-#global J4OpenLoopStat
-#J4OpenLoopStat = IntVar()
-#global J5OpenLoopStat
-#J5OpenLoopStat = IntVar()
-#global J6OpenLoopStat
-#J6OpenLoopStat = IntVar()
-#global DisableWristRot
-#DisableWristRot = IntVar()
-#global J1CalStat
-#J1CalStat = IntVar()
-#global J2CalStat
-#J2CalStat = IntVar()
-#global J3CalStat
-#J3CalStat = IntVar()
-#global J4CalStat
-#J4CalStat = IntVar()
-#global J5CalStat
-#J5CalStat = IntVar()
-#global J6CalStat
-#J6CalStat = IntVar()
-#global J7CalStat
-#J7CalStat = IntVar()
-#global J8CalStat
-#J8CalStat = IntVar()
-#global J9CalStat
-#J9CalStat = IntVar()
-#global J1CalStat2
-#J1CalStat2 = IntVar()
-#global J2CalStat2
-#J2CalStat2 = IntVar()
-#global J3CalStat2
-#J3CalStat2 = IntVar()
-#global J4CalStat2
-#J4CalStat2 = IntVar()
-#global J5CalStat2
-#J5CalStat2 = IntVar()
-#global J6CalStat2
-#J6CalStat2 = IntVar()
-#global J7CalStat2
-#J7CalStat2 = IntVar()
-#global J8CalStat2
-#J8CalStat2 = IntVar()
-#global J9CalStat2
-#J9CalStat2 = IntVar()
-#global IncJogStat
-#IncJogStat = IntVar()
-#global fullRot
-#fullRot = IntVar()
-#global pick180
-#pick180 = IntVar()
-#global pickClosest
-#pickClosest = IntVar()
-#global autoBG
-#autoBG = IntVar()
-#global estopActive
-#estopActive = False
-#global posOutreach
-#posOutreach = False
-#global SplineTrue
-#SplineTrue = False
-#global gcodeSpeed
-#gcodeSpeed = "10"
-#global inchTrue
-#inchTrue = False
-#global moveInProc
-#moveInProc = 0
-#global liveJog
-#liveJog = False
-#global progRunning
-#progRunning = False
-#offlineMode = False
-#global setColor
-#global renderer
-#color_map = {}
-#J1StepM = None
-#J2StepM = None
-#J3StepM = None
-#J4StepM = None
-#J5StepM = None
-#J6StepM = None
-#oriImage = None
-#DHparams = None
-#StepMonitors = [0] * 6
-#rndSpeed = 0
-#minSpeedDelay = 200  # µs
-#speedViolation = "0"
-#mainMode = 1
-# Robot constants and placeholders (you should replace these with actual values)
-#ROBOT_nDOFs = 6
-#SolutionMatrix = np.zeros((6, 2))
-#joints_estimate = np.zeros(6)
-###
-#xyzuvw_In = np.zeros(6)
-#KinematicError = 0
-# Tool and base frame placeholders (4x4 matrices)
-#Robot_BaseFrame = np.eye(4)
-#Robot_ToolFrame = np.eye(4)
-#Robot_Data = np.zeros(66)  # Replace with actual DK values
 
-#cam_on = False
-#cap = None
-
-# global RUN['xboxUse']
-# global curTheme
-
-# Vision Find variables (full implementation on Tab 6)
 RUN['selectedTemplate'] = StringVar()
 RUN['selectedTemplate'].set("")
 
@@ -427,7 +324,7 @@ RUN['IncJogStat'] = IntVar()
 RUN['fullRot'] = IntVar()
 RUN['pick180'] = IntVar()
 RUN['pickClosest'] = IntVar()
-RUN['autoBG'] = tk.IntVar(value=0)
+RUN['autoBG'] = IntVar()
 RUN['estopActive'] = False
 RUN['posOutreach'] = False
 RUN['gcodeSpeed'] = "10"
@@ -510,6 +407,7 @@ RUN['_smooth'] = None
 RUN['_grip_closed'] = None
 RUN['_pneu_open'] = None
 RUN['cmdType'] = None
+RUN['cmdTypeLong'] = None
 
 # Vision System
 RUN['cropping'] = False
@@ -542,6 +440,7 @@ RUN['render_window'] = None
 
 # Input Devices
 RUN['xboxUse'] = None
+RUN['selectedTemplate'] = None
 RUN['selectedCam'] = None
 
 
@@ -2157,6 +2056,8 @@ def startup():
   sendPos()
   time.sleep(.1)
   requestPos()
+  time.sleep(.1)
+  updateVisOp()
 
 
 
@@ -2349,6 +2250,11 @@ def runProg():
     RUN['posOutreach'] = False
     RUN['stopQueue'] = "0"
     RUN['splineActive'] = "0"
+
+    last = tab1.progView.index('end')
+    for row in range (0,last):
+      tab1.progView.itemconfig(row, {'fg': "#FFFFFF"})
+
     try:
       curRow = tab1.progView.curselection()[0]
       if (curRow == 0):
@@ -2373,32 +2279,55 @@ def runProg():
         almStatusLab.config(text="PROGRAM RUNNING",  style="OK.TLabel")
         almStatusLab2.config(text="PROGRAM RUNNING",  style="OK.TLabel") 
       RUN['rowinproc'] = 1
-      executeRow()
-      while RUN['rowinproc'] == 1:
+      try:
+        selRow = tab1.progView.curselection()[0] 
+      except:
+        if(tab1.lastProg == ""):
+          selRow = 1
+          progLoop = ("## START PROGRAM LOOP ##\r\n").encode('utf-8')
+          try:
+            index = tab1.progView.get(0, "end").index(progLoop)
+            tab1.progView.selection_clear(0, END)
+            tab1.progView.select_set(index)
+          except:
+            stopProg() 
+        else:
+          lastRow = tab1.lastRow + 1
+          lastProg = tab1.lastProg
+          ProgEntryField.delete(0, 'end')
+          ProgEntryField.insert(0,lastProg)
+          callProg(lastProg)
+          time.sleep(.4) 
+          tab1.progView.selection_clear(0, END)
+          tab1.progView.select_set(lastRow) 
+          curRowEntryField.delete(0, 'end')
+          curRowEntryField.insert(0,lastRow)
+          tab1.lastProg = ""
+      if(tab1.runTrue == 1):
+        executeRow()
+      
+        while RUN['rowinproc'] == 1:
+          time.sleep(.1)
+        #last = tab1.progView.index('end')
+        #for row in range (0,selRow):
+          #tab1.progView.itemconfig(row, {'fg': 'dodger blue'})
+        #tab1.progView.itemconfig(selRow, {'fg': 'blue2'})
+        #for row in range (selRow+1,last):
+          #tab1.progView.itemconfig(row, {'fg': 'black'})
+        
+        try:
+          selRow = tab1.progView.curselection()[0]
+          selRow += 1
+          tab1.progView.selection_clear(0, END)
+          tab1.progView.select_set(selRow)
+          curRowEntryField.delete(0, 'end')
+          curRowEntryField.insert(0,selRow)
+        except:
+          curRow=1
+          tab1.progView.selection_clear(0, END)
+          tab1.progView.select_set(curRow)
         time.sleep(.1)
-      selRow = tab1.progView.curselection()[0]
-      last = tab1.progView.index('end')
-      #for row in range (0,selRow):
-        #tab1.progView.itemconfig(row, {'fg': 'dodger blue'})
-      #tab1.progView.itemconfig(selRow, {'fg': 'blue2'})
-      #for row in range (selRow+1,last):
-        #tab1.progView.itemconfig(row, {'fg': 'black'})
-      tab1.progView.selection_clear(0, END)
-      try:
-        selRow += 1
-        tab1.progView.select_set(selRow)
-        curRow += 1
-      except:
-        pass
-      time.sleep(.1)
-      try:
-        selRow = tab1.progView.curselection()[0]
-        curRowEntryField.delete(0, 'end')
-        curRowEntryField.insert(0,selRow)
-      except:
-        curRowEntryField.delete(0, 'end')
-        curRowEntryField.insert(0,"---") 
-        tab1.runTrue = 0
+
         if (RUN['estopActive']):
           almStatusLab.config(text="Estop Button was Pressed",  style="Alarm.TLabel")
           almStatusLab2.config(text="Estop Button was Pressed",  style="Alarm.TLabel")
@@ -2419,24 +2348,53 @@ def stepFwd():
       RUN['posOutreach'] = False
       almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
       almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel") 
-      executeRow() 
-      selRow = tab1.progView.curselection()[0]
-      last = tab1.progView.index('end')
-      for row in range (0,selRow):
-        tab1.progView.itemconfig(row, {'fg': 'dodger blue'})
-      tab1.progView.itemconfig(selRow, {'fg': 'blue2'})
-      for row in range (selRow+1,last):
-        tab1.progView.itemconfig(row, {'fg': 'gray'})
-      tab1.progView.selection_clear(0, END)
-      selRow += 1
-      tab1.progView.select_set(selRow)
       try:
         selRow = tab1.progView.curselection()[0]
-        curRowEntryField.delete(0, 'end')
-        curRowEntryField.insert(0,selRow)
       except:
-        curRowEntryField.delete(0, 'end')
-        curRowEntryField.insert(0,"---")
+        if(tab1.lastProg == ""):
+          selRow = 1
+          progLoop = ("## START PROGRAM LOOP ##\r\n").encode('utf-8')
+          try:
+            index = tab1.progView.get(0, "end").index(progLoop)
+            tab1.progView.selection_clear(0, END)
+            tab1.progView.select_set(index)
+          except:
+            stopProg()  
+        else:
+          lastRow = tab1.lastRow + 1
+          lastProg = tab1.lastProg
+          ProgEntryField.delete(0, 'end')
+          ProgEntryField.insert(0,lastProg)
+          callProg(lastProg)
+          time.sleep(.4) 
+          tab1.progView.selection_clear(0, END)
+          tab1.progView.select_set(lastRow) 
+          curRowEntryField.delete(0, 'end')
+          curRowEntryField.insert(0,lastRow)
+          tab1.lastProg = ""
+      executeRow() 
+      try:
+        last = tab1.progView.index('end')
+        selRow = tab1.progView.curselection()[0]
+        for row in range (0,selRow):
+          tab1.progView.itemconfig(row, {'fg': "#1E90FF"})
+        tab1.progView.itemconfig(selRow, {'fg': "#0561BD"})
+        for row in range (selRow+1,last):
+          tab1.progView.itemconfig(row, {'fg': "#9E9E9E"})
+        try:
+          selRow = tab1.progView.curselection()[0]
+          selRow += 1
+          tab1.progView.selection_clear(0, END)
+          tab1.progView.select_set(selRow)
+          curRowEntryField.delete(0, 'end')
+          curRowEntryField.insert(0,selRow)
+        except:
+          curRow=1
+          tab1.progView.selection_clear(0, END)
+          tab1.progView.select_set(curRow)
+        time.sleep(.1)
+      except Exception:
+        pass  
     t = threading.Thread(target=threadProg)
     t.start()
 
@@ -2447,14 +2405,19 @@ def stepRev():
     RUN['posOutreach'] = False
     almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
     almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel") 
+    try:
+      selRow = tab1.progView.curselection()[0]
+    except:
+      selRow = 1
+      tab1.progView.selection_clear(0, END)
+      tab1.progView.select_set(selRow) 
     executeRow()  
-    selRow = tab1.progView.curselection()[0]
     last = tab1.progView.index('end')
     for row in range (0,selRow):
-      tab1.progView.itemconfig(row, {'fg': 'gray'})
-    tab1.progView.itemconfig(selRow, {'fg': 'red'})
+      tab1.progView.itemconfig(row, {'fg': "#9E9E9E"})
+    tab1.progView.itemconfig(selRow, {'fg': "#FF0000"})
     for row in range (selRow+1,last):
-      tab1.progView.itemconfig(row, {'fg': 'tomato2'})
+      tab1.progView.itemconfig(row, {'fg': "#EE5C42"})
     tab1.progView.selection_clear(0, END)
     selRow -= 1
     tab1.progView.select_set(selRow)
@@ -2472,7 +2435,20 @@ def stopProg():
   #global estopActive
   #global posOutreach
   # global RUN['stopQueue']
-  lastProg = ""
+  #lastProg = ""
+
+  try:
+    command = "STOP\n"
+    cmdSentEntryField.delete(0, 'end')
+    cmdSentEntryField.insert(0,command)
+    RUN['ser2'].write(command.encode())
+    RUN['ser2'].flushInput()
+    time.sleep(.1)
+    response = str(RUN['ser2'].readline().strip(),'utf-8')
+    cmdRecEntryField.delete(0, 'end')
+    cmdRecEntryField.insert(0,response)
+  except:
+    print("Error IO Board Not Connected")
   tab1.runTrue = 0
   if (RUN['estopActive']):
     almStatusLab.config(text="Estop Button was Pressed",  style="Alarm.TLabel")
@@ -2487,22 +2463,22 @@ def stopProg():
   
   
 def executeRow():
-  # global RUN['rowinproc']
-  # global RUN['LineDist']
-  # global RUN['Xv']
-  # global RUN['Yv']
-  # global RUN['Zv']
-  #global progRunning, offlineMode
-  # global RUN['VR_angles'], RUN['stopQueue'], RUN['splineActive']
-  #global moveInProc
   RUN['progRunning'] = True
-  selRow = tab1.progView.curselection()[0]
-  tab1.progView.see(selRow+2)
-  data = list(map(int, tab1.progView.curselection()))
-  command=tab1.progView.get(data[0]).decode().strip()
-  RUN['cmdType'] =command[:6]
-  cmdTypeLong=command[:11]
-  
+  try:
+    selRow = tab1.progView.curselection()[0]
+    tab1.progView.see(selRow+2)
+  except Exception:
+    pass
+
+  try: 
+    data = list(map(int, tab1.progView.curselection()))
+    command=tab1.progView.get(data[0]).decode().strip()
+    RUN['cmdType'] =command[:6]
+    RUN['cmdTypeLong']=command[:11]
+  except:
+    RUN['cmdType'] = "Stop P"
+    RUN['cmdTypeLong'] = "Stop P"
+
   ##Call Program##
   if (RUN['cmdType'] == "Call P"):
     if (RUN['moveInProc'] == 1):
@@ -2510,14 +2486,16 @@ def executeRow():
     tab1.lastRow = tab1.progView.curselection()[0]
     tab1.lastProg = ProgEntryField.get()
     programIndex = command.find("Program -")
-    progNum = str(command[programIndex+10:])
+    progName = str(command[programIndex+10:])
     ProgEntryField.delete(0, 'end')
-    ProgEntryField.insert(0,progNum)
-    callProg(progNum)
+    ProgEntryField.insert(0,progName)
+    callProg(progName)
     time.sleep(.4) 
     index = 0
     tab1.progView.selection_clear(0, END)
-    tab1.progView.select_set(index) 
+    tab1.progView.select_set(index)
+    
+
 
   ##Run Gcode Program##
   if (RUN['cmdType'] == "Run Gc"):
@@ -2538,19 +2516,12 @@ def executeRow():
     tab1.progView.selection_clear(0, END)
     tab1.progView.select_set(index) 
 
-  ##Return Program##
-  if (RUN['cmdType'] == "Return"):
+  ##Stop Program##
+  if (RUN['cmdType'] == "Stop P"):
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
-    lastRow = tab1.lastRow
-    lastProg = tab1.lastProg
-    ProgEntryField.delete(0, 'end')
-    ProgEntryField.insert(0,lastProg)
-    callProg(lastProg)
-    time.sleep(.4) 
-    index = 0
-    tab1.progView.selection_clear(0, END)
-    tab1.progView.select_set(lastRow) 
+    stopProg()
+
 
   ##Test Limit Switches
   if (RUN['cmdType'] == "Test L"):
@@ -2566,6 +2537,23 @@ def executeRow():
     RUN['ser'].flushInput()
     time.sleep(.05)
     response = str(RUN['ser'].readline().strip(),'utf-8')
+    manEntryField.delete(0, 'end')
+    manEntryField.insert(0,response)
+
+  ##Test Gripper Amperage
+  if (RUN['cmdType'] == "Test G"):
+    if RUN['offlineMode']:
+      almStatusLab.config(text="Test limit switches not supported in offline programming mode", style="Alarm.TLabel")
+      return
+    if (RUN['moveInProc'] == 1):
+      RUN['moveInProc'] = 2
+    command = "TG\n" 
+    cmdSentEntryField.delete(0, 'end')
+    cmdSentEntryField.insert(0,command)
+    RUN['ser2'].write(command.encode())
+    RUN['ser2'].flushInput()
+    time.sleep(.05)
+    response = str(RUN['ser2'].readline().strip(),'utf-8')
     manEntryField.delete(0, 'end')
     manEntryField.insert(0,response)
 
@@ -2879,7 +2867,7 @@ def executeRow():
     action = str(command[actionIndex+2:actionIndex+6])
     slaveID = str(command[slavestartIndex+9:regNumstartIndex-2])
     opVal = str(command[regNumstartIndex+11:inputIndex-8])
-    subcommand = "BD"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
+    subcommand = "BH"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
     RUN['ser'].write(subcommand.encode())
     RUN['ser'].flushInput()
     time.sleep(.1) 
@@ -2955,7 +2943,7 @@ def executeRow():
         stopProg()
 
   ##Wait 5v IO board##
-  if (cmdTypeLong == "Wait 5v Inp"):
+  if (RUN['cmdTypeLong'] == "Wait 5v Inp"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       return
@@ -2977,7 +2965,7 @@ def executeRow():
  
 
   ##Wait Modbus Coil##
-  if (cmdTypeLong == "Wait MBcoil"):
+  if (RUN['cmdTypeLong'] == "Wait MBcoil"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       return
@@ -3000,7 +2988,7 @@ def executeRow():
     RUN['ser'].read()
 
   ##Wait Modbus Input##
-  if (cmdTypeLong == "Wait MBinpu"):
+  if (RUN['cmdTypeLong'] == "Wait MBinpu"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       return
@@ -3024,7 +3012,7 @@ def executeRow():
    
               
 
-### this will fail on first run without reloading program - the insertion inserts it as bytes (due to pickling the program save) but when reloaded its a listbox of strings - therefore this would only work after reload and looking for string
+  ### this will fail on first run without reloading program - the insertion inserts it as bytes (due to pickling the program save) but when reloaded its a listbox of strings - therefore this would only work after reload and looking for string
   ## long term fix refactor all 
   ''' 
   ##Jump to Row##
@@ -3085,12 +3073,8 @@ def executeRow():
 
 
 
-
-
-
-
   ##Set Output 5v IO Board##
-  if (cmdTypeLong == "Set 5v Outp"):
+  if (RUN['cmdTypeLong'] == "Set 5v Outp"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       return
@@ -3112,7 +3096,7 @@ def executeRow():
     RUN['ser2'].read()
 
   ##Set Modbus Coil##
-  if (cmdTypeLong == "Set MBcoil "):
+  if (RUN['cmdTypeLong'] == "Set MBcoil "):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       return
@@ -3135,7 +3119,7 @@ def executeRow():
       ErrorHandler("Modbus Error")
 
   ##Set Modbus Register##
-  if (cmdTypeLong == "Set MBoutpu"):
+  if (RUN['cmdTypeLong'] == "Set MBoutpu"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       return
@@ -3415,10 +3399,6 @@ def executeRow():
 
 
 
-
-
-
-
  ##Offs J Command##  
   if (RUN['cmdType'] == "OFF J "): 
     if (RUN['moveInProc'] == 0):
@@ -3684,8 +3664,8 @@ def executeRow():
     RUN['yVal'] = command[yIndex+3:zIndex]
     RUN['zVal'] = command[zIndex+3:rzIndex]
     rzVal = command[rzIndex+4:ryIndex]
-    if (np.sign(float(rzVal)) != np.sign(float(CAL['RzcurPos']))):
-      rzVal=str(float(rzVal)*-1)
+    #if (np.sign(float(rzVal)) != np.sign(float(CAL['RzcurPos']))):
+    #  rzVal=str(float(rzVal)*-1)
     ryVal = command[ryIndex+4:rxIndex]
     rxVal = command[rxIndex+4:J7Index]
     J7Val = command[J7Index+4:J8Index]
@@ -3823,11 +3803,11 @@ def executeRow():
       curRow = tab1.progView.curselection()[0]
       selRow = tab1.progView.curselection()[0]
       last = tab1.progView.index('end')
-      for row in range (0,selRow):
-        tab1.progView.itemconfig(row, {'fg': 'dodger blue'})
-      tab1.progView.itemconfig(selRow, {'fg': 'blue2'})
-      for row in range (selRow+1,last):
-        tab1.progView.itemconfig(row, {'fg': 'black'})
+      #for row in range (0,selRow):
+      #  tab1.progView.itemconfig(row, {'fg': "#1E90FF"})
+      #tab1.progView.itemconfig(selRow, {'fg': "#116AC4"})
+      #for row in range (selRow+1,last):
+      #  tab1.progView.itemconfig(row, {'fg': "#050505"})
       tab1.progView.selection_clear(0, END)
       selRow += 1
       tab1.progView.select_set(selRow)
@@ -3928,10 +3908,10 @@ def executeRow():
       selRow = tab1.progView.curselection()[0]
       last = tab1.progView.index('end')
       for row in range (0,selRow):
-        tab1.progView.itemconfig(row, {'fg': 'dodger blue'})
-      tab1.progView.itemconfig(selRow, {'fg': 'blue2'})
+        tab1.progView.itemconfig(row, {'fg': "#1E90FF"})
+      tab1.progView.itemconfig(selRow, {'fg': "#0057A6"})
       for row in range (selRow+1,last):
-        tab1.progView.itemconfig(row, {'fg': 'black'})
+        tab1.progView.itemconfig(row, {'fg': "#000000"})
       tab1.progView.selection_clear(0, END)
       selRow += 1
       tab1.progView.select_set(selRow)
@@ -3951,10 +3931,10 @@ def executeRow():
       selRow = tab1.progView.curselection()[0]
       last = tab1.progView.index('end')
       for row in range (0,selRow):
-        tab1.progView.itemconfig(row, {'fg': 'dodger blue'})
-      tab1.progView.itemconfig(selRow, {'fg': 'blue2'})
+        tab1.progView.itemconfig(row, {'fg': "#1E90FF"})
+      tab1.progView.itemconfig(selRow, {'fg': "#0057A6"})
       for row in range (selRow+1,last):
-        tab1.progView.itemconfig(row, {'fg': 'black'})
+        tab1.progView.itemconfig(row, {'fg': "#000000"})
       tab1.progView.selection_clear(0, END)
       selRow += 1
       tab1.progView.select_set(selRow)
@@ -4069,6 +4049,7 @@ def executeRow():
       index = tab1.progView.get(0, "end").index(tabNum)
       tab1.progView.selection_clear(0, END)
       tab1.progView.select_set(index) 
+  
 
 
   RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
@@ -5524,7 +5505,8 @@ def LiveJointJog(value):
   #!! WC isn't defined prior to use here, at least sometimes
   RUN['WC'] = locals().get("RUN['WC']", "")
   ############
-  command = "LJ"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+  #command = "LJ"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+  command = "LJ"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
   start_live_joint_jog_thread(command)
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
@@ -5568,7 +5550,8 @@ def LiveCarJog(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "LC"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+  #command = "LC"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+  command = "LC"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
   start_live_cartesian_jog_thread(command)
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
@@ -5613,7 +5596,8 @@ def LiveToolJog(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "LT"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+  #command = "LT"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+  command = "LT"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
   start_live_tool_jog_thread(command)
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
@@ -5971,7 +5955,8 @@ def XjogNeg(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -6026,7 +6011,8 @@ def YjogNeg(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -6081,7 +6067,8 @@ def ZjogNeg(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -6132,7 +6119,8 @@ def RxjogNeg(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -6184,7 +6172,8 @@ def RyjogNeg(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -6235,7 +6224,8 @@ def RzjogNeg(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -6286,7 +6276,8 @@ def XjogPos(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -6337,7 +6328,8 @@ def YjogPos(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -6389,7 +6381,8 @@ def ZjogPos(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -6441,7 +6434,8 @@ def RxjogPos(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -6492,7 +6486,8 @@ def RyjogPos(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -6543,7 +6538,8 @@ def RzjogPos(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -7057,7 +7053,8 @@ def teachInsertBelSelected():
         f.write('\n')
       f.close()
   elif(movetype == "Move L"):
-    newPos = movetype + " [*] X "+CAL['XcurPos']+" Y "+CAL['YcurPos']+" Z "+CAL['ZcurPos']+" Rz "+CAL['RzcurPos']+" Ry "+CAL['RycurPos']+" Rx "+CAL['RxcurPos']+" J7 "+str(CAL['J7PosCur'])+" J8 "+str(CAL['J8PosCur'])+" J9 "+str(CAL['J9PosCur'])+" "+speedPrefix+" "+Speed+" Ac "+ACCspd+ " Dc "+DECspd+" Rm "+ACCramp+" Rnd "+Rounding+" $ "+RUN['WC'] 
+    #newPos = movetype + " [*] X "+CAL['XcurPos']+" Y "+CAL['YcurPos']+" Z "+CAL['ZcurPos']+" Rz "+CAL['RzcurPos']+" Ry "+CAL['RycurPos']+" Rx "+CAL['RxcurPos']+" J7 "+str(CAL['J7PosCur'])+" J8 "+str(CAL['J8PosCur'])+" J9 "+str(CAL['J9PosCur'])+" "+speedPrefix+" "+Speed+" Ac "+ACCspd+ " Dc "+DECspd+" Rm "+ACCramp+" Rnd "+Rounding+" $ "+RUN['WC'] 
+    newPos = movetype + " [*] X "+CAL['XcurPos']+" Y "+CAL['YcurPos']+" Z "+CAL['ZcurPos']+" Rz "+CAL['RzcurPos']+" Ry "+CAL['RycurPos']+" Rx "+CAL['RxcurPos']+" J7 "+str(CAL['J7PosCur'])+" J8 "+str(CAL['J8PosCur'])+" J9 "+str(CAL['J9PosCur'])+" "+speedPrefix+" "+Speed+" Ac "+ACCspd+ " Dc "+DECspd+" Rm "+ACCramp+" Rnd "+Rounding+" $ A" 
     tab1.progView.insert(selRow, bytes(newPos + '\n', 'utf-8')) 
     tab1.progView.selection_clear(0, END)
     tab1.progView.select_set(selRow)
@@ -7317,7 +7314,7 @@ def manInsItem():
   selRow = tab1.progView.curselection()[0]
   curRowEntryField.delete(0, 'end')
   curRowEntryField.insert(0,selRow)
-  tab1.progView.itemconfig(selRow, {'fg': 'darkgreen'})
+  tab1.progView.itemconfig(selRow, {'fg': "#8264B8"})
   items = tab1.progView.get(0,END)
   file_path = path.relpath(ProgEntryField.get())
   with open(file_path,'w', encoding='utf-8') as f:
@@ -7333,7 +7330,7 @@ def manReplItem():
   tab1.progView.insert(selRow, bytes(manEntryField.get() + '\n', 'utf-8')) 
   tab1.progView.selection_clear(0, END)
   tab1.progView.select_set(selRow)
-  tab1.progView.itemconfig(selRow, {'fg': 'darkgreen'})  
+  tab1.progView.itemconfig(selRow, {'fg': "#8264B8"})  
   items = tab1.progView.get(0,END)
   file_path = path.relpath(ProgEntryField.get())
   with open(file_path,'w', encoding='utf-8') as f:
@@ -7812,7 +7809,10 @@ def CreateProg():
   user_input = simpledialog.askstring(title="New Program", prompt="New Program Name:")
   file_path = user_input + ".ar4"
   with open(file_path,'w', encoding='utf-8') as f:
-    f.write("##BEGINNING OF PROGRAM##")
+    f.write("## RUN ONCE ##")
+    f.write('\n')
+    f.write('\n')
+    f.write("## START PROGRAM LOOP ##")
     f.write('\n')
   f.close()
   ProgEntryField.delete(0, 'end')
@@ -7874,7 +7874,7 @@ def insertGCprog():
 
     
 
-def insertReturn():  
+def insertStop():  
   try:
     selRow = tab1.progView.curselection()[0]
     selRow += 1
@@ -7882,7 +7882,7 @@ def insertReturn():
     last = tab1.progView.index('end')
     selRow = last
     tab1.progView.select_set(selRow)
-  value = "Return"           
+  value = "Stop Program"           
   tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8')) 
   tab1.progView.selection_clear(0, END)
   tab1.progView.select_set(selRow)
@@ -8867,7 +8867,7 @@ def sendPos():
 def CalZeroPos():
   # global RUN['VR_angles']
   #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  command = "SPA0B0C0D0E90F0\n"
+  command = "SPA0B0C0D0E45F0\n"
   RUN['ser'].write(command.encode())    
   RUN['ser'].flushInput()
   time.sleep(.1)
@@ -9196,7 +9196,7 @@ def LoadAR4Mk2default():
   J1StepDegEntryField.insert(0,str(44.4444))
   J2StepDegEntryField.insert(0,str(55.5555)) 
   J3StepDegEntryField.insert(0,str(55.5555)) 
-  J4StepDegEntryField.insert(0,str(49.7777)) 
+  J4StepDegEntryField.insert(0,str(42.7266)) 
   J5StepDegEntryField.insert(0,str(21.8602)) 
   J6StepDegEntryField.insert(0,str(22.2222))
   J1DriveMSEntryField.insert(0,str(400))
@@ -9386,6 +9386,81 @@ def LoadAR3default():
   J4aEntryField.insert(0,str(0))
   J5aEntryField.insert(0,str(0))
   J6aEntryField.insert(0,str(0)) 
+
+def LoadMaxdefault():
+  ClearKinTabFields()
+  J1MotDirEntryField.insert(0,str(0))
+  J2MotDirEntryField.insert(0,str(1))
+  J3MotDirEntryField.insert(0,str(1))
+  J4MotDirEntryField.insert(0,str(1))
+  J5MotDirEntryField.insert(0,str(1))
+  J6MotDirEntryField.insert(0,str(1))
+  J7MotDirEntryField.insert(0,str(1))
+  J8MotDirEntryField.insert(0,str(1))
+  J9MotDirEntryField.insert(0,str(1))
+  J1CalDirEntryField.insert(0,str(1))
+  J2CalDirEntryField.insert(0,str(0))
+  J3CalDirEntryField.insert(0,str(1))
+  J4CalDirEntryField.insert(0,str(0))
+  J5CalDirEntryField.insert(0,str(0))
+  J6CalDirEntryField.insert(0,str(1))
+  J7CalDirEntryField.insert(0,str(0))
+  J8CalDirEntryField.insert(0,str(0))
+  J9CalDirEntryField.insert(0,str(0))
+  J1PosLimEntryField.insert(0,str(170))
+  J1NegLimEntryField.insert(0,str(170))
+  J2PosLimEntryField.insert(0,str(90))
+  J2NegLimEntryField.insert(0,str(42))
+  J3PosLimEntryField.insert(0,str(52))
+  J3NegLimEntryField.insert(0,str(89))
+  J4PosLimEntryField.insert(0,str(180))
+  J4NegLimEntryField.insert(0,str(180))
+  J5PosLimEntryField.insert(0,str(105))
+  J5NegLimEntryField.insert(0,str(105))
+  J6PosLimEntryField.insert(0,str(180))
+  J6NegLimEntryField.insert(0,str(180))  
+  J1StepDegEntryField.insert(0,str(1422.222))
+  J2StepDegEntryField.insert(0,str(1777.777)) 
+  J3StepDegEntryField.insert(0,str(1777.777)) 
+  J4StepDegEntryField.insert(0,str(1592.888)) 
+  J5StepDegEntryField.insert(0,str(349.763)) 
+  J6StepDegEntryField.insert(0,str(711.111))
+  J1DriveMSEntryField.insert(0,str(12800))
+  J2DriveMSEntryField.insert(0,str(12800))  
+  J3DriveMSEntryField.insert(0,str(12800))  
+  J4DriveMSEntryField.insert(0,str(12800))  
+  J5DriveMSEntryField.insert(0,str(12800))  
+  J6DriveMSEntryField.insert(0,str(12800))
+  J1EncCPREntryField.insert(0,str(4000))
+  J2EncCPREntryField.insert(0,str(4000))
+  J3EncCPREntryField.insert(0,str(4000))
+  J4EncCPREntryField.insert(0,str(4000))
+  J5EncCPREntryField.insert(0,str(4000))
+  J6EncCPREntryField.insert(0,str(4000))
+  J1ΘEntryField.insert(0,str(0))
+  J2ΘEntryField.insert(0,str(-90))
+  J3ΘEntryField.insert(0,str(0))
+  J4ΘEntryField.insert(0,str(0))
+  J5ΘEntryField.insert(0,str(0))
+  J6ΘEntryField.insert(0,str(180))
+  J1αEntryField.insert(0,str(0))
+  J2αEntryField.insert(0,str(-90))
+  J3αEntryField.insert(0,str(0))
+  J4αEntryField.insert(0,str(-90))
+  J5αEntryField.insert(0,str(90))
+  J6αEntryField.insert(0,str(-90))
+  J1dEntryField.insert(0,str(169.77))
+  J2dEntryField.insert(0,str(0))
+  J3dEntryField.insert(0,str(0))
+  J4dEntryField.insert(0,str(222.63))
+  J5dEntryField.insert(0,str(0))
+  J6dEntryField.insert(0,str(41))
+  J1aEntryField.insert(0,str(0))
+  J2aEntryField.insert(0,str(64.2))
+  J3aEntryField.insert(0,str(305))
+  J4aEntryField.insert(0,str(0))
+  J5aEntryField.insert(0,str(0))
+  J6aEntryField.insert(0,str(0))   
   
 def save_custom_calibration():
   sync_fields_to_calibration()
@@ -9474,7 +9549,7 @@ def sync_calibration_to_fields():
   J4aEntryField.insert(0,str(CAL['J4aDHpar']))
   J5aEntryField.insert(0,str(CAL['J5aDHpar']))
   J6aEntryField.insert(0,str(CAL['J6aDHpar']))
-  visoptions.set(str(CAL['curCam']))
+
 
   # Add Encoder control checkboxes
   # Add auto-calibration settings
@@ -9507,6 +9582,28 @@ def sync_fields_to_calibration():
   CAL['J9length']     = float(axis9lengthEntryField.get())
   CAL['J9rotation']   = float(axis9rotEntryField.get())
   CAL['J9steps']      = float(axis9stepsEntryField.get())
+
+  CAL['VisBrightVal']   = float(VisBrightSlide.get())
+  CAL['VisContVal']     = float(VisContrastSlide.get())
+  CAL['VisBacColor']    = str(VisBacColorEntryField.get()) 
+  CAL['VisScore']       = float(VisScoreEntryField.get())
+  CAL['VisX1Val']       = int(VisX1PixEntryField.get())
+  CAL['VisY1Val']       = int(VisY1PixEntryField.get())
+  CAL['VisX2Val']       = int(VisX2PixEntryField.get())
+  CAL['VisY2Val']       = int(VisY2PixEntryField.get())
+  CAL['VisRobX1Val']    = float(VisX1RobEntryField.get())
+  CAL['VisRobY1Val']    = float(VisY1RobEntryField.get())
+  CAL['VisRobX2Val']    = float(VisX2RobEntryField.get())
+  CAL['VisRobY2Val']    = float(VisY2RobEntryField.get())
+  CAL['zoom']           = float(VisZoomSlide.get())
+  CAL['pick180Val']     = int(RUN['pick180'].get()) 
+  CAL['pickClosestVal'] = int(RUN['pickClosest'].get())
+  CAL['curCam']         = str(visoptions.get())
+  CAL['fullRotVal']     = int(RUN['fullRot'].get())
+  CAL['autoBGVal']      = int(RUN['autoBG'].get())
+
+
+
 
   # Checkboxes directly manipulate CAL variable and don't need to be sync'd
 
@@ -9758,30 +9855,26 @@ def show_frame():
         live_lbl.after(10, show_frame)
 
 def start_vid():
+    #global cam_on, cap
+    #global cap
     stop_vid()
     RUN['cam_on'] = True
-    curVisStingSel = visoptions.get()
-    logger.debug(f"start_vid.curVisStingSel: {curVisStingSel}")
-    logger.debug(f"start_vid.camList: {camList}")
-
-    #OS Enumeration order isn't reliable on Linux, use the detected device ID instead
-    match CE['Platform']['OS']:
-      case "Windows":
-        l = len(camList)
-        for i in range(l):
-          if (visoptions.get() == camList[i]):
-            logger.debug(f"Selected Camera detected on list index: {i}")
-            RUN['selectedCam'] = i
-      case "Linux":
-        RUN['selectedCam'] = camMap.get(visoptions.get())
-
-    RUN['cap'] = cv2.VideoCapture(RUN['selectedCam'])
+    curVisStringSel = visoptions.get()
+    for i in range(len(camList)):
+      if curVisStringSel == camList[i]:
+          RUN['selectedCam'] = i
+          break
+    #RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
+    RUN['cap'] = cv2.VideoCapture(RUN['selectedCam'], cv2.CAP_DSHOW)
+    for _ in range(5):
+      RUN['cap'].read()
     show_frame()
 
 
 
 
 def stop_vid():
+    #global cam_on
     RUN['cam_on'] = False
     
     if RUN['cap']:
@@ -9790,114 +9883,112 @@ def stop_vid():
 #vismenu.size
 
 def take_pic():
-  
-  if(RUN['cam_on']):
-    ret, frame = RUN['cap'].read()
-  else:
-    curVisStingSel = visoptions.get()
+  # global RUN['selectedCam']
+  #global cap
+  # global RUN['BGavg']
+  # global RUN['mX1']
+  # global RUN['mY1']
+  # global RUN['mX2']
+  # global RUN['mY2']
 
+  try:
+    if(RUN['cam_on']):
+      ret, frame = RUN['cap'].read()
+    else:
+      curVisStingSel = visoptions.get()
+      l = len(camList)
+      for i in range(l):
+        if (visoptions.get() == camList[i]):
+          RUN['selectedCam'] = i
+      RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
+      ret, frame = RUN['cap'].read()
 
-    #OS Enumeration order isn't reliable on Linux, use the detected device ID instead
-    match CE['Platform']['OS']:
-      case "Windows":
-        l = len(camList)
-        for i in range(l):
-          if (visoptions.get() == camList[i]):
-            logger.debug(f"Selected Camera detected on list index: {i}")
-            RUN['selectedCam'] = i
-      case "Linux":
-        RUN['selectedCam'] = camMap.get(visoptions.get())
+    brightness = int(VisBrightSlide.get())
+    contrast = int(VisContrastSlide.get())
+    CAL['zoom'] = int(VisZoomSlide.get())
 
-    RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
-    ret, frame = RUN['cap'].read()
+    frame = np.int16(frame)
+    frame = frame * (contrast/127+1) - contrast + brightness
+    frame = np.clip(frame, 0, 255)
+    frame = np.uint8(frame) 
+    cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
+    
 
-  brightness = int(VisBrightSlide.get())
-  contrast = int(VisContrastSlide.get())
-  CAL['zoom'] = int(VisZoomSlide.get())
+    #get the webcam size
+    height, width = cv2image.shape
 
-  frame = np.int16(frame)
-  frame = frame * (contrast/127+1) - contrast + brightness
-  frame = np.clip(frame, 0, 255)
-  frame = np.uint8(frame) 
-  cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
-  
+    #prepare the crop
+    centerX,centerY=int(height/2),int(width/2)
+    radiusX,radiusY= int(CAL['zoom']*height/100),int(CAL['zoom']*width/100)
 
-  #get the webcam size
-  height, width = cv2image.shape
+    minX,maxX=centerX-radiusX,centerX+radiusX
+    minY,maxY=centerY-radiusY,centerY+radiusY
 
-  #prepare the crop
-  centerX,centerY=int(height/2),int(width/2)
-  radiusX,radiusY= int(CAL['zoom']*height/100),int(CAL['zoom']*width/100)
+    cropped = cv2image[minX:maxX, minY:maxY]
+    cv2image = cv2.resize(cropped, (width, height))
 
-  minX,maxX=centerX-radiusX,centerX+radiusX
-  minY,maxY=centerY-radiusY,centerY+radiusY
+    CAL['autoBGVal'] = int(RUN['autoBG'].get())
+    if(CAL['autoBGVal']==1):
+      x1 = int(float(VisX1PixEntryField.get()))
+      y1 = int(float(VisY1PixEntryField.get()))
+      x2 = int(float(VisX2PixEntryField.get()))
+      y2 = int(float(VisY1PixEntryField.get()))
+      x3 = int(float(VisX1PixEntryField.get()))
+      y3 = int(float(VisY2PixEntryField.get()))
+      BG1 = cv2image[x1][y1]
+      BG2 = cv2image[x2][y2]
+      BG3 = cv2image[x3][y3]
+      avg = int(mean([BG1,BG2,BG3]))
+      RUN['BGavg'] = (avg,avg,avg) 
+      background = avg
+      VisBacColorEntryField.configure(state='enabled')  
+      VisBacColorEntryField.delete(0, 'end')
+      VisBacColorEntryField.insert(0,str(RUN['BGavg']))
+      VisBacColorEntryField.configure(state='disabled')  
+    else:
+      temp = VisBacColorEntryField.get()  
+      startIndex = temp.find("(")
+      endIndex = temp.find(",")
+      background = int(temp[startIndex+1:endIndex])
+      #background = eval(VisBacColorEntryField.get())
 
-  cropped = cv2image[minX:maxX, minY:maxY]
-  cv2image = cv2.resize(cropped, (width, height))
+    h = cv2image.shape[0]
+    w = cv2image.shape[1]
+    # loop over the image
+    for y in range(0, h):
+      for x in range(0, w):
+        # change the pixel
+        cv2image[y, x] = background if x >= RUN['mX2'] or x <= RUN['mX1'] or y <= RUN['mY1'] or y >= RUN['mY2'] else cv2image[y, x]  
 
-  CAL['autoBGVal'] = int(RUN['autoBG'].get())
-  if(CAL['autoBGVal']==1):
-    BG1 = cv2image[int(VisX1PixEntryField.get())][int(VisY1PixEntryField.get())]
-    BG2 = cv2image[int(VisX1PixEntryField.get())][int(VisY2PixEntryField.get())]
-    BG3 = cv2image[int(VisX2PixEntryField.get())][int(VisY2PixEntryField.get())]
-    avg = int(mean([BG1,BG2,BG3]))
-    RUN['BGavg'] = (avg,avg,avg) 
-    background = avg
-    VisBacColorEntryField.configure(state='enabled')  
-    VisBacColorEntryField.delete(0, 'end')
-    VisBacColorEntryField.insert(0,str(RUN['BGavg']))
-    VisBacColorEntryField.configure(state='disabled')  
-  else:
-    temp = VisBacColorEntryField.get()  
-    startIndex = temp.find("(")
-    endIndex = temp.find(",")
-    background = int(temp[startIndex+1:endIndex])
-    #background = eval(VisBacColorEntryField.get())
+    img = Image.fromarray(cv2image).resize((640,480))
 
-  h = cv2image.shape[0]
-  w = cv2image.shape[1]
-  # loop over the image
-  for y in range(0, h):
-    for x in range(0, w):
-      # change the pixel
-      cv2image[y, x] = background if x >= RUN['mX2'] or x <= RUN['mX1'] or y <= RUN['mY1'] or y >= RUN['mY2'] else cv2image[y, x]  
+    
 
-  img = Image.fromarray(cv2image).resize((640,480))
-
-  
-
-  imgtk = ImageTk.PhotoImage(image=img) 
-  vid_lbl.imgtk = imgtk    
-  vid_lbl.configure(image=imgtk)
-  temp_dir = os.path.dirname(os.path.abspath(__file__))
-  temp_file = os.path.join(temp_dir, "curImage.jpg")
-
-  #filename = 'curImage.jpg'
-  cv2.imwrite(temp_file, cv2image)
-
-  #If cam was off before, turn it back off
-  if not RUN['cam_on']:
-    RUN['cap'].release()
-
+    imgtk = ImageTk.PhotoImage(image=img) 
+    vid_lbl.imgtk = imgtk    
+    vid_lbl.configure(image=imgtk) 
+    filename = 'curImage.jpg'
+    cv2.imwrite(filename, cv2image)
+  except:
+    print("camera failed")
 
 def mask_pic():
+  # global RUN['selectedCam']
+  #global cap
+  # global RUN['BGavg']
+  # global RUN['mX1']
+  # global RUN['mY1']
+  # global RUN['mX2']
+  # global RUN['mY2']
+
   if(RUN['cam_on']):
     ret, frame = RUN['cap'].read()
   else:
     curVisStingSel = visoptions.get()
-
-    #OS Enumeration order isn't reliable on Linux, use the detected device ID instead
-    match CE['Platform']['OS']:
-      case "Windows":
-        l = len(camList)
-        for i in range(l):
-          if (visoptions.get() == camList[i]):
-            logger.debug(f"Selected Camera detected on list index: {i}")
-            RUN['selectedCam'] = i
-      case "Linux":
-        RUN['selectedCam'] = camMap.get(visoptions.get())
-
-
+    l = len(camList)
+    for i in range(l):
+      if (visoptions.get() == camList[i]):
+        RUN['selectedCam'] = i
     RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
     ret, frame = RUN['cap'].read()
   brightness = int(VisBrightSlide.get())
@@ -9920,18 +10011,25 @@ def mask_pic():
   #img = Image.fromarray(cv2image).resize((640,480))
   #imgtk = ImageTk.PhotoImage(image=img) 
   #vid_lbl.imgtk = imgtk    
-  #vid_lbl.configure(image=imgtk)
-  temp_dir = os.path.dirname(os.path.abspath(__file__))
-  temp_file = os.path.join(temp_dir, "curImage.jpg")
-
-  #filename = 'curImage.jpg'
-  cv2.imwrite(temp_file, cv2image)
+  #vid_lbl.configure(image=imgtk) 
+  filename = 'curImage.jpg'
+  cv2.imwrite(filename, cv2image)
 
   
 
 
 
 def mask_crop(event, x, y, flags, param):
+    # global RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'], RUN['cropping']
+    #global oriImage
+    # global RUN['box_points']
+    # global RUN['button_down']
+    # global RUN['mX1']
+    # global RUN['mY1']
+    # global RUN['mX2']
+    # global RUN['mY2']
+
+
     cropDone = False
     
 
@@ -9991,26 +10089,21 @@ def mask_crop(event, x, y, flags, param):
         img = Image.fromarray(RUN['oriImage'])
         imgtk = ImageTk.PhotoImage(image=img) 
         vid_lbl.imgtk = imgtk    
-        vid_lbl.configure(image=imgtk)
-
-        temp_dir = os.path.dirname(os.path.abspath(__file__))
-        temp_file = os.path.join(temp_dir, "curImage.jpg")
-        #filename = 'curImage.jpg'
-        cv2.imwrite(temp_file, RUN['oriImage'])
+        vid_lbl.configure(image=imgtk) 
+        filename = 'curImage.jpg'
+        cv2.imwrite(filename, RUN['oriImage'])
         cv2.destroyAllWindows()
 
 
 
 def selectMask():
+  #global oriImage
+  # global RUN['button_down']
   RUN['button_down'] = False
   RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
   mask_pic()
-  temp_dir = os.path.dirname(os.path.abspath(__file__))
-  temp_file = os.path.join(temp_dir, "curImage.jpg")
-  image = cv2.imread(temp_file)
-  if image is None:
-    logger.error(f"Error reading file: {temp_file}")
-    return
+
+  image = cv2.imread('curImage.jpg')
   RUN['oriImage'] = image.copy()
   
   cv2.namedWindow("image")
@@ -10020,8 +10113,14 @@ def selectMask():
 
 
 def mouse_crop(event, x, y, flags, param):
+    # global RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'], RUN['cropping']
+    #global oriImage
+    # global RUN['box_points']
+    # global RUN['button_down']
+
     cropDone = False
     
+
     if (not RUN['button_down']) and (event == cv2.EVENT_LBUTTONDOWN):
         RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = x, y, x, y
         RUN['cropping'] = True
@@ -10052,8 +10151,7 @@ def mouse_crop(event, x, y, flags, param):
         if len(refPoint) == 2: #when two points were found
             roi = RUN['oriImage'][refPoint[0][1]:refPoint[1][1], refPoint[0][0]:refPoint[1][0]]
             
-            #cv2.imshow("Cropped", roi)
-            cv2.imshow("image", roi)
+            cv2.imshow("Cropped", roi)
             USER_INP = simpledialog.askstring(title="Teach Vision Object",
                                   prompt="Save Object As:")
             templateName = USER_INP+".jpg"                      
@@ -10064,41 +10162,25 @@ def mouse_crop(event, x, y, flags, param):
 
 
 def selectTemplate():
-  '''
-  Beginning of workflow for Teach Object
-  '''
+  #global oriImage
+  # global RUN['button_down']
   RUN['button_down'] = False
   RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
-  temp_dir = os.path.dirname(os.path.abspath(__file__))
-  temp_file = os.path.join(temp_dir, "curImage.jpg")
-
-  image = None
-  logger.debug(f"Opening temp file: {temp_file}")
-  image = cv2.imread(temp_file)
-
+  image = cv2.imread('curImage.jpg')
   RUN['oriImage'] = image.copy()
   
-  #cv2.namedWindow("image")
-  #cv2.setMouseCallback("image", mouse_crop)
-  #cv2.imshow("image", image)
-
-  cv2.namedWindow("image", cv2.WINDOW_NORMAL)  # optional but helps on Linux
+  cv2.namedWindow("image")
   cv2.setMouseCallback("image", mouse_crop)
   cv2.imshow("image", image)
-  cv2.waitKey(0)  # <- required to process events and actually paint
-  #cv2.destroyAllWindows()
 
 
 
 
 def snapFind():
+  # global RUN['selectedTemplate']
+  # global RUN['BGavg']
   take_pic()
-  # This was always "" assuming curImage is what is wanted here
-  #template = RUN['selectedTemplate'].get()
-  temp_dir = os.path.dirname(os.path.abspath(__file__))
-  temp_file = os.path.join(temp_dir, "curImage.jpg")  
-  template = temp_file
-
+  template = RUN['selectedTemplate'].get()
   min_score = float(VisScoreEntryField.get())*.01
   CAL['autoBGVal'] = int(RUN['autoBG'].get())
   if(CAL['autoBGVal']==1):
@@ -10121,6 +10203,10 @@ def rotate_image(img,angle,background):
     return result
 
 def visFind(template,min_score,background):
+    # global RUN['xMMpos']
+    # global RUN['yMMpos']
+    #global autoBG
+
     if(background == "Auto"):
       background = RUN['BGavg']
       VisBacColorEntryField.configure(state='enabled')  
@@ -10128,22 +10214,15 @@ def visFind(template,min_score,background):
       VisBacColorEntryField.insert(0,str(RUN['BGavg']))
       VisBacColorEntryField.configure(state='disabled')  
       
+
     green = (0,255,0)
     red = (255,0,0)
     blue = (0,0,255)
     dkgreen = (0,128,0)
     status = "fail"
     highscore = 0
-    temp_dir = os.path.dirname(os.path.abspath(__file__))
-    temp_file = os.path.join(temp_dir, "curImage.jpg")
-    img1 = cv2.imread(temp_file)  # target Image
-    if img1 is None:
-      logger.error(f"Error opening file: {temp_file}")
-      return
+    img1 = cv2.imread('curImage.jpg')  # target Image
     img2 = cv2.imread(template)  # target Image
-    if img2 is None:
-      logger.error(f"Error opening file: {template}")
-      return
     
     #method = cv2.TM_CCOEFF_NORMED
     #method = cv2.TM_CCORR_NORMED
@@ -10436,7 +10515,8 @@ def visFind(template,min_score,background):
 
 
 def updateVisOp():
-  #RUN['selectedTemplate'] = StringVar()
+  # global RUN['selectedTemplate']
+  RUN['selectedTemplate'] = StringVar()
   if getattr(sys, 'frozen', False):
     folder = os.path.dirname(sys.executable)
   elif __file__:
@@ -10447,31 +10527,46 @@ def updateVisOp():
   Visoptmenu.place(x=390, y=52)
   Visoptmenu.bind("<<ComboboxSelected>>", VisOpUpdate)
 
+
+
+
 def VisOpUpdate(foo):
-  # global RUN['selectedTemplate']
-  file = RUN['selectedTemplate'].get()
-  logger.info(f"{file} selected as template file")
-  img = cv2.imread(file, cv2.IMREAD_COLOR)
-  if img is None:
-    logger.error(f"Error reading file: {file}")
-    return
-  img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  
+    file = RUN['selectedTemplate'].get()
+    logger.info(file)
 
+    # Load image
+    img = cv2.imread(file, cv2.IMREAD_COLOR)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-  TARGET_PIXEL_AREA = 22500
+    # --- Square preview settings ---
+    TARGET_SIZE = 150   # final image will be 150x150
 
-  ratio = float(img.shape[1]) / float(img.shape[0])
-  new_h = int(math.sqrt(TARGET_PIXEL_AREA / ratio) + 0.5)
-  new_w = int((new_h * ratio) + 0.5)
+    h, w = img.shape[:2]
 
-  img = cv2.resize(img, (new_w,new_h))
+    # Scale so the longest side fits TARGET_SIZE
+    scale = TARGET_SIZE / max(w, h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
 
+    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
+    # Create square canvas (background color can be changed)
+    square = np.zeros((TARGET_SIZE, TARGET_SIZE, 3), dtype=np.uint8)
+    # Example gray background instead of black:
+    # square[:] = (40, 40, 40)
 
-  img = Image.fromarray(img)
-  imgtk = ImageTk.PhotoImage(image=img)        
-  template_lbl.imgtk = imgtk    
-  template_lbl.configure(image=imgtk) 
+    # Center the resized image
+    x = (TARGET_SIZE - new_w) // 2
+    y = (TARGET_SIZE - new_h) // 2
+    square[y:y+new_h, x:x+new_w] = img
+
+    # Convert to Tk image
+    img = Image.fromarray(square)
+    imgtk = ImageTk.PhotoImage(image=img)
+
+    template_lbl.imgtk = imgtk
+    template_lbl.configure(image=imgtk, anchor='center')
+
 
 
 def zeroBrCn():
@@ -10622,10 +10717,10 @@ def GCstepFwd():
     GCselRow = tab7.gcodeView.curselection()[0]
     last = tab7.gcodeView.index('end')
     for row in range (0,GCselRow):
-      tab7.gcodeView.itemconfig(row, {'fg': 'dodger blue'})
-    tab7.gcodeView.itemconfig(GCselRow, {'fg': 'blue2'})
+      tab7.gcodeView.itemconfig(row, {'fg': "#1E90FF"})
+    tab7.gcodeView.itemconfig(GCselRow, {'fg': "#0057A6"})
     for row in range (GCselRow+1,last):
-      tab7.gcodeView.itemconfig(row, {'fg': 'gray'})
+      tab7.gcodeView.itemconfig(row, {'fg': "#959697"})
     tab7.gcodeView.selection_clear(0, END)
     GCselRow += 1
     tab7.gcodeView.select_set(GCselRow)
@@ -10728,7 +10823,7 @@ def GCconvertProg():
     response = str(RUN['ser'].readline().strip(),'utf-8')  
     last = tab7.gcodeView.index('end')
     for row in range (0,last):
-      tab7.gcodeView.itemconfig(row, {'fg': 'black'})
+      tab7.gcodeView.itemconfig(row, {'fg': "#000000"})
     def GCthreadProg():
       # global RUN['GCrowinproc']
       # global RUN['GCstopQueue']
@@ -10763,7 +10858,7 @@ def GCconvertProg():
         #last = tab7.gcodeView.index('end')
         #for row in range (0,GCselRow):
         #  tab7.gcodeView.itemconfig(row, {'fg': 'dodger blue'})
-        tab7.gcodeView.itemconfig(GCselRow, {'fg': 'blue2'})
+        tab7.gcodeView.itemconfig(GCselRow, {'fg': "#0057A6"})
         #for row in range (GCselRow+1,last):
         #  tab7.gcodeView.itemconfig(row, {'fg': 'black'})
         tab7.gcodeView.selection_clear(0, END)
@@ -10877,13 +10972,15 @@ def GCexecuteRow():
       Filename = GcodeFilenameField.get() + ".txt"
       command = "WC"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"Fn"+Filename+"\n"
       cmdSentEntryField.delete(0, 'end') 
-
+      
+      print(str(command))
 
       cmdSentEntryField.insert(0,command)
       RUN['ser'].write(command.encode())
       RUN['ser'].flushInput()
       time.sleep(.1)
       response = str(RUN['ser'].readline().strip(),'utf-8')
+      print(str(response))
       if (response[:1] == 'E'):
         ErrorHandler(response)
         GCstopProg()
@@ -10899,19 +10996,19 @@ def GCexecuteRow():
       if("X" in command):
         xtemp=command[command.find("X")+1:]     
         RUN['xVal'] =xtemp[:xtemp.find(" ")]
-        RUN['xVal'] =str(round(float(xVal),3))
+        RUN['xVal'] =str(round(float(RUN['xVal']),3))
       else:
         RUN['xVal'] =""  
       if("Y" in command):
         ytemp=command[command.find("Y")+1:]     
         RUN['yVal'] =ytemp[:ytemp.find(" ")]
-        RUN['yVal'] =str(round(float(yVal),3))
+        RUN['yVal'] =str(round(float(RUN['yVal']),3))
       else:
         RUN['yVal'] =""
       if("Z" in command):
         ztemp=command[command.find("Z")+1:]     
         RUN['zVal'] =ztemp[:ztemp.find(" ")]
-        RUN['zVal'] =str(round(float(zVal),3))
+        RUN['zVal'] =str(round(float(RUN['zVal']),3))
       else:
         RUN['zVal'] =""
       if("A" in command):
@@ -10950,7 +11047,7 @@ def GCexecuteRow():
       if(RUN['xVal'] != ""):
         if(RUN['inchTrue']):
           RUN['xVal'] =str(float(xVal)*25.4)
-        RUN['xVal'] = str(round((float(GC_ST_E1_EntryField.get())+float(xVal)),3))
+        RUN['xVal'] = str(round((float(GC_ST_E1_EntryField.get())+float(RUN['xVal'])),3))
       else:
         try:
           if(RUN['prevxVal'] != 0):
@@ -10964,7 +11061,7 @@ def GCexecuteRow():
       if(RUN['yVal'] != ""):
         if(RUN['inchTrue']):
           RUN['yVal'] =str(float(yVal)*25.4)
-        RUN['yVal'] = str(round((float(GC_ST_E2_EntryField.get())+float(yVal)),3))
+        RUN['yVal'] = str(round((float(GC_ST_E2_EntryField.get())+float(RUN['yVal'])),3))
       else:
         try:
           if(RUN['prevyVal'] != 0):
@@ -10977,7 +11074,7 @@ def GCexecuteRow():
       if(RUN['zVal'] != ""):
         if(RUN['inchTrue']):
           RUN['zVal'] =str(float(zVal)*25.4)
-        RUN['zVal'] = str(round((float(GC_ST_E3_EntryField.get())+float(zVal)),3))
+        RUN['zVal'] = str(round((float(GC_ST_E3_EntryField.get())+float(RUN['zVal'])),3))
       else:
         try:
           if(RUN['prevzVal'] != 0):
@@ -11274,7 +11371,7 @@ posFrame.grid(row=7, column=0, columnspan=2, sticky="new", padx=5, pady=(2, 5))
 
 posFrame.grid_columnconfigure(0, weight=1)
 
-moveSelMenu = OptionMenu(posFrame, options, "Move J", "Move J", "OFF J", "Move L", "Move R", "Move A Mid", "Move A End", "Move C Center", "Move C Start", "Move C Plane", "Start Spline", "End Spline", "Move PR", "OFF PR ", "Teach PR", "Move Vis", command=posRegFieldVisible)
+moveSelMenu = OptionMenu(posFrame, options, "Move J", "Move J", "Move L", "Move R", "OFF J", "Move PR", "OFF PR ", "Teach PR", "Move A Mid", "Move A End", "Move C Center", "Move C Start", "Move C Plane", "Start Spline", "End Spline", "Move Vis", command=posRegFieldVisible)
 moveSelMenu.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
 
 # Position Register Entry Field (hidden by default, shown when PR moves selected)
@@ -11291,12 +11388,9 @@ modPosBut.grid(row=3, column=0, sticky="ew", padx=2, pady=2)
 deleteBut = ttk.Button(posFrame, text="Delete", command=deleteitem)
 deleteBut.grid(row=4, column=0, sticky="ew", padx=2, pady=2)
 
-returnBut = ttk.Button(posFrame, text="Return", command=insertReturn)
-returnBut.grid(row=5, column=0, sticky="ew", padx=2, pady=2)
-
 autoCalBut = ttk.Button(posFrame, text="Auto Calibrate CMD", command=insCalibrate)
 CalibrateBut = autoCalBut  # Alias for compatibility
-autoCalBut.grid(row=6, column=0, sticky="ew", padx=2, pady=2)
+autoCalBut.grid(row=5, column=0, sticky="ew", padx=2, pady=2)
 
 # Row 8: Vision container
 visionFrame = LabelFrame(leftPanel, text="Vision", padding=5)
@@ -11336,7 +11430,7 @@ VisBacColorEntryField.insert(0, "116, 116, 116")  # Default background color
 VisScoreEntryField.insert(0, "85")  # Default score threshold
 
 # Row 9: Wait container
-waitContainer = LabelFrame(leftPanel, text="Wait", padding=5)
+waitContainer = LabelFrame(leftPanel, text="Wait - Stop", padding=5)
 waitContainer.grid(row=9, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
 
 waitContainer.grid_columnconfigure(0, weight=1)
@@ -11347,6 +11441,9 @@ waitSecBut.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
 
 waitSecField = Entry(waitContainer, width=8, justify="center")
 waitSecField.grid(row=0, column=1, sticky="w", padx=2, pady=2)
+
+stopBut = ttk.Button(waitContainer, text="Stop", command=insertStop)
+stopBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
 
 # ============================================================================
 # CENTER PANEL - Program Display and Controls
@@ -11437,16 +11534,16 @@ manEntryField = Entry(manEntryFrame, width=60)
 manEntryField.grid(row=0, column=0, columnspan=5, sticky="ew", padx=2, pady=(2, 5))
 
 # Five buttons below entry field (equal width)
-getSelBut = ttk.Button(manEntryFrame, text="Get Selected", command=getSel)
+getSelBut = ttk.Button(manEntryFrame, text="Copy", command=getSel)
 getSelBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
 
-insertBut = ttk.Button(manEntryFrame, text="Insert", command=manInsItem)
+insertBut = ttk.Button(manEntryFrame, text="Paste", command=manInsItem)
 insertBut.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
 
 replaceBut = ttk.Button(manEntryFrame, text="Replace", command=manReplItem)
 replaceBut.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
 
-openTextBut = ttk.Button(manEntryFrame, text="Open Text", command=openText)
+openTextBut = ttk.Button(manEntryFrame, text="Open .txt File", command=openText)
 openTextBut.grid(row=1, column=3, sticky="ew", padx=2, pady=2)
 
 reloadBut = ttk.Button(manEntryFrame, text="Reload", command=reloadProg)
@@ -13187,32 +13284,32 @@ stepDegFrame.grid_columnconfigure(1, weight=1)
 
 J1StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J1 Step/Deg")
 J1StepDegLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
-J1StepDegEntryField = Entry(stepDegFrame, width=5, justify="center")
+J1StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
 J1StepDegEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
 
 J2StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J2 Step/Deg")
 J2StepDegLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
-J2StepDegEntryField = Entry(stepDegFrame, width=5, justify="center")
+J2StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
 J2StepDegEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
 
 J3StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J3 Step/Deg")
 J3StepDegLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
-J3StepDegEntryField = Entry(stepDegFrame, width=5, justify="center")
+J3StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
 J3StepDegEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
 
 J4StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J4 Step/Deg")
 J4StepDegLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
-J4StepDegEntryField = Entry(stepDegFrame, width=5, justify="center")
+J4StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
 J4StepDegEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
 
 J5StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J5 Step/Deg")
 J5StepDegLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
-J5StepDegEntryField = Entry(stepDegFrame, width=5, justify="center")
+J5StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
 J5StepDegEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
 
 J6StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J6 Step/Deg")
 J6StepDegLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
-J6StepDegEntryField = Entry(stepDegFrame, width=5, justify="center")
+J6StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
 J6StepDegEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
 
 # ============================================================================
@@ -13424,27 +13521,33 @@ defaultsFrame.grid(row=0, column=4, rowspan=2, sticky="nsew", padx=5, pady=5)
 
 defaultsFrame.grid_columnconfigure(0, weight=1)
 
-loadAR4Mk2But = Button(defaultsFrame, text="Load AR4-MK3 Defaults", width=26, command=LoadAR4Mk3default)
-loadAR4Mk2But.grid(row=0, column=0, padx=5, pady=5)
+loadAR4Mk4But = Button(defaultsFrame, text="Load AR4-MK4 Defaults", width=26, command=LoadAR4Mk3default)
+loadAR4Mk4But.grid(row=0, column=0, padx=5, pady=5)
+
+loadAR4Mk3But = Button(defaultsFrame, text="Load AR4-MK3 Defaults", width=26, command=LoadAR4Mk3default)
+loadAR4Mk3But.grid(row=1, column=0, padx=5, pady=5)
 
 loadAR4Mk2But = Button(defaultsFrame, text="Load AR4-MK2 Defaults", width=26, command=LoadAR4Mk2default)
-loadAR4Mk2But.grid(row=1, column=0, padx=5, pady=5)
+loadAR4Mk2But.grid(row=2, column=0, padx=5, pady=5)
 
-loadAR4But = Button(defaultsFrame, text="Load AR4 Defaults", width=26, command=LoadAR4default)
-loadAR4But.grid(row=2, column=0, padx=5, pady=5)
+loadAR4But = Button(defaultsFrame, text="Load AR4-MK1 Defaults", width=26, command=LoadAR4default)
+loadAR4But.grid(row=3, column=0, padx=5, pady=5)
 
 loadAR3But = Button(defaultsFrame, text="Load AR3 Defaults", width=26, command=LoadAR3default)
-loadAR3But.grid(row=3, column=0, padx=5, pady=5)
+loadAR3But.grid(row=4, column=0, padx=5, pady=5)
 
 saveCalBut = Button(defaultsFrame, text="SAVE", width=26, command=SaveAndApplyCalibration)
-saveCalBut.grid(row=4, column=0, padx=5, pady=(10, 30)) # 10 pixels above, 30 below
+saveCalBut.grid(row=5, column=0, padx=5, pady=(10, 30)) # 10 pixels above, 30 below
 
 
 loadCustomBut = Button(defaultsFrame, text="Load Custom Calibration", width=26, command=load_custom_calibration)
-loadCustomBut .grid(row=5, column=0, padx=5, pady=(30, 5))
+loadCustomBut .grid(row=6, column=0, padx=5, pady=(30, 5))
 
 saveCustomBut = Button(defaultsFrame, text="Save Custom Calibration", width=26, command=save_custom_calibration)
-saveCustomBut.grid(row=6, column=0, padx=5, pady=5)
+saveCustomBut.grid(row=7, column=0, padx=5, pady=5)
+
+loadMaxStepBut = Button(defaultsFrame, text="Load Max Microsteps", width=26, command=LoadMaxdefault)
+loadMaxStepBut.grid(row=8, column=0, padx=5, pady=5)
 
 
 
@@ -14823,8 +14926,8 @@ live_lbl = Label(live_frame)
 live_lbl.place(x=0, y=0)
 
 
-template_frame = Frame(tab6,width=120,height=150)
-template_frame.place(x=575, y=50)
+template_frame = Frame(tab6,width=150,height=150)
+template_frame.place(x=565, y=50)
 
 template_lbl = Label(template_frame)
 template_lbl.place(x=0, y=0)
@@ -14864,25 +14967,19 @@ match CE['Platform']['OS']:
     try:
       # If we have real cams, preselect the first real one; otherwise keep the placeholder
       if camList and camList[0] != "Select a Camera":
-        vismenu = OptionMenu(tab6, visoptions, camList[0], *camList, command=on_camera_select)
+        vismenu = OptionMenu(tab6, visoptions, camList[0], *camList)
         visoptions.set(camList[0])  # ensures the real cam (e.g., Logi C270) is selected
       else:
-        vismenu = OptionMenu(tab6, visoptions, "Select a Camera", command=on_camera_select)
+        vismenu = OptionMenu(tab6, visoptions, "Select a Camera")
       vismenu.config(width=20)
       vismenu.place(x=10, y=10)
     except Exception:
       logger.error("no camera")
 
-    def on_camera_select(chosen_label):
-      CAL['curCam'] = chosen_label
-      logger.debug(f"Debug - User picked: {chosen_label}")
-
   case "Linux":
     # Build label->id map
-    camMap = {c.label: c.id for c in CE['Cameras']['Enum']}
-    camList = list(camMap.keys())
-    logger.debug(f"camMap value: {camMap}")
-    logger.debug(f"Cameras Detected: {camList}")
+    label_to_id = {c.label: c.id for c in CE['Cameras']['Enum']}
+    camList = list(label_to_id.keys())
 
     selected_label = tk.StringVar(value=(camList[0] if camList else "Select a Camera"))
 
@@ -14890,9 +14987,8 @@ match CE['Platform']['OS']:
     visoptions.set("Select a Camera")
 
     def on_camera_select(chosen_label):
-      cam_id = camMap.get(chosen_label, "None")
-      CAL['curCam'] = visoptions.get()
-      logger.debug(f"Debug - User picked: {chosen_label} -> using id: {cam_id}")
+      cam_id = label_to_id.get(chosen_label, "None")
+      logger.debug("Debug - User picked:", chosen_label, " -> using id:", cam_id)
 
     try:
       vismenu = OptionMenu(tab6, visoptions, selected_label.get(), *camList, command=on_camera_select)
@@ -14900,6 +14996,7 @@ match CE['Platform']['OS']:
       vismenu.place(x=10, y=10)
     except Exception:
       logger.error("no camera")
+
 
 
 
@@ -14920,10 +15017,10 @@ FindVisBut = Button(tab6,  text="Snap & Find",  width=12, command = snapFind)
 FindVisBut.place(x=270, y=50)
 
 
-ZeroBrCnBut = Button(tab6, text="Zero",  width=4, command = zeroBrCn)
+ZeroBrCnBut = Button(tab6, text="Zero",  width=5, command = zeroBrCn)
 ZeroBrCnBut.place(x=10, y=110)
 
-maskBut = Button(tab6, text="Mask",  width=4, command = selectMask)
+maskBut = Button(tab6, text="Mask",  width=5, command = selectMask)
 maskBut.place(x=10, y=150)
 
 
@@ -14938,21 +15035,21 @@ VisZoomSlide.place(x=75, y=95)
 VisZoomSlide.set(50)
 
 VisZoomLab = Label(tab6, text = "Zoom")
-VisZoomLab.place(x=75, y=115)
+VisZoomLab.place(x=75, y=110)
 
 VisBrightSlide = Scale(tab6, from_=-127, to=127,  length=250, orient=HORIZONTAL)
 VisBrightSlide.bind("<ButtonRelease-1>", VisUpdateBriCon)
 VisBrightSlide.place(x=75, y=130)
 
 VisBrightLab = Label(tab6, text = "Brightness")
-VisBrightLab.place(x=75, y=150)
+VisBrightLab.place(x=75, y=145)
 
 VisContrastSlide = Scale(tab6, from_=-127, to=127,  length=250, orient=HORIZONTAL)
 VisContrastSlide.bind("<ButtonRelease-1>", VisUpdateBriCon)
 VisContrastSlide.place(x=75, y=165)
 
 VisContrastLab = Label(tab6, text = "Contrast")
-VisContrastLab.place(x=75, y=185)
+VisContrastLab.place(x=75, y=180)
 
 
 fullRotCbut = Checkbutton(tab6, text="Full Rotation Search",variable = RUN['fullRot'])
@@ -14978,20 +15075,21 @@ saveCalBut.place(x=915, y=340)
 #### 6 ENTRY FIELDS##########################################################
 #############################################################################
 
+VisSelObjLab = Label(tab6, text = "Select Object")
+VisSelObjLab.place(x=390, y=82)
 
-
-VisBacColorEntryField = Entry(tab6,width=12,justify="center")
-VisBacColorEntryField.place(x=390, y=100)
+VisBacColorEntryField = Entry(tab6,width=14,justify="center")
+VisBacColorEntryField.place(x=390, y=115)
 VisBacColorLab = Label(tab6, text = "Background Color")
-VisBacColorLab.place(x=390, y=120)
+VisBacColorLab.place(x=390, y=135)
 
 bgAutoCbut = Checkbutton(tab6, command=checkAutoBG, text="Auto",variable = RUN['autoBG'])
-bgAutoCbut.place(x=490, y=101)
+bgAutoCbut.place(x=490, y=116)
 
 VisScoreEntryField = Entry(tab6,width=12,justify="center")
-VisScoreEntryField.place(x=390, y=150)
+VisScoreEntryField.place(x=390, y=165)
 VisScoreLab = Label(tab6, text = "Score Threshold")
-VisScoreLab.place(x=390, y=170)
+VisScoreLab.place(x=390, y=185)
 
 
 
@@ -15519,8 +15617,7 @@ if (CAL['pickClosestVal'] == 1):
   RUN['pickClosest'].set(True)
 if (CAL['pick180Val'] == 1):
   RUN['pick180'].set(True)  
-if CAL['curCam'] in camList:
-  visoptions.set(CAL['curCam'])
+visoptions.set(CAL['curCam'])
 if (CAL['fullRotVal'] == 1):
   RUN['fullRot'].set(True)
 if (CAL['autoBGVal'] == 1):
@@ -15688,24 +15785,13 @@ Copyright © 2022 by Annin Robotics. All Rights Reserved"
 #tkinter.messagebox.showwarning("AR4 License / Copyright notice", msg)
 RUN['xboxUse'] = 0
 
-
+tab1.lastProg = ""
 tab1.after(100, setCom)
 
 #tab1.mainloop()
 root.mainloop()
 
 
+
 #manEntryField.delete(0, 'end')
 #manEntryField.insert(0,value)
-
-
-# Exit cleanly
-try:
-  if root.winfo_exists():
-    root.destroy()
-except:
-  pass
-
-sys.exit(0)
-
-

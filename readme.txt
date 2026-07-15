@@ -31,7 +31,7 @@ Using Source Code
 
 	5. To convert ARCS.py to an EXE file python open CMD window and navigate to the folder python was installed in.
 		and then install program: -m pip install auto-py-to-exe.
-		Next execute the execute py to exe program by typing python -m auto_py_to_exe in cmd window.
+		Next execute the execute py to exe program by typing "python -m auto_py_to_exe" in cmd window.
 		add each of these to Advanced Options --Hidded-import
 			vtkmodules.all
 			vtkmodules.util.execution_model
@@ -42,5 +42,8 @@ Using Source Code
 			vtkmodules.vtkCommonDataModel
 			vtkmodules.vtkCommonExecutionModel
 			vtkmodules.util.data_model
+			
+        add the folder ARrobots to additional paths.  		
+		
 		Use this program to create the exe files. Copy all .ico, .gif and program files from source code folder into your new exe folder otherwise exe will not work.
 		
