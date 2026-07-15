@@ -241,10 +241,9 @@ impact-per-effort.
 
 ### 1. Hazards list reflects the trend report
 
-The prompt template's `## Project hazards that have repeatedly bitten
-this codebase (REPLACE ME — see README)` section enumerates archetypes
-Codex must scrutinize. Each hazard should correspond to at least one
-BLOCKER cluster in the trend report.
+The prompt template's `## Project hazards` section enumerates archetypes
+the reviewer must scrutinize. Each hazard should correspond to concrete
+codebase evidence or a BLOCKER cluster in the trend report.
 
 **Audit:** for each BLOCKER archetype cluster in the trend report with
 ≥ 3 findings in the last 30 days, verify that the prompt template has a
@@ -300,7 +299,7 @@ mention it AND name what Codex should do with it. The scope-doc's
 `PLAN-CONSISTENCY.txt` line is the model; when the consistency check is
 enabled (`CROSS_REVIEW_CONSISTENCY_DOC` set), the Project-hazards section
 should also instruct the reviewer to read it first and treat each entry as
-a BLOCKER candidate (the template's REPLACE-ME hazards guidance notes this).
+a BLOCKER candidate (the template's project-hazards guidance notes this).
 
 **Drift signals:**
 - A wrapper-produced evidence file in the prompt-reads-it set is not
