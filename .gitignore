@@ -24,3 +24,6 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# cross-review-gate generated artifacts (verdict logs, dispatch-checklist, skip log)
+logs/

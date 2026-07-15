@@ -1,0 +1,1034 @@
+#!/bin/sh
+#
+# Adversarial review gate - every commit must pass review before it lands.
+# See AGENTS.md "Convergence Loop" section for the workflow.
+#
+# Installed via: bootstrap.ps1 (sets up a per-clone dispatcher at
+#                .git/hooks/pre-commit that delegates to this script
+#                after verifying the script exists in the working tree
+#                AND is tracked in HEAD). Do NOT install via
+#                `git config core.hooksPath scripts/git-hooks` directly:
+#                a versioned core.hooksPath leaves `git rm scripts/git-hooks/
+#                pre-commit` as a silent gate-removal bypass; the
+#                dispatcher closes that hole by living per-clone outside
+#                the working tree.
+#
+# DUAL-BACKEND CROSS-REVIEW:
+#   REVIEW_BACKEND env var selects which reviewer runs:
+#     codex             - scripts/codex/auto-review.ps1 (GPT-5.5 reviews)
+#     claude            - scripts/claude/auto-review.ps1 (Claude reviews)
+#     both              - run codex first; ONLY if codex passes, also
+#                         run claude. SHORT-CIRCUITS on codex failure
+#                         (no point burning a second backend's tokens
+#                         on a commit that cannot land). If you want
+#                         the Claude verdict on a commit codex would
+#                         reject, run with REVIEW_BACKEND=claude
+#                         directly instead of `both`.
+#   The committing agent declares itself by setting the env var before
+#   `git commit` -- typically each agent sets the OTHER's backend so the
+#   review is cross-author (Claude commit -> Codex review; Codex commit
+#   -> Claude review). REVIEW_BACKEND is REQUIRED -- bare `git commit`
+#   without an explicit setting is rejected, so a forgotten env var
+#   cannot silently route a commit to self-review. The commit wrappers
+#   set REVIEW_BACKEND for you; use them as the default path.
+#
+# Security: when staged changes touch a backend's wrapper or the shared
+# prompt template, THAT backend's wrapper + prompt run from HEAD's
+# trusted versions extracted to a tempdir - never from the staged
+# candidate version. So a commit cannot stage a weakened wrapper or
+# prompt and have that weakened version approve itself.
+#
+# Trust chain for this hook script itself: bootstrap.ps1 installs a
+# per-clone dispatcher at .git/hooks/pre-commit that extracts
+# HEAD:scripts/git-hooks/pre-commit to a temp file and execs THAT
+# (not the working-tree copy). So a staged edit to this hook is
+# reviewed by the HEAD-extracted trusted copy (which IS this hook's
+# previous version) -- not by the working-tree candidate. This closes
+# the staged-no-op-replacement bypass that an in-tree-only install
+# would leave open. Listing this hook in each backend's REVIEW_INFRA
+# additionally routes the staged change through the backend's
+# adversarial review, so a hook edit gets both (a) executed under
+# HEAD's last-good logic and (b) flagged for review against HEAD's
+# wrapper + prompt. See docs/audit-protocol.md "How the audit ships"
+# for the audit recommendations.
+#
+# To skip this hook for a one-off legitimate reason (rare), set
+# CROSS_REVIEW_SKIP=1 in the environment. NEVER use `git commit --no-verify`.
+# The skip variable exists so the bypass is explicit, logged, and visible.
+# Bootstrap of the review infrastructure itself necessarily uses this skip
+# because HEAD has no trusted version to source from yet.
+
+ensure_unix_tool_path() {
+  # Git for Windows hooks launched from PowerShell can inherit /cmd without
+  # /usr/bin. This hook depends on POSIX tools from /usr/bin (env, mktemp,
+  # find, rm, grep, sed, head, tr), so repair PATH before any such call.
+  for d in /usr/bin /bin; do
+    if [ -d "$d" ]; then
+      case ":$PATH:" in
+        *":$d:"*) ;;
+        *) PATH="$d:$PATH" ;;
+      esac
+    fi
+  done
+  export PATH
+}
+ensure_unix_tool_path
+
+# ---- --self-test: hermetic fixture suite over the guard branches ----
+# Run as `sh scripts/git-hooks/pre-commit --self-test`. Builds a scratch git
+# repo under mktemp with STUB powershell infra (wrapper/prompt/author-lint
+# committed to the scratch HEAD) and re-invokes THIS hook file inside it,
+# asserting exit codes + output markers for the runtime-critical branches:
+# backend-required (incl. its ordering BEFORE the empty-commit exemption),
+# invalid backend, untracked commit-wrapper guard, untracked-infra guard,
+# author-lint exit-code contract (3 = findings -> abort; 1 = crash -> warn
+# and proceed; CROSS_REVIEW_SKIP_AUTHOR_LINT=1 -> skip), the wrapper exit-code contract
+# under the 2026-07 severity change (BLOCKER exit 2 -> abort; the retired exit 1
+# -> fail closed; QUALITY passes as exit 0, covered by the clean-run case), and
+# the semantic -ReasoningEffort detect (a stub whose only `ReasoningEffort` text
+# is a comment mention must NOT be treated as declaring the parameter). NO codex
+# or claude is invoked -- the stub backend wrapper exits 0 (2 / 1 in the
+# exit-code-contract cases). Git never passes
+# arguments to a pre-commit hook, so this branch is unreachable in normal
+# operation; it exists so a hook edit ships with executable coverage instead
+# of only an out-of-band smoke note.
+if [ "$1" = "--self-test" ]; then
+  # Hermetic env: re-exec ONCE under a scrubbed environment so every fixture
+  # git command AND every child hook invocation below runs free of the
+  # ambient GIT_* family (the same family the review wrappers scrub for
+  # their children) -- an inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE or
+  # GIT_CONFIG* redirect could otherwise point fixture commits at a
+  # different repository or override the scratch repo's isolation config.
+  # One exec at entry beats per-command wrappers: nothing downstream can
+  # forget the scrub.
+  if [ -z "$CROSS_REVIEW_SELFTEST_SCRUBBED" ]; then
+    exec env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE \
+      -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+      -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_PREFIX \
+      -u GIT_CEILING_DIRECTORIES -u GIT_CONFIG -u GIT_CONFIG_GLOBAL \
+      -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_NOSYSTEM \
+      -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
+      CROSS_REVIEW_SELFTEST_SCRUBBED=1 sh "$0" --self-test
+  fi
+  HOOK_ABS=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  ST_FAILURES=0
+  ST_ROOT=$(mktemp -d 2>/dev/null || mktemp -d -t crg-precommit-selftest)
+  if [ -z "$ST_ROOT" ] || [ ! -d "$ST_ROOT" ]; then
+    echo "[SelfTest] FAIL: could not create scratch root" >&2
+    exit 1
+  fi
+  # No-recurse cleanup (package policy bans `rm -rf` even for the gate's own
+  # scratch): delete files first, then the now-empty dirs bottom-up. Mirrors
+  # cleanup_trusted_dirs below and the PowerShell wrappers' Remove-TreeNoRecurse.
+  st_cleanup() {
+    [ -d "$ST_ROOT" ] || return 0
+    find "$ST_ROOT" -type f -exec rm -f {} + 2>/dev/null
+    find "$ST_ROOT" -depth -type d -exec rmdir {} + 2>/dev/null
+  }
+  trap st_cleanup EXIT
+
+  ST_REPO="$ST_ROOT/repo"
+  mkdir -p "$ST_REPO/scripts/codex" "$ST_REPO/scripts/claude" "$ST_REPO/scripts/git-hooks"
+  (
+    cd "$ST_REPO" || exit 1
+    git init -q .
+    git config user.email selftest@local
+    git config user.name selftest
+    # Hermetic isolation from AMBIENT hooks: a user/global core.hooksPath or
+    # an init-template hook would otherwise fire on every fixture `git commit`
+    # below (failing setup or recursing into real review logic). An empty
+    # local hooks dir neutralizes both. The hook under test is never invoked
+    # via `git commit` here -- each case runs it DIRECTLY (sh "$HOOK_ABS") --
+    # so this repo-local setting cannot mask the behavior being tested.
+    mkdir -p .git/hooks-none
+    git config core.hooksPath .git/hooks-none
+    # ...and from ambient signing config: a global commit.gpgSign=true would
+    # make every fixture `git commit` depend on a signing key/agent and fail
+    # the suite before any hook branch under test runs.
+    git config commit.gpgsign false
+    # Stub backend wrapper: exits 0 (PASS). Its ONLY ReasoningEffort text is
+    # a comment MENTION -- the semantic detect must not treat that as a
+    # parameter declaration (a bare substring grep would).
+    printf '# stub wrapper; callers may pass -ReasoningEffort but this stub does not declare it\nexit 0\n' > scripts/codex/auto-review.ps1
+    printf '# stub prompt\n' > scripts/codex/review-prompt-template.md
+    printf '# stub codex commit wrapper\n' > scripts/codex/commit.ps1
+    printf '# stub claude commit wrapper\n' > scripts/claude/commit.ps1
+    printf 'exit 0\n' > scripts/codex/author-lint.ps1
+    # `-c core.excludesfile=` on every fixture `git add`: a host global excludes
+    # file (e.g. one ignoring *.ps1) would otherwise silently skip the stub infra
+    # or f.txt and produce false self-test failures. Mirrors the review wrappers'
+    # TCK fixtures, which neutralize the same host edge.
+    git -c core.excludesfile= add -A
+    git commit -qm 'selftest fixture baseline'
+  ) || { echo "[SelfTest] FAIL: scratch repo setup failed" >&2; exit 1; }
+
+  # st_case <name> <want_exit> <want_marker> <want_marker2> <forbid_marker>
+  # <env assignments...> -- runs the hook in the scratch repo with a scrubbed
+  # env plus the given assignments. Both want-markers must appear ('' = not
+  # asserted); the forbid-marker must be ABSENT ('' = not asserted). The
+  # second/forbid markers exist so the author-lint contract cases can prove
+  # whether the BACKEND actually ran (skip/crash must still reach the backend
+  # PASS; a findings abort must never start the backend), not just match one
+  # line + an exit code.
+  st_case() {
+    ST_NAME="$1"; ST_WANT_EXIT="$2"; ST_WANT_MARK="$3"; ST_WANT_MARK2="$4"; ST_FORBID_MARK="$5"; shift 5
+    ST_OUT=$(cd "$ST_REPO" && env -u REVIEW_BACKEND -u CROSS_REVIEW_SKIP -u CROSS_REVIEW_SKIP_AUTHOR_LINT -u CROSS_REVIEW_COMMIT_EFFORT -u CROSS_REVIEW_FOLLOWUPS_PENDING "$@" sh "$HOOK_ABS" 2>&1)
+    ST_EXIT=$?
+    ST_OK=1
+    [ "$ST_EXIT" -eq "$ST_WANT_EXIT" ] || ST_OK=0
+    if [ -n "$ST_WANT_MARK" ]; then
+      case "$ST_OUT" in *"$ST_WANT_MARK"*) ;; *) ST_OK=0 ;; esac
+    fi
+    if [ -n "$ST_WANT_MARK2" ]; then
+      case "$ST_OUT" in *"$ST_WANT_MARK2"*) ;; *) ST_OK=0 ;; esac
+    fi
+    if [ -n "$ST_FORBID_MARK" ]; then
+      case "$ST_OUT" in *"$ST_FORBID_MARK"*) ST_OK=0 ;; esac
+    fi
+    if [ "$ST_OK" -eq 1 ]; then
+      echo "[SelfTest] PASS $ST_NAME"
+    else
+      echo "[SelfTest] FAIL $ST_NAME: exit=$ST_EXIT (want $ST_WANT_EXIT); output:"
+      echo "$ST_OUT" | sed 's/^/    /'
+      ST_FAILURES=$((ST_FAILURES + 1))
+    fi
+  }
+
+  # st_stage re-creates a staged (non-infra) change for the staged-path
+  # cases; st_fixture_commit lands the CURRENT index+worktree state as a
+  # fixture commit (a plain full commit -- pathspec commits are unusable for
+  # --cached removals since they commit working-tree content). Cases that
+  # need staged changes call st_stage AFTER the fixture commit.
+  st_stage() { ( cd "$ST_REPO" && echo x >> f.txt && git -c core.excludesfile= add f.txt ); }
+  st_fixture_commit() { ( cd "$ST_REPO" && git -c core.excludesfile= add -A && git commit -qm "$1" >/dev/null 2>&1 || git commit -qm "$1" ); }
+
+  ST_BACKEND_RAN='Running codex adversarial review'
+  ST_BACKEND_PASS='[pre-commit:codex] PASS'
+
+  st_stage
+  st_case 'backend-required: unset REVIEW_BACKEND rejected' 1 'REVIEW_BACKEND is not set' '' "$ST_BACKEND_RAN"
+  st_case 'backend-required: invalid value rejected' 1 'is not valid' '' "$ST_BACKEND_RAN" REVIEW_BACKEND=bogus
+
+  # Ordering: the guard fires even with NOTHING staged.
+  ( cd "$ST_REPO" && git reset -q )
+  st_case 'backend-required precedes empty-commit exemption' 1 'REVIEW_BACKEND is not set' '' ''
+  st_case 'empty commit with backend set passes the exemption' 0 'no staged changes' '' "$ST_BACKEND_RAN" REVIEW_BACKEND=codex
+
+  st_stage
+  st_case 'clean staged run passes (stub backend, clean author-lint)' 0 "$ST_BACKEND_PASS" '' '' REVIEW_BACKEND=codex
+  st_case 'effort forward: comment mention is NOT a declaration' 0 'does not declare -ReasoningEffort' "$ST_BACKEND_PASS" '-> -ReasoningEffort' REVIEW_BACKEND=codex CROSS_REVIEW_COMMIT_EFFORT=xhigh
+  # (The tier validation sits inside run_backend AFTER its "Running..."
+  # banner, so the banner appears; what must NOT appear is a backend PASS.)
+  st_case 'effort forward: invalid tier is an invocation error' 1 'not a valid codex reasoning-effort tier' '' "$ST_BACKEND_PASS" REVIEW_BACKEND=codex CROSS_REVIEW_COMMIT_EFFORT=bogus
+
+  # Positive forwarding: a stub that REALLY declares -ReasoningEffort (plus
+  # the -Scope/-PromptPath params the hook always passes, so param binding
+  # succeeds) must receive the tier -- proves the semantic detect recognizes
+  # a genuine declaration, not only that it rejects a comment mention. The
+  # stub VERIFIES the received value (exit 7 unless it equals the requested
+  # tier) -- asserting only the hook's "-> -ReasoningEffort" diagnostic would
+  # let a regression that prints the marker but drops or misquotes the actual
+  # PowerShell argument slip through (a value mismatch fails the stub, so no
+  # backend PASS and the fixture's want-exit-0 both fail).
+  ( cd "$ST_REPO" && printf 'param([string]$Scope,[string]$PromptPath,[string]$ReasoningEffort)\nif ($ReasoningEffort -ne "xhigh") { Write-Host "stub effort mismatch: [$ReasoningEffort]"; exit 7 }\nexit 0\n' > scripts/codex/auto-review.ps1 )
+  st_fixture_commit 'declaring wrapper stub'
+  st_stage
+  st_case 'effort forward: real declaration forwards the tier' 0 '-> -ReasoningEffort' "$ST_BACKEND_PASS" 'does not declare' REVIEW_BACKEND=codex CROSS_REVIEW_COMMIT_EFFORT=xhigh
+
+  # Restore the plain PASS stub: the fixtures below run WITHOUT
+  # CROSS_REVIEW_COMMIT_EFFORT, and the verifying stub above exits 7 when the
+  # tier is absent -- leaving it in place would fail their backend-PASS
+  # assertions for a reason unrelated to what they test.
+  ( cd "$ST_REPO" && printf '# stub wrapper; callers may pass -ReasoningEffort but this stub does not declare it\nexit 0\n' > scripts/codex/auto-review.ps1 )
+  st_fixture_commit 'restore plain stub'
+
+  # author-lint exit-code contract. The pre-pass runs HEAD's copy, so each
+  # variant is landed as a fixture commit, then a fresh change is staged.
+  # Skip/crash must still REACH the backend (assert its PASS); a findings
+  # abort must never START it (forbid the backend-run marker).
+  ( cd "$ST_REPO" && printf 'Write-Host "[author-lint] stub findings"\nexit 3\n' > scripts/codex/author-lint.ps1 )
+  st_fixture_commit 'lint exit3'
+  st_stage
+  st_case 'author-lint exit 3 (findings) aborts before the backend' 1 'ERROR-tier findings' '' "$ST_BACKEND_RAN" REVIEW_BACKEND=codex
+  st_case 'CROSS_REVIEW_SKIP_AUTHOR_LINT=1 skips only the pre-pass' 0 'author-lint pre-pass skipped' "$ST_BACKEND_PASS" '' REVIEW_BACKEND=codex CROSS_REVIEW_SKIP_AUTHOR_LINT=1
+  ( cd "$ST_REPO" && printf 'throw "stub crash"\n' > scripts/codex/author-lint.ps1 )
+  st_fixture_commit 'lint crash'
+  st_stage
+  st_case 'author-lint crash (exit 1) warns and fails open to the backend' 0 'did not complete' "$ST_BACKEND_PASS" '' REVIEW_BACKEND=codex
+  ( cd "$ST_REPO" && printf 'exit 0\n' > scripts/codex/author-lint.ps1 )
+  st_fixture_commit 'lint clean'
+
+  # --- Wrapper exit-code contract (2026-07 severity change: only BLOCKER aborts) ---
+  # A QUALITY-only verdict now yields wrapper exit 0 -> the hook PASSES (covered by
+  # the clean staged-run case above; the hook sees exit 0 regardless of any QUALITY
+  # findings, which the wrapper prints + stages for the hook's post-pass promotion
+  # to review-followups.md). BLOCKER (exit 2) aborts; the RETIRED exit 1 fails
+  # closed (never a silent pass).
+  ( cd "$ST_REPO" && printf '# stub: BLOCKER verdict\nexit 2\n' > scripts/codex/auto-review.ps1 )
+  st_fixture_commit 'wrapper exit 2 (BLOCKER)'
+  st_stage
+  st_case 'wrapper exit 2 (BLOCKER) aborts the commit' 1 'BLOCKER findings' '' "$ST_BACKEND_PASS" REVIEW_BACKEND=codex
+  ( cd "$ST_REPO" && printf '# stub: retired exit 1\nexit 1\n' > scripts/codex/auto-review.ps1 )
+  st_fixture_commit 'wrapper exit 1 (retired)'
+  st_stage
+  st_case 'wrapper exit 1 (retired) fails closed, not a silent pass' 1 'unexpected wrapper exit 1' '' "$ST_BACKEND_PASS" REVIEW_BACKEND=codex
+
+  # --- Follow-up promotion contract (parent-directed staging) ---
+  # A wrapper stages QUALITY follow-ups to $env:CROSS_REVIEW_FOLLOWUPS_PENDING; the hook
+  # promotes them to logs/review-followups.md ONLY after the overall
+  # gate passed. A BLOCKER abort must leave the staged block unpromoted.
+  ( cd "$ST_REPO" && printf 'if ($env:CROSS_REVIEW_FOLLOWUPS_PENDING) { [System.IO.File]::WriteAllText($env:CROSS_REVIEW_FOLLOWUPS_PENDING, "## t  backend=codex  verdict=v.md`n- QUALITY: q-pass.rs:1`n`n") }\nexit 0\n' > scripts/codex/auto-review.ps1 )
+  st_fixture_commit 'followup staging stub (PASS)'
+  st_stage
+  st_case 'QUALITY follow-ups promote after an overall pass' 0 'promoted QUALITY follow-ups' "$ST_BACKEND_PASS" '' REVIEW_BACKEND=codex
+  if grep -q 'QUALITY: q-pass.rs:1' "$ST_REPO/logs/review-followups.md" 2>/dev/null; then
+    echo '[SelfTest] PASS follow-up index holds the promoted entry'
+  else
+    echo '[SelfTest] FAIL follow-up index missing the promoted entry'
+    ST_FAILURES=$((ST_FAILURES + 1))
+  fi
+  ( cd "$ST_REPO" && printf 'if (-not $env:CROSS_REVIEW_FOLLOWUPS_PENDING) { Write-Host "stub: CROSS_REVIEW_FOLLOWUPS_PENDING missing"; exit 7 }\n[System.IO.File]::WriteAllText($env:CROSS_REVIEW_FOLLOWUPS_PENDING, "## t  backend=codex  verdict=v.md`n- QUALITY: q-blocked.rs:1`n`n")\nexit 2\n' > scripts/codex/auto-review.ps1 )
+  st_fixture_commit 'followup staging stub (BLOCKER)'
+  st_stage
+  st_case 'BLOCKER abort does not promote staged follow-ups' 1 'BLOCKER findings' '' 'promoted QUALITY follow-ups' REVIEW_BACKEND=codex
+  if grep -q 'q-blocked.rs:1' "$ST_REPO/logs/review-followups.md" 2>/dev/null; then
+    echo '[SelfTest] FAIL blocked follow-ups leaked into the index'
+    ST_FAILURES=$((ST_FAILURES + 1))
+  else
+    echo '[SelfTest] PASS blocked follow-ups stayed out of the index'
+  fi
+  # Both-mode staging isolation: the FIRST backend (codex) PASSES and stages a
+  # QUALITY block, the SECOND backend (claude) then BLOCKS -- the codex block
+  # must NOT reach the durable index. This is the exact cross-backend regression
+  # the parent-promotion design exists to prevent (a per-child promoter would
+  # have already appended before claude's verdict existed).
+  # Both stubs FAIL LOUDLY (exit 7 -> the hook's invocation-failure arm, which
+  # never prints the asserted 'BLOCKER findings' marker) when the hook did not
+  # supply CROSS_REVIEW_FOLLOWUPS_PENDING -- otherwise a regression that skipped staging
+  # entirely would pass the index-absence check vacuously.
+  ( cd "$ST_REPO" && printf 'if (-not $env:CROSS_REVIEW_FOLLOWUPS_PENDING) { Write-Host "stub: CROSS_REVIEW_FOLLOWUPS_PENDING missing"; exit 7 }\n[System.IO.File]::WriteAllText($env:CROSS_REVIEW_FOLLOWUPS_PENDING, "## t  backend=codex  verdict=v.md`n- QUALITY: q-bothmode.rs:1`n`n")\nexit 0\n' > scripts/codex/auto-review.ps1 )
+  ( cd "$ST_REPO" && printf '# stub claude wrapper: BLOCKER verdict\nexit 2\n' > scripts/claude/auto-review.ps1 )
+  st_fixture_commit 'both-mode staging stubs (codex pass + claude block)'
+  st_stage
+  st_case 'both-mode: claude BLOCKER after a codex QUALITY pass aborts unpromoted' 1 'BLOCKER findings' '' 'promoted QUALITY follow-ups' REVIEW_BACKEND=both
+  if grep -q 'q-bothmode.rs:1' "$ST_REPO/logs/review-followups.md" 2>/dev/null; then
+    echo '[SelfTest] FAIL both-mode codex follow-ups leaked into the index despite the claude block'
+    ST_FAILURES=$((ST_FAILURES + 1))
+  else
+    echo '[SelfTest] PASS both-mode codex follow-ups stayed out of the index'
+  fi
+  # Space-bearing TMPDIR: the pending path then contains a space; the fixed
+  # per-backend scalars (quoted expansion) must still stage AND promote -- a
+  # whitespace-split path list silently skipped promotion here (Codex BLOCKER
+  # 2026-07-11: PROMO_ANY stayed 0 and follow-ups were dropped without warning).
+  ST_TMP_SPACED="$ST_ROOT/tmp dir"
+  mkdir -p "$ST_TMP_SPACED"
+  ( cd "$ST_REPO" && printf 'if (-not $env:CROSS_REVIEW_FOLLOWUPS_PENDING) { Write-Host "stub: CROSS_REVIEW_FOLLOWUPS_PENDING missing"; exit 7 }\n[System.IO.File]::WriteAllText($env:CROSS_REVIEW_FOLLOWUPS_PENDING, "## t  backend=codex  verdict=v.md`n- QUALITY: q-spaced.rs:1`n`n")\nexit 0\n' > scripts/codex/auto-review.ps1 )
+  st_fixture_commit 'spaced-tmpdir staging stub (PASS)'
+  st_stage
+  st_case 'space-bearing TMPDIR still stages and promotes follow-ups' 0 'promoted QUALITY follow-ups' "$ST_BACKEND_PASS" '' REVIEW_BACKEND=codex TMPDIR="$ST_TMP_SPACED"
+  if grep -q 'QUALITY: q-spaced.rs:1' "$ST_REPO/logs/review-followups.md" 2>/dev/null; then
+    echo '[SelfTest] PASS spaced-TMPDIR follow-ups reached the index'
+  else
+    echo '[SelfTest] FAIL spaced-TMPDIR follow-ups missing from the index'
+    ST_FAILURES=$((ST_FAILURES + 1))
+  fi
+  # Claude-only promotion: exercises the FOLLOWUPS_PENDING_CLAUDE scalar branch
+  # (run_backend's claude arm + the promotion loop's claude slot). Without this,
+  # a typo in the claude branch would pass every codex-only case above. The stub
+  # fails loudly (exit 7) when the hook did not supply CROSS_REVIEW_FOLLOWUPS_PENDING.
+  ( cd "$ST_REPO" && printf 'if (-not $env:CROSS_REVIEW_FOLLOWUPS_PENDING) { Write-Host "stub: CROSS_REVIEW_FOLLOWUPS_PENDING missing"; exit 7 }\n[System.IO.File]::WriteAllText($env:CROSS_REVIEW_FOLLOWUPS_PENDING, "## t  backend=claude  verdict=v.md`n- QUALITY: q-claude.rs:1`n`n")\nexit 0\n' > scripts/claude/auto-review.ps1 )
+  st_fixture_commit 'claude followup staging stub (PASS)'
+  st_stage
+  st_case 'claude-only QUALITY follow-ups promote after a pass' 0 'promoted QUALITY follow-ups' '[pre-commit:claude] PASS' '' REVIEW_BACKEND=claude
+  if grep -q 'QUALITY: q-claude.rs:1' "$ST_REPO/logs/review-followups.md" 2>/dev/null; then
+    echo '[SelfTest] PASS claude follow-up index entry present (backend=claude block promoted)'
+  else
+    echo '[SelfTest] FAIL claude follow-up index entry missing'
+    ST_FAILURES=$((ST_FAILURES + 1))
+  fi
+
+  # Restore the plain PASS stub so the untracked-infra cases below start from a
+  # tracked, PASSing auto-review.ps1 (they then drop it from HEAD themselves).
+  ( cd "$ST_REPO" && printf '# stub wrapper; callers may pass -ReasoningEffort but this stub does not declare it\nexit 0\n' > scripts/codex/auto-review.ps1 )
+  st_fixture_commit 'restore plain stub after exit-code cases'
+
+  # Untracked commit wrapper: present in the tree, absent from HEAD, unstaged.
+  # Drop fixtures use PLAIN commits of the staged removal -- st_fixture_commit's
+  # `git add -A` would re-track the just-removed file and undo the drop.
+  ( cd "$ST_REPO" && git rm -q --cached scripts/codex/commit.ps1 && git commit -qm 'drop wrapper from HEAD' )
+  st_stage
+  st_case 'untracked commit wrapper is rejected' 1 'not tracked in HEAD and not staged' '' "$ST_BACKEND_RAN" REVIEW_BACKEND=codex
+
+  # Untracked review infra: wrapper file present but absent from HEAD with no
+  # staged infra change -> the no-staged-infra guard refuses to run it. The
+  # commit wrapper is restored first (its guard runs earlier and would mask
+  # this one); the restore commit also sweeps the prior case's staged f.txt.
+  ( cd "$ST_REPO" && git -c core.excludesfile= add scripts/codex/commit.ps1 && git commit -qm 'restore wrapper' )
+  ( cd "$ST_REPO" && git rm -q --cached scripts/codex/auto-review.ps1 && git commit -qm 'drop infra from HEAD' )
+  st_stage
+  st_case 'untracked review infra is rejected' 1 'review infrastructure is not tracked in HEAD' '' "$ST_BACKEND_RAN" REVIEW_BACKEND=codex
+
+  if [ "$ST_FAILURES" -eq 0 ]; then
+    echo '[SelfTest] All pre-commit hook fixtures passed.'
+    exit 0
+  else
+    echo "[SelfTest] $ST_FAILURES failure(s)." >&2
+    exit 1
+  fi
+fi
+
+if [ "$CROSS_REVIEW_SKIP" = "1" ]; then
+  SKIP_LOG_DIR="$(git rev-parse --show-toplevel)/logs/review-skips"
+  SKIP_LOG="$SKIP_LOG_DIR/review-skip-log.txt"
+  if ! mkdir -p "$SKIP_LOG_DIR"; then
+    echo "[pre-commit] ERROR: could not create $SKIP_LOG_DIR for skip audit log" >&2
+    echo "[pre-commit] Skip cannot proceed without audit trail. Aborting commit." >&2
+    exit 1
+  fi
+  if ! echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) skip on $(git rev-parse --abbrev-ref HEAD) sha-staged=$(git diff --cached | git hash-object --stdin)" >> "$SKIP_LOG"; then
+    echo "[pre-commit] ERROR: could not append to $SKIP_LOG" >&2
+    echo "[pre-commit] Skip cannot proceed without audit trail. Aborting commit." >&2
+    exit 1
+  fi
+  echo "[pre-commit] CROSS_REVIEW_SKIP=1 - adversarial review skipped (logged to $SKIP_LOG)"
+  exit 0
+fi
+
+# Backend selection. REVIEW_BACKEND must be set EXPLICITLY -- there is
+# no implicit default. An implicit default to codex would let a bare
+# `git commit` from a Codex implementer session silently route to
+# Codex review (self-review), defeating the cross-review property
+# with no CROSS_REVIEW_SKIP audit entry. Forcing an explicit choice
+# means the committer has to declare which backend reviews and the
+# wrappers (scripts/codex/commit.ps1 / scripts/claude/commit.ps1) make
+# that declaration hard to forget. Bare `git commit` without an
+# explicit REVIEW_BACKEND is rejected with guidance. This check runs
+# BEFORE the empty-commit exemption below so the rejection is
+# unconditional -- even a `--allow-empty` commit declares its reviewer
+# (there is nothing to review, but routing discipline stays uniform and
+# the docs' "bare git commit is rejected" claim holds without a carve-out).
+if [ -z "$REVIEW_BACKEND" ]; then
+  echo "[pre-commit] ERROR: REVIEW_BACKEND is not set." >&2
+  echo "[pre-commit] Cross-review requires the COMMITTER to declare which backend reviews." >&2
+  echo "[pre-commit] Use the matching commit wrapper (recommended):" >&2
+  echo "[pre-commit]   Codex implementer:  scripts/codex/commit.ps1 -m '...'   (sets REVIEW_BACKEND=claude)" >&2
+  echo "[pre-commit]   Claude implementer: scripts/claude/commit.ps1 -m '...'  (sets REVIEW_BACKEND=codex)" >&2
+  echo "[pre-commit] Or set REVIEW_BACKEND inline (scoped to one commit) before \`git commit\`:" >&2
+  echo "[pre-commit]   PowerShell: \$env:REVIEW_BACKEND = 'codex'; git commit ...; Remove-Item Env:REVIEW_BACKEND" >&2
+  echo "[pre-commit]   bash:       REVIEW_BACKEND=codex git commit ..." >&2
+  echo "[pre-commit] Valid values: codex | claude | both. Set to the BACKEND that should REVIEW." >&2
+  exit 1
+fi
+REVIEW_BACKEND_VAL="$REVIEW_BACKEND"
+case "$REVIEW_BACKEND_VAL" in
+  codex|claude|both) ;;
+  *)
+    echo "[pre-commit] ERROR: REVIEW_BACKEND='$REVIEW_BACKEND_VAL' is not valid (codex|claude|both)" >&2
+    exit 1
+    ;;
+esac
+
+# Empty commits (no staged changes) are not subject to review. This
+# exemption sits AFTER the REVIEW_BACKEND guard: it skips the review,
+# never the routing declaration.
+if git diff --cached --quiet; then
+  echo "[pre-commit] no staged changes - nothing to review"
+  exit 0
+fi
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+# Commit-wrapper protection. The wrappers (scripts/codex/commit.ps1,
+# scripts/claude/commit.ps1) ran BEFORE this hook to set REVIEW_BACKEND.
+# Three threat models:
+#
+#   (a) STAGED edit to a commit wrapper: a malicious commit could ship
+#       a wrapper change that sets the env var to the same backend that
+#       authored the change, so the commit gets self-reviewed by the
+#       agent that wrote the wrapper edit. Defense: force
+#       REVIEW_BACKEND=both so the OTHER backend ALSO reviews.
+#       (Historical regression.)
+#
+#   (b) UNSTAGED working-tree edit to a commit wrapper: the running
+#       version of the wrapper differs from what is committed. An
+#       agent could have hand-edited commit.ps1 to flip
+#       REVIEW_BACKEND, then committed unrelated files. The hook
+#       would not even see the wrapper change as staged. Defense:
+#       abort if a commit wrapper has unstaged changes; force the
+#       user to stage them so threat (a) takes over.
+#       (Historical regression.)
+#
+#   (c) UNTRACKED commit wrapper: a wrapper present in the working
+#       tree but never in HEAD has NO trusted baseline. `git diff`
+#       checks (threat b) say nothing about untracked files, so a
+#       hand-installed or partially-applied wrapper would silently
+#       choose REVIEW_BACKEND with no audit trail. Defense: require
+#       each commit-wrapper path to be tracked in HEAD OR staged in
+#       this commit. Without this, threats (a) and (b) only cover
+#       wrappers that have ever been committed. NOTE: this branch is
+#       NOT the CROSS_REVIEW_SKIP=1 bootstrap path -- the hook
+#       short-circuits at the top-of-script CROSS_REVIEW_SKIP check
+#       before reaching this guard. The staged-in-current-commit
+#       branch instead covers recovery cases ("wrapper accidentally
+#       `git rm`'d and a recovery commit re-adds it") and same-commit
+#       wrapper introduction (which also trips threat (a)).
+COMMIT_WRAPPERS="scripts/codex/commit.ps1 scripts/claude/commit.ps1"
+
+# Threat (b): unstaged wrapper change.
+DIRTY_WRAPPERS=""
+for f in $COMMIT_WRAPPERS; do
+  if ! git diff --quiet -- "$f" 2>/dev/null; then
+    DIRTY_WRAPPERS="$DIRTY_WRAPPERS $f"
+  fi
+done
+if [ -n "$DIRTY_WRAPPERS" ]; then
+  echo "[pre-commit] ERROR: commit-wrapper script has unstaged changes:" >&2
+  for f in $DIRTY_WRAPPERS; do
+    echo "    $f" >&2
+  done
+  echo "[pre-commit] These wrappers run BEFORE this hook and decide which" >&2
+  echo "[pre-commit] backend reviews. The working-tree version cannot diverge" >&2
+  echo "[pre-commit] from the committed version without subverting cross-review." >&2
+  echo "[pre-commit] Stage these changes (or revert them) and retry. Aborting." >&2
+  exit 1
+fi
+
+# Threat (c): untracked wrapper file. Each wrapper must be tracked in
+# HEAD OR staged in the current commit. The staged-in-current-commit
+# branch is NOT for the CROSS_REVIEW_SKIP=1 bootstrap (the hook
+# short-circuits at the top-of-script CROSS_REVIEW_SKIP check before
+# reaching this guard); it covers cases like "wrapper was accidentally
+# `git rm`'d and a recovery commit re-adds it without bootstrap
+# bypass" or "the same commit that introduces the wrapper also
+# substantively edits it" (which is also threat (a)'s case and gets
+# forced to REVIEW_BACKEND=both below).
+UNTRACKED_WRAPPERS=""
+for f in $COMMIT_WRAPPERS; do
+  WRAPPER_IN_HEAD=0
+  if git rev-parse --verify HEAD >/dev/null 2>&1 && git cat-file -e "HEAD:$f" 2>/dev/null; then
+    WRAPPER_IN_HEAD=1
+  fi
+  WRAPPER_STAGED=0
+  if ! git diff --cached --quiet -- "$f" 2>/dev/null; then
+    WRAPPER_STAGED=1
+  fi
+  if [ "$WRAPPER_IN_HEAD" -eq 0 ] && [ "$WRAPPER_STAGED" -eq 0 ]; then
+    UNTRACKED_WRAPPERS="$UNTRACKED_WRAPPERS $f"
+  fi
+done
+if [ -n "$UNTRACKED_WRAPPERS" ]; then
+  echo "[pre-commit] ERROR: commit-wrapper script is not tracked in HEAD and not staged in this commit:" >&2
+  for f in $UNTRACKED_WRAPPERS; do
+    echo "    $f" >&2
+  done
+  echo "[pre-commit] These wrappers run BEFORE this hook and set REVIEW_BACKEND." >&2
+  echo "[pre-commit] An untracked wrapper has NO trusted baseline -- the hook cannot" >&2
+  echo "[pre-commit] verify it has not been altered to subvert cross-review routing." >&2
+  echo "[pre-commit] Stage the wrapper(s) (or restore them from HEAD if accidentally" >&2
+  echo "[pre-commit] removed). For the very first bootstrap commit that installs them," >&2
+  echo "[pre-commit] stage them and use CROSS_REVIEW_SKIP=1 -- subsequent commits will then" >&2
+  echo "[pre-commit] find them in HEAD. Aborting." >&2
+  exit 1
+fi
+
+# Threat (a): staged wrapper change -> force =both.
+STAGED_WRAPPER=0
+for f in $COMMIT_WRAPPERS; do
+  if ! git diff --cached --quiet -- "$f" 2>/dev/null; then
+    STAGED_WRAPPER=1
+    break
+  fi
+done
+if [ "$STAGED_WRAPPER" -eq 1 ] && [ "$REVIEW_BACKEND_VAL" != "both" ]; then
+  echo "[pre-commit] commit-wrapper edit detected -- forcing REVIEW_BACKEND=both (cannot trust a wrapper to honestly route its own review)"
+  REVIEW_BACKEND_VAL="both"
+fi
+
+# Path translator for powershell.exe under git-for-windows sh.
+to_win_path() {
+  case "$1" in
+    [A-Za-z]:/*|[A-Za-z]:\\*)
+      echo "$1" | sed 's|/|\\|g'
+      ;;
+    *)
+      if command -v cygpath >/dev/null 2>&1; then
+        cygpath -w "$1"
+      else
+        echo "$1" | sed 's|/|\\|g'
+      fi
+      ;;
+  esac
+}
+
+# Run one backend's review gate. Args:
+#   $1 = backend name (codex|claude)
+#   $2 = wrapper path relative to repo (scripts/<x>/auto-review.ps1)
+#   $3 = prompt path relative to repo
+# REVIEW_INFRA for trusted-base bootstrap is computed inside.
+# Returns 0 on pass, non-zero on fail. Echoes diagnostics directly.
+run_backend() {
+  BACKEND_NAME="$1"
+  WRAPPER_REL="$2"
+  PROMPT_REL="$3"
+  REVIEW_INFRA="$WRAPPER_REL $PROMPT_REL scripts/git-hooks/pre-commit"
+
+  # Refuse if backend infra has unstaged changes (running version would
+  # differ from staged version).
+  DIRTY_INFRA=""
+  for f in $REVIEW_INFRA; do
+    if ! git diff --quiet -- "$f" 2>/dev/null; then
+      DIRTY_INFRA="$DIRTY_INFRA $f"
+    fi
+  done
+  if [ -n "$DIRTY_INFRA" ]; then
+    echo "[pre-commit:$BACKEND_NAME] ERROR: review infrastructure has unstaged changes:" >&2
+    for f in $DIRTY_INFRA; do
+      echo "    $f" >&2
+    done
+    echo "[pre-commit:$BACKEND_NAME] Stage these changes (or revert them) so the running" >&2
+    echo "[pre-commit:$BACKEND_NAME] gate matches what is being committed. Aborting commit." >&2
+    return 1
+  fi
+
+  # Trusted-base bootstrap if staged changes touch this backend's infra.
+  INFRA_STAGED=0
+  for f in $REVIEW_INFRA; do
+    if ! git diff --cached --quiet -- "$f" 2>/dev/null; then
+      INFRA_STAGED=1
+      break
+    fi
+  done
+
+  WRAPPER_PATH=""
+  PROMPT_PATH=""
+  TRUSTED_DIR=""
+
+  if [ "$INFRA_STAGED" -eq 1 ]; then
+    if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+      echo "[pre-commit:$BACKEND_NAME] ERROR: staged commit modifies review infrastructure but" >&2
+      echo "[pre-commit:$BACKEND_NAME] there is no HEAD to source a trusted copy from." >&2
+      echo "[pre-commit:$BACKEND_NAME] Use CROSS_REVIEW_SKIP=1 git commit ... after manual review." >&2
+      return 1
+    fi
+    for f in $WRAPPER_REL $PROMPT_REL; do
+      if ! git cat-file -e "HEAD:$f" 2>/dev/null; then
+        echo "[pre-commit:$BACKEND_NAME] ERROR: staged commit modifies review infrastructure but" >&2
+        echo "[pre-commit:$BACKEND_NAME] HEAD does not contain $f to source a trusted copy from." >&2
+        echo "[pre-commit:$BACKEND_NAME] Use CROSS_REVIEW_SKIP=1 git commit ... after manual review." >&2
+        return 1
+      fi
+    done
+    TRUSTED_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t crg-pre-commit-$BACKEND_NAME)
+    if [ -z "$TRUSTED_DIR" ] || [ ! -d "$TRUSTED_DIR" ]; then
+      echo "[pre-commit:$BACKEND_NAME] ERROR: could not create tempdir for trusted review infra" >&2
+      return 1
+    fi
+    # Per-backend cleanup is appended to a list so multi-backend runs don't
+    # tread on each other. EXIT trap (set once below) deletes all of them.
+    TRUSTED_DIRS_LIST="$TRUSTED_DIRS_LIST $TRUSTED_DIR"
+    # Create parent directories for BOTH the wrapper and the prompt
+    # (their parents can differ -- e.g., Claude backend has the wrapper
+    # under scripts/claude/ but reuses the prompt at scripts/codex/).
+    # Without creating BOTH, the second `git show` redirect lands in a
+    # nonexistent directory and the trusted-base bootstrap aborts the
+    # gate. (Historical regression.)
+    mkdir -p "$TRUSTED_DIR/$(dirname "$WRAPPER_REL")"
+    mkdir -p "$TRUSTED_DIR/$(dirname "$PROMPT_REL")"
+    if ! git show "HEAD:$WRAPPER_REL" > "$TRUSTED_DIR/$WRAPPER_REL" 2>/dev/null; then
+      echo "[pre-commit:$BACKEND_NAME] ERROR: git show HEAD:$WRAPPER_REL failed" >&2
+      return 1
+    fi
+    if ! git show "HEAD:$PROMPT_REL"  > "$TRUSTED_DIR/$PROMPT_REL" 2>/dev/null; then
+      echo "[pre-commit:$BACKEND_NAME] ERROR: git show HEAD:$PROMPT_REL failed" >&2
+      return 1
+    fi
+    WRAPPER_PATH="$TRUSTED_DIR/$WRAPPER_REL"
+    PROMPT_PATH="$TRUSTED_DIR/$PROMPT_REL"
+    echo "[pre-commit:$BACKEND_NAME] Staged changes touch review infrastructure - running gate from HEAD's trusted copy"
+  else
+    # No staged change to infra. Require the wrapper + prompt to be
+    # TRACKED in HEAD before running the working-tree copy. Without this
+    # check, an untracked working-tree wrapper/prompt (e.g. just dropped
+    # in by bootstrap.ps1, never committed) would run as the gate with
+    # NO trusted baseline -- the user could ship arbitrary wrapper code
+    # in untracked form and the gate would approve any commit using it.
+    UNTRACKED_INFRA=""
+    if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+      # No HEAD at all (fresh repo). All review infra is untracked by
+      # definition; the only safe escape is CROSS_REVIEW_SKIP=1 for the
+      # initial bootstrap commit.
+      UNTRACKED_INFRA="$WRAPPER_REL $PROMPT_REL"
+    else
+      for f in $WRAPPER_REL $PROMPT_REL; do
+        if ! git cat-file -e "HEAD:$f" 2>/dev/null; then
+          UNTRACKED_INFRA="$UNTRACKED_INFRA $f"
+        fi
+      done
+    fi
+    if [ -n "$UNTRACKED_INFRA" ]; then
+      echo "[pre-commit:$BACKEND_NAME] ERROR: review infrastructure is not tracked in HEAD:" >&2
+      for f in $UNTRACKED_INFRA; do
+        echo "    $f" >&2
+      done
+      echo "[pre-commit:$BACKEND_NAME] The gate has no trusted baseline to verify against." >&2
+      echo "[pre-commit:$BACKEND_NAME] If you just installed the cross-review-gate package, stage" >&2
+      echo "[pre-commit:$BACKEND_NAME] the wrapper + prompt files and do an initial bootstrap" >&2
+      echo "[pre-commit:$BACKEND_NAME] commit with CROSS_REVIEW_SKIP=1:" >&2
+      echo "[pre-commit:$BACKEND_NAME]   git add scripts/codex scripts/claude scripts/git-hooks docs/audit-protocol.md .gitignore" >&2
+      echo "[pre-commit:$BACKEND_NAME]   PowerShell: \$env:CROSS_REVIEW_SKIP = '1'; git commit ...; Remove-Item Env:CROSS_REVIEW_SKIP" >&2
+      echo "[pre-commit:$BACKEND_NAME]   bash:       CROSS_REVIEW_SKIP=1 git commit -m 'cross-review-gate: install'" >&2
+      echo "[pre-commit:$BACKEND_NAME] Then retry the current commit normally. Aborting." >&2
+      return 1
+    fi
+    WRAPPER_PATH="$REPO_ROOT/$WRAPPER_REL"
+    PROMPT_PATH="$REPO_ROOT/$PROMPT_REL"
+  fi
+
+  if [ ! -f "$WRAPPER_PATH" ]; then
+    echo "[pre-commit:$BACKEND_NAME] ERROR: auto-review.ps1 not found at $WRAPPER_PATH" >&2
+    return 1
+  fi
+
+  echo "[pre-commit:$BACKEND_NAME] Running $BACKEND_NAME adversarial review on staged changes..."
+
+  WRAPPER_WIN=$(to_win_path "$WRAPPER_PATH")
+  PROMPT_WIN=$(to_win_path "$PROMPT_PATH")
+
+  # Optional codex reasoning-effort override for the commit gate. When
+  # CROSS_REVIEW_COMMIT_EFFORT is set, forward it to the CODEX wrapper's
+  # -ReasoningEffort (the claude wrapper has no effort knob, so it is NOT
+  # forwarded there). Empty/unset inherits ~/.codex/config.toml (no
+  # tier-policy change) -- a documented default, not a silent drop.
+  #
+  # CROSS_REVIEW_COMMIT_EFFORT is THIS package's documented effort knob
+  # (INSTALL.md Step 10). v1.2.0 renamed the gate's env vars onto the package-
+  # standard `CROSS_REVIEW_*` prefix -- an intentional one-time retirement of the
+  # old source-project prefix (a breaking rename for any install that set the old
+  # names; the old names are NOT aliased). UNSET inherits ~/.codex/config.toml,
+  # a documented default rather than a silent drop.
+  #
+  # Validate the value HERE against the wrapper's ValidateSet
+  # (-ReasoningEffort: '' minimal low medium high xhigh) BEFORE invoking
+  # PowerShell. The value is lowercased first (the wrapper case-folds explicit
+  # values, so a case variant must be normalized, not rejected). A bad value
+  # forwarded to `powershell -File` would fail the param ValidateSet as a
+  # `powershell.exe` exit 1. Under the 2026-07 severity contract the REVIEW_EXIT
+  # case treats a raw exit 1 as an unexpected wrapper failure (fail closed), so
+  # an operator typo would abort with a generic "unexpected wrapper exit 1"
+  # instead of naming the real cause. Catch it here and route it through the
+  # invocation-failure path with a distinct, specific message.
+  FORWARD_EFFORT=0
+  EFFORT_NORM=""
+  if [ "$BACKEND_NAME" = "codex" ] && [ -n "${CROSS_REVIEW_COMMIT_EFFORT:-}" ]; then
+    EFFORT_NORM=$(printf '%s' "$CROSS_REVIEW_COMMIT_EFFORT" | tr '[:upper:]' '[:lower:]')
+    case "$EFFORT_NORM" in
+      minimal|low|medium|high|xhigh) ;;
+      *)
+        echo "[pre-commit:$BACKEND_NAME] ERROR: CROSS_REVIEW_COMMIT_EFFORT='$CROSS_REVIEW_COMMIT_EFFORT' is not a valid codex reasoning-effort tier (minimal|low|medium|high|xhigh, case-insensitive)." >&2
+        echo "[pre-commit:$BACKEND_NAME] This is an invocation/config error, not a review finding. Fix the value (or unset it) and retry. Aborting commit." >&2
+        return 1
+        ;;
+    esac
+    # The wrapper actually invoked may be HEAD's TRUSTED copy (when review infra
+    # is staged). An older HEAD wrapper may predate the -ReasoningEffort
+    # parameter; forwarding it then param-bind-fails as `powershell -File` exit 1
+    # EVEN for a valid tier, bypassing the tier guard above and landing in the
+    # generic exit-1 fail-closed path. Forward the option only when the selected wrapper
+    # DECLARES the parameter; otherwise warn and run at the wrapper's default
+    # effort (graceful degrade -- a missing effort knob must not abort or
+    # mis-report a valid commit).
+    #
+    # SEMANTIC detect, not a substring scan: match the PARAMETER DECLARATION
+    # shape `[<type/attr>]$ReasoningEffort` (a `]` closing a type cast/attribute
+    # immediately before the variable). A bare `grep ReasoningEffort` would also
+    # match this wrapper's OWN comment/usage mentions of `-ReasoningEffort` /
+    # `$ReasoningEffort`, falsely concluding an effort-less wrapper supports the
+    # param and forwarding into the exact param-bind exit-1 this guard prevents.
+    if grep -Eq '\]\$ReasoningEffort\b' "$WRAPPER_PATH" 2>/dev/null; then
+      FORWARD_EFFORT=1
+    else
+      echo "[pre-commit:$BACKEND_NAME] NOTE: the selected wrapper ($WRAPPER_PATH) does not declare -ReasoningEffort; running at its default effort (CROSS_REVIEW_COMMIT_EFFORT=$CROSS_REVIEW_COMMIT_EFFORT ignored for this invocation)." >&2
+    fi
+  fi
+  # Parent-directed follow-up staging: the wrapper must NOT append QUALITY
+  # follow-ups to the durable index on its own pass -- in both-mode the OTHER
+  # backend can still BLOCK this commit, which would leave the index holding
+  # follow-ups for content that never landed (merge-gate BLOCKER 2026-07-10 on
+  # the child-append design). Hand the child a pending path via
+  # CROSS_REVIEW_FOLLOWUPS_PENDING; promotion to logs/review-followups.md happens
+  # once, after the case dispatch, only when ALL selected backends passed. The
+  # path is pre-created empty; an empty file after the run means "no QUALITY
+  # follow-ups" ([ -s ] gates promotion). If even the pre-create fails the env
+  # var still points the wrapper at the path (its own write attempt then warns
+  # and degrades) -- losing one follow-up record beats the alternative failure
+  # mode of the wrapper falling back to a premature direct append.
+  # Fixed PER-BACKEND variables, not a whitespace-split list: a space-bearing
+  # ${TMPDIR} would fragment a list on `for pf in $LIST` and silently skip
+  # promotion (dropping the follow-ups the recording contract promises). The
+  # backend set is closed (codex|claude), so two scalars cover it and every
+  # expansion stays quoted.
+  PENDING_FILE="${TMPDIR:-/tmp}/crg-followups-$BACKEND_NAME-$$.md"
+  : > "$PENDING_FILE" 2>/dev/null || true
+  if [ "$BACKEND_NAME" = "claude" ]; then
+    FOLLOWUPS_PENDING_CLAUDE="$PENDING_FILE"
+  else
+    FOLLOWUPS_PENDING_CODEX="$PENDING_FILE"
+  fi
+  CROSS_REVIEW_FOLLOWUPS_PENDING=$(to_win_path "$PENDING_FILE")
+  export CROSS_REVIEW_FOLLOWUPS_PENDING
+  if [ "$FORWARD_EFFORT" -eq 1 ]; then
+    echo "[pre-commit:$BACKEND_NAME] CROSS_REVIEW_COMMIT_EFFORT=$CROSS_REVIEW_COMMIT_EFFORT (normalized: $EFFORT_NORM) -> -ReasoningEffort"
+    powershell.exe -ExecutionPolicy Bypass -File "$WRAPPER_WIN" -Scope Staged -PromptPath "$PROMPT_WIN" -ReasoningEffort "$EFFORT_NORM"
+  else
+    powershell.exe -ExecutionPolicy Bypass -File "$WRAPPER_WIN" -Scope Staged -PromptPath "$PROMPT_WIN"
+  fi
+  REVIEW_EXIT=$?
+  unset CROSS_REVIEW_FOLLOWUPS_PENDING
+
+  # Latest verdict file. The wrappers default their output to the MAIN repo's
+  # logs/<backend>/reviews (resolved via the git common dir) so a linked-worktree
+  # commit centralizes its verdict where forensics can find it. Search that
+  # centralized location FIRST (<common-dir>/../logs/<backend>/reviews) to print
+  # the LATEST verdict path, then fall back to the cwd-relative path for a
+  # non-worktree / older layout.
+  COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  if [ -z "$COMMON_DIR" ]; then
+    COMMON_DIR_RAW=$(git rev-parse --git-common-dir 2>/dev/null)
+    if [ -n "$COMMON_DIR_RAW" ] && [ -d "$COMMON_DIR_RAW" ]; then
+      COMMON_DIR=$(cd "$COMMON_DIR_RAW" 2>/dev/null && pwd)
+    fi
+  fi
+  LATEST_VERDICT=''
+  if [ -n "$COMMON_DIR" ]; then
+    LATEST_VERDICT=$(ls -t "$COMMON_DIR/../logs/$BACKEND_NAME/reviews"/*-staged.md 2>/dev/null | head -1)
+  fi
+  if [ -z "$LATEST_VERDICT" ]; then
+    LATEST_VERDICT=$(ls -t "logs/$BACKEND_NAME/reviews"/*-staged.md 2>/dev/null | head -1)
+  fi
+
+  # Wrapper exit-code contract (2026-07 severity change: only BLOCKER aborts).
+  # 0 = PASS (CLEAN, NOTE-only, OR QUALITY-only -- QUALITY findings are printed
+  #     prominently by the wrapper and staged via CROSS_REVIEW_FOLLOWUPS_PENDING for this
+  #     hook's post-pass promotion to logs/review-followups.md for batch
+  #     triage; they do NOT block the commit).
+  # 2 = BLOCKER -> abort. 3/other -> invocation failure -> abort (fail closed).
+  # 1 = RETIRED (was QUALITY). QUALITY now passes as 0, so a wrapper returning 1
+  #     means a PowerShell param-bind/startup failure (exits 1 before any verdict)
+  #     or a stale pre-contract wrapper -- treat it as an invocation failure and
+  #     fail closed, never a silent pass.
+  case "$REVIEW_EXIT" in
+    0)
+      echo "[pre-commit:$BACKEND_NAME] PASS"
+      return 0
+      ;;
+    2)
+      echo "[pre-commit:$BACKEND_NAME] BLOCKER findings - commit ABORTED" >&2
+      echo "[pre-commit:$BACKEND_NAME] Fix the BLOCKER findings in the verdict and retry." >&2
+      echo "[pre-commit:$BACKEND_NAME] Latest verdict: $LATEST_VERDICT" >&2
+      return 1
+      ;;
+    1)
+      echo "[pre-commit:$BACKEND_NAME] unexpected wrapper exit 1 - commit ABORTED (fail closed)" >&2
+      echo "[pre-commit:$BACKEND_NAME] exit 1 was retired with the 2026-07 severity contract (QUALITY no longer blocks; it passes as exit 0). A raw exit 1 now signals a wrapper startup/param-bind failure or a stale pre-contract wrapper - fix that, not a review finding." >&2
+      echo "[pre-commit:$BACKEND_NAME] Latest verdict: $LATEST_VERDICT" >&2
+      return 1
+      ;;
+    *)
+      echo "[pre-commit:$BACKEND_NAME] Review invocation failed (exit $REVIEW_EXIT) - commit ABORTED" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Single EXIT trap cleans up all per-backend trusted-base tempdirs and any
+# staged-but-unpromoted follow-up pending files (an aborted gate leaves them;
+# they must not linger or be promoted by a later run). The pending paths live
+# in fixed per-backend scalars (quoted expansion) so a space-bearing ${TMPDIR}
+# cannot fragment them.
+# Package cleanup policy: avoid the recursive force-delete (`rm -rf`) even for
+# the gate's own mktemp scratch -- delete files first, then the now-empty dirs
+# bottom-up (`rmdir`). Mirrors the no-Recurse pattern the PowerShell wrappers
+# use. Best-effort; cleanup must never abort the commit.
+cleanup_trusted_dirs() {
+  for d in $TRUSTED_DIRS_LIST; do
+    [ -d "$d" ] || continue
+    find "$d" -type f -exec rm -f {} + 2>/dev/null
+    find "$d" -depth -type d -exec rmdir {} + 2>/dev/null
+  done
+  for f in "$FOLLOWUPS_PENDING_CODEX" "$FOLLOWUPS_PENDING_CLAUDE"; do
+    [ -n "$f" ] && [ -f "$f" ] && rm -f "$f"
+  done
+}
+TRUSTED_DIRS_LIST=""
+FOLLOWUPS_PENDING_CODEX=""
+FOLLOWUPS_PENDING_CLAUDE=""
+trap cleanup_trusted_dirs EXIT
+
+# ---- author-lint fail-fast pre-pass (mechanical, runs BEFORE the AI review) ----
+# scripts/codex/author-lint.ps1 in staged mode catches the mechanical,
+# script-detectable defect classes the AI gate repeatedly raises on
+# narrative/doc and staged source-comment content (the author-lint header and
+# the AGENTS.md Review-Infrastructure row are the authoritative class list) --
+# at ~zero cost in seconds, vs a full AI gate round per leaked instance. Exit
+# contract here:
+#   author-lint exit 0 (clean / advisory-only) -> proceed to the AI gate.
+#   author-lint exit 3 (ERROR-tier findings)   -> ABORT with the report.
+#   any other exit / not in HEAD -> WARN and PROCEED: the pre-pass is a
+#     fail-fast OPTIMIZATION, not the authority -- the AI gate below still
+#     reviews everything, so a broken/absent linter fails open ONLY to the
+#     gate, never past it. Findings are exit 3 (not 1) PRECISELY so a
+#     CRASHED linter is distinguishable: an uncaught PowerShell exception
+#     makes `powershell -File` exit 1, which lands in this warn-and-proceed
+#     arm instead of masquerading as findings and blocking every commit.
+# TRUST MODEL: the pre-pass ALWAYS executes HEAD's copy of author-lint,
+# extracted to a tempdir -- NEVER the working-tree copy. This is not about
+# verdict influence (a tampered linter cannot approve or skip the AI gate);
+# it is about SIDE EFFECTS: the pre-pass runs arbitrary PowerShell BEFORE
+# the backend snapshots the staged evidence, so a staged or locally
+# replaced author-lint.ps1 executing from the working tree could mutate
+# the index or files pre-snapshot. HEAD-copy execution closes that the
+# same way the per-clone dispatcher closes it for this hook itself; an
+# author-lint fix therefore takes effect on the NEXT commit after it
+# lands, matching the hook's own HEAD-executes semantics.
+# CROSS_REVIEW_SKIP_AUTHOR_LINT=1 skips ONLY this pre-pass (logged) -- the escape
+# for a linter false positive; the AI gate still runs. CROSS_REVIEW_SKIP=1 (top of
+# script) skips everything including this.
+AUTHOR_LINT_REL="scripts/codex/author-lint.ps1"
+if [ "$CROSS_REVIEW_SKIP_AUTHOR_LINT" = "1" ]; then
+  echo "[pre-commit] CROSS_REVIEW_SKIP_AUTHOR_LINT=1 - author-lint pre-pass skipped (AI review still runs)"
+elif ! git rev-parse --verify HEAD >/dev/null 2>&1 || ! git cat-file -e "HEAD:$AUTHOR_LINT_REL" 2>/dev/null; then
+  echo "[pre-commit] WARN: $AUTHOR_LINT_REL not tracked in HEAD - skipping the mechanical pre-pass (no trusted copy to run; AI review still runs)" >&2
+else
+  AUTHOR_LINT_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t crg-pre-commit-authorlint)
+  if [ -z "$AUTHOR_LINT_DIR" ] || [ ! -d "$AUTHOR_LINT_DIR" ]; then
+    echo "[pre-commit] WARN: could not create tempdir for the trusted author-lint copy - skipping the mechanical pre-pass (AI review still runs)" >&2
+  else
+    TRUSTED_DIRS_LIST="$TRUSTED_DIRS_LIST $AUTHOR_LINT_DIR"
+    if ! git show "HEAD:$AUTHOR_LINT_REL" > "$AUTHOR_LINT_DIR/author-lint.ps1" 2>/dev/null; then
+      echo "[pre-commit] WARN: git show HEAD:$AUTHOR_LINT_REL failed - skipping the mechanical pre-pass (AI review still runs)" >&2
+    else
+      echo "[pre-commit] Running author-lint mechanical pre-pass on staged changes (HEAD's trusted copy)..."
+      AUTHOR_LINT_WIN=$(to_win_path "$AUTHOR_LINT_DIR/author-lint.ps1")
+      powershell.exe -ExecutionPolicy Bypass -File "$AUTHOR_LINT_WIN"
+      AUTHOR_LINT_EXIT=$?
+      case "$AUTHOR_LINT_EXIT" in
+        0)
+          : # clean or advisory-only -- proceed
+          ;;
+        3)
+          echo "[pre-commit] author-lint ERROR-tier findings - commit ABORTED before the AI review." >&2
+          echo "[pre-commit] Fix the ERROR-tier findings listed in the author-lint report above (mechanical, script-detectable defect classes)." >&2
+          echo "[pre-commit] For a linter FALSE POSITIVE only (AI review still runs): re-run keeping REVIEW_BACKEND set --" >&2
+          echo "[pre-commit]   raw git:  CROSS_REVIEW_SKIP_AUTHOR_LINT=1 REVIEW_BACKEND=<codex|claude> git commit ..." >&2
+          echo "[pre-commit]   wrapper:  set CROSS_REVIEW_SKIP_AUTHOR_LINT=1 in your env, then re-run scripts/<codex|claude>/commit.ps1 ..." >&2
+          exit 1
+          ;;
+        *)
+          echo "[pre-commit] WARN: author-lint pre-pass did not complete (exit $AUTHOR_LINT_EXIT; exit 1 usually means the linter itself crashed) - proceeding; the AI review below remains authoritative." >&2
+          ;;
+      esac
+    fi
+  fi
+fi
+
+OVERALL_EXIT=0
+
+case "$REVIEW_BACKEND_VAL" in
+  codex)
+    run_backend "codex" "scripts/codex/auto-review.ps1" "scripts/codex/review-prompt-template.md" || OVERALL_EXIT=$?
+    ;;
+  claude)
+    # Claude wrapper shares the codex prompt template (verdict format is
+    # identical; backend differs only in invocation + system-prompt).
+    run_backend "claude" "scripts/claude/auto-review.ps1" "scripts/codex/review-prompt-template.md" || OVERALL_EXIT=$?
+    ;;
+  both)
+    run_backend "codex" "scripts/codex/auto-review.ps1" "scripts/codex/review-prompt-template.md" || OVERALL_EXIT=$?
+    if [ "$OVERALL_EXIT" -eq 0 ]; then
+      run_backend "claude" "scripts/claude/auto-review.ps1" "scripts/codex/review-prompt-template.md" || OVERALL_EXIT=$?
+    else
+      echo "[pre-commit] codex backend failed - skipping claude backend (both-mode short-circuits)" >&2
+    fi
+    ;;
+esac
+
+# Promote staged QUALITY follow-ups to the durable index -- ONLY after the
+# OVERALL gate outcome is success. Each wrapper staged its block to the
+# CROSS_REVIEW_FOLLOWUPS_PENDING path during its run (see run_backend); promoting here,
+# at the single point that knows every selected backend passed, keeps the
+# index free of follow-ups for commits a later backend rejected. On any abort
+# the EXIT trap discards the pending files unpromoted.
+if [ "$OVERALL_EXIT" -eq 0 ]; then
+  PROMO_ANY=0
+  for pf in "$FOLLOWUPS_PENDING_CODEX" "$FOLLOWUPS_PENDING_CLAUDE"; do
+    [ -n "$pf" ] && [ -s "$pf" ] && PROMO_ANY=1
+  done
+  if [ "$PROMO_ANY" -eq 1 ]; then
+    # Main-repo logs dir via the SAME submodule-aware selection the wrappers'
+    # Get-FollowupIndexDir / Get-ReviewLogDir uses: the common-dir PARENT for a
+    # normal repo / linked worktree (so a linked-worktree commit records where
+    # the operator's main session reads), the working-tree TOP-LEVEL for a
+    # submodule -- a submodule's common dir lives under
+    # `<super>/.git/modules/<name>`, whose parent is NOT the submodule tree, so
+    # the parent shortcut would write the index where batch triage never looks.
+    # Two-step common-dir probe as the verdict-path lookup above (absolute form
+    # first, else the plain form absolutized). The index lives beside the
+    # verdict logs (the package's gitignored logs/ dir).
+    PROMO_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+    if [ -z "$PROMO_COMMON_DIR" ]; then
+      PROMO_RAW=$(git rev-parse --git-common-dir 2>/dev/null)
+      if [ -n "$PROMO_RAW" ] && [ -d "$PROMO_RAW" ]; then
+        PROMO_COMMON_DIR=$(cd "$PROMO_RAW" 2>/dev/null && pwd)
+      fi
+    fi
+    PROMO_LOGS_DIR="logs"
+    if [ -n "$PROMO_COMMON_DIR" ]; then
+      case "$PROMO_COMMON_DIR" in
+        */.git/modules/*)
+          PROMO_TOP=$(git rev-parse --show-toplevel 2>/dev/null)
+          if [ -n "$PROMO_TOP" ]; then
+            PROMO_LOGS_DIR="$PROMO_TOP/logs"
+          fi
+          ;;
+        *)
+          PROMO_LOGS_DIR="$(dirname "$PROMO_COMMON_DIR")/logs"
+          ;;
+      esac
+    fi
+    mkdir -p "$PROMO_LOGS_DIR" 2>/dev/null
+    FOLLOWUP_INDEX="$PROMO_LOGS_DIR/review-followups.md"
+    for pf in "$FOLLOWUPS_PENDING_CODEX" "$FOLLOWUPS_PENDING_CLAUDE"; do
+      [ -n "$pf" ] || continue
+      [ -s "$pf" ] || continue
+      # Append-only, NEVER truncate ('>>' even for the header): a concurrent
+      # writer (another worktree's commit gate, a standalone wrapper run, the
+      # merge gate's PS promoter) may have written between any check here and
+      # this write; '>' would clobber its content. Worst case of the header
+      # race is a duplicated header -- cosmetic; append cannot lose data. A
+      # sharing violation (a PS writer holds the file FileShare.None) makes
+      # the append fail -> bounded retry, then WARN and drop: losing one
+      # follow-up record beats blocking an already-passed commit.
+      PROMOTED=0
+      PROMO_TRIES=0
+      while [ "$PROMO_TRIES" -lt 5 ]; do
+        if [ ! -s "$FOLLOWUP_INDEX" ]; then
+          printf '# Review follow-ups (non-blocking QUALITY findings)\n\nAppend-only index of QUALITY findings from PASSING adversarial-gate runs.\nUnder the 2026-07 severity contract QUALITY does NOT block (only BLOCKER does),\nso these are recorded here for a follow-up session to fix as classes in one\npass, then prune the handled entries. Gitignored execution-state.\n\n' >> "$FOLLOWUP_INDEX" 2>/dev/null
+        fi
+        if cat "$pf" >> "$FOLLOWUP_INDEX" 2>/dev/null; then
+          PROMOTED=1
+          break
+        fi
+        PROMO_TRIES=$((PROMO_TRIES + 1))
+        sleep 1
+      done
+      if [ "$PROMOTED" -eq 1 ]; then
+        echo "[pre-commit] promoted QUALITY follow-ups to $FOLLOWUP_INDEX"
+      else
+        echo "[pre-commit] WARN: could not promote QUALITY follow-ups from $pf (index busy?) - record dropped, commit still passes" >&2
+      fi
+    done
+  fi
+fi
+
+exit $OVERALL_EXIT
