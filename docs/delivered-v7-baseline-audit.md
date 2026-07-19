@@ -160,7 +160,7 @@ Selective integration wins because the current branch already enforces the respo
 ## Validation evidence and limitations
 
 - Static AST parsing covered delivered Python sources without importing either application entry point; no syntax failures were found.
-- The full current hardware-free suite completed with 351 passing tests after the HMI review fixes.
+- The full current hardware-free test discovery completed successfully after the HMI review fixes.
 - Fake-serial defect demonstrations completed successfully and reproduced delivered timeout and response-ownership defects.
 - Delivered kinematics passed `g++ -std=c++14 -Wall -Wextra -pedantic -fsyntax-only`.
 - Firmware compilation was unavailable because Arduino CLI and PlatformIO are not installed.
