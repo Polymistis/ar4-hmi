@@ -5939,8 +5939,11 @@ void loop() {
       gcFile = SD.open(fn);
       if (!gcFile) {
         Serial.println("EG");
-        while (1)
-          ;
+        // Preserve command-buffer rotation when loop() exits before its shared tail.
+        inData = "";
+        cmdBuffer1 = "";
+        shiftCMDarray();
+        return;
       }
       while (gcFile.available() && estopActive == false) {
         Cmd = gcFile.readStringUntil('\n');

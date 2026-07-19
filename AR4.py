@@ -129,13 +129,15 @@ from os import path, execv
 import pathlib
 import subprocess
 from multiprocessing.resource_sharer import stop
+from dataclasses import dataclass
+from contextlib import contextmanager
 import threading
 from threading import Lock, Thread
-from queue import Queue
+from queue import Empty, Queue
 
 import time
 
-from functools import partial
+from functools import partial, wraps
 import ctypes
 
 import math
@@ -171,6 +173,56 @@ import re
 import ARrobots.robot_kinematics as robot
 from ARrobots.Calibration import load_calibration, save_calibration
 from ARrobots.HMI.Calibration import apply_calibration
+from ARrobots.HMI.joint_motion import (
+  AUXILIARY_BOARD_MEGA,
+  AUXILIARY_BOARD_NANO,
+  AUXILIARY_BOARD_NONE,
+  CoalescingJointDispatcher,
+  CONTROL_POLL_INTERVAL_SECONDS,
+  ControllerJointCalibration,
+  DeferredLiveMotionArbiter,
+  LiveMotionScheduleResult,
+  DeferredJointAdjustments,
+  MAX_COMMAND_LENGTH,
+  MAX_RESPONSE_FRAME_LENGTH,
+  MAX_RESPONSE_PAYLOAD_LENGTH,
+  MotionInputError,
+  MotionQueueFault,
+  MotionProfile,
+  MotionRequestLease,
+  MotionRequestRegistry,
+  MotionTransportBusy,
+  PositionResponse,
+  ProtocolResponseError,
+  SerialTransportQuarantinedError,
+  SerialTransportTimeout,
+  SerialActivityRegistry,
+  SerialActivityRejected,
+  VirtualMotionOperation,
+  auxiliary_pneumatic_output_pin,
+  build_virtual_joint_command,
+  canonicalize_serial_command,
+  canonicalize_virtual_command,
+  command_response_timeout,
+  controller_protocol_decimal,
+  controller_ratio,
+  decode_serial_response_line,
+  exchange_serial_line,
+  exchange_serial_line_until_cancelled,
+  finite_number,
+  motion_timing_response_timeout,
+  normalize_auxiliary_board_profile,
+  parse_command_timing,
+  parse_position_response,
+  parse_virtual_command_timing,
+  quarantine_serial_transport,
+  read_serial_exact_response,
+  read_serial_line_response,
+  read_serial_line_response_with_optional_followup,
+  serial_transport_quarantined,
+  validate_auxiliary_output_command,
+  write_serial_control,
+)
 
 #####################################################################################
 # Cross-Compat Patch
@@ -179,7 +231,7 @@ from ARrobots.HMI.Calibration import apply_calibration
 from pathlib import Path
 import platform
 from serial.tools import list_ports
-from typing import List
+from typing import List, Optional
 
 from ARrobots.AR4config import AR4_Configuration
 
@@ -188,6 +240,15 @@ Config = AR4_Configuration()
 CE = Config.Environment
 CAL = Config.Calibration
 RUN = Config.RuntimeState # Not implemented yet
+
+
+def _load_startup_calibration():
+  calibration_values = load_calibration()
+  if not isinstance(calibration_values, dict):
+    raise RuntimeError(
+      "startup calibration is unavailable or invalid; controller motion remains disabled"
+    )
+  return calibration_values
 
 if CE['Platform']['IS_WINDOWS']:
   from pygrabber.dshow_graph import FilterGraph
@@ -278,10 +339,40 @@ tab9 = ttk_bootstrap.Frame(nb)
 #nb.add(tab9, text='   Info    ')
 
 def on_closing():
-  cv2.destroyAllWindows()
-  root.quit()
-  root.update()
-  root.destroy()
+  closing_event = globals().get('application_closing')
+  if closing_event is not None and closing_event.is_set():
+    return False
+
+  serial_activity_registry.begin_shutdown()
+  if closing_event is not None:
+    closing_event.set()
+  runtime_state = globals().get('RUN')
+  if isinstance(runtime_state, dict):
+    runtime_state['xboxUse'] = 0
+
+  live_pending = globals().get('live_serial_result_pending')
+  live_stop = globals().get('live_jog_stop_requested')
+  if (
+    live_pending is not None
+    and live_pending.is_set()
+    and live_stop is not None
+  ):
+    live_stop.set()
+
+  offline_state_lock = globals().get('offline_live_jog_state_lock')
+  offline_stop = globals().get('offline_live_jog_stop_event')
+  if offline_state_lock is not None and offline_stop is not None:
+    with offline_state_lock:
+      offline_stop.set()
+
+  dispatcher = globals().get('joint_motion_dispatcher')
+  if dispatcher is not None and dispatcher.active:
+    dispatcher.close()
+
+  almStatusLab.config(text="SHUTDOWN WAITING FOR CONTROLLER", style="Warn.TLabel")
+  almStatusLab2.config(text="SHUTDOWN WAITING FOR CONTROLLER", style="Warn.TLabel")
+  _poll_application_close()
+  return True
 
 root.wm_protocol("WM_DELETE_WINDOW", on_closing)
 
@@ -295,8 +386,904 @@ RUN['selectedTemplate'].set("")
 live_jog_lock = threading.Lock()
 live_cartesian_lock = threading.Lock()
 live_tool_lock = threading.Lock()
+offline_live_jog_lock = threading.Lock()
+offline_live_jog_state_lock = threading.Lock()
+offline_live_jog_stop_event = threading.Event()
+offline_live_jog_stop_event.set()
+offline_live_jog_pose_snapshot = None
 drive_lock = threading.Lock()
 serial_lock = threading.Lock()
+main_serial_operation_state = threading.local()
+manual_motion_request_state = threading.local()
+serial_write_lock = threading.Lock()
+serial_event_queue = Queue()
+auxiliary_serial_lock = threading.Lock()
+auxiliary_serial_write_lock = threading.Lock()
+auxiliary_serial_event_queue = Queue()
+startup_auxiliary_cleanup_lock = threading.Lock()
+startup_auxiliary_cleanup_pending = {}
+startup_auxiliary_cleanup_worker = None
+startup_controller_cleanup_lock = threading.Lock()
+startup_controller_cleanup_pending = {}
+startup_controller_cleanup_worker = None
+xbox_auxiliary_event_queue = Queue()
+auxiliary_stop_requested = threading.Event()
+auxiliary_stop_state_lock = threading.Lock()
+auxiliary_stop_next_request_id = 0
+auxiliary_stop_pending_request_id = None
+auxiliary_stop_active_request_id = None
+auxiliary_stop_owner_waiting = False
+auxiliary_stop_owner_result = None
+auxiliary_stop_owner_result_event = threading.Event()
+auxiliary_stop_injected_event = threading.Event()
+auxiliary_stop_acknowledgement_deadline = None
+xbox_auxiliary_next_request_id = 0
+controller_correction_requested = threading.Event()
+controller_correction_state_lock = threading.Lock()
+manual_motion_pose_pending = threading.Event()
+controller_position_resynchronization_required = threading.Event()
+acknowledged_forced_position_lock = threading.Lock()
+acknowledged_forced_position_target = None
+virtual_motion_event_queue = Queue()
+offline_live_jog_operation = None
+legacy_serial_result_pending = threading.Event()
+live_serial_result_pending = threading.Event()
+live_jog_stop_requested = threading.Event()
+application_closing = threading.Event()
+application_shutdown_started_at = None
+shutdown_serial_cancel_requested = set()
+serial_activity_registry = SerialActivityRegistry(
+  ("ser", "ser2"),
+  single_owner_names=("ser2",),
+)
+motion_request_registry = MotionRequestRegistry()
+joint_motion_request_lock = threading.Lock()
+joint_motion_request_lease = None
+offline_live_jog_motion_lease = None
+
+SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS = 120
+SERIAL_RESPONSE_MARGIN_SECONDS = 10
+SERIAL_EVENT_APPLICATION_MARGIN_SECONDS = 5
+SERIAL_WRITE_TIMEOUT_SECONDS = 5
+SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS = 5
+SERIAL_AUXILIARY_WAIT_MARGIN_SECONDS = 5
+# Teensy WJ, WK, and WT convert seconds to signed 32-bit milliseconds.
+MAIN_FIRMWARE_WAIT_MAX_SECONDS = 2147483
+# Firmware emits the live acknowledgement before entering segment execution.
+SERIAL_LIVE_ACK_TIMEOUT_SECONDS = 5
+SERIAL_STARTUP_READ_TIMEOUT_SECONDS = 10
+SERIAL_SHUTDOWN_POLL_MS = 25
+SERIAL_SHUTDOWN_RETRY_MS = 1000
+SERIAL_SHUTDOWN_ACTIVITY_GRACE_SECONDS = 1.0
+FIRMWARE_AXIS_COUNT = 9
+FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS = 30
+FIRMWARE_MAX_MILLIMETERS_PER_SECOND = 192
+AUXILIARY_FIRMWARE_SIGNED_INT_MAX = 32767
+AUXILIARY_WAIT_TERMINAL_RESPONSES = ("Done", "Timeout", "Nano Stopped")
+AUXILIARY_WAIT_NATURAL_RESPONSES = ("Done", "Timeout")
+AUXILIARY_INACTIVE_STOP_RESPONSE = "Nano Inactive Stopped"
+AUXILIARY_STOP_OWNER_RESPONSES = (
+  *AUXILIARY_WAIT_TERMINAL_RESPONSES,
+  AUXILIARY_INACTIVE_STOP_RESPONSE,
+)
+AUXILIARY_STOP_NOT_REQUIRED = "not-required"
+AUXILIARY_STOP_PENDING = "pending"
+AUXILIARY_STOP_DISPATCHED = "dispatched"
+XBOX_AUXILIARY_PENDING_KEYS = {
+  "_grip_closed": "_grip_pending_request_id",
+  "_pneu_open": "_pneu_pending_request_id",
+}
+XBOX_AUXILIARY_FIXED_TOGGLE_COMMANDS = {
+  "_grip_closed": {
+    False: ("SV0P50\n", b"Servo Done"),
+    True: ("SV0P0\n", b"Servo Done"),
+  },
+}
+XBOX_AUXILIARY_TOGGLE_RESPONSES = {
+  "_grip_closed": b"Servo Done",
+  "_pneu_open": b"Done",
+}
+XBOX_AUXILIARY_FIXED_EXCHANGES = frozenset(
+  exchange
+  for commands in XBOX_AUXILIARY_FIXED_TOGGLE_COMMANDS.values()
+  for exchange in commands.values()
+)
+
+
+def _bind_auxiliary_board_profile(serial_port, board_profile):
+  if serial_port is None or not getattr(serial_port, "is_open", False):
+    raise ConnectionError(
+      "auxiliary-board profile requires an open auxiliary connection"
+    )
+  if RUN.get('ser2') is not serial_port:
+    raise ConnectionError(
+      "auxiliary-board profile requires the active auxiliary connection"
+    )
+  profile = normalize_auxiliary_board_profile(board_profile)
+  RUN['ser2BoardProfile'] = (serial_port, profile)
+  return profile
+
+
+def _clear_auxiliary_board_profile(serial_port=None):
+  binding = RUN.get('ser2BoardProfile')
+  if serial_port is None or (
+    isinstance(binding, tuple)
+    and len(binding) == 2
+    and binding[0] is serial_port
+  ):
+    RUN['ser2BoardProfile'] = None
+    return True
+  return False
+
+
+def _connected_auxiliary_board_profile(serial_port=None):
+  if serial_port is None:
+    serial_port = RUN.get('ser2')
+  if serial_port is None or not getattr(serial_port, "is_open", False):
+    raise ConnectionError("auxiliary controller serial connection is not open")
+  if RUN.get('ser2') is not serial_port:
+    raise ConnectionError("auxiliary controller connection ownership changed")
+  binding = RUN.get('ser2BoardProfile')
+  if (
+    not isinstance(binding, tuple)
+    or len(binding) != 2
+    or binding[0] is not serial_port
+  ):
+    raise MotionInputError(
+      "auxiliary-board profile is not bound to the active connection"
+    )
+  return normalize_auxiliary_board_profile(binding[1])
+
+
+def _xbox_auxiliary_toggle_exchange(
+  state_name,
+  target_state,
+  serial_port=None,
+):
+  if state_name not in XBOX_AUXILIARY_PENDING_KEYS:
+    raise MotionInputError("Xbox auxiliary state name is invalid")
+  if not isinstance(target_state, bool):
+    raise MotionInputError("Xbox auxiliary target state must be boolean")
+  profile = _connected_auxiliary_board_profile(serial_port)
+  if state_name == "_grip_closed":
+    return XBOX_AUXILIARY_FIXED_TOGGLE_COMMANDS[state_name][target_state]
+  if state_name != "_pneu_open":
+    raise MotionInputError("Xbox pneumatic state name is invalid")
+  output_pin = auxiliary_pneumatic_output_pin(profile)
+  output_prefix = "OF" if target_state else "ON"
+  command = f"{output_prefix}X{output_pin}\n"
+  expected_response = _xbox_auxiliary_expected_response(command, serial_port)
+  return command, expected_response
+
+
+def _xbox_auxiliary_expected_response(command, serial_port=None):
+  if (
+    not isinstance(command, str)
+    or not command
+    or len(command) > MAX_COMMAND_LENGTH
+  ):
+    raise MotionInputError("Xbox auxiliary command is invalid")
+  fixed_responses = {
+    expected_response
+    for supported_command, expected_response in XBOX_AUXILIARY_FIXED_EXCHANGES
+    if supported_command == command
+  }
+  if len(fixed_responses) == 1:
+    return fixed_responses.pop()
+  output_match = re.fullmatch(r"(?:ON|OF)X([0-9]+)\n", command)
+  if output_match is None:
+    raise MotionInputError("Xbox auxiliary exchange is not supported")
+  profile = _connected_auxiliary_board_profile(serial_port)
+  validate_auxiliary_output_command(command, profile)
+  return b"Done"
+
+
+def _main_serial_transmit_required(transmit=True):
+  return transmit is not False
+
+
+def _synchronous_motion_request(name, rejection_result=False):
+  def decorate(callback):
+    @wraps(callback)
+    def guarded(*args, **kwargs):
+      request_lease = _acquire_motion_request(name)
+      if request_lease is None:
+        return rejection_result
+      try:
+        return callback(*args, **kwargs)
+      finally:
+        _finish_motion_request(request_lease)
+    return guarded
+  return decorate
+
+
+@contextmanager
+def _reserve_main_serial_operation():
+  reservation = getattr(main_serial_operation_state, "reservation", None)
+  created = reservation is None
+  if created:
+    if not serial_lock.acquire(blocking=False):
+      raise SerialActivityRejected("controller transport is busy")
+    reservation = {"depth": 0, "transferred": False}
+    main_serial_operation_state.reservation = reservation
+  elif (
+    not isinstance(reservation, dict)
+    or set(reservation) != {"depth", "transferred"}
+    or isinstance(reservation["depth"], bool)
+    or not isinstance(reservation["depth"], int)
+    or reservation["depth"] <= 0
+    or not isinstance(reservation["transferred"], bool)
+  ):
+    raise RuntimeError("main serial reservation state is invalid")
+
+  if reservation["transferred"]:
+    raise SerialActivityRejected(
+      "controller transport ownership was transferred to a serial worker"
+    )
+  reservation["depth"] += 1
+  try:
+    yield
+  finally:
+    current = getattr(main_serial_operation_state, "reservation", None)
+    if current is not reservation or reservation["depth"] <= 0:
+      raise RuntimeError("main serial reservation cleanup state is invalid")
+    reservation["depth"] -= 1
+    if reservation["depth"] == 0:
+      del main_serial_operation_state.reservation
+      if not reservation["transferred"]:
+        serial_lock.release()
+
+
+def _transfer_main_serial_reservation():
+  reservation = getattr(main_serial_operation_state, "reservation", None)
+  if reservation is None:
+    return False
+  if (
+    not isinstance(reservation, dict)
+    or reservation.get("depth") != 1
+    or reservation.get("transferred") is not False
+    or not serial_lock.locked()
+  ):
+    raise RuntimeError("main serial reservation cannot be transferred")
+  reservation["transferred"] = True
+  return True
+
+
+def _restore_main_serial_reservation():
+  reservation = getattr(main_serial_operation_state, "reservation", None)
+  if (
+    not isinstance(reservation, dict)
+    or reservation.get("depth") != 1
+    or reservation.get("transferred") is not True
+    or not serial_lock.locked()
+  ):
+    raise RuntimeError("main serial reservation cannot be restored")
+  reservation["transferred"] = False
+
+
+def _tracked_serial_operation(
+  *serial_names,
+  auxiliary_control_injectable=False,
+  rejection_result=False,
+  on_rejected=None,
+  operation_required=None,
+):
+  if not isinstance(auxiliary_control_injectable, bool):
+    raise TypeError("auxiliary_control_injectable must be boolean")
+  if auxiliary_control_injectable and "ser2" not in serial_names:
+    raise ValueError(
+      "auxiliary control injection requires tracked ser2 activity"
+    )
+  if on_rejected is not None and not callable(on_rejected):
+    raise TypeError("on_rejected must be callable")
+  if operation_required is not None and not callable(operation_required):
+    raise TypeError("operation_required must be callable")
+  injectable_names = (
+    ("ser2",)
+    if auxiliary_control_injectable
+    else ()
+  )
+
+  def decorator(function):
+    @wraps(function)
+    def tracked(*args, **kwargs):
+      required = (
+        True
+        if operation_required is None
+        else operation_required(*args, **kwargs)
+      )
+      if not isinstance(required, bool):
+        raise TypeError("operation_required must return a boolean")
+      if not required:
+        return function(*args, **kwargs)
+
+      main_reservation = None
+      main_reserved = False
+      auxiliary_reserved = False
+      activity = None
+      try:
+        if "ser" in serial_names:
+          main_reservation = _reserve_main_serial_operation()
+          main_reservation.__enter__()
+          main_reserved = True
+        if "ser2" in serial_names:
+          auxiliary_reserved = auxiliary_serial_lock.acquire(blocking=False)
+          if not auxiliary_reserved:
+            raise SerialActivityRejected(
+              "auxiliary controller transport is busy"
+            )
+        activity = serial_activity_registry.operations(
+          serial_names,
+          control_injectable_names=injectable_names,
+        )
+        activity.__enter__()
+      except SerialActivityRejected as exc:
+        if auxiliary_reserved:
+          auxiliary_serial_lock.release()
+        if main_reserved:
+          main_reservation.__exit__(None, None, None)
+        logger.warning("Serial operation rejected: %s", exc)
+        if on_rejected is not None:
+          on_rejected()
+        return rejection_result
+      except Exception:
+        if auxiliary_reserved:
+          auxiliary_serial_lock.release()
+        if main_reserved:
+          main_reservation.__exit__(None, None, None)
+        raise
+      try:
+        return function(*args, **kwargs)
+      finally:
+        try:
+          activity.__exit__(None, None, None)
+        finally:
+          try:
+            if auxiliary_reserved:
+              auxiliary_serial_lock.release()
+          finally:
+            if main_reserved:
+              main_reservation.__exit__(None, None, None)
+
+    return tracked
+
+  return decorator
+
+
+@contextmanager
+def _tracked_auxiliary_operation(control_injectable=False):
+  if not isinstance(control_injectable, bool):
+    raise TypeError("control_injectable must be boolean")
+  auxiliary_reserved = auxiliary_serial_lock.acquire(blocking=False)
+  if not auxiliary_reserved:
+    raise SerialActivityRejected(
+      "serial operation rejected while the auxiliary transport is busy"
+    )
+  activity = serial_activity_registry.operations(
+    ("ser2",),
+    control_injectable_names=("ser2",) if control_injectable else (),
+  )
+  try:
+    activity.__enter__()
+  except Exception:
+    auxiliary_serial_lock.release()
+    raise
+  try:
+    yield
+  finally:
+    activity.__exit__(None, None, None)
+    auxiliary_serial_lock.release()
+
+
+def _write_legacy_auxiliary_command(command):
+  serial_port = RUN.get('ser2')
+  try:
+    if isinstance(command, str) and command[:2] in ("ON", "OF"):
+      board_profile = _connected_auxiliary_board_profile(serial_port)
+      validate_auxiliary_output_command(command, board_profile)
+    return write_serial_control(
+      serial_port,
+      command,
+      write_lock=auxiliary_serial_write_lock,
+      reset_input=True,
+    )
+  finally:
+    if (
+      RUN.get('ser2') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      RUN['ser2'] = None
+      _clear_auxiliary_board_profile(serial_port)
+
+
+@_tracked_serial_operation("ser2")
+def _exchange_xbox_auxiliary_command(
+  command,
+  expected_response,
+  expected_serial_port=None,
+):
+  if not isinstance(command, str) or not isinstance(expected_response, bytes):
+    raise MotionInputError("Xbox auxiliary exchange contract is invalid")
+  serial_port = RUN.get('ser2')
+  if (
+    expected_serial_port is not None
+    and serial_port is not expected_serial_port
+  ):
+    raise ConnectionError(
+      "Xbox auxiliary connection changed before request dispatch"
+    )
+  _connected_auxiliary_board_profile(serial_port)
+  if expected_response != _xbox_auxiliary_expected_response(
+    command,
+    serial_port,
+  ):
+    raise MotionInputError("Xbox auxiliary expected response is invalid")
+
+  try:
+    _write_legacy_auxiliary_command(command)
+    response = read_serial_exact_response(
+      serial_port,
+      expected_response,
+      SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+    )
+  except Exception:
+    if RUN.get('ser2') is serial_port:
+      _close_serial_port('ser2', "Xbox auxiliary response failure")
+    raise
+  return response
+
+
+def _run_xbox_auxiliary_request(
+  request_id,
+  state_name,
+  target_state,
+  serial_port,
+  command,
+  expected_response,
+):
+  try:
+    response = _exchange_xbox_auxiliary_command(
+      command,
+      expected_response,
+      serial_port,
+    )
+    if response is False:
+      event = (
+        "rejected",
+        request_id,
+        state_name,
+        target_state,
+        "auxiliary controller transport is busy",
+      )
+    elif not isinstance(response, str) or not response:
+      raise ProtocolResponseError(
+        "Xbox auxiliary exchange returned an invalid acknowledgement"
+      )
+    else:
+      event = (
+        "completed",
+        request_id,
+        state_name,
+        target_state,
+        response,
+      )
+  except Exception as exc:
+    logger.exception("Xbox auxiliary command failed")
+    message = str(exc).strip() or "Xbox auxiliary command failed without details"
+    event = ("failed", request_id, state_name, target_state, message)
+  xbox_auxiliary_event_queue.put(event)
+
+
+def _start_xbox_auxiliary_request(request_id, state_name, target_state):
+  if (
+    isinstance(request_id, bool)
+    or not isinstance(request_id, int)
+    or request_id <= 0
+  ):
+    raise MotionInputError("Xbox auxiliary request ID must be positive")
+  if state_name not in XBOX_AUXILIARY_PENDING_KEYS:
+    raise MotionInputError("Xbox auxiliary state name is invalid")
+  if not isinstance(target_state, bool):
+    raise MotionInputError("Xbox auxiliary target state must be boolean")
+  serial_port = RUN.get('ser2')
+  command, expected_response = _xbox_auxiliary_toggle_exchange(
+    state_name,
+    target_state,
+    serial_port,
+  )
+  try:
+    thread = threading.Thread(
+      target=_run_xbox_auxiliary_request,
+      args=(
+        request_id,
+        state_name,
+        target_state,
+        serial_port,
+        command,
+        expected_response,
+      ),
+      daemon=True,
+    )
+    thread.start()
+  except Exception:
+    logger.exception("Unable to start the Xbox auxiliary worker")
+    return False
+  return True
+
+
+def _request_xbox_auxiliary_toggle(state_name):
+  global xbox_auxiliary_next_request_id
+
+  if state_name not in XBOX_AUXILIARY_PENDING_KEYS:
+    raise MotionInputError("Xbox auxiliary state name is invalid")
+  current_state = RUN.get(state_name)
+  if not isinstance(current_state, bool):
+    logger.error("Xbox auxiliary state is unknown: %s", state_name)
+    return False
+  pending_name = XBOX_AUXILIARY_PENDING_KEYS[state_name]
+  pending_request_id = RUN.get(pending_name)
+  if pending_request_id is not None:
+    logger.warning("Xbox auxiliary toggle already pending: %s", state_name)
+    return False
+  if (
+    isinstance(xbox_auxiliary_next_request_id, bool)
+    or not isinstance(xbox_auxiliary_next_request_id, int)
+    or xbox_auxiliary_next_request_id < 0
+  ):
+    raise RuntimeError("Xbox auxiliary request counter is invalid")
+
+  xbox_auxiliary_next_request_id += 1
+  request_id = xbox_auxiliary_next_request_id
+  target_state = not current_state
+  RUN[pending_name] = request_id
+  try:
+    started = _start_xbox_auxiliary_request(
+      request_id,
+      state_name,
+      target_state,
+    )
+  except Exception:
+    RUN[pending_name] = None
+    raise
+  if started is not True:
+    RUN[pending_name] = None
+    return False
+  return True
+
+
+def _close_serial_port(serial_name, context="application shutdown"):
+  serial_port = RUN.get(serial_name)
+  if serial_port is None:
+    return True
+  try:
+    serial_port.close()
+  except Exception:
+    logger.exception("Unable to close %s during %s", serial_name, context)
+    return False
+  if getattr(serial_port, "is_open", False):
+    logger.error("Serial port %s remained open during %s", serial_name, context)
+    return False
+  if RUN.get(serial_name) is serial_port:
+    RUN[serial_name] = None
+    if serial_name == 'ser2':
+      _clear_auxiliary_board_profile(serial_port)
+  return True
+
+
+def _interrupt_tracked_serial_activity(serial_name):
+  if not serial_activity_registry.active(serial_name):
+    return False
+  serial_port = RUN.get(serial_name)
+  if serial_port is None:
+    logger.error(
+      "Tracked %s activity has no serial connection to interrupt",
+      serial_name,
+    )
+    return False
+
+  if serial_name not in shutdown_serial_cancel_requested:
+    cancel_read = getattr(serial_port, "cancel_read", None)
+    if callable(cancel_read):
+      try:
+        cancel_read()
+        shutdown_serial_cancel_requested.add(serial_name)
+        logger.warning(
+          "Cancelled blocking %s read during application shutdown",
+          serial_name,
+        )
+        return True
+      except Exception:
+        logger.exception(
+          "Unable to cancel blocking %s read during application shutdown",
+          serial_name,
+        )
+
+  logger.warning(
+    "Closing %s to release tracked activity during application shutdown",
+    serial_name,
+  )
+  return _close_serial_port(
+    serial_name,
+    "tracked activity shutdown interruption",
+  )
+
+
+def _release_async_main_serial_transport(activity_lease, request_lease):
+  close_activity = getattr(activity_lease, "close", None)
+  if not callable(close_activity):
+    raise TypeError("main serial activity lease must be closeable")
+  if not serial_lock.locked():
+    raise RuntimeError("main serial transport reservation was already released")
+  if close_activity() is not True:
+    raise RuntimeError("main serial activity lease was already released")
+  serial_lock.release()
+  _finish_motion_request(request_lease)
+
+
+def _close_failed_controller_startup(
+  serial_port,
+  activity_lease,
+  request_lease,
+):
+  if not getattr(serial_port, "is_open", False):
+    if RUN.get('ser') is serial_port:
+      RUN['ser'] = None
+    closed = True
+  elif RUN.get('ser') is serial_port:
+    closed = _close_serial_port('ser', "failed controller connection cleanup")
+  else:
+    logger.error("Main serial reference changed during failed connection cleanup")
+    if not getattr(serial_port, "is_open", False):
+      closed = True
+    else:
+      try:
+        serial_port.close()
+        closed = not getattr(serial_port, "is_open", False)
+      except Exception:
+        logger.exception("Unable to close replaced controller startup connection")
+        closed = False
+  if not closed:
+    return False
+  try:
+    _release_async_main_serial_transport(activity_lease, request_lease)
+  except Exception:
+    logger.exception("Unable to release failed controller startup ownership")
+    return False
+  return True
+
+
+def _run_startup_controller_cleanup():
+  global startup_controller_cleanup_worker
+
+  while True:
+    with startup_controller_cleanup_lock:
+      pending = tuple(startup_controller_cleanup_pending.items())
+      if not pending:
+        startup_controller_cleanup_worker = None
+        return
+
+    completed_any = False
+    for key, entry in pending:
+      serial_port, activity_lease, request_lease = entry
+      if not _close_failed_controller_startup(
+        serial_port,
+        activity_lease,
+        request_lease,
+      ):
+        continue
+      with startup_controller_cleanup_lock:
+        current = startup_controller_cleanup_pending.get(key)
+        if (
+          isinstance(current, tuple)
+          and len(current) == 3
+          and current[0] is serial_port
+          and current[1] is activity_lease
+          and current[2] is request_lease
+        ):
+          del startup_controller_cleanup_pending[key]
+      completed_any = True
+
+    if not completed_any:
+      time.sleep(SERIAL_SHUTDOWN_RETRY_MS / 1000.0)
+
+
+def _ensure_startup_controller_cleanup():
+  global startup_controller_cleanup_worker
+
+  with startup_controller_cleanup_lock:
+    if not startup_controller_cleanup_pending:
+      return True
+    worker = startup_controller_cleanup_worker
+    if worker is not None and worker.is_alive():
+      return True
+    try:
+      worker = threading.Thread(
+        target=_run_startup_controller_cleanup,
+        name="ar4-startup-controller-cleanup",
+        daemon=True,
+      )
+      startup_controller_cleanup_worker = worker
+      worker.start()
+    except Exception:
+      startup_controller_cleanup_worker = None
+      logger.exception("Unable to start controller startup cleanup retry")
+      return False
+  return True
+
+
+def _retain_failed_controller_startup(
+  serial_port,
+  activity_lease,
+  request_lease,
+):
+  entry = (serial_port, activity_lease, request_lease)
+  with startup_controller_cleanup_lock:
+    key = id(serial_port)
+    existing = startup_controller_cleanup_pending.get(key)
+    if existing is not None and not (
+      isinstance(existing, tuple)
+      and len(existing) == 3
+      and existing[0] is serial_port
+      and existing[1] is activity_lease
+      and existing[2] is request_lease
+    ):
+      raise RuntimeError("controller startup cleanup identity collision")
+    startup_controller_cleanup_pending[key] = entry
+  _ensure_startup_controller_cleanup()
+  return False
+
+
+def _poll_failed_controller_close(
+  serial_port,
+  activity_lease,
+  request_lease,
+):
+  if _close_failed_controller_startup(
+    serial_port,
+    activity_lease,
+    request_lease,
+  ):
+    return True
+
+  message = "CONTROLLER CONNECTION CLEANUP PENDING"
+  try:
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+  except Exception:
+    logger.exception("Unable to report pending controller connection cleanup")
+  try:
+    root.after(
+      SERIAL_SHUTDOWN_RETRY_MS,
+      lambda: _poll_failed_controller_close(
+        serial_port,
+        activity_lease,
+        request_lease,
+      ),
+    )
+  except Exception:
+    logger.exception("Unable to schedule controller connection cleanup retry")
+    _retain_failed_controller_startup(
+      serial_port,
+      activity_lease,
+      request_lease,
+    )
+  return False
+
+
+def _abandon_failed_controller_startup(
+  serial_port,
+  activity_lease,
+  request_lease,
+):
+  if _close_failed_controller_startup(
+    serial_port,
+    activity_lease,
+    request_lease,
+  ):
+    return True
+  logger.error("Controller startup cleanup retained for a durable retry")
+  return _retain_failed_controller_startup(
+    serial_port,
+    activity_lease,
+    request_lease,
+  )
+
+
+def _poll_application_close():
+  global application_shutdown_started_at
+
+  _poll_serial_events()
+  _poll_auxiliary_serial_events()
+  _poll_joint_motion_events()
+  _poll_virtual_motion_events()
+
+  with startup_controller_cleanup_lock:
+    controller_cleanup_pending = bool(startup_controller_cleanup_pending)
+  if controller_cleanup_pending:
+    _ensure_startup_controller_cleanup()
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
+
+  with startup_auxiliary_cleanup_lock:
+    auxiliary_cleanup_pending = bool(startup_auxiliary_cleanup_pending)
+  if auxiliary_cleanup_pending:
+    _ensure_startup_auxiliary_cleanup()
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
+
+  if not serial_activity_registry.idle():
+    now = time.monotonic()
+    if application_shutdown_started_at is None:
+      application_shutdown_started_at = now
+    elif (
+      now - application_shutdown_started_at
+      >= SERIAL_SHUTDOWN_ACTIVITY_GRACE_SECONDS
+    ):
+      for serial_name in ("ser", "ser2"):
+        _interrupt_tracked_serial_activity(serial_name)
+
+  with offline_live_jog_state_lock:
+    offline_motion_pending = offline_live_jog_operation is not None
+  if offline_motion_pending or _virtual_motion_active():
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
+
+  if not serial_lock.acquire(blocking=False):
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
+  if not auxiliary_serial_lock.acquire(blocking=False):
+    serial_lock.release()
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
+  if not serial_activity_registry.idle():
+    auxiliary_serial_lock.release()
+    serial_lock.release()
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
+
+  persisted = False
+  closed = False
+  try:
+    joint_motion_dispatcher.close()
+    try:
+      persisted = _flush_calibration_save() is True
+    except Exception:
+      logger.exception("Unable to flush final controller state during shutdown")
+    if persisted:
+      closed = _close_serial_port('ser')
+      closed = _close_serial_port('ser2') and closed
+  finally:
+    auxiliary_serial_lock.release()
+    serial_lock.release()
+
+  if not persisted:
+    almStatusLab.config(
+      text="SHUTDOWN WAITING FOR CALIBRATION SAVE",
+      style="Alarm.TLabel",
+    )
+    almStatusLab2.config(
+      text="SHUTDOWN WAITING FOR CALIBRATION SAVE",
+      style="Alarm.TLabel",
+    )
+    root.after(SERIAL_SHUTDOWN_RETRY_MS, _poll_application_close)
+    return False
+
+  if not closed:
+    almStatusLab.config(
+      text="SHUTDOWN WAITING FOR SERIAL CLOSE",
+      style="Alarm.TLabel",
+    )
+    almStatusLab2.config(
+      text="SHUTDOWN WAITING FOR SERIAL CLOSE",
+      style="Alarm.TLabel",
+    )
+    root.after(SERIAL_SHUTDOWN_RETRY_MS, _poll_application_close)
+    return False
+
+  cv2.destroyAllWindows()
+  root.quit()
+  root.destroy()
+  return True
 
 '''
 RUN['J1CalStat1'] = IntVar()
@@ -373,7 +1360,6 @@ RUN['J6axisLimNeg'] = None
 RUN['negLim'] = None
 RUN['stepDeg'] = None
 RUN['flag'] = None
-RUN['xyzuvw_Out'] = None
 RUN['LineDist'] = None
 RUN['Xv'] = None
 RUN['Yv'] = None
@@ -385,14 +1371,12 @@ RUN['zVal'] = None
 # Serial Communication
 RUN['ser'] = None
 RUN['ser2'] = None
+RUN['ser2BoardProfile'] = None
 RUN['ser3'] = None
 
 # Program Execution
 RUN['rowinproc'] = None
-RUN['stopQueue'] = None
-RUN['splineActive'] = None
 RUN['GCrowinproc'] = None
-RUN['GCstopQueue'] = None
 
 # Live Jog State
 RUN['_current'] = None
@@ -406,6 +1390,8 @@ RUN['_mainMode'] = None
 RUN['_smooth'] = None
 RUN['_grip_closed'] = None
 RUN['_pneu_open'] = None
+RUN['_grip_pending_request_id'] = None
+RUN['_pneu_pending_request_id'] = None
 RUN['cmdType'] = None
 RUN['cmdTypeLong'] = None
 
@@ -502,43 +1488,66 @@ CAL['DisableWristRotVal'] = tk.IntVar(value=0)
 #DEG2RAD = np.pi / 180
 #RAD2DEG = 180 / np.pi
 
+def _set_cpp_kinematics_from_values(values):
+    theta = tuple(
+        math.radians(finite_number(values[f'J{axis}ΘDHpar'], f"J{axis} theta"))
+        for axis in range(1, 7)
+    )
+    alpha = tuple(
+        math.radians(finite_number(values[f'J{axis}αDHpar'], f"J{axis} alpha"))
+        for axis in range(1, 7)
+    )
+    link_a = tuple(
+        finite_number(values[f'J{axis}aDHpar'], f"J{axis} link a")
+        for axis in range(1, 7)
+    )
+    link_d = tuple(
+        finite_number(values[f'J{axis}dDHpar'], f"J{axis} link d")
+        for axis in range(1, 7)
+    )
+    positive_limits = tuple(
+        finite_number(values[f'J{axis}PosLim'], f"J{axis} positive limit")
+        for axis in range(1, 7)
+    )
+    negative_limits = tuple(
+        finite_number(values[f'J{axis}NegLim'], f"J{axis} negative limit")
+        for axis in range(1, 7)
+    )
+    tool_frame = tuple(
+        finite_number(values[key], f"tool-frame {key}")
+        for key in ('TFx', 'TFy', 'TFz', 'TFrz', 'TFry', 'TFrx')
+    )
+
+    robot.set_dh_parameters_explicit(*(theta + alpha + link_a + link_d))
+    robot.set_joint_limits(positive_limits, negative_limits)
+    robot.set_robot_tool_frame(*tool_frame)
+    return True
+
+
 def update_CPP_kin_from_entries():
-    #global DHparams
-    #global Robot_Data
     try:
-
-        robot.set_dh_parameters_explicit(
-          # θ (radians)
-          np.radians(float(J1ΘEntryField.get())), np.radians(float(J2ΘEntryField.get())), np.radians(float(J3ΘEntryField.get())),
-          np.radians(float(J4ΘEntryField.get())), np.radians(float(J5ΘEntryField.get())), np.radians(float(J6ΘEntryField.get())),
-
-          # α (radians)
-          np.radians(float(J1αEntryField.get())), np.radians(float(J2αEntryField.get())), np.radians(float(J3αEntryField.get())),
-          np.radians(float(J4αEntryField.get())), np.radians(float(J5αEntryField.get())), np.radians(float(J6αEntryField.get())),
-
-          # a (mm)
-          float(J1aEntryField.get()), float(J2aEntryField.get()), float(J3aEntryField.get()),
-          float(J4aEntryField.get()), float(J5aEntryField.get()), float(J6aEntryField.get()),
-
-          # d (mm)
-          float(J1dEntryField.get()), float(J2dEntryField.get()), float(J3dEntryField.get()),
-          float(J4dEntryField.get()), float(J5dEntryField.get()), float(J6dEntryField.get())
-      )
-        
-        PosLimits = [float(val) for val in [CAL['J1PosLim'], CAL['J2PosLim'], CAL['J3PosLim'], CAL['J4PosLim'], CAL['J5PosLim'], CAL['J6PosLim']]]
-        NegLimits = [float(val) for val in [CAL['J1NegLim'], CAL['J2NegLim'], CAL['J3NegLim'], CAL['J4NegLim'], CAL['J5NegLim'], CAL['J6NegLim']]]
-        robot.set_joint_limits(PosLimits, NegLimits)
-        robot.set_robot_tool_frame(float(TFxEntryField.get()), 
-                                   float(TFyEntryField.get()), 
-                                   float(TFzEntryField.get()), 
-                                   float(TFrxEntryField.get()), 
-                                   float(TFryEntryField.get()), 
-                                   float(TFrzEntryField.get()))
-          
-
-    except ValueError as e:
-        logger.error(f"Invalid parameter input: {e}")
-        return None 
+        values = dict(CAL)
+        entry_groups = (
+            ('ΘDHpar', (J1ΘEntryField, J2ΘEntryField, J3ΘEntryField, J4ΘEntryField, J5ΘEntryField, J6ΘEntryField)),
+            ('αDHpar', (J1αEntryField, J2αEntryField, J3αEntryField, J4αEntryField, J5αEntryField, J6αEntryField)),
+            ('aDHpar', (J1aEntryField, J2aEntryField, J3aEntryField, J4aEntryField, J5aEntryField, J6aEntryField)),
+            ('dDHpar', (J1dEntryField, J2dEntryField, J3dEntryField, J4dEntryField, J5dEntryField, J6dEntryField)),
+        )
+        for suffix, fields in entry_groups:
+            for axis, field in enumerate(fields, start=1):
+                values[f'J{axis}{suffix}'] = field.get()
+        values.update({
+            'TFx': TFxEntryField.get(),
+            'TFy': TFyEntryField.get(),
+            'TFz': TFzEntryField.get(),
+            'TFrx': TFrxEntryField.get(),
+            'TFry': TFryEntryField.get(),
+            'TFrz': TFrzEntryField.get(),
+        })
+        return _set_cpp_kinematics_from_values(values)
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.error("Invalid parameter input: %s", exc)
+        return False
 
 
 def setStepMonitorsVR():
@@ -560,77 +1569,82 @@ def setStepMonitorsVR():
 
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
 def refresh_gui_from_joint_angles(joint_angles):
-    setStepMonitorsVR()
-    # Forward kinematics to get XYZ + orientation
     try:
-        fk_xyzuvw = robot.forward_kinematics(joint_angles)
-        xyzuvw = fk_xyzuvw[:3] + [math.degrees(v) for v in fk_xyzuvw[3:]]
-    except Exception as e:
-        logger.error(f"Forward kinematics failed: {e}")
-        return
+        joints = _validated_virtual_six_vector(
+            joint_angles,
+            "virtual GUI refresh joints",
+        )
+        fk_xyzuvw = _validated_virtual_six_vector(
+            robot.forward_kinematics(joints),
+            "virtual GUI refresh Cartesian pose",
+        )
+    except Exception as exc:
+        raise MotionInputError(f"Forward kinematics refresh failed: {exc}") from exc
 
-    # Cast and unpack as strings with 3 decimal places
-    CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [f"{v:.3f}" for v in xyzuvw]
+    xyzuvw = fk_xyzuvw[:3] + tuple(
+        math.degrees(value) for value in fk_xyzuvw[3:]
+    )
+    RUN['VR_angles'] = list(joints)
+    setStepMonitorsVR()
 
-    # Update cartesian position fields
-    XcurEntryField.delete(0, 'end'); XcurEntryField.insert(0, CAL['XcurPos'])
-    YcurEntryField.delete(0, 'end'); YcurEntryField.insert(0, CAL['YcurPos'])
-    ZcurEntryField.delete(0, 'end'); ZcurEntryField.insert(0, CAL['ZcurPos'])
-    RzcurEntryField.delete(0, 'end'); RzcurEntryField.insert(0, CAL['RzcurPos'])
-    RycurEntryField.delete(0, 'end'); RycurEntryField.insert(0, CAL['RycurPos'])
-    RxcurEntryField.delete(0, 'end'); RxcurEntryField.insert(0, CAL['RxcurPos'])
+    cartesian_values = tuple(f"{value:.3f}" for value in xyzuvw)
+    (
+        CAL['XcurPos'],
+        CAL['YcurPos'],
+        CAL['ZcurPos'],
+        CAL['RzcurPos'],
+        CAL['RycurPos'],
+        CAL['RxcurPos'],
+    ) = cartesian_values
+    for field, value in zip(
+        (
+            XcurEntryField,
+            YcurEntryField,
+            ZcurEntryField,
+            RzcurEntryField,
+            RycurEntryField,
+            RxcurEntryField,
+        ),
+        cartesian_values,
+    ):
+        field.delete(0, 'end')
+        field.insert(0, value)
 
-    # Update jog sliders
-    J1jogslide.set(joint_angles[0])
-    J2jogslide.set(joint_angles[1])
-    J3jogslide.set(joint_angles[2])
-    J4jogslide.set(joint_angles[3])
-    J5jogslide.set(joint_angles[4])
-    J6jogslide.set(joint_angles[5])
+    joint_values = tuple(str(value) for value in joints)
+    (
+        CAL['J1AngCur'],
+        CAL['J2AngCur'],
+        CAL['J3AngCur'],
+        CAL['J4AngCur'],
+        CAL['J5AngCur'],
+        CAL['J6AngCur'],
+    ) = joint_values
+    RUN['WC'] = "F" if joints[4] > 0 else "N"
+    logger.info(CAL['J5AngCur'])
 
-
-
-    CAL['J1AngCur'] = str(joint_angles[0])
-    CAL['J2AngCur'] = str(joint_angles[1])
-    CAL['J3AngCur'] = str(joint_angles[2])
-    CAL['J4AngCur'] = str(joint_angles[3])
-    CAL['J5AngCur'] = str(joint_angles[4])
-    CAL['J6AngCur'] = str(joint_angles[5])
-
-    if CAL['J5AngCur'] != '' and float(CAL['J5AngCur']) > 0:
-      RUN['WC'] = "F"
-    else:
-      RUN['WC'] = "N"
-
-    logger.info(CAL['J5AngCur'])  
-
-    J1curAngEntryField.delete(0, 'end')
-    J1curAngEntryField.insert(0,CAL['J1AngCur'])
-    J2curAngEntryField.delete(0, 'end')
-    J2curAngEntryField.insert(0,CAL['J2AngCur'])
-    J3curAngEntryField.delete(0, 'end')
-    J3curAngEntryField.insert(0,CAL['J3AngCur'])
-    J4curAngEntryField.delete(0, 'end')
-    J4curAngEntryField.insert(0,CAL['J4AngCur'])
-    J5curAngEntryField.delete(0, 'end')
-    J5curAngEntryField.insert(0,CAL['J5AngCur'])
-    J6curAngEntryField.delete(0, 'end')
-    J6curAngEntryField.insert(0,CAL['J6AngCur'])   
-
-    J1jogslide.set(CAL['J1AngCur'])
-    J2jogslide.set(CAL['J2AngCur'])
-    J3jogslide.set(CAL['J3AngCur'])
-    J4jogslide.set(CAL['J4AngCur'])
-    J5jogslide.set(CAL['J5AngCur'])
-    J6jogslide.set(CAL['J6AngCur'])
-
-    # Update joint angle fields
-    J1curAngEntryField.delete(0, 'end'); J1curAngEntryField.insert(0, CAL['J1AngCur'])
-    J2curAngEntryField.delete(0, 'end'); J2curAngEntryField.insert(0, CAL['J2AngCur'])
-    J3curAngEntryField.delete(0, 'end'); J3curAngEntryField.insert(0, CAL['J3AngCur'])
-    J4curAngEntryField.delete(0, 'end'); J4curAngEntryField.insert(0, CAL['J4AngCur'])
-    J5curAngEntryField.delete(0, 'end'); J5curAngEntryField.insert(0, CAL['J5AngCur'])
-    J6curAngEntryField.delete(0, 'end'); J6curAngEntryField.insert(0, CAL['J6AngCur'])
+    for field, slider, value in zip(
+        (
+            J1curAngEntryField,
+            J2curAngEntryField,
+            J3curAngEntryField,
+            J4curAngEntryField,
+            J5curAngEntryField,
+            J6curAngEntryField,
+        ),
+        (
+            J1jogslide,
+            J2jogslide,
+            J3jogslide,
+            J4jogslide,
+            J5jogslide,
+            J6jogslide,
+        ),
+        joint_values,
+    ):
+        field.delete(0, 'end')
+        field.insert(0, value)
+        slider.set(value)
+    return True
 
 
 
@@ -647,26 +1661,79 @@ def refresh_gui_from_joint_angles(joint_angles):
 
 
 def start_driveMotorsJ_thread(*args):
-    if drive_lock.locked():
-        logger.info("Drive already in progress — ignoring new command.")
-        return
-    t = threading.Thread(target=run_driveMotorsJ_safe, args=args, daemon=True)
-    t.start()
+    if not drive_lock.acquire(blocking=False):
+        logger.info("Drive already in progress; command rejected")
+        return False
+    operation = VirtualMotionOperation()
+    try:
+        thread = threading.Thread(
+            target=run_driveMotorsJ_safe,
+            args=(operation,) + args,
+            daemon=True,
+        )
+        thread.start()
+    except Exception:
+        drive_lock.release()
+        raise
+    return operation
 
-def run_driveMotorsJ_safe(*args):
-    with drive_lock:
-        driveMotorsJ(*args)    
+def run_driveMotorsJ_safe(operation, *args):
+    if not isinstance(operation, VirtualMotionOperation):
+        raise TypeError("virtual drive operation has an invalid type")
+    error = None
+    try:
+        driveMotorsJ(*args)
+    except BaseException as exc:
+        detail = str(exc).strip() or type(exc).__name__
+        error = f"{type(exc).__name__}: {detail}"
+        logger.exception("Virtual drive execution failed")
+    finally:
+        try:
+            drive_lock.release()
+        except BaseException as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            if error is None:
+                error = f"{type(exc).__name__}: {detail}"
+            logger.exception("Virtual drive ownership release failed")
+        if error is None:
+            operation.complete(True)
+        else:
+            operation.complete(False, error)
+
+
+def _validated_virtual_six_vector(values, label):
+    try:
+        vector = tuple(values)
+    except TypeError as exc:
+        raise MotionInputError(f"{label} must be a six-value numeric sequence") from exc
+    if len(vector) != 6:
+        raise MotionInputError(f"{label} must contain six values")
+    return tuple(
+        finite_number(value, f"{label} field {index}")
+        for index, value in enumerate(vector, start=1)
+    )
 
 
 def driveMotorsJ(
     J1step, J2step, J3step, J4step, J5step, J6step,
     J1dir, J2dir, J3dir, J4dir, J5dir, J6dir,
-    SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp):
+    SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp,
+    cartesian_start=None, cartesian_target=None):
 
     
     #global J1StepM, J2StepM, J3StepM, J4StepM, J5StepM, J6StepM
     #global xyzuvw_In
-    # global RUN['xyzuvw_Out'], RUN['stepDeg'], RUN['negLim'], RUN['VR_angles']
+    timing_start = None
+    timing_target = None
+    if SpeedType == "m":
+        timing_start = _validated_virtual_six_vector(
+            cartesian_start,
+            "Cartesian timing start",
+        )
+        timing_target = _validated_virtual_six_vector(
+            cartesian_target,
+            "Cartesian timing target",
+        )
 
     limits = robot.get_joint_limits()
 
@@ -691,13 +1758,12 @@ def driveMotorsJ(
 
 
     if live_cartesian_lock.locked():
-        virOffset = 4.7
+        virOffset = VIRTUAL_CARTESIAN_SECONDS_SCALE
     elif live_tool_lock.locked():
-        virOffset = 5.1
+        virOffset = VIRTUAL_TOOL_SECONDS_SCALE
     else:
-        virOffset = 4.5    
+        virOffset = VIRTUAL_JOINT_SECONDS_SCALE
 
-    # Keep your existing virOffset scaling
     SpeedVal = SpeedVal * virOffset
     #ACCspd   = ACCspd   * virOffset
     #DCCspd   = DCCspd   * virOffset
@@ -712,10 +1778,10 @@ def driveMotorsJ(
     speedSP = 0.0
     if SpeedType == "s":
         speedSP = SpeedVal * 1_000_000.0
-    elif SpeedType == "m" and RUN['xyzuvw_In'] and RUN['xyzuvw_Out']:
-        dx = RUN['xyzuvw_In'][0] - RUN['xyzuvw_Out'][0]
-        dy = RUN['xyzuvw_In'][1] - RUN['xyzuvw_Out'][1]
-        dz = RUN['xyzuvw_In'][2] - RUN['xyzuvw_Out'][2]
+    elif SpeedType == "m":
+        dx = timing_target[0] - timing_start[0]
+        dy = timing_target[1] - timing_start[1]
+        dz = timing_target[2] - timing_start[2]
         lineDist = math.sqrt(dx*dx + dy*dy + dz*dz)
         # seconds = distance / (mm/s)
         speedSP = (lineDist / SpeedVal) * 1_000_000.0
@@ -813,13 +1879,16 @@ def driveMotorsJ(
         time.sleep(max((curDelay - disDelayCur), 0) / 1_000_000)
 
     RUN['J1StepM'], RUN['J2StepM'], RUN['J3StepM'], RUN['J4StepM'], RUN['J5StepM'], RUN['J6StepM'] = RUN['StepMonitors']
-    if RUN['offlineMode'] and not RUN['liveJog']:
-        refresh_gui_from_joint_angles(RUN['VR_angles'])
 
 
 def parse_mj_command(inData):
-    pattern = r"X([-+]?[0-9.]+)Y([-+]?[0-9.]+)Z([-+]?[0-9.]+)Rz([-+]?[0-9.]+)Ry([-+]?[0-9.]+)Rx([-+]?[0-9.]+)Sp([-+]?[0-9.]+)Ac([-+]?[0-9.]+)Dc([-+]?[0-9.]+)Rm([-+]?[0-9.]+)"
-    match = re.search(pattern, inData)
+    try:
+        normalized = canonicalize_virtual_command(inData)
+    except MotionInputError as exc:
+        logger.error("MJ command parse failed: %s", exc)
+        return None
+    pattern = r"X([-+]?[0-9.]+)Y([-+]?[0-9.]+)Z([-+]?[0-9.]+)Rz([-+]?[0-9.]+)Ry([-+]?[0-9.]+)Rx([-+]?[0-9.]+)S[psm]([-+]?[0-9.]+)Ac([-+]?[0-9.]+)Dc([-+]?[0-9.]+)Rm([-+]?[0-9.]+)"
+    match = re.search(pattern, normalized)
     if not match:
         logger.error("MJ command parse failed")
         return None
@@ -827,6 +1896,7 @@ def parse_mj_command(inData):
     vals = [float(v) for v in match.groups()]
     return {
         "xyzuvw": vals[:6],
+        "SpeedType": normalized[normalized.find("S") + 1],
         "Speed": vals[6],
         "Acc": vals[7],
         "Dec": vals[8],
@@ -944,7 +2014,7 @@ def rj_command(in_data):
     total_axis_fault = sum(faults)
 
     if total_axis_fault == 0:
-        start_driveMotorsJ_thread(
+        return start_driveMotorsJ_thread(
             *[abs(d) for d in step_difs],
             *dirs,
             SpeedType,
@@ -957,6 +2027,7 @@ def rj_command(in_data):
         if RUN['offlineMode']:
           RUN['Alarm'] = "EL" + ''.join(str(f) for f in faults)
           ErrorHandler(RUN['Alarm'])
+    return False
 
 
 def mj_command(inData):
@@ -972,17 +2043,43 @@ def mj_command(inData):
     if not result:
         if RUN['offlineMode']:
           ErrorHandler("ER")
-        return
+        return False
 
     # Extract values
-    RUN['xyzuvw_In'][:] = result["xyzuvw"]
+    target_xyzuvw = np.array(result["xyzuvw"], dtype=float)
     SpeedVal = result["Speed"]
     ACCspd = result["Acc"]
     DCCspd = result["Dec"]
     ACCramp = result["Ramp"]
-    SpeedType = inData[inData.find("S") + 1]
+    SpeedType = result["SpeedType"]
 
-    RUN['xyzuvw_In'] = np.array(RUN['xyzuvw_In'], dtype=float)
+    cartesian_start = None
+    cartesian_target = None
+    if SpeedType == "m":
+        try:
+            current_angles = _validated_virtual_six_vector(
+                RUN['VR_angles'],
+                "Virtual joint timing start",
+            )
+            native_cartesian_start = _validated_virtual_six_vector(
+                robot.forward_kinematics(current_angles),
+                "Cartesian timing start",
+            )
+            cartesian_start = (
+                native_cartesian_start[:3]
+                + tuple(math.degrees(value) for value in native_cartesian_start[3:])
+            )
+            cartesian_target = _validated_virtual_six_vector(
+                target_xyzuvw,
+                "Cartesian timing target",
+            )
+        except Exception as exc:
+            logger.error("MJ Cartesian timing preparation failed: %s", exc)
+            if RUN['offlineMode']:
+                ErrorHandler("ER")
+            return False
+
+    RUN['xyzuvw_In'] = target_xyzuvw
 
     # IK call
     RUN['JangleOut'] = robot.SolveInverseKinematics(RUN['xyzuvw_In'], RUN['VR_angles'])
@@ -991,7 +2088,7 @@ def mj_command(inData):
         if RUN['offlineMode']:
           logger.error("Inverse kinematics failed. No solution found.")
           ErrorHandler("ER")
-        return
+        return False
 
  
     RUN['JangleOut'] = np.array(RUN['JangleOut'], dtype=np.float64).flatten()
@@ -1022,20 +2119,23 @@ def mj_command(inData):
     total_axis_fault = sum(faults)
 
     if total_axis_fault == 0:
-        start_driveMotorsJ_thread(
+        return start_driveMotorsJ_thread(
             *[abs(d) for d in step_difs],
             *dirs,
             SpeedType,
             SpeedVal,
             ACCspd,
             DCCspd,
-            ACCramp
+            ACCramp,
+            cartesian_start,
+            cartesian_target,
         )
     else:
         if RUN['offlineMode']:
           RUN['Alarm'] = "EL" + ''.join(str(f) for f in faults)
           ErrorHandler(RUN['Alarm'])
           logger.error(RUN['Alarm'])
+    return False
 
 
 
@@ -1055,29 +2155,33 @@ def mt_command(inData):
         return
     
     offset = [float(v) for v in result["offset_vector"]]
+    original_tool_frame = tuple(
+        finite_number(field.get(), f"tool-frame field {index}")
+        for index, field in enumerate((
+            TFxEntryField,
+            TFyEntryField,
+            TFzEntryField,
+            TFrzEntryField,
+            TFryEntryField,
+            TFrxEntryField,
+        ), start=1)
+    )
     robot.set_robot_tool_frame(*offset)
-
-    # Build xyzuvw_In from current pose
-    RUN['xyzuvw_In'] = np.array([
-        float(CAL['XcurPos']),
-        float(CAL['YcurPos']),
-        float(CAL['ZcurPos']),
-        float(CAL['RzcurPos']),
-        float(CAL['RycurPos']),
-        float(CAL['RxcurPos'])
-    ], dtype=float)
-
-
-    # IK solve
-    RUN['JangleOut'] = robot.SolveInverseKinematics(RUN['xyzuvw_In'], RUN['VR_angles'])
-
-    # put tool frame back where it was
-    robot.set_robot_tool_frame(float(TFxEntryField.get()), 
-                                   float(TFyEntryField.get()), 
-                                   float(TFzEntryField.get()), 
-                                   float(TFrxEntryField.get()), 
-                                   float(TFryEntryField.get()), 
-                                   float(TFrzEntryField.get()))
+    try:
+        RUN['xyzuvw_In'] = np.array([
+            float(CAL['XcurPos']),
+            float(CAL['YcurPos']),
+            float(CAL['ZcurPos']),
+            float(CAL['RzcurPos']),
+            float(CAL['RycurPos']),
+            float(CAL['RxcurPos'])
+        ], dtype=float)
+        RUN['JangleOut'] = robot.SolveInverseKinematics(
+            RUN['xyzuvw_In'],
+            RUN['VR_angles'],
+        )
+    finally:
+        robot.set_robot_tool_frame(*original_tool_frame)
 
     if RUN['JangleOut'] is None:
         if RUN['offlineMode']:
@@ -1111,7 +2215,7 @@ def mt_command(inData):
             faults.append(0)
 
     if sum(faults) == 0:
-        start_driveMotorsJ_thread(
+        return start_driveMotorsJ_thread(
             *[abs(d) for d in step_difs],
             *dirs,
             result["SpeedType"],
@@ -1124,10 +2228,40 @@ def mt_command(inData):
         if RUN['offlineMode']:
             RUN['Alarm'] = "EL" + ''.join(str(f) for f in faults)
             ErrorHandler(RUN['Alarm'])     
+    return False
      
 
 
-def live_joint_jog(in_data):
+def _queue_virtual_motion_error(response):
+    virtual_motion_event_queue.put(("error", response))
+
+
+def _start_offline_virtual_segment(stop_event, args):
+    while True:
+        with offline_live_jog_state_lock:
+            if stop_event.is_set():
+                return None
+            operation = start_driveMotorsJ_thread(*args)
+        if isinstance(operation, VirtualMotionOperation):
+            return operation
+        if operation is not False:
+            raise TypeError("offline virtual segment returned an invalid operation")
+        time.sleep(CONTROL_POLL_INTERVAL_SECONDS)
+
+
+def _await_offline_virtual_segment(operation):
+    if not isinstance(operation, VirtualMotionOperation):
+        raise TypeError("offline virtual segment has an invalid operation")
+    while not operation.completed:
+        operation.wait(CONTROL_POLL_INTERVAL_SECONDS)
+    succeeded, error = operation.result()
+    if not succeeded:
+        logger.error("Offline virtual segment failed: %s", error)
+        _queue_virtual_motion_error("ER")
+    return succeeded
+
+
+def live_joint_jog(in_data, stop_event):
     #global J1StepM, J2StepM, J3StepM, J4StepM, J5StepM, J6StepM
     # global RUN['VR_angles'], RUN['J1axisLimNeg'], RUN['J2axisLimNeg'], RUN['J3axisLimNeg'], RUN['J4axisLimNeg'], RUN['J5axisLimNeg'], RUN['J6axisLimNeg']
     # global RUN['Alarm'], RUN['flag']
@@ -1147,21 +2281,18 @@ def live_joint_jog(in_data):
 
     if not (0 <= idx < 6):
         RUN['Alarm'] = "ER"
-        ErrorHandler(RUN['Alarm'])
-        return
+        _queue_virtual_motion_error(RUN['Alarm'])
+        return False
 
-    RUN['liveJog'] = True
-    while RUN['liveJog']:
-        while drive_lock.locked():
-                    time.sleep(0.005)   
+    while not stop_event.is_set():
         try:
             Jangles = [float(a) for a in RUN['VR_angles'][:6]]
         except Exception as e:
             if RUN['offlineMode']:
-              logger.error("Invalid RUN['VR_angles']:", RUN['VR_angles'][:6])
+              logger.error("Invalid virtual joint angles: %r", RUN['VR_angles'][:6])
               RUN['Alarm'] = "ER"
-              ErrorHandler(RUN['Alarm'])
-            return
+              _queue_virtual_motion_error(RUN['Alarm'])
+            return False
 
         Jangles[idx] += direction * .1
 
@@ -1192,30 +2323,36 @@ def live_joint_jog(in_data):
         total_axis_fault = sum(faults)
 
         if total_axis_fault == 0:
-            if not drive_lock.locked():
-                start_driveMotorsJ_thread(
+            operation = _start_offline_virtual_segment(
+                stop_event,
+                (
                     *[abs(d) for d in step_difs],
                     *dirs,
                     SpeedType,
                     SpeedVal,
                     ACCspd,
                     DCCspd,
-                    ACCramp
+                    ACCramp,
+                ),
             )
+            if operation is None:
+                break
+            if not _await_offline_virtual_segment(operation):
+                return False
 
                 
         else:
             if RUN['offlineMode']:
               RUN['Alarm'] = "EL" + ''.join(str(f) for f in faults)
-              ErrorHandler(RUN['Alarm'])
+              _queue_virtual_motion_error(RUN['Alarm'])
               RUN['Alarm'] = "0"
-            break
+            return False
+    return True
 
 
 
-def live_cartesian_jog(in_data):
+def live_cartesian_jog(in_data, stop_event):
     #global xyzuvw_In, KinematicError
-    # global RUN['xyzuvw_Out'], RUN['VR_angles'], RUN['JangleOut'], RUN['Alarm']
     #global J1StepM, J2StepM, J3StepM, J4StepM, J5StepM, J6StepM
     # global RUN['J1axisLimNeg'], RUN['J2axisLimNeg'], RUN['J3axisLimNeg'], RUN['J4axisLimNeg'], RUN['J5axisLimNeg'], RUN['J6axisLimNeg']
     #global liveJog
@@ -1240,11 +2377,7 @@ def live_cartesian_jog(in_data):
         float(CAL['RxcurPos'])
     ], dtype=float)
 
-    RUN['liveJog'] = True
-    while RUN['liveJog']:
-        while drive_lock.locked():
-            time.sleep(0.005)   
-
+    while not stop_event.is_set():
         idx = int(Vector // 10) - 1
         direction = 1 if int(Vector) % 10 == 1 else -1
 
@@ -1252,22 +2385,22 @@ def live_cartesian_jog(in_data):
             RUN['xyzuvw_In'][idx] += direction * jog_step
         else:
             RUN['Alarm'] = "ER"
-            #ErrorHandler(Alarm)
-            break
+            _queue_virtual_motion_error(RUN['Alarm'])
+            return False
 
         # Inverse Kinematics
         try:
             RUN['JangleOut'] = robot.SolveInverseKinematics(RUN['xyzuvw_In'], RUN['VR_angles'])
         except Exception as e:
-            logger.error("IK Exception:", e)
-            ErrorHandler("ER")
-            break
+            logger.error("Virtual Cartesian jog IK failed: %s", e)
+            _queue_virtual_motion_error("ER")
+            return False
 
         if RUN['JangleOut'] is None:
             if RUN['offlineMode']:
               RUN['Alarm'] = "ER"
-              ErrorHandler(RUN['Alarm'])
-            break
+              _queue_virtual_motion_error(RUN['Alarm'])
+            return False
         
         RUN['JangleOut'] = np.array(RUN['JangleOut'], dtype=np.float64).flatten()
 
@@ -1299,26 +2432,36 @@ def live_cartesian_jog(in_data):
             else:
                 faults.append(0)
 
-        if sum(faults) == 0 and RUN['KinematicError'] == 0:
-            if not drive_lock.locked():
-                start_driveMotorsJ_thread(
+        if (
+            sum(faults) == 0
+            and RUN['KinematicError'] == 0
+        ):
+            operation = _start_offline_virtual_segment(
+                stop_event,
+                (
                     *[abs(d) for d in step_difs],
                     *dirs,
                     SpeedType,
                     SpeedVal,
                     ACCspd,
                     DCCspd,
-                    ACCramp
+                    ACCramp,
+                ),
             )
+            if operation is None:
+                break
+            if not _await_offline_virtual_segment(operation):
+                return False
 
                  
         else:
             RUN['Alarm'] = "EL" + ''.join(str(f) for f in faults)
-            ErrorHandler(RUN['Alarm'])
-            break
+            _queue_virtual_motion_error(RUN['Alarm'])
+            return False
+    return True
 
 
-def live_tool_jog(in_data):
+def live_tool_jog(in_data, original_tool_frame, stop_event):
     #global xyzuvw_In, KinematicError
     # global RUN['JangleOut'], RUN['Alarm'], RUN['VR_angles']
     #global J1StepM, J2StepM, J3StepM, J4StepM, J5StepM, J6StepM
@@ -1338,26 +2481,22 @@ def live_tool_jog(in_data):
     # Tool frame jog step size
     jog_step = 1  # mm or degrees depending on axis
 
-    # Save original tool frame to restore later
-    original_tool_frame = [
-        float(TFxEntryField.get()),
-        float(TFyEntryField.get()),
-        float(TFzEntryField.get()),
-        float(TFrxEntryField.get()),
-        float(TFryEntryField.get()),
-        float(TFrzEntryField.get())
-    ]
+    try:
+        original_tool_frame = tuple(
+            finite_number(value, "tool-frame value")
+            for value in original_tool_frame
+        )
+    except (TypeError, ValueError):
+        _queue_virtual_motion_error("ER")
+        return False
+    if len(original_tool_frame) != 6 or not all(
+        math.isfinite(value) for value in original_tool_frame
+    ):
+        _queue_virtual_motion_error("ER")
+        return False
 
-    RUN['liveJog'] = True
-    while RUN['liveJog']:
-        while drive_lock.locked():
-            time.sleep(0.005)
-
+    while not stop_event.is_set():
         idx = int(Vector // 10) - 1
-        if idx == 3:  # Rz → Trx
-            idx = 5
-        elif idx == 5:  # Rx → Trz
-            idx = 3
 
         direction = 1 if int(Vector) % 10 == 1 else -1
 
@@ -1367,29 +2506,28 @@ def live_tool_jog(in_data):
 
         if 0 <= idx < 6:
             # Modify tool frame temporarily
-            jogged_tool_frame = original_tool_frame.copy()
+            jogged_tool_frame = list(original_tool_frame)
             jogged_tool_frame[idx] += direction * jog_step
             robot.set_robot_tool_frame(*jogged_tool_frame)
         else:
             RUN['Alarm'] = "ER"
-            ErrorHandler(RUN['Alarm'])
-            break
+            _queue_virtual_motion_error(RUN['Alarm'])
+            return False
 
         try:
             RUN['JangleOut'] = robot.SolveInverseKinematics(RUN['xyzuvw_In'], RUN['VR_angles'])
         except Exception as e:
-            logger.error(f"IK Exception: {e}")
-            ErrorHandler("ER")
-            break
-
-        # Restore original tool frame
-        robot.set_robot_tool_frame(*original_tool_frame)
+            logger.error("Virtual tool jog IK failed: %s", e)
+            _queue_virtual_motion_error("ER")
+            return False
+        finally:
+            robot.set_robot_tool_frame(*original_tool_frame)
 
         if RUN['JangleOut'] is None:
             if RUN['offlineMode']:
                 RUN['Alarm'] = "ER"
-                ErrorHandler(RUN['Alarm'])
-            break
+                _queue_virtual_motion_error(RUN['Alarm'])
+            return False
 
         RUN['JangleOut'] = np.array(RUN['JangleOut'], dtype=np.float64).flatten()
 
@@ -1419,21 +2557,31 @@ def live_tool_jog(in_data):
             else:
                 faults.append(0)
 
-        if sum(faults) == 0 and RUN['KinematicError'] == 0:
-            if not drive_lock.locked():
-                start_driveMotorsJ_thread(
+        if (
+            sum(faults) == 0
+            and RUN['KinematicError'] == 0
+        ):
+            operation = _start_offline_virtual_segment(
+                stop_event,
+                (
                     *[abs(d) for d in step_difs],
                     *dirs,
                     SpeedType,
                     SpeedVal,
                     ACCspd,
                     DCCspd,
-                    ACCramp
-                )
+                    ACCramp,
+                ),
+            )
+            if operation is None:
+                break
+            if not _await_offline_virtual_segment(operation):
+                return False
         else:
             RUN['Alarm'] = "EL" + ''.join(str(f) for f in faults)
-            ErrorHandler(RUN['Alarm'])
-            break
+            _queue_virtual_motion_error(RUN['Alarm'])
+            return False
+    return True
         
 
 
@@ -1451,45 +2599,123 @@ RUN['joint_transforms'] = {}
 RUN['composite_transforms'] = {}
 
 
-def toggle_offline_mode():
-    #global offlineMode
-    # global RUN['VR_angles']
-    RUN['offlineMode'] = not RUN['offlineMode']
-    if RUN['offlineMode']:
-        offline_button.config(text="Go Online", style="Offline.TButton")
-        almStatusLab.config(text="SYSTEM IN OFFLINE MODE", style="Warn.TLabel")
-        almStatusLab2.config(text="SYSTEM IN OFFLINE MODE", style="Warn.TLabel")
-        RUN['VR_angles'] = [0.000, 0.000, 0.000, 0.000, 90.000, 0.000]
-        J1negLimLab.config(text="-"+CAL['J1NegLim'], style="Jointlim.TLabel")
-        J1posLimLab.config(text=CAL['J1PosLim'], style="Jointlim.TLabel")
-        J1jogslide.config(from_=float("-"+CAL['J1NegLim']), to=float(CAL['J1PosLim']),  length=180, orient=HORIZONTAL,  command=J1sliderUpdate)
-        J2negLimLab.config(text="-"+CAL['J2NegLim'], style="Jointlim.TLabel")
-        J2posLimLab.config(text=CAL['J2PosLim'], style="Jointlim.TLabel")
-        J2jogslide.config(from_=float("-"+CAL['J2NegLim']), to=float(CAL['J2PosLim']),  length=180, orient=HORIZONTAL,  command=J2sliderUpdate)
-        J3negLimLab.config(text="-"+CAL['J3NegLim'], style="Jointlim.TLabel")
-        J3posLimLab.config(text=CAL['J3PosLim'], style="Jointlim.TLabel")
-        J3jogslide.config(from_=float("-"+CAL['J3NegLim']), to=float(CAL['J3PosLim']),  length=180, orient=HORIZONTAL,  command=J3sliderUpdate)
-        J4negLimLab.config(text="-"+CAL['J4NegLim'], style="Jointlim.TLabel")
-        J4posLimLab.config(text=CAL['J4PosLim'], style="Jointlim.TLabel")
-        J4jogslide.config(from_=float("-"+CAL['J4NegLim']), to=float(CAL['J4PosLim']),  length=180, orient=HORIZONTAL,  command=J4sliderUpdate)
-        J5negLimLab.config(text="-"+CAL['J5NegLim'], style="Jointlim.TLabel")
-        J5posLimLab.config(text=CAL['J5PosLim'], style="Jointlim.TLabel")
-        J5jogslide.config(from_=float("-"+CAL['J5NegLim']), to=float(CAL['J5PosLim']),  length=180, orient=HORIZONTAL,  command=J5sliderUpdate)
-        J6negLimLab.config(text="-"+CAL['J6NegLim'], style="Jointlim.TLabel")
-        J6posLimLab.config(text=CAL['J6PosLim'], style="Jointlim.TLabel")
-        J6jogslide.config(from_=float("-"+CAL['J6NegLim']), to=float(CAL['J6PosLim']),  length=180, orient=HORIZONTAL,  command=J6sliderUpdate)
-        refresh_gui_from_joint_angles(RUN['VR_angles'])
+def _mode_change_is_blocked(request_lease=None, transport_reserved=False):
+    if not isinstance(transport_reserved, bool):
+        raise TypeError("mode-transition transport reservation flag must be boolean")
+    if request_lease is not None and not motion_request_registry.owns(request_lease):
+        raise RuntimeError("mode transition requires matching motion ownership")
+    if transport_reserved and request_lease is None:
+        raise RuntimeError("mode transition transport requires motion ownership")
+    if transport_reserved and not serial_lock.locked():
+        raise RuntimeError("mode transition transport reservation is missing")
 
+    if application_closing.is_set():
+        message = "Mode change rejected during application shutdown"
+    elif (
+        controller_correction_requested.is_set()
+        or manual_motion_pose_pending.is_set()
+        or controller_position_resynchronization_required.is_set()
+    ):
+        message = "Mode change rejected while controller recovery is pending"
+    elif (
+        _virtual_motion_active(request_lease)
+        or live_serial_result_pending.is_set()
+        or legacy_serial_result_pending.is_set()
+        or joint_motion_dispatcher.active
+        or (serial_lock.locked() and not transport_reserved)
+    ):
+        message = "Mode change rejected while motion or controller ownership is active"
+    else:
+        return False
+    logger.warning(message)
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
+    return True
+
+
+def _set_offline_mode_status(offline):
+    if offline:
+        offline_button.config(text="Go Online", style="Offline.TButton")
+        message = "SYSTEM IN OFFLINE MODE"
+        style = "Warn.TLabel"
     else:
         offline_button.config(text="Run Offline", style="Online.TButton")
-        almStatusLab.config(text="SYSTEM IN ONLINE MODE", style="OK.TLabel")
-        almStatusLab2.config(text="SYSTEM IN ONLINE MODE", style="OK.TLabel")
-        requestPos()
-        RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-        setStepMonitorsVR()
-        
-def request_render():
-    RUN['render_window'].Render()
+        message = "SYSTEM IN ONLINE MODE"
+        style = "OK.TLabel"
+    almStatusLab.config(text=message, style=style)
+    almStatusLab2.config(text=message, style=style)
+
+
+def toggle_offline_mode():
+    request_lease = _acquire_motion_request("Mode transition")
+    if request_lease is None:
+        message = "Mode change rejected while motion or recovery ownership is active"
+        logger.warning(message)
+        almStatusLab.config(text=message, style="Warn.TLabel")
+        almStatusLab2.config(text=message, style="Warn.TLabel")
+        return False
+    try:
+        with _reserve_main_serial_operation():
+            if _mode_change_is_blocked(
+                request_lease,
+                transport_reserved=True,
+            ):
+                return False
+
+            if RUN['offlineMode']:
+                virtual_snapshot = list(RUN['VR_angles'])
+                if requestPos() is not True:
+                    RUN['VR_angles'] = virtual_snapshot
+                    _set_offline_mode_status(True)
+                    return False
+                RUN['offlineMode'] = False
+                _set_offline_mode_status(False)
+                RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
+                setStepMonitorsVR()
+            else:
+                previous_virtual_pose = list(RUN['VR_angles'])
+                RUN['offlineMode'] = True
+                _set_offline_mode_status(True)
+                RUN['VR_angles'] = [0.000, 0.000, 0.000, 0.000, 90.000, 0.000]
+                J1negLimLab.config(text="-"+CAL['J1NegLim'], style="Jointlim.TLabel")
+                J1posLimLab.config(text=CAL['J1PosLim'], style="Jointlim.TLabel")
+                J1jogslide.config(from_=float("-"+CAL['J1NegLim']), to=float(CAL['J1PosLim']),  length=180, orient=HORIZONTAL,  command=J1sliderUpdate)
+                J2negLimLab.config(text="-"+CAL['J2NegLim'], style="Jointlim.TLabel")
+                J2posLimLab.config(text=CAL['J2PosLim'], style="Jointlim.TLabel")
+                J2jogslide.config(from_=float("-"+CAL['J2NegLim']), to=float(CAL['J2PosLim']),  length=180, orient=HORIZONTAL,  command=J2sliderUpdate)
+                J3negLimLab.config(text="-"+CAL['J3NegLim'], style="Jointlim.TLabel")
+                J3posLimLab.config(text=CAL['J3PosLim'], style="Jointlim.TLabel")
+                J3jogslide.config(from_=float("-"+CAL['J3NegLim']), to=float(CAL['J3PosLim']),  length=180, orient=HORIZONTAL,  command=J3sliderUpdate)
+                J4negLimLab.config(text="-"+CAL['J4NegLim'], style="Jointlim.TLabel")
+                J4posLimLab.config(text=CAL['J4PosLim'], style="Jointlim.TLabel")
+                J4jogslide.config(from_=float("-"+CAL['J4NegLim']), to=float(CAL['J4PosLim']),  length=180, orient=HORIZONTAL,  command=J4sliderUpdate)
+                J5negLimLab.config(text="-"+CAL['J5NegLim'], style="Jointlim.TLabel")
+                J5posLimLab.config(text=CAL['J5PosLim'], style="Jointlim.TLabel")
+                J5jogslide.config(from_=float("-"+CAL['J5NegLim']), to=float(CAL['J5PosLim']),  length=180, orient=HORIZONTAL,  command=J5sliderUpdate)
+                J6negLimLab.config(text="-"+CAL['J6NegLim'], style="Jointlim.TLabel")
+                J6posLimLab.config(text=CAL['J6PosLim'], style="Jointlim.TLabel")
+                J6jogslide.config(from_=float("-"+CAL['J6NegLim']), to=float(CAL['J6PosLim']),  length=180, orient=HORIZONTAL,  command=J6sliderUpdate)
+                try:
+                    refresh_gui_from_joint_angles(RUN['VR_angles'])
+                except MotionInputError as exc:
+                    RUN['offlineMode'] = False
+                    RUN['VR_angles'] = previous_virtual_pose
+                    setStepMonitorsVR()
+                    _set_offline_mode_status(False)
+                    message = f"Mode change rejected during virtual refresh: {exc}"
+                    logger.error(message)
+                    almStatusLab.config(text=message, style="Alarm.TLabel")
+                    almStatusLab2.config(text=message, style="Alarm.TLabel")
+                    return False
+            return True
+    except SerialActivityRejected as exc:
+        message = f"Mode change rejected: {exc}"
+        logger.warning(message)
+        almStatusLab.config(text=message, style="Warn.TLabel")
+        almStatusLab2.config(text=message, style="Warn.TLabel")
+        return False
+    finally:
+        _finish_motion_request(request_lease)
 
 def update_joint_transforms():
     angles = RUN['VR_angles']  # List of 6 joint angles in degrees
@@ -1711,10 +2937,24 @@ def on_close_event(obj, event):
         pass
 
 def update_vtk(render_window, root_widget):
-    if RUN['vtk_running']:
+    if not RUN['vtk_running']:
+        return
+
+    angles = tuple(
+        finite_number(angle, "virtual joint angle")
+        for angle in RUN['VR_angles']
+    )
+    angles_changed = angles != RUN.get('lastRenderedAngles')
+    if angles_changed:
         update_joint_angles()
-        tab1.after(0, request_render)
-        root_widget.after(16, lambda: update_vtk(RUN['render_window'], root_widget))
+        render_window.Render()
+        RUN['lastRenderedAngles'] = angles
+
+    delay_ms = 16 if angles_changed else 100
+    root_widget.after(
+        delay_ms,
+        lambda: update_vtk(render_window, root_widget),
+    )
 
 
 def add_reset_view_button(renderer, interactor, camera):
@@ -1784,117 +3024,123 @@ def launch_vtk_nonblocking(root_widget):
     RUN['interactor'].Initialize()
     RUN['render_window'].Render()
     
-    # Set window to stay on top
-    set_vtk_topmost_delayed(RUN['render_window'], root_widget)
-
-    # Embed periodic update and check render loop
-    update_vtk(RUN['render_window'], root_widget)
+    set_vtk_topmost_delayed()
 
     RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
     setStepMonitorsVR()
     update_main_color()
 
+    RUN['lastRenderedAngles'] = None
+    update_vtk(RUN['render_window'], root_widget)
 
 
 
 
-def set_vtk_topmost_delayed(render_window, root_widget):
-    '''Continuously keep VTK window on top - cross-platform'''
-    def keep_on_top():
-        import time
-        import platform
-        import subprocess
-        time.sleep(0.5)  # Initial delay for window creation
-        
-        attempt = 0
+
+def set_vtk_topmost_delayed():
+    window_title = "AR4 Virtual Robot Viewer"
+
+    def set_topmost():
+        time.sleep(0.5)
         os_type = platform.system()
-        
-        while RUN['vtk_running']:
+
+        for _attempt in range(20):
+            if not RUN['vtk_running']:
+                return
             try:
                 if os_type == 'Windows':
-                    import win32gui
                     import win32con
-                    
-                    # Find window by title
-                    hwnd = win32gui.FindWindow(None, "AR4 Virtual Robot Viewer")
-                    
-                    if hwnd and hwnd != 0:
-                        win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
-                                            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
-                
-                elif os_type == 'Linux':
-                    # Use wmctrl to set window above others
-                    # First try to find the window
-                    try:
-                        result = subprocess.run(['wmctrl', '-l'], capture_output=True, text=True, check=False)
-                        if result.returncode == 0:
-                            for line in result.stdout.split('\n'):
-                                    window_id = line.split()[0]
-                                    # Set window to stay on top
-                                    subprocess.run(['wmctrl', '-i', '-r', window_id, '-b', 'add,above'], 
-                                                 stderr=subprocess.DEVNULL, check=False)
-                                    break
-                    except FileNotFoundError:
-                        # wmctrl not installed, try xdotool as fallback
-                        try:
-                            result = subprocess.run(['xdotool', 'search', '--name', 'AR4 Virtual Robot Viewer'], 
-                                                  capture_output=True, text=True, check=False)
-                            if result.returncode == 0 and result.stdout.strip():
-                                window_id = result.stdout.strip().split()[0]
-                                subprocess.run(['xdotool', 'windowraise', window_id], 
-                                             stderr=subprocess.DEVNULL, check=False)
-                        except FileNotFoundError:
-                            pass  # Neither wmctrl nor xdotool available
-                
-                attempt += 1
-            except Exception as e:
-                if attempt % 10 == 0:
-                    logger.debug(f"VTK topmost error: {e}")
-            
-            time.sleep(0.5)  # Re-apply every 500ms
-    
-    # Run in a thread to not block
-    import threading
-    threading.Thread(target=keep_on_top, daemon=True).start()
+                    import win32gui
 
-def set_vtk_topmost_delayed(render_window, root_widget):
-    '''Continuously keep VTK window on top using window title'''
-    def keep_on_top():
-        import time
-        import platform
-        time.sleep(0.5)  # Initial delay for window creation
-        
-        attempt = 0
-        while RUN['vtk_running']:
-            try:
-                if platform.system() == 'Windows':
-                    import win32gui
-                    import win32con
-                    
-                    # Find window by title
-                    hwnd = win32gui.FindWindow(None, "AR4 Virtual Robot Viewer")
-                    
-                    # Debug output every 10 attempts (every 3 seconds)
-                    if attempt % 10 == 0:
-                        print(f"[VTK Topmost Debug] Attempt {attempt}: hwnd={hwnd}")
-                    
-                    if hwnd and hwnd != 0:
-                        result = win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
-                                            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
-                        if attempt % 10 == 0:
-                            print(f"[VTK Topmost Debug] SetWindowPos result: {result}")
-                    else:
-                        if attempt % 10 == 0:
-                            print(f"[VTK Topmost Debug] Window not found!")
-                    
-                    attempt += 1
-            except Exception as e:
-                print(f"[VTK Topmost Debug] Error: {e}")
-            time.sleep(0.3)  # Re-apply every 300ms
-    
-    # Run in a thread to not block
-    import threading
-    threading.Thread(target=keep_on_top, daemon=True).start()
+                    hwnd = win32gui.FindWindow(None, window_title)
+                    if hwnd:
+                        win32gui.SetWindowPos(
+                            hwnd,
+                            win32con.HWND_TOPMOST,
+                            0,
+                            0,
+                            0,
+                            0,
+                            win32con.SWP_NOMOVE
+                            | win32con.SWP_NOSIZE
+                            | win32con.SWP_NOACTIVATE,
+                        )
+                        return
+
+                elif os_type == 'Linux':
+                    try:
+                        result = subprocess.run(
+                            ['wmctrl', '-l'],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=2,
+                        )
+                    except FileNotFoundError:
+                        result = None
+
+                    if result is not None and result.returncode == 0:
+                        for line in result.stdout.splitlines():
+                            fields = line.split(maxsplit=3)
+                            if len(fields) == 4 and window_title in fields[3]:
+                                mutation = subprocess.run(
+                                    [
+                                        'wmctrl',
+                                        '-i',
+                                        '-r',
+                                        fields[0],
+                                        '-b',
+                                        'add,above',
+                                    ],
+                                    capture_output=True,
+                                    check=False,
+                                    timeout=2,
+                                )
+                                if mutation.returncode == 0:
+                                    return
+                                logger.debug(
+                                    "wmctrl could not mark the VTK viewer topmost: exit %s",
+                                    mutation.returncode,
+                                )
+
+                    try:
+                        result = subprocess.run(
+                            ['xdotool', 'search', '--name', window_title],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=2,
+                        )
+                    except FileNotFoundError:
+                        result = None
+
+                    if result is not None and result.returncode == 0:
+                        window_ids = result.stdout.split()
+                        if window_ids:
+                            mutation = subprocess.run(
+                                ['xdotool', 'windowraise', window_ids[0]],
+                                capture_output=True,
+                                check=False,
+                                timeout=2,
+                            )
+                            if mutation.returncode == 0:
+                                return
+                            logger.debug(
+                                "xdotool could not raise the VTK viewer: exit %s",
+                                mutation.returncode,
+                            )
+                else:
+                    return
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.debug("VTK topmost attempt failed: %s", exc)
+
+            time.sleep(0.25)
+
+        logger.debug("VTK viewer did not become available for topmost configuration")
+
+    threading.Thread(target=set_topmost, daemon=True).start()
+
+
 
 def update_stl_transform():
     name = stl_name_var.get()
@@ -2012,52 +3258,700 @@ def startup_spinner(root, message="Please wait…"):
     return win, pb
 
 
-def startup_with_spinner(root, timeout=10.0):
+def _validated_startup_command(command, expected_prefix):
+    if not isinstance(command, str) or not command.startswith(expected_prefix):
+        raise MotionInputError(
+            f"controller startup command must begin with {expected_prefix!r}"
+        )
+    if not command.endswith("\n") or "\n" in command[:-1] or "\r" in command:
+        raise MotionInputError(
+            "controller startup command must contain one trailing line delimiter"
+        )
+    if len(command) > MAX_COMMAND_LENGTH:
+        raise MotionInputError("controller startup command exceeds the size limit")
+    try:
+        command.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise MotionInputError(
+            "controller startup command must contain ASCII characters only"
+        ) from exc
+    return command
+
+
+def _build_startup_numeric_command(prefix, fields):
+    if not isinstance(prefix, str) or not prefix or not prefix.isascii():
+        raise MotionInputError("controller startup prefix must be ASCII text")
+    if isinstance(fields, (str, bytes)):
+        raise MotionInputError("controller startup fields must be a sequence")
+    try:
+        fields = iter(fields)
+    except TypeError as exc:
+        raise MotionInputError(
+            "controller startup fields must be a sequence"
+        ) from exc
+    parts = [prefix]
+    markers = set()
+    for index, field in enumerate(fields):
+        if (
+            not isinstance(field, (tuple, list))
+            or len(field) != 2
+        ):
+            raise MotionInputError(
+                f"controller startup field {index} must contain a marker and value"
+            )
+        marker, value = field
+        if (
+            not isinstance(marker, str)
+            or not marker
+            or not marker.isascii()
+            or "\n" in marker
+            or "\r" in marker
+        ):
+            raise MotionInputError("controller startup marker must be ASCII text")
+        if marker in markers:
+            raise MotionInputError(
+                f"controller startup marker {marker!r} is duplicated"
+            )
+        markers.add(marker)
+        parts.append(marker)
+        parts.append(
+            controller_protocol_decimal(
+                value,
+                f"{prefix} field {marker!r}",
+            )
+        )
+    return _validated_startup_command("".join(parts) + "\n", prefix)
+
+
+@dataclass(frozen=True)
+class ControllerStartupRequest:
+    auxiliary_port: Optional[str]
+    update_parameters_command: str
+    external_axis_command: str
+    position_command: str
+    auxiliary_board: Optional[str] = None
+
+    def __post_init__(self):
+        if self.auxiliary_port is None:
+            auxiliary_port = None
+        elif not isinstance(self.auxiliary_port, str):
+            raise MotionInputError("auxiliary controller port must be text")
+        else:
+            auxiliary_port = self.auxiliary_port.strip()
+            if auxiliary_port in ("", "None"):
+                auxiliary_port = None
+        auxiliary_board = normalize_auxiliary_board_profile(
+            self.auxiliary_board,
+            allow_none=True,
+        )
+        object.__setattr__(self, "auxiliary_port", auxiliary_port)
+        object.__setattr__(self, "auxiliary_board", auxiliary_board)
+        object.__setattr__(
+            self,
+            "update_parameters_command",
+            _validated_startup_command(self.update_parameters_command, "UP"),
+        )
+        object.__setattr__(
+            self,
+            "external_axis_command",
+            _validated_startup_command(self.external_axis_command, "CE"),
+        )
+        object.__setattr__(
+            self,
+            "position_command",
+            _validated_startup_command(self.position_command, "SP"),
+        )
+
+
+@dataclass(frozen=True)
+class ControllerStartupResult:
+    position: PositionResponse
+    visual_options: tuple
+    auxiliary_serial: object
+    auxiliary_error: Optional[str] = None
+
+    def __post_init__(self):
+        if not isinstance(self.position, PositionResponse):
+            raise ProtocolResponseError(
+                "controller startup position has an invalid type"
+            )
+        if isinstance(self.visual_options, (str, bytes)):
+            raise ProtocolResponseError("visual options must be a sequence")
+        try:
+            visual_options = tuple(self.visual_options)
+        except TypeError as exc:
+            raise ProtocolResponseError("visual options must be a sequence") from exc
+        if not all(
+            isinstance(option, str)
+            and option.endswith('.jpg')
+            and os.path.basename(option) == option
+            for option in visual_options
+        ):
+            raise ProtocolResponseError("visual options contain an invalid filename")
+        auxiliary_error = self.auxiliary_error
+        if auxiliary_error is not None:
+            if not isinstance(auxiliary_error, str) or not auxiliary_error.strip():
+                raise ProtocolResponseError(
+                    "auxiliary startup error must be non-empty text or None"
+                )
+            auxiliary_error = auxiliary_error.strip()
+        if self.auxiliary_serial is not None and auxiliary_error is not None:
+            raise ProtocolResponseError(
+                "auxiliary startup cannot contain both a connection and an error"
+            )
+        object.__setattr__(self, "visual_options", visual_options)
+        object.__setattr__(self, "auxiliary_error", auxiliary_error)
+
+
+def _startup_visual_options():
+    if getattr(sys, 'frozen', False):
+        folder = os.path.dirname(sys.executable)
+    else:
+        folder = os.path.dirname(os.path.realpath(__file__))
+    return tuple(sorted(
+        filename
+        for filename in os.listdir(folder)
+        if isinstance(filename, str) and filename.endswith('.jpg')
+    ))
+
+
+def _startup_exchange_response(
+    command,
+    cancel_event,
+    expected_response=None,
+):
+    if not isinstance(command, str):
+        raise MotionInputError("controller startup command must be text")
+    command = _validated_startup_command(command, command[:2])
+    if not callable(getattr(cancel_event, "is_set", None)):
+        raise TypeError("controller startup cancellation must satisfy the event contract")
+    if expected_response is not None and (
+        not isinstance(expected_response, bytes) or not expected_response
+    ):
+        raise MotionInputError("expected startup response must be non-empty bytes")
+    framed_expected_response = (
+        expected_response is not None and expected_response.endswith(b"\n")
+    )
+    expected_payload = expected_response
+    if framed_expected_response:
+        try:
+            expected_payload = decode_serial_response_line(
+                expected_response
+            ).encode("ascii")
+        except ProtocolResponseError as exc:
+            raise MotionInputError(
+                "expected framed startup response is invalid"
+            ) from exc
+    elif expected_response is not None and (
+        len(expected_response) > MAX_RESPONSE_PAYLOAD_LENGTH
+        or expected_response != expected_response.strip()
+        or b"\r" in expected_response
+        or b"\n" in expected_response
+        or not expected_response.isascii()
+    ):
+        raise MotionInputError(
+            "expected startup response must contain normalized unframed ASCII bytes"
+        )
+    response_limit = (
+        MAX_RESPONSE_FRAME_LENGTH
+        if expected_response is None or framed_expected_response
+        else MAX_RESPONSE_PAYLOAD_LENGTH
+    )
+
+    serial_port = RUN.get('ser')
+    if serial_port is None or not getattr(serial_port, "is_open", False):
+        raise ConnectionError("controller serial connection is not open")
+    if serial_transport_quarantined(serial_port):
+        raise SerialTransportQuarantinedError(
+            "controller serial connection is quarantined; reconnect required"
+        )
+    try:
+        original_timeout = serial_port.timeout
+    except Exception as exc:
+        raise TypeError("controller serial connection has no read timeout") from exc
+
+    reset_input = getattr(serial_port, "reset_input_buffer", None)
+    if not callable(reset_input):
+        reset_input = getattr(serial_port, "flushInput", None)
+    write = getattr(serial_port, "write", None)
+    flush = getattr(serial_port, "flush", None)
+    read = getattr(serial_port, "read", None)
+    read_until = getattr(serial_port, "read_until", None)
+    if not all(callable(method) for method in (reset_input, write, flush, read)):
+        raise TypeError("controller serial connection lacks the startup I/O contract")
+
+    def cancellation_requested():
+        requested = cancel_event.is_set()
+        if not isinstance(requested, bool):
+            raise ProtocolResponseError(
+                "controller startup cancellation state must be boolean"
+            )
+        return requested
+
+    command_bytes = command.encode("ascii")
+    acquired = serial_write_lock.acquire()
+    if acquired is False:
+        raise RuntimeError("controller startup write lock acquisition failed")
+    try:
+        if cancellation_requested():
+            raise TimeoutError("controller startup cancelled")
+        reset_input()
+        if cancellation_requested():
+            raise TimeoutError("controller startup cancelled")
+        written = write(command_bytes)
+        if written != len(command_bytes):
+            raise OSError(
+                "controller startup write was incomplete: "
+                f"expected {len(command_bytes)} bytes, wrote {written!r}"
+            )
+        flush()
+    finally:
+        serial_write_lock.release()
+
+    response = bytearray()
+    deadline = time.monotonic() + SERIAL_STARTUP_READ_TIMEOUT_SECONDS
+    operation_error = None
+    try:
+        while True:
+            if cancellation_requested():
+                raise TimeoutError("controller startup cancelled")
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                raise SerialTransportTimeout(
+                    "controller startup response deadline expired"
+                )
+            serial_port.timeout = min(
+                CONTROL_POLL_INTERVAL_SECONDS,
+                remaining_time,
+            )
+            remaining_size = response_limit + 1 - len(response)
+            if expected_response is not None and not framed_expected_response:
+                remaining_size = len(expected_response) - len(response)
+                chunk = read(remaining_size)
+            elif callable(read_until):
+                chunk = read_until(b"\n", remaining_size)
+            else:
+                chunk = read(remaining_size)
+            if not isinstance(chunk, (bytes, bytearray)):
+                raise ProtocolResponseError(
+                    "controller startup reader returned a non-bytes response"
+                )
+            if not chunk:
+                continue
+            response.extend(chunk)
+            if len(response) > response_limit:
+                raise ProtocolResponseError(
+                    "controller startup response exceeds the size limit"
+                )
+            if expected_response is not None and not framed_expected_response:
+                if len(response) < len(expected_response):
+                    continue
+                if bytes(response) != expected_response:
+                    raise ProtocolResponseError(
+                        "controller startup returned an unexpected acknowledgement"
+                    )
+                if cancellation_requested():
+                    raise TimeoutError("controller startup cancelled")
+                remaining_time = deadline - time.monotonic()
+                if remaining_time < CONTROL_POLL_INTERVAL_SECONDS:
+                    raise SerialTransportTimeout(
+                      "controller startup quiet-boundary deadline expired"
+                    )
+                serial_port.timeout = CONTROL_POLL_INTERVAL_SECONDS
+                trailing = read(1)
+                if not isinstance(trailing, (bytes, bytearray)):
+                    raise ProtocolResponseError(
+                        "controller startup quiet-boundary reader returned non-bytes"
+                    )
+                if trailing:
+                    raise ProtocolResponseError(
+                        "controller startup returned trailing unframed data"
+                    )
+                if cancellation_requested():
+                    raise TimeoutError("controller startup cancelled")
+                if not getattr(serial_port, "is_open", False):
+                    raise ConnectionError(
+                        "controller startup connection closed before the quiet boundary"
+                    )
+                return bytes(response).decode("ascii")
+            if b"\n" not in response:
+                continue
+            if response.find(b"\n") != len(response) - 1:
+                raise ProtocolResponseError(
+                    "controller startup returned trailing framed data"
+                )
+            framed_payload = bytes(response[:-1])
+            if framed_payload.endswith(b"\r"):
+                framed_payload = framed_payload[:-1]
+            if (
+                framed_expected_response
+                and framed_payload != expected_payload
+            ):
+                raise ProtocolResponseError(
+                    "controller startup returned an unexpected acknowledgement"
+                )
+            decoded = decode_serial_response_line(response)
+            if cancellation_requested():
+                raise TimeoutError("controller startup cancelled")
+            remaining_time = deadline - time.monotonic()
+            if remaining_time < CONTROL_POLL_INTERVAL_SECONDS:
+                raise SerialTransportTimeout(
+                  "controller startup quiet-boundary deadline expired"
+                )
+            serial_port.timeout = CONTROL_POLL_INTERVAL_SECONDS
+            trailing = read(1)
+            if not isinstance(trailing, (bytes, bytearray)):
+                raise ProtocolResponseError(
+                    "controller startup quiet-boundary reader returned non-bytes"
+                )
+            if trailing:
+                raise ProtocolResponseError(
+                    "controller startup returned queued trailing framed data"
+                )
+            if not getattr(serial_port, "is_open", False):
+                raise ConnectionError(
+                    "controller startup connection closed before the quiet boundary"
+                )
+            return decoded
+    except Exception as exc:
+        operation_error = exc
+        raise
+    finally:
+        try:
+            serial_port.timeout = original_timeout
+        except Exception as exc:
+            if operation_error is None:
+                raise TypeError(
+                    "unable to restore the controller startup read timeout"
+                ) from exc
+            raise TypeError(
+                f"{operation_error}; unable to restore the controller startup read timeout"
+            ) from exc
+
+
+def _close_startup_auxiliary(serial_port):
+    if serial_port is None:
+        return True
+    if not auxiliary_serial_lock.acquire(blocking=False):
+        logger.error("Auxiliary startup cleanup could not reserve the transport")
+        return False
+    try:
+        if getattr(serial_port, "is_open", None) is False:
+            if RUN.get('ser2') is serial_port:
+                RUN['ser2'] = None
+                _clear_auxiliary_board_profile(serial_port)
+            return True
+        try:
+            serial_port.close()
+        except Exception:
+            logger.exception("Unable to close the auxiliary startup connection")
+            return False
+        if getattr(serial_port, "is_open", False):
+            logger.error("Auxiliary startup connection remained open during cleanup")
+            return False
+        if RUN.get('ser2') is serial_port:
+            RUN['ser2'] = None
+            _clear_auxiliary_board_profile(serial_port)
+        return True
+    finally:
+        auxiliary_serial_lock.release()
+
+
+def _run_startup_auxiliary_cleanup():
+    global startup_auxiliary_cleanup_worker
+
+    while True:
+        with startup_auxiliary_cleanup_lock:
+            serial_ports = tuple(startup_auxiliary_cleanup_pending.values())
+            if not serial_ports:
+                startup_auxiliary_cleanup_worker = None
+                return
+
+        closed_any = False
+        for serial_port in serial_ports:
+            if not _close_startup_auxiliary(serial_port):
+                continue
+            with startup_auxiliary_cleanup_lock:
+                key = id(serial_port)
+                if startup_auxiliary_cleanup_pending.get(key) is serial_port:
+                    del startup_auxiliary_cleanup_pending[key]
+            closed_any = True
+
+        if not closed_any:
+            time.sleep(SERIAL_SHUTDOWN_RETRY_MS / 1000.0)
+
+
+def _ensure_startup_auxiliary_cleanup():
+    global startup_auxiliary_cleanup_worker
+
+    with startup_auxiliary_cleanup_lock:
+        if not startup_auxiliary_cleanup_pending:
+            return True
+        worker = startup_auxiliary_cleanup_worker
+        if worker is not None and worker.is_alive():
+            return True
+        try:
+            worker = threading.Thread(
+                target=_run_startup_auxiliary_cleanup,
+                name="ar4-startup-auxiliary-cleanup",
+                daemon=True,
+            )
+            startup_auxiliary_cleanup_worker = worker
+            worker.start()
+        except Exception:
+            startup_auxiliary_cleanup_worker = None
+            logger.exception("Unable to start auxiliary startup cleanup retry")
+            return False
+    return True
+
+
+def _request_startup_auxiliary_cleanup(serial_port):
+    if serial_port is None:
+        return True
+    if _close_startup_auxiliary(serial_port):
+        with startup_auxiliary_cleanup_lock:
+            key = id(serial_port)
+            if startup_auxiliary_cleanup_pending.get(key) is serial_port:
+                del startup_auxiliary_cleanup_pending[key]
+        return True
+
+    # Retain the failed handle until a retry closes it; dropping the last
+    # reference can leave an open OS handle outside shutdown ownership.
+    with startup_auxiliary_cleanup_lock:
+        startup_auxiliary_cleanup_pending[id(serial_port)] = serial_port
+    _ensure_startup_auxiliary_cleanup()
+    return False
+
+
+def _connect_startup_auxiliary(port, board_profile):
+  if not auxiliary_serial_lock.acquire(blocking=False):
+    raise MotionTransportBusy("auxiliary controller transport is busy")
+  try:
+    return _replace_auxiliary_serial(port, board_profile)
+  finally:
+    auxiliary_serial_lock.release()
+
+
+def _clear_unavailable_startup_auxiliary():
+  serial_port = RUN.get('ser2')
+  if serial_port is None:
+    _clear_auxiliary_board_profile()
+    return True
+  if _request_startup_auxiliary_cleanup(serial_port):
+    if RUN.get('ser2') is None:
+      _clear_auxiliary_board_profile()
+      return True
+    raise MotionTransportBusy(
+      "auxiliary controller ownership changed during startup cleanup"
+    )
+  raise MotionTransportBusy(
+    "existing auxiliary controller could not be closed before startup commit"
+  )
+
+
+def startup_with_spinner(
+    root,
+    startup_request,
+    on_finished,
+    on_timeout,
+    on_abandoned,
+    timeout=10.0,
+):
+    timeout = finite_number(timeout, "controller startup timeout")
+    if timeout <= 0:
+        raise MotionInputError("controller startup timeout must be positive")
+    if not isinstance(startup_request, ControllerStartupRequest):
+        raise MotionInputError(
+            "startup_request must be a ControllerStartupRequest"
+        )
+    if not all(callable(callback) for callback in (
+        on_finished,
+        on_timeout,
+        on_abandoned,
+    )):
+        raise TypeError("controller startup callbacks must be callable")
+
     spinner, pb = startup_spinner(root, "Please Wait.. System Starting")
     q = Queue()
+    cancel_event = threading.Event()
+    missing = object()
+    pending_result = missing
+    timed_out = False
+    spinner_closed = False
+    cancelled = False
+    work_complete = threading.Event()
+    finalization_complete = threading.Event()
+    scheduler_failed = threading.Event()
 
     def worker():
         try:
-            q.put(startup())
-        except Exception as e:
-            q.put(e)
+            result = startup(startup_request, cancel_event)
+        except BaseException as exc:
+            result = exc
+        q.put((time.monotonic(), result))
+        work_complete.set()
+        while not finalization_complete.wait(CONTROL_POLL_INTERVAL_SECONDS):
+            if scheduler_failed.is_set():
+                try:
+                    on_abandoned(result)
+                except Exception:
+                    logger.exception("Unable to abandon controller startup safely")
+                return
 
-    Thread(target=worker, daemon=True).start()
+    def close_spinner():
+        nonlocal spinner_closed
+        if spinner_closed:
+            return
+        spinner_closed = True
+        try:
+            pb.stop()
+        except Exception:
+            logger.exception("Unable to stop the controller startup progress bar")
+        try:
+            spinner.grab_release()
+        except Exception:
+            logger.exception("Unable to release the controller startup dialog")
+        try:
+            spinner.destroy()
+        except Exception:
+            logger.exception("Unable to destroy the controller startup dialog")
 
+    try:
+        worker_thread = Thread(target=worker, daemon=True)
+    except Exception:
+        close_spinner()
+        raise
     deadline = time.monotonic() + timeout
-    while q.empty() and time.monotonic() < deadline:
-        root.update()
-        time.sleep(0.01)
 
-    # close spinner (success or timeout)
-    try: pb.stop()
-    except: pass
-    try: spinner.grab_release()
-    except: pass
-    spinner.destroy()
+    def poll_worker():
+        nonlocal pending_result, timed_out
+        if cancelled:
+            return
 
-    if q.empty():
-        logger.error("UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER (timed out after %.1fs)", timeout)
-        raise TimeoutError(f"Startup timed out after {timeout:.1f}s")
+        if pending_result is missing:
+            try:
+                pending_result = q.get_nowait()
+            except Empty:
+                pass
 
-    res = q.get()
-    if isinstance(res, Exception):
-        logger.exception("Startup failed while initializing Teensy 4.1 controller")
-        raise res
-    return res
+        now = time.monotonic()
+        completion_time = (
+            pending_result[0]
+            if pending_result is not missing
+            else None
+        )
+        deadline_exceeded = (
+            completion_time > deadline
+            if completion_time is not None
+            else now >= deadline
+        )
+        if not timed_out and deadline_exceeded:
+            timed_out = True
+            cancel_event.set()
+            close_spinner()
+            try:
+                on_timeout()
+            except Exception:
+                logger.exception("Unable to report the controller startup timeout")
+
+        if pending_result is not missing and work_complete.is_set():
+            close_spinner()
+            try:
+                on_finished(pending_result[1], timed_out)
+            except Exception:
+                logger.exception("Unable to finalize controller startup")
+            finally:
+                finalization_complete.set()
+            return
+
+        try:
+            root.after(10, poll_worker)
+        except Exception:
+            logger.exception("Unable to continue controller startup polling")
+            cancel_event.set()
+            if not timed_out:
+                timed_out = True
+                close_spinner()
+                try:
+                    on_timeout()
+                except Exception:
+                    logger.exception("Unable to report the controller startup timeout")
+            scheduler_failed.set()
+
+    try:
+        poll_job = root.after(10, poll_worker)
+    except Exception:
+        close_spinner()
+        raise
+    try:
+        worker_thread.start()
+    except Exception:
+        cancelled = True
+        finalization_complete.set()
+        try:
+            root.after_cancel(poll_job)
+        except Exception:
+            logger.exception("Unable to cancel controller startup polling")
+        close_spinner()
+        raise
+    return worker_thread
 
 
-def startup():
-  setCom2()
-  updateParams()
-  time.sleep(.1)
-  calExtAxis()
-  time.sleep(.1)
-  sendPos()
-  time.sleep(.1)
-  requestPos()
-  time.sleep(.1)
-  updateVisOp()
+def startup(startup_request, cancel_event=None):
+  if not isinstance(startup_request, ControllerStartupRequest):
+    raise MotionInputError("startup_request must be a ControllerStartupRequest")
+  if cancel_event is None:
+    cancel_event = threading.Event()
+  if not callable(getattr(cancel_event, "is_set", None)):
+    raise TypeError("controller startup cancellation must satisfy the event contract")
+  auxiliary_serial = None
+  auxiliary_error = None
+  try:
+    if startup_request.auxiliary_port is None:
+      _clear_unavailable_startup_auxiliary()
+    elif startup_request.auxiliary_board is None:
+      _clear_unavailable_startup_auxiliary()
+      auxiliary_error = "auxiliary-board profile must be selected"
+    else:
+      try:
+        auxiliary_serial = _connect_startup_auxiliary(
+          startup_request.auxiliary_port,
+          startup_request.auxiliary_board,
+        )
+      except Exception as exc:
+        _clear_unavailable_startup_auxiliary()
+        auxiliary_error = str(exc).strip() or type(exc).__name__
+    _startup_exchange_response(
+      startup_request.update_parameters_command,
+      cancel_event,
+      expected_response=b"Done",
+    )
+    _startup_exchange_response(
+      startup_request.external_axis_command,
+      cancel_event,
+      expected_response=b"Done",
+    )
+    _startup_exchange_response(
+      startup_request.position_command,
+      cancel_event,
+      expected_response=b"Done\n",
+    )
+    position_text = _startup_exchange_response("RP\n", cancel_event)
+    position = parse_position_response(position_text)
+    if position.flag:
+      raise ProtocolResponseError(
+        f"controller reported a startup fault: {position.flag}"
+      )
+    return ControllerStartupResult(
+      position=position,
+      visual_options=_startup_visual_options(),
+      auxiliary_serial=auxiliary_serial,
+      auxiliary_error=auxiliary_error,
+    )
+  except BaseException:
+    if auxiliary_serial is not None:
+      _request_startup_auxiliary_cleanup(auxiliary_serial)
+    raise
 
 
 
@@ -2067,100 +3961,455 @@ def startup():
 ###############################################################################################################################################################
 
 ###############################################################################################################################################################
-# Change of field to support automatic comm detection and drop down
-# Added exception output to log window
-def setCom(misc=None):  # Requires an input parameter for element use / it's unused
-  # global RUN['ser']
-  #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  CAL['comPort'] = com1SelectedValue.get()
-  baud = 9600
+def _prepare_controller_startup():
+  auxiliary_port = com2SelectedValue.get()
+  auxiliary_board = auxiliaryBoardSelectedValue.get()
+  (
+    update_values,
+    update_command,
+    external_values,
+    external_command,
+  ) = _prepare_controller_calibration()
+  merged_values = dict(CAL)
+  merged_values.update(update_values)
+  merged_values.update(external_values)
+  request = ControllerStartupRequest(
+    auxiliary_port=auxiliary_port,
+    auxiliary_board=auxiliary_board,
+    update_parameters_command=update_command,
+    external_axis_command=external_command,
+    position_command=_prepare_position_command(merged_values),
+  )
+  return request, update_values, external_values
 
-  # If something was already open, close it first (prevents WinError 5 on switch)
-  try:
-    if 'ser' in globals() and ser and getattr(ser, "is_open", False):
-      RUN['ser'].close()
-      time.sleep(0.2)  # give Windows a moment to release the handle
-  except Exception:
-    pass
 
+def _apply_controller_startup_result(
+  startup_request,
+  result,
+  update_values,
+  external_values,
+  startup_serial,
+  original_startup_timeout,
+):
+  staged_values = dict(CAL)
+  staged_values.update(update_values)
+  staged_values.update(external_values)
+  staged_calibration = _controller_joint_calibration_from_values(staged_values)
+  staged_calibration.validate_positions(
+    result.position.joints + result.position.external
+  )
+
+  calibration_applied = False
   try:
-    if CAL['comPort'] in (None, "", "None"):
-      raise ValueError("No COM port selected")
-    # Add small timeouts so reads/writes can’t hang forever
-    RUN['ser'] = serial.Serial(
-      port=CAL['comPort'],
-      baudrate=baud
+    _apply_controller_calibration(update_values, external_values)
+    calibration_applied = True
+    applied_position = displayPosition(
+      result.position.raw,
+      parsed=result.position,
     )
-    logger.info("COMMUNICATIONS STARTED WITH TEENSY 4.1 CONTROLLER on Port %s", CAL['comPort'])
+    if applied_position is None:
+      raise ProtocolResponseError(
+        "controller startup position could not be applied"
+      )
+    updateVisOp(result.visual_options)
+    startup_serial.timeout = original_startup_timeout
+    value = tab8.ElogView.get(0, END)
+    with open("ErrorLog", "wb") as error_log:
+      pickle.dump(value, error_log)
+    CAL['com2Port'] = startup_request.auxiliary_port
+    CAL['auxiliaryBoard'] = (
+      startup_request.auxiliary_board or AUXILIARY_BOARD_NONE
+    )
+  except Exception:
+    if calibration_applied:
+      try:
+        _invalidate_joint_motion_state(
+          "controller startup finalization failed after staged calibration "
+          "was applied"
+        )
+      except Exception:
+        logger.exception(
+          "Unable to invalidate motion after controller startup finalization"
+        )
+    raise
+  return applied_position
 
-    almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
-    logger.info("COMMUNICATIONS STARTED WITH TEENSY 4.1 CONTROLLER")
+
+def setCom(misc=None):
+  request_lease = _acquire_motion_request(
+    "Controller connection change",
+    allow_position_recovery=True,
+  )
+  if request_lease is None:
+    return False
+  request_state = {"transferred": False}
+  try:
+    return _set_com_admitted(request_lease, request_state, misc)
+  finally:
+    if (
+      not request_state["transferred"]
+      and motion_request_registry.owns(request_lease)
+    ):
+      _finish_motion_request(request_lease)
+
+
+def _set_com_admitted(request_lease, request_state, misc=None):
+  if application_closing.is_set():
+    logger.warning("Controller connection change rejected during application shutdown")
+    return False
+  if not serial_lock.acquire(blocking=False):
+    message = "Controller connection change rejected while the transport is busy"
+    logger.warning(message)
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
+    return False
+  try:
+    activity_lease = serial_activity_registry.lease("ser")
+  except SerialActivityRejected as exc:
+    serial_lock.release()
+    message = f"Controller connection change rejected: {exc}"
+    logger.warning(message)
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
+    return False
+  except Exception:
+    serial_lock.release()
+    raise
+  release_transport = True
+  try:
+    selected_main_port = com1SelectedValue.get()
+    if not isinstance(selected_main_port, str):
+      raise MotionInputError("main controller port must be text")
+    selected_main_port = selected_main_port.strip()
+    baud = 9600
+
+    existing_serial = RUN.get('ser')
+    if existing_serial is not None:
+      if getattr(existing_serial, "is_open", False):
+        existing_serial.close()
+        if getattr(existing_serial, "is_open", False):
+          raise OSError("Existing Teensy serial connection remained open")
+        time.sleep(0.2)  # Windows can retain a just-closed COM handle briefly.
+      if RUN.get('ser') is existing_serial:
+        RUN['ser'] = None
+
+    if selected_main_port in ("", "None"):
+      raise ValueError("No COM port selected")
+    # Command-specific read deadlines are applied by the owned transport path.
+    RUN['ser'] = serial.Serial(
+      port=selected_main_port,
+      baudrate=baud,
+      timeout=None,
+      write_timeout=SERIAL_WRITE_TIMEOUT_SECONDS,
+    )
+    logger.info(
+      "COMMUNICATIONS STARTED WITH TEENSY 4.1 CONTROLLER on Port %s",
+      selected_main_port,
+    )
+
+    almStatusLab.config(text="CONTROLLER STARTING", style="Warn.TLabel")
+    almStatusLab2.config(text="CONTROLLER STARTING", style="Warn.TLabel")
 
     time.sleep(.1)
     # Prefer reset_input_buffer over deprecated flushInput
     try:
       RUN['ser'].reset_input_buffer()
       RUN['ser'].reset_output_buffer()
-    except Exception:
-      pass
+    except Exception as exc:
+      raise OSError("Unable to reset controller serial buffers") from exc
 
-    startup_with_spinner(root)  # if this raises, we’ll close port in except block below
+    (
+      startup_request,
+      startup_update_values,
+      startup_external_values,
+    ) = _prepare_controller_startup()
+    startup_serial = RUN['ser']
+    original_startup_timeout = startup_serial.timeout
+    startup_serial.timeout = SERIAL_STARTUP_READ_TIMEOUT_SECONDS
 
-    # persist log view
-    value = tab8.ElogView.get(0, END)
-    pickle.dump(value, open("ErrorLog", "wb"))
+    def set_startup_status(message, style):
+      try:
+        almStatusLab.config(text=message, style=style)
+        almStatusLab2.config(text=message, style=style)
+      except Exception:
+        logger.exception("Unable to update controller startup status")
 
-  except Exception as e:
-    # Ensure the port is closed on ANY failure after open
+    def report_startup_timeout():
+      message = "CONTROLLER STARTUP TIMED OUT; WAITING FOR CLEANUP"
+      logger.error(message)
+      set_startup_status(message, "Alarm.TLabel")
+
+    def finish_startup(result, timed_out):
+      if RUN.get('ser') is not startup_serial:
+        logger.error("Main serial reference changed during controller startup")
+        if isinstance(result, ControllerStartupResult):
+          _request_startup_auxiliary_cleanup(result.auxiliary_serial)
+        _poll_failed_controller_close(
+          startup_serial,
+          activity_lease,
+          request_lease,
+        )
+        return
+
+      if (
+        timed_out
+        or isinstance(result, BaseException)
+        or not isinstance(result, ControllerStartupResult)
+      ):
+        if isinstance(result, BaseException) and not (
+          timed_out and isinstance(result, TimeoutError)
+        ):
+          logger.error(
+            "Startup failed while initializing Teensy 4.1 controller",
+            exc_info=(type(result), result, result.__traceback__),
+          )
+        elif not isinstance(result, (BaseException, ControllerStartupResult)):
+          logger.error("Controller startup worker returned an invalid result")
+        if isinstance(result, ControllerStartupResult):
+          _request_startup_auxiliary_cleanup(result.auxiliary_serial)
+        message = (
+          "CONTROLLER STARTUP TIMED OUT; CONNECTION CLOSING"
+          if timed_out
+          else "UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER"
+        )
+        set_startup_status(message, "Alarm.TLabel")
+        _poll_failed_controller_close(
+          startup_serial,
+          activity_lease,
+          request_lease,
+        )
+        return
+
+      try:
+        if not getattr(startup_serial, "is_open", False):
+          raise OSError("Teensy serial connection closed during startup")
+        startup_position = _apply_controller_startup_result(
+          startup_request,
+          result,
+          startup_update_values,
+          startup_external_values,
+          startup_serial,
+          original_startup_timeout,
+        )
+      except Exception:
+        logger.exception("Unable to finalize the Teensy 4.1 controller connection")
+        _request_startup_auxiliary_cleanup(result.auxiliary_serial)
+        message = "UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER"
+        set_startup_status(message, "Alarm.TLabel")
+        _poll_failed_controller_close(
+          startup_serial,
+          activity_lease,
+          request_lease,
+        )
+        return
+
+      logger.info("COMMUNICATIONS STARTED WITH TEENSY 4.1 CONTROLLER")
+      if result.auxiliary_error is not None:
+        logger.warning(
+          "Auxiliary controller unavailable during main startup: %s",
+          result.auxiliary_error,
+        )
+      if not startup_position.speed_violation:
+        if result.auxiliary_error is not None:
+          set_startup_status(
+            "SYSTEM READY; AUXILIARY CONTROLLER UNAVAILABLE",
+            "Warn.TLabel",
+          )
+        elif startup_request.auxiliary_port is None:
+          set_startup_status(
+            "SYSTEM READY; AUXILIARY CONTROLLER NOT CONFIGURED",
+            "Warn.TLabel",
+          )
+        else:
+          set_startup_status("SYSTEM READY", "OK.TLabel")
+      CAL['comPort'] = selected_main_port
+      _release_async_main_serial_transport(activity_lease, request_lease)
+
+    def abandon_startup(result):
+      if isinstance(result, ControllerStartupResult):
+        _request_startup_auxiliary_cleanup(result.auxiliary_serial)
+      _abandon_failed_controller_startup(
+        startup_serial,
+        activity_lease,
+        request_lease,
+      )
+
+    release_transport = False
     try:
-      if 'ser' in globals() and ser and getattr(ser, "is_open", False):
-        RUN['ser'].close()
-        time.sleep(0.2)
+      startup_with_spinner(
+        root,
+        startup_request,
+        finish_startup,
+        report_startup_timeout,
+        abandon_startup,
+        timeout=SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+      )
+      request_state["transferred"] = True
     except Exception:
-      pass
+      release_transport = True
+      raise
+    return True
 
-    # logger.exception("UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER")
-    # logger.exception raises a new unhandled exception instead of just logging the issue
-    logger.error("UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER")
-    
+  except Exception:
+    failed_serial = RUN.get('ser')
+    if failed_serial is not None:
+      release_transport = False
+      _poll_failed_controller_close(
+        failed_serial,
+        activity_lease,
+        request_lease,
+      )
+      request_state["transferred"] = True
+
+    logger.exception(
+      "UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER"
+    )
+
     almStatusLab.config(text="UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER", style="Alarm.TLabel")
     almStatusLab2.config(text="UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER", style="Alarm.TLabel")
 
-    # persist log view even on error
     try:
       value = tab8.ElogView.get(0, END)
       pickle.dump(value, open("ErrorLog", "wb"))
     except Exception:
-      pass
+      logger.exception("Unable to persist the controller startup error log")
+    return False
+  finally:
+    if release_transport:
+      _release_async_main_serial_transport(activity_lease, request_lease)
 
 
-def setCom2(misc=None): # Requires and input parameter for element use / its unused
+def _replace_auxiliary_serial(port, board_profile):
+  if not isinstance(port, str):
+    raise MotionInputError("auxiliary controller port must be text")
+  port = port.strip()
+  if port in ("", "None"):
+    raise MotionInputError("no auxiliary controller port selected")
+  board_profile = normalize_auxiliary_board_profile(board_profile)
+
+  existing_serial = RUN.get('ser2')
+  if existing_serial is not None:
+    if getattr(existing_serial, "is_open", False):
+      existing_serial.close()
+      if getattr(existing_serial, "is_open", False):
+        raise OSError("Existing auxiliary serial connection remained open")
+    if RUN.get('ser2') is existing_serial:
+      RUN['ser2'] = None
+      _clear_auxiliary_board_profile(existing_serial)
+
+  replacement = serial.Serial(
+    port=port,
+    baudrate=9600,
+    timeout=SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+    write_timeout=SERIAL_WRITE_TIMEOUT_SECONDS,
+  )
+  if not getattr(replacement, "is_open", False):
+    try:
+      replacement.close()
+    finally:
+      raise OSError("Auxiliary serial connection did not open")
+  RUN['ser2'] = replacement
   try:
-    # global RUN['ser2']
-    #port = "COM" + com2PortEntryField.get()
-    CAL['com2Port'] = com2SelectedValue.get()
-    baud = 9600
+    _bind_auxiliary_board_profile(replacement, board_profile)
+  except Exception as bind_error:
+    close_error = None
+    try:
+      replacement.close()
+    except Exception as exc:
+      close_error = exc
+      logger.exception(
+        "Unable to close auxiliary replacement after profile binding failed"
+      )
+    closed = not getattr(replacement, "is_open", False)
+    _clear_auxiliary_board_profile(replacement)
+    if closed:
+      if RUN.get('ser2') is replacement:
+        RUN['ser2'] = None
+    if close_error is not None:
+      raise OSError(
+        "Auxiliary profile binding failed and the replacement remained open"
+      ) from bind_error
+    if not closed:
+      raise OSError(
+        "Auxiliary profile binding failed and the replacement remained open"
+      ) from bind_error
+    raise
+  return replacement
 
-    if CAL['com2Port'] in (None, "", "None"):
-      raise ValueError("No COM port selected")
-    
-    RUN['ser2'] = serial.Serial(CAL['com2Port'],baud)
-    #almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
-    #almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
-    logger.info(f"COMMUNICATIONS STARTED WITH ARDUINO IO BOARD on port: {CAL['com2Port']}")
-    #tab8.ElogView.insert(END, Curtime+f" - COMMUNICATIONS STARTED WITH ARDUINO IO BOARD on port: {port}")
-    value=tab8.ElogView.get(0,END)
-    pickle.dump(value,open("ErrorLog","wb"))
+
+@_synchronous_motion_request("Auxiliary connection change")
+def setCom2(misc=None):
+  if application_closing.is_set():
+    logger.warning(
+      "Auxiliary connection change rejected during application shutdown"
+    )
+    return False
+  if not auxiliary_serial_lock.acquire(blocking=False):
+    logger.warning("Auxiliary connection change rejected while the transport is busy")
+    return False
+  previous_port = CAL.get('com2Port', "None")
+  previous_board = CAL.get('auxiliaryBoard', AUXILIARY_BOARD_NONE)
+  try:
+    selected_port = com2SelectedValue.get()
+    if not isinstance(selected_port, str):
+      raise MotionInputError("auxiliary controller port must be text")
+    selected_port = selected_port.strip()
+    if selected_port in ("", "None"):
+      selected_port = None
+    selected_board = normalize_auxiliary_board_profile(
+      auxiliaryBoardSelectedValue.get(),
+      allow_none=True,
+    )
+    if selected_port is None or selected_board is None:
+      if RUN.get('ser2') is not None and not _close_serial_port(
+        'ser2',
+        "auxiliary configuration change",
+      ):
+        raise OSError("Unable to close the prior auxiliary connection")
+      _clear_auxiliary_board_profile()
+      logger.warning(
+        "Auxiliary controller disabled until both a COM port and board profile "
+        "are selected"
+      )
+    else:
+      _replace_auxiliary_serial(selected_port, selected_board)
+      logger.info(
+        "COMMUNICATIONS STARTED WITH %s ARDUINO IO BOARD on port: %s",
+        selected_board,
+        selected_port,
+      )
+
+    committed_port = selected_port or "None"
+    committed_board = selected_board or AUXILIARY_BOARD_NONE
+    CAL['com2Port'] = committed_port
+    CAL['auxiliaryBoard'] = committed_board
+    _retain_calibration_persistence_retry()
+    try:
+      value = tab8.ElogView.get(0, END)
+      pickle.dump(value, open("ErrorLog", "wb"))
+    except Exception:
+      logger.exception("Unable to persist the auxiliary connection log")
+    return True
   except Exception as e:
-    logger.debug(f"{e}")
-    #tab8.ElogView.insert(END, Curtime+f" - Error: {e}")
-    #almStatusLab.config(text="UNABLE TO ESTABLISH COMMUNICATIONS WITH ARDUINO IO BOARD", style="Alarm.TLabel")
-    #almStatusLab2.config(text="UNABLE TO ESTABLISH COMMUNICATIONS WITH ARDUINO IO BOARD", style="Alarm.TLabel")
-    logger.error(f"UNABLE TO ESTABLISH COMMUNICATIONS WITH ARDUINO IO BOARD")
-    #tab8.ElogView.insert(END, Curtime+" - UNABLE TO ESTABLISH COMMUNICATIONS WITH ARDUINO IO BOARD")
-    value=tab8.ElogView.get(0,END)
-    pickle.dump(value,open("ErrorLog","wb"))
+    CAL['com2Port'] = previous_port
+    CAL['auxiliaryBoard'] = previous_board
+    try:
+      com2SelectedValue.set(previous_port)
+      auxiliaryBoardSelectedValue.set(previous_board)
+    except Exception:
+      logger.exception("Unable to restore the auxiliary configuration selection")
+    logger.error(
+      "UNABLE TO ESTABLISH COMMUNICATIONS WITH ARDUINO IO BOARD: %s",
+      e,
+    )
+    try:
+      value = tab8.ElogView.get(0, END)
+      pickle.dump(value, open("ErrorLog", "wb"))
+    except Exception:
+      logger.exception("Unable to persist the auxiliary connection failure log")
+    return False
+  finally:
+    auxiliary_serial_lock.release()
     
 def darkTheme():
   CAL['curTheme'] = 0
@@ -2239,17 +4488,1498 @@ def lightTheme():
 ### EXECUTION DEFS ######################################################################################################################### EXECUTION DEFS ###  
 ############################################################################################################################################################### 
 
+ROW_EXECUTION_COMPLETE = "complete"
+ROW_EXECUTION_PENDING = "pending"
+ROW_EXECUTION_REJECTED = "rejected"
+VIRTUAL_COMPLETION_POLL_MS = 10
+VIRTUAL_COMPLETION_BASE_TIMEOUT_SECONDS = 120
+VIRTUAL_COMPLETION_SAFETY_SCALE = 1.25
+VIRTUAL_JOINT_SECONDS_SCALE = 4.5
+VIRTUAL_CARTESIAN_SECONDS_SCALE = 4.7
+VIRTUAL_TOOL_SECONDS_SCALE = 5.1
+
+
+@dataclass(frozen=True)
+class ProgramMotionPoseSnapshot:
+  controller_positions: Optional[tuple]
+  virtual_pose: tuple
+
+
+def _apply_valid_position_response(response):
+  try:
+    parsed = parse_position_response(response)
+  except ProtocolResponseError:
+    displayPosition(response)
+    return None
+  applied_position = displayPosition(response, parsed=parsed)
+  if applied_position is None or applied_position.flag:
+    return None
+  return applied_position
+
+
+def _exchange_legacy_main_command(
+  command,
+  *,
+  read_line=True,
+  response_timeout=SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+  accepted_responses=None,
+  expected_response=None,
+):
+  if not isinstance(read_line, bool):
+    raise TypeError("read_line must be boolean")
+  response_timeout = finite_number(
+    response_timeout,
+    "legacy controller response timeout",
+  )
+  if response_timeout <= 0:
+    raise MotionInputError("legacy controller response timeout must be positive")
+  if read_line == (expected_response is not None):
+    raise MotionInputError(
+      "legacy controller commands require exactly one framed or exact response contract"
+    )
+  if not read_line and accepted_responses is not None:
+    raise MotionInputError(
+      "accepted legacy responses require line-response ownership"
+    )
+
+  serial_port = RUN.get('ser')
+  try:
+    write_serial_control(
+      serial_port,
+      command,
+      write_lock=serial_write_lock,
+      reset_input=True,
+    )
+    if read_line:
+      return read_serial_line_response(
+        serial_port,
+        response_timeout,
+        accepted_responses=accepted_responses,
+      )
+    return read_serial_exact_response(
+      serial_port,
+      expected_response,
+      response_timeout,
+    )
+  finally:
+    if (
+      RUN.get('ser') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      RUN['ser'] = None
+
+
+@_synchronous_motion_request(
+  "Program controller command",
+  rejection_result=(ROW_EXECUTION_REJECTED, None),
+)
+@_tracked_serial_operation(
+  "ser",
+  rejection_result=(ROW_EXECUTION_REJECTED, None),
+)
+def _execute_row_main_command(command, **response_contract):
+  try:
+    response = _exchange_legacy_main_command(command, **response_contract)
+  except Exception as exc:
+    message = f"Program controller command failed: {exc}"
+    logger.exception(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return ROW_EXECUTION_REJECTED, None
+  return ROW_EXECUTION_COMPLETE, response
+
+
+def _execute_row_main_response(command, **response_contract):
+  execution_state, response = _execute_row_main_command(
+    command,
+    **response_contract,
+  )
+  if execution_state != ROW_EXECUTION_COMPLETE:
+    _finish_execute_row()
+    return execution_state, None
+  return execution_state, response
+
+
+def _apply_controller_position_response(response):
+  if isinstance(response, str) and response.startswith("E"):
+    _invalidate_joint_motion_state(f"controller rejected request: {response}")
+    ErrorHandler(response)
+    return False
+  return _apply_valid_position_response(response) is not None
+
+
+def _finish_execute_row():
+  RUN['VR_angles'] = [
+    float(CAL['J1AngCur']),
+    float(CAL['J2AngCur']),
+    float(CAL['J3AngCur']),
+    float(CAL['J4AngCur']),
+    float(CAL['J5AngCur']),
+    float(CAL['J6AngCur']),
+  ]
+  setStepMonitorsVR()
+  RUN['progRunning'] = False
+  RUN['rowinproc'] = 0
+
+
+def _execute_row_auxiliary_command(
+  command,
+  *,
+  read_line=False,
+  control_injectable=False,
+  response_delay=0.1,
+  response_timeout=SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+  accepted_responses=None,
+  expected_response=None,
+):
+  if not isinstance(read_line, bool):
+    raise TypeError("read_line must be boolean")
+  if not isinstance(control_injectable, bool):
+    raise TypeError("control_injectable must be boolean")
+  response_delay = finite_number(response_delay, "auxiliary response delay")
+  if response_delay < 0:
+    raise MotionInputError("auxiliary response delay must not be negative")
+  response_timeout = finite_number(
+    response_timeout,
+    "auxiliary response timeout",
+  )
+  if response_timeout <= 0:
+    raise MotionInputError("auxiliary response timeout must be positive")
+  if control_injectable and (
+    not read_line or accepted_responses is None
+  ):
+    raise MotionInputError(
+      "injectable auxiliary operations require validated line responses"
+    )
+  if read_line == (expected_response is not None):
+    raise MotionInputError(
+      "auxiliary commands require exactly one framed or exact response contract"
+    )
+  if not read_line and accepted_responses is not None:
+    raise MotionInputError(
+      "accepted auxiliary responses require line-response ownership"
+    )
+  if expected_response is not None and (
+    not isinstance(expected_response, bytes)
+    or not expected_response
+    or len(expected_response) > MAX_RESPONSE_PAYLOAD_LENGTH
+    or expected_response != expected_response.strip()
+    or b"\r" in expected_response
+    or b"\n" in expected_response
+    or not expected_response.isascii()
+  ):
+    raise MotionInputError(
+      "expected auxiliary response must contain normalized unframed ASCII bytes"
+    )
+  try:
+    with _tracked_auxiliary_operation(
+      control_injectable=control_injectable,
+    ):
+      _write_legacy_auxiliary_command(command)
+      time.sleep(response_delay)
+      serial_port = RUN.get('ser2')
+      try:
+        if read_line:
+          if control_injectable:
+            _begin_auxiliary_stop_owner_wait()
+          try:
+            if control_injectable:
+              response, stop_response = (
+                read_serial_line_response_with_optional_followup(
+                  serial_port,
+                  response_timeout,
+                  accepted_responses=accepted_responses,
+                  followup_after_responses=AUXILIARY_WAIT_NATURAL_RESPONSES,
+                  accepted_followup_responses=(
+                    AUXILIARY_INACTIVE_STOP_RESPONSE,
+                  ),
+                  control_event=auxiliary_stop_injected_event,
+                  control_response_timeout_seconds=(
+                    SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS
+                  ),
+                  control_response_deadline_provider=(
+                    _auxiliary_stop_acknowledgement_deadline_value
+                  ),
+                )
+              )
+            else:
+              response = read_serial_line_response(
+                serial_port,
+                response_timeout,
+                accepted_responses=accepted_responses,
+              )
+              stop_response = None
+          except Exception as exc:
+            if control_injectable:
+              _publish_auxiliary_stop_owner_result(False, str(exc))
+            raise
+          else:
+            if control_injectable:
+              stop_result_published = _publish_auxiliary_stop_owner_result(
+                True,
+                response if stop_response is None else stop_response,
+              )
+              if stop_response is not None and not stop_result_published:
+                quarantine_serial_transport(
+                  serial_port,
+                  "auxiliary stop acknowledgement had no active stop request",
+                )
+                raise ProtocolResponseError(
+                  "auxiliary stop acknowledgement had no active stop request"
+                )
+        else:
+          response = read_serial_exact_response(
+            serial_port,
+            expected_response,
+            response_timeout,
+          )
+      finally:
+        if (
+          RUN.get('ser2') is serial_port
+          and not getattr(serial_port, "is_open", False)
+        ):
+          RUN['ser2'] = None
+          _clear_auxiliary_board_profile(serial_port)
+  except SerialActivityRejected as exc:
+    logger.warning("Program auxiliary command rejected: %s", exc)
+    _finish_execute_row()
+    return ROW_EXECUTION_REJECTED, None
+  except Exception as exc:
+    message = f"Program auxiliary command failed: {exc}"
+    logger.exception(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _finish_execute_row()
+    return ROW_EXECUTION_REJECTED, None
+  return ROW_EXECUTION_COMPLETE, response
+
+
+def _auxiliary_wait_timeout_seconds(value):
+  if isinstance(value, bool):
+    raise MotionInputError("auxiliary wait timeout must be an integer")
+  text = str(value).strip()
+  if not re.fullmatch(r"[0-9]+", text):
+    raise MotionInputError(
+      "auxiliary wait timeout must be a non-negative integer"
+    )
+  timeout = int(text)
+  if timeout > AUXILIARY_FIRMWARE_SIGNED_INT_MAX:
+    raise MotionInputError("auxiliary wait timeout exceeds the firmware range")
+  return timeout
+
+
+def _main_modbus_wait_timeout_seconds(value):
+  if isinstance(value, bool):
+    raise MotionInputError("controller Modbus wait timeout must be an integer")
+  text = str(value).strip()
+  if not re.fullmatch(r"[0-9]+", text):
+    raise MotionInputError(
+      "controller Modbus wait timeout must be a non-negative integer"
+    )
+  timeout = int(text)
+  if timeout > MAIN_FIRMWARE_WAIT_MAX_SECONDS:
+    raise MotionInputError(
+      "controller Modbus wait timeout exceeds the firmware range"
+    )
+  return timeout
+
+
+def _main_timed_wait_seconds(value):
+  wait_seconds = finite_number(value, "controller timed wait")
+  if wait_seconds < 0:
+    raise MotionInputError("controller timed wait must be non-negative")
+  encoded = controller_protocol_decimal(wait_seconds, "controller timed wait")
+  encoded_seconds = float(encoded)
+  if encoded_seconds > MAIN_FIRMWARE_WAIT_MAX_SECONDS:
+    raise MotionInputError("controller timed wait exceeds the firmware range")
+  return encoded_seconds, encoded
+
+
+def _finish_step_reverse_selection(sel_row):
+  last = tab1.progView.index('end')
+  for row in range(0, sel_row):
+    tab1.progView.itemconfig(row, {'fg': "#9E9E9E"})
+  tab1.progView.itemconfig(sel_row, {'fg': "#FF0000"})
+  for row in range(sel_row + 1, last):
+    tab1.progView.itemconfig(row, {'fg': "#EE5C42"})
+  tab1.progView.selection_clear(0, END)
+  sel_row -= 1
+  tab1.progView.select_set(sel_row)
+  try:
+    selected_row = tab1.progView.curselection()[0]
+    curRowEntryField.delete(0, 'end')
+    curRowEntryField.insert(0, selected_row)
+  except Exception:
+    curRowEntryField.delete(0, 'end')
+    curRowEntryField.insert(0, "---")
+
+
+def _virtual_motion_active(ignored_request_lease=None):
+  if (
+    ignored_request_lease is not None
+    and not motion_request_registry.owns(ignored_request_lease)
+  ):
+    raise RuntimeError("ignored virtual-motion request lease is not active")
+  with offline_live_jog_state_lock:
+    if offline_live_jog_operation is not None:
+      return True
+  return (
+    (
+      motion_request_registry.active
+      and ignored_request_lease is None
+    )
+    or offline_live_jog_lock.locked()
+    or live_jog_lock.locked()
+    or live_cartesian_lock.locked()
+    or live_tool_lock.locked()
+    or drive_lock.locked()
+  )
+
+
+def _acquire_motion_request(name, allow_position_recovery=False):
+  if not isinstance(allow_position_recovery, bool):
+    raise TypeError("position-recovery admission flag must be boolean")
+  if application_closing.is_set():
+    logger.warning("%s rejected during application shutdown", name)
+    return None
+  if not allow_position_recovery and (
+    manual_motion_pose_pending.is_set()
+    or controller_position_resynchronization_required.is_set()
+  ):
+    logger.warning(
+      "%s rejected until controller position resynchronization completes",
+      name,
+    )
+    return None
+  lease = motion_request_registry.acquire(name)
+  if lease is None:
+    logger.warning(
+      "%s rejected while %s owns motion",
+      name,
+      motion_request_registry.active_name,
+    )
+  return lease
+
+
+def _finish_motion_request(
+  request_lease,
+  completion_callback=None,
+  succeeded=None,
+):
+  if not isinstance(request_lease, MotionRequestLease):
+    raise TypeError("motion request completion requires a valid lease")
+  if completion_callback is not None and not callable(completion_callback):
+    raise TypeError("motion request completion callback must be callable")
+  if completion_callback is not None and not isinstance(succeeded, bool):
+    raise TypeError("motion request callback requires a boolean result")
+  if request_lease.close() is not True:
+    raise RuntimeError("motion request result reused a released lease")
+  try:
+    if completion_callback is not None:
+      completion_callback(succeeded)
+  finally:
+    virtual_motion_event_queue.put(("motion-released", None))
+  return True
+
+
+def _manual_motion_request(name):
+  def decorate(callback):
+    @wraps(callback)
+    def guarded(*args, **kwargs):
+      # Admission precedes coordinate reads; only an admitted virtual request
+      # transfers this lease beyond the callback's synchronous lifetime.
+      request_lease = _acquire_motion_request(name)
+      if request_lease is None:
+        message = f"{name} not started; another motion request is active"
+        almStatusLab.config(text=message, style="Warn.TLabel")
+        almStatusLab2.config(text=message, style="Warn.TLabel")
+        return False
+      if getattr(manual_motion_request_state, "lease", None) is not None:
+        _finish_motion_request(request_lease)
+        raise RuntimeError("nested manual motion request is not supported")
+      manual_motion_request_state.lease = request_lease
+      manual_motion_request_state.transferred = False
+      try:
+        return callback(*args, **kwargs)
+      finally:
+        transferred = manual_motion_request_state.transferred
+        manual_motion_request_state.lease = None
+        manual_motion_request_state.transferred = False
+        if not transferred and motion_request_registry.owns(request_lease):
+          _finish_motion_request(request_lease)
+    return guarded
+  return decorate
+
+
+def _start_manual_motion(
+  physical_command,
+  motion_name,
+  virtual_dispatch,
+  virtual_command,
+):
+  request_lease = getattr(manual_motion_request_state, "lease", None)
+  if not motion_request_registry.owns(request_lease):
+    raise RuntimeError("manual motion requires matching request ownership")
+  if not callable(virtual_dispatch):
+    raise TypeError("manual virtual dispatch must be callable")
+
+  try:
+    if RUN['offlineMode']:
+      saved_controller_positions = None
+      saved_virtual_pose = tuple(
+        finite_number(value, f"saved virtual joint {axis}")
+        for axis, value in enumerate(RUN['VR_angles'], start=1)
+      )
+      if len(saved_virtual_pose) != 6:
+        raise MotionInputError("saved virtual pose must contain six joints")
+    else:
+      saved_controller_positions = _current_joint_positions()
+      saved_virtual_pose = saved_controller_positions[:6]
+  except (KeyError, TypeError, ValueError, MotionInputError) as exc:
+    message = f"{motion_name} rejected because the confirmed pose is invalid: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+
+  def apply_confirmed_pose(controller_positions, virtual_pose):
+    try:
+      if controller_positions is not None and (
+        joint_motion_dispatcher.synchronize(controller_positions) is not True
+      ):
+        raise MotionQueueFault(
+          "joint dispatcher rejected confirmed-position synchronization"
+        )
+      if controller_positions is None:
+        if refresh_gui_from_joint_angles(virtual_pose) is not True:
+          raise MotionQueueFault("virtual GUI rejected confirmed position")
+      elif _try_set_virtual_joint_target(virtual_pose) is not True:
+        raise MotionQueueFault("virtual model rejected confirmed position")
+    except (KeyError, TypeError, ValueError, MotionInputError, MotionQueueFault) as exc:
+      logger.error("Unable to restore confirmed manual-motion pose: %s", exc)
+      return False
+    return True
+
+  def require_controller_resynchronization():
+    controller_position_resynchronization_required.set()
+
+  def restore_untransmitted_preview():
+    restored = apply_confirmed_pose(
+      saved_controller_positions,
+      saved_virtual_pose,
+    )
+    if not restored and not RUN['offlineMode']:
+      require_controller_resynchronization()
+    return restored
+
+  try:
+    virtual_completion_timeout = _virtual_completion_timeout(virtual_command)
+    virtual_operation = virtual_dispatch(virtual_command)
+  except Exception as exc:
+    restore_untransmitted_preview()
+    message = f"{motion_name} virtual preview did not start: {exc}"
+    logger.exception(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+  if not isinstance(virtual_operation, VirtualMotionOperation):
+    restore_untransmitted_preview()
+    message = f"{motion_name} virtual preview did not publish an operation"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+  if virtual_operation.completed:
+    virtual_succeeded, virtual_error = virtual_operation.result()
+    if not virtual_succeeded:
+      restore_untransmitted_preview()
+      message = f"{motion_name} virtual preview failed: {virtual_error}"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      return False
+
+  virtual_completion_deadline = time.monotonic() + virtual_completion_timeout
+  controller_write_started = (
+    threading.Event()
+    if physical_command is not None
+    else None
+  )
+  controller_state = {
+    "succeeded": physical_command is None,
+    "speed_violation": False,
+  }
+  if physical_command is not None:
+    manual_motion_pose_pending.set()
+
+  def reconcile_manual_motion(succeeded):
+    pose_confirmed = True
+    try:
+      if physical_command is None:
+        if succeeded:
+          pose_confirmed = apply_confirmed_pose(
+            None,
+            tuple(RUN['VR_angles']),
+          )
+        else:
+          pose_confirmed = restore_untransmitted_preview()
+      elif controller_state["succeeded"]:
+        try:
+          controller_positions = _current_joint_positions()
+        except (KeyError, TypeError, ValueError, MotionInputError) as exc:
+          logger.error("Unable to read confirmed controller pose: %s", exc)
+          pose_confirmed = False
+        else:
+          pose_confirmed = apply_confirmed_pose(
+            controller_positions,
+            controller_positions[:6],
+          )
+      elif not controller_write_started.is_set():
+        pose_confirmed = restore_untransmitted_preview()
+      else:
+        pose_confirmed = False
+
+      if physical_command is not None:
+        if pose_confirmed:
+          controller_position_resynchronization_required.clear()
+        else:
+          require_controller_resynchronization()
+    finally:
+      manual_motion_pose_pending.clear()
+
+    return succeeded and pose_confirmed
+
+  def complete_manual_motion(succeeded):
+    if succeeded:
+      if not controller_state["speed_violation"]:
+        almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
+        almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+      return
+    if controller_position_resynchronization_required.is_set():
+      message = (
+        f"{motion_name} failed; controller position resynchronization is required"
+      )
+    else:
+      message = f"{motion_name} failed during controller or virtual settlement"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+
+  def settle(controller_position):
+    if physical_command is None:
+      if controller_position is not None:
+        raise RuntimeError(
+          "offline manual motion received a physical controller result"
+        )
+      controller_state["succeeded"] = True
+      controller_state["speed_violation"] = False
+    else:
+      if controller_position is not None and not isinstance(
+        controller_position,
+        PositionResponse,
+      ):
+        raise RuntimeError(
+          "manual motion completion returned an invalid controller result"
+        )
+      controller_state["succeeded"] = controller_position is not None
+      controller_state["speed_violation"] = (
+        controller_position is not None
+        and controller_position.speed_violation
+      )
+    _complete_program_motion_when_virtual_idle(
+      complete_manual_motion,
+      request_lease,
+      virtual_operation,
+      virtual_completion_timeout,
+      controller_succeeded=controller_state["succeeded"],
+      deadline=virtual_completion_deadline,
+      settlement_callback=reconcile_manual_motion,
+    )
+
+  manual_motion_request_state.transferred = True
+  if physical_command is None:
+    settle(None)
+    return True
+
+  try:
+    controller_started = _start_legacy_motion(
+      physical_command,
+      motion_name,
+      completion_callback=settle,
+      request_lease=request_lease,
+      write_started_event=controller_write_started,
+    )
+  except Exception:
+    logger.exception("%s controller worker failed during startup", motion_name)
+    controller_started = False
+  if not controller_started:
+    settle(None)
+  return controller_started
+
+
+def _virtual_completion_timeout(command):
+  timing = parse_virtual_command_timing(command)
+  minimum_ramp_full_scale_seconds, millimeter_motion_distance_bound = (
+    _configured_motion_timeout_bounds()
+  )
+  timeout = motion_timing_response_timeout(
+    timing,
+    VIRTUAL_COMPLETION_BASE_TIMEOUT_SECONDS,
+    minimum_ramp_full_scale_seconds,
+    millimeter_motion_distance_bound,
+    margin_seconds=SERIAL_RESPONSE_MARGIN_SECONDS,
+  )
+  if timing.mode == "s":
+    simulated_duration = timing.speed * max(
+      VIRTUAL_JOINT_SECONDS_SCALE,
+      VIRTUAL_CARTESIAN_SECONDS_SCALE,
+      VIRTUAL_TOOL_SECONDS_SCALE,
+    )
+    timeout = max(
+      timeout,
+      simulated_duration * VIRTUAL_COMPLETION_SAFETY_SCALE
+      + SERIAL_RESPONSE_MARGIN_SECONDS,
+    )
+  return timeout
+
+
+def _finish_settled_motion_request(
+  completion_callback,
+  request_lease,
+  succeeded,
+  settlement_callback=None,
+):
+  if not isinstance(succeeded, bool):
+    raise TypeError("motion settlement result must be boolean")
+  if settlement_callback is not None:
+    if not callable(settlement_callback):
+      raise TypeError("motion settlement callback must be callable")
+    try:
+      succeeded = settlement_callback(succeeded)
+    except Exception:
+      logger.exception("Unable to reconcile motion state before ownership release")
+      succeeded = False
+    if not isinstance(succeeded, bool):
+      logger.error("Motion settlement callback returned a non-boolean result")
+      succeeded = False
+  return _finish_motion_request(
+    request_lease,
+    completion_callback,
+    succeeded,
+  )
+
+
+def _complete_program_motion_when_virtual_idle(
+  completion_callback,
+  request_lease,
+  operation,
+  timeout,
+  controller_succeeded=True,
+  deadline=None,
+  timed_out=False,
+  settlement_callback=None,
+):
+  if not isinstance(operation, VirtualMotionOperation):
+    logger.error("Virtual program motion did not publish an operation result")
+    _finish_settled_motion_request(
+      completion_callback,
+      request_lease,
+      False,
+      settlement_callback,
+    )
+    return
+  if deadline is None:
+    deadline = time.monotonic() + timeout
+  if not timed_out and time.monotonic() >= deadline:
+    logger.error("Virtual program motion did not finish before timeout")
+    timed_out = True
+  if not operation.completed:
+    try:
+      root.after(
+        VIRTUAL_COMPLETION_POLL_MS,
+        lambda: _complete_program_motion_when_virtual_idle(
+          completion_callback,
+          request_lease,
+          operation,
+          timeout,
+          controller_succeeded,
+          deadline,
+          timed_out,
+          settlement_callback,
+        ),
+      )
+    except Exception:
+      logger.exception("Unable to schedule virtual program completion")
+      fallback_started = _start_program_completion_fallback(
+        completion_callback,
+        request_lease,
+        operation,
+        controller_succeeded,
+        deadline,
+        timed_out,
+        settlement_callback,
+      )
+      if not fallback_started:
+        _finish_settled_motion_request(
+          completion_callback,
+          request_lease,
+          _program_completion_fallback_result(
+            operation,
+            controller_succeeded,
+            deadline,
+            timed_out,
+          ),
+          settlement_callback,
+        )
+    return
+  succeeded, error = operation.result()
+  if not succeeded:
+    logger.error("Virtual program motion failed: %s", error)
+  _finish_settled_motion_request(
+    completion_callback,
+    request_lease,
+    controller_succeeded is True and succeeded and not timed_out,
+    settlement_callback,
+  )
+
+
+def _program_completion_fallback_result(
+  operation,
+  controller_succeeded,
+  deadline,
+  timed_out,
+):
+  while not operation.completed:
+    if not timed_out and time.monotonic() >= deadline:
+      logger.error("Virtual program motion did not finish before timeout")
+      timed_out = True
+    operation.wait(CONTROL_POLL_INTERVAL_SECONDS)
+  if not timed_out and time.monotonic() >= deadline:
+    logger.error("Virtual program motion did not finish before timeout")
+    timed_out = True
+  succeeded, error = operation.result()
+  if not succeeded:
+    logger.error("Virtual program motion failed: %s", error)
+  return controller_succeeded is True and succeeded and not timed_out
+
+
+def _run_program_completion_fallback(
+  completion_callback,
+  request_lease,
+  operation,
+  controller_succeeded,
+  deadline,
+  timed_out,
+  settlement_callback,
+):
+  succeeded = _program_completion_fallback_result(
+    operation,
+    controller_succeeded,
+    deadline,
+    timed_out,
+  )
+  virtual_motion_event_queue.put((
+    "program-completion",
+    (
+      completion_callback,
+      request_lease,
+      succeeded,
+      settlement_callback,
+    ),
+  ))
+
+
+def _start_program_completion_fallback(
+  completion_callback,
+  request_lease,
+  operation,
+  controller_succeeded,
+  deadline,
+  timed_out,
+  settlement_callback,
+):
+  try:
+    thread = threading.Thread(
+      target=_run_program_completion_fallback,
+      args=(
+        completion_callback,
+        request_lease,
+        operation,
+        controller_succeeded,
+        deadline,
+        timed_out,
+        settlement_callback,
+      ),
+      daemon=True,
+    )
+    thread.start()
+  except Exception:
+    logger.exception("Unable to retain virtual program completion ownership")
+    return False
+  return True
+
+
+def _wait_for_virtual_motion_operation(operation, timeout, deadline=None):
+  if not isinstance(operation, VirtualMotionOperation):
+    logger.error("Virtual program motion did not publish an operation result")
+    return False
+  if deadline is None:
+    deadline = time.monotonic() + timeout
+  timed_out = False
+  while not operation.completed:
+    remaining = deadline - time.monotonic()
+    if not timed_out and remaining <= 0:
+      logger.error("Virtual program motion did not finish before timeout")
+      timed_out = True
+    operation.wait(CONTROL_POLL_INTERVAL_SECONDS)
+  if not timed_out and time.monotonic() >= deadline:
+    logger.error("Virtual program motion did not finish before timeout")
+    timed_out = True
+  succeeded, error = operation.result()
+  if not succeeded:
+    logger.error("Virtual program motion failed: %s", error)
+  return succeeded and not timed_out
+
+
+def _complete_step_reverse_motion(sel_row, succeeded):
+  _finish_execute_row()
+  if succeeded:
+    _finish_step_reverse_selection(sel_row)
+
+
+def _start_legacy_motion(
+  command,
+  motion_name,
+  completion_callback=None,
+  request_lease=None,
+  write_started_event=None,
+):
+  if not motion_request_registry.owns(request_lease):
+    raise RuntimeError("legacy motion requires matching request ownership")
+  if start_send_serial_thread(
+    command,
+    completion_callback=completion_callback,
+    write_started_event=write_started_event,
+  ):
+    return True
+  message = f"{motion_name} not started; controller transport is unavailable"
+  logger.warning(message)
+  almStatusLab.config(text=message, style="Warn.TLabel")
+  almStatusLab2.config(text=message, style="Warn.TLabel")
+  return False
+
+
+def _capture_program_motion_pose():
+  if RUN['offlineMode']:
+    controller_positions = None
+    virtual_pose = tuple(
+      finite_number(value, f"saved virtual joint {axis}")
+      for axis, value in enumerate(RUN['VR_angles'], start=1)
+    )
+    if len(virtual_pose) != 6:
+      raise MotionInputError("saved virtual pose must contain six joints")
+  else:
+    controller_positions = tuple(_current_joint_positions())
+    if len(controller_positions) != 9:
+      raise MotionInputError("saved controller pose must contain nine axes")
+    virtual_pose = controller_positions[:6]
+  return ProgramMotionPoseSnapshot(controller_positions, virtual_pose)
+
+
+def _apply_program_motion_pose(controller_positions, virtual_pose):
+  try:
+    if controller_positions is None:
+      normalized_controller_positions = None
+    else:
+      normalized_controller_positions = tuple(
+        finite_number(value, f"confirmed controller axis {axis}")
+        for axis, value in enumerate(controller_positions, start=1)
+      )
+      if len(normalized_controller_positions) != 9:
+        raise MotionInputError("confirmed controller pose must contain nine axes")
+    normalized_virtual_pose = tuple(
+      finite_number(value, f"confirmed virtual joint {axis}")
+      for axis, value in enumerate(virtual_pose, start=1)
+    )
+    if len(normalized_virtual_pose) != 6:
+      raise MotionInputError("confirmed virtual pose must contain six joints")
+
+    if normalized_controller_positions is not None and (
+      joint_motion_dispatcher.synchronize(normalized_controller_positions)
+      is not True
+    ):
+      raise MotionQueueFault(
+        "joint dispatcher rejected program-position synchronization"
+      )
+    if normalized_controller_positions is None:
+      if refresh_gui_from_joint_angles(normalized_virtual_pose) is not True:
+        raise MotionQueueFault("virtual GUI rejected the program position")
+    elif _try_set_virtual_joint_target(normalized_virtual_pose) is not True:
+      raise MotionQueueFault("virtual model rejected the program position")
+  except (KeyError, TypeError, ValueError, MotionInputError, MotionQueueFault) as exc:
+    logger.error("Unable to apply a confirmed program-motion pose: %s", exc)
+    return False
+  return True
+
+
+def _reconcile_program_motion_pose(
+  snapshot,
+  controller_position,
+  controller_write_started,
+  motion_succeeded,
+):
+  if not isinstance(snapshot, ProgramMotionPoseSnapshot):
+    raise TypeError("program motion pose snapshot has an invalid type")
+  if controller_position is not None and not isinstance(
+    controller_position,
+    PositionResponse,
+  ):
+    raise TypeError("program motion controller position has an invalid type")
+  if not isinstance(motion_succeeded, bool):
+    raise TypeError("program motion settlement result must be boolean")
+
+  online_motion = snapshot.controller_positions is not None
+  if online_motion:
+    if not all(
+      callable(getattr(controller_write_started, method, None))
+      for method in ("set", "is_set")
+    ):
+      raise TypeError("program motion write boundary has an invalid event")
+  elif controller_write_started is not None or controller_position is not None:
+    raise RuntimeError("offline program motion received physical controller state")
+
+  if not online_motion:
+    virtual_pose = (
+      tuple(RUN['VR_angles'])
+      if motion_succeeded
+      else snapshot.virtual_pose
+    )
+    pose_confirmed = _apply_program_motion_pose(None, virtual_pose)
+  elif controller_position is not None:
+    pose_confirmed = _apply_program_motion_pose(
+      controller_position.joints + controller_position.external,
+      controller_position.joints,
+    )
+  elif not controller_write_started.is_set():
+    pose_confirmed = _apply_program_motion_pose(
+      snapshot.controller_positions,
+      snapshot.virtual_pose,
+    )
+  else:
+    pose_confirmed = False
+
+  if online_motion:
+    if (
+      pose_confirmed
+      and controller_position_resynchronization_required.is_set()
+    ):
+      pose_confirmed = False
+    if not pose_confirmed:
+      message = (
+        "Program motion pose is uncertain; controller position "
+        "resynchronization is required"
+      )
+      _invalidate_joint_motion_state(message)
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+  elif not pose_confirmed:
+    message = "Offline program motion could not restore the confirmed virtual pose"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+
+  return motion_succeeded and pose_confirmed
+
+
+def _dispatch_program_controller_sequence(commands, completion_callback):
+  if completion_callback is not None and not callable(completion_callback):
+    raise TypeError("program motion completion callback must be callable")
+  if RUN['offlineMode']:
+    message = "Program motion requires virtual playback while offline"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return ROW_EXECUTION_REJECTED
+  if isinstance(commands, (str, bytes)):
+    commands = (commands,)
+  else:
+    try:
+      commands = tuple(commands)
+    except TypeError as exc:
+      raise MotionInputError("program motion commands must be a sequence") from exc
+  if not commands or any(not isinstance(command, str) for command in commands):
+    raise MotionInputError(
+      "program motion commands must contain controller command text"
+    )
+
+  try:
+    commands = tuple(
+      _canonicalize_main_serial_command(command)
+      for command in commands
+    )
+    completion_timeout = sum(
+      _controller_response_timeout(command)
+      + SERIAL_EVENT_APPLICATION_MARGIN_SECONDS
+      for command in commands
+    )
+  except Exception as exc:
+    message = f"Program motion sequence rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return ROW_EXECUTION_REJECTED
+
+  request_lease = _acquire_motion_request("Program motion")
+  if request_lease is None:
+    message = "Program motion not started; another motion request is active"
+    logger.warning(message)
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
+    return ROW_EXECUTION_REJECTED
+
+  try:
+    pose_snapshot = _capture_program_motion_pose()
+  except (KeyError, TypeError, ValueError, MotionInputError) as exc:
+    message = f"Program motion rejected because the confirmed pose is invalid: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _finish_motion_request(request_lease)
+    return ROW_EXECUTION_REJECTED
+
+  controller_write_started = threading.Event()
+  controller_result = {"position": None}
+  completion_event = threading.Event()
+  completion_result = {"succeeded": False}
+  completion_lock = threading.Lock()
+  completion_state = {"finished": False}
+
+  def publish_completion(succeeded):
+    completion_result["succeeded"] = succeeded is True
+    completion_event.set()
+    if completion_callback is not None:
+      completion_callback(succeeded is True)
+
+  def finalize_sequence(succeeded):
+    with completion_lock:
+      if completion_state["finished"]:
+        logger.error("Program motion sequence emitted duplicate completion")
+        return False
+      completion_state["finished"] = True
+    return _finish_settled_motion_request(
+      publish_completion,
+      request_lease,
+      succeeded is True,
+      lambda motion_succeeded: _reconcile_program_motion_pose(
+        pose_snapshot,
+        controller_result["position"],
+        controller_write_started,
+        motion_succeeded,
+      ),
+    )
+
+  def start_command(index):
+    controller_write_started.clear()
+
+    def complete_command(controller_position):
+      if controller_position is not None and not isinstance(
+        controller_position,
+        PositionResponse,
+      ):
+        logger.error("Program motion sequence returned an invalid controller result")
+        if controller_write_started.is_set():
+          controller_result["position"] = None
+        finalize_sequence(False)
+        return
+      if controller_position is None:
+        if controller_write_started.is_set():
+          controller_result["position"] = None
+        finalize_sequence(False)
+        return
+      controller_result["position"] = controller_position
+      next_index = index + 1
+      if next_index >= len(commands):
+        finalize_sequence(True)
+        return
+      if not start_command(next_index):
+        finalize_sequence(False)
+
+    try:
+      started = _start_legacy_motion(
+        commands[index],
+        "Program motion",
+        completion_callback=complete_command,
+        request_lease=request_lease,
+        write_started_event=controller_write_started,
+      )
+    except Exception:
+      logger.exception("Program motion controller worker failed during startup")
+      started = False
+    if not started and controller_write_started.is_set():
+      controller_result["position"] = None
+    return started
+
+  if not start_command(0):
+    finalize_sequence(False)
+    return ROW_EXECUTION_REJECTED
+  if completion_callback is not None:
+    return ROW_EXECUTION_PENDING
+
+  deadline_missed = not completion_event.wait(completion_timeout)
+  if deadline_missed:
+    logger.error("Controller program sequence missed the application deadline")
+    completion_event.wait()
+  return (
+    ROW_EXECUTION_COMPLETE
+    if completion_result["succeeded"] and not deadline_missed
+    else ROW_EXECUTION_REJECTED
+  )
+
+
+def _dispatch_program_motion(
+  command,
+  virtual_dispatch,
+  virtual_command,
+  completion_callback,
+):
+  if virtual_dispatch is None:
+    if virtual_command is not None:
+      raise MotionInputError(
+        "controller-only program motion cannot receive a virtual command"
+      )
+    return _dispatch_program_controller_sequence(
+      (command,),
+      completion_callback,
+    )
+  if not callable(virtual_dispatch) or not isinstance(virtual_command, str):
+    raise MotionInputError("program virtual motion contract is invalid")
+  try:
+    command = _canonicalize_main_serial_command(command)
+    virtual_completion_timeout = _virtual_completion_timeout(virtual_command)
+    controller_completion_timeout = (
+      None
+      if RUN['offlineMode']
+      else _controller_response_timeout(command)
+      + SERIAL_EVENT_APPLICATION_MARGIN_SECONDS
+    )
+  except Exception as exc:
+    message = f"Program motion timing rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return ROW_EXECUTION_REJECTED
+
+  request_lease = _acquire_motion_request("Program motion")
+  if request_lease is None:
+    message = "Program motion not started; another motion request is active"
+    logger.warning(message)
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
+    return ROW_EXECUTION_REJECTED
+
+  try:
+    pose_snapshot = _capture_program_motion_pose()
+  except (KeyError, TypeError, ValueError, MotionInputError) as exc:
+    message = f"Program motion rejected because the confirmed pose is invalid: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _finish_motion_request(request_lease)
+    return ROW_EXECUTION_REJECTED
+
+  controller_write_started = (
+    None
+    if RUN['offlineMode']
+    else threading.Event()
+  )
+  controller_result = {"position": None}
+
+  def settle_program_pose(succeeded):
+    return _reconcile_program_motion_pose(
+      pose_snapshot,
+      controller_result["position"],
+      controller_write_started,
+      succeeded,
+    )
+
+  try:
+    virtual_operation = virtual_dispatch(virtual_command)
+  except Exception:
+    logger.exception("Virtual program preview failed during startup")
+    virtual_operation = False
+  if not isinstance(virtual_operation, VirtualMotionOperation):
+    virtual_operation = None
+  if virtual_operation is None:
+    message = "Program motion stopped because virtual preview did not start"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _finish_settled_motion_request(
+      None,
+      request_lease,
+      False,
+      settle_program_pose,
+    )
+    return ROW_EXECUTION_REJECTED
+  virtual_completion_deadline = time.monotonic() + virtual_completion_timeout
+
+  if virtual_operation.completed:
+    virtual_succeeded, virtual_error = virtual_operation.result()
+    if not virtual_succeeded:
+      message = f"Program motion stopped after virtual preview failed: {virtual_error}"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _finish_settled_motion_request(
+        None,
+        request_lease,
+        False,
+        settle_program_pose,
+      )
+      return ROW_EXECUTION_REJECTED
+
+  def start_controller_motion(callback):
+    try:
+      return _start_legacy_motion(
+        command,
+        "Program motion",
+        completion_callback=callback,
+        request_lease=request_lease,
+        write_started_event=controller_write_started,
+      )
+    except Exception as exc:
+      message = f"Program motion controller worker failed during startup: {exc}"
+      logger.exception(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      return False
+
+  if completion_callback is not None:
+    if RUN['offlineMode']:
+      _complete_program_motion_when_virtual_idle(
+        completion_callback,
+        request_lease,
+        virtual_operation,
+        virtual_completion_timeout,
+        deadline=virtual_completion_deadline,
+        settlement_callback=settle_program_pose,
+      )
+      return ROW_EXECUTION_PENDING
+
+    def complete_controller_and_virtual(controller_position):
+      if controller_position is not None and not isinstance(
+        controller_position,
+        PositionResponse,
+      ):
+        raise RuntimeError(
+          "program motion completion returned an invalid controller result"
+        )
+      controller_result["position"] = controller_position
+      _complete_program_motion_when_virtual_idle(
+        completion_callback,
+        request_lease,
+        virtual_operation,
+        virtual_completion_timeout,
+        controller_succeeded=controller_position is not None,
+        deadline=virtual_completion_deadline,
+        settlement_callback=settle_program_pose,
+      )
+
+    if not start_controller_motion(complete_controller_and_virtual):
+      _complete_program_motion_when_virtual_idle(
+        completion_callback,
+        request_lease,
+        virtual_operation,
+        virtual_completion_timeout,
+        controller_succeeded=False,
+        deadline=virtual_completion_deadline,
+        settlement_callback=settle_program_pose,
+      )
+    return ROW_EXECUTION_PENDING
+
+  try:
+    controller_completion = None
+    if not RUN['offlineMode']:
+      controller_completion = threading.Event()
+
+      def record_controller_completion(controller_position):
+        if controller_position is not None and not isinstance(
+          controller_position,
+          PositionResponse,
+        ):
+          raise RuntimeError(
+            "program motion completion returned an invalid controller result"
+          )
+        controller_result["position"] = controller_position
+        controller_completion.set()
+
+      if not start_controller_motion(record_controller_completion):
+        _wait_for_virtual_motion_operation(
+          virtual_operation,
+          virtual_completion_timeout,
+          deadline=virtual_completion_deadline,
+        )
+        settle_program_pose(False)
+        return ROW_EXECUTION_REJECTED
+
+    controller_succeeded = True
+    if controller_completion is not None:
+      controller_timed_out = not controller_completion.wait(
+        controller_completion_timeout,
+      )
+      if controller_timed_out:
+        logger.error("Controller program result missed the application deadline")
+        controller_completion.wait()
+      controller_succeeded = (
+        not controller_timed_out
+        and controller_result["position"] is not None
+      )
+
+    virtual_finished = _wait_for_virtual_motion_operation(
+      virtual_operation,
+      virtual_completion_timeout,
+      deadline=virtual_completion_deadline,
+    )
+
+    motion_succeeded = controller_succeeded and virtual_finished
+    pose_succeeded = settle_program_pose(motion_succeeded)
+
+    if not pose_succeeded:
+      if not controller_succeeded:
+        message = "Program motion stopped after controller completion failed"
+      elif not virtual_finished:
+        message = "Program motion stopped after virtual preview failed or timed out"
+      else:
+        message = "Program motion stopped because pose reconciliation failed"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      return ROW_EXECUTION_REJECTED
+    return ROW_EXECUTION_COMPLETE
+  finally:
+    _finish_motion_request(request_lease)
+
+
+def _dispatch_program_command(
+  command,
+  virtual_dispatch,
+  virtual_command,
+  completion_callback,
+):
+  if not RUN['offlineMode']:
+    cmdSentEntryField.delete(0, 'end')
+    cmdSentEntryField.insert(0, command)
+  if RUN['vtk_running']:
+    return _dispatch_program_motion(
+      command,
+      virtual_dispatch,
+      virtual_command,
+      completion_callback,
+    )
+  return _dispatch_program_motion(
+    command,
+    None,
+    None,
+    completion_callback,
+  )
+
+
+def _gcode_storage_filename(filename):
+  if not isinstance(filename, str):
+    raise MotionInputError("G-code filename must be text")
+  filename = filename.strip()
+  if (
+    not filename
+    or filename in (".", "..")
+    or "/" in filename
+    or "\\" in filename
+    or ":" in filename
+    or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+  ):
+    raise MotionInputError("G-code filename contains an invalid path or control character")
+  storage_filename = f"{filename}.txt"
+  command = f"PGFn{storage_filename}\n"
+  try:
+    command.encode("ascii")
+  except UnicodeEncodeError as exc:
+    raise MotionInputError("G-code filename must contain ASCII characters") from exc
+  if len(command) > MAX_COMMAND_LENGTH:
+    raise MotionInputError("G-code playback command exceeds the size limit")
+  return storage_filename
+
+
+def _gcode_playback_command(filename):
+  return f"PGFn{_gcode_storage_filename(filename)}\n"
+
+
+def _gcode_feed_rate_mm_per_second(value, imperial):
+  if not isinstance(imperial, bool):
+    raise MotionInputError("G-code unit mode must be boolean")
+  feed_rate = finite_number(value, "G-code feed rate")
+  if feed_rate <= 0:
+    raise MotionInputError("G-code feed rate must be positive")
+  millimeters_per_minute = feed_rate * (25.4 if imperial else 1.0)
+  return controller_protocol_decimal(
+    millimeters_per_minute / 60.0,
+    "G-code feed rate in millimeters per second",
+  )
+
+
+def _dispatch_program_gcode(filename, completion_callback):
+  controller_completion = None
+  controller_result = None
+  controller_callback = completion_callback
+
+  try:
+    _gcode_playback_command(filename)
+    if completion_callback is None:
+      controller_completion = threading.Event()
+      controller_result = {"succeeded": False}
+
+      def record_controller_completion(succeeded):
+        controller_result["succeeded"] = succeeded is True
+        controller_completion.set()
+
+      controller_callback = record_controller_completion
+  except Exception as exc:
+    message = f"G-code playback rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return ROW_EXECUTION_REJECTED
+
+  if not GCplayProg(filename, completion_callback=controller_callback):
+    message = "G-code playback not started; controller transport is unavailable"
+    logger.warning(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return ROW_EXECUTION_REJECTED
+
+  if completion_callback is not None:
+    return ROW_EXECUTION_PENDING
+
+  controller_succeeded = (
+    controller_completion.wait()
+    and controller_result["succeeded"]
+  )
+  if not controller_succeeded:
+    message = "G-code playback stopped after controller completion failed"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return ROW_EXECUTION_REJECTED
+  return ROW_EXECUTION_COMPLETE
+
 def runProg():
+  if RUN.get('programStopRequestId') is not None:
+    _set_program_stop_status("pending")
+    return False
+  RUN['programStopState'] = "completed"
+
   def threadProg():
-    # global RUN['rowinproc']
-    # global RUN['stopQueue']
-    # global RUN['splineActive']
-    #global estopActive
     RUN['estopActive'] = False
-    #global posOutreach
     RUN['posOutreach'] = False
-    RUN['stopQueue'] = "0"
-    RUN['splineActive'] = "0"
 
     last = tab1.progView.index('end')
     for row in range (0,last):
@@ -2266,21 +5996,13 @@ def runProg():
     tab1.runTrue = 1
     while tab1.runTrue == 1:
       if (tab1.runTrue == 0):
-        if (RUN['estopActive']):
-          almStatusLab.config(text="Estop Button was Pressed",  style="Alarm.TLabel")
-          almStatusLab2.config(text="Estop Button was Pressed",  style="Alarm.TLabel")
-        elif (RUN['posOutreach']):
-          almStatusLab.config(text="Position Out of Reach",  style="Alarm.TLabel")
-          almStatusLab2.config(text="Position Out of Reach",  style="Alarm.TLabel")  
-        else:
-          almStatusLab.config(text="PROGRAM STOPPED",  style="Alarm.TLabel")
-          almStatusLab2.config(text="PROGRAM STOPPED",  style="Alarm.TLabel")  
+        _set_program_stop_status(RUN['programStopState'])
       else:
         almStatusLab.config(text="PROGRAM RUNNING",  style="OK.TLabel")
-        almStatusLab2.config(text="PROGRAM RUNNING",  style="OK.TLabel") 
+        almStatusLab2.config(text="PROGRAM RUNNING",  style="OK.TLabel")
       RUN['rowinproc'] = 1
       try:
-        selRow = tab1.progView.curselection()[0] 
+        selRow = tab1.progView.curselection()[0]
       except:
         if(tab1.lastProg == ""):
           selRow = 1
@@ -2290,31 +6012,29 @@ def runProg():
             tab1.progView.selection_clear(0, END)
             tab1.progView.select_set(index)
           except:
-            stopProg() 
+            stopProg()
         else:
           lastRow = tab1.lastRow + 1
           lastProg = tab1.lastProg
           ProgEntryField.delete(0, 'end')
           ProgEntryField.insert(0,lastProg)
           callProg(lastProg)
-          time.sleep(.4) 
+          time.sleep(.4)
           tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(lastRow) 
+          tab1.progView.select_set(lastRow)
           curRowEntryField.delete(0, 'end')
           curRowEntryField.insert(0,lastRow)
           tab1.lastProg = ""
       if(tab1.runTrue == 1):
-        executeRow()
-      
+        execution_state = executeRow()
+        if execution_state == ROW_EXECUTION_REJECTED:
+          tab1.runTrue = 0
+          RUN['rowinproc'] = 0
+          break
+
         while RUN['rowinproc'] == 1:
           time.sleep(.1)
-        #last = tab1.progView.index('end')
-        #for row in range (0,selRow):
-          #tab1.progView.itemconfig(row, {'fg': 'dodger blue'})
-        #tab1.progView.itemconfig(selRow, {'fg': 'blue2'})
-        #for row in range (selRow+1,last):
-          #tab1.progView.itemconfig(row, {'fg': 'black'})
-        
+
         try:
           selRow = tab1.progView.curselection()[0]
           selRow += 1
@@ -2328,26 +6048,17 @@ def runProg():
           tab1.progView.select_set(curRow)
         time.sleep(.1)
 
-        if (RUN['estopActive']):
-          almStatusLab.config(text="Estop Button was Pressed",  style="Alarm.TLabel")
-          almStatusLab2.config(text="Estop Button was Pressed",  style="Alarm.TLabel")
-        elif (RUN['posOutreach']):
-          almStatusLab.config(text="Position Out of Reach",  style="Alarm.TLabel")
-          almStatusLab2.config(text="Position Out of Reach",  style="Alarm.TLabel")    
-        else:
-          almStatusLab.config(text="PROGRAM STOPPED",  style="Alarm.TLabel")
-          almStatusLab2.config(text="PROGRAM STOPPED",  style="Alarm.TLabel") 
+    _set_program_stop_status(RUN['programStopState'])
   t = threading.Thread(target=threadProg)
   t.start()
-  
+  return True
+
 def stepFwd():
     def threadProg():
-      #global estopActive
       RUN['estopActive'] = False
-      #global posOutreach
       RUN['posOutreach'] = False
       almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-      almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel") 
+      almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
       try:
         selRow = tab1.progView.curselection()[0]
       except:
@@ -2359,20 +6070,21 @@ def stepFwd():
             tab1.progView.selection_clear(0, END)
             tab1.progView.select_set(index)
           except:
-            stopProg()  
+            stopProg()
         else:
           lastRow = tab1.lastRow + 1
           lastProg = tab1.lastProg
           ProgEntryField.delete(0, 'end')
           ProgEntryField.insert(0,lastProg)
           callProg(lastProg)
-          time.sleep(.4) 
+          time.sleep(.4)
           tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(lastRow) 
+          tab1.progView.select_set(lastRow)
           curRowEntryField.delete(0, 'end')
           curRowEntryField.insert(0,lastRow)
           tab1.lastProg = ""
-      executeRow() 
+      if executeRow() == ROW_EXECUTION_REJECTED:
+        return
       try:
         last = tab1.progView.index('end')
         selRow = tab1.progView.curselection()[0]
@@ -2394,14 +6106,12 @@ def stepFwd():
           tab1.progView.select_set(curRow)
         time.sleep(.1)
       except Exception:
-        pass  
+        pass
     t = threading.Thread(target=threadProg)
     t.start()
 
 def stepRev():
-    #global estopActive
     RUN['estopActive'] = False
-    #global posOutreach
     RUN['posOutreach'] = False
     almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
     almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel") 
@@ -2411,58 +6121,69 @@ def stepRev():
       selRow = 1
       tab1.progView.selection_clear(0, END)
       tab1.progView.select_set(selRow) 
-    executeRow()  
-    last = tab1.progView.index('end')
-    for row in range (0,selRow):
-      tab1.progView.itemconfig(row, {'fg': "#9E9E9E"})
-    tab1.progView.itemconfig(selRow, {'fg': "#FF0000"})
-    for row in range (selRow+1,last):
-      tab1.progView.itemconfig(row, {'fg': "#EE5C42"})
-    tab1.progView.selection_clear(0, END)
-    selRow -= 1
-    tab1.progView.select_set(selRow)
-    try:
-      selRow = tab1.progView.curselection()[0]
-      curRowEntryField.delete(0, 'end')
-      curRowEntryField.insert(0,selRow)
-    except:
-      curRowEntryField.delete(0, 'end')
-      curRowEntryField.insert(0,"---")  
-    
+    execution_state = executeRow(
+      motion_complete=lambda succeeded: _complete_step_reverse_motion(
+        selRow,
+        succeeded,
+      )
+    )
+    if execution_state == ROW_EXECUTION_COMPLETE:
+      _finish_step_reverse_selection(selRow)
+
+
+def _set_program_stop_status(auxiliary_state):
+  if auxiliary_state not in ("pending", "completed", "failed"):
+    raise ValueError("unknown auxiliary program-stop state")
+  RUN['programStopState'] = auxiliary_state
+  if RUN['estopActive']:
+    message = "Estop Button was Pressed"
+    style = "Alarm.TLabel"
+  elif RUN['posOutreach']:
+    message = "Position Out of Reach"
+    style = "Alarm.TLabel"
+  elif auxiliary_state == "pending":
+    message = (
+      "PROGRAM HALT REQUESTED; AUXILIARY STOP PENDING; "
+      "ACTIVE MAIN MOTION NOT PREEMPTED"
+    )
+    style = "Warn.TLabel"
+  elif auxiliary_state == "failed":
+    message = (
+      "PROGRAM SCHEDULING HALTED; AUXILIARY STOP FAILED; "
+      "ACTIVE MAIN MOTION NOT PREEMPTED"
+    )
+    style = "Alarm.TLabel"
+  else:
+    message = (
+      "PROGRAM SCHEDULING HALTED; ACTIVE MAIN MOTION NOT PREEMPTED"
+    )
+    style = "Alarm.TLabel"
+  almStatusLab.config(text=message, style=style)
+  almStatusLab2.config(text=message, style=style)
+
+
 def stopProg():
-  # global RUN['cmdType']
-  # global RUN['splineActive']
-  #global estopActive
-  #global posOutreach
-  # global RUN['stopQueue']
-  #lastProg = ""
-
-  try:
-    command = "STOP\n"
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0,command)
-    RUN['ser2'].write(command.encode())
-    RUN['ser2'].flushInput()
-    time.sleep(.1)
-    response = str(RUN['ser2'].readline().strip(),'utf-8')
-    cmdRecEntryField.delete(0, 'end')
-    cmdRecEntryField.insert(0,response)
-  except:
-    print("Error IO Board Not Connected")
   tab1.runTrue = 0
-  if (RUN['estopActive']):
-    almStatusLab.config(text="Estop Button was Pressed",  style="Alarm.TLabel")
-    almStatusLab2.config(text="Estop Button was Pressed",  style="Alarm.TLabel")
-  elif (RUN['posOutreach']):
-    almStatusLab.config(text="Position Out of Reach",  style="Alarm.TLabel")
-    almStatusLab2.config(text="Position Out of Reach",  style="Alarm.TLabel")    
-  else:        
-    almStatusLab.config(text="PROGRAM STOPPED",  style="Alarm.TLabel")
-    almStatusLab2.config(text="PROGRAM STOPPED",  style="Alarm.TLabel")
+  if RUN.get('programStopRequestId') is not None:
+    _set_program_stop_status("pending")
+    return
+  try:
+    auxiliary_state, request_id = _request_auxiliary_stop()
+  except Exception:
+    logger.exception("Unable to dispatch the auxiliary program stop")
+    RUN['programStopRequestId'] = None
+    _set_program_stop_status("failed")
+    return
+  if auxiliary_state == AUXILIARY_STOP_NOT_REQUIRED:
+    RUN['programStopRequestId'] = None
+    _set_program_stop_status("completed")
+  else:
+    RUN['programStopRequestId'] = request_id
+    _set_program_stop_status("pending")
 
-  
-  
-def executeRow():
+
+
+def executeRow(motion_complete=None):
   RUN['progRunning'] = True
   try:
     selRow = tab1.progView.curselection()[0]
@@ -2479,7 +6200,6 @@ def executeRow():
     RUN['cmdType'] = "Stop P"
     RUN['cmdTypeLong'] = "Stop P"
 
-  ##Call Program##
   if (RUN['cmdType'] == "Call P"):
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
@@ -2497,103 +6217,105 @@ def executeRow():
     
 
 
-  ##Run Gcode Program##
   if (RUN['cmdType'] == "Run Gc"):
     if RUN['offlineMode']:
       almStatusLab.config(text="Gcode not supported in offline programming mode", style="Alarm.TLabel")
-      return 
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
-    tab1.lastRow = tab1.progView.curselection()[0]
-    tab1.lastProg = ProgEntryField.get()
     programIndex = command.find("Program -")
     filename = str(command[programIndex+10:])
     manEntryField.delete(0, 'end')
     manEntryField.insert(0,filename)
-    GCplayProg(filename)
-    time.sleep(.4) 
-    index = 0
-    tab1.progView.selection_clear(0, END)
-    tab1.progView.select_set(index) 
+    motion_state = _dispatch_program_gcode(filename, motion_complete)
+    if motion_state == ROW_EXECUTION_REJECTED:
+      _finish_execute_row()
+      return motion_state
+    if motion_state == ROW_EXECUTION_PENDING:
+      return motion_state
 
-  ##Stop Program##
   if (RUN['cmdType'] == "Stop P"):
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     stopProg()
 
 
-  ##Test Limit Switches
   if (RUN['cmdType'] == "Test L"):
     if RUN['offlineMode']:
       almStatusLab.config(text="Test limit switches not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     command = "TL\n" 
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.05)
-    response = str(RUN['ser'].readline().strip(),'utf-8')
+    execution_state, response = _execute_row_main_response(command)
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
     manEntryField.delete(0, 'end')
     manEntryField.insert(0,response)
 
-  ##Test Gripper Amperage
   if (RUN['cmdType'] == "Test G"):
     if RUN['offlineMode']:
       almStatusLab.config(text="Test limit switches not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     command = "TG\n" 
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser2'].write(command.encode())
-    RUN['ser2'].flushInput()
-    time.sleep(.05)
-    response = str(RUN['ser2'].readline().strip(),'utf-8')
+    execution_state, response = _execute_row_auxiliary_command(
+      command,
+      read_line=True,
+      response_delay=.05,
+    )
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
     manEntryField.delete(0, 'end')
     manEntryField.insert(0,response)
 
-  ##Set Encoders 1000
   if (RUN['cmdType'] == "Set En"):
     if RUN['offlineMode']:
       almStatusLab.config(text="Encoder testing not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     command = "SE\n" 
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.05)
-    RUN['ser'].read() 
+    execution_state, _ = _execute_row_main_response(
+      command,
+      read_line=False,
+      expected_response=b"Done",
+    )
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
 
-  ##Read Encoders
   if (RUN['cmdType'] == "Read E"):
     if RUN['offlineMode']:
       almStatusLab.config(text="Read Encoders not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     command = "RE\n" 
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.05)
-    response = str(RUN['ser'].readline().strip(),'utf-8')
+    execution_state, response = _execute_row_main_response(command)
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
     manEntryField.delete(0, 'end')
     manEntryField.insert(0,response)
 
-  ##Servo Command##
   if (RUN['cmdType'] == "Servo "):
     if RUN['offlineMode']:
       almStatusLab.config(text="Servo control not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     servoIndex = command.find("number ")
@@ -2603,16 +6325,18 @@ def executeRow():
     command = "SV"+servoNum+"P"+servoPos+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser2'].write(command.encode())
-    RUN['ser2'].flushInput()
-    time.sleep(.1)
-    RUN['ser2'].read() 
+    execution_state, _ = _execute_row_auxiliary_command(
+      command,
+      expected_response=b"Servo Done",
+    )
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
 
-  ##If Input##
   if (RUN['cmdType'] == "If Inp"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     inputIndex = command.find("# ")
@@ -2621,14 +6345,16 @@ def executeRow():
     inputNum = str(command[inputIndex+2:valIndex])
     valNum = int(command[valIndex+2:actionIndex-1])
     action = str(command[actionIndex+2:actionIndex+6])
-    ##querry board for IO value
     cmd = "JFX"+inputNum+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,cmd)   
-    RUN['ser2'].write(cmd.encode())
-    RUN['ser2'].flushInput()
-    time.sleep(.1)
-    response = str(RUN['ser2'].readline().strip(),'utf-8')
+    execution_state, response = _execute_row_auxiliary_command(
+      cmd,
+      read_line=True,
+      accepted_responses=("T", "F"),
+    )
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
     if (response == "T"):
       querry = 1
     elif(response == "F"):
@@ -2657,11 +6383,11 @@ def executeRow():
          
 
 
-  ##Read Com##
   if (RUN['cmdType'] == "Read C"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     comIndex = command.find("# ")
     charIndex = command.find("Char: ")
     actionIndex = command.find(": ")
@@ -2687,7 +6413,6 @@ def executeRow():
 
 
   
-  ##If Register##
   if (RUN['cmdType'] == "If Reg"):
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
@@ -2697,7 +6422,6 @@ def executeRow():
     inputNum = str(command[inputIndex+2:valIndex-1])
     valNum = int(command[valIndex+2:actionIndex-1])
     action = str(command[actionIndex+2:actionIndex+6])
-    ##querry board for IO value
     regEntry = "R"+inputNum+"EntryField"
     curRegVal = eval(regEntry).get()
     if (int(curRegVal) == valNum):
@@ -2722,11 +6446,11 @@ def executeRow():
       elif(action == "Stop"):
         stopProg()  
 
-  ##If COM device##
   if (RUN['cmdType'] == "If COM"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     inputIndex = command.find("# ")
@@ -2758,11 +6482,11 @@ def executeRow():
       elif(action == "Stop"):
         stopProg()           
 
-  ##If Modbus Coil##
   if (RUN['cmdType'] == "If MBc"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     inputIndex = command.find("# ")
@@ -2776,10 +6500,9 @@ def executeRow():
     slaveID = str(command[slavestartIndex+1:slaveendIndex])
     opVal = "1"
     subcommand = "BB"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
-    RUN['ser'].write(subcommand.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1) 
-    response = RUN['ser'].readline().decode("utf-8").strip()  
+    execution_state, response = _execute_row_main_response(subcommand)
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
     if (response == "Modbus Error"):
       ErrorHandler(response)  
     elif (response == valNum):
@@ -2804,11 +6527,11 @@ def executeRow():
       elif(action == "Stop"):
         stopProg()   
 
-  ##If Modbus Input##
   if (RUN['cmdType'] == "If MBi"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     inputIndex = command.find("# ")
@@ -2822,10 +6545,9 @@ def executeRow():
     slaveID = str(command[slavestartIndex+1:slaveendIndex])
     opVal = "1"
     subcommand = "BC"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
-    RUN['ser'].write(subcommand.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1) 
-    response = RUN['ser'].readline().decode("utf-8").strip()  
+    execution_state, response = _execute_row_main_response(subcommand)
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
     if (response == "Modbus Error"):
       ErrorHandler(response)  
     elif (response == valNum):
@@ -2850,11 +6572,11 @@ def executeRow():
       elif(action == "Stop"):
         stopProg()
 
-  ##If Modbus Holding Register##
   if (RUN['cmdType'] == "If MBh"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     inputIndex = command.find("# ")
@@ -2868,10 +6590,9 @@ def executeRow():
     slaveID = str(command[slavestartIndex+9:regNumstartIndex-2])
     opVal = str(command[regNumstartIndex+11:inputIndex-8])
     subcommand = "BH"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
-    RUN['ser'].write(subcommand.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1) 
-    response = RUN['ser'].readline().decode("utf-8").strip()  
+    execution_state, response = _execute_row_main_response(subcommand)
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
     if (response == "Modbus Error"):
       ErrorHandler(response)  
     elif (response == valNum):
@@ -2896,11 +6617,11 @@ def executeRow():
       elif(action == "Stop"):
         stopProg()  
 
-  ##If Modbus Input Register##
   if (RUN['cmdType'] == "If MBI"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     inputIndex = command.find("# ")
@@ -2914,10 +6635,9 @@ def executeRow():
     slaveID = str(command[slavestartIndex+9:regNumstartIndex-2])
     opVal = str(command[regNumstartIndex+11:inputIndex-14])
     subcommand = "BD"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
-    RUN['ser'].write(subcommand.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1) 
-    response = RUN['ser'].readline().decode("utf-8").strip()  
+    execution_state, response = _execute_row_main_response(subcommand)
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
     if (response == "Modbus Error"):
       ErrorHandler(response)  
     elif (response == valNum):
@@ -2942,11 +6662,11 @@ def executeRow():
       elif(action == "Stop"):
         stopProg()
 
-  ##Wait 5v IO board##
   if (RUN['cmdTypeLong'] == "Wait 5v Inp"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     inputIndex = command.find("# ")
@@ -2954,21 +6674,34 @@ def executeRow():
     timeoutIndex = command.find("Timeout =")
     inputNum = str(command[inputIndex+2:valIndex-1])
     valNum = str(command[valIndex+2:timeoutIndex-3])
-    timeout = str(command[timeoutIndex+10:])
-    command = "WI"+"A"+inputNum+"B"+valNum+"C"+timeout+"\n"
+    try:
+      timeout = _auxiliary_wait_timeout_seconds(command[timeoutIndex+10:])
+    except MotionInputError as exc:
+      message = f"Wait command rejected: {exc}"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
+    command = "WI"+"A"+inputNum+"B"+valNum+"C"+str(timeout)+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser2'].write(command.encode())
-    RUN['ser2'].flushInput()
-    time.sleep(.1)
-    RUN['ser2'].read()
+    execution_state, _ = _execute_row_auxiliary_command(
+      command,
+      read_line=True,
+      control_injectable=True,
+      response_timeout=timeout + SERIAL_AUXILIARY_WAIT_MARGIN_SECONDS,
+      accepted_responses=AUXILIARY_WAIT_TERMINAL_RESPONSES,
+    )
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
  
 
-  ##Wait Modbus Coil##
   if (RUN['cmdTypeLong'] == "Wait MBcoil"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     slavestartIndex = command.find("SlaveID (")  
@@ -2978,20 +6711,32 @@ def executeRow():
     slaveID = str(command[slavestartIndex+9:inputIndex-9])
     inputNum = str(command[inputIndex+2:valIndex-1])
     valNum = str(command[valIndex+2:timeoutIndex-3])
-    timeout = str(command[timeoutIndex+10:])
-    command = "WJ"+"A"+slaveID+"B"+inputNum+"C"+valNum+"D"+timeout+"\n"
+    try:
+      timeout = _main_modbus_wait_timeout_seconds(command[timeoutIndex+10:])
+    except MotionInputError as exc:
+      message = f"Controller Modbus wait rejected: {exc}"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
+    command = "WJ"+"A"+slaveID+"B"+inputNum+"C"+valNum+"D"+str(timeout)+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    RUN['ser'].read()
+    execution_state, _ = _execute_row_main_response(
+      command,
+      read_line=False,
+      expected_response=b"Done",
+      response_timeout=timeout + SERIAL_RESPONSE_MARGIN_SECONDS,
+    )
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
 
-  ##Wait Modbus Input##
   if (RUN['cmdTypeLong'] == "Wait MBinpu"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     slavestartIndex = command.find("SlaveID (")  
@@ -3001,21 +6746,30 @@ def executeRow():
     slaveID = str(command[slavestartIndex+9:inputIndex-9])
     inputNum = str(command[inputIndex+2:valIndex-1])
     valNum = str(command[valIndex+2:timeoutIndex-3])
-    timeout = str(command[timeoutIndex+10:])
-    command = "WK"+"A"+slaveID+"B"+inputNum+"C"+valNum+"D"+timeout+"\n"
+    try:
+      timeout = _main_modbus_wait_timeout_seconds(command[timeoutIndex+10:])
+    except MotionInputError as exc:
+      message = f"Controller Modbus wait rejected: {exc}"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
+    command = "WK"+"A"+slaveID+"B"+inputNum+"C"+valNum+"D"+str(timeout)+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    RUN['ser'].read()  
+    execution_state, _ = _execute_row_main_response(
+      command,
+      read_line=False,
+      expected_response=b"Done",
+      response_timeout=timeout + SERIAL_RESPONSE_MARGIN_SECONDS,
+    )
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
    
               
 
-  ### this will fail on first run without reloading program - the insertion inserts it as bytes (due to pickling the program save) but when reloaded its a listbox of strings - therefore this would only work after reload and looking for string
-  ## long term fix refactor all 
   ''' 
-  ##Jump to Row##
     if (RUN['moveInProc'] == 1):
         RUN['moveInProc'] = 2
     tabIndex = command.find("Tab-")
@@ -3025,7 +6779,6 @@ def executeRow():
     tab1.progView.select_set(index) 
   ''' 
   
-  ## Jump to Row (bytes/str + CRLF tolerant) ##
   if RUN['cmdType'] == "Jump T":
       if (RUN['moveInProc'] == 1):
         RUN['moveInProc'] = 2
@@ -3033,7 +6786,8 @@ def executeRow():
       tabIndex = command.find("Tab-")
       if tabIndex == -1:
           print("[Jump T] Malformed command, missing 'Tab-':", repr(command))
-          return
+          _finish_execute_row()
+          return ROW_EXECUTION_REJECTED
 
       # keep your original tabNum (bytes with CRLF)
       tabNum = ("Tab Number " + str(command[tabIndex+4:]) + "\r\n").encode('utf-8')
@@ -3073,11 +6827,11 @@ def executeRow():
 
 
 
-  ##Set Output 5v IO Board##
   if (RUN['cmdTypeLong'] == "Set 5v Outp"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     outputIndex = command.find("# ")
@@ -3090,16 +6844,18 @@ def executeRow():
       command = "OFX"+output+"\n"  
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser2'].write(command.encode())
-    RUN['ser2'].flushInput()
-    time.sleep(.1)
-    RUN['ser2'].read()
+    execution_state, _ = _execute_row_auxiliary_command(
+      command,
+      expected_response=b"Done",
+    )
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
 
-  ##Set Modbus Coil##
   if (RUN['cmdTypeLong'] == "Set MBcoil "):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     slavestartIndex = command.find("SlaveID (")  
@@ -3111,18 +6867,17 @@ def executeRow():
     command = "SC"+"A"+slaveID+"B"+inputNum+"C"+valNum+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    response = RUN['ser'].readline().decode("utf-8").strip()
+    execution_state, response = _execute_row_main_response(command)
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
     if (response == "-1"):
       ErrorHandler("Modbus Error")
 
-  ##Set Modbus Register##
   if (RUN['cmdTypeLong'] == "Set MBoutpu"):
     if RUN['offlineMode']:
       almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     slavestartIndex = command.find("SlaveID (")  
@@ -3134,33 +6889,44 @@ def executeRow():
     command = "SO"+"A"+slaveID+"B"+inputNum+"C"+valNum+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    response = RUN['ser'].readline().decode("utf-8").strip()
+    execution_state, response = _execute_row_main_response(command)
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
     if (response == "-1"):
       ErrorHandler("Modbus Error")       
  
 
 
-  ##Wait Time Command##
   if (RUN['cmdType'] == "Wait T"):
     if RUN['offlineMode']:
       almStatusLab.config(text="Wait time not supported in offline programming mode", style="Alarm.TLabel")
-      return
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     timeIndex = command.find("Wait Time = ")
-    timeSeconds = str(command[timeIndex+12:])
-    command = "WTS"+timeSeconds+"\n"
+    try:
+      timeSeconds, encoded_wait = _main_timed_wait_seconds(
+        command[timeIndex+12:]
+      )
+    except MotionInputError as exc:
+      message = f"Controller timed wait rejected: {exc}"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
+    command = "WTS"+encoded_wait+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    RUN['ser'].read() 
+    execution_state, _ = _execute_row_main_response(
+      command,
+      accepted_responses=("WTdone",),
+      response_timeout=timeSeconds + SERIAL_RESPONSE_MARGIN_SECONDS,
+    )
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      return execution_state
 
-  ##Set Register##  
   if (RUN['cmdType'] == "Regist"):
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
@@ -3182,7 +6948,6 @@ def executeRow():
     eval(regEntry).delete(0, 'end')
     eval(regEntry).insert(0,regEqVal)
 
-  ##Set Position Register##  
   if (RUN['cmdType'] == "Positi"):
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
@@ -3207,142 +6972,41 @@ def executeRow():
     eval(regEntry).insert(0,regEqVal)
     
 
-  ##Calibrate Command##   
-  if (RUN['cmdType'] == "Calibr"):
-    if RUN['offlineMode']:
-      almStatusLab.config(text="Calibration not supported in offline programming mode", style="Alarm.TLabel")
-      return
-    if (RUN['moveInProc'] == 1):
+  if RUN['cmdType'] in {
+    "Calibr", "Cal_J1", "Cal_J2", "Cal_J3", "Cal_J4",
+    "Cal_J5", "Cal_J6", "Cal_J7", "Cal_J8", "Cal_J9",
+  }:
+    calibration_action = {
+      "Calibr": calRobotAll,
+      "Cal_J1": calRobotJ1,
+      "Cal_J2": calRobotJ2,
+      "Cal_J3": calRobotJ3,
+      "Cal_J4": calRobotJ4,
+      "Cal_J5": calRobotJ5,
+      "Cal_J6": calRobotJ6,
+      "Cal_J7": calRobotJ7,
+      "Cal_J8": calRobotJ8,
+      "Cal_J9": calRobotJ9,
+    }[RUN['cmdType']]
+    if RUN['moveInProc'] == 1:
       RUN['moveInProc'] = 2
-    calRobotAll()
+    if calibration_action() is not True:
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
 
-  ##Calibrate J1##   
-  if (RUN['cmdType'] == "Cal_J1"):
-    if RUN['offlineMode']:
-      almStatusLab.config(text="Calibration not supported in offline programming mode", style="Alarm.TLabel")
-      return
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    calRobotJ1()
-
-  ##Calibrate J2##   
-  if (RUN['cmdType'] == "Cal_J2"):
-    if RUN['offlineMode']:
-      almStatusLab.config(text="Calibration not supported in offline programming mode", style="Alarm.TLabel")
-      return
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    calRobotJ2() 
-
-  ##Calibrate J1##   
-  if (RUN['cmdType'] == "Cal_J3"):
-    if RUN['offlineMode']:
-      almStatusLab.config(text="Calibration not supported in offline programming mode", style="Alarm.TLabel")
-      return
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    calRobotJ3() 
-
-  ##Calibrate J1##   
-  if (RUN['cmdType'] == "Cal_J4"):
-    if RUN['offlineMode']:
-      almStatusLab.config(text="Calibration not supported in offline programming mode", style="Alarm.TLabel")
-      return
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    calRobotJ4() 
-
-  ##Calibrate J5##   
-  if (RUN['cmdType'] == "Cal_J5"):
-    if RUN['offlineMode']:
-      almStatusLab.config(text="Calibration not supported in offline programming mode", style="Alarm.TLabel")
-      return
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    calRobotJ5() 
-
-  ##Calibrate J6##   
-  if (RUN['cmdType'] == "Cal_J6"):
-    if RUN['offlineMode']:
-      almStatusLab.config(text="Calibration not supported in offline programming mode", style="Alarm.TLabel")
-      return
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    calRobotJ6() 
-
-  ##Calibrate J7##   
-  if (RUN['cmdType'] == "Cal_J7"):
-    if RUN['offlineMode']:
-      almStatusLab.config(text="Calibration not supported in offline programming mode", style="Alarm.TLabel")
-      return
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    calRobotJ7() 
-
-  ##Calibrate J8##   
-  if (RUN['cmdType'] == "Cal_J8"):
-    if RUN['offlineMode']:
-      almStatusLab.config(text="Calibration not supported in offline programming mode", style="Alarm.TLabel")
-      return
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    calRobotJ8()
-
-   ##Calibrate J9##   
-  if (RUN['cmdType'] == "Cal_J9"):
-    if RUN['offlineMode']:
-      almStatusLab.config(text="Calibration not supported in offline programming mode", style="Alarm.TLabel")
-      return
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    calRobotJ9()                   
-
-  ##Set tool##  
   if (RUN['cmdType'] == "Tool S"):
     if RUN['offlineMode']:
       almStatusLab.config(text="Set tool not supported in offline programming mode", style="Alarm.TLabel")
-      return 
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel") 
-    xIndex = command.find(" X ")
-    yIndex = command.find(" Y ")
-    zIndex = command.find(" Z ")
-    rzIndex = command.find(" Rz ")
-    ryIndex = command.find(" Ry ")
-    rxIndex = command.find(" Rx ")
-    RUN['xVal'] = command[xIndex+3:yIndex]
-    RUN['yVal'] = command[yIndex+3:zIndex]
-    RUN['zVal'] = command[zIndex+3:rzIndex]
-    rzVal = command[rzIndex+4:ryIndex]
-    ryVal = command[ryIndex+4:rxIndex]
-    rxVal = command[rxIndex+4:]
-    TFxEntryField.delete(0,'end')
-    TFyEntryField.delete(0,'end')
-    TFzEntryField.delete(0,'end')
-    TFrzEntryField.delete(0,'end')
-    TFryEntryField.delete(0,'end')
-    TFrxEntryField.delete(0,'end')
-    TFxEntryField.insert(0,str(RUN['xVal']))
-    TFyEntryField.insert(0,str(RUN['yVal']))
-    TFzEntryField.insert(0,str(RUN['zVal']))
-    TFrzEntryField.insert(0,str(rzVal))
-    TFryEntryField.insert(0,str(ryVal))
-    TFrxEntryField.insert(0,str(rxVal))
-    command = "TF"+"A"+RUN['xVal']+"B"+RUN['yVal']+"C"+RUN['zVal']+"D"+rzVal+"E"+ryVal+"F"+rxVal+"\n"
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    RUN['ser'].read()
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
+    message = "Set tool program rows are unsupported by the Teensy 6.7.1 protocol"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _finish_execute_row()
+    return ROW_EXECUTION_REJECTED
      
   
-  ##Move J Command##  
   if (RUN['cmdType'] == "Move J"): 
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
@@ -3377,29 +7041,20 @@ def executeRow():
     RUN['WC'] = command[WristConfIndex+3:]
     LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
     command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    if not RUN['vtk_running']:
-      cmdSentEntryField.delete(0, 'end')
-      cmdSentEntryField.insert(0,command)
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      time.sleep(.1)
-      response = str(RUN['ser'].readline().strip(),'utf-8')
-      if (response[:1] == 'E'):
-        ErrorHandler(response)   
-      else:
-        displayPosition(response)  
-    else:
-      if not RUN['offlineMode']:
-        cmdSentEntryField.delete(0, 'end')
-        cmdSentEntryField.insert(0, command)
-        start_send_serial_thread(command)
-      commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"  
-      mj_command(commandVR)
-      wait_until_all_locks_free(min_hold_time=0.05)
+    commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    motion_state = _dispatch_program_command(
+      command,
+      mj_command,
+      commandVR,
+      motion_complete,
+    )
+    if motion_state != ROW_EXECUTION_COMPLETE:
+      if motion_state == ROW_EXECUTION_REJECTED:
+        _finish_execute_row()
+      return motion_state
 
 
 
- ##Offs J Command##  
   if (RUN['cmdType'] == "OFF J "): 
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
@@ -3443,27 +7098,18 @@ def executeRow():
     RUN['WC'] = command[WristConfIndex+3:]
     LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
     command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    if not RUN['vtk_running']:
-      cmdSentEntryField.delete(0, 'end')
-      cmdSentEntryField.insert(0,command)
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      time.sleep(.1)
-      response = str(RUN['ser'].readline().strip(),'utf-8')
-      if (response[:1] == 'E'):
-        ErrorHandler(response)   
-      else:
-        displayPosition(response)  
-    else:
-      if not RUN['offlineMode']:
-        cmdSentEntryField.delete(0, 'end')
-        cmdSentEntryField.insert(0, command)
-        start_send_serial_thread(command)
-      commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"  
-      mj_command(commandVR)
-      wait_until_all_locks_free(min_hold_time=0.05)  
+    commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    motion_state = _dispatch_program_command(
+      command,
+      mj_command,
+      commandVR,
+      motion_complete,
+    )
+    if motion_state != ROW_EXECUTION_COMPLETE:
+      if motion_state == ROW_EXECUTION_REJECTED:
+        _finish_execute_row()
+      return motion_state
 
-  ##Move Vis Command##  
   if (RUN['cmdType'] == "Move V"): 
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
@@ -3508,27 +7154,18 @@ def executeRow():
     visRot = VisRetAngleEntryField.get()
     LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
     command = "MV"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Vr"+visRot+"Lm"+LoopMode+"\n"
-    if not RUN['vtk_running']:
-      cmdSentEntryField.delete(0, 'end')
-      cmdSentEntryField.insert(0,command)
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      time.sleep(.1)
-      response = str(RUN['ser'].readline().strip(),'utf-8')
-      if (response[:1] == 'E'):
-        ErrorHandler(response)   
-      else:
-        displayPosition(response)  
-    else:
-      if not RUN['offlineMode']:
-        cmdSentEntryField.delete(0, 'end')
-        cmdSentEntryField.insert(0, command)
-        start_send_serial_thread(command)
-      commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"  
-      mj_command(commandVR)
-      wait_until_all_locks_free(min_hold_time=0.05)       
+    commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    motion_state = _dispatch_program_command(
+      command,
+      mj_command,
+      commandVR,
+      motion_complete,
+    )
+    if motion_state != ROW_EXECUTION_COMPLETE:
+      if motion_state == ROW_EXECUTION_REJECTED:
+        _finish_execute_row()
+      return motion_state
 
-  ##Move PR Command##  
   if (RUN['cmdType'] == "Move P"): 
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
@@ -3566,27 +7203,18 @@ def executeRow():
     RUN['WC'] = command[WristConfIndex+3:]
     LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
     command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    if not RUN['vtk_running']:
-      cmdSentEntryField.delete(0, 'end')
-      cmdSentEntryField.insert(0,command)
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      time.sleep(.1)
-      response = str(RUN['ser'].readline().strip(),'utf-8')
-      if (response[:1] == 'E'):
-        ErrorHandler(response)   
-      else:
-        displayPosition(response)  
-    else:
-      if not RUN['offlineMode']:
-        cmdSentEntryField.delete(0, 'end')
-        cmdSentEntryField.insert(0, command)
-        start_send_serial_thread(command)
-      commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"  
-      mj_command(commandVR)
-      wait_until_all_locks_free(min_hold_time=0.05)   
+    commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    motion_state = _dispatch_program_command(
+      command,
+      mj_command,
+      commandVR,
+      motion_complete,
+    )
+    if motion_state != ROW_EXECUTION_COMPLETE:
+      if motion_state == ROW_EXECUTION_REJECTED:
+        _finish_execute_row()
+      return motion_state
 
-  ##OFFS PR Command##  
   if (RUN['cmdType'] == "OFF PR"): 
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
@@ -3621,27 +7249,18 @@ def executeRow():
     RUN['WC'] = command[WristConfIndex+3:]
     LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
     command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    if not RUN['vtk_running']:
-      cmdSentEntryField.delete(0, 'end')
-      cmdSentEntryField.insert(0,command)
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      time.sleep(.1)
-      response = str(RUN['ser'].readline().strip(),'utf-8')
-      if (response[:1] == 'E'):
-        ErrorHandler(response)   
-      else:
-        displayPosition(response)  
-    else:
-      if not RUN['offlineMode']:
-        cmdSentEntryField.delete(0, 'end')
-        cmdSentEntryField.insert(0, command)
-        start_send_serial_thread(command)
-      commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"  
-      mj_command(commandVR)
-      wait_until_all_locks_free(min_hold_time=0.05)  
+    commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    motion_state = _dispatch_program_command(
+      command,
+      mj_command,
+      commandVR,
+      motion_complete,
+    )
+    if motion_state != ROW_EXECUTION_COMPLETE:
+      if motion_state == ROW_EXECUTION_REJECTED:
+        _finish_execute_row()
+      return motion_state
 
-  ##Move L Command##  
   if (RUN['cmdType'] == "Move L"): 
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
@@ -3681,30 +7300,21 @@ def executeRow():
     LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
     DisWrist = str(CAL['DisableWristRotVal'].get())
     command = "ML"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"Rnd"+Rounding+"W"+RUN['WC']+"Lm"+LoopMode+"Q"+DisWrist+"\n"
-    if not RUN['vtk_running']:
-      cmdSentEntryField.delete(0, 'end')
-      cmdSentEntryField.insert(0,command)
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      time.sleep(.1)
-      response = str(RUN['ser'].readline().strip(),'utf-8')
-      if (response[:1] == 'E'):
-        ErrorHandler(response)   
-      else:
-        displayPosition(response)  
-    else:
-      if not RUN['offlineMode']:
-        cmdSentEntryField.delete(0, 'end')
-        cmdSentEntryField.insert(0, command)
-        start_send_serial_thread(command)
-      commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"  
-      mj_command(commandVR)
-      wait_until_all_locks_free(min_hold_time=0.05) 
+    commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    motion_state = _dispatch_program_command(
+      command,
+      mj_command,
+      commandVR,
+      motion_complete,
+    )
+    if motion_state != ROW_EXECUTION_COMPLETE:
+      if motion_state == ROW_EXECUTION_REJECTED:
+        _finish_execute_row()
+      return motion_state
 
 
 
 
-  ##Move R Command##  
   if (RUN['cmdType'] == "Move R"):
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1 
@@ -3739,289 +7349,64 @@ def executeRow():
     RUN['WC'] = command[WristConfIndex+3:]
     LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
     command = "RJ"+"A"+J1Val+"B"+J2Val+"C"+J3Val+"D"+J4Val+"E"+J5Val+"F"+J6Val+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    if not RUN['vtk_running']:
-      cmdSentEntryField.delete(0, 'end')
-      cmdSentEntryField.insert(0,command)
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      time.sleep(.1)
-      response = str(RUN['ser'].readline().strip(),'utf-8')
-      if (response[:1] == 'E'):
-        ErrorHandler(response)   
-      else:
-        displayPosition(response)  
-    else:
-      if not RUN['offlineMode']:
-        cmdSentEntryField.delete(0, 'end')
-        cmdSentEntryField.insert(0, command)
-        start_send_serial_thread(command)
-      commandVR = "RJ"+"A"+J1Val+"B"+J2Val+"C"+J3Val+"D"+J4Val+"E"+J5Val+"F"+J6Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-      rj_command(commandVR)
-      wait_until_all_locks_free(min_hold_time=0.05)
+    commandVR = "RJ"+"A"+J1Val+"B"+J2Val+"C"+J3Val+"D"+J4Val+"E"+J5Val+"F"+J6Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    motion_state = _dispatch_program_command(
+      command,
+      rj_command,
+      commandVR,
+      motion_complete,
+    )
+    if motion_state != ROW_EXECUTION_COMPLETE:
+      if motion_state == ROW_EXECUTION_REJECTED:
+        _finish_execute_row()
+      return motion_state
       
-  ##Move A Command##  
   if (RUN['cmdType'] == "Move A"):
-    if (RUN['moveInProc'] == 0):
-      RUN['moveInProc'] == 1
-    subCmd=command[:10]
-    if (subCmd == "Move A End"):
-      almStatusLab.config(text="Move A must start with a Mid followed by End", style="Alarm.TLabel")
-      almStatusLab2.config(text="Move A must start with a Mid followed by End", style="Alarm.TLabel")
-    else:
-      xIndex = command.find(" X ")
-      yIndex = command.find(" Y ")
-      zIndex = command.find(" Z ")
-      rzIndex = command.find(" Rz ")
-      ryIndex = command.find(" Ry ")
-      rxIndex = command.find(" Rx ")
-      trIndex = command.find(" Tr ")	
-      SpeedIndex = command.find(" S")
-      ACCspdIndex = command.find(" Ac ")
-      DECspdIndex = command.find(" Dc ")
-      ACCrampIndex = command.find(" Rm ")
-      WristConfIndex = command.find(" $")
-      RUN['xVal'] = command[xIndex+3:yIndex]
-      RUN['yVal'] = command[yIndex+3:zIndex]
-      RUN['zVal'] = command[zIndex+3:rzIndex]
-      rzVal = command[rzIndex+4:ryIndex]
-      ryVal = command[ryIndex+4:rxIndex]
-      rxVal = command[rxIndex+4:trIndex]
-      trVal = command[trIndex+4:SpeedIndex]
-      speedPrefix = command[SpeedIndex+1:SpeedIndex+3]
-      Speed = command[SpeedIndex+4:ACCspdIndex]
-      ACCspd = command[ACCspdIndex+4:DECspdIndex]
-      DECspd = command[DECspdIndex+4:ACCrampIndex]
-      ACCramp = command[ACCrampIndex+4:WristConfIndex]
-      RUN['WC'] = command[WristConfIndex+3:]
-      TCX = 0
-      TCY = 0 
-      TCZ = 0
-      TCRx = 0
-      TCRy = 0
-      TCRz = 0
-      ##read next row for End position	
-      curRow = tab1.progView.curselection()[0]
-      selRow = tab1.progView.curselection()[0]
-      last = tab1.progView.index('end')
-      #for row in range (0,selRow):
-      #  tab1.progView.itemconfig(row, {'fg': "#1E90FF"})
-      #tab1.progView.itemconfig(selRow, {'fg': "#116AC4"})
-      #for row in range (selRow+1,last):
-      #  tab1.progView.itemconfig(row, {'fg': "#050505"})
-      tab1.progView.selection_clear(0, END)
-      selRow += 1
-      tab1.progView.select_set(selRow)
-      curRow += 1
-      selRow = tab1.progView.curselection()[0]
-      tab1.progView.see(selRow+2)
-      data = list(map(int, tab1.progView.curselection()))
-      command=tab1.progView.get(data[0]).decode()
-      xIndex = command.find(" X ")
-      yIndex = command.find(" Y ")
-      zIndex = command.find(" Z ")
-      rzIndex = command.find(" Rz ")
-      ryIndex = command.find(" Ry ")
-      rxIndex = command.find(" Rx ")
-      trIndex = command.find(" Tr ")	
-      SpeedIndex = command.find(" S")
-      ACCspdIndex = command.find(" Ac ")
-      DECspdIndex = command.find(" Dc ")
-      ACCrampIndex = command.find(" Rm ")
-      WristConfIndex = command.find(" $")
-      Xend = command[xIndex+3:yIndex]
-      Yend = command[yIndex+3:zIndex]
-      Zend = command[zIndex+3:rzIndex]
-      rzVal = command[rzIndex+4:ryIndex]
-      ryVal = command[ryIndex+4:rxIndex]
-      rxVal = command[rxIndex+4:trIndex]
-      trVal = command[trIndex+4:SpeedIndex]
-      speedPrefix = command[SpeedIndex+1:SpeedIndex+3]
-      Speed = command[SpeedIndex+4:ACCspdIndex]
-      ACCspd = command[ACCspdIndex+4:DECspdIndex]
-      DECspd = command[DECspdIndex+4:ACCrampIndex]
-      ACCramp = command[ACCrampIndex+4:WristConfIndex]
-      RUN['WC'] = command[WristConfIndex+3:]
-      TCX = 0
-      TCY = 0 
-      TCZ = 0
-      TCRx = 0
-      TCRy = 0
-      TCRz = 0
-      #move arc command
-      if RUN['vtk_running']:
-        almStatusLab.config(text="Arc move not yet programmed for virtual robot playback", style="Alarm.TLabel")
-      LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-      command = "MA"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"Ex"+Xend+"Ey"+Yend+"Ez"+Zend+"Tr"+trVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-      cmdSentEntryField.delete(0, 'end')
-      cmdSentEntryField.insert(0,command)
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      time.sleep(.1)
-      response = str(RUN['ser'].readline().strip(),'utf-8')
-      if (response[:1] == 'E'):
-        ErrorHandler(response)   
-      else:
-        displayPosition(response) 
+    message = (
+      "Arc program motion is disabled pending a safe Teensy MA protocol"
+    )
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _finish_execute_row()
+    return ROW_EXECUTION_REJECTED
 
-  ##Move C Command##  
   if (RUN['cmdType'] == "Move C"):
-    if (RUN['moveInProc'] == 0):
-      RUN['moveInProc'] == 1
-    subCmd=command[:10]
-    if (subCmd == "Move C Sta" or subCmd == "Move C Pla"):
-      almStatusLab.config(text="Move C must start with a Center followed by Start & Plane", style="Alarm.TLabel")
-      almStatusLab2.config(text="Move C must start with a Center followed by Start & Plane", style="Alarm.TLabel")
-    else:
-      xIndex = command.find(" X ")
-      yIndex = command.find(" Y ")
-      zIndex = command.find(" Z ")
-      rzIndex = command.find(" Rz ")
-      ryIndex = command.find(" Ry ")
-      rxIndex = command.find(" Rx ")
-      trIndex = command.find(" Tr ")	
-      SpeedIndex = command.find(" S")
-      ACCspdIndex = command.find(" Ac ")
-      DECspdIndex = command.find(" Dc ")
-      ACCrampIndex = command.find(" Rm ")
-      WristConfIndex = command.find(" $")
-      RUN['xVal'] = command[xIndex+3:yIndex]
-      RUN['yVal'] = command[yIndex+3:zIndex]
-      RUN['zVal'] = command[zIndex+3:rzIndex]
-      rzVal = command[rzIndex+4:ryIndex]
-      ryVal = command[ryIndex+4:rxIndex]
-      rxVal = command[rxIndex+4:trIndex]
-      trVal = command[trIndex+4:SpeedIndex]
-      speedPrefix = command[SpeedIndex+1:SpeedIndex+3]
-      Speed = command[SpeedIndex+4:ACCspdIndex]
-      ACCspd = command[ACCspdIndex+4:DECspdIndex]
-      DECspd = command[DECspdIndex+4:ACCrampIndex]
-      ACCramp = command[ACCrampIndex+4:WristConfIndex]
-      RUN['WC'] = command[WristConfIndex+3:]
-      TCX = 0
-      TCY = 0 
-      TCZ = 0
-      TCRx = 0
-      TCRy = 0
-      TCRz = 0
-      ##read next row for Mid position	
-      curRow = tab1.progView.curselection()[0]
-      selRow = tab1.progView.curselection()[0]
-      last = tab1.progView.index('end')
-      for row in range (0,selRow):
-        tab1.progView.itemconfig(row, {'fg': "#1E90FF"})
-      tab1.progView.itemconfig(selRow, {'fg': "#0057A6"})
-      for row in range (selRow+1,last):
-        tab1.progView.itemconfig(row, {'fg': "#000000"})
-      tab1.progView.selection_clear(0, END)
-      selRow += 1
-      tab1.progView.select_set(selRow)
-      curRow += 1
-      selRow = tab1.progView.curselection()[0]
-      tab1.progView.see(selRow+2)
-      data = list(map(int, tab1.progView.curselection()))
-      command=tab1.progView.get(data[0]).decode()
-      xIndex = command.find(" X ")
-      yIndex = command.find(" Y ")
-      zIndex = command.find(" Z ")
-      Xmid = command[xIndex+3:yIndex]
-      Ymid = command[yIndex+3:zIndex]
-      Zmid = command[zIndex+3:rzIndex]
-      ##read next row for End position	
-      curRow = tab1.progView.curselection()[0]
-      selRow = tab1.progView.curselection()[0]
-      last = tab1.progView.index('end')
-      for row in range (0,selRow):
-        tab1.progView.itemconfig(row, {'fg': "#1E90FF"})
-      tab1.progView.itemconfig(selRow, {'fg': "#0057A6"})
-      for row in range (selRow+1,last):
-        tab1.progView.itemconfig(row, {'fg': "#000000"})
-      tab1.progView.selection_clear(0, END)
-      selRow += 1
-      tab1.progView.select_set(selRow)
-      curRow += 1
-      selRow = tab1.progView.curselection()[0]
-      tab1.progView.see(selRow+2)
-      data = list(map(int, tab1.progView.curselection()))
-      command=tab1.progView.get(data[0]).decode()
-      xIndex = command.find(" X ")
-      yIndex = command.find(" Y ")
-      zIndex = command.find(" Z ")
-      Xend = command[xIndex+3:yIndex]
-      Yend = command[yIndex+3:zIndex]
-      Zend = command[zIndex+3:rzIndex]
-      #move j to the beginning (second or mid point is start of circle)
-      LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-      command = "MJ"+"X"+Xmid+"Y"+Ymid+"Z"+Zmid+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"Tr"+trVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      time.sleep(.1)
-      response = str(RUN['ser'].readline().strip(),'utf-8')
-      #move circle command
-      start = time.time()
-      if RUN['vtk_running']:
-        almStatusLab.config(text="Circle move not yet programmed for virtual robot playback", style="Alarm.TLabel")
-      LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-      command = "MC"+"Cx"+RUN['xVal']+"Cy"+RUN['yVal']+"Cz"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"Bx"+Xmid+"By"+Ymid+"Bz"+Zmid+"Px"+Xend+"Py"+Yend+"Pz"+Zend+"Tr"+trVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-      cmdSentEntryField.delete(0, 'end')
-      cmdSentEntryField.insert(0,command)
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      time.sleep(.1)
-      response = str(RUN['ser'].readline().strip(),'utf-8')
-      end = time.time()
-      #manEntryField.delete(0, 'end')
-      #manEntryField.insert(0,end-start) 
-      if (response[:1] == 'E'):
-        ErrorHandler(response)   
-      else:
-        displayPosition(response) 
+    message = (
+      "Circle program motion is disabled pending a safe Teensy MC protocol"
+    )
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _finish_execute_row()
+    return ROW_EXECUTION_REJECTED
 
-  ##Start Spline
   if (RUN['cmdType'] == "Start "):
-    RUN['splineActive'] = "1"
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    command = "SL\n" 
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    RUN['ser'].read() 
+    message = "Spline program motion is disabled pending an owned response protocol"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _finish_execute_row()
+    return ROW_EXECUTION_REJECTED
 
-  ##End Spline
   if (RUN['cmdType'] == "End Sp"):
-    RUN['splineActive'] = "0"
-    if(RUN['stopQueue'] == "1"):
-      RUN['stopQueue'] = "0"
-      stop()
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    command = "SS\n" 
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    response = str(RUN['ser'].readline().strip(),'utf-8')
-    if (response[:1] == 'E'):
-      ErrorHandler(response)   
-    else:
-      displayPosition(response) 
+    message = "Spline program motion is disabled pending an owned response protocol"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _finish_execute_row()
+    return ROW_EXECUTION_REJECTED
 
-  ##Camera On
   if(RUN['cmdType'] == "Cam On"):
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     start_vid()
 
-  ##Camera Off
   if(RUN['cmdType'] == "Cam Of"):
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     stop_vid()  
 
-  ##Vision Find
   if(RUN['cmdType'] == "Vis Fi"):
     #if (RUN['moveInProc'] == 1):
       #RUN['moveInProc'] = 2
@@ -4052,10 +7437,8 @@ def executeRow():
   
 
 
-  RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-  setStepMonitorsVR() 
-  RUN['progRunning'] = False  
-  RUN['rowinproc'] = 0
+  _finish_execute_row()
+  return ROW_EXECUTION_COMPLETE
   
 
 
@@ -4150,60 +7533,73 @@ if CE['Platform']['IS_WINDOWS']:
           return False
 
   def _gui_stop():
-      if _tk_call(globals().get("StopJog"), None):
-          return
-      try:
-          send_serial_command("S\n")
-      except Exception:
-          pass
+      live_pending = globals().get('live_serial_result_pending')
+      stop_requested = globals().get('live_jog_stop_requested')
+      if (
+          live_pending is not None
+          and stop_requested is not None
+          and live_pending.is_set()
+      ):
+          stop_requested.set()
+      scheduled = _tk_call(globals().get("StopJog"), None)
+      if not scheduled:
+          logger.warning("Unable to schedule the live-jog stop callback")
+      return scheduled
 
-  def _gui_start_joint(code):
-      _tk_call(globals().get("LiveJointJog"), code)
+  def _gui_start_joint(active):
+      callback = globals().get("LiveJointJog")
+      return callable(callback) and callback(_lj_code(*active)) is True
 
-  def _gui_start_cart(code):
-      _tk_call(globals().get("LiveCarJog"), code)
+  def _gui_start_cart(active):
+      callback = globals().get("LiveCarJog")
+      axis, direction = active
+      code = _cart_code(axis, direction)
+      return callable(callback) and code is not None and callback(code) is True
 
-  def _gui_start_tool(code):
-      _tk_call(globals().get("LiveToolJog"), code)
+  def _gui_start_tool(active):
+      callback = globals().get("LiveToolJog")
+      axis, direction = active
+      code = _tool_code(axis, direction)
+      return callable(callback) and code is not None and callback(code) is True
+
+  def _schedule_xbox_motion(delay_ms, callback, reject_callback):
+      if application_closing.is_set():
+          return LiveMotionScheduleResult.CANCELLED
+
+      def schedule_on_tk():
+          if application_closing.is_set():
+              reject_callback(LiveMotionScheduleResult.CANCELLED)
+              return
+          try:
+              if delay_ms > 0:
+                  root.after(delay_ms, callback)
+              else:
+                  callback()
+          except Exception as exc:
+              reject_callback(exc)
+
+      return _tk_call(schedule_on_tk)
 
   # ----- Teach (X button) -----
   def _teach_position():
-      _tk_call(globals().get("teachInsertBelSelected"))
+      if not _tk_call(globals().get("teachInsertBelSelected")):
+          logger.warning("Unable to schedule the Xbox teach-position callback")
 
   # ----- Servo gripper toggle (Y button) over ser2 -----
   RUN['_grip_closed'] = False  # False = open; first press closes (SV0P0)
-
-  def _nano_send(cmd):
-      def worker():
-          try:
-              RUN['ser2'].write(cmd.encode())
-              RUN['ser2'].flushInput()
-              time.sleep(0.1)
-              RUN['ser2'].read()
-          except Exception:
-              pass
-      threading.Thread(target=worker, daemon=True).start()
+  RUN['_grip_pending_request_id'] = None
 
   def _toggle_servo_gripper():
-      # global RUN['_grip_closed']
-      if not RUN['_grip_closed']:
-          _nano_send("SV0P0\n")   # close
-          RUN['_grip_closed'] = True
-      else:
-          _nano_send("SV0P50\n")  # open
-          RUN['_grip_closed'] = False
+      if not _tk_call(_request_xbox_auxiliary_toggle, "_grip_closed"):
+          logger.warning("Unable to schedule the Xbox servo-gripper toggle")
 
   # ----- Pneumatic gripper toggle (START) over ser2 -----
   RUN['_pneu_open'] = False  # False = closed
+  RUN['_pneu_pending_request_id'] = None
 
   def _toggle_pneu_gripper():
-      # global RUN['_pneu_open']
-      if not RUN['_pneu_open']:
-          _nano_send("OFX8\n")   # OPEN
-          RUN['_pneu_open'] = True
-      else:
-          _nano_send("ONX8\n")   # CLOSE
-          RUN['_pneu_open'] = False
+      if not _tk_call(_request_xbox_auxiliary_toggle, "_pneu_open"):
+          logger.warning("Unable to schedule the Xbox pneumatic-gripper toggle")
 
   # ----- Triggers adjust speedEntryField (smart stepping) -----
   def _bump_speed_smart(delta_hint):
@@ -4226,44 +7622,13 @@ if CE['Platform']['IS_WINDOWS']:
       except Exception:
           do()
 
-  # ---------- Joint arbiter ----------
-  RUN['_current'] = None
-  RUN['_pending_start'] = None
   RUN['_last_input_time'] = 0.0
+  RUN['_xbox_watchdog_failed'] = False
   SWITCH_DELAY_MS = 60
   WATCHDOG_MS     = 200
 
   def _lj_code(j, direction):  # J1- = 10, J1+ = 11; J2- = 20, J2+ = 21; ...
       return j*10 + (1 if direction > 0 else 0)
-
-  def _request_switch(new_active):
-      # global RUN['_current'], RUN['_pending_start']
-      old = RUN['_current']
-      if old == new_active:
-          return
-
-      def do_start_if_pending():
-          # global RUN['_current'], RUN['_pending_start']
-          code = _pending_start; RUN['_pending_start'] = None
-          if code is not None:
-              RUN['_current'] = new_active
-              _gui_start_joint(code)
-
-      if old is not None:
-          RUN['_current'] = None
-          RUN['_pending_start'] = _lj_code(*new_active) if new_active else None
-          _gui_stop()
-          try: root.after(SWITCH_DELAY_MS, do_start_if_pending)
-          except Exception: do_start_if_pending()
-          return
-
-      if new_active is not None:
-          RUN['_current'] = new_active
-          _gui_start_joint(_lj_code(*new_active))
-
-  # ---------- Cartesian arbiter ----------
-  RUN['_cart_current'] = None
-  RUN['_cart_pending'] = None
 
   def _cart_code(axis, d):
       if axis == 'X':  return 10 if d < 0 else 11
@@ -4274,90 +7639,90 @@ if CE['Platform']['IS_WINDOWS']:
       if axis == 'Rz': return 60 if d < 0 else 61
       return None
 
-  def _request_switch_cart(new_active):
-      # global RUN['_cart_current'], RUN['_cart_pending']
-      old = RUN['_cart_current']
-      if old == new_active:
-          return
-
-      def do_start_if_pending():
-          # global RUN['_cart_current'], RUN['_cart_pending']
-          item = _cart_pending; RUN['_cart_pending'] = None
-          if item is not None:
-              RUN['_cart_current'] = item
-              axis, d = item
-              code = _cart_code(axis, d)
-              if code is not None:
-                  _gui_start_cart(code)
-
-      if old is not None:
-          RUN['_cart_current'] = None
-          RUN['_cart_pending'] = new_active
-          _gui_stop()
-          try: root.after(SWITCH_DELAY_MS, do_start_if_pending)
-          except Exception: do_start_if_pending()
-          return
-
-      if new_active is not None:
-          RUN['_cart_current'] = new_active
-          axis, d = new_active
-          code = _cart_code(axis, d)
-          if code is not None:
-              _gui_start_cart(code)
-
-  # ---------- Tool (Tz) arbiter (for bumpers) ----------
-  RUN['_tool_current'] = None
-  RUN['_tool_pending'] = None
-
   def _tool_code(axis, d):
       if axis == 'Tz': return 30 if d < 0 else 31   # per your LiveToolJog mapping
       return None
 
+  def _report_xbox_motion_error(message):
+      logger.error("Xbox live-motion arbitration failed: %s", message)
+      _lbl("XBOX LIVE MOTION FAILED", style="Alarm.TLabel")
+
+  joint_xbox_arbiter = DeferredLiveMotionArbiter(
+      _schedule_xbox_motion,
+      _gui_start_joint,
+      _gui_stop,
+      SWITCH_DELAY_MS,
+      _report_xbox_motion_error,
+  )
+  cartesian_xbox_arbiter = DeferredLiveMotionArbiter(
+      _schedule_xbox_motion,
+      _gui_start_cart,
+      _gui_stop,
+      SWITCH_DELAY_MS,
+      _report_xbox_motion_error,
+  )
+  tool_xbox_arbiter = DeferredLiveMotionArbiter(
+      _schedule_xbox_motion,
+      _gui_start_tool,
+      _gui_stop,
+      SWITCH_DELAY_MS,
+      _report_xbox_motion_error,
+  )
+
+  def _request_switch(new_active):
+      return joint_xbox_arbiter.request(new_active)
+
+  def _request_switch_cart(new_active):
+      return cartesian_xbox_arbiter.request(new_active)
+
   def _request_switch_tool(new_active):
-      # global RUN['_tool_current'], RUN['_tool_pending']
-      old = RUN['_tool_current']
-      if old == new_active:
-          return
+      return tool_xbox_arbiter.request(new_active)
 
-      def do_start_if_pending():
-          # global RUN['_tool_current'], RUN['_tool_pending']
-          item = _tool_pending; RUN['_tool_pending'] = None
-          if item is not None:
-              RUN['_tool_current'] = item
-              axis, d = item
-              code = _tool_code(axis, d)
-              if code is not None:
-                  _gui_start_tool(code)
+  def _fail_xbox_watchdog(error):
+      RUN['_xbox_watchdog_failed'] = True
+      live_stop = globals().get('live_jog_stop_requested')
+      if live_stop is not None:
+          live_stop.set()
+      offline_lock = globals().get('offline_live_jog_state_lock')
+      offline_stop = globals().get('offline_live_jog_stop_event')
+      if offline_lock is not None and offline_stop is not None:
+          with offline_lock:
+              offline_stop.set()
+      for requester in (
+          _request_switch,
+          _request_switch_cart,
+          _request_switch_tool,
+      ):
+          try:
+              requester(None)
+          except Exception:
+              logger.exception("Unable to stop Xbox motion after watchdog failure")
+      logger.error("Xbox watchdog scheduling failed: %s", error)
+      _lbl("XBOX WATCHDOG FAILED", style="Alarm.TLabel")
+      return False
 
-      if old is not None:
-          RUN['_tool_current'] = None
-          RUN['_tool_pending'] = new_active
-          _gui_stop()
-          try: root.after(SWITCH_DELAY_MS, do_start_if_pending)
-          except Exception: do_start_if_pending()
-          return
-
-      if new_active is not None:
-          RUN['_tool_current'] = new_active
-          axis, d = new_active
-          code = _tool_code(axis, d)
-          if code is not None:
-              _gui_start_tool(code)
-
-  # ---------- Watchdog (covers all 3 arbiters) ----------
-  def _watchdog_tick():
-      # global RUN['_current'], RUN['_pending_start'], RUN['_cart_current'], RUN['_cart_pending'], RUN['_tool_current'], RUN['_tool_pending'], RUN['_last_input_time']
+  def _schedule_watchdog():
       try:
+          root.after(WATCHDOG_MS, _watchdog_tick)
+      except Exception as exc:
+          return _fail_xbox_watchdog(exc)
+      return True
+
+  def _watchdog_tick():
+      try:
+          if application_closing.is_set():
+              return
           now = time.monotonic()
           if (now - RUN['_last_input_time']) * 1000.0 > WATCHDOG_MS:
-              if RUN['_current'] is not None or RUN['_cart_current'] is not None or RUN['_tool_current'] is not None:
-                  RUN['_current'] = None; RUN['_pending_start'] = None
-                  RUN['_cart_current'] = None; RUN['_cart_pending'] = None
-                  RUN['_tool_current'] = None; RUN['_tool_pending'] = None
-                  _gui_stop()
+              _request_switch(None)
+              _request_switch_cart(None)
+              _request_switch_tool(None)
       finally:
-          try: root.after(WATCHDOG_MS, _watchdog_tick)
-          except Exception: pass
+          if (
+              not application_closing.is_set()
+              and not RUN['_xbox_watchdog_failed']
+          ):
+              _schedule_watchdog()
 
   # ---------- Axis selection (one axis per stick) ----------
   RUN['_smooth'] = {'LX': 0, 'LY': 0, 'RX': 0, 'RY': 0}
@@ -4436,15 +7801,19 @@ if CE['Platform']['IS_WINDOWS']:
       if idx is None:
           _lbl("No XInput controller detected"); return
       _lbl(f"Xbox connected (slot {idx})")
-      try: root.after(WATCHDOG_MS, _watchdog_tick)
-      except Exception: pass
+      if not _tk_call(_schedule_watchdog):
+          _fail_xbox_watchdog("initial Tk scheduling failed")
+          return
 
       last_buttons = 0  # for edges X/Y/START/LB/RB
       lt_down = False
       rt_down = False
       TRIG_THR = 30  # analog threshold for a 'press'
 
-      while True:
+      while (
+          not application_closing.is_set()
+          and not RUN['_xbox_watchdog_failed']
+      ):
           st = XINPUT_STATE()
           if XInputGetState(idx, ctypes.byref(st)) != 0:
               _request_switch(None); _request_switch_cart(None); _request_switch_tool(None)
@@ -4557,14 +7926,27 @@ if CE['Platform']['IS_WINDOWS']:
           last_buttons = buttons
           time.sleep(0.008)  # ~120 Hz
 
+      _request_switch(None)
+      _request_switch_cart(None)
+      _request_switch_tool(None)
+
   # ---------- Public entry ----------
   def start_xbox():
+      RUN['_xbox_watchdog_failed'] = False
       threading.Thread(target=_poll_loop, daemon=True).start()
       _lbl("Xbox ON / polling…", style="Warn.TLabel")
 
 else:
   from inputs import get_gamepad
   def xbox():
+    def send_xbox_auxiliary(command):
+      serial_port = RUN.get('ser2')
+      return _exchange_xbox_auxiliary_command(
+        command,
+        _xbox_auxiliary_expected_response(command, serial_port),
+        serial_port,
+      )
+
     def threadxbox():
       # global RUN['xboxUse']
       jogMode = 1
@@ -4582,10 +7964,12 @@ else:
         almStatusLab.config(text='XBOX CONTROLLER OFF', style="Warn.TLabel")
         almStatusLab2.config(text='XBOX CONTROLLER OFF', style="Warn.TLabel")
         #xbcStatusLab.config(text='Xbox OFF', )
-      while RUN['xboxUse'] == 1:
+      while RUN['xboxUse'] == 1 and not application_closing.is_set():
         try:
         #if (TRUE):
           events = get_gamepad()
+          if application_closing.is_set() or RUN['xboxUse'] != 1:
+            break
           for event in events:
             ##DISTANCE
             if (event.code == 'ABS_RZ' and event.state >= 100):
@@ -4715,22 +8099,16 @@ else:
             ##GRIPPER         
             elif (event.code == 'BTN_SELECT' and event.state == 1): 
               if grip == 0:
-                grip = 1
                 outputNum = DO1offEntryField.get()
                 command = "OFX"+outputNum+"\n"
-                RUN['ser2'].write(command.encode())
-                RUN['ser2'].flushInput()
-                time.sleep(.1)
-                RUN['ser2'].read() 
+                if send_xbox_auxiliary(command):
+                  grip = 1
               else:
-                grip = 0
                 outputNum = DO1onEntryField.get()
                 command = "ONX"+outputNum+"\n"
-                RUN['ser2'].write(command.encode())
-                RUN['ser2'].flushInput()
-                time.sleep(.1)
-                RUN['ser2'].read()     
-                time.sleep(.1)
+                if send_xbox_auxiliary(command):
+                  grip = 0
+                  time.sleep(.1)
             else:
               pass   
         except:
@@ -4783,1146 +8161,2080 @@ else:
 
 ##end xbox ###################################################################################################################################################
 
-def send_serial_command(cmd):
-    #global progRunning
-    RUN['ser'].write(cmd.encode())    
-    RUN['ser'].flushInput()
-    time.sleep(0.1)
-    response = str(RUN['ser'].readline().strip(), 'utf-8')
-    IncJogStatVal = int(RUN['IncJogStat'].get())
-    if IncJogStatVal or RUN['progRunning']:
-      if response[:1] == 'E':
-        ErrorHandler(response)
+def _configuration_number(key):
+  try:
+    raw_value = CAL[key]
+  except (KeyError, TypeError) as exc:
+    raise MotionInputError(f"invalid controller timing configuration {key!r}") from exc
+  return finite_number(raw_value, f"controller timing configuration {key!r}")
+
+
+def _runtime_number(key):
+  try:
+    raw_value = RUN[key]
+  except (KeyError, TypeError) as exc:
+    raise MotionInputError(f"invalid controller runtime value {key!r}") from exc
+  return finite_number(raw_value, f"controller runtime value {key!r}")
+
+
+def _configured_motion_timeout_bounds():
+  axis_step_ranges = []
+  for axis in range(1, 7):
+    positive_limit = _configuration_number(f'J{axis}PosLim')
+    negative_limit = _configuration_number(f'J{axis}NegLim')
+    steps_per_degree = _configuration_number(f'J{axis}StepDeg')
+    if positive_limit < 0 or negative_limit < 0 or steps_per_degree <= 0:
+      raise MotionInputError(f"J{axis} motion timing configuration is out of range")
+    axis_step_ranges.append(
+      (positive_limit + negative_limit) * steps_per_degree
+    )
+
+  external_lengths = []
+  for axis, length_key in ((7, 'J7PosLim'), (8, 'J8length'), (9, 'J9length')):
+    length = _configuration_number(length_key)
+    rotation = _configuration_number(f'J{axis}rotation')
+    steps = _configuration_number(f'J{axis}steps')
+    if length < 0 or rotation <= 0 or steps <= 0:
+      raise MotionInputError(f"J{axis} motion timing configuration is out of range")
+    external_lengths.append(length)
+    axis_step_ranges.append(length * (steps / rotation))
+
+  maximum_steps = max(axis_step_ranges)
+  minimum_step_delay = _runtime_number('minSpeedDelay')
+  if minimum_step_delay <= 0:
+    raise MotionInputError("controller minimum step delay must be positive and finite")
+  distribution_delay = (
+    minimum_step_delay
+    + FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS * FIRMWARE_AXIS_COUNT
+  )
+  minimum_ramp_full_scale_seconds = (
+    maximum_steps * distribution_delay / 1_000_000.0
+  )
+  if (
+    not math.isfinite(minimum_ramp_full_scale_seconds)
+    or minimum_ramp_full_scale_seconds <= 0
+  ):
+    raise MotionInputError("configured full-scale motion duration is invalid")
+
+  link_extent = sum(
+    abs(_configuration_number(f'J{axis}{parameter}DHpar'))
+    for axis in range(1, 7)
+    for parameter in ('a', 'd')
+  )
+  tool_extent = math.sqrt(sum(
+    _configuration_number(key) ** 2
+    for key in ('TFx', 'TFy', 'TFz')
+  ))
+  maximum_radius = link_extent + tool_extent + sum(external_lengths)
+  millimeter_motion_distance_bound = max(
+    2.0 * math.pi * maximum_radius,
+    minimum_ramp_full_scale_seconds * FIRMWARE_MAX_MILLIMETERS_PER_SECOND,
+  )
+  if (
+    not math.isfinite(millimeter_motion_distance_bound)
+    or millimeter_motion_distance_bound <= 0
+  ):
+    raise MotionInputError("configured Cartesian path bound is invalid")
+
+  return minimum_ramp_full_scale_seconds, millimeter_motion_distance_bound
+
+
+def _controller_response_timeout(command):
+  timing = parse_command_timing(command)
+  if timing is None:
+    if command[:2] == "PG":
+      raise MotionInputError(
+        "G-code playback has no fixed response deadline"
+      )
+    return SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS
+
+  minimum_ramp_full_scale_seconds, millimeter_motion_distance_bound = (
+    _configured_motion_timeout_bounds()
+  )
+  return command_response_timeout(
+    command,
+    SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+    minimum_ramp_full_scale_seconds,
+    millimeter_motion_distance_bound,
+    margin_seconds=SERIAL_RESPONSE_MARGIN_SECONDS,
+  )
+
+
+def _canonicalize_main_serial_command(command):
+  calibration = None
+  if isinstance(command, str) and command[:2] in (
+    "MG", "MJ", "ML", "MV", "RJ", "WC", "WG",
+  ):
+    calibration = _current_controller_joint_calibration()
+  return canonicalize_serial_command(command, calibration)
+
+
+def _exchange_serial_line(
+  command,
+  control_event=None,
+  write_started_event=None,
+):
+  command = _canonicalize_main_serial_command(command)
+  serial_port = RUN.get('ser')
+  try:
+    if command[:2] == "PG":
+      if control_event is not None:
+        raise MotionInputError(
+          "G-code playback does not support live-jog control injection"
+        )
+      parse_command_timing(command)
+      return exchange_serial_line_until_cancelled(
+        serial_port,
+        command,
+        application_closing,
+        write_lock=serial_write_lock,
+        write_started_event=write_started_event,
+      )
+    response_timeout = _controller_response_timeout(command)
+    return exchange_serial_line(
+      serial_port,
+      command,
+      response_timeout,
+      write_lock=serial_write_lock,
+      control_event=control_event,
+      control_command="S\n" if control_event is not None else None,
+      control_ack_timeout_seconds=(
+        SERIAL_LIVE_ACK_TIMEOUT_SECONDS
+        if control_event is not None
+        else None
+      ),
+      control_response_timeout_seconds=(
+        response_timeout
+        if control_event is not None
+        else None
+      ),
+      write_started_event=write_started_event,
+    )
+  finally:
+    if (
+      RUN.get('ser') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      RUN['ser'] = None
+
+
+def _exchange_auxiliary_line(command):
+  serial_port = RUN.get('ser2')
+  try:
+    return exchange_serial_line(
+      serial_port,
+      command,
+      SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+      write_lock=auxiliary_serial_write_lock,
+    )
+  finally:
+    if (
+      RUN.get('ser2') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      RUN['ser2'] = None
+      _clear_auxiliary_board_profile(serial_port)
+
+
+def _raise_auxiliary_stop_acknowledgement_timeout():
+  serial_port = RUN.get('ser2')
+  if serial_port is not None:
+    try:
+      quarantine_serial_transport(
+        serial_port,
+        "auxiliary stop acknowledgement deadline expired",
+      )
+    except Exception:
+      logger.exception("Unable to close auxiliary transport after stop timeout")
+  raise SerialTransportTimeout(
+    "auxiliary stop acknowledgement deadline expired"
+  )
+
+
+def _remaining_auxiliary_stop_acknowledgement_time(deadline):
+  deadline = finite_number(deadline, "auxiliary stop acknowledgement deadline")
+  remaining = deadline - time.monotonic()
+  if remaining <= 0:
+    _raise_auxiliary_stop_acknowledgement_timeout()
+  return remaining
+
+
+def _read_auxiliary_inactive_stop_response(deadline):
+  serial_port = RUN.get('ser2')
+  try:
+    remaining = _remaining_auxiliary_stop_acknowledgement_time(deadline)
+    return read_serial_line_response(
+      serial_port,
+      remaining,
+      accepted_responses=(AUXILIARY_INACTIVE_STOP_RESPONSE,),
+      response_deadline=deadline,
+    )
+  finally:
+    if (
+      RUN.get('ser2') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      RUN['ser2'] = None
+      _clear_auxiliary_board_profile(serial_port)
+
+
+def _begin_auxiliary_stop_owner_wait():
+  global auxiliary_stop_acknowledgement_deadline
+  global auxiliary_stop_owner_waiting
+
+  with auxiliary_stop_state_lock:
+    if auxiliary_stop_owner_waiting:
+      raise RuntimeError("auxiliary stop owner wait was already active")
+    auxiliary_stop_injected_event.clear()
+    auxiliary_stop_acknowledgement_deadline = None
+    auxiliary_stop_owner_waiting = True
+
+
+def _auxiliary_stop_acknowledgement_deadline_value():
+  with auxiliary_stop_state_lock:
+    deadline = auxiliary_stop_acknowledgement_deadline
+  if deadline is None:
+    raise ProtocolResponseError(
+      "auxiliary stop acknowledgement deadline is unavailable"
+    )
+  return deadline
+
+
+def _publish_auxiliary_stop_owner_result(succeeded, value):
+  global auxiliary_stop_acknowledgement_deadline
+  global auxiliary_stop_owner_result
+  global auxiliary_stop_owner_waiting
+
+  validation_error = None
+  if not isinstance(succeeded, bool):
+    validation_error = "auxiliary stop owner result must use a boolean status"
+  elif not isinstance(value, str):
+    validation_error = "auxiliary stop owner result must contain text"
+  else:
+    value = value.strip()
+    if succeeded and value not in AUXILIARY_STOP_OWNER_RESPONSES:
+      validation_error = "unexpected auxiliary wait terminal response"
+    elif not value:
+      value = "auxiliary wait owner ended without a terminal response"
+
+  with auxiliary_stop_state_lock:
+    if not auxiliary_stop_owner_waiting:
+      raise RuntimeError("auxiliary stop owner wait was not active")
+    auxiliary_stop_owner_waiting = False
+    request_id = auxiliary_stop_active_request_id
+    if request_id is not None:
+      if auxiliary_stop_owner_result is not None:
+        raise RuntimeError("auxiliary stop owner result was already published")
+      if validation_error is not None:
+        auxiliary_stop_owner_result = (request_id, False, validation_error)
       else:
-        displayPosition(response) 		
+        auxiliary_stop_owner_result = (request_id, succeeded, value)
+      auxiliary_stop_owner_result_event.set()
+    auxiliary_stop_injected_event.clear()
+    auxiliary_stop_acknowledgement_deadline = None
+  if validation_error is not None:
+    raise ProtocolResponseError(validation_error)
+  if request_id is None:
+    return False
+  return True
 
 
+def _run_auxiliary_stop_safe(request_id, control_mode):
+  global auxiliary_stop_acknowledgement_deadline
+  global auxiliary_stop_active_request_id
+  global auxiliary_stop_owner_result
 
-def start_send_serial_thread(command):
-    #global progRunning
-    if serial_lock.locked():
-        logger.warning("Serial command already in progress — ignoring.")
-        return
-    t = threading.Thread(target=run_send_serial_safe, args=(command,), daemon=True)
-    t.start()
+  terminal_type = "completed"
+  terminal_value = ""
+  auxiliary_serial_event_queue.put(("started", request_id, "STOP\n"))
+  try:
+    if control_mode == SerialActivityRegistry.CONTROL_INJECT:
+      write_serial_control(
+        RUN.get('ser2'),
+        "STOP\n",
+        write_lock=auxiliary_serial_write_lock,
+      )
+      acknowledgement_deadline = (
+        time.monotonic() + SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS
+      )
+      with auxiliary_stop_state_lock:
+        if auxiliary_stop_active_request_id != request_id:
+          raise RuntimeError("auxiliary stop request ownership changed before wait")
+        auxiliary_stop_acknowledgement_deadline = acknowledgement_deadline
+      auxiliary_stop_injected_event.set()
+      while True:
+        remaining = acknowledgement_deadline - time.monotonic()
+        if remaining <= 0:
+          _raise_auxiliary_stop_acknowledgement_timeout()
+        if auxiliary_stop_owner_result_event.wait(
+          min(CONTROL_POLL_INTERVAL_SECONDS, remaining)
+        ):
+          break
+        if application_closing.is_set():
+          raise SerialActivityRejected(
+            "application shutdown interrupted auxiliary stop acknowledgement"
+          )
+      with auxiliary_stop_state_lock:
+        owner_result = auxiliary_stop_owner_result
+        if (
+          not isinstance(owner_result, tuple)
+          or len(owner_result) != 3
+          or owner_result[0] != request_id
+          or not isinstance(owner_result[1], bool)
+          or not isinstance(owner_result[2], str)
+        ):
+          raise RuntimeError("auxiliary stop owner result is invalid")
+        _, owner_succeeded, terminal_value = owner_result
+        auxiliary_stop_owner_result = None
+        auxiliary_stop_owner_result_event.clear()
+      if not owner_succeeded:
+        raise RuntimeError(terminal_value)
+      if terminal_value in AUXILIARY_WAIT_NATURAL_RESPONSES:
+        remaining = _remaining_auxiliary_stop_acknowledgement_time(
+          acknowledgement_deadline
+        )
+        acquired = auxiliary_serial_lock.acquire(
+          timeout=remaining
+        )
+        if acquired is False:
+          _raise_auxiliary_stop_acknowledgement_timeout()
+        try:
+          terminal_value = _read_auxiliary_inactive_stop_response(
+            acknowledgement_deadline
+          )
+        finally:
+          auxiliary_serial_lock.release()
+      elif terminal_value not in (
+        "Nano Stopped",
+        AUXILIARY_INACTIVE_STOP_RESPONSE,
+      ):
+        raise ProtocolResponseError("unexpected injected auxiliary stop response")
+    elif control_mode == SerialActivityRegistry.CONTROL_EXCLUSIVE:
+      acquired = auxiliary_serial_lock.acquire()
+      if acquired is False:
+        raise RuntimeError("auxiliary stop transport acquisition failed")
+      try:
+        terminal_value = _exchange_auxiliary_line("STOP\n")
+      finally:
+        auxiliary_serial_lock.release()
+      if terminal_value != AUXILIARY_INACTIVE_STOP_RESPONSE:
+        raise ProtocolResponseError("unexpected inactive auxiliary stop response")
+    else:
+      raise RuntimeError("auxiliary stop received an invalid control mode")
+  except Exception as exc:
+    terminal_type = "failed"
+    terminal_value = str(exc).strip() or "auxiliary stop failed without details"
 
-def run_send_serial_safe(command):
-    #global progRunning
-    with serial_lock:
+  cleanup_errors = []
+  try:
+    serial_activity_registry.finish_control("ser2", control_mode)
+  except Exception as exc:
+    cleanup_errors.append(f"control ownership cleanup failed: {exc}")
+  with auxiliary_stop_state_lock:
+    if auxiliary_stop_active_request_id != request_id:
+      cleanup_errors.append("auxiliary stop request ownership changed unexpectedly")
+    else:
+      auxiliary_stop_active_request_id = None
+    if (
+      isinstance(auxiliary_stop_owner_result, tuple)
+      and auxiliary_stop_owner_result[0] == request_id
+    ):
+      auxiliary_stop_owner_result = None
+      auxiliary_stop_owner_result_event.clear()
+    if (
+      not auxiliary_stop_owner_waiting
+      or auxiliary_stop_acknowledgement_deadline is None
+    ):
+      auxiliary_stop_injected_event.clear()
+      auxiliary_stop_acknowledgement_deadline = None
+  if cleanup_errors:
+    terminal_type = "failed"
+    cleanup_message = "; ".join(cleanup_errors)
+    terminal_value = (
+      f"{terminal_value}; {cleanup_message}"
+      if terminal_value
+      else cleanup_message
+    )
+  auxiliary_serial_event_queue.put(
+    (terminal_type, request_id, terminal_value)
+  )
+
+
+def _auxiliary_stop_not_required():
+  if application_closing.is_set() or RUN['offlineMode']:
+    return True
+  configured_port = CAL.get('com2Port')
+  configured_board = CAL.get('auxiliaryBoard')
+  return (
+    configured_port is None
+    or configured_port == ""
+    or configured_port == "None"
+    or configured_board is None
+    or configured_board == ""
+    or configured_board == AUXILIARY_BOARD_NONE
+  )
+
+
+def _try_dispatch_auxiliary_stop():
+  global auxiliary_stop_acknowledgement_deadline
+  global auxiliary_stop_active_request_id
+  global auxiliary_stop_owner_result
+  global auxiliary_stop_pending_request_id
+
+  with auxiliary_stop_state_lock:
+    request_id = auxiliary_stop_pending_request_id
+    if (
+      request_id is None
+      or auxiliary_stop_active_request_id is not None
+      or auxiliary_stop_acknowledgement_deadline is not None
+    ):
+      return False
+    if _auxiliary_stop_not_required():
+      auxiliary_stop_pending_request_id = None
+      auxiliary_stop_requested.clear()
+      auxiliary_serial_event_queue.put(
+        ("completed", request_id, "AUXILIARY STOP NOT REQUIRED")
+      )
+      return False
+    control_mode = serial_activity_registry.reserve_control("ser2")
+    if control_mode is None:
+      return False
+    if (
+      control_mode == SerialActivityRegistry.CONTROL_INJECT
+      and not auxiliary_stop_owner_waiting
+    ):
+      serial_activity_registry.finish_control("ser2", control_mode)
+      return False
+    auxiliary_stop_pending_request_id = None
+    auxiliary_stop_active_request_id = request_id
+    auxiliary_stop_owner_result = None
+    auxiliary_stop_owner_result_event.clear()
+    auxiliary_stop_injected_event.clear()
+    auxiliary_stop_acknowledgement_deadline = None
+    auxiliary_stop_requested.clear()
+
+  try:
+    thread = threading.Thread(
+      target=_run_auxiliary_stop_safe,
+      args=(request_id, control_mode),
+      daemon=True,
+    )
+    thread.start()
+  except Exception as exc:
+    failure = f"unable to start auxiliary stop worker: {exc}"
+    try:
+      serial_activity_registry.finish_control("ser2", control_mode)
+    except Exception as cleanup_exc:
+      failure = f"{failure}; control ownership cleanup failed: {cleanup_exc}"
+    with auxiliary_stop_state_lock:
+      if auxiliary_stop_active_request_id == request_id:
+        auxiliary_stop_active_request_id = None
+      auxiliary_stop_owner_result = None
+      auxiliary_stop_owner_result_event.clear()
+      auxiliary_stop_injected_event.clear()
+      auxiliary_stop_acknowledgement_deadline = None
+    auxiliary_serial_event_queue.put(("failed", request_id, failure))
+  return True
+
+
+def _request_auxiliary_stop():
+  global auxiliary_stop_next_request_id
+  global auxiliary_stop_pending_request_id
+
+  if _auxiliary_stop_not_required():
+    return AUXILIARY_STOP_NOT_REQUIRED, None
+  with auxiliary_stop_state_lock:
+    if auxiliary_stop_active_request_id is not None:
+      return AUXILIARY_STOP_DISPATCHED, auxiliary_stop_active_request_id
+    if auxiliary_stop_pending_request_id is None:
+      auxiliary_stop_next_request_id += 1
+      auxiliary_stop_pending_request_id = auxiliary_stop_next_request_id
+      auxiliary_stop_requested.set()
+    request_id = auxiliary_stop_pending_request_id
+
+  if _try_dispatch_auxiliary_stop():
+    return AUXILIARY_STOP_DISPATCHED, request_id
+  with auxiliary_stop_state_lock:
+    if auxiliary_stop_active_request_id == request_id:
+      return AUXILIARY_STOP_DISPATCHED, request_id
+    if auxiliary_stop_pending_request_id == request_id:
+      return AUXILIARY_STOP_PENDING, request_id
+  return AUXILIARY_STOP_NOT_REQUIRED, None
+
+
+def start_send_serial_thread(
+  command,
+  live_jog=False,
+  completion_callback=None,
+  controller_recovery=False,
+  write_started_event=None,
+):
+  if completion_callback is not None and not callable(completion_callback):
+    raise TypeError("completion_callback must be callable")
+  if not isinstance(controller_recovery, bool):
+    raise TypeError("controller_recovery must be boolean")
+  if write_started_event is not None and not all(
+    callable(getattr(write_started_event, method, None))
+    for method in ("set", "is_set")
+  ):
+    raise TypeError("write_started_event must satisfy the event contract")
+  if application_closing.is_set():
+    logger.warning("Serial command rejected during application shutdown")
+    return False
+  if controller_correction_requested.is_set() and not controller_recovery:
+    logger.warning("Serial command rejected until controller correction completes")
+    return False
+  inherited_transport = _transfer_main_serial_reservation()
+  if not inherited_transport and not serial_lock.acquire(blocking=False):
+    logger.warning("Serial command already in progress; command rejected")
+    return False
+  try:
+    activity_lease = serial_activity_registry.lease("ser")
+  except SerialActivityRejected as exc:
+    if inherited_transport:
+      _restore_main_serial_reservation()
+    else:
+      serial_lock.release()
+    logger.warning("Serial command rejected: %s", exc)
+    return False
+  except Exception:
+    if inherited_transport:
+      _restore_main_serial_reservation()
+    else:
+      serial_lock.release()
+    raise
+  legacy_serial_result_pending.set()
+  if live_jog:
+    live_jog_stop_requested.clear()
+    live_serial_result_pending.set()
+
+  try:
+    thread = threading.Thread(
+      target=run_send_serial_safe,
+      args=(
+        command,
+        live_jog,
+        completion_callback,
+        activity_lease,
+        write_started_event,
+      ),
+      daemon=True,
+    )
+    thread.start()
+  except Exception:
+    legacy_serial_result_pending.clear()
+    if live_jog:
+      live_serial_result_pending.clear()
+      live_jog_stop_requested.clear()
+    if inherited_transport:
+      _restore_main_serial_reservation()
+    else:
+      serial_lock.release()
+    activity_lease.close()
+    raise
+  return True
+
+
+def _try_dispatch_controller_correction():
+  with controller_correction_state_lock:
+    if not controller_correction_requested.is_set():
+      return False
+    if application_closing.is_set() or RUN['offlineMode']:
+      return False
+    serial_port = RUN.get('ser')
+    if (
+      serial_port is None
+      or not getattr(serial_port, "is_open", False)
+      or serial_transport_quarantined(serial_port)
+    ):
+      return False
+    if serial_lock.locked() or motion_request_registry.active:
+      return False
+    request_lease = _acquire_motion_request(
+      "Controller correction",
+      allow_position_recovery=True,
+    )
+    if request_lease is None:
+      return False
+    try:
+      started = start_send_serial_thread(
+        "CP\n",
+        completion_callback=lambda controller_position: _complete_controller_correction(
+          request_lease,
+          controller_position,
+        ),
+        controller_recovery=True,
+      )
+    except Exception:
+      _finish_motion_request(request_lease)
+      logger.exception("Unable to start controller correction")
+      return False
+    if not started:
+      _finish_motion_request(request_lease)
+      return False
+    return True
+
+
+def _complete_controller_correction(request_lease, controller_position):
+  if controller_position is not None and not isinstance(
+    controller_position,
+    PositionResponse,
+  ):
+    raise RuntimeError(
+      "controller correction returned an invalid position result"
+    )
+  try:
+    with controller_correction_state_lock:
+      if (
+        controller_position is not None
+        and not controller_position_resynchronization_required.is_set()
+      ):
+        controller_correction_requested.clear()
+      else:
+        controller_correction_requested.set()
+  finally:
+    _finish_motion_request(request_lease)
+
+
+def _request_controller_correction():
+  if application_closing.is_set() or RUN['offlineMode']:
+    return False
+  _clear_deferred_joint_adjustments()
+  with controller_correction_state_lock:
+    controller_correction_requested.set()
+  return _try_dispatch_controller_correction()
+
+
+def run_send_serial_safe(
+  command,
+  live_jog=False,
+  completion_callback=None,
+  activity_lease=None,
+  write_started_event=None,
+):
+  serial_event_queue.put(
+    (
+      "started",
+      command,
+      None,
+      None,
+      live_jog,
+      completion_callback,
+      activity_lease,
+    )
+  )
+  try:
+    response = _exchange_serial_line(
+      command,
+      control_event=live_jog_stop_requested if live_jog else None,
+      write_started_event=write_started_event,
+    )
+    serial_event_queue.put(
+      (
+        "completed",
+        command,
+        response,
+        None,
+        live_jog,
+        completion_callback,
+        activity_lease,
+      )
+    )
+  except Exception as exc:
+    serial_event_queue.put(
+      (
+        "failed",
+        command,
+        None,
+        str(exc),
+        live_jog,
+        completion_callback,
+        activity_lease,
+      )
+    )
+
+
+def _invalidate_joint_motion_state(reason):
+  if not isinstance(reason, str) or not reason.strip():
+    reason = "controller state became uncertain"
+  else:
+    reason = reason.strip()
+  controller_position_resynchronization_required.set()
+  pending_discarded = joint_motion_dispatcher.invalidate(reason)
+  deferred_discarded = deferred_joint_adjustments.pending
+  _clear_deferred_joint_adjustments()
+  if pending_discarded or deferred_discarded:
+    logger.warning("Pending joint target discarded because controller state is unknown")
+
+
+def _apply_legacy_serial_response(response):
+  if not isinstance(response, str):
+    reason = "legacy serial exchange returned a non-text response"
+    _invalidate_joint_motion_state(reason)
+    raise ProtocolResponseError(reason)
+  if response.startswith('E'):
+    ErrorHandler(response)
+    _invalidate_joint_motion_state(f"controller rejected motion: {response}")
+    return None
+
+  try:
+    parsed = parse_position_response(response)
+  except ProtocolResponseError:
+    displayPosition(response)
+    return None
+
+  applied_position = displayPosition(response, parsed=parsed)
+  if applied_position is None:
+    return None
+  if parsed.flag:
+    return None
+  return applied_position
+
+
+def _poll_serial_events():
+  try:
+    while True:
+      try:
+        event = serial_event_queue.get_nowait()
+      except Empty:
+        break
+      if not isinstance(event, tuple) or len(event) != 7:
+        raise RuntimeError("serial worker emitted an invalid event")
+      (
+        event_type,
+        command,
+        response,
+        error,
+        live_jog,
+        completion_callback,
+        activity_lease,
+      ) = event
+      if completion_callback is not None and not callable(completion_callback):
+        raise RuntimeError("serial worker emitted an invalid completion callback")
+      if activity_lease is not None and not callable(
+        getattr(activity_lease, "close", None)
+      ):
+        raise RuntimeError("serial worker emitted an invalid activity lease")
+
+      if event_type == "started":
         cmdSentEntryField.delete(0, 'end')
         cmdSentEntryField.insert(0, command)
-        send_serial_command(command)
-       
+        if live_jog:
+          almStatusLab.config(text="LIVE JOG IN PROGRESS", style="OK.TLabel")
+          almStatusLab2.config(text="LIVE JOG IN PROGRESS", style="OK.TLabel")
+        continue
 
- 
-def J1jogNeg(value):
-  # global RUN['xboxUse']
-  # global RUN['VR_angles']
-  #global offlineMode
+      if event_type not in ("completed", "failed"):
+        raise RuntimeError(f"serial worker emitted an unknown event: {event_type!r}")
+
+      applied_position = None
+      try:
+        if event_type == "failed":
+          message = f"Serial command failed: {error}"
+          logger.error(message)
+          almStatusLab.config(text=message, style="Alarm.TLabel")
+          almStatusLab2.config(text=message, style="Alarm.TLabel")
+          _invalidate_joint_motion_state(message)
+        else:
+          applied_position = _apply_legacy_serial_response(response)
+          if applied_position is not None and not isinstance(
+            applied_position,
+            PositionResponse,
+          ):
+            raise RuntimeError(
+              "serial response application returned an invalid position result"
+            )
+          if applied_position is not None and live_jog:
+            RUN['VR_angles'] = [
+              finite_number(CAL[f'J{axis}AngCur'], f"J{axis} angle")
+              for axis in range(1, 7)
+            ]
+            setStepMonitorsVR()
+            if not applied_position.speed_violation:
+              almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
+              almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+      except Exception as exc:
+        message = f"Unable to apply serial worker result: {exc}"
+        logger.exception(message)
+        _invalidate_joint_motion_state(message)
+      finally:
+        if live_jog:
+          RUN['liveJog'] = False
+        legacy_serial_result_pending.clear()
+        live_serial_result_pending.clear()
+        live_jog_stop_requested.clear()
+        try:
+          if serial_lock.locked():
+            serial_lock.release()
+          else:
+            logger.error("Serial result arrived without transport ownership")
+        finally:
+          if activity_lease is not None and activity_lease.close() is not True:
+            logger.error("Serial result reused a released activity lease")
+
+        if completion_callback is not None:
+          try:
+            completion_callback(applied_position)
+          except Exception:
+            logger.exception("Unable to apply a serial completion callback")
+        if (
+          applied_position is not None
+          and applied_position.speed_violation
+        ):
+          if deferred_joint_adjustments.pending:
+            logger.warning(
+              "Deferred joint target discarded after a controller speed violation"
+            )
+          _clear_deferred_joint_adjustments()
+          deferred_dispatched = False
+        else:
+          deferred_dispatched = _try_dispatch_deferred_joint_adjustments(
+            allow_current_generation=True,
+          )
+        if (
+          applied_position is not None
+          and not applied_position.speed_violation
+          and not deferred_dispatched
+          and not joint_motion_dispatcher.active
+          and not motion_request_registry.active
+          and not application_closing.is_set()
+        ):
+          almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
+          almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+  except Exception:
+    logger.exception("Unable to apply a serial worker result on the Tk event thread")
+  finally:
+    if not application_closing.is_set():
+      root.after(25, _poll_serial_events)
+
+
+def _poll_auxiliary_serial_events():
+  try:
+    while True:
+      try:
+        event = auxiliary_serial_event_queue.get_nowait()
+      except Empty:
+        break
+      if (
+        not isinstance(event, tuple)
+        or len(event) != 3
+        or event[0] not in ("started", "completed", "failed")
+        or isinstance(event[1], bool)
+        or not isinstance(event[1], int)
+        or event[1] <= 0
+        or not isinstance(event[2], str)
+        or not event[2]
+      ):
+        raise RuntimeError("auxiliary serial worker emitted an invalid event")
+
+      event_type, request_id, value = event
+      current_request_id = RUN.get('programStopRequestId')
+      if event_type == "started":
+        cmdSentEntryField.delete(0, 'end')
+        cmdSentEntryField.insert(0, value)
+        if current_request_id == request_id:
+          _set_program_stop_status("pending")
+      elif event_type == "completed":
+        cmdRecEntryField.delete(0, 'end')
+        cmdRecEntryField.insert(0, value)
+        if current_request_id == request_id:
+          RUN['programStopRequestId'] = None
+          _set_program_stop_status("completed")
+      else:
+        message = f"Auxiliary stop failed: {value}"
+        logger.error(message)
+        if current_request_id == request_id:
+          RUN['programStopRequestId'] = None
+          _set_program_stop_status("failed")
+  except Exception:
+    logger.exception("Unable to apply an auxiliary serial result on the Tk event thread")
+  finally:
+    _try_dispatch_controller_correction()
+    _try_dispatch_auxiliary_stop()
+    _ensure_startup_auxiliary_cleanup()
+    if not application_closing.is_set():
+      root.after(25, _poll_auxiliary_serial_events)
+
+
+def _poll_xbox_auxiliary_events():
+  try:
+    while True:
+      try:
+        event = xbox_auxiliary_event_queue.get_nowait()
+      except Empty:
+        break
+      if (
+        not isinstance(event, tuple)
+        or len(event) != 5
+        or event[0] not in ("completed", "rejected", "failed")
+        or isinstance(event[1], bool)
+        or not isinstance(event[1], int)
+        or event[1] <= 0
+        or event[2] not in XBOX_AUXILIARY_PENDING_KEYS
+        or not isinstance(event[3], bool)
+        or not isinstance(event[4], str)
+        or not event[4].strip()
+      ):
+        raise RuntimeError("Xbox auxiliary worker emitted an invalid event")
+
+      event_type, request_id, state_name, target_state, value = event
+      pending_name = XBOX_AUXILIARY_PENDING_KEYS[state_name]
+      if RUN.get(pending_name) != request_id:
+        logger.warning(
+          "Ignoring a stale Xbox auxiliary result for %s",
+          state_name,
+        )
+        continue
+      current_state = RUN.get(state_name)
+      if not isinstance(current_state, bool) or target_state is current_state:
+        raise RuntimeError("Xbox auxiliary result conflicts with confirmed state")
+      value = value.strip()
+      if event_type == "completed":
+        expected_response = XBOX_AUXILIARY_TOGGLE_RESPONSES[state_name]
+        if value != expected_response.decode("ascii"):
+          raise RuntimeError("Xbox auxiliary acknowledgement contract changed")
+
+      RUN[pending_name] = None
+      if event_type == "completed":
+        RUN[state_name] = target_state
+        continue
+
+      if event_type == "failed":
+        RUN[state_name] = None
+        message = f"Xbox auxiliary command failed: {value}"
+        style = "Alarm.TLabel"
+        logger.error(message)
+      else:
+        message = f"Xbox auxiliary command rejected: {value}"
+        style = "Warn.TLabel"
+        logger.warning(message)
+      almStatusLab.config(text=message, style=style)
+      almStatusLab2.config(text=message, style=style)
+  except Exception:
+    logger.exception("Unable to apply an Xbox auxiliary result on the Tk event thread")
+  finally:
+    if not application_closing.is_set():
+      root.after(25, _poll_xbox_auxiliary_events)
+
+
+def _poll_virtual_motion_events():
+  try:
+    while True:
+      try:
+        event = virtual_motion_event_queue.get_nowait()
+      except Empty:
+        break
+      if not isinstance(event, tuple) or len(event) != 2:
+        raise RuntimeError("virtual motion worker emitted an invalid event")
+      event_type, value = event
+      if event_type == "error" and isinstance(value, str):
+        ErrorHandler(value)
+      elif (
+        event_type == "program-completion"
+        and isinstance(value, tuple)
+        and len(value) == 4
+        and callable(value[0])
+        and isinstance(value[1], MotionRequestLease)
+        and isinstance(value[2], bool)
+        and (value[3] is None or callable(value[3]))
+      ):
+        (
+          completion_callback,
+          request_lease,
+          succeeded,
+          settlement_callback,
+        ) = value
+        _finish_settled_motion_request(
+          completion_callback,
+          request_lease,
+          succeeded,
+          settlement_callback,
+        )
+      elif (
+        event_type == "offline-live-terminal"
+        and isinstance(value, VirtualMotionOperation)
+      ):
+        _settle_offline_live_jog(value)
+      elif event_type == "motion-released" and value is None:
+        _try_dispatch_controller_correction()
+        _try_dispatch_deferred_joint_adjustments(
+          allow_current_generation=True,
+        )
+      else:
+        raise RuntimeError("virtual motion worker emitted an invalid event")
+  except Exception:
+    logger.exception("Unable to apply a virtual-motion result on the Tk event thread")
+  finally:
+    if not application_closing.is_set():
+      root.after(25, _poll_virtual_motion_events)
+
+
+def _current_joint_positions():
+  return _controller_joint_positions_from_values(CAL)
+
+
+def _controller_joint_positions_from_values(values):
+  return tuple(
+    finite_number(values[key], label)
+    for key, label in (
+      ('J1AngCur', 'J1 current angle'),
+      ('J2AngCur', 'J2 current angle'),
+      ('J3AngCur', 'J3 current angle'),
+      ('J4AngCur', 'J4 current angle'),
+      ('J5AngCur', 'J5 current angle'),
+      ('J6AngCur', 'J6 current angle'),
+      ('J7PosCur', 'J7 current position'),
+      ('J8PosCur', 'J8 current position'),
+      ('J9PosCur', 'J9 current position'),
+    )
+  )
+
+
+def _controller_joint_calibration_from_values(values):
+  negative_limits = tuple(
+    finite_number(values[f'J{axis}NegLim'], f'J{axis} negative limit')
+    for axis in range(1, 7)
+  ) + (0.0, 0.0, 0.0)
+  positive_limits = tuple(
+    finite_number(values[f'J{axis}PosLim'], f'J{axis} positive limit')
+    for axis in range(1, 7)
+  ) + tuple(
+    finite_number(values[key], key)
+    for key in ('J7PosLim', 'J8length', 'J9length')
+  )
+  steps_per_unit = [
+    finite_number(values[f'J{axis}StepDeg'], f'J{axis} steps per degree')
+    for axis in range(1, 7)
+  ]
+  for axis in range(7, 10):
+    rotation = finite_number(values[f'J{axis}rotation'], f'J{axis} rotation')
+    steps = finite_number(values[f'J{axis}steps'], f'J{axis} steps')
+    if rotation <= 0:
+      raise MotionInputError(f"J{axis} rotation must be positive")
+    steps_per_unit.append(
+      controller_ratio(steps, rotation, f"J{axis} steps per unit")
+    )
+  return ControllerJointCalibration(
+    negative_limits=negative_limits,
+    positive_limits=positive_limits,
+    steps_per_unit=tuple(steps_per_unit),
+  )
+
+
+def _validate_controller_pose(values):
+  calibration = _controller_joint_calibration_from_values(values)
+  return calibration.validate_positions(
+    _controller_joint_positions_from_values(values)
+  )
+
+
+def _current_controller_joint_calibration():
+  return _controller_joint_calibration_from_values(CAL)
+
+
+def _current_joint_motion_profile():
   checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
+  speed_type = speedOption.get()
+  if speed_type == "mm per Sec":
+    speedOption.set("Percent")
     speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+str(float(CAL['J1AngCur'])-value)+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  commandVR = "RJ"+"A"+str(float(RUN['VR_angles'][0])-value)+"B"+str(RUN['VR_angles'][1])+"C"+str(RUN['VR_angles'][2])+"D"+str(RUN['VR_angles'][3])+"E"+str(RUN['VR_angles'][4])+"F"+str(RUN['VR_angles'][5])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  #send command to virtual robot
-  rj_command(commandVR)   
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-   
+    speedEntryField.insert(0, "50")
+    speed_prefix = "Sp"
+  elif speed_type == "Seconds":
+    speed_prefix = "Ss"
+  elif speed_type == "Percent":
+    speed_prefix = "Sp"
+  else:
+    raise MotionInputError(f"Unsupported joint speed type: {speed_type!r}")
+
+  wrist_config = RUN.get('WC')
+  if wrist_config not in ("N", "F"):
+    wrist_config = (
+      "F" if finite_number(CAL['J5AngCur'], "J5 angle") > 0 else "N"
+    )
+    RUN['WC'] = wrist_config
+
+  loop_mode = ''.join(
+    str(CAL[f'J{axis}OpenLoopVal'].get())
+    for axis in range(1, 7)
+  )
+  return MotionProfile(
+    speed_prefix=speed_prefix,
+    speed=speedEntryField.get(),
+    acceleration=ACCspeedField.get(),
+    deceleration=DECspeedField.get(),
+    ramp=ACCrampField.get(),
+    wrist_config=wrist_config,
+    loop_mode=loop_mode,
+  )
+
+
+def _exchange_joint_motion(command):
+  return _exchange_serial_line(command)
+
+
+joint_motion_dispatcher = CoalescingJointDispatcher(
+  _exchange_joint_motion,
+  _current_controller_joint_calibration,
+  transport_lock=serial_lock,
+  activity_factory=lambda: serial_activity_registry.lease("ser"),
+)
+confirmed_position_generation = 0
+deferred_joint_adjustments = DeferredJointAdjustments()
+
+
+def _reserve_joint_motion_request():
+  global joint_motion_request_lease
+
+  with joint_motion_request_lock:
+    if joint_motion_request_lease is not None:
+      if not motion_request_registry.owns(joint_motion_request_lease):
+        raise RuntimeError("joint dispatcher lost motion request ownership")
+      return joint_motion_request_lease, False
+    request_lease = _acquire_motion_request("Joint target dispatcher")
+    if request_lease is None:
+      return None, False
+    joint_motion_request_lease = request_lease
+    return request_lease, True
+
+
+def _abandon_joint_motion_request(request_lease):
+  global joint_motion_request_lease
+
+  with joint_motion_request_lock:
+    if joint_motion_request_lease is not request_lease:
+      raise RuntimeError("joint dispatcher request cleanup is stale")
+    if joint_motion_dispatcher.active:
+      raise RuntimeError("active joint dispatcher request cannot be abandoned")
+    joint_motion_request_lease = None
+  if request_lease.close() is not True:
+    raise RuntimeError("joint dispatcher request was already released")
+  return True
+
+
+def _finish_joint_motion_request_if_idle():
+  global joint_motion_request_lease
+
+  with joint_motion_request_lock:
+    request_lease = joint_motion_request_lease
+    if request_lease is None or joint_motion_dispatcher.active:
+      return False
+    joint_motion_request_lease = None
+  _finish_motion_request(request_lease)
+  return True
+
+
+def _clear_deferred_joint_adjustments():
+  deferred_joint_adjustments.clear()
+
+
+def _defer_joint_adjustment(axis, delta, profile):
+  return deferred_joint_adjustments.add(
+    axis,
+    delta,
+    profile,
+    confirmed_position_generation,
+  )
+
+
+def _defer_joint_target(axis, target, profile):
+  return deferred_joint_adjustments.set_target(
+    axis,
+    target,
+    profile,
+    confirmed_position_generation,
+  )
+
+
+def _try_dispatch_deferred_joint_adjustments(allow_current_generation=False):
+  if application_closing.is_set():
+    return False
+  if not deferred_joint_adjustments.pending:
+    return False
+  if (
+    controller_correction_requested.is_set()
+    or legacy_serial_result_pending.is_set()
+    or serial_lock.locked()
+    or joint_motion_dispatcher.active
+    or motion_request_registry.active
+  ):
+    return False
+  if not deferred_joint_adjustments.ready(
+    confirmed_position_generation,
+    allow_current_generation=allow_current_generation,
+  ):
+    return False
+
+  request_lease = None
+  lease_created = False
+  try:
+    actual_positions = _current_joint_positions()
+
+    def submit_deferred(target_positions, profile):
+      nonlocal request_lease, lease_created
+      request_lease, lease_created = _reserve_joint_motion_request()
+      if request_lease is None:
+        raise MotionTransportBusy("another motion request is active")
+      return joint_motion_dispatcher.submit_positions(
+        target_positions,
+        actual_positions,
+        profile,
+      )
+
+    submission = deferred_joint_adjustments.consume(
+      actual_positions,
+      confirmed_position_generation,
+      submit_deferred,
+      allow_current_generation=allow_current_generation,
+    )
+  except MotionTransportBusy:
+    if lease_created and not joint_motion_dispatcher.active:
+      _abandon_joint_motion_request(request_lease)
+    return False
+  except (KeyError, TypeError, ValueError, MotionInputError, MotionQueueFault) as exc:
+    if (
+      lease_created
+      and request_lease is not None
+      and not joint_motion_dispatcher.active
+    ):
+      _abandon_joint_motion_request(request_lease)
+    _clear_deferred_joint_adjustments()
+    message = f"Deferred joint jog rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+
+  status = "JOINT TARGET QUEUED" if submission.coalesced else "JOINT MOVE IN PROGRESS"
+  almStatusLab.config(text=status, style="OK.TLabel")
+  almStatusLab2.config(text=status, style="OK.TLabel")
+  _try_set_virtual_joint_target(submission.target)
+  return True
+
+
+def _set_virtual_joint_target(target_positions):
+  try:
+    values = tuple(target_positions)
+    if len(values) < 6:
+      raise ValueError("joint target contains fewer than six robot axes")
+    joints = [
+      finite_number(value, f"virtual joint {axis}")
+      for axis, value in enumerate(values[:6], start=1)
+    ]
+  except (TypeError, ValueError) as exc:
+    raise MotionInputError(f"invalid virtual joint target: {exc}") from exc
+  if not all(math.isfinite(value) for value in joints):
+    raise MotionInputError("virtual joint target must contain finite values")
+  RUN['VR_angles'] = joints
+  setStepMonitorsVR()
+
+
+def _try_set_virtual_joint_target(target_positions):
+  try:
+    _set_virtual_joint_target(target_positions)
+  except (KeyError, TypeError, ValueError, MotionInputError) as exc:
+    message = f"Virtual model update failed; controller state remains authoritative: {exc}"
+    logger.exception(message)
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
+    return False
+  return True
+
+
+def _set_virtual_from_joint_result(position):
+  target = joint_motion_dispatcher.desired_target
+  if target is None:
+    target = position.joints
+  return _try_set_virtual_joint_target(target)
+
+
+def _start_offline_joint_motion(command):
+  request_lease = _acquire_motion_request("Offline joint motion")
+  if request_lease is None:
+    return False
+
+  try:
+    saved_virtual_pose = _validated_virtual_six_vector(
+      RUN['VR_angles'],
+      "offline joint starting pose",
+    )
+  except (KeyError, TypeError, ValueError, MotionInputError) as exc:
+    _finish_motion_request(request_lease)
+    message = f"Offline virtual joint motion rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+
+  def reconcile_offline_joint(succeeded):
+    target_pose = (
+      tuple(RUN['VR_angles'])
+      if succeeded
+      else saved_virtual_pose
+    )
+    try:
+      if refresh_gui_from_joint_angles(target_pose) is not True:
+        raise MotionQueueFault("virtual GUI rejected offline joint settlement")
+    except (KeyError, TypeError, ValueError, MotionInputError, MotionQueueFault) as exc:
+      logger.error("Unable to reconcile offline joint motion: %s", exc)
+      return False
+    return succeeded
+
+  try:
+    virtual_completion_timeout = _virtual_completion_timeout(command)
+    operation = rj_command(command)
+  except Exception:
+    _finish_settled_motion_request(
+      None,
+      request_lease,
+      False,
+      reconcile_offline_joint,
+    )
+    raise
+  if not isinstance(operation, VirtualMotionOperation):
+    _finish_settled_motion_request(
+      None,
+      request_lease,
+      False,
+      reconcile_offline_joint,
+    )
+    return False
+
+  def complete_offline_joint(succeeded):
+    if succeeded:
+      almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
+      almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+      return
+    message = "Offline virtual joint motion failed"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+
+  _complete_program_motion_when_virtual_idle(
+    complete_offline_joint,
+    request_lease,
+    operation,
+    virtual_completion_timeout,
+    settlement_callback=reconcile_offline_joint,
+  )
+  return True
+
+
+def _poll_joint_motion_events():
+  try:
+    for event in joint_motion_dispatcher.drain_events():
+      try:
+        try:
+          if event.kind == "started":
+            cmdSentEntryField.delete(0, 'end')
+            cmdSentEntryField.insert(0, event.move.command)
+            almStatusLab.config(text="JOINT MOVE IN PROGRESS", style="OK.TLabel")
+            almStatusLab2.config(text="JOINT MOVE IN PROGRESS", style="OK.TLabel")
+            continue
+
+          if event.kind == "completed":
+            applied_position = displayPosition(
+              event.response,
+              parsed=event.position,
+              synchronize_dispatcher=False,
+            )
+            if applied_position is not None and not isinstance(
+              applied_position,
+              PositionResponse,
+            ):
+              raise RuntimeError(
+                "joint response application returned an invalid position result"
+            )
+            if applied_position is not None:
+              if applied_position.speed_violation:
+                pending_discarded = (
+                  joint_motion_dispatcher.discard_pending_after_completion(
+                    applied_position.joints + applied_position.external
+                  )
+                )
+                deferred_discarded = deferred_joint_adjustments.pending
+                _clear_deferred_joint_adjustments()
+                if pending_discarded or deferred_discarded:
+                  logger.warning(
+                    "Pending joint target discarded after a controller speed violation"
+                  )
+              if _set_virtual_from_joint_result(event.position) is not True:
+                _invalidate_joint_motion_state(
+                  "completed joint motion could not update the virtual model"
+                )
+                continue
+              if applied_position.speed_violation:
+                continue
+              status = (
+                "JOINT TARGET QUEUED"
+                if joint_motion_dispatcher.pending
+                else "SYSTEM READY"
+              )
+              almStatusLab.config(text=status, style="OK.TLabel")
+              almStatusLab2.config(text=status, style="OK.TLabel")
+            continue
+
+          if event.position is not None:
+            applied_position = displayPosition(
+              event.response,
+              parsed=event.position,
+              synchronize_dispatcher=False,
+            )
+            if applied_position is not None and not isinstance(
+              applied_position,
+              PositionResponse,
+            ):
+              raise RuntimeError(
+                "joint response application returned an invalid position result"
+              )
+            if applied_position is not None:
+              _set_virtual_from_joint_result(event.position)
+          elif event.response is not None and event.response.startswith('E'):
+            _try_set_virtual_joint_target(_current_joint_positions())
+            _invalidate_joint_motion_state(
+              f"controller rejected joint motion: {event.response}"
+            )
+            ErrorHandler(event.response)
+          else:
+            _try_set_virtual_joint_target(_current_joint_positions())
+            message = f"Joint motion failed: {event.error}"
+            _invalidate_joint_motion_state(message)
+            logger.error(message)
+            almStatusLab.config(text=message, style="Alarm.TLabel")
+            almStatusLab2.config(text=message, style="Alarm.TLabel")
+          if event.pending_discarded:
+            logger.warning("Pending joint target discarded because controller state is unknown")
+        except Exception as exc:
+          message = f"Unable to apply joint-motion result: {exc}"
+          logger.exception(message)
+          _invalidate_joint_motion_state(message)
+          almStatusLab.config(text=message, style="Alarm.TLabel")
+          almStatusLab2.config(text=message, style="Alarm.TLabel")
+      finally:
+        event.acknowledge()
+
+    if not _finish_joint_motion_request_if_idle():
+      _try_dispatch_deferred_joint_adjustments()
+  finally:
+    if not application_closing.is_set():
+      root.after(25, _poll_joint_motion_events)
+
+
+def _queue_joint_motion(axis, value, absolute):
+  try:
+    if application_closing.is_set():
+      raise MotionQueueFault("joint motion is unavailable during application shutdown")
+    if controller_correction_requested.is_set():
+      raise MotionQueueFault("joint motion is unavailable during controller correction")
+    if RUN['xboxUse'] != 1:
+      almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
+      almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+
+    if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis < 9:
+      raise MotionInputError("joint axis must be an integer in [0, 8]")
+    normalized_value = finite_number(value, "joint input")
+    if not absolute and normalized_value == 0:
+      raise MotionInputError("joint adjustment must be non-zero")
+
+    profile = _current_joint_motion_profile()
+    deferred = False
+    submission = None
+
+    if RUN['offlineMode']:
+      if axis >= 6:
+        raise MotionInputError(
+          "offline virtual motion supports J1-J6 only; J7-J9 require a controller"
+        )
+      virtual_positions = [
+        finite_number(position, f"virtual joint {virtual_axis}")
+        for virtual_axis, position in enumerate(RUN['VR_angles'], start=1)
+      ]
+      if absolute:
+        virtual_positions[axis] = normalized_value
+      else:
+        virtual_positions[axis] += normalized_value
+      if not _start_offline_joint_motion(
+        build_virtual_joint_command(virtual_positions, profile)
+      ):
+        raise MotionQueueFault("offline virtual joint motion did not start")
+      coalesced = False
+    elif (
+      deferred_joint_adjustments.pending
+      or (
+        motion_request_registry.active
+        and not joint_motion_dispatcher.active
+      )
+    ):
+      deferred = True
+      if absolute:
+        coalesced = _defer_joint_target(axis, normalized_value, profile)
+      else:
+        coalesced = _defer_joint_adjustment(axis, normalized_value, profile)
+    else:
+      actual_positions = _current_joint_positions()
+      request_lease = None
+      lease_created = False
+      try:
+        request_lease, lease_created = _reserve_joint_motion_request()
+        if request_lease is None:
+          raise MotionTransportBusy("another motion request is active")
+        if absolute:
+          submission = joint_motion_dispatcher.submit_target(
+            axis,
+            normalized_value,
+            actual_positions,
+            profile,
+          )
+        else:
+          submission = joint_motion_dispatcher.submit_delta(
+            axis,
+            normalized_value,
+            actual_positions,
+            profile,
+          )
+        coalesced = submission.coalesced
+      except MotionTransportBusy:
+        if lease_created and not joint_motion_dispatcher.active:
+          _abandon_joint_motion_request(request_lease)
+        if (
+          not legacy_serial_result_pending.is_set()
+          and not motion_request_registry.active
+        ):
+          raise MotionQueueFault(
+            "controller transport is busy outside the legacy motion queue"
+          )
+        deferred = True
+        if absolute:
+          coalesced = _defer_joint_target(axis, normalized_value, profile)
+        else:
+          coalesced = _defer_joint_adjustment(axis, normalized_value, profile)
+      except Exception:
+        if lease_created and not joint_motion_dispatcher.active:
+          _abandon_joint_motion_request(request_lease)
+        raise
+
+    if not RUN['offlineMode']:
+      if deferred and not coalesced:
+        if live_serial_result_pending.is_set():
+          status = "LIVE JOG IN PROGRESS"
+        elif (
+          legacy_serial_result_pending.is_set()
+          or serial_lock.locked()
+          or joint_motion_dispatcher.active
+        ):
+          status = "CONTROLLER MOVE IN PROGRESS"
+        else:
+          status = "SYSTEM READY"
+      else:
+        status = "JOINT TARGET QUEUED" if coalesced else "JOINT MOVE IN PROGRESS"
+      almStatusLab.config(text=status, style="OK.TLabel")
+      almStatusLab2.config(text=status, style="OK.TLabel")
+      if submission is not None:
+        _try_set_virtual_joint_target(submission.target)
+    return True
+  except (KeyError, TypeError, ValueError, MotionInputError, MotionQueueFault) as exc:
+    message = f"Joint motion rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+
+
+def _queue_joint_jog(axis, delta):
+  return _queue_joint_motion(axis, delta, absolute=False)
+
+
+def _queue_joint_target(axis, target):
+  return _queue_joint_motion(axis, target, absolute=True)
+
+
+def J1jogNeg(value):
+  _queue_joint_jog(0, -value)
 
 def J1jogPos(value):
-  # global RUN['xboxUse']
-  # global RUN['VR_angles']
-  #global offlineMode
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+str(float(CAL['J1AngCur'])+value)+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  commandVR = "RJ"+"A"+str(float(RUN['VR_angles'][0])+value)+"B"+str(RUN['VR_angles'][1])+"C"+str(RUN['VR_angles'][2])+"D"+str(RUN['VR_angles'][3])+"E"+str(RUN['VR_angles'][4])+"F"+str(RUN['VR_angles'][5])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  #send command to virtual robot
-  rj_command(commandVR)  
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-     
+  _queue_joint_jog(0, value)
 
 def J2jogNeg(value):
-  # global RUN['xboxUse']
-  # global RUN['VR_angles']
-  #global offlineMode
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+str(float(CAL['J2AngCur'])-value)+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  commandVR = "RJ"+"A"+str(float(RUN['VR_angles'][0]))+"B"+str(RUN['VR_angles'][1]-value)+"C"+str(RUN['VR_angles'][2])+"D"+str(RUN['VR_angles'][3])+"E"+str(RUN['VR_angles'][4])+"F"+str(RUN['VR_angles'][5])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  #send command to virtual robot
-  rj_command(commandVR)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-
-     
+  _queue_joint_jog(1, -value)
 
 def J2jogPos(value):
-  # global RUN['xboxUse']
-  # global RUN['VR_angles']
-  #global offlineMode
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+str(float(CAL['J2AngCur'])+value)+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  commandVR = "RJ"+"A"+str(float(RUN['VR_angles'][0]))+"B"+str(RUN['VR_angles'][1]+value)+"C"+str(RUN['VR_angles'][2])+"D"+str(RUN['VR_angles'][3])+"E"+str(RUN['VR_angles'][4])+"F"+str(RUN['VR_angles'][5])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  #send command to virtual robot
-  rj_command(commandVR)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
+  _queue_joint_jog(1, value)
 
 def J3jogNeg(value):
-  # global RUN['xboxUse']
-  # global RUN['VR_angles']
-  #global offlineMode
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+str(float(CAL['J3AngCur'])-value)+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  commandVR = "RJ"+"A"+str(float(RUN['VR_angles'][0]))+"B"+str(RUN['VR_angles'][1])+"C"+str(RUN['VR_angles'][2]-value)+"D"+str(RUN['VR_angles'][3])+"E"+str(RUN['VR_angles'][4])+"F"+str(RUN['VR_angles'][5])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  #send command to virtual robot
-  rj_command(commandVR)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
+  _queue_joint_jog(2, -value)
 
 def J3jogPos(value):
-  # global RUN['xboxUse']
-  # global RUN['VR_angles']
-  #global offlineMode
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+str(float(CAL['J3AngCur'])+value)+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  commandVR = "RJ"+"A"+str(float(RUN['VR_angles'][0]))+"B"+str(RUN['VR_angles'][1])+"C"+str(RUN['VR_angles'][2]+value)+"D"+str(RUN['VR_angles'][3])+"E"+str(RUN['VR_angles'][4])+"F"+str(RUN['VR_angles'][5])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  #send command to virtual robot
-  rj_command(commandVR)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
+  _queue_joint_jog(2, value)
 
 def J4jogNeg(value):
-  # global RUN['xboxUse']
-  # global RUN['VR_angles']
-  #global offlineMode
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+str(float(CAL['J4AngCur'])-value)+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  commandVR = "RJ"+"A"+str(float(RUN['VR_angles'][0]))+"B"+str(RUN['VR_angles'][1])+"C"+str(RUN['VR_angles'][2])+"D"+str(RUN['VR_angles'][3]-value)+"E"+str(RUN['VR_angles'][4])+"F"+str(RUN['VR_angles'][5])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  #send command to virtual robot
-  rj_command(commandVR)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
+  _queue_joint_jog(3, -value)
 
 def J4jogPos(value):
-  # global RUN['xboxUse']
-  # global RUN['VR_angles']
-  #global offlineMode
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+str(float(CAL['J4AngCur'])+value)+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  commandVR = "RJ"+"A"+str(float(RUN['VR_angles'][0]))+"B"+str(RUN['VR_angles'][1])+"C"+str(RUN['VR_angles'][2])+"D"+str(RUN['VR_angles'][3]+value)+"E"+str(RUN['VR_angles'][4])+"F"+str(RUN['VR_angles'][5])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  #send command to virtual robot
-  rj_command(commandVR)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command) 
+  _queue_joint_jog(3, value)
 
 def J5jogNeg(value):
-  # global RUN['xboxUse']
-  # global RUN['VR_angles']
-  #global offlineMode
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+str(float(CAL['J5AngCur'])-value)+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  commandVR = "RJ"+"A"+str(float(RUN['VR_angles'][0]))+"B"+str(RUN['VR_angles'][1])+"C"+str(RUN['VR_angles'][2])+"D"+str(RUN['VR_angles'][3])+"E"+str(RUN['VR_angles'][4]-value)+"F"+str(RUN['VR_angles'][5])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  #send command to virtual robot
-  rj_command(commandVR)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
+  _queue_joint_jog(4, -value)
 
 def J5jogPos(value):
-  # global RUN['xboxUse']
-  # global RUN['VR_angles']
-  #global offlineMode
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+str(float(CAL['J5AngCur'])+value)+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  commandVR = "RJ"+"A"+str(float(RUN['VR_angles'][0]))+"B"+str(RUN['VR_angles'][1])+"C"+str(RUN['VR_angles'][2])+"D"+str(RUN['VR_angles'][3])+"E"+str(RUN['VR_angles'][4]+value)+"F"+str(RUN['VR_angles'][5])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  #send command to virtual robot
-  rj_command(commandVR)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)   
+  _queue_joint_jog(4, value)
 
 def J6jogNeg(value):
-  # global RUN['xboxUse']
-  # global RUN['VR_angles']
-  #global offlineMode
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+str(float(CAL['J6AngCur'])-value)+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  commandVR = "RJ"+"A"+str(float(RUN['VR_angles'][0]))+"B"+str(RUN['VR_angles'][1])+"C"+str(RUN['VR_angles'][2])+"D"+str(RUN['VR_angles'][3])+"E"+str(RUN['VR_angles'][4])+"F"+str(RUN['VR_angles'][5]-value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  #send command to virtual robot
-  rj_command(commandVR)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
+  _queue_joint_jog(5, -value)
 
 def J6jogPos(value):
-  # global RUN['xboxUse']
-  # global RUN['VR_angles']
-  #global offlineMode
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+str(float(CAL['J6AngCur'])+value)+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  commandVR = "RJ"+"A"+str(float(RUN['VR_angles'][0]))+"B"+str(RUN['VR_angles'][1])+"C"+str(RUN['VR_angles'][2])+"D"+str(RUN['VR_angles'][3])+"E"+str(RUN['VR_angles'][4])+"F"+str(RUN['VR_angles'][5]+value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  #send command to virtual robot
-  rj_command(commandVR)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
+  _queue_joint_jog(5, value)
 
 
 
 
 def J7jogNeg(value):
-  # global RUN['xboxUse']
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(float(CAL['J7PosCur'])-value)+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)    
-  else:
-    displayPosition(response)
+  _queue_joint_jog(6, -value)
 
 def J7jogPos(value):
-  # global RUN['xboxUse']
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(float(CAL['J7PosCur'])+value)+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)    
-  else:
-    displayPosition(response) 
+  _queue_joint_jog(6, value)
 
 
 
 def J8jogNeg(value):
-  # global RUN['xboxUse']
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(float(CAL['J8PosCur'])-value)+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)    
-  else:
-    displayPosition(response)
+  _queue_joint_jog(7, -value)
 
 
 
 def J8jogPos(value):
-  # global RUN['xboxUse']
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(float(CAL['J8PosCur'])+value)+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)    
-  else:
-    displayPosition(response)  
+  _queue_joint_jog(7, value)
 
 
 def J9jogNeg(value):
-  # global RUN['xboxUse']
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(float(CAL['J9PosCur'])-value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)    
-  else:
-    displayPosition(response)
+  _queue_joint_jog(8, -value)
 
 
 
 def J9jogPos(value):
-  # global RUN['xboxUse']
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(float(CAL['J9PosCur'])+value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)    
-  else:
-    displayPosition(response)        
+  _queue_joint_jog(8, value)
 
+
+def _live_jog_start_is_blocked():
+  offline_operation = None
+  if application_closing.is_set():
+    message = "Live jog rejected during application shutdown"
+  else:
+    with offline_live_jog_state_lock:
+      offline_operation = offline_live_jog_operation
+    if offline_operation is not None:
+      message = "An offline live jog is already in progress"
+    elif live_serial_result_pending.is_set():
+      message = "A controller live jog is already in progress"
+    elif motion_request_registry.active:
+      message = (
+        "Live jog rejected while "
+        f"{motion_request_registry.active_name} owns motion"
+      )
+    else:
+      return False
+  logger.warning(message)
+  almStatusLab.config(text=message, style="Warn.TLabel")
+  almStatusLab2.config(text=message, style="Warn.TLabel")
+  return True
+
+
+def _live_jog_parameters(default_percent):
+  checkSpeedVals()
+  speed_type = speedOption.get()
+  if speed_type in ("mm per Sec", "Seconds"):
+    speedOption.set("Percent")
+    speedEntryField.delete(0, 'end')
+    speedEntryField.insert(0, str(default_percent))
+    speed_type = "Percent"
+
+  if speed_type == "Percent":
+    speed_prefix = "Sp"
+  else:
+    raise MotionInputError(f"Unsupported live-jog speed type: {speed_type!r}")
+
+  loop_mode = ''.join(
+    str(CAL[f'J{axis}OpenLoopVal'].get())
+    for axis in range(1, 7)
+  )
+  profile = MotionProfile(
+    speed_prefix=speed_prefix,
+    speed=speedEntryField.get(),
+    acceleration=ACCspeedField.get(),
+    deceleration=DECspeedField.get(),
+    ramp=ACCrampField.get(),
+    wrist_config="N",
+    loop_mode=loop_mode,
+  )
+  return (
+    profile.speed_prefix,
+    controller_protocol_decimal(profile.speed, "live-jog speed"),
+    controller_protocol_decimal(
+      profile.acceleration,
+      "live-jog acceleration",
+    ),
+    controller_protocol_decimal(
+      profile.deceleration,
+      "live-jog deceleration",
+    ),
+    controller_protocol_decimal(profile.ramp, "live-jog ramp"),
+    profile.loop_mode,
+  )
+
+
+LIVE_CARTESIAN_VECTORS = frozenset((10, 11, 20, 21, 30, 31, 40, 41, 50, 51, 60, 61))
+LIVE_JOINT_VECTORS = LIVE_CARTESIAN_VECTORS | frozenset((70, 71, 80, 81, 90, 91))
+
+
+def _prepare_live_jog(value, allowed_vectors, default_percent):
+  try:
+    if isinstance(value, bool):
+      raise MotionInputError("live-jog vector must be numeric")
+    vector = finite_number(value, "live-jog vector")
+    if vector not in allowed_vectors:
+      raise MotionInputError(f"unsupported live-jog vector: {value!r}")
+    parameters = _live_jog_parameters(default_percent)
+  except (KeyError, TypeError, ValueError, tk.TclError) as exc:
+    message = f"Live jog rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return None
+  return (
+    controller_protocol_decimal(vector, "live-jog vector"),
+  ) + parameters
+
+
+def _dispatch_live_jog(command, motion_name):
+  if RUN['offlineMode']:
+    return True
+  request_lease = _acquire_motion_request(motion_name)
+  if request_lease is None:
+    message = f"Controller busy; {motion_name} not started"
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
+    return False
+  cmdSentEntryField.delete(0, 'end')
+  cmdSentEntryField.insert(0, command)
+  try:
+    started = start_send_serial_thread(
+      command,
+      live_jog=True,
+      completion_callback=lambda controller_position: _finish_motion_request(
+        request_lease,
+      ),
+    )
+  except Exception:
+    if motion_request_registry.owns(request_lease):
+      _finish_motion_request(request_lease)
+    raise
+  if started:
+    RUN['liveJog'] = True
+    return True
+
+  _finish_motion_request(request_lease)
+  if not live_serial_result_pending.is_set():
+    RUN['liveJog'] = False
+  message = f"Controller busy; {motion_name} not started"
+  almStatusLab.config(text=message, style="Warn.TLabel")
+  almStatusLab2.config(text=message, style="Warn.TLabel")
+  return False
+
+
+
+def _settle_offline_live_jog(operation):
+  global offline_live_jog_operation, offline_live_jog_motion_lease
+  global offline_live_jog_pose_snapshot
+
+  if not operation.completed:
+    raise RuntimeError("offline live-jog terminal event arrived before completion")
+  with offline_live_jog_state_lock:
+    if offline_live_jog_operation is not operation:
+      raise RuntimeError("offline live-jog terminal event is stale")
+    request_lease = offline_live_jog_motion_lease
+    if not motion_request_registry.owns(request_lease):
+      raise RuntimeError("offline live-jog motion ownership is missing")
+    pose_snapshot = offline_live_jog_pose_snapshot
+    if not isinstance(pose_snapshot, tuple) or len(pose_snapshot) != 6:
+      raise RuntimeError("offline live-jog starting pose is missing")
+  succeeded, error = operation.result()
+  refresh_succeeded = True
+  try:
+    target_pose = tuple(RUN['VR_angles']) if succeeded else pose_snapshot
+    refresh_gui_from_joint_angles(target_pose)
+  except Exception:
+    refresh_succeeded = False
+    logger.exception("Unable to settle offline live-jog GUI state")
+  finally:
+    with offline_live_jog_state_lock:
+      if offline_live_jog_operation is operation:
+        offline_live_jog_operation = None
+        offline_live_jog_motion_lease = None
+        offline_live_jog_pose_snapshot = None
+    RUN['liveJog'] = False
+    _finish_motion_request(request_lease)
+  if not succeeded or not refresh_succeeded:
+    message = error or "offline live-jog GUI settlement failed"
+    message = f"Offline live jog failed: {message}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+  return True
+
+
+def _start_offline_live_jog(mode_lock, target, args):
+  global offline_live_jog_operation, offline_live_jog_stop_event
+  global offline_live_jog_motion_lease, offline_live_jog_pose_snapshot
+
+  request_lease = _acquire_motion_request("Offline live jog")
+  if request_lease is None:
+    return False
+  try:
+    pose_snapshot = _validated_virtual_six_vector(
+      RUN['VR_angles'],
+      "offline live-jog starting pose",
+    )
+  except (KeyError, TypeError, ValueError, MotionInputError) as exc:
+    _finish_motion_request(request_lease)
+    logger.error("Offline live jog rejected: %s", exc)
+    return False
+  if not offline_live_jog_lock.acquire(blocking=False):
+    _finish_motion_request(request_lease)
+    logger.warning("Offline live jog already in progress; request rejected")
+    return False
+  if not mode_lock.acquire(blocking=False):
+    offline_live_jog_lock.release()
+    _finish_motion_request(request_lease)
+    logger.warning("Offline live-jog mode already in progress; request rejected")
+    return False
+
+  stop_event = threading.Event()
+  operation = VirtualMotionOperation()
+  with offline_live_jog_state_lock:
+    if application_closing.is_set() or offline_live_jog_operation is not None:
+      mode_lock.release()
+      offline_live_jog_lock.release()
+      _finish_motion_request(request_lease)
+      if application_closing.is_set():
+        logger.warning("Offline live jog rejected during application shutdown")
+      else:
+        logger.warning("Offline live-jog settlement remains pending; request rejected")
+      return False
+    offline_live_jog_stop_event.set()
+    offline_live_jog_stop_event = stop_event
+    offline_live_jog_operation = operation
+    offline_live_jog_motion_lease = request_lease
+    offline_live_jog_pose_snapshot = pose_snapshot
+  RUN['liveJog'] = True
+
+  def thread_wrapper():
+    succeeded = False
+    error = None
+    try:
+      succeeded = target(*args, stop_event) is True
+      if not succeeded:
+        error = "offline live-jog worker reported failure"
+    except BaseException as exc:
+      detail = str(exc).strip() or type(exc).__name__
+      error = f"{type(exc).__name__}: {detail}"
+      logger.exception("Offline live-jog worker failed")
+    finally:
+      stop_event.set()
+      mode_lock.release()
+      offline_live_jog_lock.release()
+    if succeeded:
+      operation.complete(True)
+    else:
+      operation.complete(False, error)
+    virtual_motion_event_queue.put(("offline-live-terminal", operation))
+
+  try:
+    thread = threading.Thread(target=thread_wrapper, daemon=True)
+    thread.start()
+  except Exception:
+    stop_event.set()
+    RUN['liveJog'] = False
+    with offline_live_jog_state_lock:
+      if offline_live_jog_operation is operation:
+        offline_live_jog_operation = None
+        offline_live_jog_motion_lease = None
+        offline_live_jog_pose_snapshot = None
+    mode_lock.release()
+    offline_live_jog_lock.release()
+    _finish_motion_request(request_lease)
+    raise
+  return operation
 
 
 def start_live_joint_jog_thread(command):
-    if live_jog_lock.locked():
-        logger.warning("Jog thread already in progress — ignoring.")
-        return
-
-    def thread_wrapper():
-        with live_jog_lock:
-            live_joint_jog(command)
-
-    t = threading.Thread(target=thread_wrapper, daemon=True)
-    t.start()
+  return _start_offline_live_jog(
+    live_jog_lock,
+    live_joint_jog,
+    (command,),
+  )
 
 
 def LiveJointJog(value):
-  # global RUN['xboxUse']
-  #global liveJog
-  RUN['liveJog'] = True
-  almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-  almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  checkSpeedVals()
-  speedtype = speedOption.get()
-  #dont allow mm/sec or sec - switch to percent
-  if(speedtype == "mm per Sec" or speedtype == "Seconds"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"25")
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  #!! WC isn't defined prior to use here, at least sometimes
-  RUN['WC'] = locals().get("RUN['WC']", "")
-  ############
-  #command = "LJ"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  command = "LJ"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
-  start_live_joint_jog_thread(command)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  time.sleep(.1)
+  if _live_jog_start_is_blocked():
+    return False
+  almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
+  almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+  prepared = _prepare_live_jog(
+    value,
+    LIVE_JOINT_VECTORS,
+    25,
+  )
+  if prepared is None:
+    return False
+  vector, speed_prefix, speed, acceleration, deceleration, ramp, loop_mode = prepared
+  if RUN['offlineMode'] and finite_number(vector, "live-jog vector") >= 70:
+    message = "Offline live motion supports J1-J6 only; J7-J9 require a controller"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+  command = (
+    f"LJV{vector}{speed_prefix}{speed}Ac{acceleration}"
+    f"Dc{deceleration}Rm{ramp}WALm{loop_mode}\n"
+  )
+  if RUN['offlineMode'] and not start_live_joint_jog_thread(command):
+    message = "Offline live joint jog not started; another live jog is active"
+    logger.warning(message)
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
+    return False
+  return _dispatch_live_jog(command, "live joint jog")
 
 
 def start_live_cartesian_jog_thread(command):
-    if live_cartesian_lock.locked():
-        logger.warning("Jog thread already in progress — ignoring.")
-        return
-
-    def thread_wrapper():
-        with live_cartesian_lock:
-            live_cartesian_jog(command)
-
-    t = threading.Thread(target=thread_wrapper, daemon=True)
-    t.start()
+  return _start_offline_live_jog(
+    live_cartesian_lock,
+    live_cartesian_jog,
+    (command,),
+  )
 
 
 def LiveCarJog(value):
-  # global RUN['xboxUse']
-  #global liveJog
-  RUN['liveJog'] = True
-  almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-  almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  checkSpeedVals()
-  speedtype = speedOption.get()
-  #dont allow mm/sec or sec - switch to percent
-  if(speedtype == "mm per Sec" or speedtype == "Seconds"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"25")
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  #command = "LC"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  command = "LC"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
-  start_live_cartesian_jog_thread(command)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  time.sleep(.1)
+  if _live_jog_start_is_blocked():
+    return False
+  almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
+  almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+  prepared = _prepare_live_jog(
+    value,
+    LIVE_CARTESIAN_VECTORS,
+    25,
+  )
+  if prepared is None:
+    return False
+  vector, speed_prefix, speed, acceleration, deceleration, ramp, loop_mode = prepared
+  command = (
+    f"LCV{vector}{speed_prefix}{speed}Ac{acceleration}"
+    f"Dc{deceleration}Rm{ramp}WALm{loop_mode}\n"
+  )
+  if RUN['offlineMode'] and not start_live_cartesian_jog_thread(command):
+    message = "Offline live Cartesian jog not started; another live jog is active"
+    logger.warning(message)
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
+    return False
+  return _dispatch_live_jog(command, "live Cartesian jog")
 
 
-def start_live_tool_jog_thread(command):
-    if live_tool_lock.locked():
-        logger.warning("Jog thread already in progress — ignoring.")
-        return
-
-    def thread_wrapper():
-        with live_tool_lock:
-            live_tool_jog(command)
-
-    t = threading.Thread(target=thread_wrapper, daemon=True)
-    t.start()
+def start_live_tool_jog_thread(command, original_tool_frame):
+  return _start_offline_live_jog(
+    live_tool_lock,
+    live_tool_jog,
+    (command, original_tool_frame),
+  )
 
 
 def LiveToolJog(value):
-  # global RUN['xboxUse']
-  almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-  almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  checkSpeedVals()
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  #command = "LT"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  command = "LT"+"V"+str(value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
-  start_live_tool_jog_thread(command)
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  time.sleep(.1)
-
-
-
-def wait_until_all_locks_free(min_hold_time, timeout=120):
-    """
-    Wait until all critical locks have been free for at least `min_hold_time` seconds.
-    Timeout after `timeout` seconds.
-    """
-    start_time = time.time()
-    stable_start = None
-
-    while True:
-        now = time.time()
-
-        # Check all lock statuses
-        all_free = not (
-            live_jog_lock.locked() or
-            live_cartesian_lock.locked() or
-            live_tool_lock.locked() or
-            drive_lock.locked() or
-            serial_lock.locked()
-        )
-
-        if all_free:
-            if stable_start is None:
-                stable_start = now  # begin stability window
-            elif now - stable_start >= min_hold_time:
-                return  # done waiting
-        else:
-            stable_start = None  # reset stability window if any lock is active
-
-        if now - start_time > timeout:
-            logger.warning("Timeout waiting for locks to be free.")
-            return
-
-        time.sleep(0.01)  # poll at 10ms intervals
-
-def wait_until_virtual_locks_free(min_hold_time, timeout=5):
-    """
-    Wait until all critical locks have been free for at least `min_hold_time` seconds.
-    Timeout after `timeout` seconds.
-    """
-    start_time = time.time()
-    stable_start = None
-
-    while True:
-        now = time.time()
-
-        # Check all lock statuses
-        all_free = not (
-            live_jog_lock.locked() or
-            live_cartesian_lock.locked() or
-            drive_lock.locked()
-        )
-
-        if all_free:
-            if stable_start is None:
-                stable_start = now  # begin stability window
-            elif now - stable_start >= min_hold_time:
-                return  # done waiting
-        else:
-            stable_start = None  # reset stability window if any lock is active
-
-        if now - start_time > timeout:
-            logger.warning("Timeout waiting for locks to be free.")
-            return
-
-        time.sleep(0.01)  # poll at 10ms intervals
-
-
-
+  if _live_jog_start_is_blocked():
+    return False
+  almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
+  almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+  prepared = _prepare_live_jog(
+    value,
+    LIVE_CARTESIAN_VECTORS,
+    50,
+  )
+  if prepared is None:
+    return False
+  vector, speed_prefix, speed, acceleration, deceleration, ramp, loop_mode = prepared
+  try:
+    original_tool_frame = tuple(
+      finite_number(field.get(), f"tool-frame field {index}")
+      for index, field in enumerate((
+        TFxEntryField,
+        TFyEntryField,
+        TFzEntryField,
+        TFrzEntryField,
+        TFryEntryField,
+        TFrxEntryField,
+      ), start=1)
+    )
+  except (TypeError, ValueError, tk.TclError) as exc:
+    message = f"Live tool jog rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+  command = (
+    f"LTV{vector}{speed_prefix}{speed}Ac{acceleration}"
+    f"Dc{deceleration}Rm{ramp}WALm{loop_mode}\n"
+  )
+  if RUN['offlineMode'] and not start_live_tool_jog_thread(
+    command,
+    original_tool_frame,
+  ):
+    message = "Offline live tool jog not started; another live jog is active"
+    logger.warning(message)
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
+    return False
+  return _dispatch_live_jog(command, "live tool jog")
 
 def StopJog(self):
-  #global liveJog
-  # global RUN['VR_angles']
-  if RUN['liveJog']:
-    RUN['liveJog'] = False
-    time.sleep(.15) 
-    if not RUN['offlineMode']:
-      command = "S\n"
-      IncJogStatVal = int(RUN['IncJogStat'].get())
-      if (IncJogStatVal == 0):
-        RUN['ser'].write(command.encode()) 
-        RUN['ser'].flushInput()
-        time.sleep(.05)
-        response = str(RUN['ser'].readline().strip(),'utf-8')
-        if (response[:1] == 'E'):
-          ErrorHandler(response)    
-        else:
-          displayPosition(response)
-          RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-          setStepMonitorsVR()   
-    else:
-      refresh_gui_from_joint_angles(RUN['VR_angles'])
-
-
-def J7jogNeg(value):
-  # global RUN['xboxUse']
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(float(CAL['J7PosCur'])-value)+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n" 
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)    
+  with offline_live_jog_state_lock:
+    offline_operation = offline_live_jog_operation
+    if offline_operation is not None:
+      offline_live_jog_stop_event.set()
+  if offline_operation is not None:
+    almStatusLab.config(text="OFFLINE LIVE JOG STOP REQUESTED", style="Warn.TLabel")
+    almStatusLab2.config(text="OFFLINE LIVE JOG STOP REQUESTED", style="Warn.TLabel")
+    return
+  if not RUN['liveJog'] and not live_serial_result_pending.is_set():
+    return
+  RUN['liveJog'] = False
+  if live_serial_result_pending.is_set():
+    live_jog_stop_requested.set()
+    almStatusLab.config(text="LIVE JOG STOP REQUESTED", style="Warn.TLabel")
+    almStatusLab2.config(text="LIVE JOG STOP REQUESTED", style="Warn.TLabel")
   else:
-    displayPosition(response)
-
-def J7jogPos(value):
-  # global RUN['xboxUse']
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(float(CAL['J7PosCur'])+value)+"J8"+str(CAL['J8PosCur'])+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n" 
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)    
-  else:
-    displayPosition(response) 
-
-
-def J8jogNeg(value):
-  # global RUN['xboxUse']
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(float(CAL['J8PosCur'])-value)+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n" 
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)    
-  else:
-    displayPosition(response)
-
-def J8jogPos(value):
-  # global RUN['xboxUse']
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(float(CAL['J8PosCur'])+value)+"J9"+str(CAL['J9PosCur'])+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n" 
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)    
-  else:
-    displayPosition(response) 
-
-
-
-def J9jogNeg(value):
-  # global RUN['xboxUse']
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(float(CAL['J9PosCur'])-value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n" 
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)    
-  else:
-    displayPosition(response)
-
-def J9jogPos(value):
-  # global RUN['xboxUse']
-  checkSpeedVals()
-  if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-  speedtype = speedOption.get()
-  #dont allow mm/sec - switch to percent
-  if(speedtype == "mm per Sec"):
-    speedMenu=OptionMenu(tab1, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-    speedPrefix = "Sp" 
-    speedEntryField.delete(0, 'end')
-    speedEntryField.insert(0,"50")
-  #seconds
-  if(speedtype == "Seconds"):
-    speedPrefix = "Ss"
-  #percent
-  if(speedtype == "Percent"):
-    speedPrefix = "Sp"   
-  Speed = speedEntryField.get() 
-  ACCspd = ACCspeedField.get()
-  DECspd = DECspeedField.get()
-  ACCramp = ACCrampField.get()
-  LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "RJ"+"A"+CAL['J1AngCur']+"B"+CAL['J2AngCur']+"C"+CAL['J3AngCur']+"D"+CAL['J4AngCur']+"E"+CAL['J5AngCur']+"F"+CAL['J6AngCur']+"J7"+str(CAL['J7PosCur'])+"J8"+str(CAL['J8PosCur'])+"J9"+str(float(CAL['J9PosCur'])+value)+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n" 
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)    
-  else:
-    displayPosition(response)     
-    
+    message = "Live jog has no active controller request"
+    logger.warning(message)
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
 
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@_manual_motion_request("Cartesian jog")
 def XjogNeg(value):
   # global RUN['xboxUse']
   # global WC, RUN['VR_angles']
@@ -5960,8 +10272,12 @@ def XjogNeg(value):
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-    mj_command(commandVR)
+    return _start_manual_motion(
+      command,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
   else:
     xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
     xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
@@ -5973,12 +10289,18 @@ def XjogNeg(value):
         f"{speedPrefix}{Speed}Ac{ACCspd}Dc{DECspd}Rm{ACCramp}"
         f"W{RUN['WC']}Lm{LoopMode}\n"
     )
-    mj_command(commandVR)
+    return _start_manual_motion(
+      None,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
 
 
 
   
 
+@_manual_motion_request("Cartesian jog")
 def YjogNeg(value):
   # global RUN['xboxUse']
   # global WC, RUN['VR_angles']
@@ -6016,8 +10338,12 @@ def YjogNeg(value):
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-    mj_command(commandVR)
+    return _start_manual_motion(
+      command,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
   else:
     xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
     xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
@@ -6029,12 +10355,18 @@ def YjogNeg(value):
         f"{speedPrefix}{Speed}Ac{ACCspd}Dc{DECspd}Rm{ACCramp}"
         f"W{RUN['WC']}Lm{LoopMode}\n"
     )
-    mj_command(commandVR)
+    return _start_manual_motion(
+      None,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
 
 
 
 
 
+@_manual_motion_request("Cartesian jog")
 def ZjogNeg(value):
   # global RUN['xboxUse']
   # global WC, RUN['VR_angles']
@@ -6072,8 +10404,12 @@ def ZjogNeg(value):
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-    mj_command(commandVR)
+    return _start_manual_motion(
+      command,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
   else:
     xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
     xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
@@ -6085,8 +10421,14 @@ def ZjogNeg(value):
         f"{speedPrefix}{Speed}Ac{ACCspd}Dc{DECspd}Rm{ACCramp}"
         f"W{RUN['WC']}Lm{LoopMode}\n"
     )
-    mj_command(commandVR)  
+    return _start_manual_motion(
+      None,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
 
+@_manual_motion_request("Cartesian jog")
 def RxjogNeg(value):
   # global RUN['xboxUse']
   # global WC, RUN['VR_angles']
@@ -6124,8 +10466,12 @@ def RxjogNeg(value):
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-    mj_command(commandVR)
+    return _start_manual_motion(
+      command,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
   else:
     xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
     xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
@@ -6137,8 +10483,14 @@ def RxjogNeg(value):
         f"{speedPrefix}{Speed}Ac{ACCspd}Dc{DECspd}Rm{ACCramp}"
         f"W{RUN['WC']}Lm{LoopMode}\n"
     )
-    mj_command(commandVR)  
+    return _start_manual_motion(
+      None,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
 
+@_manual_motion_request("Cartesian jog")
 def RyjogNeg(value):
   # global RUN['xboxUse']
   # global XcurPos, YcurPos, ZcurPos, RzcurPos, RycurPos, RxcurPos
@@ -6177,8 +10529,12 @@ def RyjogNeg(value):
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-    mj_command(commandVR)
+    return _start_manual_motion(
+      command,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
   else:
     xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
     xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
@@ -6190,8 +10546,14 @@ def RyjogNeg(value):
         f"{speedPrefix}{Speed}Ac{ACCspd}Dc{DECspd}Rm{ACCramp}"
         f"W{RUN['WC']}Lm{LoopMode}\n"
     )
-    mj_command(commandVR)    
+    return _start_manual_motion(
+      None,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
 
+@_manual_motion_request("Cartesian jog")
 def RzjogNeg(value):
   # global RUN['xboxUse']
   # global WC, RUN['VR_angles']
@@ -6229,8 +10591,12 @@ def RzjogNeg(value):
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-    mj_command(commandVR)
+    return _start_manual_motion(
+      command,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
   else:
     xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
     xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
@@ -6242,8 +10608,14 @@ def RzjogNeg(value):
         f"{speedPrefix}{Speed}Ac{ACCspd}Dc{DECspd}Rm{ACCramp}"
         f"W{RUN['WC']}Lm{LoopMode}\n"
     )
-    mj_command(commandVR)  
+    return _start_manual_motion(
+      None,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
 
+@_manual_motion_request("Cartesian jog")
 def XjogPos(value):
   # global RUN['xboxUse']
   # global WC, RUN['VR_angles']
@@ -6281,8 +10653,12 @@ def XjogPos(value):
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-    mj_command(commandVR)
+    return _start_manual_motion(
+      command,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
   else:
     xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
     xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
@@ -6294,8 +10670,14 @@ def XjogPos(value):
         f"{speedPrefix}{Speed}Ac{ACCspd}Dc{DECspd}Rm{ACCramp}"
         f"W{RUN['WC']}Lm{LoopMode}\n"
     )
-    mj_command(commandVR)   
+    return _start_manual_motion(
+      None,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
 
+@_manual_motion_request("Cartesian jog")
 def YjogPos(value):
   # global RUN['xboxUse']
   # global WC, RUN['VR_angles']
@@ -6333,8 +10715,12 @@ def YjogPos(value):
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-    mj_command(commandVR)
+    return _start_manual_motion(
+      command,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
   else:
     xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
     xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
@@ -6346,9 +10732,15 @@ def YjogPos(value):
         f"{speedPrefix}{Speed}Ac{ACCspd}Dc{DECspd}Rm{ACCramp}"
         f"W{RUN['WC']}Lm{LoopMode}\n"
     )
-    mj_command(commandVR)   
+    return _start_manual_motion(
+      None,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
 
 
+@_manual_motion_request("Cartesian jog")
 def ZjogPos(value):
   # global RUN['xboxUse']
   # global WC, RUN['VR_angles']
@@ -6386,8 +10778,12 @@ def ZjogPos(value):
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-    mj_command(commandVR)
+    return _start_manual_motion(
+      command,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
   else:
     xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
     xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
@@ -6399,8 +10795,14 @@ def ZjogPos(value):
         f"{speedPrefix}{Speed}Ac{ACCspd}Dc{DECspd}Rm{ACCramp}"
         f"W{RUN['WC']}Lm{LoopMode}\n"
     )
-    mj_command(commandVR)     
+    return _start_manual_motion(
+      None,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
 
+@_manual_motion_request("Cartesian jog")
 def RxjogPos(value):
   # global RUN['xboxUse']
   # global XcurPos, YcurPos, ZcurPos, RzcurPos, RycurPos, RxcurPos
@@ -6439,8 +10841,12 @@ def RxjogPos(value):
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-    mj_command(commandVR)
+    return _start_manual_motion(
+      command,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
   else:
     xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
     xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
@@ -6452,8 +10858,14 @@ def RxjogPos(value):
         f"{speedPrefix}{Speed}Ac{ACCspd}Dc{DECspd}Rm{ACCramp}"
         f"W{RUN['WC']}Lm{LoopMode}\n"
     )
-    mj_command(commandVR)   
+    return _start_manual_motion(
+      None,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
 
+@_manual_motion_request("Cartesian jog")
 def RyjogPos(value):
   # global RUN['xboxUse']
   # global WC, RUN['VR_angles']
@@ -6491,8 +10903,12 @@ def RyjogPos(value):
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-    mj_command(commandVR)
+    return _start_manual_motion(
+      command,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
   else:
     xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
     xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
@@ -6504,8 +10920,14 @@ def RyjogPos(value):
         f"{speedPrefix}{Speed}Ac{ACCspd}Dc{DECspd}Rm{ACCramp}"
         f"W{RUN['WC']}Lm{LoopMode}\n"
     )
-    mj_command(commandVR)   
+    return _start_manual_motion(
+      None,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
 
+@_manual_motion_request("Cartesian jog")
 def RzjogPos(value):
   # global RUN['xboxUse']
   # global WC, RUN['VR_angles']
@@ -6543,8 +10965,12 @@ def RzjogPos(value):
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-    mj_command(commandVR)
+    return _start_manual_motion(
+      command,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
   else:
     xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
     xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
@@ -6556,10 +10982,16 @@ def RzjogPos(value):
         f"{speedPrefix}{Speed}Ac{ACCspd}Dc{DECspd}Rm{ACCramp}"
         f"W{RUN['WC']}Lm{LoopMode}\n"
     )
-    mj_command(commandVR)  
+    return _start_manual_motion(
+      None,
+      "Cartesian jog",
+      mj_command,
+      commandVR,
+    )
 
    
   
+@_manual_motion_request("Tool-frame jog")
 def TXjogNeg(value):
   # global RUN['xboxUse']
   checkSpeedVals()
@@ -6588,10 +11020,21 @@ def TXjogNeg(value):
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  mt_command(command)
+    return _start_manual_motion(
+      command,
+      "Tool-frame jog",
+      mt_command,
+      command,
+    )
+  return _start_manual_motion(
+    None,
+    "Tool-frame jog",
+    mt_command,
+    command,
+  )
 
 
+@_manual_motion_request("Tool-frame jog")
 def TYjogNeg(value):
   # global RUN['xboxUse']
   checkSpeedVals()
@@ -6620,9 +11063,20 @@ def TYjogNeg(value):
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  mt_command(command) 
+    return _start_manual_motion(
+      command,
+      "Tool-frame jog",
+      mt_command,
+      command,
+    )
+  return _start_manual_motion(
+    None,
+    "Tool-frame jog",
+    mt_command,
+    command,
+  )
 
+@_manual_motion_request("Tool-frame jog")
 def TZjogNeg(value):
   # global RUN['xboxUse']
   checkSpeedVals()
@@ -6651,12 +11105,23 @@ def TZjogNeg(value):
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  mt_command(command)
+    return _start_manual_motion(
+      command,
+      "Tool-frame jog",
+      mt_command,
+      command,
+    )
+  return _start_manual_motion(
+    None,
+    "Tool-frame jog",
+    mt_command,
+    command,
+  )
 
 
 
 
+@_manual_motion_request("Tool-frame jog")
 def TRxjogNeg(value):
   # global RUN['xboxUse']
   checkSpeedVals()
@@ -6685,9 +11150,20 @@ def TRxjogNeg(value):
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  mt_command(command)
+    return _start_manual_motion(
+      command,
+      "Tool-frame jog",
+      mt_command,
+      command,
+    )
+  return _start_manual_motion(
+    None,
+    "Tool-frame jog",
+    mt_command,
+    command,
+  )
 
+@_manual_motion_request("Tool-frame jog")
 def TRyjogNeg(value):
   # global RUN['xboxUse']
   checkSpeedVals()
@@ -6716,9 +11192,20 @@ def TRyjogNeg(value):
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  mt_command(command)
+    return _start_manual_motion(
+      command,
+      "Tool-frame jog",
+      mt_command,
+      command,
+    )
+  return _start_manual_motion(
+    None,
+    "Tool-frame jog",
+    mt_command,
+    command,
+  )
 
+@_manual_motion_request("Tool-frame jog")
 def TRzjogNeg(value):
   # global RUN['xboxUse']
   checkSpeedVals()
@@ -6747,9 +11234,20 @@ def TRzjogNeg(value):
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  mt_command(command)
+    return _start_manual_motion(
+      command,
+      "Tool-frame jog",
+      mt_command,
+      command,
+    )
+  return _start_manual_motion(
+    None,
+    "Tool-frame jog",
+    mt_command,
+    command,
+  )
 
+@_manual_motion_request("Tool-frame jog")
 def TXjogPos(value):
   # global RUN['xboxUse']
   checkSpeedVals()
@@ -6778,9 +11276,20 @@ def TXjogPos(value):
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  mt_command(command)
+    return _start_manual_motion(
+      command,
+      "Tool-frame jog",
+      mt_command,
+      command,
+    )
+  return _start_manual_motion(
+    None,
+    "Tool-frame jog",
+    mt_command,
+    command,
+  )
 
+@_manual_motion_request("Tool-frame jog")
 def TYjogPos(value):
   # global RUN['xboxUse']
   checkSpeedVals()
@@ -6809,9 +11318,20 @@ def TYjogPos(value):
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  mt_command(command) 
+    return _start_manual_motion(
+      command,
+      "Tool-frame jog",
+      mt_command,
+      command,
+    )
+  return _start_manual_motion(
+    None,
+    "Tool-frame jog",
+    mt_command,
+    command,
+  )
 
+@_manual_motion_request("Tool-frame jog")
 def TZjogPos(value):
   # global RUN['xboxUse']
   checkSpeedVals()
@@ -6840,9 +11360,20 @@ def TZjogPos(value):
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  mt_command(command) 
+    return _start_manual_motion(
+      command,
+      "Tool-frame jog",
+      mt_command,
+      command,
+    )
+  return _start_manual_motion(
+    None,
+    "Tool-frame jog",
+    mt_command,
+    command,
+  )
 
+@_manual_motion_request("Tool-frame jog")
 def TRxjogPos(value):
   # global RUN['xboxUse']
   checkSpeedVals()
@@ -6871,9 +11402,20 @@ def TRxjogPos(value):
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  mt_command(command)
+    return _start_manual_motion(
+      command,
+      "Tool-frame jog",
+      mt_command,
+      command,
+    )
+  return _start_manual_motion(
+    None,
+    "Tool-frame jog",
+    mt_command,
+    command,
+  )
 
+@_manual_motion_request("Tool-frame jog")
 def TRyjogPos(value):
   # global RUN['xboxUse']
   checkSpeedVals()
@@ -6902,9 +11444,20 @@ def TRyjogPos(value):
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  mt_command(command) 
+    return _start_manual_motion(
+      command,
+      "Tool-frame jog",
+      mt_command,
+      command,
+    )
+  return _start_manual_motion(
+    None,
+    "Tool-frame jog",
+    mt_command,
+    command,
+  )
 
+@_manual_motion_request("Tool-frame jog")
 def TRzjogPos(value):
   # global RUN['xboxUse']
   checkSpeedVals()
@@ -6933,8 +11486,18 @@ def TRzjogPos(value):
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
-    start_send_serial_thread(command)
-  mt_command(command)
+    return _start_manual_motion(
+      command,
+      "Tool-frame jog",
+      mt_command,
+      command,
+    )
+  return _start_manual_motion(
+    None,
+    "Tool-frame jog",
+    mt_command,
+    command,
+  )
 
 
   
@@ -7193,95 +11756,79 @@ def teachReplaceSelected():
 ############################################################################################################################################################## 
 
 
+@_tracked_serial_operation("ser")
 def MBreadHoldReg():
   slaveID = MBslaveEntryField.get()
   address = MBaddressEntryField.get()
   opVal = MBoperValEntryField.get()
   command = "BA"+"A"+slaveID+"B"+address+"C"+opVal+"\n"
-  RUN['ser'].write(command.encode())
-  RUN['ser'].flushInput()
-  time.sleep(.1) 
-  response = RUN['ser'].readline().decode("utf-8").strip()
+  response = _exchange_legacy_main_command(command)
   MBoutputEntryField.delete(0, 'end')
   MBoutputEntryField.insert(0,response)
 
+@_tracked_serial_operation("ser")
 def MBreadCoil():
   slaveID = MBslaveEntryField.get()
   address = MBaddressEntryField.get()
   opVal = MBoperValEntryField.get()
   command = "BB"+"A"+slaveID+"B"+address+"C"+opVal+"\n"
-  RUN['ser'].write(command.encode())
-  RUN['ser'].flushInput()
-  time.sleep(.1) 
-  response = RUN['ser'].readline().decode("utf-8").strip()
+  response = _exchange_legacy_main_command(command)
   MBoutputEntryField.delete(0, 'end')
   MBoutputEntryField.insert(0,response)
 
+@_tracked_serial_operation("ser")
 def MBreadInput():
   slaveID = MBslaveEntryField.get()
   address = MBaddressEntryField.get()
   opVal = MBoperValEntryField.get()
   command = "BC"+"A"+slaveID+"B"+address+"C"+opVal+"\n"
-  RUN['ser'].write(command.encode())
-  RUN['ser'].flushInput()
-  time.sleep(.1) 
-  response = RUN['ser'].readline().decode("utf-8").strip()
+  response = _exchange_legacy_main_command(command)
   MBoutputEntryField.delete(0, 'end')
   MBoutputEntryField.insert(0,response)
 
+@_tracked_serial_operation("ser")
 def MBreadInputReg():
   slaveID = MBslaveEntryField.get()
   address = MBaddressEntryField.get()
   opVal = MBoperValEntryField.get()
   command = "BD"+"A"+slaveID+"B"+address+"C"+opVal+"\n"
-  RUN['ser'].write(command.encode())
-  RUN['ser'].flushInput()
-  time.sleep(.1) 
-  response = RUN['ser'].readline().decode("utf-8").strip()
+  response = _exchange_legacy_main_command(command)
   MBoutputEntryField.delete(0, 'end')
   MBoutputEntryField.insert(0,response) 
 
+@_tracked_serial_operation("ser")
 def MBwriteCoil():
   slaveID = MBslaveEntryField.get()
   address = MBaddressEntryField.get()
   opVal = MBoperValEntryField.get()
   command = "BE"+"A"+slaveID+"B"+address+"C"+opVal+"\n"
-  RUN['ser'].write(command.encode())
-  RUN['ser'].flushInput()
-  time.sleep(.1) 
-  response = RUN['ser'].readline().decode("utf-8").strip()
+  response = _exchange_legacy_main_command(command)
   MBoutputEntryField.delete(0, 'end')
   MBoutputEntryField.insert(0,response) 
 
    
+@_tracked_serial_operation("ser")
 def MBwriteReg():
   slaveID = MBslaveEntryField.get()
   address = MBaddressEntryField.get()
   opVal = MBoperValEntryField.get()
   command = "BF"+"A"+slaveID+"B"+address+"C"+opVal+"\n"
-  RUN['ser'].write(command.encode())
-  RUN['ser'].flushInput()
-  time.sleep(.1) 
-  response = RUN['ser'].readline().decode("utf-8").strip()
+  response = _exchange_legacy_main_command(command)
   MBoutputEntryField.delete(0, 'end')
   MBoutputEntryField.insert(0,response)          
 
+@_tracked_serial_operation("ser")
 def QueryModbus():
   #command = "HD"+"\n"
   command = "MQ"+"\n"
-  RUN['ser'].write(command.encode())
-  RUN['ser'].flushInput()
-  time.sleep(.1) 
-  response = RUN['ser'].readline().decode("utf-8").strip()
+  response = _exchange_legacy_main_command(command)
   cmdSentEntryField.delete(0, 'end')
   cmdSentEntryField.insert(0,response)
 
+@_tracked_serial_operation("ser")
 def FaultReset():
   command = "FR"+"\n"
-  RUN['ser'].write(command.encode())
-  RUN['ser'].flushInput()
-  time.sleep(.1) 
-  response = str((RUN['ser'].readline().strip(),'utf-8'))
+  response = _exchange_legacy_main_command(command)
   cmdSentEntryField.delete(0, 'end')
   cmdSentEntryField.insert(0,response)    
 
@@ -7466,7 +12013,7 @@ def cameraOn():
     selRow = last
     tab1.progView.select_set(selRow)
   value = "Cam On"
-  tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8')) 
+  tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8'))
   tab1.progView.selection_clear(0, END)
   tab1.progView.select_set(selRow)
   items = tab1.progView.get(0,END)
@@ -7934,7 +12481,7 @@ def insertvisFind():
   template = RUN['selectedTemplate'].get()
   if (template == ""):
     template = "None_Selected.jpg"
-  CAL['autoBGVal'] = int(RUN['autoBG'].get())  
+  CAL['autoBGVal'] = int(RUN['autoBG'].get())
   if (CAL['autoBGVal'] == 1):
     BGcolor = "(Auto)"
   else:
@@ -7943,7 +12490,7 @@ def insertvisFind():
   passTab = visPassEntryField.get()
   failTab = visFailEntryField.get()
   value = "Vis Find - "+template+" - BGcolor "+BGcolor+" Score "+score+" Pass "+passTab+" Fail "+failTab
-  tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8')) 
+  tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8'))
   tab1.progView.selection_clear(0, END)
   tab1.progView.select_set(selRow)
   items = tab1.progView.get(0,END)
@@ -7953,32 +12500,6 @@ def insertvisFind():
       f.write(str(item.strip(), encoding='utf-8'))
       f.write('\n')
     f.close()
-
-#!! Appears not to be used
-'''
-def IfRegjumpTab():
-  try:
-    selRow = tab1.progView.curselection()[0]
-    selRow += 1
-  except:
-    last = tab1.progView.index('end')
-    selRow = last
-    tab1.progView.select_set(selRow)
-  regNum = regNumJmpEntryField.get()
-  regEqNum = regEqJmpEntryField.get()
-  tabNum = regTabJmpEntryField.get()
-  tabjmp = "If Register "+regNum+" = "+regEqNum+" Jump to Tab "+ tabNum            
-  tab1.progView.insert(selRow, bytes(tabjmp + '\n', 'utf-8')) 
-  tab1.progView.selection_clear(0, END)
-  tab1.progView.select_set(selRow)
-  items = tab1.progView.get(0,END)
-  file_path = path.relpath(ProgEntryField.get())
-  with open(file_path,'w', encoding='utf-8') as f:
-    for item in items:
-      f.write(str(item.strip(), encoding='utf-8'))
-      f.write('\n')
-    f.close()
-'''
 
 def insertRegister():  
   try:
@@ -8061,208 +12582,189 @@ def getSel():
   manEntryField.delete(0, 'end')
   manEntryField.insert(0, command)  
   
+@_tracked_serial_operation("ser2")
 def Servo0on():
   save_calibration(CAL) 
   servoPos = servo0onEntryField.get()
   command = "SV0P"+servoPos+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read()
 
 
+@_tracked_serial_operation("ser2")
 def Servo0off():
   save_calibration(CAL) 
   servoPos = servo0offEntryField.get()
   command = "SV0P"+servoPos+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read()
 
 
+@_tracked_serial_operation("ser2")
 def Servo1on():
   save_calibration(CAL) 
   servoPos = servo1onEntryField.get()
   command = "SV1P"+servoPos+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read() 
 
 
+@_tracked_serial_operation("ser2")
 def Servo1off():
   save_calibration(CAL) 
   servoPos = servo1offEntryField.get()
   command = "SV1P"+servoPos+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read()
  
 
+@_tracked_serial_operation("ser2")
 def Servo2on():
   save_calibration(CAL) 
   servoPos = servo2onEntryField.get()
   command = "SV2P"+servoPos+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read() 
 
 
+@_tracked_serial_operation("ser2")
 def Servo2off():
   save_calibration(CAL) 
   servoPos = servo2offEntryField.get()
   command = "SV2P"+servoPos+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read()
 
+@_tracked_serial_operation("ser2")
 def Servo3on():
   save_calibration(CAL) 
   servoPos = servo3onEntryField.get()
   command = "SV3P"+servoPos+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read() 
 
+@_tracked_serial_operation("ser2")
 def Servo3off():
   save_calibration(CAL) 
   servoPos = servo3offEntryField.get()
   command = "SV3P"+servoPos+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read()
 
+@_tracked_serial_operation("ser2")
 def DO1on():
   outputNum = DO1onEntryField.get()
   command = "ONX"+outputNum+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read() 
 
 
+@_tracked_serial_operation("ser2")
 def DO1off():
   outputNum = DO1offEntryField.get()
   command = "OFX"+outputNum+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read() 
  
 
+@_tracked_serial_operation("ser2")
 def DO2on():
   outputNum = DO2onEntryField.get()
   command = "ONX"+outputNum+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read()
  
 
+@_tracked_serial_operation("ser2")
 def DO2off():
   outputNum = DO2offEntryField.get()
   command = "OFX"+outputNum+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read() 
 
 
+@_tracked_serial_operation("ser2")
 def DO3on():
   outputNum = DO3onEntryField.get()
   command = "ONX"+outputNum+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read() 
 
 
+@_tracked_serial_operation("ser2")
 def DO3off():
   outputNum = DO3offEntryField.get()
   command = "OFX"+outputNum+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read() 
  
 
+@_tracked_serial_operation("ser2")
 def DO4on():
   outputNum = DO4onEntryField.get()
   command = "ONX"+outputNum+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read()
  
 
+@_tracked_serial_operation("ser2")
 def DO4off():
   outputNum = DO4offEntryField.get()
   command = "OFX"+outputNum+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read() 
 
 
+@_tracked_serial_operation("ser2")
 def DO5on():
   outputNum = DO5onEntryField.get()
   command = "ONX"+outputNum+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read() 
 
 
+@_tracked_serial_operation("ser2")
 def DO5off():
   outputNum = DO5offEntryField.get()
   command = "OFX"+outputNum+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read() 
  
 
+@_tracked_serial_operation("ser2")
 def DO6on():
   outputNum = DO6onEntryField.get()
   command = "ONX"+outputNum+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read()
  
 
+@_tracked_serial_operation("ser2")
 def DO6off():
   outputNum = DO6offEntryField.get()
   command = "OFX"+outputNum+"\n"
-  RUN['ser2'].write(command.encode())
-  RUN['ser2'].flushInput()
+  _write_legacy_auxiliary_command(command)
   time.sleep(.1)
   RUN['ser2'].read() 
-
-#!! Appears not to be used
-'''
-def TestString():
-  message = testSendEntryField.get()
-  command = "TM"+message+"\n"
-  RUN['ser'].write(command.encode())
-  RUN['ser'].flushInput()
-  time.sleep(0)
-  echo = RUN['ser'].readline()
-  testRecEntryField.delete(0, 'end')
-  testRecEntryField.insert(0,echo)  
-'''
-
-#!! Appears not to be used
-'''
-def ClearTestString():
-  testRecEntryField.delete(0, 'end')
-'''
 
 def CalcLinDist(X2,Y2,Z2):
   # global RUN['LineDist']
@@ -8282,537 +12784,829 @@ def CalcLinVect(X2,Y2,Z2):
   RUN['Xv'] = X2-X1
   RUN['Yv'] = Y2-Y1
   RUN['Zv'] = Z2-Z1
-  return (RUN['Xv'],RUN['Yv'],RUN['Zv'])  
+  return (RUN['Xv'],RUN['Yv'],RUN['Zv'])
 
-''' not used
-def CalcLinWayPt(CX,CY,CZ,curWayPt,):
-  return
-'''
- 
-
-
-	
-	
-##############################################################################################################################################################	
+##############################################################################################################################################################
 ### CALIBRATION & SAVE DEFS ###################################################################################################### CALIBRATION & SAVE DEFS ###
-##############################################################################################################################################################	
+##############################################################################################################################################################
 
+def _calibration_available():
+  if not RUN['offlineMode']:
+    return True
+  message = "Calibration not supported in offline mode"
+  almStatusLab.config(text=message, style="Alarm.TLabel")
+  almStatusLab2.config(text=message, style="Alarm.TLabel")
+  return False
+
+
+def _binary_controller_flag(value, field_name):
+  number = finite_number(value, field_name)
+  if number not in (0, 1):
+    raise MotionInputError(f"{field_name} must be 0 or 1")
+  return int(number)
+
+
+def _prepare_calibration_command(selections):
+  if isinstance(selections, (str, bytes)):
+    raise MotionInputError("calibration selections must be a numeric sequence")
+  try:
+    selections = tuple(selections)
+  except TypeError as exc:
+    raise MotionInputError(
+      "calibration selections must be a numeric sequence"
+    ) from exc
+  if len(selections) != 9:
+    raise MotionInputError("calibration selections must contain 9 values")
+  normalized_selections = tuple(
+    _binary_controller_flag(value, f"J{axis} calibration selection")
+    for axis, value in enumerate(selections, start=1)
+  )
+  offsets = tuple(
+    finite_number(CAL[f'J{axis}calOff'], f"J{axis} calibration offset")
+    for axis in range(1, 10)
+  )
+  return _build_startup_numeric_command(
+    "LL",
+    zip(tuple("ABCDEFGHIJKLMNOPQR"), normalized_selections + offsets),
+  )
+
+
+def _record_calibration_response(
+  response,
+  success_message,
+  failure_message,
+  *,
+  update_virtual,
+  controller_write_started=True,
+  uncertainty_reason=None,
+):
+  if not isinstance(controller_write_started, bool):
+    raise TypeError("calibration write-start state must be boolean")
+  if uncertainty_reason is not None and (
+    not isinstance(uncertainty_reason, str)
+    or not uncertainty_reason.strip()
+    or uncertainty_reason != uncertainty_reason.strip()
+  ):
+    raise TypeError("calibration uncertainty reason must be normalized text")
+
+  parsed_position = None
+  applied_position = None
+  position_validation_reason = None
+  if isinstance(response, str):
+    try:
+      parsed_position = parse_position_response(response)
+    except ProtocolResponseError:
+      pass
+  if parsed_position is not None:
+    try:
+      _current_controller_joint_calibration().validate_positions(
+        parsed_position.joints + parsed_position.external
+      )
+    except MotionInputError:
+      parsed_position = None
+      position_validation_reason = (
+        "calibration command returned a position outside calibrated limits"
+      )
+  if parsed_position is not None and parsed_position.flag:
+    ErrorHandler(parsed_position.flag)
+    succeeded = False
+    if controller_write_started:
+      _invalidate_uncertain_controller_calibration(
+        "calibration command ended with a controller motion fault"
+      )
+  else:
+    applied_position = (
+      _apply_valid_position_response(response)
+      if parsed_position is not None
+      else None
+    )
+    succeeded = applied_position is not None
+  if parsed_position is None and controller_write_started:
+    _invalidate_uncertain_controller_calibration(
+      position_validation_reason
+      or uncertainty_reason
+      or "calibration command returned no valid controller position"
+    )
+  if (
+    not succeeded
+    and isinstance(response, str)
+    and response
+    and not response.startswith("A")
+  ):
+    ErrorHandler(response)
+
+  message = success_message if succeeded else failure_message
+  style = "OK.TLabel" if succeeded else "Alarm.TLabel"
+  if not (
+    succeeded
+    and applied_position.speed_violation
+  ):
+    almStatusLab.config(text=message, style=style)
+    almStatusLab2.config(text=message, style=style)
+  if succeeded and update_virtual:
+    RUN['VR_angles'] = [
+      float(CAL['J1AngCur']),
+      float(CAL['J2AngCur']),
+      float(CAL['J3AngCur']),
+      float(CAL['J4AngCur']),
+      float(CAL['J5AngCur']),
+      float(CAL['J6AngCur']),
+    ]
+    setStepMonitorsVR()
+
+  if succeeded:
+    logger.info(message)
+  else:
+    logger.error(message)
+  value = tab8.ElogView.get(0, END)
+  pickle.dump(value, open("ErrorLog", "wb"))
+  return succeeded
+
+
+def _execute_calibration_command(
+  command,
+  success_message,
+  failure_message,
+  *,
+  update_virtual=True,
+):
+  write_started_event = threading.Event()
+  cmdSentEntryField.delete(0, 'end')
+  cmdSentEntryField.insert(0, command)
+  uncertainty_reason = None
+  try:
+    response = exchange_serial_line_until_cancelled(
+      RUN.get('ser'),
+      command,
+      application_closing,
+      write_lock=serial_write_lock,
+      write_started_event=write_started_event,
+    )
+  except Exception:
+    response = None
+    if write_started_event.is_set():
+      uncertainty_reason = (
+        "calibration response failed after controller transmission"
+      )
+    logger.exception("Calibration controller exchange failed")
+  cmdRecEntryField.delete(0, 'end')
+  cmdRecEntryField.insert(0, "" if response is None else response)
+  return _record_calibration_response(
+    response,
+    success_message,
+    failure_message,
+    update_virtual=update_virtual,
+    controller_write_started=write_started_event.is_set(),
+    uncertainty_reason=uncertainty_reason,
+  )
+
+
+@_synchronous_motion_request("Automatic calibration")
+@_tracked_serial_operation("ser")
 def calRobotAll():
-  # global RUN['VR_angles']
-  success = FALSE
-  if RUN['offlineMode']:
-    almStatusLab.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    almStatusLab2.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    return 
-  ##### STAGE 1 ########
-  command = "LL"+"A"+str(CAL['J1CalStatVal'].get())+"B"+str(CAL['J2CalStatVal'].get())+"C"+str(CAL['J3CalStatVal'].get())+"D"+str(CAL['J4CalStatVal'].get())+"E"+str(CAL['J5CalStatVal'].get())+"F"+str(CAL['J6CalStatVal'].get())+"G"+str(CAL['J7CalStatVal'].get())+"H"+str(CAL['J8CalStatVal'].get())+"I"+str(CAL['J9CalStatVal'].get())+"J"+str(CAL['J1calOff'])+"K"+str(CAL['J2calOff'])+"L"+str(CAL['J3calOff'])+"M"+str(CAL['J4calOff'])+"N"+str(CAL['J5calOff'])+"O"+str(CAL['J6calOff'])+"P"+str(CAL['J7calOff'])+"Q"+str(CAL['J8calOff'])+"R"+str(CAL['J9calOff'])+"\n" 
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)
-  RUN['ser'].flushInput()
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0,response)
-  if (response[:1] == 'A'):
-    displayPosition(response)  
-    message = "Auto Calibration Stage 1 Successful"
-    RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-    setStepMonitorsVR()
-    almStatusLab.config(text=message, style="OK.TLabel")
-    almStatusLab2.config(text=message, style="OK.TLabel")
-    success = TRUE
-  else:
-    message = "Auto Calibration Stage 1 Failed - See Log" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
-    ErrorHandler(response)
+  if not _calibration_available():
+    return False
+  first_stage = tuple(
+    CAL[f'J{joint}CalStatVal'].get()
+    for joint in range(1, 10)
+  )
+  second_stage = tuple(
+    _binary_controller_flag(
+      CAL[f'J{joint}CalStatVal2'].get(),
+      f"J{joint} second-stage calibration selection",
+    )
+    for joint in range(1, 10)
+  )
+  first_command = _prepare_calibration_command(first_stage)
+  second_command = (
+    _prepare_calibration_command(second_stage)
+    if sum(second_stage) > 0
+    else None
+  )
+  if not _execute_calibration_command(
+    first_command,
+    "Auto Calibration Stage 1 Successful",
+    "Auto Calibration Stage 1 Failed - See Log",
+  ):
+    return False
 
-  if "success" in message.strip().lower():
-    logger.info(message)
-  else:
-    logger.error(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb")) 
-  ##### STAGE 2 ########
-  if (success):
-    CalStatVal2 = int(CAL['J1CalStatVal2'].get())+int(CAL['J2CalStatVal2'].get())+int(CAL['J3CalStatVal2'].get())+int(CAL['J4CalStatVal2'].get())+int(CAL['J5CalStatVal2'].get())+int(CAL['J6CalStatVal2'].get())
-    if(CalStatVal2>0):
-      command = "LL"+"A"+str(CAL['J1CalStatVal2'].get())+"B"+str(CAL['J2CalStatVal2'].get())+"C"+str(CAL['J3CalStatVal2'].get())+"D"+str(CAL['J4CalStatVal2'].get())+"E"+str(CAL['J5CalStatVal2'].get())+"F"+str(CAL['J6CalStatVal2'].get())+"G"+str(CAL['J7CalStatVal2'].get())+"H"+str(CAL['J8CalStatVal2'].get())+"I"+str(CAL['J9CalStatVal2'].get())+"J"+str(CAL['J1calOff'])+"K"+str(CAL['J2calOff'])+"L"+str(CAL['J3calOff'])+"M"+str(CAL['J4calOff'])+"N"+str(CAL['J5calOff'])+"O"+str(CAL['J6calOff'])+"P"+str(CAL['J7calOff'])+"Q"+str(CAL['J8calOff'])+"R"+str(CAL['J9calOff'])+"\n" 
-      RUN['ser'].write(command.encode())
-      cmdSentEntryField.delete(0, 'end')
-      cmdSentEntryField.insert(0,command)
-      RUN['ser'].flushInput()
-      response = str(RUN['ser'].readline().strip(),'utf-8')
-      cmdRecEntryField.delete(0, 'end')
-      cmdRecEntryField.insert(0,response)
-      if (response[:1] == 'A'):
-        displayPosition(response)  
-        message = "Auto Calibration Stage 2 Successful"
-        RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-        setStepMonitorsVR()
-        almStatusLab.config(text=message, style="OK.TLabel")
-        almStatusLab2.config(text=message, style="OK.TLabel") 
-      else:
-        message = "Auto Calibration Stage 2 Failed - See Log" 
-        almStatusLab.config(text=message, style="Alarm.TLabel")
-        almStatusLab2.config(text=message, style="Alarm.TLabel")
-        ErrorHandler(response)
-      if "success" in message.strip().lower():
-        logger.info(message)
-      else:
-        logger.error(message)
-      value=tab8.ElogView.get(0,END)
-      pickle.dump(value,open("ErrorLog","wb")) 
+  if second_command is None:
+    return True
+  return _execute_calibration_command(
+    second_command,
+    "Auto Calibration Stage 2 Successful",
+    "Auto Calibration Stage 2 Failed - See Log",
+  )
 
 
+@_synchronous_motion_request("J1 calibration")
+@_tracked_serial_operation("ser")
 def calRobotJ1():
-  # global RUN['VR_angles']
-  if RUN['offlineMode']:
-    almStatusLab.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    almStatusLab2.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    return
-  command = "LLA1B0C0D0E0F0G0H0I0"+"J"+str(CAL['J1calOff'])+"K"+str(CAL['J2calOff'])+"L"+str(CAL['J3calOff'])+"M"+str(CAL['J4calOff'])+"N"+str(CAL['J5calOff'])+"O"+str(CAL['J6calOff'])+"P"+str(CAL['J7calOff'])+"Q"+str(CAL['J8calOff'])+"R"+str(CAL['J9calOff'])+"\n" 
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)
-  RUN['ser'].flushInput()
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0,response)
-  if (response[:1] == 'A'):
-    displayPosition(response)  
-    message = "J1 Calibrated Successfully"
-    RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-    setStepMonitorsVR()
-    almStatusLab.config(text=message, style="OK.TLabel")
-    almStatusLab2.config(text=message, style="OK.TLabel") 
-  else:
-    message = "J1 Calibrated Failed" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
-    ErrorHandler(response)
-  if "success" in message.strip().lower():
-    logger.info(message)
-  else:
-    logger.error(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb"))     
+  if not _calibration_available():
+    return False
+  command = _prepare_calibration_command((1, 0, 0, 0, 0, 0, 0, 0, 0))
+  return _execute_calibration_command(
+    command,
+    "J1 Calibrated Successfully",
+    "J1 Calibration Failed",
+  )
 
+
+@_synchronous_motion_request("J2 calibration")
+@_tracked_serial_operation("ser")
 def calRobotJ2():
-  # global RUN['VR_angles']
-  if RUN['offlineMode']:
-    almStatusLab.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    almStatusLab2.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    return
-  command = "LLA0B1C0D0E0F0G0H0I0"+"J"+str(CAL['J1calOff'])+"K"+str(CAL['J2calOff'])+"L"+str(CAL['J3calOff'])+"M"+str(CAL['J4calOff'])+"N"+str(CAL['J5calOff'])+"O"+str(CAL['J6calOff'])+"P"+str(CAL['J7calOff'])+"Q"+str(CAL['J8calOff'])+"R"+str(CAL['J9calOff'])+"\n" 
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)
-  RUN['ser'].flushInput()
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0,response)
-  if (response[:1] == 'A'):
-    displayPosition(response)  
-    message = "J2 Calibrated Successfully"
-    RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-    setStepMonitorsVR()
-    almStatusLab.config(text=message, style="OK.TLabel")
-    almStatusLab2.config(text=message, style="OK.TLabel") 
-  else:
-    message = "J2 Calibrated Failed" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
-    ErrorHandler(response)
-  #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  #tab8.ElogView.insert(END, Curtime+" - "+message)
-  logger.error(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb"))     
+  if not _calibration_available():
+    return False
+  command = _prepare_calibration_command((0, 1, 0, 0, 0, 0, 0, 0, 0))
+  return _execute_calibration_command(
+    command,
+    "J2 Calibrated Successfully",
+    "J2 Calibration Failed",
+  )
 
+
+@_synchronous_motion_request("J3 calibration")
+@_tracked_serial_operation("ser")
 def calRobotJ3():
-  # global RUN['VR_angles']
-  if RUN['offlineMode']:
-    almStatusLab.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    almStatusLab2.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    return
-  command = "LLA0B0C1D0E0F0G0H0I0"+"J"+str(CAL['J1calOff'])+"K"+str(CAL['J2calOff'])+"L"+str(CAL['J3calOff'])+"M"+str(CAL['J4calOff'])+"N"+str(CAL['J5calOff'])+"O"+str(CAL['J6calOff'])+"P"+str(CAL['J7calOff'])+"Q"+str(CAL['J8calOff'])+"R"+str(CAL['J9calOff'])+"\n" 
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)
-  RUN['ser'].flushInput()
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0,response)
-  if (response[:1] == 'A'):
-    displayPosition(response)  
-    message = "J3 Calibrated Successfully"
-    RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-    setStepMonitorsVR()
-    almStatusLab.config(text=message, style="OK.TLabel")
-    almStatusLab2.config(text=message, style="OK.TLabel") 
-  else:
-    message = "J3 Calibrated Failed" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
-    ErrorHandler(response)
-  #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  #tab8.ElogView.insert(END, Curtime+" - "+message)
-  logger.error(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb"))     
+  if not _calibration_available():
+    return False
+  command = _prepare_calibration_command((0, 0, 1, 0, 0, 0, 0, 0, 0))
+  return _execute_calibration_command(
+    command,
+    "J3 Calibrated Successfully",
+    "J3 Calibration Failed",
+  )
 
+
+@_synchronous_motion_request("J4 calibration")
+@_tracked_serial_operation("ser")
 def calRobotJ4():
-  # global RUN['VR_angles']
-  if RUN['offlineMode']:
-    almStatusLab.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    almStatusLab2.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    return
-  command = "LLA0B0C0D1E0F0G0H0I0"+"J"+str(CAL['J1calOff'])+"K"+str(CAL['J2calOff'])+"L"+str(CAL['J3calOff'])+"M"+str(CAL['J4calOff'])+"N"+str(CAL['J5calOff'])+"O"+str(CAL['J6calOff'])+"P"+str(CAL['J7calOff'])+"Q"+str(CAL['J8calOff'])+"R"+str(CAL['J9calOff'])+"\n" 
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)
-  RUN['ser'].flushInput()
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0,response)
-  if (response[:1] == 'A'):
-    displayPosition(response)  
-    message = "J4 Calibrated Successfully"
-    RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-    setStepMonitorsVR()
-    almStatusLab.config(text=message, style="OK.TLabel")
-    almStatusLab2.config(text=message, style="OK.TLabel" ) 
-  else:
-    message = "J4 Calibrated Failed" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
-    ErrorHandler(response)
-  #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  #tab8.ElogView.insert(END, Curtime+" - "+message)
-  logger.error(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb"))     
+  if not _calibration_available():
+    return False
+  command = _prepare_calibration_command((0, 0, 0, 1, 0, 0, 0, 0, 0))
+  return _execute_calibration_command(
+    command,
+    "J4 Calibrated Successfully",
+    "J4 Calibration Failed",
+  )
 
+
+@_synchronous_motion_request("J5 calibration")
+@_tracked_serial_operation("ser")
 def calRobotJ5():
-  # global RUN['VR_angles']
-  if RUN['offlineMode']:
-    almStatusLab.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    almStatusLab2.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    return
-  command = "LLA0B0C0D0E1F0G0H0I0"+"J"+str(CAL['J1calOff'])+"K"+str(CAL['J2calOff'])+"L"+str(CAL['J3calOff'])+"M"+str(CAL['J4calOff'])+"N"+str(CAL['J5calOff'])+"O"+str(CAL['J6calOff'])+"P"+str(CAL['J7calOff'])+"Q"+str(CAL['J8calOff'])+"R"+str(CAL['J9calOff'])+"\n"  
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)
-  RUN['ser'].flushInput()
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0,response)
-  if (response[:1] == 'A'):
-    displayPosition(response)  
-    message = "J5 Calibrated Successfully"
-    RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-    setStepMonitorsVR()
-    almStatusLab.config(text=message, style="OK.TLabel")
-    almStatusLab2.config(text=message, style="OK.TLabel") 
-  else:
-    message = "J5 Calibrated Failed" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
-    ErrorHandler(response)
-  #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  #tab8.ElogView.insert(END, Curtime+" - "+message)
-  logger.error(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb"))     
+  if not _calibration_available():
+    return False
+  command = _prepare_calibration_command((0, 0, 0, 0, 1, 0, 0, 0, 0))
+  return _execute_calibration_command(
+    command,
+    "J5 Calibrated Successfully",
+    "J5 Calibration Failed",
+  )
 
+
+@_synchronous_motion_request("J6 calibration")
+@_tracked_serial_operation("ser")
 def calRobotJ6():
-  # global RUN['VR_angles']
-  if RUN['offlineMode']:
-    almStatusLab.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    almStatusLab2.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    return
-  command = "LLA0B0C0D0E0F1G0H0I0"+"J"+str(CAL['J1calOff'])+"K"+str(CAL['J2calOff'])+"L"+str(CAL['J3calOff'])+"M"+str(CAL['J4calOff'])+"N"+str(CAL['J5calOff'])+"O"+str(CAL['J6calOff'])+"P"+str(CAL['J7calOff'])+"Q"+str(CAL['J8calOff'])+"R"+str(CAL['J9calOff'])+"\n"  
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)
-  RUN['ser'].flushInput()
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0,response)
-  if (response[:1] == 'A'):
-    displayPosition(response)  
-    message = "J6 Calibrated Successfully"
-    RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-    setStepMonitorsVR()
-    almStatusLab.config(text=message, style="OK.TLabel")
-    almStatusLab2.config(text=message, style="OK.TLabel") 
-  else:
-    message = "J6 Calibrated Failed" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
-    ErrorHandler(response)
-  #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  #tab8.ElogView.insert(END, Curtime+" - "+message)
-  logger.error(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb"))   
+  if not _calibration_available():
+    return False
+  command = _prepare_calibration_command((0, 0, 0, 0, 0, 1, 0, 0, 0))
+  return _execute_calibration_command(
+    command,
+    "J6 Calibrated Successfully",
+    "J6 Calibration Failed",
+  )
 
+
+@_synchronous_motion_request("J7 calibration")
+@_tracked_serial_operation("ser")
 def calRobotJ7():
-  if RUN['offlineMode']:
-    almStatusLab.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    almStatusLab2.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    return
-  command = "LLA0B0C0D0E0F0G1H0I0"+"J"+str(CAL['J1calOff'])+"K"+str(CAL['J2calOff'])+"L"+str(CAL['J3calOff'])+"M"+str(CAL['J4calOff'])+"N"+str(CAL['J5calOff'])+"O"+str(CAL['J6calOff'])+"P"+str(CAL['J7calOff'])+"Q"+str(CAL['J8calOff'])+"R"+str(CAL['J9calOff'])+"\n"  
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)
-  RUN['ser'].flushInput()
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0,response)
-  if (response[:1] == 'A'):
-    displayPosition(response)  
-    message = "J7 Calibrated Successfully"
-    almStatusLab.config(text=message, style="OK.TLabel")
-    almStatusLab2.config(text=message, style="OK.TLabel") 
-  else:
-    message = "J7 Calibrated Failed" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
-    ErrorHandler(response)
-  #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  #tab8.ElogView.insert(END, Curtime+" - "+message)
-  logger.error(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb")) 
+  if not _calibration_available():
+    return False
+  command = _prepare_calibration_command((0, 0, 0, 0, 0, 0, 1, 0, 0))
+  return _execute_calibration_command(
+    command,
+    "J7 Calibrated Successfully",
+    "J7 Calibration Failed",
+    update_virtual=False,
+  )
 
+
+@_synchronous_motion_request("J8 calibration")
+@_tracked_serial_operation("ser")
 def calRobotJ8():
-  if RUN['offlineMode']:
-    almStatusLab.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    return
-  command = "LLA0B0C0D0E0F0G0H1I0"+"J"+str(CAL['J1calOff'])+"K"+str(CAL['J2calOff'])+"L"+str(CAL['J3calOff'])+"M"+str(CAL['J4calOff'])+"N"+str(CAL['J5calOff'])+"O"+str(CAL['J6calOff'])+"P"+str(CAL['J7calOff'])+"Q"+str(CAL['J8calOff'])+"R"+str(CAL['J9calOff'])+"\n"  
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)
-  RUN['ser'].flushInput()
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0,response)
-  if (response[:1] == 'A'):
-    displayPosition(response)  
-    message = "J8 Calibrated Successfully"
-    almStatusLab.config(text=message, style="OK.TLabel")
-    almStatusLab2.config(text=message, style="OK.TLabel") 
-  else:
-    message = "J8 Calibrated Failed" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
-    ErrorHandler(response)
-  #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  #tab8.ElogView.insert(END, Curtime+" - "+message)
-  logger.error(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb"))    
+  if not _calibration_available():
+    return False
+  command = _prepare_calibration_command((0, 0, 0, 0, 0, 0, 0, 1, 0))
+  return _execute_calibration_command(
+    command,
+    "J8 Calibrated Successfully",
+    "J8 Calibration Failed",
+    update_virtual=False,
+  )
 
+
+@_synchronous_motion_request("J9 calibration")
+@_tracked_serial_operation("ser")
 def calRobotJ9():
-  if RUN['offlineMode']:
-    almStatusLab.config(text="Calibration not supported in offline mode", style="Alarm.TLabel")
-    return
-  command = "LLA0B0C0D0E0F0G0H0I1"+"J"+str(CAL['J1calOff'])+"K"+str(CAL['J2calOff'])+"L"+str(CAL['J3calOff'])+"M"+str(CAL['J4calOff'])+"N"+str(CAL['J5calOff'])+"O"+str(CAL['J6calOff'])+"P"+str(CAL['J7calOff'])+"Q"+str(CAL['J8calOff'])+"R"+str(CAL['J9calOff'])+"\n"  
-  RUN['ser'].write(command.encode())
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)
-  RUN['ser'].flushInput()
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0,response)
-  if (response[:1] == 'A'):
-    displayPosition(response)  
-    message = "J9 Calibrated Successfully"
-    almStatusLab.config(text=message, style="OK.TLabel")
-    almStatusLab2.config(text=message, style="OK.TLabel") 
-  else:
-    message = "J9 Calibrated Failed" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
-    ErrorHandler(response)
-  #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  #tab8.ElogView.insert(END, Curtime+" - "+message)
-  logger.error(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb"))             
+  if not _calibration_available():
+    return False
+  command = _prepare_calibration_command((0, 0, 0, 0, 0, 0, 0, 0, 1))
+  return _execute_calibration_command(
+    command,
+    "J9 Calibrated Successfully",
+    "J9 Calibration Failed",
+    update_virtual=False,
+  )
 	
 
 
 
 def correctPos():
-  command = "CP\n"
-  RUN['ser'].write(command.encode())    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  displayPosition(response) 
+  return _request_controller_correction()
 
+@_tracked_serial_operation("ser")
 def requestPos():
-  command = "RP\n"
-  RUN['ser'].write(command.encode())    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  displayPosition(response) 
+  response = _exchange_serial_line("RP\n")
+  return _apply_controller_position_response(response)
 
-def updateParams():
-  CAL['TFx']  = TFxEntryField.get()
-  CAL['TFy']  = TFyEntryField.get()
-  CAL['TFz']  = TFzEntryField.get()
-  CAL['TFrz'] = TFrzEntryField.get()
-  CAL['TFry'] = TFryEntryField.get()
-  CAL['TFrx'] = TFrxEntryField.get()
-  CAL['J1MotDir'] = J1MotDirEntryField.get()
-  CAL['J2MotDir'] = J2MotDirEntryField.get()
-  CAL['J3MotDir'] = J3MotDirEntryField.get()
-  CAL['J4MotDir'] = J4MotDirEntryField.get()
-  CAL['J5MotDir'] = J5MotDirEntryField.get()
-  CAL['J6MotDir'] = J6MotDirEntryField.get()
-  CAL['J7MotDir'] = J7MotDirEntryField.get()
-  CAL['J8MotDir'] = J8MotDirEntryField.get()
-  CAL['J9MotDir'] = J9MotDirEntryField.get()
-  CAL['J1CalDir'] = J1CalDirEntryField.get()
-  CAL['J2CalDir'] = J2CalDirEntryField.get()
-  CAL['J3CalDir'] = J3CalDirEntryField.get()
-  CAL['J4CalDir'] = J4CalDirEntryField.get()
-  CAL['J5CalDir'] = J5CalDirEntryField.get()
-  CAL['J6CalDir'] = J6CalDirEntryField.get()
-  CAL['J7CalDir'] = J7CalDirEntryField.get()
-  CAL['J8CalDir'] = J8CalDirEntryField.get()
-  CAL['J9CalDir'] = J9CalDirEntryField.get()
-  CAL['J1PosLim'] = J1PosLimEntryField.get()
-  CAL['J1NegLim'] = J1NegLimEntryField.get()
-  CAL['J2PosLim'] = J2PosLimEntryField.get()
-  CAL['J2NegLim'] = J2NegLimEntryField.get()
-  CAL['J3PosLim'] = J3PosLimEntryField.get()
-  CAL['J3NegLim'] = J3NegLimEntryField.get()
-  CAL['J4PosLim'] = J4PosLimEntryField.get()
-  CAL['J4NegLim'] = J4NegLimEntryField.get()
-  CAL['J5PosLim'] = J5PosLimEntryField.get()
-  CAL['J5NegLim'] = J5NegLimEntryField.get()
-  CAL['J6PosLim'] = J6PosLimEntryField.get()
-  CAL['J6NegLim'] = J6NegLimEntryField.get()
-  CAL['J1StepDeg'] = J1StepDegEntryField.get()
-  CAL['J2StepDeg'] = J2StepDegEntryField.get()
-  CAL['J3StepDeg'] = J3StepDegEntryField.get()
-  CAL['J4StepDeg'] = J4StepDegEntryField.get()
-  CAL['J5StepDeg'] = J5StepDegEntryField.get()
-  CAL['J6StepDeg'] = J6StepDegEntryField.get()
-  J1EncMult = str(float(J1EncCPREntryField.get())/float(J1DriveMSEntryField.get()))
-  J2EncMult = str(float(J2EncCPREntryField.get())/float(J2DriveMSEntryField.get()))
-  J3EncMult = str(float(J3EncCPREntryField.get())/float(J3DriveMSEntryField.get()))
-  J4EncMult = str(float(J4EncCPREntryField.get())/float(J4DriveMSEntryField.get()))
-  J5EncMult = str(float(J5EncCPREntryField.get())/float(J5DriveMSEntryField.get()))
-  J6EncMult = str(float(J6EncCPREntryField.get())/float(J6DriveMSEntryField.get()))
-  CAL['J1ΘDHpar'] = J1ΘEntryField.get()
-  CAL['J2ΘDHpar'] = J2ΘEntryField.get()
-  CAL['J3ΘDHpar'] = J3ΘEntryField.get()
-  CAL['J4ΘDHpar'] = J4ΘEntryField.get()
-  CAL['J5ΘDHpar'] = J5ΘEntryField.get()
-  CAL['J6ΘDHpar'] = J6ΘEntryField.get()
-  CAL['J1αDHpar'] = J1αEntryField.get()
-  CAL['J2αDHpar'] = J2αEntryField.get()
-  CAL['J3αDHpar'] = J3αEntryField.get()
-  CAL['J4αDHpar'] = J4αEntryField.get()
-  CAL['J5αDHpar'] = J5αEntryField.get()
-  CAL['J6αDHpar'] = J6αEntryField.get()
-  CAL['J1dDHpar'] = J1dEntryField.get()
-  CAL['J2dDHpar'] = J2dEntryField.get()
-  CAL['J3dDHpar'] = J3dEntryField.get()
-  CAL['J4dDHpar'] = J4dEntryField.get()
-  CAL['J5dDHpar'] = J5dEntryField.get()
-  CAL['J6dDHpar'] = J6dEntryField.get()
-  CAL['J1aDHpar'] = J1aEntryField.get()
-  CAL['J2aDHpar'] = J2aEntryField.get()
-  CAL['J3aDHpar'] = J3aEntryField.get()
-  CAL['J4aDHpar'] = J4aEntryField.get()
-  CAL['J5aDHpar'] = J5aEntryField.get()
-  CAL['J6aDHpar'] = J6aEntryField.get()
 
-  update_CPP_kin_from_entries()
+def _collect_update_parameter_values():
+  values = {
+    'TFx': TFxEntryField.get(),
+    'TFy': TFyEntryField.get(),
+    'TFz': TFzEntryField.get(),
+    'TFrz': TFrzEntryField.get(),
+    'TFry': TFryEntryField.get(),
+    'TFrx': TFrxEntryField.get(),
+  }
+  field_groups = (
+    ('MotDir', (J1MotDirEntryField, J2MotDirEntryField, J3MotDirEntryField, J4MotDirEntryField, J5MotDirEntryField, J6MotDirEntryField, J7MotDirEntryField, J8MotDirEntryField, J9MotDirEntryField)),
+    ('CalDir', (J1CalDirEntryField, J2CalDirEntryField, J3CalDirEntryField, J4CalDirEntryField, J5CalDirEntryField, J6CalDirEntryField, J7CalDirEntryField, J8CalDirEntryField, J9CalDirEntryField)),
+    ('PosLim', (J1PosLimEntryField, J2PosLimEntryField, J3PosLimEntryField, J4PosLimEntryField, J5PosLimEntryField, J6PosLimEntryField)),
+    ('NegLim', (J1NegLimEntryField, J2NegLimEntryField, J3NegLimEntryField, J4NegLimEntryField, J5NegLimEntryField, J6NegLimEntryField)),
+    ('StepDeg', (J1StepDegEntryField, J2StepDegEntryField, J3StepDegEntryField, J4StepDegEntryField, J5StepDegEntryField, J6StepDegEntryField)),
+    ('ΘDHpar', (J1ΘEntryField, J2ΘEntryField, J3ΘEntryField, J4ΘEntryField, J5ΘEntryField, J6ΘEntryField)),
+    ('αDHpar', (J1αEntryField, J2αEntryField, J3αEntryField, J4αEntryField, J5αEntryField, J6αEntryField)),
+    ('dDHpar', (J1dEntryField, J2dEntryField, J3dEntryField, J4dEntryField, J5dEntryField, J6dEntryField)),
+    ('aDHpar', (J1aEntryField, J2aEntryField, J3aEntryField, J4aEntryField, J5aEntryField, J6aEntryField)),
+    ('DriveMS', (J1DriveMSEntryField, J2DriveMSEntryField, J3DriveMSEntryField, J4DriveMSEntryField, J5DriveMSEntryField, J6DriveMSEntryField)),
+    ('EncCPR', (J1EncCPREntryField, J2EncCPREntryField, J3EncCPREntryField, J4EncCPREntryField, J5EncCPREntryField, J6EncCPREntryField)),
+  )
+  for suffix, fields in field_groups:
+    for axis, field in enumerate(fields, start=1):
+      value = field.get()
+      if suffix in ('MotDir', 'CalDir'):
+        value = _binary_controller_flag(
+          value,
+          f"J{axis} {suffix}",
+        )
+      elif suffix in ('DriveMS', 'EncCPR'):
+        value = int(value)
+      values[f'J{axis}{suffix}'] = value
+  return values
 
-  J1negLimLab.config(text="-"+CAL['J1NegLim'], style="Jointlim.TLabel")
-  J1posLimLab.config(text=CAL['J1PosLim'], style="Jointlim.TLabel")
-  J1jogslide.config(from_=float("-"+CAL['J1NegLim']), to=float(CAL['J1PosLim']),  length=180, orient=HORIZONTAL,  command=J1sliderUpdate)
-  J2negLimLab.config(text="-"+CAL['J2NegLim'], style="Jointlim.TLabel")
-  J2posLimLab.config(text=CAL['J2PosLim'], style="Jointlim.TLabel")
-  J2jogslide.config(from_=float("-"+CAL['J2NegLim']), to=float(CAL['J2PosLim']),  length=180, orient=HORIZONTAL,  command=J2sliderUpdate)
-  J3negLimLab.config(text="-"+CAL['J3NegLim'], style="Jointlim.TLabel")
-  J3posLimLab.config(text=CAL['J3PosLim'], style="Jointlim.TLabel")
-  J3jogslide.config(from_=float("-"+CAL['J3NegLim']), to=float(CAL['J3PosLim']),  length=180, orient=HORIZONTAL,  command=J3sliderUpdate)
-  J4negLimLab.config(text="-"+CAL['J4NegLim'], style="Jointlim.TLabel")
-  J4posLimLab.config(text=CAL['J4PosLim'], style="Jointlim.TLabel")
-  J4jogslide.config(from_=float("-"+CAL['J4NegLim']), to=float(CAL['J4PosLim']),  length=180, orient=HORIZONTAL,  command=J4sliderUpdate)
-  J5negLimLab.config(text="-"+CAL['J5NegLim'], style="Jointlim.TLabel")
-  J5posLimLab.config(text=CAL['J5PosLim'], style="Jointlim.TLabel")
-  J5jogslide.config(from_=float("-"+CAL['J5NegLim']), to=float(CAL['J5PosLim']),  length=180, orient=HORIZONTAL,  command=J5sliderUpdate)
-  J6negLimLab.config(text="-"+CAL['J6NegLim'], style="Jointlim.TLabel")
-  J6posLimLab.config(text=CAL['J6PosLim'], style="Jointlim.TLabel")
-  J6jogslide.config(from_=float("-"+CAL['J6NegLim']), to=float(CAL['J6PosLim']),  length=180, orient=HORIZONTAL,  command=J6sliderUpdate)
 
-  command = "UP"+"A"+CAL['TFx']+"B"+CAL['TFy']+"C"+CAL['TFz']+"D"+CAL['TFrz']+"E"+CAL['TFry']+"F"+CAL['TFrx']+\
-  "G"+CAL['J1MotDir']+"H"+CAL['J2MotDir']+"I"+CAL['J3MotDir']+"J"+CAL['J4MotDir']+"K"+CAL['J5MotDir']+"L"+CAL['J6MotDir']+"M"+CAL['J7MotDir']+"N"+CAL['J8MotDir']+"O"+CAL['J9MotDir']+\
-  "P"+CAL['J1CalDir']+"Q"+CAL['J2CalDir']+"R"+CAL['J3CalDir']+"S"+CAL['J4CalDir']+"T"+CAL['J5CalDir']+"U"+CAL['J6CalDir']+"V"+CAL['J7CalDir']+"W"+CAL['J8CalDir']+"X"+CAL['J9CalDir']+\
-  "Y"+CAL['J1PosLim']+"Z"+CAL['J1NegLim']+"a"+CAL['J2PosLim']+"b"+CAL['J2NegLim']+"c"+CAL['J3PosLim']+"d"+CAL['J3NegLim']+"e"+CAL['J4PosLim']+"f"+CAL['J4NegLim']+"g"+CAL['J5PosLim']+"h"+CAL['J5NegLim']+"i"+CAL['J6PosLim']+"j"+CAL['J6NegLim']+\
-  "k"+CAL['J1StepDeg']+"l"+CAL['J2StepDeg']+"m"+CAL['J3StepDeg']+"n"+CAL['J4StepDeg']+"o"+CAL['J5StepDeg']+"p"+CAL['J6StepDeg']+\
-  "q"+J1EncMult+"r"+J2EncMult+"s"+J3EncMult+"t"+J4EncMult+"u"+J5EncMult+"v"+J6EncMult+\
-  "w"+CAL['J1ΘDHpar']+"x"+CAL['J2ΘDHpar']+"y"+CAL['J3ΘDHpar']+"z"+CAL['J4ΘDHpar']+"!"+CAL['J5ΘDHpar']+"@"+CAL['J6ΘDHpar']+\
-  "#"+CAL['J1αDHpar']+"$"+CAL['J2αDHpar']+"%"+CAL['J3αDHpar']+"^"+CAL['J4αDHpar']+"&"+CAL['J5αDHpar']+"*"+CAL['J6αDHpar']+\
-  "("+CAL['J1dDHpar']+")"+CAL['J2dDHpar']+"+"+CAL['J3dDHpar']+"="+CAL['J4dDHpar']+","+CAL['J5dDHpar']+"_"+CAL['J6dDHpar']+\
-  "<"+CAL['J1aDHpar']+">"+CAL['J2aDHpar']+"?"+CAL['J3aDHpar']+"{"+CAL['J4aDHpar']+"}"+CAL['J5aDHpar']+"~"+CAL['J6aDHpar']+\
-  "\n"
+def _robot_joint_calibration_from_values(values):
+  return ControllerJointCalibration(
+    negative_limits=tuple(
+      finite_number(values[f'J{axis}NegLim'], f'J{axis} negative limit')
+      for axis in range(1, 7)
+    ) + (0.0, 0.0, 0.0),
+    positive_limits=tuple(
+      finite_number(values[f'J{axis}PosLim'], f'J{axis} positive limit')
+      for axis in range(1, 7)
+    ) + (0.0, 0.0, 0.0),
+    steps_per_unit=tuple(
+      finite_number(values[f'J{axis}StepDeg'], f'J{axis} steps per degree')
+      for axis in range(1, 7)
+    ) + (1.0, 1.0, 1.0),
+  )
+
+
+def _prepare_update_parameters_from_values(source_values):
+  if not isinstance(source_values, dict):
+    raise MotionInputError("update-parameter values must be a dictionary")
   try:
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flush()
-    time.sleep(.1)    
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    response = RUN['ser'].read_all()
-  except Exception as e:
-    if RUN['ser'] in locals():
-      logger.error("Serial error: "+str(e))
-    else:
-      logger.error("Serial port not open")
+    values = {
+      key: source_values[key]
+      for key in ('TFx', 'TFy', 'TFz', 'TFrz', 'TFry', 'TFrx')
+    }
+    for suffix, axis_count in (
+      ('MotDir', 9),
+      ('CalDir', 9),
+      ('PosLim', 6),
+      ('NegLim', 6),
+      ('StepDeg', 6),
+      ('DriveMS', 6),
+      ('EncCPR', 6),
+      ('ΘDHpar', 6),
+      ('αDHpar', 6),
+      ('dDHpar', 6),
+      ('aDHpar', 6),
+    ):
+      for axis in range(1, axis_count + 1):
+        key = f'J{axis}{suffix}'
+        values[key] = source_values[key]
+  except KeyError as exc:
+    raise MotionInputError(
+      f"update-parameter values are missing {exc.args[0]}"
+    ) from exc
 
-def calExtAxis():
-  J7NegLim = 0
-  J8NegLim = 0
-  J9NegLim = 0
+  for axis in range(1, 10):
+    for suffix in ('MotDir', 'CalDir'):
+      values[f'J{axis}{suffix}'] = _binary_controller_flag(
+        values[f'J{axis}{suffix}'],
+        f"J{axis} {suffix}",
+      )
+  _robot_joint_calibration_from_values(values)
+  encoder_multipliers = []
+  for axis in range(1, 7):
+    drive_key = f'J{axis}DriveMS'
+    encoder_key = f'J{axis}EncCPR'
+    drive_microsteps = finite_number(
+      values[drive_key],
+      f"J{axis} drive microsteps",
+    )
+    encoder_counts = finite_number(
+      values[encoder_key],
+      f"J{axis} encoder counts",
+    )
+    if (
+      drive_microsteps <= 0
+      or encoder_counts <= 0
+      or not drive_microsteps.is_integer()
+      or not encoder_counts.is_integer()
+    ):
+      raise MotionInputError(
+        f"J{axis} encoder counts and drive microsteps must be positive integers"
+      )
+    drive_microsteps = int(drive_microsteps)
+    encoder_counts = int(encoder_counts)
+    values[drive_key] = drive_microsteps
+    values[encoder_key] = encoder_counts
+    encoder_multipliers.append(controller_ratio(
+      encoder_counts,
+      drive_microsteps,
+      f"J{axis} encoder multiplier",
+    ))
 
-  CAL['J7PosLim'] = float(axis7lengthEntryField.get())
-  J8PosLim = float(axis8lengthEntryField.get())
-  J9PosLim = float(axis9lengthEntryField.get())
+  command_fields = list(zip(
+    tuple("ABCDEF"),
+    tuple(values[key] for key in ('TFx', 'TFy', 'TFz', 'TFrz', 'TFry', 'TFrx')),
+  ))
+  command_fields.extend(zip(
+    tuple("GHIJKLMNO"),
+    tuple(values[f'J{axis}MotDir'] for axis in range(1, 10)),
+  ))
+  command_fields.extend(zip(
+    tuple("PQRSTUVWX"),
+    tuple(values[f'J{axis}CalDir'] for axis in range(1, 10)),
+  ))
+  command_fields.extend(zip(
+    ("Y", "Z", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j"),
+    tuple(
+      values[f'J{axis}{limit}Lim']
+      for axis in range(1, 7)
+      for limit in ("Pos", "Neg")
+    ),
+  ))
+  command_fields.extend(zip(
+    tuple("klmnop"),
+    tuple(values[f'J{axis}StepDeg'] for axis in range(1, 7)),
+  ))
+  command_fields.extend(zip(tuple("qrstuv"), encoder_multipliers))
+  command_fields.extend(zip(
+    ("w", "x", "y", "z", "!", "@"),
+    tuple(values[f'J{axis}ΘDHpar'] for axis in range(1, 7)),
+  ))
+  command_fields.extend(zip(
+    ("#", "$", "%", "^", "&", "*"),
+    tuple(values[f'J{axis}αDHpar'] for axis in range(1, 7)),
+  ))
+  command_fields.extend(zip(
+    ("(", ")", "+", "=", ",", "_"),
+    tuple(values[f'J{axis}dDHpar'] for axis in range(1, 7)),
+  ))
+  command_fields.extend(zip(
+    ("<", ">", "?", "{", "}", "~"),
+    tuple(values[f'J{axis}aDHpar'] for axis in range(1, 7)),
+  ))
+  return values, _build_startup_numeric_command("UP", command_fields)
 
-  J7negLimLab.config(text=str(-J7NegLim), style="Jointlim.TLabel")
-  J8negLimLab.config(text=str(-J8NegLim), style="Jointlim.TLabel")
-  J9negLimLab.config(text=str(-J9NegLim), style="Jointlim.TLabel")
 
-  J7posLimLab.config(text=str(CAL['J7PosLim']), style="Jointlim.TLabel")
-  J8posLimLab.config(text=str(J8PosLim), style="Jointlim.TLabel")
-  J9posLimLab.config(text=str(J9PosLim), style="Jointlim.TLabel")
+def _prepare_update_parameters():
+  return _prepare_update_parameters_from_values(
+    _collect_update_parameter_values()
+  )
 
-  J7jogslide.config(from_=-J7NegLim, to=CAL['J7PosLim'],  length=125, orient=HORIZONTAL,  command=J7sliderUpdate)
-  J8jogslide.config(from_=-J8NegLim, to=J8PosLim,  length=125, orient=HORIZONTAL,  command=J8sliderUpdate)
-  J9jogslide.config(from_=-J9NegLim, to=J9PosLim,  length=125, orient=HORIZONTAL,  command=J9sliderUpdate)
 
-  command = "CE"+"A"+str(CAL['J7PosLim'])+"B"+str(CAL['J7rotation'])+"C"+str(CAL['J7steps'])+"D"+str(J8PosLim)+"E"+str(CAL['J8rotation'])+"F"+str(CAL['J8steps'])+"G"+str(J9PosLim)+"H"+str(CAL['J9rotation'])+"I"+str(CAL['J9steps'])+"\n"
-  RUN['ser'].write(command.encode())    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = RUN['ser'].read()
+def _apply_joint_limit_widgets(values):
+  negative_labels = (J1negLimLab, J2negLimLab, J3negLimLab, J4negLimLab, J5negLimLab, J6negLimLab)
+  positive_labels = (J1posLimLab, J2posLimLab, J3posLimLab, J4posLimLab, J5posLimLab, J6posLimLab)
+  sliders = (J1jogslide, J2jogslide, J3jogslide, J4jogslide, J5jogslide, J6jogslide)
+  slider_callbacks = (J1sliderUpdate, J2sliderUpdate, J3sliderUpdate, J4sliderUpdate, J5sliderUpdate, J6sliderUpdate)
+  for axis, widgets in enumerate(
+    zip(negative_labels, positive_labels, sliders, slider_callbacks),
+    start=1,
+  ):
+    negative_label, positive_label, slider, callback = widgets
+    negative = finite_number(values[f'J{axis}NegLim'], f'J{axis} negative limit')
+    positive = finite_number(values[f'J{axis}PosLim'], f'J{axis} positive limit')
+    negative_label.config(text=f"-{values[f'J{axis}NegLim']}", style="Jointlim.TLabel")
+    positive_label.config(text=values[f'J{axis}PosLim'], style="Jointlim.TLabel")
+    slider.config(
+      from_=-negative,
+      to=positive,
+      length=180,
+      orient=HORIZONTAL,
+      command=callback,
+    )
 
+
+def _apply_update_parameter_values(values):
+  _set_cpp_kinematics_from_values(values)
+  CAL.update(values)
+  _apply_joint_limit_widgets(values)
+  return True
+
+
+@_tracked_serial_operation("ser")
+def _exchange_controller_calibration_acknowledgement(
+  command,
+  write_started_event=None,
+):
+  serial_port = RUN.get('ser')
+  try:
+    write_serial_control(
+      serial_port,
+      command,
+      write_lock=serial_write_lock,
+      reset_input=True,
+      write_started_event=write_started_event,
+    )
+    return read_serial_exact_response(
+      serial_port,
+      b"Done",
+      SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+    ) == "Done"
+  finally:
+    if (
+      RUN.get('ser') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      RUN['ser'] = None
+
+
+def _transmit_update_parameters(command, write_started_event=None):
+  return _exchange_controller_calibration_acknowledgement(
+    command,
+    write_started_event,
+  )
+
+
+def _preflight_controller_calibration_transport():
+  serial_port = RUN.get('ser')
+  if serial_port is None or not getattr(serial_port, "is_open", False):
+    raise ConnectionError("controller serial connection is not open")
+  if serial_transport_quarantined(serial_port):
+    raise SerialTransportQuarantinedError(
+      "controller serial connection is quarantined; reconnect required"
+    )
+  return serial_port
+
+
+def _restore_prewrite_calibration(snapshot, context):
+  try:
+    _restore_controller_calibration(snapshot)
+  except Exception:
+    logger.exception("Unable to restore calibration after %s", context)
+    return _invalidate_uncertain_controller_calibration(
+      f"local calibration rollback failed after {context}"
+    )
+  return False
+
+
+def _apply_single_calibration_transaction(
+  values,
+  apply_values,
+  command,
+  transmit_command,
+  context,
+):
+  try:
+    _preflight_controller_calibration_transport()
+  except Exception:
+    logger.exception("Calibration transport preflight failed during %s", context)
+    return False
+
+  snapshot = dict(CAL)
+  try:
+    apply_values(values)
+  except Exception:
+    logger.exception("Local calibration application failed during %s", context)
+    return _restore_prewrite_calibration(snapshot, context)
+
+  write_started = threading.Event()
+  try:
+    acknowledged = transmit_command(command, write_started)
+  except Exception:
+    logger.exception("Controller calibration transmission failed during %s", context)
+    if write_started.is_set():
+      return _invalidate_uncertain_controller_calibration(
+        f"controller calibration became uncertain during {context}"
+      )
+    return _restore_prewrite_calibration(snapshot, context)
+  if acknowledged is not True:
+    logger.error(
+      "Controller calibration returned a non-true acknowledgement during %s",
+      context,
+    )
+    if write_started.is_set():
+      return _invalidate_uncertain_controller_calibration(
+        f"controller calibration acknowledgement was invalid during {context}"
+      )
+    return _restore_prewrite_calibration(snapshot, context)
+  return True
+
+
+@_synchronous_motion_request("Update controller parameters")
+@_tracked_serial_operation(
+  "ser",
+  operation_required=_main_serial_transmit_required,
+)
+def updateParams(transmit=True):
+  if not isinstance(transmit, bool):
+    raise TypeError("update-parameters transmit flag must be boolean")
+  values, command = _prepare_update_parameters()
+  if not transmit:
+    snapshot = dict(CAL)
+    try:
+      _apply_update_parameter_values(values)
+    except Exception:
+      _restore_controller_calibration(snapshot)
+      raise
+    return command
+  return _apply_single_calibration_transaction(
+    values,
+    _apply_update_parameter_values,
+    command,
+    _transmit_update_parameters,
+    "update-parameters application",
+  )
+
+
+def _collect_external_axis_values():
+  fields = (
+    (7, axis7lengthEntryField, axis7rotEntryField, axis7stepsEntryField),
+    (8, axis8lengthEntryField, axis8rotEntryField, axis8stepsEntryField),
+    (9, axis9lengthEntryField, axis9rotEntryField, axis9stepsEntryField),
+  )
+  values = {}
+  for axis, length_field, rotation_field, steps_field in fields:
+    length_key = 'J7PosLim' if axis == 7 else f'J{axis}length'
+    values[length_key] = finite_number(length_field.get(), f'J{axis} length')
+    values[f'J{axis}rotation'] = finite_number(
+      rotation_field.get(),
+      f'J{axis} rotation',
+    )
+    values[f'J{axis}steps'] = finite_number(steps_field.get(), f'J{axis} steps')
+  return values
+
+
+def _prepare_external_axis_parameters_from_values(
+  source_values,
+  base_values=None,
+):
+  if not isinstance(source_values, dict):
+    raise MotionInputError("external-axis values must be a dictionary")
+  try:
+    values = {
+      key: finite_number(source_values[key], label)
+      for key, label in (
+        ('J7PosLim', 'J7 length'),
+        ('J7rotation', 'J7 rotation'),
+        ('J7steps', 'J7 steps'),
+        ('J8length', 'J8 length'),
+        ('J8rotation', 'J8 rotation'),
+        ('J8steps', 'J8 steps'),
+        ('J9length', 'J9 length'),
+        ('J9rotation', 'J9 rotation'),
+        ('J9steps', 'J9 steps'),
+      )
+    }
+  except KeyError as exc:
+    raise MotionInputError(
+      f"external-axis values are missing {exc.args[0]}"
+    ) from exc
+  calibration_values = dict(CAL if base_values is None else base_values)
+  calibration_values.update(values)
+  _controller_joint_calibration_from_values(calibration_values)
+  command = _build_startup_numeric_command(
+    "CE",
+    zip(
+      tuple("ABCDEFGHI"),
+      (
+        values['J7PosLim'], values['J7rotation'], values['J7steps'],
+        values['J8length'], values['J8rotation'], values['J8steps'],
+        values['J9length'], values['J9rotation'], values['J9steps'],
+      ),
+    ),
+  )
+  return values, command
+
+
+def _prepare_external_axis_parameters(base_values=None):
+  return _prepare_external_axis_parameters_from_values(
+    _collect_external_axis_values(),
+    base_values,
+  )
+
+
+def _apply_external_axis_values(values):
+  CAL.update(values)
+  negative_labels = (J7negLimLab, J8negLimLab, J9negLimLab)
+  positive_labels = (J7posLimLab, J8posLimLab, J9posLimLab)
+  sliders = (J7jogslide, J8jogslide, J9jogslide)
+  slider_callbacks = (J7sliderUpdate, J8sliderUpdate, J9sliderUpdate)
+  lengths = (values['J7PosLim'], values['J8length'], values['J9length'])
+  for negative_label, positive_label, slider, callback, length in zip(
+    negative_labels,
+    positive_labels,
+    sliders,
+    slider_callbacks,
+    lengths,
+  ):
+    negative_label.config(text="0", style="Jointlim.TLabel")
+    positive_label.config(text=str(length), style="Jointlim.TLabel")
+    slider.config(
+      from_=0,
+      to=length,
+      length=125,
+      orient=HORIZONTAL,
+      command=callback,
+    )
+  return True
+
+
+def _transmit_external_axis_parameters(command, write_started_event=None):
+  return _exchange_controller_calibration_acknowledgement(
+    command,
+    write_started_event,
+  )
+
+
+def _prepare_controller_calibration():
+  update_values, update_command = _prepare_update_parameters()
+  merged_values = dict(CAL)
+  merged_values.update(update_values)
+  external_values, external_command = _prepare_external_axis_parameters(
+    merged_values,
+  )
+  return update_values, update_command, external_values, external_command
+
+
+def _apply_controller_calibration(update_values, external_values):
+  snapshot = dict(CAL)
+  try:
+    _apply_update_parameter_values(update_values)
+    _apply_external_axis_values(external_values)
+  except Exception:
+    _restore_controller_calibration(snapshot)
+    raise
+  return True
+
+@_synchronous_motion_request("Apply external-axis calibration")
+@_tracked_serial_operation(
+  "ser",
+  operation_required=_main_serial_transmit_required,
+)
+def calExtAxis(transmit=True):
+  if not isinstance(transmit, bool):
+    raise TypeError("external-axis transmit flag must be boolean")
+  values, command = _prepare_external_axis_parameters()
+  if not transmit:
+    snapshot = dict(CAL)
+    try:
+      _apply_external_axis_values(values)
+    except Exception:
+      _restore_controller_calibration(snapshot)
+      raise
+    return command
+  return _apply_single_calibration_transaction(
+    values,
+    _apply_external_axis_values,
+    command,
+    _transmit_external_axis_parameters,
+    "external-axis application",
+  )
+
+@_synchronous_motion_request("Zero external axis 7")
+@_tracked_serial_operation("ser")
 def zeroAxis7():
   command = "Z7"+"\n"
-  RUN['ser'].write(command.encode())    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
+  response = _exchange_legacy_main_command(command)
+  if not _apply_controller_position_response(response):
+    return False
   almStatusLab.config(text="J7 Calibration Forced to Zero", style="Warn.TLabel")
   almStatusLab2.config(text="J7 Calibration Forced to Zero", style="Warn.TLabel")
   message = "J7 Calibration Forced to Zero - this is for commissioning and testing - be careful!"
@@ -8821,14 +13615,15 @@ def zeroAxis7():
   logger.warning(message)
   value=tab8.ElogView.get(0,END)
   pickle.dump(value,open("ErrorLog","wb"))  
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  displayPosition(response) 
+  return True
 
+@_synchronous_motion_request("Zero external axis 8")
+@_tracked_serial_operation("ser")
 def zeroAxis8():
   command = "Z8"+"\n"
-  RUN['ser'].write(command.encode())    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
+  response = _exchange_legacy_main_command(command)
+  if not _apply_controller_position_response(response):
+    return False
   almStatusLab.config(text="J8 Calibration Forced to Zero", style="Warn.TLabel")
   almStatusLab2.config(text="J8 Calibration Forced to Zero", style="Warn.TLabel")
   message = "J8 Calibration Forced to Zero - this is for commissioning and testing - be careful!"
@@ -8837,14 +13632,15 @@ def zeroAxis8():
   logger.warning(message)
   value=tab8.ElogView.get(0,END)
   pickle.dump(value,open("ErrorLog","wb"))  
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  displayPosition(response) 
+  return True
 
+@_synchronous_motion_request("Zero external axis 9")
+@_tracked_serial_operation("ser")
 def zeroAxis9():
   command = "Z9"+"\n"
-  RUN['ser'].write(command.encode())    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
+  response = _exchange_legacy_main_command(command)
+  if not _apply_controller_position_response(response):
+    return False
   almStatusLab.config(text="J9 Calibration Forced to Zero", style="Warn.TLabel")
   almStatusLab2.config(text="J9 Calibration Forced to Zero", style="Warn.TLabel")
   message = "J9 Calibration Forced to Zero - this is for commissioning and testing - be careful!"
@@ -8853,26 +13649,173 @@ def zeroAxis9():
   logger.warning(message)
   value=tab8.ElogView.get(0,END)
   pickle.dump(value,open("ErrorLog","wb"))  
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  displayPosition(response)   
+  return True
 
 
-def sendPos():
-  command = "SP"+"A"+str(CAL['J1AngCur'])+"B"+str(CAL['J2AngCur'])+"C"+str(CAL['J3AngCur'])+"D"+str(CAL['J4AngCur'])+"E"+str(CAL['J5AngCur'])+"F"+str(CAL['J6AngCur'])+"G"+str(CAL['J7PosCur'])+"H"+str(CAL['J8PosCur'])+"I"+str(CAL['J9PosCur'])+"\n"
-  RUN['ser'].write(command.encode())    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = RUN['ser'].read()
+def _acknowledged_forced_position_target_value():
+  with acknowledged_forced_position_lock:
+    if acknowledged_forced_position_target is None:
+      return None
+    return tuple(acknowledged_forced_position_target)
 
+
+def _record_acknowledged_forced_position_target(target):
+  global acknowledged_forced_position_target
+
+  if isinstance(target, (str, bytes)):
+    raise MotionInputError("acknowledged forced position must be a numeric sequence")
+  try:
+    target = tuple(target)
+  except TypeError as exc:
+    raise MotionInputError(
+      "acknowledged forced position must be a numeric sequence"
+    ) from exc
+  if len(target) != 9:
+    raise MotionInputError("acknowledged forced position must contain 9 values")
+  target = tuple(
+    finite_number(value, f"acknowledged J{axis} forced position")
+    for axis, value in enumerate(target, start=1)
+  )
+  with acknowledged_forced_position_lock:
+    acknowledged_forced_position_target = target
+  controller_position_resynchronization_required.set()
+  _invalidate_joint_motion_state(
+    "controller acknowledged a forced position; position recovery is required"
+  )
+  return target
+
+
+def _clear_acknowledged_forced_position_target():
+  global acknowledged_forced_position_target
+
+  with acknowledged_forced_position_lock:
+    acknowledged_forced_position_target = None
+
+
+def _prepare_position_command(calibration_values=None):
+  positions = _acknowledged_forced_position_target_value()
+  if positions is None:
+    positions = _current_joint_positions()
+  calibration = (
+    _current_controller_joint_calibration()
+    if calibration_values is None
+    else _controller_joint_calibration_from_values(calibration_values)
+  )
+  calibration.validate_positions(positions)
+  return _build_startup_numeric_command(
+    "SP",
+    zip(tuple("ABCDEFGHI"), positions),
+  )
+
+
+def _prepare_forced_position_request(primary_positions):
+  if isinstance(primary_positions, (str, bytes)):
+    raise MotionInputError("forced primary positions must be a numeric sequence")
+  try:
+    primary_positions = tuple(primary_positions)
+  except TypeError as exc:
+    raise MotionInputError(
+      "forced primary positions must be a numeric sequence"
+    ) from exc
+  if len(primary_positions) != 6:
+    raise MotionInputError("forced primary positions must contain 6 values")
+  positions = primary_positions + _current_joint_positions()[6:]
+  calibration = _current_controller_joint_calibration()
+  normalized = calibration.validate_positions(positions)
+  encoded_target = tuple(
+    float(controller_protocol_decimal(value, f"J{axis} forced position"))
+    for axis, value in enumerate(normalized, start=1)
+  )
+  calibration.validate_positions(encoded_target)
+  command = _build_startup_numeric_command(
+    "SP",
+    zip(tuple("ABCDEFGHI"), encoded_target),
+  )
+  return command, encoded_target
+
+
+def _prepare_forced_position_command(primary_positions):
+  command, _ = _prepare_forced_position_request(primary_positions)
+  return command
+
+
+def _force_controller_position(primary_positions):
+  command, target = _prepare_forced_position_request(primary_positions)
+  if _exchange_position_acknowledgement(command) is not True:
+    return False
+  try:
+    _record_acknowledged_forced_position_target(target)
+    return requestPos() is True
+  except Exception as exc:
+    message = f"Forced controller position requires recovery: {exc}"
+    logger.exception(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+
+
+@_tracked_serial_operation("ser")
+def _exchange_position_acknowledgement(command):
+  command = _validated_startup_command(command, "SP")
+  serial_port = RUN.get('ser')
+  write_started = threading.Event()
+  try:
+    write_serial_control(
+      serial_port,
+      command,
+      write_lock=serial_write_lock,
+      reset_input=True,
+      write_started_event=write_started,
+    )
+    response = read_serial_line_response(
+      serial_port,
+      SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+      accepted_responses=("Done",),
+    )
+    if response != "Done":
+      raise ProtocolResponseError(
+        "controller returned an invalid set-position acknowledgement"
+      )
+    return True
+  except Exception:
+    if write_started.is_set():
+      try:
+        _invalidate_joint_motion_state(
+          "set-position acknowledgement failed after controller transmission"
+        )
+      except Exception:
+        logger.exception(
+          "Unable to invalidate motion after set-position acknowledgement failure"
+        )
+    raise
+  finally:
+    if (
+      RUN.get('ser') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      RUN['ser'] = None
+
+
+@_synchronous_motion_request("Set controller position")
+@_tracked_serial_operation(
+  "ser",
+  operation_required=_main_serial_transmit_required,
+)
+def sendPos(transmit=True):
+  if not isinstance(transmit, bool):
+    raise TypeError("send-position transmit flag must be boolean")
+  command = _prepare_position_command()
+  if not transmit:
+    return command
+  return _exchange_position_acknowledgement(command)
+
+@_synchronous_motion_request("Force calibration home position")
+@_tracked_serial_operation("ser")
 def CalZeroPos():
   # global RUN['VR_angles']
   #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  command = "SPA0B0C0D0E45F0\n"
-  RUN['ser'].write(command.encode())    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = RUN['ser'].read()
-  requestPos()
+  if _force_controller_position((0, 0, 0, 0, 45, 0)) is not True:
+    return False
   almStatusLab.config(text="Calibration Forced to Home", style="Warn.TLabel")
   almStatusLab2.config(text="Calibration Forced to Home", style="Warn.TLabel")
   message = "Calibration Forced to Home - this is for commissioning and testing - be careful!"
@@ -8881,17 +13824,16 @@ def CalZeroPos():
   value=tab8.ElogView.get(0,END)
   pickle.dump(value,open("ErrorLog","wb"))
   RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-  setStepMonitorsVR()  
+  setStepMonitorsVR()
+  return True
 
+@_synchronous_motion_request("Force calibration rest position")
+@_tracked_serial_operation("ser")
 def CalRestPos():
   # global RUN['VR_angles']
   #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  command = "SPA0B0C-89D0E0F0\n"
-  RUN['ser'].write(command.encode())    
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = RUN['ser'].read()
-  requestPos()
+  if _force_controller_position((0, 0, -89, 0, 0, 0)) is not True:
+    return False
   almStatusLab.config(text="Calibration Forced to Vertical Rest Pos", style="Warn.TLabel")
   almStatusLab2.config(text="Calibration Forced to Vertical Rest Pos", style="Warn.TLabel")
   message = "Calibration Forced to Vertical - this is for commissioning and testing - be careful!"
@@ -8900,115 +13842,198 @@ def CalRestPos():
   value=tab8.ElogView.get(0,END)
   pickle.dump(value,open("ErrorLog","wb")) 
   RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-  setStepMonitorsVR() 
+  setStepMonitorsVR()
+  return True
 
 
 
 
-def displayPosition(response):
-  # global WC, RUN['VR_angles'] 
+CALIBRATION_SAVE_DEBOUNCE_MS = 250
+_calibration_save_job = None
+_calibration_dirty = False
+
+
+def _write_pending_calibration():
+  global _calibration_save_job, _calibration_dirty
+  _calibration_save_job = None
+  if not _calibration_dirty:
+    return True
+
+  failure_logged = False
+  try:
+    persisted = save_calibration(CAL)
+  except Exception:
+    persisted = False
+    failure_logged = True
+    logger.exception("Unable to persist the latest calibration state")
+  if persisted is True:
+    _calibration_dirty = False
+    return True
+
+  if persisted is not False:
+    logger.error("Calibration persistence returned an invalid result")
+  elif not failure_logged:
+    logger.error("Unable to persist the latest calibration state")
+  if not application_closing.is_set():
+    try:
+      _calibration_save_job = root.after(
+        CALIBRATION_SAVE_DEBOUNCE_MS,
+        _write_pending_calibration,
+      )
+    except (RuntimeError, tk.TclError):
+      logger.exception("Unable to schedule a calibration persistence retry")
+  return False
+
+
+def _schedule_calibration_save():
+  global _calibration_save_job, _calibration_dirty
+  _calibration_dirty = True
+  if _calibration_save_job is not None:
+    root.after_cancel(_calibration_save_job)
+  _calibration_save_job = root.after(
+    CALIBRATION_SAVE_DEBOUNCE_MS,
+    _write_pending_calibration,
+  )
+
+
+def _flush_calibration_save():
+  global _calibration_save_job
+  if _calibration_save_job is not None:
+    root.after_cancel(_calibration_save_job)
+    _calibration_save_job = None
+  return _write_pending_calibration()
+
+
+def _retain_calibration_persistence_retry():
+  global _calibration_dirty
+
+  try:
+    _schedule_calibration_save()
+  except Exception:
+    _calibration_dirty = True
+    logger.exception("Unable to schedule calibration persistence retry")
+    return False
+  return True
+
+
+def displayPosition(response, parsed=None, synchronize_dispatcher=True):
+  global confirmed_position_generation
+  try:
+    if parsed is None:
+      parsed = parse_position_response(response)
+    elif not isinstance(parsed, PositionResponse):
+      raise ProtocolResponseError("parsed response has an invalid type")
+    elif not isinstance(response, str) or parsed.raw != response:
+      raise ProtocolResponseError("parsed response does not match the raw response")
+    _current_controller_joint_calibration().validate_positions(
+      parsed.joints + parsed.external
+    )
+  except (MotionInputError, ProtocolResponseError) as exc:
+    message = f"Invalid controller position response: {exc}"
+    _invalidate_joint_motion_state(message)
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return None
+
+  if parsed.flag:
+    _invalidate_joint_motion_state(
+      f"controller reported motion fault: {parsed.flag}"
+    )
+  elif synchronize_dispatcher:
+    if joint_motion_dispatcher.synchronize(
+      parsed.joints + parsed.external
+    ) is not True:
+      message = "Controller position response rejected while joint motion is active"
+      _invalidate_joint_motion_state(message)
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      return None
+
+  resynchronizing_virtual_pose = (
+    not parsed.flag
+    and controller_position_resynchronization_required.is_set()
+  )
+  if resynchronizing_virtual_pose and (
+    _try_set_virtual_joint_target(parsed.joints) is not True
+  ):
+    message = "Controller position could not resynchronize the virtual model"
+    _invalidate_joint_motion_state(message)
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return None
 
   cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0,response)
-  J1AngIndex = response.find('A')
-  J2AngIndex = response.find('B');
-  J3AngIndex = response.find('C');
-  J4AngIndex = response.find('D');
-  J5AngIndex = response.find('E');
-  J6AngIndex = response.find('F');
-  XposIndex = response.find('G');
-  YposIndex = response.find('H');
-  ZposIndex = response.find('I');
-  RzposIndex = response.find('J');
-  RyposIndex = response.find('K');
-  RxposIndex = response.find('L');
-  SpeedVioIndex = response.find('M');
-  DebugIndex = response.find('N');
-  FlagIndex = response.find('O');
-  J7PosIndex = response.find('P');
-  J8PosIndex = response.find('Q');
-  J9PosIndex = response.find('R');
-  CAL['J1AngCur'] = response[J1AngIndex+1:J2AngIndex].strip();
-  CAL['J2AngCur'] = response[J2AngIndex+1:J3AngIndex].strip();
-  CAL['J3AngCur'] = response[J3AngIndex+1:J4AngIndex].strip();
-  CAL['J4AngCur'] = response[J4AngIndex+1:J5AngIndex].strip();
-  CAL['J5AngCur'] = response[J5AngIndex+1:J6AngIndex].strip();
-  CAL['J6AngCur'] = response[J6AngIndex+1:XposIndex].strip();
-  
-  if CAL['J5AngCur'].strip() != '' and float(CAL['J5AngCur']) > 0:
-    RUN['WC'] = "F"
-  else:
-    RUN['WC'] = "N"
-  CAL['XcurPos'] = response[XposIndex+1:YposIndex].strip();
-  CAL['YcurPos'] = response[YposIndex+1:ZposIndex].strip();
-  CAL['ZcurPos'] = response[ZposIndex+1:RzposIndex].strip();
-  CAL['RzcurPos'] = response[RzposIndex+1:RyposIndex].strip();
-  CAL['RycurPos'] = response[RyposIndex+1:RxposIndex].strip();
-  CAL['RxcurPos'] = response[RxposIndex+1:SpeedVioIndex].strip();
-  SpeedVioation = response[SpeedVioIndex+1:DebugIndex].strip();
-  Debug = response[DebugIndex+1:FlagIndex].strip();
-  Flag = response[FlagIndex+1:J7PosIndex].strip();
-  #J7PosCur = float(response[J7PosIndex+1:J8PosIndex].strip());
-  #J8PosCur = float(response[J8PosIndex+1:J9PosIndex].strip());
-  #J9PosCur = float(response[J9PosIndex+1:].strip());
-  CAL['J7PosCur'] = response[J7PosIndex+1:J8PosIndex].strip();
-  CAL['J8PosCur'] = response[J8PosIndex+1:J9PosIndex].strip();
-  CAL['J9PosCur'] = response[J9PosIndex+1:].strip();
-  
-  J1curAngEntryField.delete(0, 'end')
-  J1curAngEntryField.insert(0,CAL['J1AngCur'])
-  J2curAngEntryField.delete(0, 'end')
-  J2curAngEntryField.insert(0,CAL['J2AngCur'])
-  J3curAngEntryField.delete(0, 'end')
-  J3curAngEntryField.insert(0,CAL['J3AngCur'])
-  J4curAngEntryField.delete(0, 'end')
-  J4curAngEntryField.insert(0,CAL['J4AngCur'])
-  J5curAngEntryField.delete(0, 'end')
-  J5curAngEntryField.insert(0,CAL['J5AngCur'])
-  J6curAngEntryField.delete(0, 'end')
-  J6curAngEntryField.insert(0,CAL['J6AngCur'])
-  XcurEntryField.delete(0, 'end')
-  XcurEntryField.insert(0,CAL['XcurPos'])
-  YcurEntryField.delete(0, 'end')
-  YcurEntryField.insert(0,CAL['YcurPos'])
-  ZcurEntryField.delete(0, 'end')
-  ZcurEntryField.insert(0,CAL['ZcurPos'])
-  RzcurEntryField.delete(0, 'end')
-  RzcurEntryField.insert(0,CAL['RzcurPos'])
-  RycurEntryField.delete(0, 'end')
-  RycurEntryField.insert(0,CAL['RycurPos'])
-  RxcurEntryField.delete(0, 'end')
-  RxcurEntryField.insert(0,CAL['RxcurPos'])
-  J7curAngEntryField.delete(0, 'end')
-  J7curAngEntryField.insert(0,CAL['J7PosCur'])
-  J8curAngEntryField.delete(0, 'end')
-  J8curAngEntryField.insert(0,CAL['J8PosCur'])
-  J9curAngEntryField.delete(0, 'end')
-  J9curAngEntryField.insert(0,CAL['J9PosCur'])
-  J1jogslide.set(CAL['J1AngCur'])
-  J2jogslide.set(CAL['J2AngCur'])
-  J3jogslide.set(CAL['J3AngCur'])
-  J4jogslide.set(CAL['J4AngCur'])
-  J5jogslide.set(CAL['J5AngCur'])
-  J6jogslide.set(CAL['J6AngCur'])
-  J7jogslide.set(CAL['J7PosCur'])
-  J8jogslide.set(CAL['J8PosCur'])
-  J9jogslide.set(CAL['J9PosCur'])
-  manEntryField.delete(0, 'end')
-  manEntryField.insert(0,Debug)
+  cmdRecEntryField.insert(0, parsed.raw)
 
-  save_calibration(CAL)
-  if (Flag != ""):
-      ErrorHandler(Flag) 
-  if (SpeedVioation=='1'):
-      #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-      message = "Max Speed Violation - Reduce Speed Setpoint or Travel Distance"
-      #tab8.ElogView.insert(END, Curtime+" - "+message)
-      logger.warning(message)
-      value=tab8.ElogView.get(0,END)
-      pickle.dump(value,open("ErrorLog","wb"))          
-      almStatusLab.config(text=message, style="Warn.TLabel")
-      almStatusLab2.config(text=message, style="Warn.TLabel")
+  joint_keys = (
+    'J1AngCur', 'J2AngCur', 'J3AngCur',
+    'J4AngCur', 'J5AngCur', 'J6AngCur',
+  )
+  cartesian_keys = (
+    'XcurPos', 'YcurPos', 'ZcurPos',
+    'RzcurPos', 'RycurPos', 'RxcurPos',
+  )
+  external_keys = ('J7PosCur', 'J8PosCur', 'J9PosCur')
+
+  for key, value in zip(joint_keys, parsed.joint_text):
+    CAL[key] = value
+  for key, value in zip(cartesian_keys, parsed.cartesian_text):
+    CAL[key] = value
+  for key, value in zip(external_keys, parsed.external_text):
+    CAL[key] = value
+
+  RUN['WC'] = "F" if parsed.joints[4] > 0 else "N"
+
+  entry_fields = (
+    J1curAngEntryField, J2curAngEntryField, J3curAngEntryField,
+    J4curAngEntryField, J5curAngEntryField, J6curAngEntryField,
+    XcurEntryField, YcurEntryField, ZcurEntryField,
+    RzcurEntryField, RycurEntryField, RxcurEntryField,
+    J7curAngEntryField, J8curAngEntryField, J9curAngEntryField,
+  )
+  entry_values = parsed.joint_text + parsed.cartesian_text + parsed.external_text
+  for entry_field, value in zip(entry_fields, entry_values):
+    entry_field.delete(0, 'end')
+    entry_field.insert(0, value)
+
+  jog_sliders = (
+    J1jogslide, J2jogslide, J3jogslide,
+    J4jogslide, J5jogslide, J6jogslide,
+    J7jogslide, J8jogslide, J9jogslide,
+  )
+  for jog_slider, value in zip(
+    jog_sliders,
+    parsed.joint_text + parsed.external_text,
+  ):
+    jog_slider.set(value)
+
+  manEntryField.delete(0, 'end')
+  manEntryField.insert(0, parsed.debug)
+
+  _schedule_calibration_save()
+  if not parsed.flag:
+    confirmed_position_generation += 1
+    _clear_acknowledged_forced_position_target()
+    if resynchronizing_virtual_pose:
+      controller_position_resynchronization_required.clear()
+
+  if parsed.flag:
+    ErrorHandler(parsed.flag)
+
+  if parsed.speed_violation:
+    message = "Max Speed Violation - Reduce Speed Setpoint or Travel Distance"
+    logger.warning(message)
+    value = tab8.ElogView.get(0, END)
+    pickle.dump(value, open("ErrorLog", "wb"))
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
+
+  return parsed
+
+
 
 
 def ClearKinTabFields():
@@ -9462,177 +14487,418 @@ def LoadMaxdefault():
   J5aEntryField.insert(0,str(0))
   J6aEntryField.insert(0,str(0))   
   
+def _custom_calibration_profile_keys():
+  keys = ['TFx', 'TFy', 'TFz', 'TFrz', 'TFry', 'TFrx']
+  for suffix, axis_count in (
+    ('MotDir', 9),
+    ('CalDir', 9),
+    ('PosLim', 6),
+    ('NegLim', 6),
+    ('StepDeg', 6),
+    ('DriveMS', 6),
+    ('EncCPR', 6),
+    ('ΘDHpar', 6),
+    ('αDHpar', 6),
+    ('dDHpar', 6),
+    ('aDHpar', 6),
+  ):
+    keys.extend(f'J{axis}{suffix}' for axis in range(1, axis_count + 1))
+  keys.extend((
+    'J7PosLim', 'J7rotation', 'J7steps',
+    'J8length', 'J8rotation', 'J8steps',
+    'J9length', 'J9rotation', 'J9steps',
+  ))
+  keys.extend(f'J{axis}calOff' for axis in range(1, 10))
+  return tuple(keys)
+
+
+def _custom_calibration_field_values(calibration_values):
+  if not isinstance(calibration_values, dict):
+    raise MotionInputError("custom calibration profile must be a dictionary")
+  try:
+    return {
+      key: calibration_values[key]
+      for key in _custom_calibration_profile_keys()
+    }
+  except KeyError as exc:
+    raise MotionInputError(
+      f"custom calibration profile is missing {exc.args[0]}"
+    ) from exc
+
+
+def _prepare_custom_calibration_profile(loaded_calibration):
+  profile_values = _custom_calibration_field_values(loaded_calibration)
+  update_values, _ = _prepare_update_parameters_from_values(profile_values)
+  staged_values = dict(CAL)
+  staged_values.update(update_values)
+  external_values, _ = _prepare_external_axis_parameters_from_values(
+    profile_values,
+    staged_values,
+  )
+  staged_values.update(external_values)
+  for axis in range(1, 10):
+    key = f'J{axis}calOff'
+    profile_values[key] = finite_number(
+      profile_values[key],
+      f"J{axis} calibration offset",
+    )
+  _validate_controller_pose(staged_values)
+  profile_values.update(update_values)
+  profile_values.update(external_values)
+  return profile_values
+
+
+def _prepare_custom_calibration_snapshot():
+  field_values = _collect_fields_to_calibration()
+  (
+    update_values,
+    _,
+    external_values,
+    _,
+  ) = _prepare_controller_calibration()
+  staged_values = dict(CAL)
+  staged_values.update(field_values)
+  staged_values.update(update_values)
+  staged_values.update(external_values)
+  _validate_controller_pose(staged_values)
+  return staged_values
+
+
 def save_custom_calibration():
-  sync_fields_to_calibration()
-  save_calibration(calibration_file='custom.json', calibration_data=CAL)
+  try:
+    profile_values = _prepare_custom_calibration_snapshot()
+    persisted = save_calibration(
+      calibration_file='custom.json',
+      calibration_data=profile_values,
+    )
+  except Exception:
+    logger.exception("Custom calibration validation or persistence failed")
+    return False
+  if persisted is not True:
+    logger.error("Custom calibration persistence returned a non-true result")
+    return False
+  return True
+
 
 def load_custom_calibration():
-  loaded_calibration = load_calibration(calibration_file='custom.json')
-  logger.debug(f"Value of J1DriveMS collected from file is: {loaded_calibration['J1DriveMS']}")
-  apply_calibration(loaded_calibration, CAL)
-
-  sync_calibration_to_fields()
-
-def sync_calibration_to_fields():
-  '''Update Kinematics fields from current CAL'''
-  ClearKinTabFields()
-  J1MotDirEntryField.insert(0, str(CAL['J1MotDir']))
-  J2MotDirEntryField.insert(0, str(CAL['J2MotDir']))
-  J3MotDirEntryField.insert(0, str(CAL['J3MotDir']))
-  J4MotDirEntryField.insert(0, str(CAL['J4MotDir']))
-  J5MotDirEntryField.insert(0, str(CAL['J5MotDir']))
-  J6MotDirEntryField.insert(0, str(CAL['J6MotDir']))
-  J7MotDirEntryField.insert(0, str(CAL['J7MotDir']))
-  J8MotDirEntryField.insert(0, str(CAL['J8MotDir']))
-  J9MotDirEntryField.insert(0, str(CAL['J9MotDir']))
-  J1CalDirEntryField.insert(0, str(CAL['J1CalDir']))
-  J2CalDirEntryField.insert(0, str(CAL['J2CalDir']))
-  J3CalDirEntryField.insert(0, str(CAL['J3CalDir']))
-  J4CalDirEntryField.insert(0, str(CAL['J4CalDir']))
-  J5CalDirEntryField.insert(0, str(CAL['J5CalDir']))
-  J6CalDirEntryField.insert(0, str(CAL['J6CalDir']))
-  J7CalDirEntryField.insert(0, str(CAL['J7CalDir']))
-  J8CalDirEntryField.insert(0, str(CAL['J8CalDir']))
-  J9CalDirEntryField.insert(0, str(CAL['J9CalDir']))
-  J1PosLimEntryField.insert(0, str(CAL['J1PosLim']))
-  J1NegLimEntryField.insert(0, str(CAL['J1NegLim']))
-  J2PosLimEntryField.insert(0, str(CAL['J2PosLim']))
-  J2NegLimEntryField.insert(0, str(CAL['J2NegLim']))
-  J3PosLimEntryField.insert(0, str(CAL['J3PosLim']))
-  J3NegLimEntryField.insert(0, str(CAL['J3NegLim']))
-  J4PosLimEntryField.insert(0, str(CAL['J4PosLim']))
-  J4NegLimEntryField.insert(0, str(CAL['J4NegLim']))
-  J5PosLimEntryField.insert(0, str(CAL['J5PosLim']))
-  J5NegLimEntryField.insert(0, str(CAL['J5NegLim']))
-  J6PosLimEntryField.insert(0, str(CAL['J6PosLim']))
-  J6NegLimEntryField.insert(0, str(CAL['J6NegLim']))
-  J1StepDegEntryField.insert(0, str(CAL['J1StepDeg']))
-  J2StepDegEntryField.insert(0, str(CAL['J2StepDeg']))
-  J3StepDegEntryField.insert(0, str(CAL['J3StepDeg']))
-  J4StepDegEntryField.insert(0, str(CAL['J4StepDeg']))
-  J5StepDegEntryField.insert(0, str(CAL['J5StepDeg']))
-  J6StepDegEntryField.insert(0, str(CAL['J6StepDeg']))
-  logger.debug(f"Loaded value of J1DriveMS is: {CAL['J1DriveMS']}")
-  J1DriveMSEntryField.insert(0, str(CAL['J1DriveMS']))
-  J2DriveMSEntryField.insert(0, str(CAL['J2DriveMS']))
-  J3DriveMSEntryField.insert(0, str(CAL['J3DriveMS']))
-  J4DriveMSEntryField.insert(0, str(CAL['J4DriveMS']))
-  J5DriveMSEntryField.insert(0, str(CAL['J5DriveMS']))
-  J6DriveMSEntryField.insert(0, str(CAL['J6DriveMS']))
-  J1EncCPREntryField.insert(0, str(CAL['J1EncCPR']))
-  J2EncCPREntryField.insert(0, str(CAL['J2EncCPR']))
-  J3EncCPREntryField.insert(0, str(CAL['J3EncCPR']))
-  J4EncCPREntryField.insert(0, str(CAL['J4EncCPR']))
-  J5EncCPREntryField.insert(0, str(CAL['J5EncCPR']))
-  J6EncCPREntryField.insert(0, str(CAL['J6EncCPR']))
-  J1ΘEntryField.insert(0,str(CAL['J1ΘDHpar']))
-  J2ΘEntryField.insert(0,str(CAL['J2ΘDHpar']))
-  J3ΘEntryField.insert(0,str(CAL['J3ΘDHpar']))
-  J4ΘEntryField.insert(0,str(CAL['J4ΘDHpar']))
-  J5ΘEntryField.insert(0,str(CAL['J5ΘDHpar']))
-  J6ΘEntryField.insert(0,str(CAL['J6ΘDHpar']))
-  J1αEntryField.insert(0,str(CAL['J1αDHpar']))
-  J2αEntryField.insert(0,str(CAL['J2αDHpar']))
-  J3αEntryField.insert(0,str(CAL['J3αDHpar']))
-  J4αEntryField.insert(0,str(CAL['J4αDHpar']))
-  J5αEntryField.insert(0,str(CAL['J5αDHpar']))
-  J6αEntryField.insert(0,str(CAL['J6αDHpar']))
-  J1dEntryField.insert(0,str(CAL['J1dDHpar']))
-  J2dEntryField.insert(0,str(CAL['J2dDHpar']))
-  J3dEntryField.insert(0,str(CAL['J3dDHpar']))
-  J4dEntryField.insert(0,str(CAL['J4dDHpar']))
-  J5dEntryField.insert(0,str(CAL['J5dDHpar']))
-  J6dEntryField.insert(0,str(CAL['J6dDHpar']))
-  J1aEntryField.insert(0,str(CAL['J1aDHpar']))
-  J2aEntryField.insert(0,str(CAL['J2aDHpar']))
-  J3aEntryField.insert(0,str(CAL['J3aDHpar']))
-  J4aEntryField.insert(0,str(CAL['J4aDHpar']))
-  J5aEntryField.insert(0,str(CAL['J5aDHpar']))
-  J6aEntryField.insert(0,str(CAL['J6aDHpar']))
-
-
-  # Add Encoder control checkboxes
-  # Add auto-calibration settings
-
-  updateParams()
-
-def sync_fields_to_calibration():
-  ''' synchronize the running CAL from field values '''
-  CAL['comPort'] = com1SelectedValue.get()
-  CAL['com2Port'] = com2SelectedValue.get()
-  CAL['J7PosCur'] = J7curAngEntryField.get()
-  CAL['J8PosCur'] = J8curAngEntryField.get()
-  CAL['J9PosCur'] = J9curAngEntryField.get()
-  CAL['VisProg'] = visoptions.get()
-  CAL['J1calOff']    = float(J1calOffEntryField.get())
-  CAL['J2calOff']    = float(J2calOffEntryField.get())
-  CAL['J3calOff']    = float(J3calOffEntryField.get())
-  CAL['J4calOff']    = float(J4calOffEntryField.get())
-  CAL['J5calOff']    = float(J5calOffEntryField.get())
-  CAL['J6calOff']    = float(J6calOffEntryField.get())
-  CAL['J7calOff']    = float(J7calOffEntryField.get())
-  CAL['J8calOff']    = float(J8calOffEntryField.get())
-  CAL['J9calOff']    = float(J9calOffEntryField.get())
-  CAL['J7PosLim']     = float(axis7lengthEntryField.get())
-  CAL['J7rotation']   = float(axis7rotEntryField.get())
-  CAL['J7steps']      = float(axis7stepsEntryField.get())
-  CAL['J8length']     = float(axis8lengthEntryField.get())
-  CAL['J8rotation']   = float(axis8rotEntryField.get())
-  CAL['J8steps']      = float(axis8stepsEntryField.get())
-  CAL['J9length']     = float(axis9lengthEntryField.get())
-  CAL['J9rotation']   = float(axis9rotEntryField.get())
-  CAL['J9steps']      = float(axis9stepsEntryField.get())
-
-  CAL['VisBrightVal']   = float(VisBrightSlide.get())
-  CAL['VisContVal']     = float(VisContrastSlide.get())
-  CAL['VisBacColor']    = str(VisBacColorEntryField.get()) 
-  CAL['VisScore']       = float(VisScoreEntryField.get())
-  CAL['VisX1Val']       = int(VisX1PixEntryField.get())
-  CAL['VisY1Val']       = int(VisY1PixEntryField.get())
-  CAL['VisX2Val']       = int(VisX2PixEntryField.get())
-  CAL['VisY2Val']       = int(VisY2PixEntryField.get())
-  CAL['VisRobX1Val']    = float(VisX1RobEntryField.get())
-  CAL['VisRobY1Val']    = float(VisY1RobEntryField.get())
-  CAL['VisRobX2Val']    = float(VisX2RobEntryField.get())
-  CAL['VisRobY2Val']    = float(VisY2RobEntryField.get())
-  CAL['zoom']           = float(VisZoomSlide.get())
-  CAL['pick180Val']     = int(RUN['pick180'].get()) 
-  CAL['pickClosestVal'] = int(RUN['pickClosest'].get())
-  CAL['curCam']         = str(visoptions.get())
-  CAL['fullRotVal']     = int(RUN['fullRot'].get())
-  CAL['autoBGVal']      = int(RUN['autoBG'].get())
-
-
-
-
-  # Checkboxes directly manipulate CAL variable and don't need to be sync'd
-
-  logger.debug(f"Current value of J1DriveMS is: {CAL['J1DriveMS']}")
-  logger.debug(f"Current value of J1DriveMSEntryField is: {J1DriveMSEntryField.get()}")
-  CAL['J1DriveMS'] = int(J1DriveMSEntryField.get())
-  logger.debug(f"Value of J1DriveMS updated to: {CAL['J1DriveMS']}")
-  CAL['J2DriveMS'] = int(J2DriveMSEntryField.get())
-  CAL['J3DriveMS'] = int(J3DriveMSEntryField.get())
-  CAL['J4DriveMS'] = int(J4DriveMSEntryField.get())
-  CAL['J5DriveMS'] = int(J5DriveMSEntryField.get())
-  CAL['J6DriveMS'] = int(J6DriveMSEntryField.get())
-  CAL['J1EncCPR'] = int(J1EncCPREntryField.get())
-  CAL['J2EncCPR'] = int(J2EncCPREntryField.get())
-  CAL['J3EncCPR'] = int(J3EncCPREntryField.get())
-  CAL['J4EncCPR'] = int(J4EncCPREntryField.get())
-  CAL['J5EncCPR'] = int(J5EncCPREntryField.get())
-  CAL['J6EncCPR'] = int(J6EncCPREntryField.get())
-
-
-def SaveAndApplyCalibration():
   try:
-    sync_fields_to_calibration()
-    updateParams()
-    time.sleep(.1)
-    calExtAxis()
-  except:
-    logger.error("no serial connection with Teensy board")  
-  save_calibration(CAL)
+    loaded_calibration = load_calibration(
+      calibration_file='custom.json',
+      allow_fallback=False,
+    )
+    profile_values = _prepare_custom_calibration_profile(loaded_calibration)
+    sync_calibration_to_fields(profile_values)
+  except Exception:
+    logger.exception("Custom calibration loading or validation failed")
+    return False
+  logger.debug(
+    "Loaded custom J1 drive microsteps into editable fields: %s",
+    profile_values['J1DriveMS'],
+  )
+  return True
+
+
+def _custom_calibration_field_bindings(calibration_values):
+  values = _custom_calibration_field_values(calibration_values)
+  fields = [
+    TFxEntryField, TFyEntryField, TFzEntryField,
+    TFrzEntryField, TFryEntryField, TFrxEntryField,
+  ]
+  fields.extend((
+    J1MotDirEntryField, J2MotDirEntryField, J3MotDirEntryField,
+    J4MotDirEntryField, J5MotDirEntryField, J6MotDirEntryField,
+    J7MotDirEntryField, J8MotDirEntryField, J9MotDirEntryField,
+  ))
+  fields.extend((
+    J1CalDirEntryField, J2CalDirEntryField, J3CalDirEntryField,
+    J4CalDirEntryField, J5CalDirEntryField, J6CalDirEntryField,
+    J7CalDirEntryField, J8CalDirEntryField, J9CalDirEntryField,
+  ))
+  for field_group in (
+    (J1PosLimEntryField, J2PosLimEntryField, J3PosLimEntryField,
+     J4PosLimEntryField, J5PosLimEntryField, J6PosLimEntryField),
+    (J1NegLimEntryField, J2NegLimEntryField, J3NegLimEntryField,
+     J4NegLimEntryField, J5NegLimEntryField, J6NegLimEntryField),
+    (J1StepDegEntryField, J2StepDegEntryField, J3StepDegEntryField,
+     J4StepDegEntryField, J5StepDegEntryField, J6StepDegEntryField),
+    (J1DriveMSEntryField, J2DriveMSEntryField, J3DriveMSEntryField,
+     J4DriveMSEntryField, J5DriveMSEntryField, J6DriveMSEntryField),
+    (J1EncCPREntryField, J2EncCPREntryField, J3EncCPREntryField,
+     J4EncCPREntryField, J5EncCPREntryField, J6EncCPREntryField),
+    (J1ΘEntryField, J2ΘEntryField, J3ΘEntryField,
+     J4ΘEntryField, J5ΘEntryField, J6ΘEntryField),
+    (J1αEntryField, J2αEntryField, J3αEntryField,
+     J4αEntryField, J5αEntryField, J6αEntryField),
+    (J1dEntryField, J2dEntryField, J3dEntryField,
+     J4dEntryField, J5dEntryField, J6dEntryField),
+    (J1aEntryField, J2aEntryField, J3aEntryField,
+     J4aEntryField, J5aEntryField, J6aEntryField),
+  ):
+    fields.extend(field_group)
+  fields.extend((
+    axis7lengthEntryField, axis7rotEntryField, axis7stepsEntryField,
+    axis8lengthEntryField, axis8rotEntryField, axis8stepsEntryField,
+    axis9lengthEntryField, axis9rotEntryField, axis9stepsEntryField,
+  ))
+  fields.extend((
+    J1calOffEntryField, J2calOffEntryField, J3calOffEntryField,
+    J4calOffEntryField, J5calOffEntryField, J6calOffEntryField,
+    J7calOffEntryField, J8calOffEntryField, J9calOffEntryField,
+  ))
+  keys = _custom_calibration_profile_keys()
+  if len(fields) != len(keys):
+    raise RuntimeError("custom calibration field mapping is inconsistent")
+  return tuple(
+    (field, values[key])
+    for field, key in zip(fields, keys)
+  )
+
+
+def sync_calibration_to_fields(calibration_values=None):
+  source_values = CAL if calibration_values is None else calibration_values
+  bindings = _custom_calibration_field_bindings(source_values)
+  for field, value in bindings:
+    field.delete(0, 'end')
+    field.insert(0, str(value))
+  return True
+
+def _collect_fields_to_calibration():
+  values = {
+    'comPort': com1SelectedValue.get(),
+    'com2Port': com2SelectedValue.get(),
+    'auxiliaryBoard': (
+      normalize_auxiliary_board_profile(
+        auxiliaryBoardSelectedValue.get(),
+        allow_none=True,
+      ) or AUXILIARY_BOARD_NONE
+    ),
+    'J7PosCur': finite_number(
+      J7curAngEntryField.get(),
+      "J7 current position",
+    ),
+    'J8PosCur': finite_number(
+      J8curAngEntryField.get(),
+      "J8 current position",
+    ),
+    'J9PosCur': finite_number(
+      J9curAngEntryField.get(),
+      "J9 current position",
+    ),
+    'VisProg': visoptions.get(),
+    'VisBrightVal': finite_number(VisBrightSlide.get(), "vision brightness"),
+    'VisContVal': finite_number(VisContrastSlide.get(), "vision contrast"),
+    'VisBacColor': str(VisBacColorEntryField.get()),
+    'VisScore': finite_number(VisScoreEntryField.get(), "vision score"),
+    'VisX1Val': int(VisX1PixEntryField.get()),
+    'VisY1Val': int(VisY1PixEntryField.get()),
+    'VisX2Val': int(VisX2PixEntryField.get()),
+    'VisY2Val': int(VisY2PixEntryField.get()),
+    'VisRobX1Val': finite_number(VisX1RobEntryField.get(), "vision robot X1"),
+    'VisRobY1Val': finite_number(VisY1RobEntryField.get(), "vision robot Y1"),
+    'VisRobX2Val': finite_number(VisX2RobEntryField.get(), "vision robot X2"),
+    'VisRobY2Val': finite_number(VisY2RobEntryField.get(), "vision robot Y2"),
+    'zoom': finite_number(VisZoomSlide.get(), "vision zoom"),
+    'pick180Val': int(RUN['pick180'].get()),
+    'pickClosestVal': int(RUN['pickClosest'].get()),
+    'curCam': str(visoptions.get()),
+    'fullRotVal': int(RUN['fullRot'].get()),
+    'autoBGVal': int(RUN['autoBG'].get()),
+  }
+  calibration_offset_fields = (
+    J1calOffEntryField,
+    J2calOffEntryField,
+    J3calOffEntryField,
+    J4calOffEntryField,
+    J5calOffEntryField,
+    J6calOffEntryField,
+    J7calOffEntryField,
+    J8calOffEntryField,
+    J9calOffEntryField,
+  )
+  for axis, field in enumerate(calibration_offset_fields, start=1):
+    values[f'J{axis}calOff'] = finite_number(
+      field.get(),
+      f"J{axis} calibration offset",
+    )
+
+  external_values = _collect_external_axis_values()
+  values.update(external_values)
+  drive_fields = (
+    J1DriveMSEntryField,
+    J2DriveMSEntryField,
+    J3DriveMSEntryField,
+    J4DriveMSEntryField,
+    J5DriveMSEntryField,
+    J6DriveMSEntryField,
+  )
+  encoder_fields = (
+    J1EncCPREntryField,
+    J2EncCPREntryField,
+    J3EncCPREntryField,
+    J4EncCPREntryField,
+    J5EncCPREntryField,
+    J6EncCPREntryField,
+  )
+  for axis, (drive_field, encoder_field) in enumerate(
+    zip(drive_fields, encoder_fields),
+    start=1,
+  ):
+    values[f'J{axis}DriveMS'] = int(drive_field.get())
+    values[f'J{axis}EncCPR'] = int(encoder_field.get())
+  return values
+
+
+def _restore_controller_calibration(snapshot):
+  CAL.clear()
+  CAL.update(snapshot)
+  _set_cpp_kinematics_from_values(snapshot)
+  _apply_joint_limit_widgets(snapshot)
+  _apply_external_axis_values({
+    key: snapshot[key]
+    for key in (
+      'J7PosLim', 'J7rotation', 'J7steps',
+      'J8length', 'J8rotation', 'J8steps',
+      'J9length', 'J9rotation', 'J9steps',
+    )
+  })
+  return True
+
+
+def _invalidate_uncertain_controller_calibration(reason):
+  serial_port = RUN.get('ser')
+  if serial_port is not None:
+    try:
+      quarantine_serial_transport(serial_port, reason)
+    except Exception:
+      logger.exception("Unable to quarantine uncertain controller calibration")
+    finally:
+      if (
+        RUN.get('ser') is serial_port
+        and not getattr(serial_port, "is_open", False)
+      ):
+        RUN['ser'] = None
+  try:
+    _invalidate_joint_motion_state(reason)
+  except Exception:
+    logger.exception("Unable to invalidate joint motion after calibration failure")
+  message = (
+    "Controller calibration state is uncertain; "
+    "controller quarantined and reconnection is required"
+  )
+  logger.error("%s: %s", message, reason)
+  almStatusLab.config(text=message, style="Alarm.TLabel")
+  almStatusLab2.config(text=message, style="Alarm.TLabel")
+  return False
+
+
+@_synchronous_motion_request("Save and apply controller calibration")
+@_tracked_serial_operation("ser")
+def SaveAndApplyCalibration():
+  snapshot = dict(CAL)
+  try:
+    field_values = _collect_fields_to_calibration()
+    (
+      update_values,
+      update_command,
+      external_values,
+      external_command,
+    ) = _prepare_controller_calibration()
+    staged_values = dict(CAL)
+    staged_values.update(field_values)
+    staged_values.update(update_values)
+    staged_values.update(external_values)
+    _validate_controller_pose(staged_values)
+  except Exception:
+    logger.exception("Calibration validation failed")
+    CAL.clear()
+    CAL.update(snapshot)
+    return False
+
+  try:
+    _preflight_controller_calibration_transport()
+  except Exception:
+    logger.exception("Calibration transport preflight failed")
+    CAL.clear()
+    CAL.update(snapshot)
+    return False
+
+  try:
+    CAL.update(field_values)
+    _apply_controller_calibration(update_values, external_values)
+  except Exception:
+    logger.exception("Calibration application failed")
+    try:
+      _restore_controller_calibration(snapshot)
+    except Exception:
+      logger.exception("Unable to restore calibration after application failure")
+      return _invalidate_uncertain_controller_calibration(
+        "local calibration rollback failed after application failure"
+      )
+    return False
+
+  update_write_started = threading.Event()
+  try:
+    update_acknowledged = _transmit_update_parameters(
+      update_command,
+      update_write_started,
+    )
+  except Exception:
+    logger.exception("Update-parameters acknowledgement failed")
+    if not update_write_started.is_set():
+      return _restore_prewrite_calibration(
+        snapshot,
+        "update-parameters pre-write failure",
+      )
+    return _invalidate_uncertain_controller_calibration(
+      "update-parameters acknowledgement failed after transmission started"
+    )
+  if update_acknowledged is not True:
+    logger.error("Update-parameters transmission returned a non-true result")
+    if not update_write_started.is_set():
+      return _restore_prewrite_calibration(
+        snapshot,
+        "update-parameters pre-write rejection",
+      )
+    return _invalidate_uncertain_controller_calibration(
+      "update-parameters acknowledgement was invalid after transmission started"
+    )
+
+  external_write_started = threading.Event()
+  try:
+    external_acknowledged = _transmit_external_axis_parameters(
+      external_command,
+      external_write_started,
+    )
+  except Exception:
+    logger.exception("External-axis acknowledgement failed")
+    phase = (
+      "after transmission started"
+      if external_write_started.is_set()
+      else "before transmission started"
+    )
+    return _invalidate_uncertain_controller_calibration(
+      "external-axis acknowledgement failed "
+      f"{phase} after primary calibration applied"
+    )
+  if external_acknowledged is not True:
+    logger.error(
+      "External-axis transmission was rejected after primary calibration applied"
+    )
+    return _invalidate_uncertain_controller_calibration(
+      "external-axis calibration was not applied after primary calibration"
+    )
+
+  try:
+    persisted = save_calibration(CAL)
+  except Exception:
+    logger.exception("Calibration applied but persistence failed")
+    _retain_calibration_persistence_retry()
+    return False
+  if persisted is not True:
+    logger.error("Calibration applied but persistence returned a non-true result")
+    _retain_calibration_persistence_retry()
+    return False
+  return True
 
 
 def checkSpeedVals():
@@ -9656,6 +14922,11 @@ def checkSpeedVals():
     ACCspeedField.insert(0,"10")
   DECspd = float(DECspeedField.get())
   if(DECspd <= .01 or DECspd >=100):
+    DECspeedField.delete(0, 'end')
+    DECspeedField.insert(0,"10")
+  if(ACCspd + DECspd > 100):
+    ACCspeedField.delete(0, 'end')
+    ACCspeedField.insert(0,"10")
     DECspeedField.delete(0, 'end')
     DECspeedField.insert(0,"10")
   ACCramp = float(ACCrampField.get())
@@ -10514,15 +15785,22 @@ def visFind(template,min_score,background):
 
 
 
-def updateVisOp():
+def updateVisOp(filelist=None):
   # global RUN['selectedTemplate']
   RUN['selectedTemplate'] = StringVar()
-  if getattr(sys, 'frozen', False):
-    folder = os.path.dirname(sys.executable)
-  elif __file__:
-    folder = os.path.dirname(os.path.realpath(__file__))
-  #folder = os.path.dirname(os.path.realpath(__file__))
-  filelist = [fname for fname in os.listdir(folder) if fname.endswith('.jpg')]
+  if filelist is None:
+    filelist = _startup_visual_options()
+  elif isinstance(filelist, (str, bytes)):
+    raise TypeError("visual options must be a filename sequence")
+  else:
+    filelist = tuple(filelist)
+    if not all(
+      isinstance(filename, str)
+      and filename.endswith('.jpg')
+      and os.path.basename(filename) == filename
+      for filename in filelist
+    ):
+      raise ValueError("visual options contain an invalid filename")
   Visoptmenu = ttk.Combobox(tab6, textvariable=RUN['selectedTemplate'], values=filelist, state='readonly')
   Visoptmenu.place(x=390, y=52)
   Visoptmenu.bind("<<ComboboxSelected>>", VisOpUpdate)
@@ -10679,6 +15957,7 @@ def SetGcodeStartPos():
   GC_ST_WC_EntryField.delete(0, 'end')
   GC_ST_WC_EntryField.insert(0,str(RUN['WC']))  
 
+@_manual_motion_request("G-code start-position motion")
 def MoveGcodeStartPos():
   RUN['xVal'] = str(float(GC_ST_E1_EntryField.get())+float(GC_SToff_E1_EntryField.get()))
   RUN['yVal'] = str(float(GC_ST_E2_EntryField.get())+float(GC_SToff_E2_EntryField.get()))
@@ -10697,23 +15976,26 @@ def MoveGcodeStartPos():
   RUN['WC'] = GC_ST_WC_EntryField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)
-  RUN['ser'].write(command.encode())
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
-  if (response[:1] == 'E'):
-    ErrorHandler(response)   
-  else:
-    displayPosition(response) 
+  commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+  physical_command = None
+  if not RUN['offlineMode']:
+    cmdSentEntryField.delete(0, 'end')
+    cmdSentEntryField.insert(0, command)
+    physical_command = command
+  return _start_manual_motion(
+    physical_command,
+    "G-code start-position motion",
+    mj_command,
+    commandVR,
+  )
   
 
 
 
 def GCstepFwd():
     GCalmStatusLab.config(text="GCODE READY",  style="OK.TLabel")
-    GCexecuteRow() 
+    if GCexecuteRow() != ROW_EXECUTION_COMPLETE:
+      return False
     GCselRow = tab7.gcodeView.curselection()[0]
     last = tab7.gcodeView.index('end')
     for row in range (0,GCselRow):
@@ -10730,18 +16012,23 @@ def GCstepFwd():
       GcodCurRowEntryField.insert(0,GCselRow)
     except:
       GcodCurRowEntryField.delete(0, 'end')
-      GcodCurRowEntryField.insert(0,"---")  
+      GcodCurRowEntryField.insert(0,"---")
+    return True
 
+@_tracked_serial_operation("ser")
 def GCdelete():
   if(GcodeFilenameField.get() != ""):
-    Filename = GcodeFilenameField.get() + ".txt"
+    try:
+      Filename = _gcode_storage_filename(GcodeFilenameField.get())
+    except MotionInputError as exc:
+      message = f"G-code deletion rejected: {exc}"
+      logger.error(message)
+      GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+      return False
     command = "DG"+"Fn"+Filename+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    response = str(RUN['ser'].readline().strip(),'utf-8')
+    response = _exchange_legacy_main_command(command)
     if (response[:1] == 'E'):
       ErrorHandler(response)   
     else:
@@ -10753,17 +16040,17 @@ def GCdelete():
       elif(response == "F"):
         text = Filename + " was not found"
         GCalmStatusLab.config(text= text,  style="Alarm.TLabel")
+    return True
   else:
     messagebox.showwarning("warning","Please Enter a Filename")
+    return False
 
+@_tracked_serial_operation("ser")
 def GCread(status):
   command = "RG"+"\n"
   cmdSentEntryField.delete(0, 'end')
   cmdSentEntryField.insert(0,command)
-  RUN['ser'].write(command.encode())
-  RUN['ser'].flushInput()
-  time.sleep(.1)
-  response = str(RUN['ser'].readline().strip(),'utf-8')
+  response = _exchange_legacy_main_command(command)
   if (response[:1] == 'E'):
     ErrorHandler(response)   
   else:
@@ -10783,59 +16070,106 @@ def GCplay():
 
   
 
-def GCplayProg(Filename):
-  GCalmStatusLab.config(text= "GCODE FILE RUNNING",  style="OK.TLabel")
-  def GCthreadPlay():
-    #global estopActive
-    Fn = Filename + ".txt"
-    command = "PG"+"Fn"+Fn+"\n"
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    response = str(RUN['ser'].readline().strip(),'utf-8')
-    if (response[:1] == 'E'):
-      ErrorHandler(response)   
-    else:
-      displayPosition(response)
-      if (RUN['estopActive']):
-        GCalmStatusLab.config(text= "Estop Button was Pressed",  style="Alarm.TLabel")
-      else:  
-        GCalmStatusLab.config(text= "GCODE FILE COMPLETE",  style="Warn.TLabel") 
-  GCplay = threading.Thread(target=GCthreadPlay)
-  GCplay.start()   
+def GCplayProg(Filename, completion_callback=None):
+  if completion_callback is not None and not callable(completion_callback):
+    raise TypeError("G-code completion callback must be callable")
+  if RUN['offlineMode']:
+    message = "G-code playback is unavailable while offline"
+    logger.error(message)
+    GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+    return False
+  try:
+    command = _gcode_playback_command(Filename)
+  except MotionInputError as exc:
+    message = f"G-code playback rejected: {exc}"
+    logger.error(message)
+    GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+    return False
+
+  request_lease = _acquire_motion_request("G-code playback")
+  if request_lease is None:
+    GCalmStatusLab.config(
+      text="GCODE FILE NOT STARTED; ANOTHER MOTION REQUEST IS ACTIVE",
+      style="Warn.TLabel",
+    )
+    return False
+
+  GCalmStatusLab.config(text="GCODE FILE RUNNING", style="OK.TLabel")
+
+  def complete_playback(controller_position):
+    if controller_position is not None and not isinstance(
+      controller_position,
+      PositionResponse,
+    ):
+      raise RuntimeError(
+        "G-code playback returned an invalid controller position"
+      )
+    succeeded = controller_position is not None
+    try:
+      if succeeded:
+        GCalmStatusLab.config(text="GCODE FILE COMPLETE", style="Warn.TLabel")
+      elif RUN['estopActive']:
+        GCalmStatusLab.config(
+          text="Estop Button was Pressed",
+          style="Alarm.TLabel",
+        )
+      else:
+        GCalmStatusLab.config(text="GCODE FILE FAILED", style="Alarm.TLabel")
+    finally:
+      _finish_motion_request(
+        request_lease,
+        completion_callback,
+        succeeded is True,
+      )
+
+  try:
+    started = start_send_serial_thread(
+      command,
+      completion_callback=complete_playback,
+    )
+  except Exception:
+    logger.exception("Unable to start G-code playback worker")
+    started = False
+  if not started:
+    if motion_request_registry.owns(request_lease):
+      _finish_motion_request(request_lease)
+    GCalmStatusLab.config(
+      text="GCODE FILE NOT STARTED",
+      style="Alarm.TLabel",
+    )
+    return False
+  return True
 
 
+@_tracked_serial_operation("ser")
 def GCconvertProg():
   if(GcodeProgEntryField.get() == ""):
     messagebox.showwarning("warning","Please Load a Gcode Program") 
   elif (GcodeFilenameField.get() == ""):  
     messagebox.showwarning("warning","Please Enter a Filename") 
   else:
-    Filename = GcodeFilenameField.get() + ".txt"
+    try:
+      Filename = _gcode_storage_filename(GcodeFilenameField.get())
+    except MotionInputError as exc:
+      message = f"G-code conversion rejected: {exc}"
+      logger.error(message)
+      GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+      return False
     command = "DG"+"Fn"+Filename+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    RUN['ser'].write(command.encode())
-    RUN['ser'].flushInput()
-    time.sleep(.1)
-    response = str(RUN['ser'].readline().strip(),'utf-8')  
+    response = _exchange_legacy_main_command(command)
     last = tab7.gcodeView.index('end')
     for row in range (0,last):
       tab7.gcodeView.itemconfig(row, {'fg': "#000000"})
     def GCthreadProg():
       # global RUN['GCrowinproc']
-      # global RUN['GCstopQueue']
-      # global RUN['splineActive']
       # global RUN['prevxVal']
       # global RUN['prevyVal']
       # global RUN['prevzVal']
       RUN['prevxVal'] = 0
       RUN['prevyVal'] = 0
       RUN['prevzVal'] = 0
-      RUN['GCstopQueue'] = "0"
-      RUN['splineActive'] = "0"
       try:
         GCselRow = tab7.gcodeView.curselection()[0]
         if (GCselRow == 0):
@@ -10851,23 +16185,44 @@ def GCconvertProg():
         else:
           GCalmStatusLab.config(text="GCODE CONVERSION RUNNING",  style="OK.TLabel")
         RUN['GCrowinproc'] = 1
-        GCexecuteRow()
+        execution_state = ROW_EXECUTION_PENDING
+        while tab7.GCrunTrue == 1:
+          while serial_lock.locked() and tab7.GCrunTrue == 1:
+            time.sleep(.01)
+          if tab7.GCrunTrue == 0:
+            RUN['GCrowinproc'] = 0
+            return
+          execution_state = GCexecuteRow()
+          if execution_state == ROW_EXECUTION_COMPLETE:
+            break
+          if execution_state == ROW_EXECUTION_REJECTED:
+            tab7.GCrunTrue = 0
+            RUN['GCrowinproc'] = 0
+            return
+          if execution_state != ROW_EXECUTION_PENDING:
+            tab7.GCrunTrue = 0
+            RUN['GCrowinproc'] = 0
+            GCalmStatusLab.config(
+              text="GCODE CONVERSION RETURNED AN INVALID ROW STATE",
+              style="Alarm.TLabel",
+            )
+            return
+          time.sleep(.01)
+        if tab7.GCrunTrue != 1:
+          RUN['GCrowinproc'] = 0
+          return
         while RUN['GCrowinproc'] == 1:
-          time.sleep(.1)	  
+          time.sleep(.1)
+        if (
+          execution_state != ROW_EXECUTION_COMPLETE
+          or tab7.GCrunTrue != 1
+        ):
+          return
         GCselRow = tab7.gcodeView.curselection()[0]
-        #last = tab7.gcodeView.index('end')
-        #for row in range (0,GCselRow):
-        #  tab7.gcodeView.itemconfig(row, {'fg': 'dodger blue'})
         tab7.gcodeView.itemconfig(GCselRow, {'fg': "#0057A6"})
-        #for row in range (GCselRow+1,last):
-        #  tab7.gcodeView.itemconfig(row, {'fg': 'black'})
         tab7.gcodeView.selection_clear(0, END)
         GCselRow += 1
         tab7.gcodeView.select_set(GCselRow)
-        #gcodeRow += 1
-        #GcodCurRowEntryField.delete(0, 'end')
-        #GcodCurRowEntryField.insert(0,GCselRow)
-        #time.sleep(.1)
         try:
           GCselRow = tab7.gcodeView.curselection()[0]
           GcodCurRowEntryField.delete(0, 'end')
@@ -10883,31 +16238,52 @@ def GCconvertProg():
      
 
 
-def GCstopProg():
-    # global RUN['cmdType']
-    # global RUN['splineActive']
-    # global RUN['GCstopQueue']
-    lastProg = ""
-    tab7.GCrunTrue = 0
-    GCalmStatusLab.config(text="GCODE CONVERSION STOPPED",  style="Alarm.TLabel")
-    if(RUN['splineActive'] ==1):
-      RUN['splineActive'] = "0"
-      if(RUN['stopQueue'] == "1"):
-        RUN['stopQueue'] = "0"
-        stop()
-      if (RUN['moveInProc'] == 1):
-        RUN['moveInProc'] == 2
-      command = "SS\n" 
-      cmdSentEntryField.delete(0, 'end')
-      cmdSentEntryField.insert(0,command)
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      response = str(RUN['ser'].readline().strip(),'utf-8')
-      if (response[:1] == 'E'):
-        ErrorHandler(response)   
-      else:
-        displayPosition(response)         
+@_tracked_serial_operation(
+  "ser",
+  rejection_result=None,
+)
+def _exchange_gcode_row(command):
+    command = _canonicalize_main_serial_command(command)
+    response_timeout = _controller_response_timeout(command)
+    serial_port = RUN.get('ser')
+    try:
+      acquired = serial_write_lock.acquire()
+      if acquired is False:
+        raise RuntimeError("G-code serial write lock acquisition failed")
+      try:
+        if tab7.GCrunTrue != 1:
+          return None
+        write_serial_control(
+          serial_port,
+          command,
+          reset_input=True,
+        )
+      finally:
+        serial_write_lock.release()
+      return read_serial_line_response(serial_port, response_timeout)
+    finally:
+      if (
+        RUN.get('ser') is serial_port
+        and not getattr(serial_port, "is_open", False)
+      ):
+        RUN['ser'] = None
 
+
+def GCstopProg():
+    tab7.GCrunTrue = 0
+    message = "GCODE SCHEDULING HALTED; ACTIVE CONTROLLER MOTION IS NOT PREEMPTED"
+    GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+    return True
+
+
+@_synchronous_motion_request(
+  "G-code conversion row",
+  rejection_result=ROW_EXECUTION_PENDING,
+)
+@_tracked_serial_operation(
+  "ser",
+  rejection_result=ROW_EXECUTION_PENDING,
+)
 def GCexecuteRow():
   # global RUN['GCrowinproc']
   # global RUN['LineDist']
@@ -10915,8 +16291,6 @@ def GCexecuteRow():
   # global RUN['Yv']
   # global RUN['Zv']
   #global moveInProc
-  # global RUN['splineActive']
-  # global RUN['stopQueue']
   #global gcodeSpeed
   #global inchTrue
   # global RUN['prevxVal']
@@ -10925,6 +16299,9 @@ def GCexecuteRow():
   # global RUN['xVal']
   # global RUN['yVal']
   # global RUN['zVal']
+  if tab7.GCrunTrue != 1:
+    RUN['GCrowinproc'] = 0
+    return ROW_EXECUTION_REJECTED
   GCstartTime = time.time()
   GCselRow = tab7.gcodeView.curselection()[0]
   tab7.gcodeView.see(GCselRow+2)
@@ -10936,7 +16313,10 @@ def GCexecuteRow():
 
   ## F ##
   if (RUN['cmdType'] == "F"):
-    RUN['gcodeSpeed']=command[command.find("F")+1:]
+    RUN['gcodeSpeed'] = _gcode_feed_rate_mm_per_second(
+      command[command.find("F")+1:],
+      RUN['inchTrue'],
+    )
 
 
   ## G ##
@@ -10969,25 +16349,45 @@ def GCexecuteRow():
       ACCramp = "100"
       RUN['WC'] = GC_ST_WC_EntryField.get()
       LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-      Filename = GcodeFilenameField.get() + ".txt"
+      Filename = _gcode_storage_filename(GcodeFilenameField.get())
       command = "WC"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"Fn"+Filename+"\n"
       cmdSentEntryField.delete(0, 'end') 
       
       print(str(command))
 
+      if tab7.GCrunTrue != 1:
+        RUN['GCrowinproc'] = 0
+        return ROW_EXECUTION_REJECTED
       cmdSentEntryField.insert(0,command)
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      time.sleep(.1)
-      response = str(RUN['ser'].readline().strip(),'utf-8')
+      try:
+        response = _exchange_gcode_row(command)
+      except Exception as exc:
+        tab7.GCrunTrue = 0
+        RUN['GCrowinproc'] = 0
+        message = f"Unable to write G-code row: {exc}"
+        logger.exception(message)
+        GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+        return ROW_EXECUTION_REJECTED
+      if response is None:
+        RUN['GCrowinproc'] = 0
+        return ROW_EXECUTION_REJECTED
       print(str(response))
       if (response[:1] == 'E'):
         ErrorHandler(response)
         GCstopProg()
         tab7.GCrunTrue = 0
-        GCalmStatusLab.config(text="UNABLE TO WRITE TO SD CARD",  style="Alarm.TLabel")   
+        RUN['GCrowinproc'] = 0
+        GCalmStatusLab.config(text="UNABLE TO WRITE TO SD CARD",  style="Alarm.TLabel")
+        return ROW_EXECUTION_REJECTED
       else:
-        displayPosition(response) 
+        if _apply_valid_position_response(response) is None:
+          tab7.GCrunTrue = 0
+          RUN['GCrowinproc'] = 0
+          GCalmStatusLab.config(
+            text="INVALID G-CODE CONTROLLER RESPONSE",
+            style="Alarm.TLabel",
+          )
+          return ROW_EXECUTION_REJECTED
 
 
     #LINEAR MOVE
@@ -11046,7 +16446,7 @@ def GCexecuteRow():
 
       if(RUN['xVal'] != ""):
         if(RUN['inchTrue']):
-          RUN['xVal'] =str(float(xVal)*25.4)
+          RUN['xVal'] =str(float(RUN['xVal'])*25.4)
         RUN['xVal'] = str(round((float(GC_ST_E1_EntryField.get())+float(RUN['xVal'])),3))
       else:
         try:
@@ -11060,7 +16460,7 @@ def GCexecuteRow():
 
       if(RUN['yVal'] != ""):
         if(RUN['inchTrue']):
-          RUN['yVal'] =str(float(yVal)*25.4)
+          RUN['yVal'] =str(float(RUN['yVal'])*25.4)
         RUN['yVal'] = str(round((float(GC_ST_E2_EntryField.get())+float(RUN['yVal'])),3))
       else:
         try:
@@ -11073,7 +16473,7 @@ def GCexecuteRow():
         
       if(RUN['zVal'] != ""):
         if(RUN['inchTrue']):
-          RUN['zVal'] =str(float(zVal)*25.4)
+          RUN['zVal'] =str(float(RUN['zVal'])*25.4)
         RUN['zVal'] = str(round((float(GC_ST_E3_EntryField.get())+float(RUN['zVal'])),3))
       else:
         try:
@@ -11092,7 +16492,7 @@ def GCexecuteRow():
         rzVal = str(CAL['RzcurPos'])
       
       if(bVal != ""):
-        ryVal = str(round((float(GC_ST_E5_EntryField.get())+float(bVal))),3)
+        ryVal = str(round((float(GC_ST_E5_EntryField.get())+float(bVal)),3))
       else:
         ryVal = str(CAL['RycurPos'])
 
@@ -11110,10 +16510,10 @@ def GCexecuteRow():
       J9Val = str(CAL['J9PosCur'])
       
       if(fVal != ""):
-        if(RUN['inchTrue']):
-          RUN['gcodeSpeed'] = str(round((float(fVal)/25.4),2))
-        else:
-          RUN['gcodeSpeed'] = str(round((float(fVal)/60),2))  
+        RUN['gcodeSpeed'] = _gcode_feed_rate_mm_per_second(
+          fVal,
+          RUN['inchTrue'],
+        )
       speedPrefix = "Sm"
       Speed = RUN['gcodeSpeed']
 
@@ -11141,7 +16541,7 @@ def GCexecuteRow():
       #LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
       LoopMode ="111111"
       #DisWrist = str(CAL['DisableWristRotVal'].get())
-      Filename = GcodeFilenameField.get() + ".txt"
+      Filename = _gcode_storage_filename(GcodeFilenameField.get())
 
       command = "WC"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"Rnd"+Rounding+"W"+RUN['WC']+"Lm"+LoopMode+"Fn"+Filename+"\n"
       RUN['prevxVal'] = RUN['xVal']
@@ -11154,19 +16554,39 @@ def GCexecuteRow():
       #value=tab8.ElogView.get(0,END)
       #pickle.dump(value,open("ErrorLog","wb"))
 
-      RUN['ser'].write(command.encode())
-      RUN['ser'].flushInput()
-      time.sleep(.05)
-      #ser.read()
-      response = str(RUN['ser'].readline().strip(),'utf-8')
+      if tab7.GCrunTrue != 1:
+        RUN['GCrowinproc'] = 0
+        return ROW_EXECUTION_REJECTED
+      try:
+        response = _exchange_gcode_row(command)
+      except Exception as exc:
+        tab7.GCrunTrue = 0
+        RUN['GCrowinproc'] = 0
+        message = f"Unable to write G-code row: {exc}"
+        logger.exception(message)
+        GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+        return ROW_EXECUTION_REJECTED
+      if response is None:
+        RUN['GCrowinproc'] = 0
+        return ROW_EXECUTION_REJECTED
       if (response[:1] == 'E'):
         tab7.GCrunTrue = 0
+        RUN['GCrowinproc'] = 0
         GCalmStatusLab.config(text="UNABLE TO WRITE TO SD CARD",  style="Alarm.TLabel")
-        ErrorHandler(response)   
+        ErrorHandler(response)
+        return ROW_EXECUTION_REJECTED
       else:
-        displayPosition(response)
+        if _apply_valid_position_response(response) is None:
+          tab7.GCrunTrue = 0
+          RUN['GCrowinproc'] = 0
+          GCalmStatusLab.config(
+            text="INVALID G-CODE CONTROLLER RESPONSE",
+            style="Alarm.TLabel",
+          )
+          return ROW_EXECUTION_REJECTED
 
   RUN['GCrowinproc'] = 0
+  return ROW_EXECUTION_COMPLETE
 
   
 
@@ -11654,11 +17074,7 @@ J1jogPosBut.bind("<ButtonRelease>", StopJog)
 def J1sliderUpdate(foo):
   J1slidelabel.config(text=round(float(J1jogslide.get()),2))   
 def J1sliderExecute(foo): 
-  J1delta = float(J1jogslide.get()) - float(J1curAngEntryField.get())
-  if (J1delta < 0):
-    J1jogNeg(abs(J1delta))
-  else:
-    J1jogPos(abs(J1delta))       
+  _queue_joint_target(0, J1jogslide.get())
 J1jogslide.config(command=J1sliderUpdate)
 J1jogslide.bind("<ButtonRelease-1>", J1sliderExecute)
 
@@ -11686,11 +17102,7 @@ J2jogPosBut.bind("<ButtonRelease>", StopJog)
 def J2sliderUpdate(foo):
   J2slidelabel.config(text=round(float(J2jogslide.get()),2))   
 def J2sliderExecute(foo): 
-  J2delta = float(J2jogslide.get()) - float(J2curAngEntryField.get())
-  if (J2delta < 0):
-    J2jogNeg(abs(J2delta))
-  else:
-    J2jogPos(abs(J2delta))       
+  _queue_joint_target(1, J2jogslide.get())
 J2jogslide.config(command=J2sliderUpdate)
 J2jogslide.bind("<ButtonRelease-1>", J2sliderExecute)
 
@@ -11718,11 +17130,7 @@ J3jogPosBut.bind("<ButtonRelease>", StopJog)
 def J3sliderUpdate(foo):
   J3slidelabel.config(text=round(float(J3jogslide.get()),2))   
 def J3sliderExecute(foo): 
-  J3delta = float(J3jogslide.get()) - float(J3curAngEntryField.get())
-  if (J3delta < 0):
-    J3jogNeg(abs(J3delta))
-  else:
-    J3jogPos(abs(J3delta))       
+  _queue_joint_target(2, J3jogslide.get())
 J3jogslide.config(command=J3sliderUpdate)
 J3jogslide.bind("<ButtonRelease-1>", J3sliderExecute)
 
@@ -11750,11 +17158,7 @@ J4jogPosBut.bind("<ButtonRelease>", StopJog)
 def J4sliderUpdate(foo):
   J4slidelabel.config(text=round(float(J4jogslide.get()),2))   
 def J4sliderExecute(foo): 
-  J4delta = float(J4jogslide.get()) - float(J4curAngEntryField.get())
-  if (J4delta < 0):
-    J4jogNeg(abs(J4delta))
-  else:
-    J4jogPos(abs(J4delta))       
+  _queue_joint_target(3, J4jogslide.get())
 J4jogslide.config(command=J4sliderUpdate)
 J4jogslide.bind("<ButtonRelease-1>", J4sliderExecute)
 
@@ -11782,11 +17186,7 @@ J5jogPosBut.bind("<ButtonRelease>", StopJog)
 def J5sliderUpdate(foo):
   J5slidelabel.config(text=round(float(J5jogslide.get()),2))   
 def J5sliderExecute(foo): 
-  J5delta = float(J5jogslide.get()) - float(J5curAngEntryField.get())
-  if (J5delta < 0):
-    J5jogNeg(abs(J5delta))
-  else:
-    J5jogPos(abs(J5delta))       
+  _queue_joint_target(4, J5jogslide.get())
 J5jogslide.config(command=J5sliderUpdate)
 J5jogslide.bind("<ButtonRelease-1>", J5sliderExecute)
 
@@ -11814,11 +17214,7 @@ J6jogPosBut.bind("<ButtonRelease>", StopJog)
 def J6sliderUpdate(foo):
   J6slidelabel.config(text=round(float(J6jogslide.get()),2))   
 def J6sliderExecute(foo): 
-  J6delta = float(J6jogslide.get()) - float(J6curAngEntryField.get())
-  if (J6delta < 0):
-    J6jogNeg(abs(J6delta))
-  else:
-    J6jogPos(abs(J6delta))       
+  _queue_joint_target(5, J6jogslide.get())
 J6jogslide.config(command=J6sliderUpdate)
 J6jogslide.bind("<ButtonRelease-1>", J6sliderExecute)
 
@@ -11834,26 +17230,7 @@ CartjogFrame.grid_columnconfigure(4, weight=1)
 CartjogFrame.grid_columnconfigure(5, weight=1)
 
 
-# Helper function for tool frame controls (no entry field)
-def create_tool_control(parent, row, col, label_text):
-    """Create a tool jog control column with horizontal buttons (no entry field)"""
-    Label(parent, font=("Arial", 14), text=label_text).grid(row=row, column=col, pady=2)
-    
-    # Create frame for horizontal button layout
-    button_frame = Frame(parent)
-    button_frame.grid(row=row+1, column=col, pady=2)
-    
-    neg_but = Button(button_frame, text="-", width=3)
-    neg_but.grid(row=0, column=0, padx=1)
-    
-    pos_but = Button(button_frame, text="+", width=3)
-    pos_but.grid(row=0, column=1, padx=1)
-    
-    return neg_but, pos_but
-
-# Helper function for cartesian controls
 def create_cart_control(parent, row, col, label_text):
-    """Create a cartesian jog control column with horizontal buttons"""
     Label(parent, font=("Arial", 14), text=label_text).grid(row=row, column=col, pady=2)
     
     entry = Entry(parent, width=6, justify="center")
@@ -11999,9 +17376,7 @@ TooljogFrame.grid_columnconfigure(3, weight=1)
 TooljogFrame.grid_columnconfigure(4, weight=1)
 TooljogFrame.grid_columnconfigure(5, weight=1)
 
-# Helper function for tool frame controls (buttons only, no entry fields)
 def create_tool_control(parent, col, label_text):
-    """Create a tool frame jog control with label and horizontal buttons (no entry field)"""
     Label(parent, font=("Arial", 14), text=label_text).grid(row=0, column=col, pady=2)
     
     # Create frame for horizontal button layout
@@ -12205,11 +17580,7 @@ def J7sliderUpdate(foo):
   J7slideLimLab.insert(0, round(float(J7jogslide.get()),2))
   J7slideLimLab.config(state="readonly")   
 def J7sliderExecute(foo): 
-  J7delta = float(J7jogslide.get()) - float(J7curAngEntryField.get())
-  if (J7delta < 0):
-    J7jogNeg(abs(J7delta))
-  else:
-    J7jogPos(abs(J7delta))       
+  _queue_joint_target(6, J7jogslide.get())
 J7jogslide.config(command=J7sliderUpdate)
 J7jogslide.bind("<ButtonRelease-1>", J7sliderExecute)
 
@@ -12276,11 +17647,7 @@ def J8sliderUpdate(foo):
   J8slideLimLab.insert(0, round(float(J8jogslide.get()),2))
   J8slideLimLab.config(state="readonly")   
 def J8sliderExecute(foo): 
-  J8delta = float(J8jogslide.get()) - float(J8curAngEntryField.get())
-  if (J8delta < 0):
-    J8jogNeg(abs(J8delta))
-  else:
-    J8jogPos(abs(J8delta))       
+  _queue_joint_target(7, J8jogslide.get())
 J8jogslide.config(command=J8sliderUpdate)
 J8jogslide.bind("<ButtonRelease-1>", J8sliderExecute)
 
@@ -12347,11 +17714,7 @@ def J9sliderUpdate(foo):
   J9slideLimLab.insert(0, round(float(J9jogslide.get()),2))
   J9slideLimLab.config(state="readonly")   
 def J9sliderExecute(foo): 
-  J9delta = float(J9jogslide.get()) - float(J9curAngEntryField.get())
-  if (J9delta < 0):
-    J9jogNeg(abs(J9delta))
-  else:
-    J9jogPos(abs(J9delta))       
+  _queue_joint_target(8, J9jogslide.get())
 J9jogslide.config(command=J9sliderUpdate)
 J9jogslide.bind("<ButtonRelease-1>", J9sliderExecute)
 
@@ -12622,7 +17985,7 @@ def detect_ports():
   else:
     port1_default = "None"
   
-  if globals().get('CAL', {}).get('com2ort') not in ("", None, "None"):
+  if globals().get('CAL', {}).get('com2Port') not in ("", None, "None"):
     port2_default = CAL['com2Port']
   else:
     port2_default = "None"
@@ -12640,13 +18003,27 @@ com1SelectedValue = tk.StringVar(value=default_comport1 or "None")
 com1Select = tk.OptionMenu(commFrame, com1SelectedValue, *port_choices, command=setCom)
 com1Select.grid(row=1, column=0, sticky="ew", padx=5, pady=2)
 
+AuxiliaryBoardLab = Label(commFrame, text="5v IO BOARD PROFILE:")
+AuxiliaryBoardLab.grid(row=2, column=0, sticky="w", padx=5, pady=(15, 2))
+
+auxiliaryBoardSelectedValue = tk.StringVar(value=AUXILIARY_BOARD_NONE)
+auxiliaryBoardSelect = tk.OptionMenu(
+  commFrame,
+  auxiliaryBoardSelectedValue,
+  AUXILIARY_BOARD_NONE,
+  AUXILIARY_BOARD_NANO,
+  AUXILIARY_BOARD_MEGA,
+  command=setCom2,
+)
+auxiliaryBoardSelect.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
+
 # 5v IO Board COM Port
 ComPortLab2 = Label(commFrame, text="5v IO BOARD COM PORT:")
-ComPortLab2.grid(row=2, column=0, sticky="w", padx=5, pady=(15, 2))
+ComPortLab2.grid(row=4, column=0, sticky="w", padx=5, pady=(15, 2))
 
 com2SelectedValue = tk.StringVar(value=default_comport2 or "None")
 com2Select = tk.OptionMenu(commFrame, com2SelectedValue, *port_choices, command=setCom2)
-com2Select.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
+com2Select.grid(row=5, column=0, sticky="ew", padx=5, pady=2)
 
 # ============================================================================
 # ROW 1, COLUMN 1: Robot Calibration Frame
@@ -15395,7 +20772,7 @@ configfile.place(x=10, y=40)
 ##############################################################################################################################################################
 
 
-loaded_calibration = load_calibration()
+loaded_calibration = _load_startup_calibration()
 apply_calibration(loaded_calibration, CAL)
 
 logger.debug(f"Comport 1 restored value is: {CAL['comPort']}")
@@ -15406,6 +20783,17 @@ if CAL['comPort'] in port_choices:
 
 if CAL['com2Port'] in port_choices:
   com2SelectedValue.set(CAL['com2Port'])
+
+try:
+  restored_auxiliary_board = normalize_auxiliary_board_profile(
+    CAL.get('auxiliaryBoard', AUXILIARY_BOARD_NONE),
+    allow_none=True,
+  )
+except MotionInputError as exc:
+  logger.error("Invalid saved auxiliary-board profile: %s", exc)
+  restored_auxiliary_board = None
+CAL['auxiliaryBoard'] = restored_auxiliary_board or AUXILIARY_BOARD_NONE
+auxiliaryBoardSelectedValue.set(CAL['auxiliaryBoard'])
 
 
 incrementEntryField.insert(0,"10")
@@ -15786,6 +21174,11 @@ Copyright © 2022 by Annin Robotics. All Rights Reserved"
 RUN['xboxUse'] = 0
 
 tab1.lastProg = ""
+tab1.after(25, _poll_joint_motion_events)
+tab1.after(25, _poll_serial_events)
+tab1.after(25, _poll_auxiliary_serial_events)
+tab1.after(25, _poll_xbox_auxiliary_events)
+tab1.after(25, _poll_virtual_motion_events)
 tab1.after(100, setCom)
 
 #tab1.mainloop()

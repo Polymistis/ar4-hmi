@@ -66,6 +66,7 @@
     "J5OpenLoopVal": 0,
     "J6OpenLoopVal": 0,
     "com2Port": "None",
+    "auxiliaryBoard": "None",
     "curTheme": 0,
     "J1CalStatVal": 1,
     "J2CalStatVal": 1,
