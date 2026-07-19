@@ -5342,23 +5342,44 @@ class HmiSourceContractTests(unittest.TestCase):
 
     def test_every_direct_serial_user_participates_in_shutdown_tracking(self):
         owner_managed = {
+            # Profile helpers validate the active auxiliary handle but perform no
+            # transport I/O; callers own or delegate the associated operation.
+            "_bind_auxiliary_board_profile": {"ser2"},
+            "_connected_auxiliary_board_profile": {"ser2"},
             # The failed-start activity lease and serial lock remain reserved
             # until close and cleanup release both ownership layers.
             "_close_failed_controller_startup": {"ser"},
             "_close_startup_auxiliary": {"ser2"},
+            # Startup state helpers either delegate auxiliary cleanup or retain
+            # the main activity lease transferred by the enclosing admission.
+            "_clear_unavailable_startup_auxiliary": {"ser2"},
+            "finish_startup": {"ser"},
             "_exchange_auxiliary_line": {"ser2"},
             "_exchange_serial_line": {"ser"},
             # The control reservation remains active until the bounded follow-up
             # read and transport cleanup finish.
+            "_raise_auxiliary_stop_acknowledgement_timeout": {"ser2"},
             "_read_auxiliary_inactive_stop_response": {"ser2"},
+            "_run_auxiliary_stop_safe": {"ser2"},
             "_replace_auxiliary_serial": {"ser2"},
             "_startup_exchange_response": {"ser"},
             "_exchange_legacy_main_command": {"ser"},
             "_write_legacy_auxiliary_command": {"ser2"},
+            # Admission helpers capture connection identity before dispatching
+            # work through an operation-owning transport path.
+            "_start_xbox_auxiliary_request": {"ser2"},
+            "_try_dispatch_controller_correction": {"ser"},
+            "send_xbox_auxiliary": {"ser2"},
             # Calibration commands run only inside the tracked public
             # calibration operation that owns the main transport.
             "_execute_calibration_command": {"ser"},
             "_invalidate_uncertain_controller_calibration": {"ser"},
+            "_preflight_controller_calibration_transport": {"ser"},
+            # The Tk callback serializes auxiliary replacement with the
+            # transport lock and delegates all close/open work to owned helpers.
+            "setCom2": {"ser2"},
+            # Main connection admission acquires the activity lease before any
+            # handle access and transfers ownership to asynchronous startup.
             "setCom": {"ser"},
             "_set_com_admitted": {"ser"},
         }
@@ -5398,6 +5419,18 @@ class HmiSourceContractTests(unittest.TestCase):
                 and isinstance(node.slice, ast.Constant)
                 and node.slice.value in {"ser", "ser2"}
             }
+            direct_names.update(
+                node.args[0].value
+                for node in function_nodes
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "RUN"
+                and node.func.attr == "get"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value in {"ser", "ser2"}
+            )
             if not direct_names:
                 continue
             if direct_names.issubset(owner_managed.get(function.name, set())):
@@ -9767,10 +9800,23 @@ class HmiSourceContractTests(unittest.TestCase):
         missing_end = playback.index("while (gcFile.available()", missing_start)
         missing_file = playback[missing_start:missing_end]
 
-        self.assertIn('Serial.println("EG")', missing_file)
-        self.assertIn('cmdBuffer1 = ""', missing_file)
-        self.assertIn("shiftCMDarray()", missing_file)
-        self.assertIn("return;", missing_file)
+        recovery_statements = [
+            line.strip()
+            for line in missing_file.splitlines()
+            if line.strip()
+            and not line.strip().startswith("//")
+            and line.strip() not in {"if (!gcFile) {", "}"}
+        ]
+        self.assertEqual(
+            recovery_statements,
+            [
+                'Serial.println("EG");',
+                'inData = "";',
+                'cmdBuffer1 = "";',
+                "shiftCMDarray();",
+                "return;",
+            ],
+        )
         self.assertNotIn("while (1)", missing_file)
 
     def test_program_gcode_propagates_completion_and_rejection(self):
