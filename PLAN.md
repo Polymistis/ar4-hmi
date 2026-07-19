@@ -186,7 +186,7 @@ Acceptance criteria:
 
 ### M4A3 - Delivered 7.0/2.0 baseline audit
 
-Status: `Proposed`
+Status: `Tested`
 
 Acceptance criteria:
 
@@ -195,6 +195,37 @@ Acceptance criteria:
 - Current HMI and safety changes are classified as superseded, directly portable, conflicting, or still required.
 - Hardware-free checks validate relevant upstream behavior without importing either application entry point or writing to a controller.
 - A scored recommendation selects selective integration, porting current changes onto the 7.0 host baseline, or full baseline replacement. No baseline replacement, controller write, calibration, or firmware flash occurs without an explicit follow-on decision.
+
+Audit result:
+
+- `docs/delivered-v7-baseline-audit.md` records the frozen archive intake, provenance, HMI and packaging review, host-controller contract comparison, firmware findings, native-kinematics review, configuration differences, current-change classification, validation limits, and scored recommendation.
+- Selective integration into the current hardened baseline scored 4.25/5 and is approved. Porting current work onto the delivered host scored 2.85/5; full replacement scored 1.60/5.
+- Delivered source remains isolated audit input. No application entry point or executable was run, and no controller write, calibration, firmware flash, or robot motion occurred.
+
+### M4A4 - Selective 7.0/2.0 integration
+
+Status: `Proposed`
+
+Authorized scope:
+
+- Port native inverse-kinematics validation, wrist-singularity continuity, configuration exposure, and deterministic tests before rebuilding supported native binaries.
+- Add schema-validated MK5 calibration-switch polarity and numeric configuration normalization without importing machine-specific ports, limits, poses, or calibration values.
+- Define a correlated JSON host-controller contract with one response owner, bounded timeouts, explicit event separation, and paired firmware fixtures before changing active command encoding.
+- Correct Teensy JSON validation, Cartesian array bounds, G-code buffer rotation, and emergency-event ownership before compilation, simulation, or hardware consideration.
+- Adapt the current semantic coalescer, confirmed-position rebasing, transport quarantine, and Tk result queues to the validated protocol rather than adopting the delivered blocking host transport.
+- Port Mega/Nano 2.0 JSON capabilities while preserving explicit board profiles and profile-bound pin validation.
+- Keep CAD and EOAT functionality optional and isolated behind validated file, scene, dependency, and lifecycle boundaries.
+
+Acceptance criteria:
+
+- Each integration unit lands independently through the cross-review gate and leaves the tracked baseline coherent.
+- Host and firmware protocol changes land together with deterministic compatibility fixtures.
+- Native changes expose supported configuration intentionally and pass boundary, singularity, wrapping, and no-solution tests.
+- Configuration migration preserves current machine-neutral defaults and rejects malformed, non-finite, or out-of-range values before mutation.
+- Firmware sources compile and pass hardware-free protocol checks before any requested flash or live test.
+- No worker reads or mutates Tk state, and no newly routed Tk callback waits on serial I/O.
+- Optional CAD/EOAT behavior can remain disabled without importing CadQuery or changing application startup.
+- Hardware verification follows M5 and cannot be inferred from compilation, simulation, or fake transports.
 
 ### M4B - Repeatability and dynamic interception pass
 
@@ -236,7 +267,7 @@ Acceptance criteria:
 - Treat host commands, firmware parsers, native kinematics bindings, and `.ar4` programs as versioned integration contracts.
 - Queue semantic targets, not raw input events. Joint, Cartesian, and tool-frame intents cannot be merged across coordinate spaces without recomputation from confirmed state.
 - Keep desktop command coalescing separate from future real-time servo and trajectory-control loops.
-- Keep delivered 7.0/2.0 sources isolated until M4A3 produces an approved baseline decision.
+- Retain the current hardened baseline and use delivered 7.0/2.0 sources only as isolated selective-integration input under M4A4.
 - Route post-bootstrap commits through the role-appropriate cross-review wrapper.
 - Route branch integrations through `scripts/codex/auto-merge.ps1`; bare merge into the integration base is prohibited.
 
@@ -246,4 +277,5 @@ Acceptance criteria:
 - Simple program movement routes now share request-scoped controller ownership, raw target validation, and offline physical-write rejection. The broader typed program state machine, non-motion row migration, Cartesian and tool-frame coalescing, complete main-controller response ownership, application lifecycle separation, and dynamic controller work remain incomplete.
 - Tracked Teensy v6.7.1 `MA` and `MC` parsing writes the `Tr` field to `xyzuvw_In[6]` even though `ROBOT_nDOFs` defines a six-element array. Host arc and circle program transmission remains disabled until a paired firmware correction, compilation, simulation, and authorized hardware-validation plan exist. Spline program transmission also remains disabled until one terminal response-owner contract replaces speculative acknowledgements.
 - Teensy coordinated pulse scheduling and E-stop response ownership were inspected but not changed. The trusted v6.7.1 E-stop protocol can race speculative spline responses and remains unsafe for claimed single-frame ownership; remediation requires a separate protocol design and hardware-validation plan. The missing-file behavior has a source-contract assertion only; compilation, simulation, and live-arm verification remain pending.
+- M4A3 found that delivered 7.0 retains busy-input loss, blocking Tk paths, incomplete response ownership, firmware array-bound defects, and emergency-event races. Selective integration is approved because delivered inverse-kinematics, MK5 calibration-switch, JSON auxiliary-controller, and optional CAD/EOAT changes can be isolated without replacing the hardened HMI baseline.
 - No live-arm command, firmware flash, calibration cycle, or movement was performed.
