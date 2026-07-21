@@ -3,6 +3,20 @@
 
 namespace ar4_protocol {
 
+enum class MotionCommandStatus {
+    kCompleted,
+    kRejected,
+    kTerminalFaultReported,
+};
+
+inline bool should_emit_generic_motion_error(MotionCommandStatus status) {
+    return status == MotionCommandStatus::kRejected;
+}
+
+inline bool should_continue_stored_playback(MotionCommandStatus status) {
+    return status == MotionCommandStatus::kCompleted;
+}
+
 template <typename Text>
 inline bool extract_serial_command_payload(
     const Text& frame,

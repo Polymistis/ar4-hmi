@@ -10923,6 +10923,51 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertNotIn("while (1)", missing_file)
 
+    def test_firmware_stored_playback_stops_after_reported_motion_fault(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        queue_contract = TEENSY_QUEUE_CONTRACT.read_text(encoding="utf-8")
+        self.assertIn("enum class MotionCommandStatus", queue_contract)
+        self.assertIn("should_emit_generic_motion_error(", queue_contract)
+        self.assertIn("should_continue_stored_playback(", queue_contract)
+
+        move_start = firmware.index("MotionCommandStatus moveJ(")
+        move_end = firmware.index("const int32_t MODBUS_PARSE_ERROR", move_start)
+        move = firmware[move_start:move_end]
+        axis_fault = move.index('Alarm = "EL"')
+        self.assertIn(
+            "return ar4_protocol::MotionCommandStatus::"
+            "kTerminalFaultReported;",
+            move[axis_fault:],
+        )
+
+        playback_start = firmware.index('if (function == "PG")')
+        playback_end = firmware.index(
+            'if (function == "WG")',
+            playback_start,
+        )
+        playback = firmware[playback_start:playback_end]
+        cartesian_start = playback.index('if (Cmd.substring(0, 1) == "X")')
+        cartesian_end = playback.index(
+            "int i1 = Cmd.indexOf(',');",
+            cartesian_start,
+        )
+        cartesian = playback[cartesian_start:cartesian_end]
+        stop_start = cartesian.index("should_continue_stored_playback(status)")
+        stop_end = cartesian.index("return;", stop_start)
+        stop_branch = cartesian[stop_start:stop_end]
+        self.assertIn("should_emit_generic_motion_error(status)", stop_branch)
+        self.assertIn("gcFile.close();", stop_branch)
+        self.assertIn("consume_current_command();", stop_branch)
+
+        direct_start = firmware.index('if (function == "MJ")')
+        direct_end = firmware.index('if (function == "DG")', direct_start)
+        direct = firmware[direct_start:direct_end]
+        self.assertEqual(
+            direct.count("should_emit_generic_motion_error(status)"),
+            2,
+        )
+        self.assertNotIn("if (!moveJ(", direct)
+
     def test_tool_jog_wrist_mode_is_paired_with_firmware_parser(self):
         firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
         native_kinematics = NATIVE_KINEMATICS_SOURCE.read_text(encoding="utf-8")
@@ -11530,7 +11575,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
 
         scopes = (
-            ("moveJ", "bool moveJ(", "//COMMUNICATIONS", 2),
+            ("moveJ", "MotionCommandStatus moveJ(", "//COMMUNICATIONS", 2),
             ("LC", 'if (function == "LC"', 'if (function == "LJ"', 1),
             ("LJ", 'if (function == "LJ"', 'if (function == "LT"', 1),
             ("LT", 'if (function == "LT"', 'if (function == "JT"', 1),
@@ -11649,7 +11694,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIn("parse_int_marker_fields(", update_branch)
         self.assertIn("consume_current_command();", update_branch[:first_mutation])
 
-        move_j_start = firmware.index("bool moveJ(")
+        move_j_start = firmware.index("MotionCommandStatus moveJ(")
         move_j_end = firmware.index("//COMMUNICATIONS", move_j_start)
         move_j = firmware[move_j_start:move_j_end]
         self.assertIn("parse_cartesian_move_command(inData, commandFields)", move_j)

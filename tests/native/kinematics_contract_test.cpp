@@ -2021,6 +2021,30 @@ void test_firmware_identity_contract() {
 }
 
 void test_firmware_command_queue_consumption() {
+    using ar4_protocol::MotionCommandStatus;
+
+    require(
+        ar4_protocol::should_continue_stored_playback(
+            MotionCommandStatus::kCompleted
+        )
+            && !ar4_protocol::should_continue_stored_playback(
+                MotionCommandStatus::kRejected
+            )
+            && !ar4_protocol::should_continue_stored_playback(
+                MotionCommandStatus::kTerminalFaultReported
+            )
+            && !ar4_protocol::should_emit_generic_motion_error(
+                MotionCommandStatus::kCompleted
+            )
+            && ar4_protocol::should_emit_generic_motion_error(
+                MotionCommandStatus::kRejected
+            )
+            && !ar4_protocol::should_emit_generic_motion_error(
+                MotionCommandStatus::kTerminalFaultReported
+            ),
+        "stored playback motion-result policy changed"
+    );
+
     std::string current = "invalid JT";
     std::string first = "invalid JT";
     std::string second = "valid RJ";

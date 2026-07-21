@@ -2730,7 +2730,12 @@ bool driveMotorsL(int J1step, int J2step, int J3step, int J4step, int J5step, in
 //MOVE J
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-bool moveJ(String inData, bool response, bool precalc, bool simspeed) {
+ar4_protocol::MotionCommandStatus moveJ(
+  String inData,
+  bool response,
+  bool precalc,
+  bool simspeed
+) {
 
   int J1dir;
   int J2dir;
@@ -2755,7 +2760,7 @@ bool moveJ(String inData, bool response, bool precalc, bool simspeed) {
 
   ar4_protocol::CartesianMoveCommandFields commandFields = {};
   if (!ar4_protocol::parse_cartesian_move_command(inData, commandFields)) {
-    return false;
+    return ar4_protocol::MotionCommandStatus::kRejected;
   }
   int staged_external_steps[3];
   if (!external_positions_to_future_steps(
@@ -2764,7 +2769,7 @@ bool moveJ(String inData, bool response, bool precalc, bool simspeed) {
       commandFields.auxiliary[2],
       staged_external_steps
   )) {
-    return false;
+    return ar4_protocol::MotionCommandStatus::kRejected;
   }
 
   for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
@@ -2795,7 +2800,7 @@ bool moveJ(String inData, bool response, bool precalc, bool simspeed) {
     KinematicError != 0
     || !primary_inverse_solution_to_future_steps(primary_future_steps)
   ) {
-    return false;
+    return ar4_protocol::MotionCommandStatus::kRejected;
   }
   for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
     future_steps[axis] = primary_future_steps[axis];
@@ -2875,7 +2880,6 @@ bool moveJ(String inData, bool response, bool precalc, bool simspeed) {
       TotalAxisFault += axisFault[i];
     }
 
-    //send move command if no axis limit error
     if (TotalAxisFault == 0 && KinematicError == 0) {
       resetEncoders();
       bool drive_succeeded = false;
@@ -2884,7 +2888,9 @@ bool moveJ(String inData, bool response, bool precalc, bool simspeed) {
       } else {
         drive_succeeded = driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes);
       }
-      if (!drive_succeeded) return false;
+      if (!drive_succeeded) {
+        return ar4_protocol::MotionCommandStatus::kRejected;
+      }
       checkEncoders();
       if (response == true) {
         sendRobotPos();
@@ -2894,17 +2900,19 @@ bool moveJ(String inData, bool response, bool precalc, bool simspeed) {
       delay(5);
       Serial.println(Alarm);
       Alarm = "0";
+      return ar4_protocol::MotionCommandStatus::kTerminalFaultReported;
     } else {
       Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault) + String(J7axisFault) + String(J8axisFault) + String(J9axisFault);
       delay(5);
       Serial.println(Alarm);
       Alarm = "0";
+      return ar4_protocol::MotionCommandStatus::kTerminalFaultReported;
     }
 
     inData = "";  // Clear recieved buffer
                   ////////MOVE COMPLETE///////////
   }
-  return true;
+  return ar4_protocol::MotionCommandStatus::kCompleted;
 }
 
 
@@ -5016,7 +5024,6 @@ void loop() {
         TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
 
 
-        //send move command if no axis limit error
         if (TotalAxisFault == 0 && KinematicError == 0) {
           if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes)) {
             KinematicError = 1;
@@ -5265,7 +5272,6 @@ void loop() {
         }
         TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
 
-        //send move command if no axis limit error
         if (TotalAxisFault == 0 && KinematicError == 0) {
           if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes)) {
             KinematicError = 1;
@@ -5491,7 +5497,6 @@ void loop() {
         TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
 
 
-        //send move command if no axis limit error
         if (TotalAxisFault == 0 && KinematicError == 0) {
           if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes)) {
             KinematicError = 1;
@@ -5684,7 +5689,6 @@ void loop() {
       TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
 
       debug = String(SpeedVal);
-      //send move command if no axis limit error
       if (TotalAxisFault == 0 && KinematicError == 0) {
         resetEncoders();
         if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes)) {
@@ -5860,7 +5864,6 @@ void loop() {
       TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
 
 
-      //send move command if no axis limit error
       if (TotalAxisFault == 0 && KinematicError == 0) {
         resetEncoders();
         if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes)) {
@@ -6011,7 +6014,6 @@ void loop() {
       TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
 
 
-      //send move command if no axis limit error
       if (TotalAxisFault == 0 && KinematicError == 0) {
         resetEncoders();
         if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes)) {
@@ -6542,7 +6544,6 @@ void loop() {
             break;
           }
 
-          //send move command if no axis limit error
           if (!driveMotorsL(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, curDelay, &motionModes)) {
             KinematicError = 1;
             break;
@@ -6583,13 +6584,21 @@ void loop() {
     //----- MOVE J ---------------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "MJ") {
-      if (!moveJ(inData, true, false, false)) Serial.println("ER");
+      const ar4_protocol::MotionCommandStatus status =
+        moveJ(inData, true, false, false);
+      if (ar4_protocol::should_emit_generic_motion_error(status)) {
+        Serial.println("ER");
+      }
     }
 
     //----- MOVE G ---------------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "MG") {
-      if (!moveJ(inData, true, false, true)) Serial.println("ER");
+      const ar4_protocol::MotionCommandStatus status =
+        moveJ(inData, true, false, true);
+      if (ar4_protocol::should_emit_generic_motion_error(status)) {
+        Serial.println("ER");
+      }
     }
 
 
@@ -6722,8 +6731,12 @@ void loop() {
         //CARTESIAN CMD
         if (Cmd.substring(0, 1) == "X") {
           updatePos();
-          if (!moveJ(Cmd, false, false, true)) {
-            Serial.println("ER");
+          const ar4_protocol::MotionCommandStatus status =
+            moveJ(Cmd, false, false, true);
+          if (!ar4_protocol::should_continue_stored_playback(status)) {
+            if (ar4_protocol::should_emit_generic_motion_error(status)) {
+              Serial.println("ER");
+            }
             gcFile.close();
             consume_current_command();
             return;
@@ -7071,7 +7084,6 @@ void loop() {
       TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
 
 
-      //send move command if no axis limit error
       if (TotalAxisFault == 0 && KinematicError == 0) {
         info = String(abs(J1stepDif)) + "," + String(abs(J2stepDif)) + "," + String(abs(J3stepDif)) + "," + String(abs(J4stepDif)) + "," + String(abs(J5stepDif)) + "," + String(abs(J6stepDif)) + "," + String(abs(J7stepDif)) + "," + String(abs(J8stepDif)) + "," + String(abs(J9stepDif)) + "," + String(J1dir) + "," + String(J2dir) + "," + String(J3dir) + "," + String(J4dir) + "," + String(J5dir) + "," + String(J6dir) + "," + String(J7dir) + "," + String(J8dir) + "," + String(J9dir) + "," + String(SpeedType) + "," + String(SpeedVal) + "," + String(ACCspd) + "," + String(DCCspd) + "," + String(ACCramp);
         if (writeSD(filename, info)) {
@@ -8094,7 +8106,6 @@ void loop() {
           break;
         }
 
-        //send move command if no axis limit error
         if (!driveMotorsL(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, curDelay, &motionModes)) {
           KinematicError = 1;
           break;

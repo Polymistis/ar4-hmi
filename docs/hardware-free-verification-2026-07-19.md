@@ -45,7 +45,9 @@ A later complete elevated Windows run on 2026-07-20 passed after motion-mode tra
 
 The complete elevated Windows suite passed again on 2026-07-20 after cross-review remediation for main-controller output handling, live-jog domain parity, linear-rounding validation, and bounded firmware serial ingress. The ordinary sandbox run was not counted because Windows denied cleanup of an unrelated temporary persistence fixture; the approved rerun completed with only the expected platform-specific skips.
 
-The latest complete elevated Windows rerun on 2026-07-20 passed after rounded-motion wrist preservation, live control-frame response ownership, positive Modbus polling waits, and complete FAT-reserved filename-character rejection were added. An initial run encountered the known timing-sensitive startup-test boundary; the isolated contract and the complete rerun both passed without a related source change.
+The complete elevated Windows rerun on 2026-07-20 passed after rounded-motion wrist preservation, live control-frame response ownership, positive Modbus polling waits, and complete FAT-reserved filename-character rejection were added. An initial run encountered the known timing-sensitive startup-test boundary; the isolated contract and the complete rerun both passed without a related source change.
+
+The 2026-07-21 complete elevated Windows rerun passed after stored-program playback gained explicit completed, rejected, and terminal-fault-reported outcomes. Source-contract coverage confirms that a reported Cartesian row fault closes playback without emitting a second error response.
 
 ## Windows native extension
 
@@ -124,9 +126,11 @@ The 2026-07-20 sanitizer rerun for motion-mode transaction atomicity passed. Rej
 
 The 2026-07-20 sanitizer rerun for the serial-frame accumulator passed with strict warnings enabled. Maximum-length frames complete, oversized unterminated frames clear accumulated storage, discard through the next LF, and accept a later valid frame. Host fixtures also reject live-jog modes, vectors, and linear rounding outside the paired firmware domain.
 
-The latest 2026-07-20 sanitizer rerun passed exact LF and CRLF live-stop classification, rejection of complete non-stop and overflow control frames, single terminal-response selection, positive Modbus polling waits, rounded `ML` parsing with `WN` and `WF`, and every FAT-reserved filename character. Compilation used strict warnings plus AddressSanitizer and UndefinedBehaviorSanitizer and completed with exit code 0.
+The 2026-07-20 sanitizer rerun passed exact LF and CRLF live-stop classification, rejection of complete non-stop and overflow control frames, single terminal-response selection, positive Modbus polling waits, rounded `ML` parsing with `WN` and `WF`, and every FAT-reserved filename character. Compilation used strict warnings plus AddressSanitizer and UndefinedBehaviorSanitizer and completed with exit code 0.
 
 The 2026-07-21 sanitizer rerun passed upper-address Modbus register-span boundaries and bounded stored-row accumulation, including maximum-length completion, overflow clearing, invalid-read rejection, and unterminated final-row completion. Compilation used strict warnings plus AddressSanitizer and UndefinedBehaviorSanitizer and completed with exit code 0.
+
+The 2026-07-21 playback-policy sanitizer rerun passed every motion-result outcome: only completed motion advances stored playback, only unreported rejection requests the generic error response, and a reported terminal fault stops playback without duplicate output. Compilation used strict warnings plus AddressSanitizer and UndefinedBehaviorSanitizer and completed with exit code 0.
 
 ## Teensy 4.1 firmware
 
@@ -158,6 +162,8 @@ The 2026-07-20 no-upload compile for command-local wrist selection and driver-pr
 
 The 2026-07-20 no-upload compile after output-command and serial-frame remediation succeeded with ample flash and RAM headroom. Main-controller `ON` and `OF` now return the standard error response without a GPIO mutation path, while the profiled Nano and Mega auxiliary output contracts remain unchanged. Every USB `Serial` line reader uses the shared bounded frame accumulator. Upstream ModbusMaster warnings remained; no tracked-source warning was emitted.
 
-The latest 2026-07-20 no-upload compile after live terminal-response ownership, rounded-motion wrist propagation, positive Modbus polling waits, and FAT filename validation succeeded with ample flash and RAM headroom. Upstream ModbusMaster warnings remained; no tracked-source warning was emitted.
+The 2026-07-20 no-upload compile after live terminal-response ownership, rounded-motion wrist propagation, positive Modbus polling waits, and FAT filename validation succeeded with ample flash and RAM headroom. Upstream ModbusMaster warnings remained; no tracked-source warning was emitted.
 
 The 2026-07-21 no-upload compile after Modbus span validation, pre-acknowledgement live-command validation, single-response finite-trajectory faults, volatile emergency-stop polling state, and bounded SD playback rows succeeded with ample flash and RAM headroom. Upstream ModbusMaster warnings remained; no tracked-source warning was emitted.
+
+The 2026-07-21 playback-policy no-upload compile succeeded after `moveJ` gained explicit completed, rejected, and terminal-fault-reported results and PG stopped on every non-completed Cartesian row. Upstream ModbusMaster warnings remained; no tracked-source warning was emitted.
