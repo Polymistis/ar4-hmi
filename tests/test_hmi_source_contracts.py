@@ -24,9 +24,13 @@ from ARrobots.HMI.joint_motion import (
     AUXILIARY_BOARD_NANO,
     AUXILIARY_BOARD_NONE,
     AUXILIARY_BOARD_OUTPUT_PINS,
+    CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+    ControllerIdentity,
     ControllerJointCalibration,
     MotionInputError,
     LiveMotionScheduleResult,
+    MAX_COMMAND_LENGTH,
+    MAX_CONTROLLER_FILENAME_BYTES,
     MAX_RESPONSE_FRAME_LENGTH,
     MAX_RESPONSE_PAYLOAD_LENGTH,
     MotionProfile,
@@ -45,6 +49,8 @@ from ARrobots.HMI.joint_motion import (
     canonicalize_serial_command,
     canonicalize_virtual_command,
     command_response_timeout,
+    controller_degree_to_native_radians,
+    controller_number,
     controller_protocol_decimal,
     controller_ratio,
     decode_serial_response_line,
@@ -54,6 +60,9 @@ from ARrobots.HMI.joint_motion import (
     motion_timing_response_timeout,
     normalize_auxiliary_board_profile,
     parse_command_timing,
+    parse_controller_identity_response,
+    parse_controller_modbus_response,
+    parse_motion_wrist_config,
     parse_position_response,
     parse_virtual_command_timing,
     quarantine_serial_transport,
@@ -62,6 +71,7 @@ from ARrobots.HMI.joint_motion import (
     read_serial_line_response_with_optional_followup,
     serial_transport_quarantined,
     validate_auxiliary_output_command,
+    validate_controller_filename,
     write_serial_control,
 )
 
@@ -69,11 +79,47 @@ from ARrobots.HMI.joint_motion import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 AR4_SOURCE = PROJECT_ROOT / "AR4.py"
 CALIBRATION_SOURCE = PROJECT_ROOT / "ARrobots" / "Calibration.py"
+NATIVE_KINEMATICS_SOURCE = PROJECT_ROOT / "ARrobots" / "src" / "kinematics.cpp"
+NATIVE_WINDOWS_BUILD_SOURCE = (
+    PROJECT_ROOT / "ARrobots" / "src" / "build_kinematics.ps1"
+)
 TEENSY_SOURCE = (
     PROJECT_ROOT
     / "ArduinoSketches"
     / "AR4_teensy41_sketch_v6.7.1"
     / "AR4_teensy41_sketch_v6.7.1.ino"
+)
+TEENSY_ANGLE_CONVERSION_CONTRACT = TEENSY_SOURCE.with_name(
+    "angle_conversion_contract.h"
+)
+TEENSY_CARTESIAN_POSE_CONTRACT = TEENSY_SOURCE.with_name(
+    "cartesian_pose_contract.h"
+)
+TEENSY_CONTROLLER_DOMAIN_CONTRACT = TEENSY_SOURCE.with_name(
+    "controller_domain_contract.h"
+)
+TEENSY_IDENTITY_CONTRACT = TEENSY_SOURCE.with_name("identity_contract.h")
+TEENSY_NUMERIC_PARSE_CONTRACT = TEENSY_SOURCE.with_name(
+    "numeric_parse_contract.h"
+)
+TEENSY_MOTION_COMMAND_PARSE_CONTRACT = TEENSY_SOURCE.with_name(
+    "motion_command_parse_contract.h"
+)
+TEENSY_MOTION_MODE_TRANSACTION = TEENSY_SOURCE.with_name(
+    "motion_mode_transaction.h"
+)
+TEENSY_QUEUE_CONTRACT = TEENSY_SOURCE.with_name("command_queue_contract.h")
+TEENSY_DEBUG_CONTRACT = TEENSY_SOURCE.with_name("debug_contract.h")
+TEENSY_PERSISTENCE_CONTRACT = TEENSY_SOURCE.with_name("persistence_contract.h")
+TEENSY_SERIAL_FRAME_CONTRACT = TEENSY_SOURCE.with_name(
+    "serial_frame_contract.h"
+)
+TEENSY_SPLINE_RESPONSE_CONTRACT = TEENSY_SOURCE.with_name(
+    "spline_response_contract.h"
+)
+TEENSY_TOOL_JOG_CONTRACT = TEENSY_SOURCE.with_name("tool_jog_contract.h")
+TEENSY_WRIST_SELECTION_CONTRACT = TEENSY_SOURCE.with_name(
+    "wrist_selection_contract.h"
 )
 VIRTUAL_CARTESIAN_TEST_COMMAND = (
     "MJX1Y2Z3Rz4Ry5Rx6Sp50Ac10Dc20Rm25WNLm000000\n"
@@ -81,9 +127,23 @@ VIRTUAL_CARTESIAN_TEST_COMMAND = (
 CONTROLLER_CARTESIAN_TEST_COMMAND = (
     "MJX1Y2Z3Rz4Ry5Rx6J77J88J99Sp50Ac10Dc20Rm25WNLm000000\n"
 )
-VIRTUAL_TOOL_TEST_COMMAND = "JTX11Sp50G10H20I25Lm000000\n"
+VIRTUAL_TOOL_TEST_COMMAND = "JTX11Sp50G10H20I25WNLm000000\n"
 VALID_CONTROLLER_POSITION = parse_position_response(
     "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+)
+VALID_CONTROLLER_IDENTITY_RESPONSE = json.dumps(
+    {
+        "DriverModel": "Teensy 4.1",
+        "FirmwareVersion": "6.7.1-ar4hmi.1",
+        "RobotModel": "AR4",
+        "RobotVersion": "MK3",
+        "SerialNumber": "Unset",
+        "AssetTag": "Unset",
+        "ProtocolCapabilities": [
+            CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+        ],
+    },
+    separators=(",", ":"),
 )
 SPEED_VIOLATION_CONTROLLER_POSITION = parse_position_response(
     "A1B2C3D4E5F6G1H2I3J4K5L6M1NOP7Q8R9"
@@ -151,13 +211,27 @@ class HmiSourceContractTests(unittest.TestCase):
 
     def compile_function(self, name, namespace, *, preserve_decorators=False):
         self.add_motion_request_dependencies(namespace)
+        if (
+            name != "_motion_request_rejection_message"
+            and "_motion_request_rejection_message" not in namespace
+        ):
+            self.compile_function("_motion_request_rejection_message", namespace)
         namespace.setdefault("AUXILIARY_BOARD_NONE", AUXILIARY_BOARD_NONE)
         namespace.setdefault(
             "normalize_auxiliary_board_profile",
             normalize_auxiliary_board_profile,
         )
+        namespace.setdefault("MotionInputError", MotionInputError)
+        namespace.setdefault("math", math)
+        namespace.setdefault("IK_POSITION_TOLERANCE_MILLIMETRES", 0.1)
+        namespace.setdefault("IK_ROTATION_TOLERANCE_DEGREES", 0.1)
+        namespace.setdefault("IK_JOINT_LIMIT_TOLERANCE_DEGREES", 0.001)
+        namespace.setdefault("IK_WRIST_SINGULARITY_DEGREES", 2.0)
         if (
-            name != "_clear_auxiliary_board_profile"
+            name not in (
+                "_clear_auxiliary_board_profile",
+                "_motion_request_rejection_message",
+            )
             and "_clear_auxiliary_board_profile" not in namespace
         ):
             self.compile_function(
@@ -176,6 +250,47 @@ class HmiSourceContractTests(unittest.TestCase):
             "canonicalize_virtual_command",
             canonicalize_virtual_command,
         )
+        namespace.setdefault(
+            "controller_degree_to_native_radians",
+            controller_degree_to_native_radians,
+        )
+        namespace.setdefault("controller_number", controller_number)
+        namespace.setdefault("finite_number", finite_number)
+        namespace.setdefault(
+            "validate_controller_filename",
+            validate_controller_filename,
+        )
+        namespace.setdefault("LIVE_TOOL_JOG_INCREMENT", 0.25)
+        namespace.setdefault("ControllerIdentity", ControllerIdentity)
+        namespace.setdefault(
+            "CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1",
+            CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+        )
+        namespace.setdefault(
+            "parse_controller_identity_response",
+            parse_controller_identity_response,
+        )
+        namespace.setdefault(
+            "parse_virtual_command_timing",
+            parse_virtual_command_timing,
+        )
+        namespace.setdefault("parse_command_timing", parse_command_timing)
+        namespace.setdefault(
+            "parse_motion_wrist_config",
+            parse_motion_wrist_config,
+        )
+        if (
+            name in ("live_joint_jog", "live_cartesian_jog", "live_tool_jog")
+            and "_parse_live_jog_drive_profile" not in namespace
+        ):
+            self.compile_function(
+                "_parse_live_jog_drive_profile",
+                namespace,
+            )
+        if "kinematics_configuration_ready" not in namespace:
+            kinematics_ready = threading.Event()
+            kinematics_ready.set()
+            namespace["kinematics_configuration_ready"] = kinematics_ready
         namespace.setdefault("VirtualMotionOperation", VirtualMotionOperation)
         namespace.setdefault("PositionResponse", PositionResponse)
         namespace.setdefault("time", time)
@@ -216,6 +331,87 @@ class HmiSourceContractTests(unittest.TestCase):
                 namespace,
             )
         dependencies = {
+            "_set_cpp_kinematics_from_values": (
+                "_prepare_cpp_kinematics_configuration",
+            ),
+            "_prepare_controller_startup": (
+                "_prepare_cpp_kinematics_configuration",
+            ),
+            "_prepare_cpp_kinematics_configuration": (
+                "_validated_native_kinematics_rotations",
+            ),
+            "_validated_native_kinematics_rotations": (
+                "_validated_native_tool_frame",
+            ),
+            "_prepare_update_parameters_from_values": (
+                "_validated_native_kinematics_rotations",
+            ),
+            "_active_tool_frame": (
+                "_validated_native_tool_frame",
+            ),
+            "_solve_inverse_kinematics": (
+                "_validated_virtual_six_vector",
+                "_validated_wrist_config",
+                "_validate_inverse_kinematics_result",
+            ),
+            "_rotation_vector_matrix": (
+                "_validated_virtual_six_vector",
+            ),
+            "_external_cartesian_pose_to_native": (
+                "_validated_virtual_six_vector",
+            ),
+            "_native_cartesian_pose_to_external": (
+                "_validated_virtual_six_vector",
+            ),
+            "_forward_kinematics_display_pose": (
+                "_validated_virtual_six_vector",
+                "_native_cartesian_pose_to_external",
+            ),
+            "refresh_gui_from_joint_angles": (
+                "_forward_kinematics_display_pose",
+            ),
+            **{
+                function_name: ("_forward_kinematics_display_pose",)
+                for function_name in (
+                    "XjogNeg",
+                    "YjogNeg",
+                    "ZjogNeg",
+                    "RxjogNeg",
+                    "RyjogNeg",
+                    "RzjogNeg",
+                    "XjogPos",
+                    "YjogPos",
+                    "ZjogPos",
+                    "RxjogPos",
+                    "RyjogPos",
+                    "RzjogPos",
+                )
+            },
+            "_rotation_error_degrees": (
+                "_rotation_vector_matrix",
+            ),
+            "_validate_inverse_kinematics_result": (
+                "_validated_native_ordered_values",
+                "_rotation_error_degrees",
+            ),
+            "_acquire_motion_request": ("_reject_motion_request",),
+            "parse_mj_command": ("_external_cartesian_pose_to_native",),
+            "mj_command": ("_solve_inverse_kinematics",),
+            "mt_command": (
+                "_solve_inverse_kinematics",
+                "_active_tool_frame",
+                "_external_cartesian_pose_to_native",
+            ),
+            "live_cartesian_jog": (
+                "_solve_inverse_kinematics",
+                "_external_cartesian_pose_to_native",
+            ),
+            "live_tool_jog": ("_solve_inverse_kinematics",),
+            "LiveCarJog": ("_validated_wrist_config",),
+            "LiveToolJog": (
+                "_validated_wrist_config",
+                "_active_tool_frame",
+            ),
             "_prepare_position_command": (
                 "_acknowledged_forced_position_target_value",
             ),
@@ -251,6 +447,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         namespace.setdefault("virtual_motion_event_queue", Queue())
         namespace.setdefault("manual_motion_request_state", threading.local())
+        namespace.setdefault("motion_request_admission_state", threading.local())
         namespace.setdefault("manual_motion_pose_pending", threading.Event())
         namespace.setdefault(
             "controller_position_resynchronization_required",
@@ -275,7 +472,18 @@ class HmiSourceContractTests(unittest.TestCase):
             lambda snapshot, position, write_started, succeeded: succeeded,
         )
 
-        def acquire(name, allow_position_recovery=False):
+        def acquire(
+            name,
+            allow_position_recovery=False,
+            requires_kinematics=True,
+        ):
+            readiness = namespace.get("kinematics_configuration_ready")
+            if (
+                requires_kinematics
+                and readiness is not None
+                and not readiness.is_set()
+            ):
+                return None
             if not allow_position_recovery and (
                 namespace["manual_motion_pose_pending"].is_set()
                 or namespace[
@@ -607,7 +815,7 @@ class HmiSourceContractTests(unittest.TestCase):
             ],
         )
 
-    def test_controller_timeout_scales_firmware_accepted_extended_ramp(self):
+    def test_controller_timeout_rejects_ramp_above_firmware_limit(self):
         namespace = {
             "parse_command_timing": parse_command_timing,
             "MotionInputError": MotionInputError,
@@ -625,12 +833,12 @@ class HmiSourceContractTests(unittest.TestCase):
         standard_ramp = response_timeout(
             f"{prefix}Sp100Ac10Dc20Rm100WNLm000000\n"
         )
-        extended_ramp = response_timeout(
-            f"{prefix}Sp100Ac10Dc20Rm200WNLm000000\n"
-        )
 
         self.assertEqual(standard_ramp, 1260.0)
-        self.assertEqual(extended_ramp, 2510.0)
+        with self.assertRaises(MotionInputError):
+            response_timeout(
+                f"{prefix}Sp100Ac10Dc20Rm200WNLm000000\n"
+            )
 
     def test_motion_timeout_bounds_follow_controller_configuration(self):
         calibration = {}
@@ -727,24 +935,152 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(result.positive_limits, (11, 12, 13, 14, 15, 16, 70, 80, 90))
         self.assertEqual(result.steps_per_unit, (100, 200, 300, 400, 500, 600, 100, 200, 300))
 
-    def test_native_tool_frame_uses_xyz_rz_ry_rx_order(self):
+    def test_inverse_kinematics_uses_validated_wrist_configuration(self):
+        class Robot:
+            def __init__(self):
+                self.calls = []
+
+            def SolveInverseKinematicsConfigured(self, target, estimate, wrist):
+                self.calls.append((target, estimate, wrist))
+                return [1, 2, 3, 4, 5, 6]
+
+            @staticmethod
+            def forward_kinematics(joints):
+                return [0, 1, 2, *[math.radians(value) for value in (3, 4, 5)]]
+
+            def SolveInverseKinematics(self, target, estimate):
+                raise AssertionError("legacy solver was selected")
+
+        robot = Robot()
+        namespace = {
+            "robot": robot,
+            "CAL": {
+                **{f"J{axis}PosLim": 180 for axis in range(1, 7)},
+                **{f"J{axis}NegLim": 180 for axis in range(1, 7)},
+            },
+            "finite_number": finite_number,
+        }
+        solve = self.compile_function("_solve_inverse_kinematics", namespace)
+
+        result = solve(
+            np.arange(6),
+            (value for value in range(6, 12)),
+            " f ",
+        )
+
+        self.assertEqual(result, (1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
+        self.assertEqual(
+            robot.calls,
+            [((0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
+              (6.0, 7.0, 8.0, 9.0, 10.0, 11.0),
+              "F")],
+        )
+
+    def test_inverse_kinematics_rejects_legacy_solver_without_calling_it(self):
+        calls = []
+        namespace = {
+            "robot": SimpleNamespace(
+                SolveInverseKinematics=(
+                    lambda target, estimate: calls.append((target, estimate))
+                ),
+                forward_kinematics=lambda joints: [0.0] * 6,
+            ),
+            "CAL": {
+                **{f"J{axis}PosLim": 180 for axis in range(1, 7)},
+                **{f"J{axis}NegLim": 180 for axis in range(1, 7)},
+            },
+            "finite_number": finite_number,
+        }
+        solve = self.compile_function("_solve_inverse_kinematics", namespace)
+
+        with self.assertRaisesRegex(MotionInputError, "required configured solver"):
+            solve([10, 0, 0, 0, 0, 0], [1] * 6, "A")
+        self.assertEqual(calls, [])
+
+    def test_inverse_kinematics_rejects_invalid_boundary_data(self):
+        calls = []
+        robot = SimpleNamespace(
+            SolveInverseKinematicsConfigured=(
+                lambda *args: calls.append(args) or [0.0] * 6
+            ),
+            SolveInverseKinematics=lambda *args: self.fail(
+                "legacy solver was selected"
+            ),
+            forward_kinematics=lambda joints: [0.0] * 6,
+        )
+        namespace = {
+            "robot": robot,
+            "CAL": {
+                **{f"J{axis}PosLim": 180 for axis in range(1, 7)},
+                **{f"J{axis}NegLim": 180 for axis in range(1, 7)},
+            },
+            "finite_number": finite_number,
+        }
+        solve = self.compile_function("_solve_inverse_kinematics", namespace)
+
+        with self.assertRaisesRegex(MotionInputError, "wrist configuration"):
+            solve([0] * 6, [0] * 6, "sideways")
+        self.assertEqual(calls, [])
+
+        robot.SolveInverseKinematicsConfigured = lambda *args: [0.0] * 5
+        with self.assertRaisesRegex(MotionInputError, "result must contain six"):
+            solve([0] * 6, [0] * 6, "A")
+
+        robot.SolveInverseKinematicsConfigured = (
+            lambda *args: [0.0, 0.0, 0.0, math.inf, 0.0, 0.0]
+        )
+        with self.assertRaises(MotionInputError):
+            solve([0] * 6, [0] * 6, "A")
+
+        robot.SolveInverseKinematicsConfigured = (
+            lambda *args: [0.0, 0.0, 0.0, 0.0, 20.0, 0.0]
+        )
+        with self.assertRaisesRegex(MotionInputError, "N wrist branch"):
+            solve([0] * 6, [0] * 6, "N")
+
+        for invalid_result in (
+            "000000",
+            b"000000",
+            {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+            {0, 1, 2, 3, 4, 5},
+        ):
+            with self.subTest(invalid_result=type(invalid_result).__name__):
+                robot.SolveInverseKinematicsConfigured = (
+                    lambda *args, value=invalid_result: value
+                )
+                with self.assertRaisesRegex(MotionInputError, "ordered numeric sequence"):
+                    solve([0] * 6, [0] * 6, "A")
+
+        robot.SolveInverseKinematicsConfigured = lambda *args: [0.0] * 6
+        for invalid_pose in (
+            "000000",
+            b"000000",
+            {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+            {0, 1, 2, 3, 4, 5},
+        ):
+            with self.subTest(invalid_pose=type(invalid_pose).__name__):
+                robot.forward_kinematics = lambda joints, value=invalid_pose: value
+                with self.assertRaisesRegex(MotionInputError, "ordered numeric sequence"):
+                    solve([0] * 6, [0] * 6, "A")
+        robot.forward_kinematics = lambda joints: [0.0] * 6
+
+        robot.SolveInverseKinematicsConfigured = "incompatible"
+        with self.assertRaisesRegex(MotionInputError, "required configured solver"):
+            solve([0] * 6, [0] * 6, "A")
+
+    def test_native_tool_frame_uses_xyz_rx_ry_rz_order(self):
         class Robot:
             def __init__(self):
                 self.tool_frames = []
                 self.raise_ik = False
 
-            @staticmethod
-            def set_dh_parameters_explicit(*values):
-                pass
-
-            @staticmethod
-            def set_joint_limits(*values):
-                pass
+            def set_robot_configuration(self, dh, positive, negative, tool):
+                self.tool_frames.append(tuple(tool))
 
             def set_robot_tool_frame(self, *values):
                 self.tool_frames.append(values)
 
-            def SolveInverseKinematics(self, *args):
+            def SolveInverseKinematicsConfigured(self, *args):
                 if self.raise_ik:
                     raise RuntimeError("IK failed")
                 return None
@@ -779,7 +1115,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         self.assertTrue(set_kinematics(values))
-        self.assertEqual(robot.tool_frames, [(1.0, 2.0, 3.0, 6.0, 5.0, 4.0)])
+        self.assertEqual(robot.tool_frames, [(1.0, 2.0, 3.0, 4.0, 5.0, 6.0)])
 
         field_values = {
             key: Entry(value)
@@ -803,9 +1139,16 @@ class HmiSourceContractTests(unittest.TestCase):
                     "RzcurPos": 0,
                     "RycurPos": 0,
                     "RxcurPos": 0,
+                    "TFx": 101,
+                    "TFy": 102,
+                    "TFz": 103,
+                    "TFrx": 104,
+                    "TFry": 105,
+                    "TFrz": 106,
                 },
                 "parse_mt_command": lambda command: {
-                    "offset_vector": (10, 20, 30, 40, 50, 60)
+                    "offset_vector": (10, 20, 30, 40, 50, 60),
+                    "WristConfig": "N",
                 },
                 "np": SimpleNamespace(array=lambda values, dtype=None: values),
                 "ErrorHandler": lambda response: None,
@@ -813,15 +1156,460 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         move_tool = self.compile_function("mt_command", namespace)
 
-        move_tool("JTR11Sp1G1H1I1Lm000000\n")
+        move_tool("JTR11Sp1G1H1I1WNLm000000\n")
 
-        self.assertEqual(robot.tool_frames[-2], (10.0, 20.0, 30.0, 40.0, 50.0, 60.0))
-        self.assertEqual(robot.tool_frames[-1], (1.0, 2.0, 3.0, 6.0, 5.0, 4.0))
+        self.assertEqual(
+            robot.tool_frames[-2],
+            (111.0, 122.0, 133.0, 144.0, 155.0, 166.0),
+        )
+        self.assertEqual(
+            robot.tool_frames[-1],
+            (101.0, 102.0, 103.0, 104.0, 105.0, 106.0),
+        )
 
         robot.raise_ik = True
         with self.assertRaisesRegex(RuntimeError, "IK failed"):
-            move_tool("JTR11Sp1G1H1I1Lm000000\n")
-        self.assertEqual(robot.tool_frames[-1], (1.0, 2.0, 3.0, 6.0, 5.0, 4.0))
+            move_tool("JTR11Sp1G1H1I1WNLm000000\n")
+        self.assertEqual(
+            robot.tool_frames[-1],
+            (101.0, 102.0, 103.0, 104.0, 105.0, 106.0),
+        )
+
+    def test_tool_roll_parser_uses_validated_timing_and_wrist_fields(self):
+        namespace = {
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                warning=lambda *args: None,
+            ),
+            "re": re,
+        }
+        parse_tool = self.compile_function("parse_mt_command", namespace)
+
+        result = parse_tool("JTW11Sp50G10H20I25WFLm010101\n")
+
+        self.assertEqual(result["offset_vector"], [0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+        self.assertEqual(result["SpeedType"], "p")
+        self.assertEqual(result["Speed"], 50.0)
+        self.assertEqual(result["Acc"], 10.0)
+        self.assertEqual(result["Dec"], 20.0)
+        self.assertEqual(result["Ramp"], 25.0)
+        self.assertEqual(result["WristConfig"], "F")
+
+        negative = parse_tool("JTW01Sp50G10H20I25WFLm010101\n")
+        self.assertEqual(
+            negative["offset_vector"],
+            [0.0, 0.0, 0.0, -1.0, 0.0, 0.0],
+        )
+        self.assertIsNone(parse_tool("JTW1-1Sp50G10H20I25WFLm010101\n"))
+
+    def test_native_configuration_uses_one_atomic_validated_call(self):
+        class Robot:
+            def __init__(self):
+                self.calls = []
+
+            def set_robot_configuration(self, *args):
+                self.calls.append(args)
+
+            @staticmethod
+            def SolveInverseKinematicsConfigured(*args):
+                return None
+
+        values = self._valid_update_parameter_values()
+        ready = threading.Event()
+        robot = Robot()
+        namespace = {
+            "robot": robot,
+            "kinematics_configuration_ready": ready,
+        }
+        set_kinematics = self.compile_function(
+            "_set_cpp_kinematics_from_values",
+            namespace,
+        )
+
+        self.assertTrue(set_kinematics(values))
+        self.assertTrue(ready.is_set())
+        self.assertEqual(len(robot.calls), 1)
+        dh, positive, negative, tool = robot.calls[0]
+        self.assertEqual(len(dh), 24)
+        self.assertEqual(len(positive), 6)
+        self.assertEqual(len(negative), 6)
+        self.assertEqual(len(tool), 6)
+
+        invalid = dict(values)
+        invalid["J3NegLim"] = -1
+        with self.assertRaisesRegex(MotionInputError, "non-negative"):
+            set_kinematics(invalid)
+        self.assertFalse(ready.is_set())
+        self.assertEqual(len(robot.calls), 1)
+
+        underflow_theta = dict(values)
+        underflow_theta["J1ΘDHpar"] = 1e-44
+        with self.assertRaisesRegex(MotionInputError, "theta native radians"):
+            set_kinematics(underflow_theta)
+        self.assertFalse(ready.is_set())
+        self.assertEqual(len(robot.calls), 1)
+
+        underflow_tool_rotation = dict(values)
+        underflow_tool_rotation["TFrz"] = 1e-44
+        with self.assertRaisesRegex(MotionInputError, "TFrz native radians"):
+            set_kinematics(underflow_tool_rotation)
+        self.assertFalse(ready.is_set())
+        self.assertEqual(len(robot.calls), 1)
+
+        maximum_tool_rotation = dict(values)
+        maximum_tool_rotation["TFrz"] = float.fromhex("0x1.fffffep+127")
+        with self.assertRaisesRegex(MotionInputError, "TFrz native degrees"):
+            set_kinematics(maximum_tool_rotation)
+        self.assertFalse(ready.is_set())
+        self.assertEqual(len(robot.calls), 1)
+
+        namespace["robot"] = SimpleNamespace()
+        with self.assertRaisesRegex(MotionInputError, "required configured API"):
+            set_kinematics(values)
+        self.assertFalse(ready.is_set())
+
+    def test_native_configuration_rejects_incomplete_apis_before_writes(self):
+        for missing_name in (
+            "set_robot_configuration",
+            "SolveInverseKinematicsConfigured",
+        ):
+            with self.subTest(missing=missing_name):
+                writes = []
+                robot = SimpleNamespace(
+                    set_dh_parameters_explicit=lambda *values: writes.append("dh"),
+                    set_joint_limits=lambda *values: writes.append("limits"),
+                    set_robot_tool_frame=lambda *values: writes.append("tool"),
+                    get_dh_parameters=lambda: [[0.0] * 4 for _ in range(6)],
+                    get_joint_limits=lambda: ([180.0] * 6, [180.0] * 6),
+                    get_robot_tool_frame=lambda: [0.0] * 6,
+                    set_robot_configuration=lambda *values: writes.append("atomic"),
+                    SolveInverseKinematicsConfigured=lambda *values: [0.0] * 6,
+                )
+                delattr(robot, missing_name)
+                ready = threading.Event()
+                set_kinematics = self.compile_function(
+                    "_set_cpp_kinematics_from_values",
+                    {
+                        "robot": robot,
+                        "kinematics_configuration_ready": ready,
+                    },
+                )
+
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    rf"required configured API:.*{missing_name}",
+                ):
+                    set_kinematics(self._valid_update_parameter_values())
+                self.assertFalse(ready.is_set())
+                self.assertEqual(writes, [])
+
+    def test_motion_admission_requires_native_configuration(self):
+        ready = threading.Event()
+        namespace = {
+            "kinematics_configuration_ready": ready,
+            "logger": SimpleNamespace(warning=lambda *args: None),
+        }
+        acquire = self.compile_function("_acquire_motion_request", namespace)
+
+        self.assertIsNone(acquire("Cartesian jog"))
+        self.assertEqual(
+            namespace["_motion_request_rejection_message"]("fallback"),
+            "Cartesian jog not started; native kinematics configuration is unavailable",
+        )
+        self.assertIsNone(
+            acquire("Position recovery", allow_position_recovery=True)
+        )
+        repair_lease = acquire(
+            "Configuration repair",
+            requires_kinematics=False,
+        )
+        self.assertIsInstance(repair_lease, MotionRequestLease)
+        repair_lease.close()
+
+        namespace["controller_position_resynchronization_required"].set()
+        self.assertIsNone(
+            acquire("Non-motion operation", requires_kinematics=False)
+        )
+        recovery_lease = acquire(
+            "Controller startup",
+            allow_position_recovery=True,
+            requires_kinematics=False,
+        )
+        self.assertIsInstance(recovery_lease, MotionRequestLease)
+        recovery_lease.close()
+        namespace["controller_position_resynchronization_required"].clear()
+
+        ready.set()
+        lease = acquire("Cartesian jog")
+        self.assertIsInstance(lease, MotionRequestLease)
+        lease.close()
+
+    def test_synchronous_configuration_repair_bypasses_only_kinematics_gate(self):
+        ready = threading.Event()
+        namespace = {
+            "kinematics_configuration_ready": ready,
+            "logger": SimpleNamespace(warning=lambda *args: None),
+            "wraps": wraps,
+        }
+        namespace["_acquire_motion_request"] = self.compile_function(
+            "_acquire_motion_request",
+            namespace,
+        )
+        decorator = self.compile_function(
+            "_synchronous_motion_request",
+            namespace,
+        )
+        calls = []
+        repair = decorator(
+            "Configuration repair",
+            requires_kinematics=False,
+        )(lambda: calls.append("repair") or True)
+        motion = decorator("Motion")(lambda: calls.append("motion") or True)
+
+        self.assertTrue(repair())
+        self.assertFalse(motion())
+        self.assertEqual(calls, ["repair"])
+
+    def test_generic_program_exchange_bypasses_only_kinematics_gate(self):
+        ready = threading.Event()
+        exchanges = []
+        registry = MotionRequestRegistry()
+        namespace = {
+            "kinematics_configuration_ready": ready,
+            "motion_request_registry": registry,
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "wraps": wraps,
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "ROW_EXECUTION_COMPLETE": "complete",
+            "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
+            "almStatusLab2": SimpleNamespace(config=lambda **kwargs: None),
+            "_tracked_serial_operation": (
+                lambda *args, **kwargs: lambda callback: callback
+            ),
+            "_exchange_legacy_main_command": (
+                lambda command, **contract: exchanges.append(
+                    (command, contract)
+                ) or b"Done\n"
+            ),
+        }
+        namespace["_acquire_motion_request"] = self.compile_function(
+            "_acquire_motion_request",
+            namespace,
+        )
+        namespace["_synchronous_motion_request"] = self.compile_function(
+            "_synchronous_motion_request",
+            namespace,
+        )
+        execute = self.compile_function(
+            "_execute_row_main_command",
+            namespace,
+            preserve_decorators=True,
+        )
+
+        self.assertEqual(
+            execute("TLX1\n", accepted_responses=(b"Done",)),
+            ("complete", b"Done\n"),
+        )
+        self.assertEqual(
+            exchanges,
+            [("TLX1\n", {"accepted_responses": (b"Done",)})],
+        )
+        self.assertFalse(registry.active)
+
+    def test_offline_cartesian_jog_matches_firmware_axis_slots(self):
+        base = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+        pose_contract = TEENSY_CARTESIAN_POSE_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("external_cartesian_pose_to_native", pose_contract)
+        self.assertIn("native_cartesian_pose_to_external", pose_contract)
+        expected_targets = {
+            10: (0.0, 2.0, 3.0, 6.0, 5.0, 4.0),
+            11: (2.0, 2.0, 3.0, 6.0, 5.0, 4.0),
+            20: (1.0, 1.0, 3.0, 6.0, 5.0, 4.0),
+            21: (1.0, 3.0, 3.0, 6.0, 5.0, 4.0),
+            30: (1.0, 2.0, 2.0, 6.0, 5.0, 4.0),
+            31: (1.0, 2.0, 4.0, 6.0, 5.0, 4.0),
+            40: (1.0, 2.0, 3.0, 6.0, 5.0, 3.0),
+            41: (1.0, 2.0, 3.0, 6.0, 5.0, 5.0),
+            50: (1.0, 2.0, 3.0, 6.0, 4.0, 4.0),
+            51: (1.0, 2.0, 3.0, 6.0, 6.0, 4.0),
+            60: (1.0, 2.0, 3.0, 5.0, 5.0, 4.0),
+            61: (1.0, 2.0, 3.0, 7.0, 5.0, 4.0),
+        }
+        captured_targets = []
+        namespace = {
+            "RUN": {
+                "offlineMode": True,
+                "VR_angles": [0.0] * 6,
+                "Alarm": "0",
+            },
+            "CAL": dict(zip(
+                ("XcurPos", "YcurPos", "ZcurPos", "RzcurPos", "RycurPos", "RxcurPos"),
+                base,
+            )),
+            "np": np,
+            "_solve_inverse_kinematics": (
+                lambda target, estimate, wrist: captured_targets.append(
+                    tuple(float(value) for value in target)
+                ) or None
+            ),
+            "_queue_virtual_motion_error": lambda error: None,
+            "logger": SimpleNamespace(error=lambda *args: None),
+        }
+        live_cartesian = self.compile_function("live_cartesian_jog", namespace)
+
+        for vector, expected in expected_targets.items():
+            with self.subTest(vector=vector):
+                captured_targets.clear()
+                self.assertFalse(live_cartesian(
+                    f"LCV{vector}Sp10Ac10Dc10Rm10WALm000000\n",
+                    threading.Event(),
+                ))
+                self.assertEqual(captured_targets, [expected])
+
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        live_start = firmware.index('if (function == "LC")')
+        live_end = firmware.index('if (function == "LJ")', live_start)
+        live_branch = firmware[live_start:live_end]
+        for vector, index, operator in (
+            (10, 0, "-"), (11, 0, "+"),
+            (20, 1, "-"), (21, 1, "+"),
+            (30, 2, "-"), (31, 2, "+"),
+            (40, 3, "-"), (41, 3, "+"),
+            (50, 4, "-"), (51, 4, "+"),
+            (60, 5, "-"), (61, 5, "+"),
+        ):
+            self.assertRegex(
+                live_branch,
+                rf"(?s)Vector == {vector}.*?xyzuvw_In\[{index}\] "
+                rf"= xyzuvw_Out\[{index}\] \{operator} JogStepInc",
+            )
+        self.assertIn(
+            "ar4_protocol::external_cartesian_pose_to_native_radians(",
+            firmware,
+        )
+        self.assertIn(
+            "ar4_protocol::native_cartesian_pose_to_external(",
+            firmware,
+        )
+
+    def test_offline_live_workers_forward_encoded_motion_profiles(self):
+        expected_profile = ("p", 37.5, 12.5, 23.5, 34.5)
+        captured_profiles = {}
+
+        def runtime_namespace(label):
+            stop_event = threading.Event()
+
+            def start_segment(event, args):
+                captured_profiles[label] = tuple(args[-5:])
+                event.set()
+                return object()
+
+            runtime = {
+                "offlineMode": True,
+                "VR_angles": [0.0] * 6,
+                "Alarm": "0",
+                "KinematicError": 0,
+            }
+            calibration = {
+                "XcurPos": 0.0,
+                "YcurPos": 0.0,
+                "ZcurPos": 0.0,
+                "RzcurPos": 0.0,
+                "RycurPos": 0.0,
+                "RxcurPos": 0.0,
+            }
+            namespace = {
+                "RUN": runtime,
+                "CAL": calibration,
+                "np": np,
+                "_start_offline_virtual_segment": start_segment,
+                "_await_offline_virtual_segment": lambda operation: True,
+                "_queue_virtual_motion_error": lambda error: None,
+                "logger": SimpleNamespace(error=lambda *args: None),
+            }
+            for axis in range(1, 7):
+                runtime[f"J{axis}axisLimNeg"] = 0.0
+                runtime[f"J{axis}StepM"] = 0
+                calibration[f"J{axis}StepDeg"] = 1.0
+                namespace[f"J{axis}StepLim"] = 100
+            return namespace, stop_event
+
+        joint_namespace, joint_stop = runtime_namespace("joint")
+        joint_worker = self.compile_function(
+            "live_joint_jog",
+            joint_namespace,
+        )
+        self.assertTrue(joint_worker(
+            "LJV11Sp37.5Ac12.5Dc23.5Rm34.5WALm000000\n",
+            joint_stop,
+        ))
+
+        cartesian_namespace, cartesian_stop = runtime_namespace("cartesian")
+        cartesian_namespace["_solve_inverse_kinematics"] = (
+            lambda target, estimate, wrist: [0.0] * 6
+        )
+        cartesian_worker = self.compile_function(
+            "live_cartesian_jog",
+            cartesian_namespace,
+        )
+        self.assertTrue(cartesian_worker(
+            "LCV11Sp37.5Ac12.5Dc23.5Rm34.5WNLm000000\n",
+            cartesian_stop,
+        ))
+
+        class Robot:
+            @staticmethod
+            def forward_kinematics(angles):
+                return [0.0] * 6
+
+            @staticmethod
+            def set_robot_tool_frame(*values):
+                return None
+
+        tool_namespace, tool_stop = runtime_namespace("tool")
+        tool_namespace.update({
+            "robot": Robot(),
+            "_solve_inverse_kinematics": (
+                lambda target, estimate, wrist: [0.0] * 6
+            ),
+        })
+        tool_worker = self.compile_function(
+            "live_tool_jog",
+            tool_namespace,
+        )
+        self.assertTrue(tool_worker(
+            "LTV10Sp37.5Ac12.5Dc23.5Rm34.5WNLm000000\n",
+            (0.0,) * 6,
+            tool_stop,
+        ))
+
+        self.assertEqual(
+            captured_profiles,
+            {
+                "joint": expected_profile,
+                "cartesian": expected_profile,
+                "tool": expected_profile,
+            },
+        )
+
+        profile_parser = self.compile_function(
+            "_parse_live_jog_drive_profile",
+            {"parse_command_timing": parse_command_timing},
+        )
+        for opcode, wrist in (("LJ", "A"), ("LC", "N"), ("LT", "N")):
+            for mode in ("s", "m"):
+                with self.subTest(opcode=opcode, mode=mode):
+                    with self.assertRaises(MotionInputError):
+                        profile_parser(
+                            f"{opcode}V11S{mode}37.5Ac12.5Dc23.5Rm34.5"
+                            f"W{wrist}Lm000000\n",
+                            opcode,
+                        )
 
     def test_live_tool_jog_preserves_native_rotation_order(self):
         class Robot:
@@ -836,7 +1624,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.tool_frames.append(values)
 
             @staticmethod
-            def SolveInverseKinematics(*args):
+            def SolveInverseKinematicsConfigured(*args):
                 return None
 
         class Entry:
@@ -859,6 +1647,14 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace = {
             **fields,
             "RUN": {"offlineMode": True},
+            "CAL": {
+                "TFx": 10,
+                "TFy": 20,
+                "TFz": 30,
+                "TFrx": 40,
+                "TFry": 50,
+                "TFrz": 60,
+            },
             "_live_jog_start_is_blocked": lambda: False,
             "_prepare_live_jog": (
                 lambda *args: (40, "Sp", "10", "10", "10", "10", "000000")
@@ -880,7 +1676,10 @@ class HmiSourceContractTests(unittest.TestCase):
         start_live_tool = self.compile_function("LiveToolJog", namespace)
 
         self.assertTrue(start_live_tool(40))
-        self.assertEqual(captured_frames, [(1.0, 2.0, 3.0, 6.0, 5.0, 4.0)])
+        self.assertEqual(
+            captured_frames,
+            [(10.0, 20.0, 30.0, 40.0, 50.0, 60.0)],
+        )
 
         robot = Robot()
         worker_namespace = {
@@ -897,15 +1696,32 @@ class HmiSourceContractTests(unittest.TestCase):
         }
         live_worker = self.compile_function("live_tool_jog", worker_namespace)
 
-        self.assertFalse(
-            live_worker(
-                "LTV41Sp10Ac10Dc10Rm10WALm000000\n",
-                (1.0, 2.0, 3.0, 6.0, 5.0, 4.0),
-                threading.Event(),
-            )
-        )
-        self.assertEqual(robot.tool_frames[0], (1.0, 2.0, 3.0, 7.0, 5.0, 4.0))
-        self.assertEqual(robot.tool_frames[1], (1.0, 2.0, 3.0, 6.0, 5.0, 4.0))
+        original = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0)
+        expected_frames = {
+            10: (10.25, 20.0, 30.0, 40.0, 50.0, 60.0),
+            11: (9.75, 20.0, 30.0, 40.0, 50.0, 60.0),
+            20: (10.0, 20.25, 30.0, 40.0, 50.0, 60.0),
+            21: (10.0, 19.75, 30.0, 40.0, 50.0, 60.0),
+            30: (10.0, 20.0, 30.25, 40.0, 50.0, 60.0),
+            31: (10.0, 20.0, 29.75, 40.0, 50.0, 60.0),
+            40: (10.0, 20.0, 30.0, 40.0, 50.0, 60.25),
+            41: (10.0, 20.0, 30.0, 40.0, 50.0, 59.75),
+            50: (10.0, 20.0, 30.0, 40.0, 50.25, 60.0),
+            51: (10.0, 20.0, 30.0, 40.0, 49.75, 60.0),
+            60: (10.0, 20.0, 30.0, 40.25, 50.0, 60.0),
+            61: (10.0, 20.0, 30.0, 39.75, 50.0, 60.0),
+        }
+        for vector, expected in expected_frames.items():
+            with self.subTest(vector=vector):
+                robot.tool_frames.clear()
+                self.assertFalse(
+                    live_worker(
+                        f"LTV{vector}Sp10Ac10Dc10Rm10WALm000000\n",
+                        original,
+                        threading.Event(),
+                    )
+                )
+                self.assertEqual(robot.tool_frames, [expected, original])
 
     def test_update_parameters_rejects_late_invalid_input_before_mutation(self):
         values = self._valid_update_parameter_values()
@@ -1184,6 +2000,110 @@ class HmiSourceContractTests(unittest.TestCase):
         del missing_external_field["J9steps"]
         with self.assertRaisesRegex(MotionInputError, "missing J9steps"):
             prepare(missing_external_field)
+
+        largest_accepted_rotation = dict(profile)
+        largest_accepted_rotation["TFrz"] = float.fromhex("0x1.fffffcp+127")
+        self.assertEqual(
+            prepare(largest_accepted_rotation)["TFrz"],
+            largest_accepted_rotation["TFrz"],
+        )
+
+        for invalid, message in (
+            (1e-44, "TFrz native radians"),
+            (float.fromhex("0x1.fffffep+127"), "TFrz native degrees"),
+        ):
+            with self.subTest(rotation=invalid):
+                invalid_rotation = dict(profile)
+                invalid_rotation["TFrz"] = invalid
+                with self.assertRaisesRegex(MotionInputError, message):
+                    prepare(invalid_rotation)
+
+    def test_rotation_contract_preflights_startup_and_profile_save(self):
+        active_calibration = self._valid_custom_calibration_profile()
+        for axis in range(1, 7):
+            active_calibration[f"J{axis}AngCur"] = 0.0
+        for axis in range(7, 10):
+            active_calibration[f"J{axis}PosCur"] = 0.0
+
+        class Robot:
+            @staticmethod
+            def set_robot_configuration(*args):
+                raise AssertionError("startup preflight invoked the native writer")
+
+            @staticmethod
+            def SolveInverseKinematicsConfigured(*args):
+                return None
+
+        startup_namespace = {
+            "CAL": active_calibration,
+            "robot": Robot(),
+            "com2SelectedValue": SimpleNamespace(get=lambda: "COM2"),
+            "auxiliaryBoardSelectedValue": SimpleNamespace(
+                get=lambda: AUXILIARY_BOARD_NANO
+            ),
+            "_prepare_position_command": lambda values: "SPA0\n",
+            "ControllerStartupRequest": SimpleNamespace,
+        }
+        prepare_startup = self.compile_function(
+            "_prepare_controller_startup",
+            startup_namespace,
+        )
+
+        profile_namespace = {"CAL": active_calibration}
+        self.add_custom_profile_validation_dependencies(profile_namespace)
+        prepare_update = profile_namespace[
+            "_prepare_update_parameters_from_values"
+        ]
+
+        for invalid, message in (
+            (1e-44, "TFrz native radians"),
+            (float.fromhex("0x1.fffffep+127"), "TFrz native degrees"),
+        ):
+            with self.subTest(rotation=invalid):
+                update_values = self._valid_update_parameter_values()
+                update_values["TFrz"] = invalid
+                startup_namespace["_prepare_controller_calibration"] = (
+                    lambda values=update_values: (
+                        values,
+                        "UPA0\n",
+                        {},
+                        "CEA0\n",
+                    )
+                )
+                with self.assertRaisesRegex(MotionInputError, message):
+                    prepare_startup()
+
+                persistence_calls = []
+                save_namespace = {
+                    "CAL": active_calibration,
+                    "_collect_fields_to_calibration": lambda: {},
+                    "_prepare_controller_calibration": (
+                        lambda values=update_values: (
+                            prepare_update(values)[0],
+                            "UPA0\n",
+                            {},
+                            "CEA0\n",
+                        )
+                    ),
+                    "_validate_controller_pose": lambda values: True,
+                    "save_calibration": (
+                        lambda **kwargs: persistence_calls.append(kwargs) or True
+                    ),
+                    "logger": SimpleNamespace(exception=lambda *args: None),
+                }
+                save_namespace["_prepare_custom_calibration_snapshot"] = (
+                    self.compile_function(
+                        "_prepare_custom_calibration_snapshot",
+                        save_namespace,
+                    )
+                )
+                save_profile = self.compile_function(
+                    "save_custom_calibration",
+                    save_namespace,
+                )
+
+                self.assertFalse(save_profile())
+                self.assertEqual(persistence_calls, [])
 
     def test_custom_profile_sync_stages_all_controller_fields_only(self):
         class Entry:
@@ -2116,6 +3036,7 @@ class HmiSourceContractTests(unittest.TestCase):
     def test_controller_startup_stages_position_before_calibration_mutation(self):
         calibration = {"com2Port": "old"}
         apply_calls = []
+        preflight_calls = []
         namespace = {
             "CAL": calibration,
             "com2SelectedValue": SimpleNamespace(get=lambda: "COM2"),
@@ -2133,6 +3054,9 @@ class HmiSourceContractTests(unittest.TestCase):
                     MotionInputError("position is outside staged limits")
                 )
             ),
+            "_prepare_cpp_kinematics_configuration": (
+                lambda values: preflight_calls.append(dict(values))
+            ),
             "_apply_controller_calibration": (
                 lambda *args: apply_calls.append(args) or True
             ),
@@ -2148,9 +3072,14 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertEqual(calibration, {"com2Port": "old"})
         self.assertEqual(apply_calls, [])
+        self.assertEqual(
+            preflight_calls,
+            [{"com2Port": "old", "update": 1, "external": 2}],
+        )
 
     def test_controller_startup_defers_local_calibration_until_success(self):
         calibration = {"com2Port": "old", "sentinel": "unchanged"}
+        preflight_calls = []
         namespace = {
             "CAL": calibration,
             "com2SelectedValue": SimpleNamespace(get=lambda: "COM2"),
@@ -2164,6 +3093,9 @@ class HmiSourceContractTests(unittest.TestCase):
                 "CEA2\n",
             ),
             "_prepare_position_command": lambda values: "SPA1\n",
+            "_prepare_cpp_kinematics_configuration": (
+                lambda values: preflight_calls.append(dict(values))
+            ),
             "ControllerStartupRequest": SimpleNamespace,
         }
         prepare_startup = self.compile_function(
@@ -2177,6 +3109,17 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(request.auxiliary_board, AUXILIARY_BOARD_NANO)
         self.assertEqual(update_values, {"update": 1})
         self.assertEqual(external_values, {"external": 2})
+        self.assertEqual(
+            preflight_calls,
+            [
+                {
+                    "com2Port": "old",
+                    "sentinel": "unchanged",
+                    "update": 1,
+                    "external": 2,
+                }
+            ],
+        )
         self.assertEqual(
             calibration,
             {"com2Port": "old", "sentinel": "unchanged"},
@@ -5616,9 +6559,9 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace,
         )
 
-        self.assertEqual(validate_modbus("0"), 0)
+        self.assertEqual(validate_modbus("1"), 1)
         self.assertEqual(validate_modbus("2147483"), 2147483)
-        for value in (True, -1, 1.5, "2147484", "1e2"):
+        for value in (True, 0, -1, 1.5, "2147484", "1e2"):
             with self.subTest(value=value):
                 with self.assertRaises(MotionInputError):
                     validate_modbus(value)
@@ -5635,10 +6578,81 @@ class HmiSourceContractTests(unittest.TestCase):
                 f'if (function == "{next_opcode}")',
                 branch_start,
             )
-            self.assertIn('Serial.print("Done")', firmware[branch_start:branch_end])
+            branch = firmware[branch_start:branch_end]
+            self.assertIn('Serial.println("Done")', branch)
+            self.assertIn('Serial.println("Modbus Error")', branch)
+            self.assertIn('Serial.println("ER")', branch)
         wait_start = firmware.index('if (function == "WT")')
-        wait_end = firmware.index('if (function == "ON")', wait_start)
+        wait_end = firmware.index(
+            'if (function == "ON" || function == "OF")',
+            wait_start,
+        )
         self.assertIn('Serial.println("WTdone")', firmware[wait_start:wait_end])
+
+    def test_program_modbus_responses_fail_before_row_completion(self):
+        class Label:
+            def __init__(self):
+                self.text = None
+
+            def config(self, **kwargs):
+                self.text = kwargs.get("text")
+
+        response = {"value": "1"}
+        finishes = []
+        first_label = Label()
+        second_label = Label()
+        namespace = {
+            "ROW_EXECUTION_COMPLETE": "complete",
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "ProtocolResponseError": ProtocolResponseError,
+            "_execute_row_main_command": (
+                lambda command, **contract: ("complete", response["value"])
+            ),
+            "_finish_execute_row": lambda: finishes.append(True),
+            "logger": SimpleNamespace(error=lambda *args: None),
+            "almStatusLab": first_label,
+            "almStatusLab2": second_label,
+        }
+        execute = self.compile_function(
+            "_execute_row_main_response",
+            namespace,
+        )
+
+        self.assertEqual(
+            execute(
+                "SCA1B0C1\n",
+                response_parser=parse_controller_modbus_response,
+            ),
+            ("complete", "1"),
+        )
+        self.assertEqual(finishes, [])
+
+        for rejected in ("ER", "Modbus Error", "-1", "unexpected"):
+            with self.subTest(rejected=rejected):
+                response["value"] = rejected
+                self.assertEqual(
+                    execute(
+                        "SCA1B0C1\n",
+                        response_parser=parse_controller_modbus_response,
+                    ),
+                    ("rejected", None),
+                )
+        self.assertEqual(len(finishes), 4)
+        self.assertIn("response rejected", first_label.text)
+        self.assertEqual(first_label.text, second_label.text)
+
+        execute_row_source = ast.get_source_segment(
+            AR4_SOURCE.read_text(encoding="utf-8"),
+            self.module_functions["executeRow"],
+        )
+        self.assertNotIn('response == "Modbus Error"', execute_row_source)
+        self.assertNotIn('response == "-1"', execute_row_source)
+        self.assertGreaterEqual(
+            execute_row_source.count(
+                "response_parser=parse_controller_modbus_response"
+            ),
+            8,
+        )
 
     def test_injectable_auxiliary_command_requires_validated_line_ownership(self):
         execute_auxiliary = self.compile_function(
@@ -5921,7 +6935,7 @@ class HmiSourceContractTests(unittest.TestCase):
         }
         exchange_line = self.compile_function("_exchange_serial_line", namespace)
 
-        command = "LJV0.1Sp50Ac10Dc20Rm25WALm000000\n"
+        command = "LJV10Sp50Ac10Dc20Rm25WALm000000\n"
         self.assertEqual(exchange_line(command, control_event), "response")
         self.assertEqual(calls[0][0][1], canonicalize_serial_command(command))
         self.assertEqual(
@@ -6348,7 +7362,7 @@ class HmiSourceContractTests(unittest.TestCase):
         cases = (
             (f"Move J [*] {cartesian}", "MJ", "mj"),
             (f"OFF J [ PR: 1 ] [*] {cartesian}", "MJ", "mj"),
-            (f"Move V [ PR: 1 ] [*] {cartesian}", "MV", "mj"),
+            (f"Move V [ PR: 1 ] [*] {cartesian}", "MV", "mv"),
             (
                 "Move P [ PR: 1 ] [*] J7 7 J8 8 J9 9 "
                 "Sp 25 Ac 10 Dc 10 Rm 100 $ N",
@@ -6381,6 +7395,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 dispatches = []
                 finishes = []
                 mj_dispatch = lambda value: value
+                mv_dispatch = lambda value: value
                 rj_dispatch = lambda value: value
                 namespace = {
                     "RUN": {
@@ -6404,6 +7419,7 @@ class HmiSourceContractTests(unittest.TestCase):
                     "VisRetYrobEntryField": Entry("0"),
                     "VisRetAngleEntryField": Entry("0"),
                     "mj_command": mj_dispatch,
+                    "mv_command": mv_dispatch,
                     "rj_command": rj_dispatch,
                     "_dispatch_program_command": (
                         lambda *args: dispatches.append(args) or "complete"
@@ -6425,7 +7441,11 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.assertTrue(dispatches[0][0].startswith(expected_opcode))
                 self.assertIs(
                     dispatches[0][1],
-                    mj_dispatch if expected_virtual == "mj" else rj_dispatch,
+                    {
+                        "mj": mj_dispatch,
+                        "mv": mv_dispatch,
+                        "rj": rj_dispatch,
+                    }[expected_virtual],
                 )
                 self.assertTrue(dispatches[0][2].startswith(expected_virtual.upper()))
                 self.assertEqual(finishes, [True])
@@ -7780,7 +8800,7 @@ class HmiSourceContractTests(unittest.TestCase):
                     "RxcurPos",
                 )
             ),
-            ("10.000", "20.000", "30.000", "40.000", "50.000", "60.000"),
+            ("10.000", "20.000", "30.000", "60.000", "50.000", "40.000"),
         )
         self.assertEqual(
             tuple(calibration[f"J{axis}AngCur"] for axis in range(1, 7)),
@@ -8003,6 +9023,11 @@ class HmiSourceContractTests(unittest.TestCase):
         order = []
         lease = object()
 
+        def acquire(name):
+            self.assertEqual(name, "Mode transition")
+            order.append("logical-acquire")
+            return lease
+
         @contextmanager
         def reserve_transport():
             order.append("transport-enter")
@@ -8018,9 +9043,7 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace = {
             "RUN": {"offlineMode": True, "VR_angles": [9.0] * 6},
             "CAL": {f"J{axis}AngCur": str(axis) for axis in range(1, 7)},
-            "_acquire_motion_request": (
-                lambda name: order.append("logical-acquire") or lease
-            ),
+            "_acquire_motion_request": acquire,
             "_finish_motion_request": (
                 lambda value: order.append("logical-release") or True
             ),
@@ -8502,6 +9525,45 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(result, "rejected")
         self.assertEqual(virtual_commands, [VIRTUAL_CARTESIAN_TEST_COMMAND])
         self.assertEqual(waits, [(operation, expected_timeout)])
+
+    def test_program_motion_rejects_physical_virtual_wrist_mismatch(self):
+        first_label = SimpleNamespace(text=None)
+        second_label = SimpleNamespace(text=None)
+        first_label.config = lambda **kwargs: setattr(
+            first_label,
+            "text",
+            kwargs.get("text"),
+        )
+        second_label.config = lambda **kwargs: setattr(
+            second_label,
+            "text",
+            kwargs.get("text"),
+        )
+        namespace = {
+            "RUN": {"offlineMode": False},
+            "_controller_response_timeout": lambda command: self.fail(
+                "mismatched wrist commands reached controller timing"
+            ),
+            "_virtual_completion_timeout": lambda command: self.fail(
+                "mismatched wrist commands reached virtual timing"
+            ),
+            "logger": SimpleNamespace(error=lambda *args: None),
+            "almStatusLab": first_label,
+            "almStatusLab2": second_label,
+            "ROW_EXECUTION_REJECTED": "rejected",
+        }
+        dispatch = self.compile_function("_dispatch_program_motion", namespace)
+
+        result = dispatch(
+            CONTROLLER_CARTESIAN_TEST_COMMAND,
+            lambda command: self.fail("mismatched wrist commands were dispatched"),
+            VIRTUAL_CARTESIAN_TEST_COMMAND.replace("WN", "WF"),
+            None,
+        )
+
+        self.assertEqual(result, "rejected")
+        self.assertIn("same wrist configuration", first_label.text)
+        self.assertEqual(second_label.text, first_label.text)
 
     def test_program_motion_worker_start_exception_settles_virtual_owner(self):
         def run_dispatch(with_callback):
@@ -9180,7 +10242,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 "MJX1Y2Z3Rz4Ry5Rx6"
                 "Ss30Ac10Dc20Rm25WNLm000000\n"
             ),
-            "JTX11Ss30G10H20I25Lm000000\n",
+            "JTX11Ss30G10H20I25WNLm000000\n",
         )
 
         for command in commands:
@@ -9214,7 +10276,11 @@ class HmiSourceContractTests(unittest.TestCase):
         }
         namespace = {
             "RUN": runtime,
-            "CAL": {f"J{axis}StepDeg": 1.0 for axis in range(1, 7)},
+            "CAL": {
+                **{f"J{axis}StepDeg": 1.0 for axis in range(1, 7)},
+                **{f"J{axis}PosLim": 100.0 for axis in range(1, 7)},
+                **{f"J{axis}NegLim": 100.0 for axis in range(1, 7)},
+            },
             "J1StepLim": 100,
             "J2StepLim": 100,
             "J3StepLim": 100,
@@ -9228,17 +10294,30 @@ class HmiSourceContractTests(unittest.TestCase):
             "re": re,
             "np": np,
             "robot": SimpleNamespace(
-                SolveInverseKinematics=lambda target, seed: [0.0] * 6,
+                SolveInverseKinematicsConfigured=(
+                    lambda target, seed, wrist: [1, 1, 1, 1, 0, 1]
+                ),
                 forward_kinematics=lambda seed: (
                     forward_inputs.append(seed)
-                    or [
-                        10.0,
-                        20.0,
-                        30.0,
-                        math.radians(4.0),
-                        math.radians(5.0),
-                        math.radians(6.0),
-                    ]
+                    or (
+                        [
+                            10.0,
+                            20.0,
+                            30.0,
+                            math.radians(4.0),
+                            math.radians(5.0),
+                            math.radians(6.0),
+                        ]
+                        if tuple(seed) == (0.0,) * 6
+                        else [
+                            1.0,
+                            2.0,
+                            3.0,
+                            math.radians(6.0),
+                            math.radians(5.0),
+                            math.radians(4.0),
+                        ]
+                    )
                 ),
             ),
             "start_driveMotorsJ_thread": (
@@ -9282,7 +10361,7 @@ class HmiSourceContractTests(unittest.TestCase):
                         self.assertAlmostEqual(actual, expected)
                     self.assertEqual(
                         started[-1][18],
-                        (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+                        (1.0, 2.0, 3.0, 6.0, 5.0, 4.0),
                     )
 
         runtime["VR_angles"] = [0.0] * 5
@@ -9293,7 +10372,7 @@ class HmiSourceContractTests(unittest.TestCase):
             )
         )
         self.assertEqual(len(started), started_count)
-        self.assertEqual(len(forward_inputs), 1)
+        self.assertEqual(len(forward_inputs), 4)
 
     def test_virtual_cartesian_mm_per_second_drive_uses_real_numpy_endpoints(self):
         sleeps = []
@@ -9620,6 +10699,12 @@ class HmiSourceContractTests(unittest.TestCase):
             "folder/demo",
             "folder\\demo",
             "C:demo",
+            'bad"name',
+            "bad*name",
+            "bad<name",
+            "bad>name",
+            "bad?name",
+            "bad|name",
             "bad\tname",
             "é",
         ):
@@ -9627,7 +10712,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 with self.assertRaises(MotionInputError):
                     build_command(filename)
 
-    def test_gcode_storage_and_feed_boundaries_match_controller_units(self):
+    def test_gcode_storage_and_feed_boundaries_enforce_controller_units(self):
         namespace = {
             "MotionInputError": MotionInputError,
             "MAX_COMMAND_LENGTH": 4096,
@@ -9644,7 +10729,28 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         self.assertEqual(storage_filename(" demo "), "demo.txt")
-        for invalid in ("", ".", "..", "folder/demo", "C:demo", "bad\x7fname"):
+        maximum_base = "a" * (MAX_CONTROLLER_FILENAME_BYTES - len(".txt"))
+        self.assertEqual(
+            storage_filename(maximum_base),
+            f"{maximum_base}.txt",
+        )
+        with self.assertRaises(MotionInputError):
+            storage_filename(f"{maximum_base}a")
+        for invalid in (
+            "",
+            ".",
+            "..",
+            "folder/demo",
+            "C:demo",
+            'bad"name',
+            "bad*name",
+            "bad<name",
+            "bad>name",
+            "bad?name",
+            "bad|name",
+            "bad\\name",
+            "bad\x7fname",
+        ):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(MotionInputError):
                     storage_filename(invalid)
@@ -9811,13 +10917,928 @@ class HmiSourceContractTests(unittest.TestCase):
             recovery_statements,
             [
                 'Serial.println("EG");',
-                'inData = "";',
-                'cmdBuffer1 = "";',
-                "shiftCMDarray();",
+                "consume_current_command();",
                 "return;",
             ],
         )
         self.assertNotIn("while (1)", missing_file)
+
+    def test_tool_jog_wrist_mode_is_paired_with_firmware_parser(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        native_kinematics = NATIVE_KINEMATICS_SOURCE.read_text(encoding="utf-8")
+        wrist_contract = TEENSY_WRIST_SELECTION_CONTRACT.read_text(encoding="utf-8")
+        motion_contract = TEENSY_MOTION_COMMAND_PARSE_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+        branch_start = firmware.index('if (function == "JT")')
+        branch_end = firmware.index('if (function == "MV")', branch_start)
+        branch = firmware[branch_start:branch_end]
+        self.assertIn("parse_tool_jog_command(inData, commandFields)", branch)
+        parse_failure = branch.index("if (!ar4_protocol::parse_tool_jog_command")
+        parse_return = branch.index("return;", parse_failure)
+        self.assertIn(
+            "consume_current_command();",
+            branch[parse_failure:parse_return],
+        )
+        self.assertIn(
+            "command.lastIndexOf('W', loop_mode_start - 1)",
+            motion_contract,
+        )
+        self.assertIn(
+            "parse_float_spans(command, begins, ends, parsed)",
+            motion_contract,
+        )
+        self.assertIn("!valid_wrist_config(wrist_config)", motion_contract)
+        self.assertNotIn("parse_int_spans", motion_contract)
+
+        command = "JTW11Sp50G10H20I25WFLm010101\n"
+        firmware_payload = command[2:].strip()
+        loop_mode_start = firmware_payload.index("Lm")
+        wrist_start = firmware_payload.rfind("W", 0, loop_mode_start)
+        ramp_start = firmware_payload.index("I")
+        self.assertEqual(
+            float(firmware_payload[ramp_start + 1:wrist_start]),
+            25.0,
+        )
+        self.assertEqual(
+            firmware_payload[wrist_start + 1:loop_mode_start],
+            "F",
+        )
+        self.assertEqual(firmware_payload[loop_mode_start + 2:], "010101")
+
+        solver_start = firmware.index(
+            "void SolveInverseKinematics(char wrist_config)"
+        )
+        solver_end = firmware.index("template<typename T>", solver_start)
+        solver = firmware[solver_start:solver_end]
+        self.assertNotIn("WristCon", solver)
+        self.assertIn("ar4_protocol::generate_wrist_solutions(", solver)
+        self.assertIn("ar4_protocol::select_wrist_solution(", solver)
+        self.assertIn(
+            "ar4_protocol::generate_wrist_solutions(",
+            native_kinematics,
+        )
+        self.assertIn(
+            "ar4_protocol::select_wrist_solution(",
+            native_kinematics,
+        )
+        self.assertIn("if (solVal < 0)", solver)
+        rejected_start = solver.index("if (solVal < 0)")
+        rejected_end = solver.index(
+            "for (int i = 0; i < ROBOT_nDOFs; i++)",
+            rejected_start,
+        )
+        self.assertIn("KinematicError = 1;", solver[rejected_start:rejected_end])
+        self.assertIn("return;", solver[rejected_start:rejected_end])
+        self.assertIn("wrist_config_valid(wrist_config)", wrist_contract)
+        self.assertIn("return -1;", wrist_contract)
+        self.assertNotIn("fall back to unfiltered best", solver)
+
+        self.assertIn(
+            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.1";',
+            firmware,
+        )
+        self.assertIn('"JT_WRIST_CONFIG_V1"', firmware)
+
+        host = AR4_SOURCE.read_text(encoding="utf-8")
+        self.assertNotIn('+"I"+ACCramp+"Lm"+LoopMode', host)
+        self.assertIn(
+            '+"I"+ACCramp+"W"+RUN[\'WC\']+"Lm"+LoopMode',
+            host,
+        )
+
+    def test_native_windows_build_default_resolves_after_script_start(self):
+        source = NATIVE_WINDOWS_BUILD_SOURCE.read_text(encoding="utf-8")
+        parameter_end = source.index(")\n\n$ErrorActionPreference")
+        self.assertNotIn("$PSScriptRoot", source[:parameter_end])
+        source_directory = source.index("$sourceDirectory = $PSScriptRoot")
+        default_directory = source.index(
+            '$BuildDirectory = Join-Path $sourceDirectory "build-windows-x64"'
+        )
+        self.assertLess(source_directory, default_directory)
+
+    def test_controller_identity_probe_matches_firmware_opcode(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        identity_contract = TEENSY_IDENTITY_CONTRACT.read_text(encoding="utf-8")
+        persistence_contract = TEENSY_PERSISTENCE_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+        host = AR4_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn('if (function == "HO")', firmware)
+        hello_start = firmware.index('if (function == "HO")')
+        hello_end = firmware.index('if (function == "RB")', hello_start)
+        self.assertNotIn("DEBUG_PRINT", firmware[hello_start:hello_end])
+        self.assertIn("ar4_protocol::build_identity_json(", firmware)
+        self.assertIn("escape_identity_json", identity_contract)
+        self.assertIn("kIdentityFieldMaximumLength = 31", identity_contract)
+        self.assertIn("parse_identity_set_command(", identity_contract)
+        self.assertIn("count_identity_marker(", identity_contract)
+        set_identity_start = firmware.index('if (function == "SR")')
+        set_identity_end = firmware.index(
+            'if (function == "BA")',
+            set_identity_start,
+        )
+        set_identity = firmware[set_identity_start:set_identity_end]
+        self.assertIn("IdentitySetCommandFields commandFields", set_identity)
+        self.assertIn("parse_identity_set_command(", set_identity)
+        self.assertNotIn('inData.indexOf("[M]")', set_identity)
+        self.assertNotIn("inData.substring(", set_identity)
+        self.assertIn("consume_current_command();", set_identity)
+        validator_start = firmware.index("String validated_identity_field")
+        validator_end = firmware.index("void use_default_robot_identity", validator_start)
+        self.assertNotIn(".trim()", firmware[validator_start:validator_end])
+        self.assertIn(
+            "value[kIdentityFieldStorageSize - 1] != '\\0'",
+            persistence_contract,
+        )
+        self.assertIn(
+            "memcmp(stored, verified, sizeof(stored)) == 0",
+            persistence_contract,
+        )
+        self.assertIn(
+            "kIdentityErasedMarker = 0xFFFFFFFFUL",
+            persistence_contract,
+        )
+        self.assertIn(
+            "kIdentityTransactionMarker = 0x41523400UL",
+            persistence_contract,
+        )
+        self.assertIn(
+            "kIdentityLegacyMagicNumber = 0x41523401UL",
+            persistence_contract,
+        )
+        self.assertIn(
+            "kIdentityMagicNumber = 0x41523402UL",
+            persistence_contract,
+        )
+        self.assertIn(
+            "marker == kIdentityErasedMarker",
+            persistence_contract,
+        )
+        self.assertIn(
+            "marker != kIdentityMagicNumber",
+            persistence_contract,
+        )
+        self.assertIn("load_legacy_identity_field(", persistence_contract)
+        self.assertIn("migrate_legacy_persistence(", persistence_contract)
+        setup_start = firmware.index("void setup()")
+        setup_end = firmware.index("void loop()", setup_start)
+        setup = firmware[setup_start:setup_end]
+        self.assertLess(
+            setup.index("migrate_legacy_persistence(EEPROM)"),
+            setup.index("load_debug_from_eeprom()"),
+        )
+        migration_failure = setup[
+            setup.index("PersistenceMigrationStatus::kFailed"):
+            setup.index("load_debug_from_eeprom()")
+        ]
+        self.assertIn("IdentityRecordStatus::kCorrupt", migration_failure)
+        self.assertIn("clear_robot_identity()", migration_failure)
+        self.assertIn(
+            "kIdentityTransactionMarker\n        )",
+            persistence_contract,
+        )
+        self.assertNotIn(
+            "verified[ar4_protocol::kIdentityFieldMaximumLength] = '\\0'",
+            firmware,
+        )
+        self.assertIn("IdentityRecordStatus::kCorrupt", firmware)
+        self.assertIn(
+            'Serial.println("EEPROM identity record corrupt in load_robot_id")',
+            firmware,
+        )
+        corrupt_branch_start = firmware.index(
+            'Serial.println("EEPROM identity record corrupt in load_robot_id")'
+        )
+        corrupt_branch_end = firmware.index("return;", corrupt_branch_start)
+        corrupt_branch = firmware[corrupt_branch_start:corrupt_branch_end]
+        self.assertIn("clear_robot_identity()", corrupt_branch)
+        self.assertNotIn("use_default_robot_identity()", corrupt_branch)
+        self.assertNotIn("identity_field_or_default", firmware)
+        handler_start = firmware.index("void handle_hello_command()")
+        handler_end = firmware.index(
+            "void handle_set_robot_id_command",
+            handler_start,
+        )
+        handler = firmware[handler_start:handler_end]
+        self.assertIn("IdentityRecordStatus::kCorrupt", handler)
+        self.assertIn('Serial.println("ER")', handler)
+        self.assertLess(
+            handler.index("IdentityRecordStatus::kCorrupt"),
+            handler.index("build_identity_json"),
+        )
+        persistence_failure_start = firmware.index(
+            'Serial.println("Error: Robot identity persistence failed")'
+        )
+        persistence_failure = firmware[
+            firmware.rfind("if (!save_robot_id_to_eeprom", 0, persistence_failure_start):
+            persistence_failure_start
+        ]
+        self.assertIn("IdentityRecordStatus::kCorrupt", persistence_failure)
+        self.assertIn("clear_robot_identity()", persistence_failure)
+        self.assertIn(
+            '_startup_exchange_response("HO\\n", cancel_event)',
+            host,
+        )
+        self.assertNotIn('_startup_exchange_response("HELLO', host)
+
+    def test_control_queries_bypass_the_spline_position_preface(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        contract = TEENSY_SPLINE_RESPONSE_CONTRACT.read_text(encoding="utf-8")
+        process_start = firmware.index("void processSerial()")
+        process_end = firmware.index("void shiftCMDarray()", process_start)
+        process = firmware[process_start:process_end]
+
+        self.assertIn("ar4_protocol::should_emit_spline_preface(", process)
+        self.assertIn("procCMDtype.c_str()", process)
+        preface_start = process.index("should_emit_spline_preface")
+        preface_end = process.index("sendRobotPosSpline();", preface_start)
+        self.assertNotIn('procCMDtype == "HO"', process[preface_start:preface_end])
+        self.assertIn("opcode[0] == 'M'", contract)
+        self.assertIn("opcode[1] == 'S'", contract)
+        self.assertIn("opcode[2] == '\\0'", contract)
+
+    def test_firmware_early_exits_consume_and_advance_the_shared_queue(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        queue_contract = TEENSY_QUEUE_CONTRACT.read_text(encoding="utf-8")
+        loop_start = firmware.index("void loop()")
+        loop_source = firmware[loop_start:]
+        for match in re.finditer(r"\breturn;", loop_source):
+            preceding = loop_source[max(0, match.start() - 180):match.start()]
+            self.assertIn("consume_current_command();", preceding)
+        self.assertIn("first = second;", queue_contract)
+        self.assertIn("second = third;", queue_contract)
+        self.assertIn("if (first.length() == 0)", queue_contract)
+
+    def test_firmware_queue_and_sd_ingress_preserve_non_delimiter_bytes(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        queue_contract = TEENSY_QUEUE_CONTRACT.read_text(encoding="utf-8")
+        process_start = firmware.index("void processSerial()")
+        process_end = firmware.index("void shiftCMDarray()", process_start)
+        loop_start = firmware.index("void loop()")
+        first_handler = firmware.index('if (function == "HO")', loop_start)
+        playback_start = firmware.index('if (function == "PG")')
+        playback_end = firmware.index('if (function == "WG")', playback_start)
+
+        self.assertNotIn(".trim()", firmware[process_start:process_end])
+        self.assertNotIn(".trim()", firmware[loop_start:first_handler])
+        self.assertNotIn(".trim()", firmware[playback_start:playback_end])
+        self.assertGreaterEqual(
+            firmware.count("extract_serial_command_payload("),
+            4,
+        )
+        self.assertIn(
+            "extract_stored_command_payload(storedRow, Cmd)",
+            firmware[playback_start:playback_end],
+        )
+        self.assertIn(
+            "read_stored_command_row(gcFile, storedRow)",
+            firmware[playback_start:playback_end],
+        )
+        self.assertNotIn(
+            "readStringUntil(",
+            firmware[playback_start:playback_end],
+        )
+        self.assertIn("frame.charAt(end - 1) != '\\n'", queue_contract)
+        self.assertIn("frame.charAt(end - 1) == '\\r'", queue_contract)
+        self.assertIn("row.charAt(end - 1) == '\\r'", queue_contract)
+
+    def test_firmware_debug_command_is_validated_and_applied_transactionally(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        debug_contract = TEENSY_DEBUG_CONTRACT.read_text(encoding="utf-8")
+        persistence_contract = TEENSY_PERSISTENCE_CONTRACT.read_text(encoding="utf-8")
+        branch_start = firmware.index('if (function == "DB")')
+        branch_end = firmware.index('if (function == "SR")', branch_start)
+        branch = firmware[branch_start:branch_end]
+        save_start = firmware.index("bool save_debug_to_eeprom")
+        save_end = firmware.index("void load_robot_id_from_eeprom", save_start)
+        save_function = firmware[save_start:save_end]
+
+        self.assertIn('#include "debug_contract.h"', firmware)
+        self.assertIn('#include "persistence_contract.h"', firmware)
+        self.assertIn("parse_debug_command(inData.c_str(), debugCommand)", branch)
+        self.assertIn("apply_debug_command(", branch)
+        self.assertNotRegex(branch, r"\bDEBUG\s*=")
+        self.assertIn("return false;", save_function)
+        self.assertIn("return true;", save_function)
+        self.assertIn("command.persistence_requested", debug_contract)
+        self.assertIn("save_debug_record(EEPROM, value)", save_function)
+        self.assertIn("kDebugMagicAddress", persistence_contract)
+        self.assertIn("write_eeprom_verified", persistence_contract)
+        self.assertLess(
+            branch.index("parse_debug_command"),
+            branch.index("apply_debug_command"),
+        )
+        failed_apply = branch.index("if (!ar4_protocol::apply_debug_command")
+        done = branch.index('Serial.println("Done")', failed_apply)
+        self.assertIn("consume_current_command();", branch[failed_apply:done])
+        self.assertIn("return;", branch[failed_apply:done])
+
+    def test_firmware_tool_frame_storage_uses_xyz_rx_ry_rz(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        angle_contract = TEENSY_ANGLE_CONVERSION_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+        tool_contract = TEENSY_TOOL_JOG_CONTRACT.read_text(encoding="utf-8")
+        self.assertIn(
+            "Robot_Kin_Tool[5] = nativeToolRz;",
+            firmware,
+        )
+        self.assertIn(
+            "Robot_Kin_Tool[3] = nativeToolRx;",
+            firmware,
+        )
+        self.assertIn("degrees_to_radians(float degrees", angle_contract)
+        self.assertIn("degrees != 0.0f && staged == 0.0f", angle_contract)
+        self.assertIn("round_trip_degrees", angle_contract)
+        self.assertIn("decode_discrete_tool_offset(", firmware)
+        self.assertIn("decode_live_tool_offset(", firmware)
+        self.assertIn("if (axis == 'W') return 3;", tool_contract)
+        self.assertIn("if (axis == 'R') return 5;", tool_contract)
+        self.assertNotIn("void updatejoints()", firmware)
+
+        update_start = firmware.index('if (function == "UP")')
+        update_end = firmware.index('if (function == "CE")', update_start)
+        update_branch = firmware[update_start:update_end]
+        refresh_start = update_branch.index("if (!robot_set_AR())")
+        refresh_end = update_branch.index('Serial.print("Done")', refresh_start)
+        self.assertIn(
+            "consume_current_command();",
+            update_branch[refresh_start:refresh_end],
+        )
+        self.assertIn("return;", update_branch[refresh_start:refresh_end])
+
+        vision_start = firmware.index('if (function == "MV")')
+        vision_end = firmware.index('if (function == "ML"', vision_start)
+        vision_branch = firmware[vision_start:vision_end]
+        self.assertIn("float RXtool = Robot_Kin_Tool[3];", vision_branch)
+        self.assertIn(
+            "Robot_Kin_Tool[3] = Robot_Kin_Tool[3] "
+            "- vision_rotation_radians;",
+            vision_branch,
+        )
+        self.assertIn("Robot_Kin_Tool[3] = RXtool;", vision_branch)
+
+    def test_live_jog_handlers_forward_validated_motion_profiles(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        motion_contract = TEENSY_MOTION_COMMAND_PARSE_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("speed_mode != 'p'", motion_contract)
+
+        stop_reader_start = firmware.index(
+            "LiveControlFrameStatus read_live_control_frame()"
+        )
+        stop_reader_end = firmware.index(
+            "void send_live_terminal_response(",
+            stop_reader_start,
+        )
+        stop_reader = firmware[stop_reader_start:stop_reader_end]
+        self.assertIn("read_serial_frame_byte(inData)", stop_reader)
+        self.assertIn("classify_live_control_frame(", stop_reader)
+        self.assertIn("inData.c_str()", stop_reader)
+
+        terminal_end = firmware.index("void EstopProg()", stop_reader_end)
+        terminal_sender = firmware[stop_reader_end:terminal_end]
+        self.assertIn("select_live_terminal_response(", terminal_sender)
+        self.assertEqual(terminal_sender.count("sendRobotPos();"), 1)
+        self.assertEqual(terminal_sender.count('Serial.println("ER");'), 1)
+        self.assertEqual(
+            terminal_sender.count("Serial.println(axis_limit_response);"),
+            1,
+        )
+
+        handler_pairs = (
+            ("LC", "LJ", "kCartesian"),
+            ("LJ", "LT", "kJoint"),
+            ("LT", "JT", "kTool"),
+        )
+        for opcode, next_opcode, command_kind in handler_pairs:
+            branch_start = firmware.index(f'if (function == "{opcode}")')
+            branch_end = firmware.index(
+                f'if (function == "{next_opcode}")',
+                branch_start,
+            )
+            branch = firmware[branch_start:branch_end]
+            with self.subTest(opcode=opcode):
+                acknowledgement = branch.index("Serial.println();")
+                self.assertLess(
+                    branch.index("parse_live_jog_command("),
+                    acknowledgement,
+                )
+                self.assertLess(
+                    branch.index('inData = "";'),
+                    acknowledgement,
+                )
+                if opcode == "LT":
+                    self.assertLess(
+                        branch.index("decode_live_tool_offset("),
+                        acknowledgement,
+                    )
+                self.assertIn(
+                    "float ACCspd = commandFields.acceleration;",
+                    branch,
+                )
+                self.assertIn(
+                    "float DCCspd = commandFields.deceleration;",
+                    branch,
+                )
+                self.assertIn("float ACCramp = commandFields.ramp;", branch)
+                self.assertIn(
+                    f"LiveJogCommandKind::{command_kind}",
+                    branch,
+                )
+                self.assertIn("driveMotorsJ(", branch)
+                self.assertIn(
+                    "liveControlStatus = read_live_control_frame();",
+                    branch,
+                )
+                self.assertEqual(
+                    branch.count("send_live_terminal_response("),
+                    1,
+                )
+                self.assertNotIn("Serial.read()", branch)
+                self.assertNotRegex(
+                    branch,
+                    r"float (?:ACCspd|DCCspd|ACCramp)\s*=\s*(?:0|100)(?:\.0f)?;",
+                )
+
+    def test_firmware_finite_trajectories_stop_after_first_axis_fault(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        branch_markers = (
+            ("ML", 'if (function == "MJ")'),
+            ("MC", 'if (function == "MA"'),
+            ("MA", None),
+        )
+        for opcode, end_marker in branch_markers:
+            branch_start = firmware.index(f'if (function == "{opcode}"')
+            branch_end = (
+                len(firmware)
+                if end_marker is None
+                else firmware.index(end_marker, branch_start)
+            )
+            branch = firmware[branch_start:branch_end]
+            loop_start = branch.index(
+                "for (int i = 1; i <= waypoint_count; i++)"
+            )
+            terminal_start = branch.index(
+                "if (KinematicError == 1)",
+                loop_start,
+            )
+            waypoint_loop = branch[loop_start:terminal_start]
+            fault_start = waypoint_loop.index('Alarm = "EL"')
+            drive_start = waypoint_loop.index("driveMotorsL(", fault_start)
+            with self.subTest(opcode=opcode):
+                self.assertIn(
+                    "break;",
+                    waypoint_loop[fault_start:drive_start],
+                )
+                self.assertNotIn("Serial.println(Alarm);", waypoint_loop)
+                terminal = branch[terminal_start:]
+                self.assertIn(
+                    "else if (TotalAxisFault != 0)",
+                    terminal,
+                )
+                self.assertIn("Serial.println(Alarm);", terminal)
+
+    def test_firmware_serial_ingress_is_bounded_and_recovers_after_overflow(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        frame_contract = TEENSY_SERIAL_FRAME_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            f"kSerialCommandFrameMaximumLength = {MAX_COMMAND_LENGTH}",
+            frame_contract,
+        )
+        self.assertIn(
+            "kStoredCommandRowMaximumLength =",
+            frame_contract,
+        )
+        self.assertIn("append_stored_row_byte(", frame_contract)
+        self.assertIn("finish_stored_row(", frame_contract)
+        self.assertIn("frame = \"\";", frame_contract)
+        self.assertIn("discarding = received != '\\n';", frame_contract)
+        self.assertIn('#include "serial_frame_contract.h"', firmware)
+        self.assertEqual(firmware.count("Serial.read()"), 1)
+        self.assertEqual(
+            firmware.count("read_serial_frame_byte(recData)"),
+            2,
+        )
+        reader_start = firmware.index(
+            "SerialFrameReadStatus read_serial_frame_byte(String &frame)"
+        )
+        reader_end = firmware.index("void processSerial()", reader_start)
+        reader = firmware[reader_start:reader_end]
+        self.assertNotIn('Serial.println("ER")', reader)
+        process_end = firmware.index("void shiftCMDarray()", reader_end)
+        process_serial = firmware[reader_end:process_end]
+        self.assertEqual(
+            process_serial.count("SerialFrameReadStatus::kOverflow"),
+            2,
+        )
+        self.assertEqual(process_serial.count('Serial.println("ER")'), 2)
+        self.assertEqual(process_serial.count("return;"), 2)
+
+    def test_main_controller_outputs_are_explicitly_unsupported(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        controller_contract = TEENSY_CONTROLLER_DOMAIN_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+        branch_start = firmware.index(
+            'if (function == "ON" || function == "OF")'
+        )
+        branch_end = firmware.index(
+            'if (function == "WJ")',
+            branch_start,
+        )
+        branch = firmware[branch_start:branch_end]
+
+        self.assertIn('Serial.println("ER")', branch)
+        self.assertIn("consume_current_command();", branch)
+        self.assertIn("return;", branch)
+        self.assertNotIn("digitalWrite(", branch)
+        self.assertNotIn("main_output_pin_is_allowlisted", controller_contract)
+
+    def test_rejected_firmware_motion_preserves_active_mode_state(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        transaction_contract = TEENSY_MOTION_MODE_TRANSACTION.read_text(
+            encoding="utf-8"
+        )
+
+        constructor_start = transaction_contract.index(
+            "MotionModeTransaction("
+        )
+        destructor_start = transaction_contract.index(
+            "~MotionModeTransaction()",
+            constructor_start,
+        )
+        constructor = transaction_contract[
+            constructor_start:destructor_start
+        ]
+        commit_start = transaction_contract.index("void commit()")
+        commit_end = transaction_contract.index(
+            "bool committed() const",
+            commit_start,
+        )
+        commit = transaction_contract[commit_start:commit_end]
+        self.assertNotIn("active_wrist_ = requested_wrist_;", constructor)
+        self.assertIn("active_wrist_ = requested_wrist_;", commit)
+        self.assertIn(
+            "active_loop_modes_[index] = requested_loop_modes_[index];",
+            commit,
+        )
+        self.assertIn("if (!committed_) restore();", transaction_contract)
+
+        self.assertIn('#include "motion_mode_transaction.h"', firmware)
+        self.assertIn("int JointLoopModes[ROBOT_nDOFs];", firmware)
+        self.assertIn("volatile bool estopActive;", firmware)
+        self.assertNotIn("apply_loop_modes(", firmware)
+        self.assertNotIn("SolveInverseKinematics();", firmware)
+        self.assertEqual(
+            firmware.count(
+                "MotionModeTransaction<String, ROBOT_nDOFs> motionModes("
+            ),
+            11,
+        )
+        self.assertNotIn("motionModes.commit();", firmware)
+        self.assertEqual(firmware.count("motionModes->commit();"), 3)
+
+        driver_markers = (
+            ("driveMotorsJ", "bool driveMotorsJ(", "//DRIVE MOTORS G"),
+            ("driveMotorsG", "bool driveMotorsG(", "//DRIVE MOTORS L"),
+            ("driveMotorsL", "bool driveMotorsL(", "//MOVE J"),
+        )
+        for name, start_marker, end_marker in driver_markers:
+            start = firmware.index(start_marker)
+            end = firmware.index(end_marker, start)
+            driver = firmware[start:end]
+            with self.subTest(driver=name):
+                self.assertIn(
+                    "FirmwareMotionModeTransaction *motionModes",
+                    driver,
+                )
+                self.assertIn("if (estopActive) return false;", driver)
+                self.assertLess(
+                    driver.index("valid_delay_envelope("),
+                    driver.index("motionModes->commit();"),
+                )
+                self.assertLess(
+                    driver.index("motionModes->commit();"),
+                    driver.index("digitalWrite("),
+                )
+
+        scopes = (
+            ("moveJ", "bool moveJ(", "//COMMUNICATIONS", 2),
+            ("LC", 'if (function == "LC"', 'if (function == "LJ"', 1),
+            ("LJ", 'if (function == "LJ"', 'if (function == "LT"', 1),
+            ("LT", 'if (function == "LT"', 'if (function == "JT"', 1),
+            ("JT", 'if (function == "JT"', 'if (function == "MV"', 1),
+            ("MV", 'if (function == "MV"', 'if (function == "RJ"', 1),
+            ("RJ", 'if (function == "RJ"', 'if (function == "ML"', 1),
+            ("ML", 'if (function == "ML"', 'if (function == "MJ"', 1),
+            ("WG", 'if (function == "WG"', 'if (function == "MC"', 0),
+            ("MC", 'if (function == "MC"', 'if (function == "MA"', 1),
+            ("MA", 'if (function == "MA"', None, 1),
+        )
+        for name, start_marker, end_marker, transaction_arguments in scopes:
+            start = firmware.index(start_marker)
+            end = (
+                len(firmware)
+                if end_marker is None
+                else firmware.index(end_marker, start)
+            )
+            scope = firmware[start:end]
+            with self.subTest(scope=name):
+                self.assertEqual(
+                    scope.count(
+                        "MotionModeTransaction<String, ROBOT_nDOFs> "
+                        "motionModes("
+                    ),
+                    1,
+                )
+                self.assertNotIn(
+                    "WristCon = String(commandFields.wrist_config);",
+                    scope,
+                )
+                self.assertNotIn("apply_loop_modes(", scope)
+                self.assertNotIn("motionModes.commit();", scope)
+                self.assertEqual(
+                    scope.count("&motionModes"),
+                    transaction_arguments,
+                )
+
+    def test_unimplemented_motion_options_fail_closed_in_firmware(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        motion_contract = TEENSY_MOTION_COMMAND_PARSE_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+        controller_contract = TEENSY_CONTROLLER_DOMAIN_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "command.charAt(disable_wrist_start + 1) != '0'",
+            motion_contract,
+        )
+        self.assertNotIn("disable_wrist_rotation", firmware)
+        self.assertNotIn("disable_wrist_rotation", motion_contract)
+        self.assertIn("supported_trajectory_rotation(", controller_contract)
+        self.assertIn("enum class CartesianMotionCommandKind", motion_contract)
+        self.assertIn("enum class LiveJogCommandKind", motion_contract)
+        self.assertIn(
+            "(requires_rounding ? rounding_start < 0 : rounding_start >= 0)",
+            motion_contract,
+        )
+        self.assertIn(
+            "kind == LiveJogCommandKind::kJoint && wrist_config != 'A'",
+            motion_contract,
+        )
+
+        gcode_constants = {
+            node.value
+            for node in ast.walk(self.module_functions["GCexecuteRow"])
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertNotIn("Rnd", gcode_constants)
+
+        for opcode, next_opcode in (("MC", "MA"), ("MA", None)):
+            branch_start = firmware.index(f'if (function == "{opcode}"')
+            branch_end = (
+                len(firmware)
+                if next_opcode is None
+                else firmware.index(
+                    f'if (function == "{next_opcode}"',
+                    branch_start,
+                )
+            )
+            branch = firmware[branch_start:branch_end]
+            with self.subTest(opcode=opcode):
+                self.assertIn("supported_trajectory_rotation(", branch)
+                self.assertNotIn("trajectoryRotation", branch)
+
+    def test_firmware_numeric_fields_use_strict_text_parsing(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        numeric_contract = TEENSY_NUMERIC_PARSE_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+        motion_contract = TEENSY_MOTION_COMMAND_PARSE_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+        controller_contract = TEENSY_CONTROLLER_DOMAIN_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('#include "numeric_parse_contract.h"', firmware)
+        self.assertIn('#include "motion_command_parse_contract.h"', firmware)
+        self.assertIn('#include "controller_domain_contract.h"', firmware)
+        self.assertNotRegex(firmware, r"\.to(?:Float|Int)\(\)")
+        self.assertNotRegex(firmware, r"xyzuvw_In\[6\]\s*=")
+        self.assertIn("strtof(text, &end)", numeric_contract)
+        self.assertIn("strtol(text, &end, 10)", numeric_contract)
+        self.assertIn("parsed == 0.0f && nonzero_mantissa", numeric_contract)
+        self.assertIn("*end != '\\0'", numeric_contract)
+
+        update_start = firmware.index('if (function == "UP")')
+        update_end = firmware.index('if (function == "CE")', update_start)
+        update_branch = firmware[update_start:update_end]
+        parse_start = update_branch.index("parse_float_marker_fields(")
+        first_mutation = update_branch.index("Robot_Kin_Tool[0] =")
+        self.assertLess(parse_start, first_mutation)
+        self.assertIn("parse_int_marker_fields(", update_branch)
+        self.assertIn("consume_current_command();", update_branch[:first_mutation])
+
+        move_j_start = firmware.index("bool moveJ(")
+        move_j_end = firmware.index("//COMMUNICATIONS", move_j_start)
+        move_j = firmware[move_j_start:move_j_end]
+        self.assertIn("parse_cartesian_move_command(inData, commandFields)", move_j)
+        self.assertNotIn("RndStart", move_j)
+
+        jog_start = firmware.index('if (function == "JT")')
+        jog_end = firmware.index('if (function == "MV")', jog_start)
+        jog_branch = firmware[jog_start:jog_end]
+        self.assertIn("parse_tool_jog_command(inData, commandFields)", jog_branch)
+        self.assertNotIn("parse_int_spans", jog_branch)
+
+        vision_start = firmware.index('if (function == "MV")')
+        vision_end = firmware.index('if (function == "ML"', vision_start)
+        vision_branch = firmware[vision_start:vision_end]
+        self.assertIn("parse_vision_move_command(inData, commandFields)", vision_branch)
+        self.assertNotIn("RndStart", vision_branch)
+
+        linear_start = vision_end
+        linear_end = firmware.index('if (function == "MA"', linear_start)
+        linear_branch = firmware[linear_start:linear_end]
+        self.assertIn(
+            '"W" + String(commandFields.wrist_config) + "Lm"',
+            linear_branch,
+        )
+        self.assertNotIn('"WA" + "Lm"', linear_branch)
+
+        self.assertIn("float rounding = 0.0f;", motion_contract)
+        self.assertIn("if (rounding_start >= 0)", motion_contract)
+        self.assertIn("float parsed[4];", motion_contract)
+        self.assertIn("parse_int_span(command, markers[0] + 1", motion_contract)
+        self.assertIn("parse_binary_digit_span(", motion_contract)
+        self.assertIn("valid_motion_profile(", motion_contract)
+        self.assertIn("parse_joint_move_command(", motion_contract)
+        self.assertIn("parse_live_jog_command(", motion_contract)
+        self.assertIn("parse_linear_move_command(", motion_contract)
+        self.assertIn("calibrated_position_to_step(", controller_contract)
+        self.assertIn("validate_modbus_request(", controller_contract)
+        self.assertIn("timeout_seconds > 0", controller_contract)
+        self.assertIn("valid_controller_filename(", controller_contract)
+        self.assertIn("fat_reserved_filename_character(", controller_contract)
+        self.assertIn("valid_circle_geometry(", controller_contract)
+        self.assertIn("valid_arc_geometry(", controller_contract)
+        self.assertIn("calculate_ordered_arc_geometry(", controller_contract)
+        arc_start = firmware.index('if (function == "MA"')
+        arc_branch = firmware[arc_start:]
+        self.assertIn("OrderedArcGeometry arc_geometry", arc_branch)
+        self.assertIn("&arc_geometry", arc_branch)
+        self.assertIn("arc_geometry.radians", arc_branch)
+        self.assertNotIn("ABradians = acos", arc_branch)
+        self.assertIn("valid_delay_envelope(", controller_contract)
+        self.assertIn("pulse_delay_microseconds(", controller_contract)
+        self.assertIn("bool driveMotorsJ(", firmware)
+        self.assertIn("bool driveMotorsG(", firmware)
+        self.assertIn("bool driveMotorsL(", firmware)
+        self.assertNotIn(
+            "delayMicroseconds(curDelay - disDelayCur)",
+            firmware,
+        )
+        self.assertIn("values_are_binary(stagedDirections)", update_branch)
+
+        calibration_start = firmware.index('if (function == "LL")')
+        calibration_end = firmware.index(
+            'if (function == "LC")',
+            calibration_start,
+        )
+        calibration_branch = firmware[calibration_start:calibration_end]
+        self.assertIn("values_are_binary(requested)", calibration_branch)
+
+        playback_start = firmware.index('if (function == "PG")')
+        playback_end = firmware.index('if (function == "WG")', playback_start)
+        playback_branch = firmware[playback_start:playback_end]
+        self.assertIn("values_are_binary(intFields + 9, 9)", playback_branch)
+        self.assertIn("stored_step_target(", playback_branch)
+
+        write_start = firmware.index('if (function == "WG")')
+        write_end = firmware.index('if (function == "MC")', write_start)
+        write_branch = firmware[write_start:write_end]
+        self.assertIn("valid_controller_filename(", write_branch)
+        self.assertIn("inverse_solution_to_future_steps(", write_branch)
+        self.assertIn("if (writeSD(filename, info))", write_branch)
+
+    def test_tool_jog_directions_match_the_firmware_contract(self):
+        discrete_commands = {
+            "TXjogNeg": "JTX1",
+            "TXjogPos": "JTX0",
+            "TYjogNeg": "JTY1",
+            "TYjogPos": "JTY0",
+            "TZjogNeg": "JTZ1",
+            "TZjogPos": "JTZ0",
+            "TRxjogNeg": "JTW1",
+            "TRxjogPos": "JTW0",
+            "TRyjogNeg": "JTP1",
+            "TRyjogPos": "JTP0",
+            "TRzjogNeg": "JTR1",
+            "TRzjogPos": "JTR0",
+        }
+        for function_name, command_prefix in discrete_commands.items():
+            with self.subTest(function=function_name):
+                constants = {
+                    node.value
+                    for node in ast.walk(self.module_functions[function_name])
+                    if isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                }
+                self.assertIn(command_prefix, constants)
+
+        live_vectors = {
+            "SelTXjogNeg": 10,
+            "SelTXjogPos": 11,
+            "SelTYjogNeg": 20,
+            "SelTYjogPos": 21,
+            "SelTZjogNeg": 30,
+            "SelTZjogPos": 31,
+            "SelTRzjogNeg": 40,
+            "SelTRzjogPos": 41,
+            "SelTRyjogNeg": 50,
+            "SelTRyjogPos": 51,
+            "SelTRxjogNeg": 60,
+            "SelTRxjogPos": 61,
+        }
+        for function_name, expected_vector in live_vectors.items():
+            with self.subTest(function=function_name):
+                calls = [
+                    node
+                    for node in ast.walk(self.module_functions[function_name])
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "LiveToolJog"
+                ]
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0].args[0].value, expected_vector)
+
+        host = AR4_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("if axis == 'Rz': return 40 if d < 0 else 41", host)
+        self.assertIn("if axis == 'Rx': return 60 if d < 0 else 61", host)
+        self.assertIn("if axis == 'Tz': return 30 if d < 0 else 31", host)
+
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("ar4_protocol::decode_discrete_tool_offset(", firmware)
+        self.assertIn("ar4_protocol::decode_live_tool_offset(", firmware)
+
+    def test_virtual_vision_and_live_tool_offsets_match_firmware(self):
+        host = AR4_SOURCE.read_text(encoding="utf-8")
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        tool_contract = TEENSY_TOOL_JOG_CONTRACT.read_text(encoding="utf-8")
+
+        self.assertIn("LIVE_TOOL_JOG_INCREMENT = 0.25", host)
+        self.assertIn("jog_step = LIVE_TOOL_JOG_INCREMENT", host)
+        self.assertIn("kLiveToolJogIncrement = 0.25f", tool_contract)
+        self.assertIn("ar4_protocol::kLiveToolJogIncrement", firmware)
+
+        move_v_start = host.index('if (RUN[\'cmdType\'] == "Move V")')
+        move_v_end = host.index('if (RUN[\'cmdType\'] == "Move P")', move_v_start)
+        move_v_branch = host[move_v_start:move_v_end]
+        self.assertIn('commandVR = "MV"', move_v_branch)
+        self.assertIn('"Vr"+visRot+"Lm"', move_v_branch)
+        self.assertIn("mv_command,", move_v_branch)
+
+        vision_command = (
+            "MVX1Y2Z3Rz4Ry5Rx6Sp50Ac10Dc20Rm25"
+            "WNVr15Lm000000\n"
+        )
+        vision_parser = self.compile_function("_vision_rotation_degrees", {})
+        self.assertEqual(vision_parser(vision_command), 15.0)
+
+        class Robot:
+            def __init__(self):
+                self.frame = [1.0, 2.0, 3.0, 40.0, 5.0, 6.0]
+
+            def get_robot_tool_frame(self):
+                return list(self.frame)
+
+            def set_robot_tool_frame(self, *frame):
+                self.frame = list(frame)
+
+        robot = Robot()
+        namespace = {
+            "contextmanager": contextmanager,
+            "robot": robot,
+            "_validated_virtual_six_vector": lambda values, label: tuple(values),
+        }
+        temporary_rotation = self.compile_function(
+            "_temporary_vision_tool_rotation",
+            namespace,
+            preserve_decorators=True,
+        )
+        with temporary_rotation(15.0):
+            self.assertEqual(robot.frame, [1.0, 2.0, 3.0, 25.0, 5.0, 6.0])
+        self.assertEqual(robot.frame, [1.0, 2.0, 3.0, 40.0, 5.0, 6.0])
 
     def test_program_gcode_propagates_completion_and_rejection(self):
         class Label:
@@ -10112,6 +12133,22 @@ class HmiSourceContractTests(unittest.TestCase):
                 ["_synchronous_motion_request", "_tracked_serial_operation"],
                 function_name,
             )
+        generic_request_decorator = self.module_functions[
+            "_execute_row_main_command"
+        ].decorator_list[0]
+        generic_request_keywords = {
+            keyword.arg: keyword.value
+            for keyword in generic_request_decorator.keywords
+        }
+        self.assertIn("requires_kinematics", generic_request_keywords)
+        self.assertIsInstance(
+            generic_request_keywords["requires_kinematics"],
+            ast.Constant,
+        )
+        self.assertIs(
+            generic_request_keywords["requires_kinematics"].value,
+            False,
+        )
 
         firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
         self.assertNotIn('if (function == "TF")', firmware)
@@ -10441,6 +12478,33 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(len(physical_calls), 1)
         self.assertLess(virtual_calls[0].lineno, physical_calls[0].lineno)
 
+    def test_manual_motion_rejects_physical_virtual_wrist_mismatch(self):
+        virtual_calls = []
+        namespace = {
+            "wraps": wraps,
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                error=lambda *args: None,
+            ),
+            "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
+            "almStatusLab2": SimpleNamespace(config=lambda **kwargs: None),
+        }
+        start_manual = self.compile_function("_start_manual_motion", namespace)
+        manual_guard = self.compile_function("_manual_motion_request", namespace)
+        physical = CONTROLLER_CARTESIAN_TEST_COMMAND.replace("WN", "WA")
+        guarded = manual_guard("Cartesian jog")(
+            lambda: start_manual(
+                physical,
+                "Cartesian jog",
+                lambda command: virtual_calls.append(command),
+                VIRTUAL_CARTESIAN_TEST_COMMAND,
+            )
+        )
+
+        self.assertFalse(guarded())
+        self.assertEqual(virtual_calls, [])
+        self.assertFalse(namespace["motion_request_registry"].active)
+
     def test_offline_cartesian_failure_restores_cal_before_owner_release(self):
         class Entry:
             def __init__(self, value):
@@ -10636,7 +12700,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         guarded = manual_guard("Cartesian jog")(
             lambda: start_manual(
-                "physical",
+                CONTROLLER_CARTESIAN_TEST_COMMAND,
                 "Cartesian jog",
                 start_virtual,
                 VIRTUAL_CARTESIAN_TEST_COMMAND,
@@ -10657,7 +12721,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         rejected = manual_guard("Cartesian jog")(
             lambda: start_manual(
-                "physical",
+                CONTROLLER_CARTESIAN_TEST_COMMAND,
                 "Cartesian jog",
                 lambda command: False,
                 VIRTUAL_CARTESIAN_TEST_COMMAND,
@@ -10726,7 +12790,7 @@ class HmiSourceContractTests(unittest.TestCase):
         manual_guard = self.compile_function("_manual_motion_request", namespace)
         guarded = manual_guard("Cartesian jog")(
             lambda: start_manual(
-                "physical",
+                CONTROLLER_CARTESIAN_TEST_COMMAND,
                 "Cartesian jog",
                 lambda command: completed_virtual_operation(),
                 VIRTUAL_CARTESIAN_TEST_COMMAND,
@@ -10804,7 +12868,7 @@ class HmiSourceContractTests(unittest.TestCase):
         manual_guard = self.compile_function("_manual_motion_request", namespace)
         guarded = manual_guard("Cartesian jog")(
             lambda: start_manual(
-                "physical",
+                CONTROLLER_CARTESIAN_TEST_COMMAND,
                 "Cartesian jog",
                 start_virtual,
                 VIRTUAL_CARTESIAN_TEST_COMMAND,
@@ -10890,7 +12954,7 @@ class HmiSourceContractTests(unittest.TestCase):
         manual_guard = self.compile_function("_manual_motion_request", namespace)
         guarded = manual_guard("Cartesian jog")(
             lambda: start_manual(
-                "physical",
+                CONTROLLER_CARTESIAN_TEST_COMMAND,
                 "Cartesian jog",
                 start_virtual,
                 VIRTUAL_CARTESIAN_TEST_COMMAND,
@@ -10982,7 +13046,7 @@ class HmiSourceContractTests(unittest.TestCase):
         manual_guard = self.compile_function("_manual_motion_request", namespace)
         guarded = manual_guard("Tool-frame jog")(
             lambda: start_manual(
-                "physical",
+                VIRTUAL_TOOL_TEST_COMMAND,
                 "Tool-frame jog",
                 start_virtual,
                 VIRTUAL_TOOL_TEST_COMMAND,
@@ -13427,6 +15491,8 @@ class HmiSourceContractTests(unittest.TestCase):
 
         def exchange(command, cancel_event, expected_response=None):
             calls.append((threading.get_ident(), command, expected_response))
+            if command == "HO\n":
+                return VALID_CONTROLLER_IDENTITY_RESPONSE
             if command == "RP\n":
                 return raw_position
             return expected_response.decode("ascii").strip()
@@ -13469,6 +15535,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(
             [call[1:] for call in calls],
             [
+                ("HO\n", None),
                 ("UPA1\n", b"Done"),
                 ("CEA1\n", b"Done"),
                 ("SPA1\n", b"Done\n"),
@@ -13585,6 +15652,8 @@ class HmiSourceContractTests(unittest.TestCase):
 
                 def exchange(command, cancel_event, expected_response=None):
                     exchanges.append((command, expected_response))
+                    if command == "HO\n":
+                        return VALID_CONTROLLER_IDENTITY_RESPONSE
                     if command == "RP\n":
                         return raw_position
                     return expected_response.decode("ascii").strip()
@@ -13614,6 +15683,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.assertEqual(
                     exchanges,
                     [
+                        ("HO\n", None),
                         ("UPA1\n", b"Done"),
                         ("CEA1\n", b"Done"),
                         ("SPA1\n", b"Done\n"),
@@ -13685,8 +15755,13 @@ class HmiSourceContractTests(unittest.TestCase):
                     raise OSError("auxiliary offline")
 
                 def exchange(command, cancel_event, expected_response=None):
+                    if command == "HO\n":
+                        self.assertIs(runtime["ser2"], old_serial)
+                        self.assertEqual(order, [])
+                        order.append(command)
+                        return VALID_CONTROLLER_IDENTITY_RESPONSE
                     self.assertIsNone(runtime["ser2"])
-                    self.assertEqual(order[0], "auxiliary-closed")
+                    self.assertEqual(order[:2], ["HO\n", "auxiliary-closed"])
                     order.append(command)
                     if command == "RP\n":
                         return raw_position
@@ -13723,7 +15798,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.assertEqual(result.auxiliary_error, expected_error)
                 self.assertFalse(old_serial.is_open)
                 self.assertIsNone(runtime["ser2BoardProfile"])
-                self.assertEqual(order[0], "auxiliary-closed")
+                self.assertEqual(order[:2], ["HO\n", "auxiliary-closed"])
 
         retained_serial = SimpleNamespace(is_open=True)
         retained_runtime = {
@@ -13734,6 +15809,13 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
         }
         exchanges = []
+
+        def retained_exchange(command, *args, **kwargs):
+            exchanges.append(command)
+            if command == "HO\n":
+                return VALID_CONTROLLER_IDENTITY_RESPONSE
+            raise AssertionError("startup must stop after auxiliary cleanup failure")
+
         retained_namespace = {
             "RUN": retained_runtime,
             "ControllerStartupRequest": Request,
@@ -13743,9 +15825,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "ProtocolResponseError": ProtocolResponseError,
             "threading": threading,
             "_connect_startup_auxiliary": lambda *args: None,
-            "_startup_exchange_response": (
-                lambda *args, **kwargs: exchanges.append(args) or "Done"
-            ),
+            "_startup_exchange_response": retained_exchange,
             "parse_position_response": parse_position_response,
             "_startup_visual_options": lambda: (),
             "_request_startup_auxiliary_cleanup": lambda serial_port: False,
@@ -13767,7 +15847,7 @@ class HmiSourceContractTests(unittest.TestCase):
         ):
             retained_startup(Request(None), threading.Event())
 
-        self.assertEqual(exchanges, [])
+        self.assertEqual(exchanges, ["HO\n"])
         self.assertIs(retained_runtime["ser2"], retained_serial)
         self.assertTrue(retained_serial.is_open)
 
@@ -14011,6 +16091,14 @@ class HmiSourceContractTests(unittest.TestCase):
 
         auxiliary_serial = object()
         closed = []
+        exchanges = []
+
+        def exchange(command, *args, **kwargs):
+            exchanges.append(command)
+            if command == "HO\n":
+                return VALID_CONTROLLER_IDENTITY_RESPONSE
+            raise TimeoutError("controller startup cancelled")
+
         namespace = {
             "ControllerStartupRequest": Request,
             "ControllerStartupResult": object,
@@ -14020,9 +16108,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_connect_startup_auxiliary": (
                 lambda port, board_profile: auxiliary_serial
             ),
-            "_startup_exchange_response": lambda *args, **kwargs: (_ for _ in ()).throw(
-                TimeoutError("controller startup cancelled")
-            ),
+            "_startup_exchange_response": exchange,
             "parse_position_response": parse_position_response,
             "_startup_visual_options": lambda: (),
             "_request_startup_auxiliary_cleanup": (
@@ -14033,7 +16119,54 @@ class HmiSourceContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(TimeoutError, "controller startup cancelled"):
             startup(Request(), threading.Event())
+        self.assertEqual(exchanges, ["HO\n", "UPA1\n"])
         self.assertEqual(closed, [auxiliary_serial])
+
+    def test_startup_rejects_missing_wrist_capability_before_side_effects(self):
+        class Request:
+            auxiliary_port = "COM2"
+            auxiliary_board = AUXILIARY_BOARD_NANO
+            update_parameters_command = "UPA1\n"
+            external_axis_command = "CEA1\n"
+            position_command = "SPA1\n"
+
+        unsupported_identity = json.loads(VALID_CONTROLLER_IDENTITY_RESPONSE)
+        unsupported_identity["ProtocolCapabilities"] = []
+        exchanges = []
+        connections = []
+        cleanup_calls = []
+
+        def exchange(command, *args, **kwargs):
+            exchanges.append(command)
+            if command != "HO\n":
+                raise AssertionError("unsupported firmware must receive no writes")
+            return json.dumps(unsupported_identity, separators=(",", ":"))
+
+        namespace = {
+            "ControllerStartupRequest": Request,
+            "ControllerStartupResult": object,
+            "MotionInputError": MotionInputError,
+            "ProtocolResponseError": ProtocolResponseError,
+            "threading": threading,
+            "_connect_startup_auxiliary": (
+                lambda *args: connections.append(args)
+            ),
+            "_startup_exchange_response": exchange,
+            "parse_position_response": parse_position_response,
+            "_startup_visual_options": lambda: (),
+            "_request_startup_auxiliary_cleanup": cleanup_calls.append,
+        }
+        startup = self.compile_function("startup", namespace)
+
+        with self.assertRaisesRegex(
+            ProtocolResponseError,
+            "lacks command-local JT wrist configuration",
+        ):
+            startup(Request(), threading.Event())
+
+        self.assertEqual(exchanges, ["HO\n"])
+        self.assertEqual(connections, [])
+        self.assertEqual(cleanup_calls, [])
 
     def test_failed_startup_auxiliary_close_is_retained_and_retried(self):
         class SerialPort:

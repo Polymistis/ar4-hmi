@@ -1,5 +1,3 @@
-//VERSION 6.7.1
-
 /*  AR4 Robot Control Software
     Copyright (c) 2024, Chris Annin
     All rights reserved.
@@ -68,8 +66,8 @@
 // 6.6 - 2/22/26 - update kinematic solver to reduce J4/6 wrap | reimplement wrist N/F config
 // 6.7 - 3/11/26 MB holding reg bug fix
 // 6.7.1 - 3/11/26 bug fix calibration debounce
-
-const char *FIRMWARE_VERSION = "6.7.1";
+const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.1";
+const char *JT_WRIST_CONFIG_CAPABILITY = "JT_WRIST_CONFIG_V1";
 
 //////////////////////////////////////////////////////////////////////////////
 //DEBUGGING
@@ -78,6 +76,7 @@ const char *FIRMWARE_VERSION = "6.7.1";
 
 #include <math.h>
 #include <limits>
+#include <string.h>
 #include <avr/pgmspace.h>
 #include <Encoder.h>
 #include <SPI.h>
@@ -85,6 +84,20 @@ const char *FIRMWARE_VERSION = "6.7.1";
 #include <stdexcept>
 #include <ModbusMaster.h>
 #include <EEPROM.h>
+#include "angle_conversion_contract.h"
+#include "command_queue_contract.h"
+#include "controller_domain_contract.h"
+#include "cartesian_pose_contract.h"
+#include "debug_contract.h"
+#include "identity_contract.h"
+#include "motion_command_parse_contract.h"
+#include "motion_mode_transaction.h"
+#include "numeric_parse_contract.h"
+#include "persistence_contract.h"
+#include "serial_frame_contract.h"
+#include "spline_response_contract.h"
+#include "tool_jog_contract.h"
+#include "wrist_selection_contract.h"
 #pragma GCC diagnostic ignored "-Warray-bounds"
 #pragma GCC diagnostic ignored "-Wunused-variable"
 #pragma GCC diagnostic ignored "-Wsequence-point"
@@ -117,6 +130,7 @@ String inData;
 String recData;
 String checkData;
 String function;
+bool serialFrameDiscarding = false;
 volatile byte state = LOW;
 
 const int J1stepPin = 0;
@@ -333,14 +347,12 @@ int J4EncSteps;
 int J5EncSteps;
 int J6EncSteps;
 
-int J1LoopMode;
-int J2LoopMode;
-int J3LoopMode;
-int J4LoopMode;
-int J5LoopMode;
-int J6LoopMode;
-
 #define ROBOT_nDOFs 6
+int JointLoopModes[ROBOT_nDOFs];
+typedef ar4_protocol::MotionModeTransaction<
+  String,
+  ROBOT_nDOFs
+> FirmwareMotionModeTransaction;
 const int numJoints = 9;
 typedef float tRobotJoints[ROBOT_nDOFs];
 typedef float tRobotPose[ROBOT_nDOFs];
@@ -353,7 +365,13 @@ float xyzuvw_Temp[ROBOT_nDOFs];
 float JangleOut[ROBOT_nDOFs];
 float JangleIn[ROBOT_nDOFs];
 float joints_estimate[ROBOT_nDOFs];
-float SolutionMatrix[ROBOT_nDOFs][4];
+static_assert(
+  ROBOT_nDOFs == ar4_protocol::kWristJointCount,
+  "Wrist selection requires the six-axis robot matrix"
+);
+float SolutionMatrix[
+  ar4_protocol::kWristJointCount
+][ar4_protocol::kMaximumWristSolutions];
 
 //external axis
 float J7_pos;
@@ -378,7 +396,7 @@ bool rndTrue;
 float rndSpeed;
 bool splineTrue;
 bool splineEndReceived;
-bool estopActive;
+volatile bool estopActive;
 
 float Xtool = 0;
 float Ytool = 0;
@@ -397,6 +415,217 @@ float DHparams[6][4] = {
   { 0, 90, 0, 0 },
   { 180, -90, 41, 0 }
 };
+
+using ar4_protocol::parse_float_marker_fields;
+using ar4_protocol::parse_float_span;
+using ar4_protocol::parse_float_spans;
+using ar4_protocol::parse_int_marker_fields;
+using ar4_protocol::parse_int_span;
+using ar4_protocol::parse_int_spans;
+
+bool parse_loop_mode_span(
+  const String &command,
+  int begin,
+  int end,
+  int (&outputs)[ROBOT_nDOFs]
+) {
+  return ar4_protocol::parse_binary_digit_span(
+    command,
+    begin,
+    end,
+    outputs
+  );
+}
+
+bool parse_loop_modes(
+  const String &command,
+  int marker,
+  int (&outputs)[ROBOT_nDOFs]
+) {
+  if (marker < 0) return false;
+  return parse_loop_mode_span(
+    command,
+    marker + 2,
+    static_cast<int>(command.length()),
+    outputs
+  );
+}
+
+void load_axis_calibration(
+  float (&negative_limits)[numJoints],
+  float (&positive_limits)[numJoints],
+  float (&steps_per_unit)[numJoints],
+  int (&step_limits)[numJoints]
+) {
+  const float staged_negative_limits[numJoints] = {
+    J1axisLimNeg, J2axisLimNeg, J3axisLimNeg,
+    J4axisLimNeg, J5axisLimNeg, J6axisLimNeg,
+    J7axisLimNeg, J8axisLimNeg, J9axisLimNeg,
+  };
+  const float staged_positive_limits[numJoints] = {
+    J1axisLimPos, J2axisLimPos, J3axisLimPos,
+    J4axisLimPos, J5axisLimPos, J6axisLimPos,
+    J7axisLimPos, J8axisLimPos, J9axisLimPos,
+  };
+  const float staged_steps_per_unit[numJoints] = {
+    J1StepDeg, J2StepDeg, J3StepDeg,
+    J4StepDeg, J5StepDeg, J6StepDeg,
+    J7StepDeg, J8StepDeg, J9StepDeg,
+  };
+  const int staged_step_limits[numJoints] = {
+    J1StepLim, J2StepLim, J3StepLim,
+    J4StepLim, J5StepLim, J6StepLim,
+    J7StepLim, J8StepLim, J9StepLim,
+  };
+  for (int axis = 0; axis < numJoints; ++axis) {
+    negative_limits[axis] = staged_negative_limits[axis];
+    positive_limits[axis] = staged_positive_limits[axis];
+    steps_per_unit[axis] = staged_steps_per_unit[axis];
+    step_limits[axis] = staged_step_limits[axis];
+  }
+}
+
+bool joint_positions_to_future_steps(
+  const float (&positions)[numJoints],
+  int (&future_steps)[numJoints]
+) {
+  float negative_limits[numJoints];
+  float positive_limits[numJoints];
+  float steps_per_unit[numJoints];
+  int step_limits[numJoints];
+  load_axis_calibration(
+    negative_limits,
+    positive_limits,
+    steps_per_unit,
+    step_limits
+  );
+  return ar4_protocol::calibrated_positions_to_steps(
+    positions,
+    negative_limits,
+    positive_limits,
+    steps_per_unit,
+    step_limits,
+    future_steps
+  );
+}
+
+bool inverse_solution_to_future_steps(
+  float J7_target,
+  float J8_target,
+  float J9_target,
+  int (&future_steps)[numJoints]
+) {
+  const float positions[numJoints] = {
+    JangleOut[0], JangleOut[1], JangleOut[2],
+    JangleOut[3], JangleOut[4], JangleOut[5],
+    J7_target, J8_target, J9_target,
+  };
+  return joint_positions_to_future_steps(positions, future_steps);
+}
+
+bool external_positions_to_future_steps(
+  float J7_target,
+  float J8_target,
+  float J9_target,
+  int (&future_steps)[3]
+) {
+  float negative_limits[numJoints];
+  float positive_limits[numJoints];
+  float steps_per_unit[numJoints];
+  int step_limits[numJoints];
+  load_axis_calibration(
+    negative_limits,
+    positive_limits,
+    steps_per_unit,
+    step_limits
+  );
+  const float targets[3] = { J7_target, J8_target, J9_target };
+  int staged[3];
+  for (int axis = 0; axis < 3; ++axis) {
+    const int calibration_index = axis + ROBOT_nDOFs;
+    if (!ar4_protocol::calibrated_position_to_step(
+        targets[axis],
+        negative_limits[calibration_index],
+        positive_limits[calibration_index],
+        steps_per_unit[calibration_index],
+        step_limits[calibration_index],
+        staged[axis]
+    )) {
+      return false;
+    }
+  }
+  for (int axis = 0; axis < 3; ++axis) future_steps[axis] = staged[axis];
+  return true;
+}
+
+bool primary_inverse_solution_to_future_steps(
+  int (&future_steps)[ROBOT_nDOFs]
+) {
+  float negative_limits[numJoints];
+  float positive_limits[numJoints];
+  float steps_per_unit[numJoints];
+  int step_limits[numJoints];
+  load_axis_calibration(
+    negative_limits,
+    positive_limits,
+    steps_per_unit,
+    step_limits
+  );
+  int staged[ROBOT_nDOFs];
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    if (!ar4_protocol::calibrated_position_to_step(
+        JangleOut[axis],
+        negative_limits[axis],
+        positive_limits[axis],
+        steps_per_unit[axis],
+        step_limits[axis],
+        staged[axis]
+    )) {
+      return false;
+    }
+  }
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    future_steps[axis] = staged[axis];
+  }
+  return true;
+}
+
+bool primary_positions_to_future_steps(
+  const float (&positions)[ROBOT_nDOFs],
+  int (&future_steps)[ROBOT_nDOFs]
+) {
+  float negative_limits[numJoints];
+  float positive_limits[numJoints];
+  float steps_per_unit[numJoints];
+  int step_limits[numJoints];
+  load_axis_calibration(
+    negative_limits,
+    positive_limits,
+    steps_per_unit,
+    step_limits
+  );
+  int staged[ROBOT_nDOFs];
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    if (!ar4_protocol::calibrated_position_to_step(
+        positions[axis],
+        negative_limits[axis],
+        positive_limits[axis],
+        steps_per_unit[axis],
+        step_limits[axis],
+        staged[axis]
+    )) {
+      return false;
+    }
+  }
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    future_steps[axis] = staged[axis];
+  }
+  return true;
+}
+
+bool future_step_is_outside_limit(int future_step, int step_limit) {
+  return future_step < 0 || future_step > step_limit;
+}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //MATRIX OPERATION
@@ -520,10 +749,8 @@ float *Robot_Kin_Base = Robot_Data + 6 * Table_Size;
 /// xyzwpr of the tool
 float *Robot_Kin_Tool = Robot_Data + 7 * Table_Size;
 
-/// Robot lower limits
 float *Robot_JointLimits_Upper = Robot_Data + 8 * Table_Size;
 
-/// Robot upper limits
 float *Robot_JointLimits_Lower = Robot_Data + 9 * Table_Size;
 
 /// Robot axis senses
@@ -576,68 +803,61 @@ bool isValidResult(float value) {
   return !std::isnan(value) && !std::isinf(value);
 }
 
-//This function sets the variable inside Robot_Data to the DHparams
-void robot_set_AR() {
+bool robot_set_AR() {
+  float nativeTheta[ROBOT_nDOFs] = {};
+  float nativeAlpha[ROBOT_nDOFs] = {};
+  for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
+    if (
+      !ar4_protocol::degrees_to_radians(
+        DHparams[joint][0],
+        nativeTheta[joint]
+      )
+      || !ar4_protocol::degrees_to_radians(
+        DHparams[joint][1],
+        nativeAlpha[joint]
+      )
+    ) {
+      return false;
+    }
+  }
+
   robot_data_reset();
-
-  // Alpha parameters
-  Robot_Kin_DHM_L1[DHM_Alpha] = DHparams[0][1] * M_PI / 180;
-  Robot_Kin_DHM_L2[DHM_Alpha] = DHparams[1][1] * M_PI / 180;
-  Robot_Kin_DHM_L3[DHM_Alpha] = DHparams[2][1] * M_PI / 180;
-  Robot_Kin_DHM_L4[DHM_Alpha] = DHparams[3][1] * M_PI / 180;
-  Robot_Kin_DHM_L5[DHM_Alpha] = DHparams[4][1] * M_PI / 180;
-  Robot_Kin_DHM_L6[DHM_Alpha] = DHparams[5][1] * M_PI / 180;
-
-  // Theta parameters
-  Robot_Kin_DHM_L1[DHM_Theta] = DHparams[0][0] * M_PI / 180;
-  Robot_Kin_DHM_L2[DHM_Theta] = DHparams[1][0] * M_PI / 180;
-  Robot_Kin_DHM_L3[DHM_Theta] = DHparams[2][0] * M_PI / 180;
-  Robot_Kin_DHM_L4[DHM_Theta] = DHparams[3][0] * M_PI / 180;
-  Robot_Kin_DHM_L5[DHM_Theta] = DHparams[4][0] * M_PI / 180;
-  Robot_Kin_DHM_L6[DHM_Theta] = DHparams[5][0] * M_PI / 180;
-
-  // A parameters
-  Robot_Kin_DHM_L1[DHM_A] = DHparams[0][3];
-  Robot_Kin_DHM_L2[DHM_A] = DHparams[1][3];
-  Robot_Kin_DHM_L3[DHM_A] = DHparams[2][3];
-  Robot_Kin_DHM_L4[DHM_A] = DHparams[3][3];
-  Robot_Kin_DHM_L5[DHM_A] = DHparams[4][3];
-  Robot_Kin_DHM_L6[DHM_A] = DHparams[5][3];
-
-  // D parameters
-  Robot_Kin_DHM_L1[DHM_D] = DHparams[0][2];
-  Robot_Kin_DHM_L2[DHM_D] = DHparams[1][2];
-  Robot_Kin_DHM_L3[DHM_D] = DHparams[2][2];
-  Robot_Kin_DHM_L4[DHM_D] = DHparams[3][2];
-  Robot_Kin_DHM_L5[DHM_D] = DHparams[4][2];
-  Robot_Kin_DHM_L6[DHM_D] = DHparams[5][2];
-
-
-  Robot_JointLimits_Lower[0] = J1axisLimNeg;
-  Robot_JointLimits_Upper[0] = J1axisLimPos;
-  Robot_JointLimits_Lower[1] = J2axisLimNeg;
-  Robot_JointLimits_Upper[1] = J2axisLimPos;
-  Robot_JointLimits_Lower[2] = J3axisLimNeg;
-  Robot_JointLimits_Upper[2] = J3axisLimPos;
-  Robot_JointLimits_Lower[3] = J4axisLimNeg;
-  Robot_JointLimits_Upper[3] = J4axisLimPos;
-  Robot_JointLimits_Lower[4] = J5axisLimNeg;
-  Robot_JointLimits_Upper[4] = J5axisLimPos;
-  Robot_JointLimits_Lower[5] = J6axisLimNeg;
-  Robot_JointLimits_Upper[5] = J6axisLimPos;
+  const float lowerLimits[ROBOT_nDOFs] = {
+    J1axisLimNeg,
+    J2axisLimNeg,
+    J3axisLimNeg,
+    J4axisLimNeg,
+    J5axisLimNeg,
+    J6axisLimNeg,
+  };
+  const float upperLimits[ROBOT_nDOFs] = {
+    J1axisLimPos,
+    J2axisLimPos,
+    J3axisLimPos,
+    J4axisLimPos,
+    J5axisLimPos,
+    J6axisLimPos,
+  };
+  for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
+    float* link = Robot_Kin_DHM_Table + joint * Table_Size;
+    link[DHM_Alpha] = nativeAlpha[joint];
+    link[DHM_Theta] = nativeTheta[joint];
+    link[DHM_A] = DHparams[joint][3];
+    link[DHM_D] = DHparams[joint][2];
+    Robot_JointLimits_Lower[joint] = lowerLimits[joint];
+    Robot_JointLimits_Upper[joint] = upperLimits[joint];
+  }
+  return true;
 }
 
 void robot_data_reset() {
-  // Reset user base and tool frames
   Matrix_Eye(Robot_BaseFrame);
   Matrix_Eye(Robot_ToolFrame);
 
-  // Reset internal base frame and tool frames
   for (int i = 0; i < 6; i++) {
     Robot_Kin_Base[i] = 0.0;
   }
 
-  // Reset joint senses and joint limits
   for (int i = 0; i < ROBOT_nDOFs; i++) {
     Robot_Senses[i] = +1.0;
   }
@@ -648,18 +868,13 @@ void robot_data_reset() {
 // ============================================================================
 
 // EEPROM Memory Map
-#define EEPROM_MAGIC_ADDR 0            // 4 bytes - magic number to verify valid data
-#define EEPROM_DEBUG_ADDR 4            // 1 byte = whether debug is active on boot
-#define EEPROM_ROBOT_MODEL_ADDR 5      // 32 bytes - robot model string
-#define EEPROM_ROBOT_VERSION_ADDR 37   // 32 bytes - robot version string
-#define EEPROM_DRIVER_BOARD_ADDR 69    // 32 bytes - driver board string
-#define EEPROM_SERIAL_NUMBER_ADDR 101  // 32 bytes - serial number string
-#define EEPROM_ASSET_TAG_ADDR 133      // 32 bytes - asset tag string
+constexpr int EEPROM_ROBOT_MODEL_ADDR = ar4_protocol::kRobotModelAddress;
+constexpr int EEPROM_ROBOT_VERSION_ADDR = ar4_protocol::kRobotVersionAddress;
+constexpr int EEPROM_DRIVER_BOARD_ADDR = ar4_protocol::kDriverBoardAddress;
+constexpr int EEPROM_SERIAL_NUMBER_ADDR = ar4_protocol::kSerialNumberAddress;
+constexpr int EEPROM_ASSET_TAG_ADDR = ar4_protocol::kAssetTagAddress;
 
-#define EEPROM_MAGIC_NUMBER 0x41523401  // "AR4" + version 01
-
-
-// Default values (used if EEPROM not initialized)
+// Defaults represent an identity record whose commit marker is absent.
 const char *DEFAULT_ROBOT_MODEL = "Unset";
 const char *DEFAULT_ROBOT_VERSION = "Unset";
 const char *DEFAULT_DRIVER_BOARD = "Unset";
@@ -672,94 +887,114 @@ String robot_version = DEFAULT_ROBOT_VERSION;
 String driver_board = DEFAULT_DRIVER_BOARD;
 String serial_number = DEFAULT_SERIAL_NUMBER;
 String asset_tag = DEFAULT_ASSET_TAG;
+ar4_protocol::IdentityRecordStatus identity_record_status =
+  ar4_protocol::IdentityRecordStatus::kUninitialized;
 
+
+String validated_identity_field(String value) {
+  if (!ar4_protocol::identity_field_valid(value.c_str())) return "";
+  return value;
+}
+
+void use_default_robot_identity() {
+  robot_model = DEFAULT_ROBOT_MODEL;
+  robot_version = DEFAULT_ROBOT_VERSION;
+  driver_board = DEFAULT_DRIVER_BOARD;
+  serial_number = DEFAULT_SERIAL_NUMBER;
+  asset_tag = DEFAULT_ASSET_TAG;
+}
+
+void clear_robot_identity() {
+  robot_model = "";
+  robot_version = "";
+  driver_board = "";
+  serial_number = "";
+  asset_tag = "";
+}
+
+bool write_identity_field_to_eeprom(int address, const String& value) {
+  return ar4_protocol::write_identity_field(
+    EEPROM,
+    address,
+    value.c_str()
+  );
+}
 
 // ============================================================================
 // EEPROM Functions
 // ============================================================================
 
-bool is_eeprom_initialized() {
-  /*
-     * Check if EEPROM has been initialized with valid data.
-     * 
-     * Returns:
-     *   true if EEPROM contains valid robot configuration
-     *   false if EEPROM is uninitialized or corrupted
-     */
-  uint32_t magic;
-  EEPROM.get(EEPROM_MAGIC_ADDR, magic);
-  return (magic == EEPROM_MAGIC_NUMBER);
-}
-
 void load_debug_from_eeprom() {
-  if (is_eeprom_initialized()) {
-    // Read from EEPROM
-    // If Debug is defined in EEPROM then turn it on now
-    bool debugBuf = false;
-    EEPROM.get(EEPROM_DEBUG_ADDR, debugBuf);
-    if (debugBuf) {
-      DEBUG = true;
-      DEBUG_PRINTLN("Loaded DEBUG=True from EEPROM - Setting DEBUG to True");
-    }
-  } else {
-    Serial.println("EEPROM not initialized in load_debug");
+  bool debugBuf = false;
+  if (!ar4_protocol::load_debug_record(EEPROM, debugBuf)) {
+    Serial.println("Debug persistence not initialized or invalid in load_debug");
+    return;
+  }
+  DEBUG = debugBuf;
+  if (DEBUG) {
+    DEBUG_PRINTLN("Loaded DEBUG=True from EEPROM - Setting DEBUG to True");
   }
 }
 
-void save_debug_to_eeprom(bool value) {
-  bool debugBuf = value;
-  DEBUG_PRINT("Saving Value: ");
-  DEBUG_PRINT(debugBuf);
-  DEBUG_PRINTLN(" to EEPROM");
-  EEPROM.put(EEPROM_DEBUG_ADDR, debugBuf);
-  bool debugTest;
-  EEPROM.get(EEPROM_DEBUG_ADDR, debugTest);
-
-  if (debugTest != value) {
-    Serial.println("Error saving Debug Persistence - Values don't match");
+bool save_debug_to_eeprom(bool value) {
+  if (!ar4_protocol::save_debug_record(EEPROM, value)) {
+    Serial.println("Error saving Debug Persistence - Transaction failed");
+    return false;
   }
+  return true;
 }
 
 void load_robot_id_from_eeprom() {
-  /*
-     * Load robot model and version from EEPROM.
-     * If EEPROM not initialized, use default values.
-     */
-  if (is_eeprom_initialized()) {
-    // Read from EEPROM
-    char charBuffer[31];
-    EEPROM.get(EEPROM_ROBOT_MODEL_ADDR, charBuffer);
-    robot_model = charBuffer;
-    DEBUG_PRINT("Debug - Loaded Robot Model from EEPROM: ");
-    DEBUG_PRINTLN(robot_model);
-    EEPROM.get(EEPROM_ROBOT_VERSION_ADDR, charBuffer);
-    robot_version = charBuffer;
-    DEBUG_PRINT("Debug - Loaded Robot Version from EEPROM: ");
-    DEBUG_PRINTLN(robot_version);
-    EEPROM.get(EEPROM_DRIVER_BOARD_ADDR, charBuffer);
-    driver_board = charBuffer;
-    DEBUG_PRINT("Debug - Loaded Driver Board from EEPROM: ");
-    DEBUG_PRINTLN(driver_board);
-    EEPROM.get(EEPROM_SERIAL_NUMBER_ADDR, charBuffer);
-    serial_number = charBuffer;
-    DEBUG_PRINT("Debug - Loaded Serial Number from EEPROM: ");
-    DEBUG_PRINTLN(serial_number);
-    EEPROM.get(EEPROM_ASSET_TAG_ADDR, charBuffer);
-    asset_tag = charBuffer;
-    DEBUG_PRINT("Debug - Loaded Asset Tag from EEPROM: ");
-    DEBUG_PRINTLN(asset_tag);
+  char stored_robot_model[ar4_protocol::kIdentityFieldStorageSize] = { 0 };
+  char stored_robot_version[ar4_protocol::kIdentityFieldStorageSize] = { 0 };
+  char stored_driver_board[ar4_protocol::kIdentityFieldStorageSize] = { 0 };
+  char stored_serial_number[ar4_protocol::kIdentityFieldStorageSize] = { 0 };
+  char stored_asset_tag[ar4_protocol::kIdentityFieldStorageSize] = { 0 };
+  identity_record_status = ar4_protocol::load_identity_record(
+    EEPROM,
+    stored_robot_model,
+    stored_robot_version,
+    stored_driver_board,
+    stored_serial_number,
+    stored_asset_tag
+  );
 
-  } else {
+  if (
+    identity_record_status
+    == ar4_protocol::IdentityRecordStatus::kUninitialized
+  ) {
     Serial.println("EEPROM not initialized in load_robot_id");
-    robot_model = DEFAULT_ROBOT_MODEL;
-    robot_version = DEFAULT_ROBOT_VERSION;
-    driver_board = DEFAULT_DRIVER_BOARD;
-    serial_number = DEFAULT_SERIAL_NUMBER;
-    asset_tag = DEFAULT_ASSET_TAG;
+    use_default_robot_identity();
+    return;
   }
+  if (
+    identity_record_status
+    != ar4_protocol::IdentityRecordStatus::kValid
+  ) {
+    Serial.println("EEPROM identity record corrupt in load_robot_id");
+    identity_record_status = ar4_protocol::IdentityRecordStatus::kCorrupt;
+    clear_robot_identity();
+    return;
+  }
+
+  robot_model = stored_robot_model;
+  robot_version = stored_robot_version;
+  driver_board = stored_driver_board;
+  serial_number = stored_serial_number;
+  asset_tag = stored_asset_tag;
+  DEBUG_PRINT("Debug - Loaded Robot Model from EEPROM: ");
+  DEBUG_PRINTLN(robot_model);
+  DEBUG_PRINT("Debug - Loaded Robot Version from EEPROM: ");
+  DEBUG_PRINTLN(robot_version);
+  DEBUG_PRINT("Debug - Loaded Driver Board from EEPROM: ");
+  DEBUG_PRINTLN(driver_board);
+  DEBUG_PRINT("Debug - Loaded Serial Number from EEPROM: ");
+  DEBUG_PRINTLN(serial_number);
+  DEBUG_PRINT("Debug - Loaded Asset Tag from EEPROM: ");
+  DEBUG_PRINTLN(asset_tag);
 }
 
-void save_robot_id_to_eeprom(const String robot_model, const String robot_version, const String driver_board, const String serial_number, const String asset_tag) {
+bool save_robot_id_to_eeprom(const String robot_model, const String robot_version, const String driver_board, const String serial_number, const String asset_tag) {
   /*
      * Save robot model and version to EEPROM.
      * 
@@ -770,41 +1005,22 @@ void save_robot_id_to_eeprom(const String robot_model, const String robot_versio
      *   serial_number: Serial number string (max 31 chars)
      *   asset_tag: Asset Tag string (max 31 chars)
      */
-  // Write magic number
-  uint32_t magic = EEPROM_MAGIC_NUMBER;
-  EEPROM.put(EEPROM_MAGIC_ADDR, magic);
-
-  char charBuffer[32] = { 0 };
-
-  // Write robot model
-  if (robot_model != "NA") {
-    robot_model.toCharArray(charBuffer, sizeof(charBuffer));
-    EEPROM.put(EEPROM_ROBOT_MODEL_ADDR, charBuffer);
+  if (
+    !ar4_protocol::identity_field_valid(robot_model.c_str())
+    || !ar4_protocol::identity_field_valid(robot_version.c_str())
+    || !ar4_protocol::identity_field_valid(driver_board.c_str())
+    || !ar4_protocol::identity_field_valid(serial_number.c_str())
+    || !ar4_protocol::identity_field_valid(asset_tag.c_str())
+  ) {
+    return false;
   }
-
-  // Write robot version
-  if (robot_version != "NA") {
-    robot_version.toCharArray(charBuffer, sizeof(charBuffer));
-    EEPROM.put(EEPROM_ROBOT_VERSION_ADDR, charBuffer);
-  }
-
-  // Write driver board
-  if (driver_board != "NA") {
-    driver_board.toCharArray(charBuffer, sizeof(charBuffer));
-    EEPROM.put(EEPROM_DRIVER_BOARD_ADDR, charBuffer);
-  }
-
-  // Write Serial Number
-  if (serial_number != "NA") {
-    serial_number.toCharArray(charBuffer, sizeof(charBuffer));
-    EEPROM.put(EEPROM_SERIAL_NUMBER_ADDR, charBuffer);
-  }
-
-  // Write Asset Tag
-  if (asset_tag != "NA") {
-    asset_tag.toCharArray(charBuffer, sizeof(charBuffer));
-    EEPROM.put(EEPROM_ASSET_TAG_ADDR, charBuffer);
-  }
+  return ar4_protocol::save_identity_record(EEPROM, [&]() {
+    return write_identity_field_to_eeprom(EEPROM_ROBOT_MODEL_ADDR, robot_model)
+      && write_identity_field_to_eeprom(EEPROM_ROBOT_VERSION_ADDR, robot_version)
+      && write_identity_field_to_eeprom(EEPROM_DRIVER_BOARD_ADDR, driver_board)
+      && write_identity_field_to_eeprom(EEPROM_SERIAL_NUMBER_ADDR, serial_number)
+      && write_identity_field_to_eeprom(EEPROM_ASSET_TAG_ADDR, asset_tag);
+  });
 }
 
 void reboot() {
@@ -826,95 +1042,66 @@ void reboot() {
 /////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void handle_hello_command() {
-  /*
-     * Responds to HELLO command with system information in JSON format.
-     * Reads robot model/version from EEPROM (or uses defaults).
-     * 
-     * Command: HELLO\n
-     * Response: {"DriverModel":"Teensy 4.1","DriverVersion":"6.3","RobotModel":"AR4","RobotVersion":"Mk3"}\n
-     */
-
-  String response = "{";
-  response += "\"DriverModel\":\"" + String(driver_board) + "\",";
-  response += "\"FirmwareVersion\":\"" + String(FIRMWARE_VERSION) + "\",";
-  response += "\"RobotModel\":\"" + String(robot_model) + "\",";
-  response += "\"RobotVersion\":\"" + String(robot_version) + "\",";
-  response += "\"SerialNumber\":\"" + String(serial_number) + "\",";
-  response += "\"AssetTag\":\"" + String(asset_tag) + "\"";
-  response += "}";
-
+  if (
+    identity_record_status
+    == ar4_protocol::IdentityRecordStatus::kCorrupt
+  ) {
+    Serial.println("ER");
+    return;
+  }
+  char response[ar4_protocol::kIdentityJsonCapacity] = { 0 };
+  if (!ar4_protocol::build_identity_json(
+      driver_board.c_str(),
+      FIRMWARE_VERSION,
+      robot_model.c_str(),
+      robot_version.c_str(),
+      serial_number.c_str(),
+      asset_tag.c_str(),
+      JT_WRIST_CONFIG_CAPABILITY,
+      response,
+      sizeof(response)
+  )) {
+    Serial.println("ER");
+    return;
+  }
   Serial.println(response);
 }
 
 
-void handle_set_robot_id_command(String robot_model, String robot_version, String driver_board, String serial_number, String asset_tag) {
-  /*
-     * Set robot model and version, save to EEPROM.
-     * 
-     * Response: Done\n (on success) or Error\n (on failure)
-     */
-
-  if (robot_model.length() == 0) {
-    DEBUG_PRINTLN("No Robot Model Provided - Not Setting");
-    robot_model = "NA";
-  } else if (robot_model.length() > 31) {
-    Serial.println("Error: Robot Model too long (max 31 chars)");
+void handle_set_robot_id_command(String new_robot_model, String new_robot_version, String new_driver_board, String new_serial_number, String new_asset_tag) {
+  new_robot_model = validated_identity_field(new_robot_model);
+  new_robot_version = validated_identity_field(new_robot_version);
+  new_driver_board = validated_identity_field(new_driver_board);
+  new_serial_number = validated_identity_field(new_serial_number);
+  new_asset_tag = validated_identity_field(new_asset_tag);
+  if (
+    new_robot_model.length() == 0
+    || new_robot_version.length() == 0
+    || new_driver_board.length() == 0
+    || new_serial_number.length() == 0
+    || new_asset_tag.length() == 0
+  ) {
+    Serial.println("Error: Invalid robot identity field");
     return;
   }
-
-  if (robot_version.length() == 0) {
-    DEBUG_PRINTLN("No Robot Version Provded - Not Setting");
-    robot_version = "NA";
-    if (robot_version.length() > 31) {
-      Serial.println("Error: Robot Version too long (max 31 chars)");
-      return;
-    }
-  }
-
-  if (driver_board.length() == 0) {
-    DEBUG_PRINTLN("No Driver Board Provded - Not Setting");
-    driver_board = "NA";
-  } else if (driver_board.length() > 31) {
-    Serial.println("Error: Driver Board too long (max 31 chars)");
+  if (!save_robot_id_to_eeprom(
+      new_robot_model,
+      new_robot_version,
+      new_driver_board,
+      new_serial_number,
+      new_asset_tag
+  )) {
+    identity_record_status = ar4_protocol::IdentityRecordStatus::kCorrupt;
+    clear_robot_identity();
+    Serial.println("Error: Robot identity persistence failed");
     return;
   }
-
-  if (serial_number.length() == 0) {
-    DEBUG_PRINTLN("No Serial Number - Not Setting");
-    serial_number = "NA";
-  } else if (serial_number.length() > 31) {
-    Serial.println("Error: Version too long (max 31 chars)");
-    return;
-  }
-
-  if (asset_tag.length() == 0) {
-    DEBUG_PRINTLN("No Asset Tag Provded - Not Setting");
-    asset_tag = "NA";
-  } else if (asset_tag.length() > 31) {
-    Serial.println("Error: Asset Tag too long (max 31 chars)");
-    return;
-  }
-
-  robot_model.trim();
-  robot_version.trim();
-  driver_board.trim();
-  serial_number.trim();
-  asset_tag.trim();
-
-  DEBUG_PRINT("Debug - Setting Robot Model: ");
-  DEBUG_PRINTLN(robot_model);
-  DEBUG_PRINT("Debug - Setting Robot Version: ");
-  DEBUG_PRINTLN(robot_version);
-  DEBUG_PRINT("Debug - Setting Driver Board: ");
-  DEBUG_PRINTLN(driver_board);
-  DEBUG_PRINT("Debug - Setting Serial Number: ");
-  DEBUG_PRINTLN(serial_number);
-  DEBUG_PRINT("Debug - Setting Asset Tag: ");
-  DEBUG_PRINTLN(asset_tag);
-
-  // Save to EEPROM
-  save_robot_id_to_eeprom(robot_model, robot_version, driver_board, serial_number, asset_tag);
-
+  robot_model = new_robot_model;
+  robot_version = new_robot_version;
+  driver_board = new_driver_board;
+  serial_number = new_serial_number;
+  asset_tag = new_asset_tag;
+  identity_record_status = ar4_protocol::IdentityRecordStatus::kValid;
   Serial.println("Done");
 }
 
@@ -922,18 +1109,6 @@ void handle_set_robot_id_command(String robot_model, String robot_version, Strin
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //MATRICE OPERATIONS
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template<typename T>
-bool robot_joints_valid(const T joints[ROBOT_nDOFs]) {
-
-  for (int i = 0; i < ROBOT_nDOFs; i++) {
-    if (joints[i] < -Robot_JointLimits_Lower[i] || joints[i] > Robot_JointLimits_Upper[i]) {
-      return false;
-    }
-  }
-  return true;
-}
-
 
 //This function returns a 4x4 matrix as an argument (pose) following the modified DH rules for the inputs T rx, T tx, T rz and T tz source : https://en.wikipedia.org/wiki/Denavit%E2%80%93Hartenberg_parameters
 template<typename T>
@@ -1157,10 +1332,12 @@ void xyzuvw_2_pose(const T xyzuvw[6], Matrix4x4 pose) {
 //FOWARD KINEMATICS
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-//This function input the JxangleIn into an array, send it to the foward kinematic solver and output the result into the position variables
 void SolveFowardKinematics() {
 
-  robot_set_AR();
+  if (!robot_set_AR()) {
+    KinematicError = 1;
+    return;
+  }
 
   float target_xyzuvw[6];
   float joints[ROBOT_nDOFs];
@@ -1171,12 +1348,21 @@ void SolveFowardKinematics() {
 
   forward_kinematics_robot_xyzuvw(joints, target_xyzuvw);
 
-  xyzuvw_Out[0] = target_xyzuvw[0];
-  xyzuvw_Out[1] = target_xyzuvw[1];
-  xyzuvw_Out[2] = target_xyzuvw[2];
-  xyzuvw_Out[3] = target_xyzuvw[3] / M_PI * 180;
-  xyzuvw_Out[4] = target_xyzuvw[4] / M_PI * 180;
-  xyzuvw_Out[5] = target_xyzuvw[5] / M_PI * 180;
+  float external_xyzuvw[ar4_protocol::kCartesianPoseSize];
+  if (!ar4_protocol::native_cartesian_pose_to_external(
+      target_xyzuvw,
+      external_xyzuvw
+  )) {
+    KinematicError = 1;
+    return;
+  }
+
+  xyzuvw_Out[0] = external_xyzuvw[0];
+  xyzuvw_Out[1] = external_xyzuvw[1];
+  xyzuvw_Out[2] = external_xyzuvw[2];
+  xyzuvw_Out[3] = external_xyzuvw[3] / M_PI * 180;
+  xyzuvw_Out[4] = external_xyzuvw[4] / M_PI * 180;
+  xyzuvw_Out[5] = external_xyzuvw[5] / M_PI * 180;
 }
 
 
@@ -1200,16 +1386,15 @@ void forward_kinematics_arm(const T *joints, Matrix4x4 pose) {
 template<typename T>
 void forward_kinematics_robot_xyzuvw(const T joints[ROBOT_nDOFs], T target_xyzuvw[6]) {
   Matrix4x4 pose;
-  forward_kinematics_robot(joints, pose);  //send the joints values and return the pose matrix as an argument
-  pose_2_xyzuvw(pose, target_xyzuvw);      //send the pose matrix and return the xyzuvw values in an array as an argument
+  forward_kinematics_robot(joints, pose);
+  pose_2_xyzuvw(pose, target_xyzuvw);
 }
 
-//Calculate de foward kinematic of the robot without the tool
 template<typename T>
 void forward_kinematics_robot(const T joints[ROBOT_nDOFs], Matrix4x4 target) {
   Matrix4x4 invBaseFrame;
   Matrix4x4 pose_arm;
-  Matrix_Inv(invBaseFrame, Robot_BaseFrame);  // invRobot_Tool could be precalculated, the tool does not change so often
+  Matrix_Inv(invBaseFrame, Robot_BaseFrame);
   forward_kinematics_arm(joints, pose_arm);
   Matrix_Multiply(target, invBaseFrame, pose_arm);
   Matrix_Multiply_Cumul(target, Robot_ToolFrame);
@@ -1219,15 +1404,6 @@ void forward_kinematics_robot(const T joints[ROBOT_nDOFs], Matrix4x4 target) {
 //REVERSE KINEMATICS
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static constexpr float ANG_EPS = 0.05f;  // degrees (try 0.05 to 0.2)
-
-void updatejoints() {
-
-  for (int i = 0; i > ROBOT_nDOFs; i++) {
-    JangleIn[i] = JangleOut[i];
-  }
-}
-
 void JointEstimate() {
 
   for (int i = 0; i < ROBOT_nDOFs; i++) {
@@ -1235,216 +1411,67 @@ void JointEstimate() {
   }
 }
 
-static inline float wrap180(float a) {
-  while (a > 180.0f) a -= 360.0f;
-  while (a < -180.0f) a += 360.0f;
-  return a;
-}
+void SolveInverseKinematics(char wrist_config) {
 
-static inline float clamp180_eps(float a, float eps) {
-  // If we're extremely close to ±180, snap to exactly ±180 to avoid sign flips.
-  if (fabsf(a - 180.0f) <= eps) return 180.0f;
-  if (fabsf(a + 180.0f) <= eps) return -180.0f;
-  return a;
-}
-
-static inline bool wrist_matches(char wc, float j5_deg) {
-  // Fanuc-style: F = J5 positive, N = J5 negative (or non-positive)
-  if (wc == 'F') return (j5_deg >= 0.0f);
-  if (wc == 'N') return (j5_deg <= 0.0f);
-  return true;  // if wc unknown, don't filter
-}
-
-static inline float angdiff_deg(float a, float b) {
-  float d = a - b;
-  while (d > 180.0f) d -= 360.0f;
-  while (d < -180.0f) d += 360.0f;
-  return d;
-}
-
-
-static inline int sgn_with_db(float v, float db) {
-  if (v > db) return +1;
-  if (v < -db) return -1;
-  return 0;  // in deadband
-}
-
-
-void SolveInverseKinematics() {
-
-  float joints[ROBOT_nDOFs];
   float target[6];
 
-  float solbuffer[ROBOT_nDOFs] = { 0 };
   int NumberOfSol = 0;
-  int solVal = 0;
+  int solVal = -1;
 
   KinematicError = 0;
 
   JointEstimate();
-  target[0] = xyzuvw_In[0];
-  target[1] = xyzuvw_In[1];
-  target[2] = xyzuvw_In[2];
-  target[3] = xyzuvw_In[3] * M_PI / 180;
-  target[4] = xyzuvw_In[4] * M_PI / 180;
-  target[5] = xyzuvw_In[5] * M_PI / 180;
-
-  // Serial.println("X : " + String(target[0]) + " Y : " + String(target[1]) + " Z : " + String(target[2]) + " rx : " + String(xyzuvw_In[3]) + " ry : " + String(xyzuvw_In[4]) + " rz : " + String(xyzuvw_In[5]));
-
-
-  for (int i = -3; i <= 3; i++) {
-    joints_estimate[4] = i * 30;
-    int success = inverse_kinematics_robot_xyzuvw<float>(target, joints, joints_estimate);
-    if (success) {
-      if (solbuffer[4] != joints[4]) {
-        if (robot_joints_valid(joints)) {
-          for (int j = 0; j < ROBOT_nDOFs; j++) {
-            solbuffer[j] = joints[j];
-            SolutionMatrix[j][NumberOfSol] = solbuffer[j];
-          }
-          if (NumberOfSol <= 6) {
-            NumberOfSol++;
-          }
-        }
-      }
-    } else {
-      KinematicError = 1;
-    }
-  }
-
-  joints_estimate[4] = JangleIn[4];
-
-
-  solVal = 0;
-
-  if (NumberOfSol > 0) {
-    int best = -1;
-    float bestCost = 1e30f;
-
-    // Use WristCon if it exists
-    char wc = 0;
-    if (WristCon.length() > 0) wc = WristCon.charAt(0);
-
-    // Industrial-ish: stop wrist flips at identical Cartesian poses
-    static int lastSolVal = 0;
-    if (lastSolVal < 0 || lastSolVal >= NumberOfSol) lastSolVal = 0;
-
-    const float J5_DB = 0.5f;     // deg: sign deadband
-    const float SING_DB = 2.0f;   // deg: “near singular” zone
-    const float TIE_EPS = 0.05f;  // cost tie threshold
-
-    // current wrist-sum reference (important near singularity)
-    float curWristSum = JangleIn[3] + JangleIn[5];
-
-    auto sgn_db = [](float v, float db) -> int {
-      if (v > db) return +1;
-      if (v < -db) return -1;
-      return 0;
-    };
-
-    // What wrist sign do we want to keep?
-    int desiredW5 = sgn_db(JangleIn[4], J5_DB);
-    if (desiredW5 == 0) desiredW5 = sgn_db(joints_estimate[4], J5_DB);
-    if (desiredW5 == 0) desiredW5 = +1;
-
-    for (int s = 0; s < NumberOfSol; s++) {
-
-      float j5 = SolutionMatrix[4][s];
-      float absJ5 = fabsf(j5);
-      int solW5 = sgn_db(j5, J5_DB);
-
-      float cost = 0.0f;
-
-      // Base joint continuity cost (wrap-aware)
-      for (int j = 0; j < ROBOT_nDOFs; j++) {
-        cost += fabsf(angdiff_deg(SolutionMatrix[j][s], joints_estimate[j]));
-      }
-
-      // WristCon behavior:
-      //  - F/N: enforce away from singular; bias near singular (don’t hard reject)
-      //  - A: allow flip (optional)
-      if (wc == 'F') desiredW5 = +1;
-      if (wc == 'N') desiredW5 = -1;
-
-      if (wc == 'F' || wc == 'N') {
-        if (absJ5 > SING_DB) {
-          // Away from singular: strict filter
-          if (solW5 != 0 && solW5 != desiredW5) continue;
-          if (solW5 == 0) cost += 50.0f;  // discourage “too close” solutions
-        } else {
-          // Near singular: don't hard reject, just strongly bias
-          if (solW5 != 0 && solW5 != desiredW5) cost += 200.0f;
-        }
-      } else if (wc == 'A') {
-        // Allow flip: mild bias toward current branch when away from singular
-        if (absJ5 > SING_DB) {
-          if (solW5 != 0 && solW5 != desiredW5) cost += 20.0f;
-        }
-      } else {
-        // Unknown / empty: behave like "keep current"
-        if (absJ5 > SING_DB) {
-          if (solW5 != 0 && solW5 != desiredW5) continue;
-        } else {
-          if (solW5 != 0 && solW5 != desiredW5) cost += 200.0f;
-        }
-      }
-
-      // Key singularity handling: keep (J4+J6) continuous when |J5| small
-      if (absJ5 <= SING_DB) {
-        float solWristSum = SolutionMatrix[3][s] + SolutionMatrix[5][s];
-        cost += 5.0f * fabsf(angdiff_deg(solWristSum, curWristSum));
-      }
-
-      // Tie-breaker: if costs are basically tied, prefer last solution index
-      if (best >= 0 && fabsf(cost - bestCost) <= TIE_EPS) {
-        if (s == lastSolVal) {
-          best = s;
-          bestCost = cost;
-          continue;
-        }
-      }
-
-      if (cost < bestCost) {
-        bestCost = cost;
-        best = s;
-      }
-    }
-
-    if (best < 0) best = lastSolVal;
-    lastSolVal = best;
-
-    // If filter rejected everything (rare near J5=0), fall back to unfiltered best
-    if (best < 0) {
-      best = lastSolVal;
-      bestCost = 1e30f;
-      for (int s = 0; s < NumberOfSol; s++) {
-        float cost = 0.0f;
-        for (int j = 0; j < ROBOT_nDOFs; j++) {
-          cost += fabsf(angdiff_deg(SolutionMatrix[j][s], joints_estimate[j]));
-        }
-        if (cost < bestCost) {
-          bestCost = cost;
-          best = s;
-        }
-      }
-    }
-
-    solVal = best;
-  }
-
-  // Stabilize numeric behavior at the ±180 branch cut (prevents occasional wraps)
-  for (int j = 0; j < ROBOT_nDOFs; j++) {
-    // keep within [-180, 180] with consistent representation
-    SolutionMatrix[j][solVal] = wrap180(SolutionMatrix[j][solVal]);
-    SolutionMatrix[j][solVal] = clamp180_eps(SolutionMatrix[j][solVal], ANG_EPS);
-  }
-
-
-  if (NumberOfSol == 0) {
+  if (!ar4_protocol::external_cartesian_pose_to_native_radians(
+      xyzuvw_In,
+      target
+  )) {
     KinematicError = 1;
+    return;
   }
 
 
+  NumberOfSol = ar4_protocol::generate_wrist_solutions(
+    SolutionMatrix,
+    target,
+    joints_estimate,
+    Robot_JointLimits_Upper,
+    Robot_JointLimits_Lower,
+    [](
+      const float* solver_target,
+      const float* candidate,
+      float position_tolerance,
+      float rotation_tolerance
+    ) {
+      Matrix4x4 target_pose;
+      Matrix4x4 candidate_pose;
+      xyzuvw_2_pose(solver_target, target_pose);
+      forward_kinematics_robot(candidate, candidate_pose);
+      return ar4_protocol::wrist_pose_matches(
+        candidate_pose,
+        target_pose,
+        position_tolerance,
+        rotation_tolerance
+      );
+    },
+    [](const float* solver_target, float* candidate, const float* seed) {
+      return inverse_kinematics_robot_xyzuvw<float>(
+        solver_target,
+        candidate,
+        seed
+      ) != 0;
+    }
+  );
+
+  solVal = ar4_protocol::select_wrist_solution(
+    SolutionMatrix,
+    NumberOfSol,
+    joints_estimate,
+    wrist_config
+  );
+  if (solVal < 0) {
+    KinematicError = 1;
+    return;
+  }
   // Serial.println("Sol : " + String(solVal) + " Nb sol : " + String(NumberOfSol));
 
   for (int i = 0; i < ROBOT_nDOFs; i++) {
@@ -1461,7 +1488,7 @@ int inverse_kinematics_robot(const Matrix4x4 target, T joints[ROBOT_nDOFs], cons
   Matrix4x4 invToolFrame;
   Matrix4x4 pose_arm;
   int nsol;
-  Matrix_Inv(invToolFrame, Robot_ToolFrame);  // invRobot_Tool could be precalculated, the tool does not change so often
+  Matrix_Inv(invToolFrame, Robot_ToolFrame);
   Matrix_Multiply(pose_arm, Robot_BaseFrame, target);
   Matrix_Multiply_Cumul(pose_arm, invToolFrame);
   if (joints_estimate != nullptr) {
@@ -1834,22 +1861,50 @@ bool initSD() {
   return true;
 }
 
-void writeSD(const String &filename, const String &info) {
-  if (!initSD()) return;
+bool writeSD(const String &filename, const String &info) {
+  if (!initSD()) return false;
 
   File f = SD.open(filename.c_str(), FILE_WRITE);
   if (!f) {
+    sd_ok = false;
     Serial.println(egSD("open fail"));
-    return;
+    return false;
   }
-  f.println(info);
+  const size_t written = f.println(info);
+  f.flush();
+  const bool succeeded = written == info.length() + 2
+    && f.getWriteError() == 0;
   f.close();
+  if (!succeeded) {
+    sd_ok = false;
+    Serial.println(egSD("write fail"));
+  }
+  return succeeded;
 }
 
-void deleteSD(String filename) {
-  SD.begin(BUILTIN_SDCARD);
-  const char *fn = filename.c_str();
-  SD.remove(fn);
+bool deleteSD(const String &filename) {
+  if (!initSD()) return false;
+  if (!SD.remove(filename.c_str())) {
+    sd_ok = false;
+    Serial.println(egSD("remove fail"));
+    return false;
+  }
+  return true;
+}
+
+ar4_protocol::StoredRowReadStatus read_stored_command_row(
+  File &file,
+  String &row
+) {
+  row = "";
+  while (file.available()) {
+    const ar4_protocol::StoredRowReadStatus status =
+      ar4_protocol::append_stored_row_byte(row, file.read());
+    if (status != ar4_protocol::StoredRowReadStatus::kPending) {
+      return status;
+    }
+  }
+  return ar4_protocol::finish_stored_row(row);
 }
 
 void printDirectory(File dir, int numTabs) {
@@ -2073,37 +2128,37 @@ void checkEncoders() {
   J6EncSteps = J6encPos.read() / J6encMult;
 
   if (abs((J1EncSteps - J1StepM)) >= encOffset) {
-    if (J1LoopMode == 0) {
+    if (JointLoopModes[0] == 0) {
       J1collisionTrue = 1;
       J1StepM = J1encPos.read() / J1encMult;
     }
   }
   if (abs((J2EncSteps - J2StepM)) >= encOffset) {
-    if (J2LoopMode == 0) {
+    if (JointLoopModes[1] == 0) {
       J2collisionTrue = 1;
       J2StepM = J2encPos.read() / J2encMult;
     }
   }
   if (abs((J3EncSteps - J3StepM)) >= encOffset) {
-    if (J3LoopMode == 0) {
+    if (JointLoopModes[2] == 0) {
       J3collisionTrue = 1;
       J3StepM = J3encPos.read() / J3encMult;
     }
   }
   if (abs((J4EncSteps - J4StepM)) >= encOffset) {
-    if (J4LoopMode == 0) {
+    if (JointLoopModes[3] == 0) {
       J4collisionTrue = 1;
       J4StepM = J4encPos.read() / J4encMult;
     }
   }
   if (abs((J5EncSteps - J5StepM)) >= encOffset) {
-    if (J5LoopMode == 0) {
+    if (JointLoopModes[4] == 0) {
       J5collisionTrue = 1;
       J5StepM = J5encPos.read() / J5encMult;
     }
   }
   if (abs((J6EncSteps - J6StepM)) >= encOffset) {
-    if (J6LoopMode == 0) {
+    if (JointLoopModes[5] == 0) {
       J6collisionTrue = 1;
       J6StepM = J6encPos.read() / J6encMult;
     }
@@ -2120,9 +2175,22 @@ void checkEncoders() {
 //DRIVE MOTORS J
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, int J6step, int J7step, int J8step, int J9step,
+void store_step_monitors(const int (&stepMonitors)[numJoints]) {
+  J1StepM = stepMonitors[0];
+  J2StepM = stepMonitors[1];
+  J3StepM = stepMonitors[2];
+  J4StepM = stepMonitors[3];
+  J5StepM = stepMonitors[4];
+  J6StepM = stepMonitors[5];
+  J7StepM = stepMonitors[6];
+  J8StepM = stepMonitors[7];
+  J9StepM = stepMonitors[8];
+}
+
+bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, int J6step, int J7step, int J8step, int J9step,
                   int J1dir, int J2dir, int J3dir, int J4dir, int J5dir, int J6dir, int J7dir, int J8dir, int J9dir,
-                  String SpeedType, float SpeedVal, float ACCspd, float DCCspd, float ACCramp) {
+                  String SpeedType, float SpeedVal, float ACCspd, float DCCspd, float ACCramp,
+                  FirmwareMotionModeTransaction *motionModes) {
   // Array of steps and directions
   int steps[9] = { J1step, J2step, J3step, J4step, J5step, J6step, J7step, J8step, J9step };
   int dirs[9] = { J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir };
@@ -2141,11 +2209,12 @@ void driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
   // Initialize step monitors
   int stepMonitors[9] = { J1StepM, J2StepM, J3StepM, J4StepM, J5StepM, J6StepM, J7StepM, J8StepM, J9StepM };
 
-  int HighStep = steps[0];
+  int HighStep = 0;
   int Jactive = 0;
 
   // FIND HIGHEST STEP
-  for (int i = 1; i < 9; i++) {
+  for (int i = 0; i < numJoints; i++) {
+    if (steps[i] < 0 || (dirs[i] != 0 && dirs[i] != 1)) return false;
     if (steps[i] > HighStep) {
       HighStep = steps[i];
     }
@@ -2154,22 +2223,24 @@ void driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
       Jactive++;
     }
   }
-
-  // SET DIRECTIONS
-  for (int i = 0; i < 9; i++) {
-    if (dirs[i] == motDirs[i]) {
-      digitalWrite(dirPins[i], HIGH);
-    } else {
-      digitalWrite(dirPins[i], LOW);
-    }
-  }
-
-  delayMicroseconds(15);
+  if (HighStep == 0) return true;
 
   /////CALC SPEEDS//////
-  float calcStepGap;  // cruise delay (µs between highStep ticks)
-  float speedSP;      // target total time in µs for the move
-  float delay;
+  float calcStepGap = 0.0f;  // cruise delay (µs between highStep ticks)
+  double speedSP = 0.0;      // target total time in µs for the move
+  if (
+    SpeedType.length() != 1
+    || !ar4_protocol::valid_motion_profile(
+      SpeedType.charAt(0),
+      SpeedVal,
+      ACCspd,
+      DCCspd,
+      ACCramp
+    )
+    || minSpeedDelay <= 0
+  ) {
+    return false;
+  }
 
   // DETERMINE STEPS
   float ACCStep = HighStep * (ACCspd / 100.0f);
@@ -2178,10 +2249,13 @@ void driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
 
   // SET SPEED FOR SECONDS OR MM PER SEC
   if (SpeedType == "s") {
-    speedSP = (SpeedVal * 1000000.0f) * 1.0f;
+    speedSP = static_cast<double>(SpeedVal) * 1000000.0;
   } else if (SpeedType == "m") {
-    float lineDist = pow(pow(xyzuvw_In[0] - xyzuvw_Out[0], 2) + pow(xyzuvw_In[1] - xyzuvw_Out[1], 2) + pow(xyzuvw_In[2] - xyzuvw_Out[2], 2), 0.5f);
-    speedSP = ((lineDist / SpeedVal) * 1000000.0f) * 1.0f;
+    const double x = static_cast<double>(xyzuvw_In[0]) - xyzuvw_Out[0];
+    const double y = static_cast<double>(xyzuvw_In[1]) - xyzuvw_Out[1];
+    const double z = static_cast<double>(xyzuvw_In[2]) - xyzuvw_Out[2];
+    const double lineDist = sqrt(x * x + y * y + z * z);
+    speedSP = lineDist / static_cast<double>(SpeedVal) * 1000000.0;
   }
 
   // fixed ramp factors (start/end slower than cruise)
@@ -2200,13 +2274,15 @@ void driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
     //
     // T = cruise * [ NORStep + (ACCStep*(1+k_acc) + DCCStep*(1+k_dec))/2 ]
     //
-    float denom = NORStep + (ACCStep * (1.0f + k_acc) + DCCStep * (1.0f + k_dec)) * 0.5f;
+    const double denom = NORStep + (
+      ACCStep * (1.0f + k_acc) + DCCStep * (1.0f + k_dec)
+    ) * 0.5;
 
     if (denom <= 0.0f) {
       // Fallback to constant speed if accel+decel consume everything
-      calcStepGap = speedSP / max(HighStep, 1.0f);
+      calcStepGap = static_cast<float>(speedSP / HighStep);
     } else {
-      calcStepGap = speedSP / denom;
+      calcStepGap = static_cast<float>(speedSP / denom);
     }
 
     if (calcStepGap < minSpeedDelay) {
@@ -2221,6 +2297,23 @@ void driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
   // With cruise known, define start/end delays and per-step increments
   float startDelay = calcStepGap * k_acc;  // slower than cruise
   float endDelay = calcStepGap * k_dec;    // slower than cruise
+  if (!ar4_protocol::valid_delay_envelope(
+      calcStepGap,
+      startDelay,
+      endDelay,
+      rndTrue,
+      rndSpeed
+  )) {
+    return false;
+  }
+  if (estopActive) return false;
+  if (motionModes != nullptr) motionModes->commit();
+
+  // Timing rejection must precede every output-pin mutation.
+  for (int i = 0; i < numJoints; i++) {
+    digitalWrite(dirPins[i], dirs[i] == motDirs[i] ? HIGH : LOW);
+  }
+  delayMicroseconds(15);
 
   // Linear ramp decrements/increments per step
   float calcACCstepInc = (ACCStep > 0.0f) ? (startDelay - calcStepGap) / ACCStep : 0.0f;  // subtract each step
@@ -2238,12 +2331,18 @@ void driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
   while ((cur[0] < steps[0] || cur[1] < steps[1] || cur[2] < steps[2] || cur[3] < steps[3] || cur[4] < steps[4] || cur[5] < steps[5] || cur[6] < steps[6] || cur[7] < steps[7] || cur[8] < steps[8]) && estopActive == false) {
 
     ////DELAY CALC/////
-    if (highStepCur <= ACCStep) {
+    if (highStepCur < ACCStep) {
       // During accel, move from startDelay down to cruise
-      curDelay -= calcACCstepInc;  // since calcACCstepInc = (start - cruise)/ACCStep > 0
+      curDelay = fmax(
+        calcStepGap,
+        curDelay - calcACCstepInc
+      );
     } else if (highStepCur >= (HighStep - DCCStep)) {
       // During decel, move from cruise up to endDelay
-      curDelay += calcDCCstepInc;  // since calcDCCstepInc = (end - cruise)/DCCStep > 0
+      curDelay = fmin(
+        endDelay,
+        curDelay + calcDCCstepInc
+      );
     } else {
       curDelay = calcStepGap;  // cruise
     }
@@ -2301,11 +2400,17 @@ void driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
       digitalWrite(stepPins[i], HIGH);
     }
 
-    delay = curDelay - disDelayCur;
-    if (delay < minSpeedDelay) {
-      delay = minSpeedDelay;
+    uint32_t pulseDelay = 0;
+    if (!ar4_protocol::pulse_delay_microseconds(
+        curDelay,
+        disDelayCur,
+        minSpeedDelay,
+        pulseDelay
+    )) {
+      store_step_monitors(stepMonitors);
+      return false;
     }
-    delayMicroseconds(delay);
+    delayMicroseconds(pulseDelay);
   }
   unsigned long moveEnd = micros();
   float elapsedSeconds = (moveEnd - moveStart) / 1000000.0f;
@@ -2315,15 +2420,8 @@ void driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
   rndSpeed = curDelay;
 
   // Update the original step monitor variables
-  J1StepM = stepMonitors[0];
-  J2StepM = stepMonitors[1];
-  J3StepM = stepMonitors[2];
-  J4StepM = stepMonitors[3];
-  J5StepM = stepMonitors[4];
-  J6StepM = stepMonitors[5];
-  J7StepM = stepMonitors[6];
-  J8StepM = stepMonitors[7];
-  J9StepM = stepMonitors[8];
+  store_step_monitors(stepMonitors);
+  return true;
 }
 
 
@@ -2332,7 +2430,7 @@ void driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
 //DRIVE MOTORS G
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void driveMotorsG(int J1step, int J2step, int J3step, int J4step, int J5step, int J6step, int J7step, int J8step, int J9step, int J1dir, int J2dir, int J3dir, int J4dir, int J5dir, int J6dir, int J7dir, int J8dir, int J9dir, String SpeedType, float SpeedVal, float ACCspd, float DCCspd, float ACCramp) {
+bool driveMotorsG(int J1step, int J2step, int J3step, int J4step, int J5step, int J6step, int J7step, int J8step, int J9step, int J1dir, int J2dir, int J3dir, int J4dir, int J5dir, int J6dir, int J7dir, int J8dir, int J9dir, String SpeedType, float SpeedVal, float ACCspd, float DCCspd, float ACCramp, FirmwareMotionModeTransaction *motionModes) {
   int steps[] = { J1step, J2step, J3step, J4step, J5step, J6step, J7step, J8step, J9step };
   int dirs[] = { J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir };
   int motDirs[] = { J1MotDir, J2MotDir, J3MotDir, J4MotDir, J5MotDir, J6MotDir, J7MotDir, J8MotDir, J9MotDir };
@@ -2342,11 +2440,13 @@ void driveMotorsG(int J1step, int J2step, int J3step, int J4step, int J5step, in
 
   // FIND HIGHEST STEP
   int HighStep = 0;
-  for (int i = 0; i < 9; i++) {
+  for (int i = 0; i < numJoints; i++) {
+    if (steps[i] < 0 || (dirs[i] != 0 && dirs[i] != 1)) return false;
     if (steps[i] > HighStep) {
       HighStep = steps[i];
     }
   }
+  if (HighStep == 0) return true;
 
   // FIND ACTIVE JOINTS
   int Jactive = 0;
@@ -2364,28 +2464,32 @@ void driveMotorsG(int J1step, int J2step, int J3step, int J4step, int J5step, in
 
   int highStepCur = 0;
   float curDelay = 0;
-  float speedSP;
+  double speedSP = 0.0;
   float moveDist;
 
-  // SET DIRECTIONS
-  for (int i = 0; i < 9; i++) {
-    if (dirs[i] == motDirs[i]) {
-      digitalWrite(dirPins[i], HIGH);
-    } else {
-      digitalWrite(dirPins[i], LOW);
-    }
-  }
-
-  delayMicroseconds(15);
-
   ///// CALC SPEEDS /////
-  float calcStepGap;
+  float calcStepGap = 0.0f;
   speedViolation = "0";  // Reset speed violation flag
+  if (
+    SpeedType.length() != 1
+    || !ar4_protocol::valid_motion_profile(
+      SpeedType.charAt(0),
+      SpeedVal,
+      ACCspd,
+      DCCspd,
+      ACCramp
+    )
+    || minSpeedDelay <= 0
+    || !isfinite(maxMMperSec)
+    || maxMMperSec <= 0.0f
+  ) {
+    return false;
+  }
 
   // Set speed for seconds or mm per sec
   if (SpeedType == "s") {
-    speedSP = (SpeedVal * 1000000) * 1.2;
-    calcStepGap = speedSP / HighStep;
+    speedSP = static_cast<double>(SpeedVal) * 1000000.0 * 1.2;
+    calcStepGap = static_cast<float>(speedSP / HighStep);
   } else if (SpeedType == "m") {
     if (SpeedVal >= maxMMperSec) {
       SpeedVal = maxMMperSec;
@@ -2402,6 +2506,23 @@ void driveMotorsG(int J1step, int J2step, int J3step, int J4step, int J5step, in
     calcStepGap = minSpeedDelay;
     speedViolation = "1";
   }
+  if (!ar4_protocol::valid_delay_envelope(
+      calcStepGap,
+      calcStepGap,
+      calcStepGap,
+      false,
+      0.0
+  )) {
+    return false;
+  }
+  if (estopActive) return false;
+  if (motionModes != nullptr) motionModes->commit();
+
+  // Timing rejection must precede every output-pin mutation.
+  for (int i = 0; i < numJoints; i++) {
+    digitalWrite(dirPins[i], dirs[i] == motDirs[i] ? HIGH : LOW);
+  }
+  delayMicroseconds(15);
 
   ///// DRIVE MOTORS /////
   while ((cur[0] != steps[0] || cur[1] != steps[1] || cur[2] != steps[2] || cur[3] != steps[3] || cur[4] != steps[4] || cur[5] != steps[5] || cur[6] != steps[6] || cur[7] != steps[7] || cur[8] != steps[8]) && estopActive == false) {
@@ -2446,22 +2567,25 @@ void driveMotorsG(int J1step, int J2step, int J3step, int J4step, int J5step, in
     for (int i = 0; i < 9; i++) {
       digitalWrite(stepPins[i], HIGH);
     }
-    delayMicroseconds(curDelay - disDelayCur);
+    uint32_t pulseDelay = 0;
+    if (!ar4_protocol::pulse_delay_microseconds(
+        curDelay,
+        disDelayCur,
+        minSpeedDelay,
+        pulseDelay
+    )) {
+      store_step_monitors(stepMonitors);
+      return false;
+    }
+    delayMicroseconds(pulseDelay);
   }
 
   // set rounding speed to last move speed
   rndSpeed = curDelay;
 
   // assign the updated values back to the original step monitors
-  J1StepM = stepMonitors[0];
-  J2StepM = stepMonitors[1];
-  J3StepM = stepMonitors[2];
-  J4StepM = stepMonitors[3];
-  J5StepM = stepMonitors[4];
-  J6StepM = stepMonitors[5];
-  J7StepM = stepMonitors[6];
-  J8StepM = stepMonitors[7];
-  J9StepM = stepMonitors[8];
+  store_step_monitors(stepMonitors);
+  return true;
 }
 
 
@@ -2470,7 +2594,7 @@ void driveMotorsG(int J1step, int J2step, int J3step, int J4step, int J5step, in
 //DRIVE MOTORS L
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void driveMotorsL(int J1step, int J2step, int J3step, int J4step, int J5step, int J6step, int J7step, int J8step, int J9step, int J1dir, int J2dir, int J3dir, int J4dir, int J5dir, int J6dir, int J7dir, int J8dir, int J9dir, float curDelay) {
+bool driveMotorsL(int J1step, int J2step, int J3step, int J4step, int J5step, int J6step, int J7step, int J8step, int J9step, int J1dir, int J2dir, int J3dir, int J4dir, int J5dir, int J6dir, int J7dir, int J8dir, int J9dir, float curDelay, FirmwareMotionModeTransaction *motionModes) {
   // Array of steps, directions, pins, motor directions, and step counters
   int steps[9] = { J1step, J2step, J3step, J4step, J5step, J6step, J7step, J8step, J9step };
   int dirs[9] = { J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir };
@@ -2487,10 +2611,21 @@ void driveMotorsL(int J1step, int J2step, int J3step, int J4step, int J5step, in
 
   // FIND HIGHEST STEP
   int HighStep = 0;
-  for (int i = 0; i < 9; i++) {
+  for (int i = 0; i < numJoints; i++) {
+    if (steps[i] < 0 || (dirs[i] != 0 && dirs[i] != 1)) return false;
     if (steps[i] > HighStep) {
       HighStep = steps[i];
     }
+  }
+  if (HighStep == 0) return true;
+  if (!ar4_protocol::valid_delay_envelope(
+      curDelay,
+      curDelay,
+      curDelay,
+      false,
+      0.0
+  ) || minSpeedDelay <= 0) {
+    return false;
   }
 
   // FIND ACTIVE JOINTS
@@ -2504,6 +2639,8 @@ void driveMotorsL(int J1step, int J2step, int J3step, int J4step, int J5step, in
   if (splineTrue) {
     processSerial();
   }
+  if (estopActive) return false;
+  if (motionModes != nullptr) motionModes->commit();
 
   // SET DIRECTIONS
   for (int i = 0; i < 9; i++) {
@@ -2570,19 +2707,22 @@ void driveMotorsL(int J1step, int J2step, int J3step, int J4step, int J5step, in
     for (int i = 0; i < 9; i++) {
       digitalWrite(stepPins[i], HIGH);
     }
-    delayMicroseconds(curDelay - disDelayCur);
+    uint32_t pulseDelay = 0;
+    if (!ar4_protocol::pulse_delay_microseconds(
+        curDelay,
+        disDelayCur,
+        minSpeedDelay,
+        pulseDelay
+    )) {
+      store_step_monitors(stepMonitors);
+      return false;
+    }
+    delayMicroseconds(pulseDelay);
   }
 
   // Assign the updated values back to the original step monitors
-  J1StepM = stepMonitors[0];
-  J2StepM = stepMonitors[1];
-  J3StepM = stepMonitors[2];
-  J4StepM = stepMonitors[3];
-  J5StepM = stepMonitors[4];
-  J6StepM = stepMonitors[5];
-  J7StepM = stepMonitors[6];
-  J8StepM = stepMonitors[7];
-  J9StepM = stepMonitors[8];
+  store_step_monitors(stepMonitors);
+  return true;
 }
 
 
@@ -2590,7 +2730,7 @@ void driveMotorsL(int J1step, int J2step, int J3step, int J4step, int J5step, in
 //MOVE J
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void moveJ(String inData, bool response, bool precalc, bool simspeed) {
+bool moveJ(String inData, bool response, bool precalc, bool simspeed) {
 
   int J1dir;
   int J2dir;
@@ -2613,62 +2753,65 @@ void moveJ(String inData, bool response, bool precalc, bool simspeed) {
   int J9axisFault = 0;
   int TotalAxisFault = 0;
 
-  int xStart = inData.indexOf("X");
-  int yStart = inData.indexOf("Y");
-  int zStart = inData.indexOf("Z");
-  int rzStart = inData.indexOf("Rz");
-  int ryStart = inData.indexOf("Ry");
-  int rxStart = inData.indexOf("Rx");
-  int J7Start = inData.indexOf("J7");
-  int J8Start = inData.indexOf("J8");
-  int J9Start = inData.indexOf("J9");
-  int SPstart = inData.indexOf("S");
-  int AcStart = inData.indexOf("Ac");
-  int DcStart = inData.indexOf("Dc");
-  int RmStart = inData.indexOf("Rm");
-  int RndStart = inData.indexOf("Rnd");
-  int WristConStart = inData.indexOf("W");
-  int LoopModeStart = inData.indexOf("Lm");
+  ar4_protocol::CartesianMoveCommandFields commandFields = {};
+  if (!ar4_protocol::parse_cartesian_move_command(inData, commandFields)) {
+    return false;
+  }
+  int staged_external_steps[3];
+  if (!external_positions_to_future_steps(
+      commandFields.auxiliary[0],
+      commandFields.auxiliary[1],
+      commandFields.auxiliary[2],
+      staged_external_steps
+  )) {
+    return false;
+  }
 
-  xyzuvw_In[0] = inData.substring(xStart + 1, yStart).toFloat();
-  xyzuvw_In[1] = inData.substring(yStart + 1, zStart).toFloat();
-  xyzuvw_In[2] = inData.substring(zStart + 1, rzStart).toFloat();
-  xyzuvw_In[3] = inData.substring(rzStart + 2, ryStart).toFloat();
-  xyzuvw_In[4] = inData.substring(ryStart + 2, rxStart).toFloat();
-  xyzuvw_In[5] = inData.substring(rxStart + 2, J7Start).toFloat();
-  J7_In = inData.substring(J7Start + 2, J8Start).toFloat();
-  J8_In = inData.substring(J8Start + 2, J9Start).toFloat();
-  J9_In = inData.substring(J9Start + 2, SPstart).toFloat();
-
-  String SpeedType = inData.substring(SPstart + 1, SPstart + 2);
-  float SpeedVal = inData.substring(SPstart + 2, AcStart).toFloat();
-  float ACCspd = inData.substring(AcStart + 2, DcStart).toFloat();
-  float DCCspd = inData.substring(DcStart + 2, RmStart).toFloat();
-  float ACCramp = inData.substring(RmStart + 2, RndStart).toFloat();
-  float Rounding = inData.substring(RndStart + 3, WristConStart).toFloat();
-  WristCon = inData.substring(WristConStart + 1, LoopModeStart);
-  String LoopMode = inData.substring(LoopModeStart + 2);
-  LoopMode.trim();
-  J1LoopMode = LoopMode.substring(0, 1).toInt();
-  J2LoopMode = LoopMode.substring(1, 2).toInt();
-  J3LoopMode = LoopMode.substring(2, 3).toInt();
-  J4LoopMode = LoopMode.substring(3, 4).toInt();
-  J5LoopMode = LoopMode.substring(4, 5).toInt();
-  J6LoopMode = LoopMode.substring(5).toInt();
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    xyzuvw_In[axis] = commandFields.pose[axis];
+  }
+  J7_In = commandFields.auxiliary[0];
+  J8_In = commandFields.auxiliary[1];
+  J9_In = commandFields.auxiliary[2];
+  String SpeedType(commandFields.speed_mode);
+  float SpeedVal = commandFields.speed;
+  float ACCspd = commandFields.acceleration;
+  float DCCspd = commandFields.deceleration;
+  float ACCramp = commandFields.ramp;
+  ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
+    WristCon,
+    JointLoopModes,
+    String(commandFields.wrist_config),
+    commandFields.loop_modes
+  );
 
 
-  SolveInverseKinematics();
+  SolveInverseKinematics(commandFields.wrist_config);
 
   //calc destination motor steps
-  int J1futStepM = (JangleOut[0] + J1axisLimNeg) * J1StepDeg;
-  int J2futStepM = (JangleOut[1] + J2axisLimNeg) * J2StepDeg;
-  int J3futStepM = (JangleOut[2] + J3axisLimNeg) * J3StepDeg;
-  int J4futStepM = (JangleOut[3] + J4axisLimNeg) * J4StepDeg;
-  int J5futStepM = (JangleOut[4] + J5axisLimNeg) * J5StepDeg;
-  int J6futStepM = (JangleOut[5] + J6axisLimNeg) * J6StepDeg;
-  int J7futStepM = (J7_In + J7axisLimNeg) * J7StepDeg;
-  int J8futStepM = (J8_In + J8axisLimNeg) * J8StepDeg;
-  int J9futStepM = (J9_In + J9axisLimNeg) * J9StepDeg;
+  int future_steps[numJoints] = {};
+  int primary_future_steps[ROBOT_nDOFs] = {};
+  if (
+    KinematicError != 0
+    || !primary_inverse_solution_to_future_steps(primary_future_steps)
+  ) {
+    return false;
+  }
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    future_steps[axis] = primary_future_steps[axis];
+  }
+  for (int axis = 0; axis < 3; ++axis) {
+    future_steps[axis + ROBOT_nDOFs] = staged_external_steps[axis];
+  }
+  int J1futStepM = future_steps[0];
+  int J2futStepM = future_steps[1];
+  int J3futStepM = future_steps[2];
+  int J4futStepM = future_steps[3];
+  int J5futStepM = future_steps[4];
+  int J6futStepM = future_steps[5];
+  int J7futStepM = future_steps[6];
+  int J8futStepM = future_steps[7];
+  int J9futStepM = future_steps[8];
 
   if (precalc) {
     J1StepM = J1futStepM;
@@ -2705,16 +2848,12 @@ void moveJ(String inData, bool response, bool precalc, bool simspeed) {
     J8dir = (J8stepDif <= 0) ? 1 : 0;
     J9dir = (J9stepDif <= 0) ? 1 : 0;
 
-    // Arrays for joint properties
-    int dir[numJoints] = { J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir };
-    int StepM[numJoints] = { J1StepM, J2StepM, J3StepM, J4StepM, J5StepM, J6StepM, J7StepM, J8StepM, J9StepM };
-    int stepDif[numJoints] = { J1stepDif, J2stepDif, J3stepDif, J4stepDif, J5stepDif, J6stepDif, J7stepDif, J8stepDif, J9stepDif };
     int StepLim[numJoints] = { J1StepLim, J2StepLim, J3StepLim, J4StepLim, J5StepLim, J6StepLim, J7StepLim, J8StepLim, J9StepLim };
     int axisFault[numJoints] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
-    // Loop to check axis limits and set faults
+    // Future counters are the safety boundary; signed deltas are not positions.
     for (int i = 0; i < numJoints; ++i) {
-      if ((dir[i] == 1 && (StepM[i] + stepDif[i] > StepLim[i])) || (dir[i] == 0 && (StepM[i] - stepDif[i] < 0))) {
+      if (future_step_is_outside_limit(future_steps[i], StepLim[i])) {
         axisFault[i] = 1;
       }
     }
@@ -2739,11 +2878,13 @@ void moveJ(String inData, bool response, bool precalc, bool simspeed) {
     //send move command if no axis limit error
     if (TotalAxisFault == 0 && KinematicError == 0) {
       resetEncoders();
+      bool drive_succeeded = false;
       if (simspeed) {
-        driveMotorsG(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp);
+        drive_succeeded = driveMotorsG(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes);
       } else {
-        driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp);
+        drive_succeeded = driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes);
       }
+      if (!drive_succeeded) return false;
       checkEncoders();
       if (response == true) {
         sendRobotPos();
@@ -2763,6 +2904,7 @@ void moveJ(String inData, bool response, bool precalc, bool simspeed) {
     inData = "";  // Clear recieved buffer
                   ////////MOVE COMPLETE///////////
   }
+  return true;
 }
 
 
@@ -2772,6 +2914,8 @@ void moveJ(String inData, bool response, bool precalc, bool simspeed) {
 
 
 
+const int32_t MODBUS_PARSE_ERROR = -2;
+
 int32_t modbusQuerry(String inData, int function) {
   int32_t result;
   int32_t response;
@@ -2779,9 +2923,55 @@ int32_t modbusQuerry(String inData, int function) {
   int slaveIdIndex = inData.indexOf('A');
   int MBaddressIndex = inData.indexOf('B');
   int MBvalIndex = inData.indexOf('C');
-  int SlaveID = inData.substring(slaveIdIndex + 1, MBaddressIndex).toInt();
-  int MBaddress = inData.substring(MBaddressIndex + 1, MBvalIndex).toInt();
-  int MBval = inData.substring(MBvalIndex + 1).toInt();
+  const int markers[] = { slaveIdIndex, MBaddressIndex, MBvalIndex };
+  const int begins[] = {
+    slaveIdIndex + 1,
+    MBaddressIndex + 1,
+    MBvalIndex + 1,
+  };
+  const int ends[] = {
+    MBaddressIndex,
+    MBvalIndex,
+    static_cast<int>(inData.length()),
+  };
+  int parsed[3];
+  if (
+    !ar4_protocol::marker_positions_are_ordered_from(
+      inData.length(),
+      markers,
+      0
+    )
+    || !parse_int_spans(inData, begins, ends, parsed)
+  ) {
+    return MODBUS_PARSE_ERROR;
+  }
+  int SlaveID = parsed[0];
+  int MBaddress = parsed[1];
+  int MBval = parsed[2];
+  ar4_protocol::ModbusOperation operation;
+  if (function == 1) {
+    operation = ar4_protocol::ModbusOperation::kReadCoil;
+  } else if (function == 2) {
+    operation = ar4_protocol::ModbusOperation::kReadDiscreteInput;
+  } else if (function == 3) {
+    operation = ar4_protocol::ModbusOperation::kReadHoldingRegisters;
+  } else if (function == 4) {
+    operation = ar4_protocol::ModbusOperation::kReadInputRegisters;
+  } else if (function == 15) {
+    operation = ar4_protocol::ModbusOperation::kWriteCoil;
+  } else if (function == 6) {
+    operation = ar4_protocol::ModbusOperation::kWriteRegister;
+  } else {
+    return MODBUS_PARSE_ERROR;
+  }
+  if (!ar4_protocol::validate_modbus_request(
+      operation,
+      SlaveID,
+      MBaddress,
+      MBval
+  )) {
+    return MODBUS_PARSE_ERROR;
+  }
   node = ModbusMaster();
   node.begin(SlaveID, Serial8);
 
@@ -2852,22 +3042,47 @@ int32_t modbusQuerry(String inData, int function) {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
+ar4_protocol::SerialFrameReadStatus read_serial_frame_byte(String &frame) {
+  if (Serial.available() <= 0) {
+    return ar4_protocol::SerialFrameReadStatus::kPending;
+  }
+  return ar4_protocol::append_serial_frame_byte(
+    frame,
+    serialFrameDiscarding,
+    Serial.read()
+  );
+}
+
+
 void processSerial() {
   if (Serial.available() > 0 and cmdBuffer3 == "") {
-    char recieved = Serial.read();
-    recData += recieved;
+    const ar4_protocol::SerialFrameReadStatus frameStatus =
+      read_serial_frame_byte(recData);
+    if (frameStatus == ar4_protocol::SerialFrameReadStatus::kOverflow) {
+      Serial.println("ER");
+      return;
+    }
     // Process message when new line character is recieved
-    if (recieved == '\n') {
+    if (frameStatus == ar4_protocol::SerialFrameReadStatus::kComplete) {
       //place data in last position
       cmdBuffer3 = recData;
       //determine if move command
-      recData.trim();
-      String procCMDtype = recData.substring(0, 2);
+      String commandPayload;
+      String procCMDtype = "";
+      if (ar4_protocol::extract_serial_command_payload(
+          recData,
+          commandPayload
+      )) {
+        procCMDtype = commandPayload.substring(0, 2);
+      }
       if (procCMDtype == "SS") {
         splineTrue = false;
         splineEndReceived = true;
       }
-      if (splineTrue == true) {
+      if (ar4_protocol::should_emit_spline_preface(
+          splineTrue,
+          procCMDtype.c_str()
+      )) {
         if (moveSequence == "") {
           moveSequence = "firsMoveActive";
         }
@@ -2890,12 +3105,28 @@ void processSerial() {
         moveSequence = "secondMoveProcessed";
         while (cmdBuffer2 == "") {
           if (Serial.available() > 0) {
-            char recieved = Serial.read();
-            recData += recieved;
-            if (recieved == '\n') {
+            const ar4_protocol::SerialFrameReadStatus lookaheadStatus =
+              read_serial_frame_byte(recData);
+            if (
+              lookaheadStatus
+              == ar4_protocol::SerialFrameReadStatus::kOverflow
+            ) {
+              Serial.println("ER");
+              return;
+            }
+            if (
+              lookaheadStatus
+              == ar4_protocol::SerialFrameReadStatus::kComplete
+            ) {
               cmdBuffer2 = recData;
-              recData.trim();
-              procCMDtype = recData.substring(0, 2);
+              commandPayload = "";
+              procCMDtype = "";
+              if (ar4_protocol::extract_serial_command_payload(
+                  recData,
+                  commandPayload
+              )) {
+                procCMDtype = commandPayload.substring(0, 2);
+              }
               if (procCMDtype == "MS") {
                 //close serial so next command can be read in
                 delay(5);
@@ -2935,6 +3166,53 @@ void shiftCMDarray() {
 }
 
 
+void consume_current_command() {
+  ar4_protocol::consume_command_queue(
+    inData,
+    cmdBuffer1,
+    cmdBuffer2,
+    cmdBuffer3
+  );
+}
+
+
+ar4_protocol::LiveControlFrameStatus read_live_control_frame() {
+  const ar4_protocol::SerialFrameReadStatus status =
+    read_serial_frame_byte(inData);
+  return ar4_protocol::classify_live_control_frame(
+    status,
+    inData.c_str(),
+    inData.length()
+  );
+}
+
+
+void send_live_terminal_response(
+  ar4_protocol::LiveControlFrameStatus control_status,
+  int kinematic_error,
+  int axis_fault,
+  const String &axis_limit_response
+) {
+  switch (ar4_protocol::select_live_terminal_response(
+      control_status,
+      kinematic_error,
+      axis_fault
+  )) {
+    case ar4_protocol::LiveTerminalResponseKind::kPosition:
+      sendRobotPos();
+      return;
+    case ar4_protocol::LiveTerminalResponseKind::kError:
+      delay(5);
+      Serial.println("ER");
+      return;
+    case ar4_protocol::LiveTerminalResponseKind::kAxisLimit:
+      delay(5);
+      Serial.println(axis_limit_response);
+      return;
+  }
+}
+
+
 void EstopProg() {
   estopActive = true;
   flag = "EB";
@@ -2952,8 +3230,19 @@ void setup() {
   Serial.begin(9600);
   Serial8.begin(38400);  // Use Serial8 (pins 34 and 35)
   // There is no Serial.print before this line
-  load_debug_from_eeprom();
-  load_robot_id_from_eeprom();
+  const ar4_protocol::PersistenceMigrationStatus migration_status =
+    ar4_protocol::migrate_legacy_persistence(EEPROM);
+  if (
+    migration_status
+    == ar4_protocol::PersistenceMigrationStatus::kFailed
+  ) {
+    Serial.println("EEPROM legacy persistence migration failed");
+    identity_record_status = ar4_protocol::IdentityRecordStatus::kCorrupt;
+    clear_robot_identity();
+  } else {
+    load_debug_from_eeprom();
+    load_robot_id_from_eeprom();
+  }
 
 
   // Initialize Modbus communication
@@ -3025,15 +3314,17 @@ void loop() {
   if (cmdBuffer1 != "") {
     //process data
     estopActive = false;
-    inData = cmdBuffer1;
-    inData.trim();
+    if (!ar4_protocol::extract_serial_command_payload(cmdBuffer1, inData)) {
+      Serial.println("ER");
+      consume_current_command();
+      return;
+    }
     String function = inData.substring(0, 2);
     inData = inData.substring(2);
     KinematicError = 0;
     debug = "";
 
     if (function == "HO") {
-      DEBUG_PRINTLN("Debug - Received HO command");
       handle_hello_command();
     }
 
@@ -3047,104 +3338,78 @@ void loop() {
       help += "required [D] - Debug State 0/1 (off/on) Enables / Disabled Serial Debug Mode\n";
       help += "optional [P] - Persistence 0/1 Disable / Enable debug mode persist accross reboots\n\n";
       help += "Example: DB[D]1[P]1 - Enabled Debug mode with persist\n";
-      help += "Example: DB[0] - Disable debug mode, don't change current persisted value\n\n";
+      help += "Example: DB[D]0 - Disable debug mode, don't change current persisted value\n\n";
 
-
-      int debugStart = inData.indexOf("[D]");
-      int persistStart = inData.indexOf("[P]", persistStart + 3);
-
-      if (debugStart == -1) {
-        inData = "";
-        cmdBuffer1 = "";  // Clear command buffer
+      ar4_protocol::DebugCommand debugCommand = {false, false, false};
+      const ar4_protocol::DebugCommandStatus debugStatus =
+        ar4_protocol::parse_debug_command(inData.c_str(), debugCommand);
+      if (
+        debugStatus == ar4_protocol::DebugCommandStatus::kMissingDebugField
+        || debugStatus == ar4_protocol::DebugCommandStatus::kInvalidFormat
+      ) {
+        if (debugStatus == ar4_protocol::DebugCommandStatus::kInvalidFormat) {
+          Serial.println("Invalid DB command format");
+        }
         Serial.println(help);
+        consume_current_command();
         return;
       }
-
-      String debugValue = inData.substring(debugStart + 3, debugStart + 4);
-      if (debugValue != "0" and debugValue != "1") {
+      if (debugStatus == ar4_protocol::DebugCommandStatus::kInvalidDebugValue) {
         Serial.println("Valid values for debug are 0 and 1\n");
         Serial.println(help);
-        inData = "";
-        cmdBuffer1 = "";  // Clear command buffer
+        consume_current_command();
         return;
       }
-
-      if (debugValue == "0") {
-        DEBUG = false;
-        DEBUG_PRINTLN("Debug - Debugging Live Toggled Off");
-      } else if (debugValue == "1") {
-        DEBUG = true;
-        DEBUG_PRINTLN("Debug - Debugging Live Toggled On");
+      if (
+        debugStatus
+        == ar4_protocol::DebugCommandStatus::kInvalidPersistenceValue
+      ) {
+        Serial.println("Valid values for persist are 0 and 1\n");
+        Serial.println(help);
+        consume_current_command();
+        return;
       }
-
-      if (persistStart > 0) {
-        String persistValue = inData.substring(persistStart + 3, persistStart + 4);
-        if (persistValue != "0" and persistValue != "1") {
-          Serial.println("Valid values for persist are 0 and 1\n");
-          Serial.println(help);
-          inData = "";
-          cmdBuffer1 = "";  // Clear command buffer
-          return;
-        } else {
-          DEBUG_PRINT("Setting Debug Persistence to: ");
-          DEBUG_PRINTLN(persistValue);
-
-          if (persistValue == "1") {
-            save_debug_to_eeprom(true);
-          } else {
-            save_debug_to_eeprom(false);
-          }
-        }
+      if (!ar4_protocol::apply_debug_command(
+        debugCommand,
+        DEBUG,
+        save_debug_to_eeprom
+      )) {
+        consume_current_command();
+        return;
       }
 
       Serial.println("Done");
-      inData = "";
-      cmdBuffer1 = "";  // clear buffer
+      consume_current_command();
       return;
     }
 
     if (function == "SR") {
-      DEBUG_PRINT("Debug - Received SR command with inData: ");
-      DEBUG_PRINTLN(inData);
-
-      int modelStart = inData.indexOf("[M]");
-      int versionStart = inData.indexOf("[V]", modelStart + 3);
-      int driverStart = inData.indexOf("[B]", versionStart + 3);
-      int serialStart = inData.indexOf("[S]", driverStart + 3);
-      int assetStart = inData.indexOf("[A]", serialStart + 3);
-
-      if (modelStart == -1 || versionStart == -1 || driverStart == -1 || serialStart == -1 || assetStart == -1) {
+      ar4_protocol::IdentitySetCommandFields commandFields = {};
+      if (!ar4_protocol::parse_identity_set_command(
+          inData.c_str(),
+          commandFields
+      )) {
         Serial.println("Error: Invalid format (SR)");
-        inData = "";
-        cmdBuffer1 = "";  // <-- drop the bad message
+        consume_current_command();
         return;
       }
 
-      robot_model = inData.substring(modelStart + 3, versionStart);
-      robot_version = inData.substring(versionStart + 3, driverStart);
-      driver_board = inData.substring(driverStart + 3, serialStart);
-      serial_number = inData.substring(serialStart + 3, assetStart);
-      asset_tag = inData.substring(assetStart + 3);
-
-      DEBUG_PRINT("Debug - Robot Model extracted: ");
-      DEBUG_PRINTLN(robot_model);
-      DEBUG_PRINT("Debug - Robot Version extracted: ");
-      DEBUG_PRINTLN(robot_version);
-      DEBUG_PRINT("Debug - Driver Board extracted: ");
-      DEBUG_PRINTLN(driver_board);
-      DEBUG_PRINT("Debug - Serial Number: ");
-      DEBUG_PRINTLN(serial_number);
-      DEBUG_PRINT("Debug - Asset Tag extracted: ");
-      DEBUG_PRINTLN(asset_tag);
-
-      handle_set_robot_id_command(robot_model, robot_version, driver_board, serial_number, asset_tag);
+      handle_set_robot_id_command(
+        String(commandFields.robot_model),
+        String(commandFields.robot_version),
+        String(commandFields.driver_board),
+        String(commandFields.serial_number),
+        String(commandFields.asset_tag)
+      );
     }
 
     //-----MODBUS READ HOLDING REGISTER - FUNCTION 03--------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "BA") {
       int32_t result = modbusQuerry(inData, 3);
-      if (result == -1) {
+      if (result == MODBUS_PARSE_ERROR) {
+        Serial.println("ER");
+      } else if (result == -1) {
         Serial.println("Modbus Error");
       } else {
         Serial.println(result);
@@ -3155,7 +3420,9 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "BB") {
       int32_t result = modbusQuerry(inData, 1);
-      if (result == -1) {
+      if (result == MODBUS_PARSE_ERROR) {
+        Serial.println("ER");
+      } else if (result == -1) {
         Serial.println("Modbus Error");
       } else {
         Serial.println(result);
@@ -3166,7 +3433,9 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "BC") {
       int32_t result = modbusQuerry(inData, 2);
-      if (result == -1) {
+      if (result == MODBUS_PARSE_ERROR) {
+        Serial.println("ER");
+      } else if (result == -1) {
         Serial.println("Modbus Error");
       } else {
         Serial.println(result);
@@ -3177,7 +3446,9 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "BH") {
       int32_t result = modbusQuerry(inData, 3);
-      if (result == -1) {
+      if (result == MODBUS_PARSE_ERROR) {
+        Serial.println("ER");
+      } else if (result == -1) {
         Serial.println("Modbus Error");
       } else {
         Serial.println(result);
@@ -3188,7 +3459,9 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "BD") {
       int32_t result = modbusQuerry(inData, 4);
-      if (result == -1) {
+      if (result == MODBUS_PARSE_ERROR) {
+        Serial.println("ER");
+      } else if (result == -1) {
         Serial.println("Modbus Error");
       } else {
         Serial.println(result);
@@ -3199,7 +3472,9 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "BE") {
       int32_t result = modbusQuerry(inData, 15);
-      if (result == -1) {
+      if (result == MODBUS_PARSE_ERROR) {
+        Serial.println("ER");
+      } else if (result == -1) {
         Serial.println("Modbus Error");
       } else {
         Serial.println("Write Success");
@@ -3210,7 +3485,9 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "BF") {
       int32_t result = modbusQuerry(inData, 6);
-      if (result == -1) {
+      if (result == MODBUS_PARSE_ERROR) {
+        Serial.println("ER");
+      } else if (result == -1) {
         Serial.println("Modbus Error");
       } else {
         Serial.println("Write Success");
@@ -3456,21 +3733,27 @@ void loop() {
       float DCCspd = 10.0;
       float ACCramp = 20.0;
 
-      JangleIn[0] = 0.00;
-      JangleIn[1] = 0.00;
-      JangleIn[2] = 0.00;
-      JangleIn[3] = 0.00;
-      JangleIn[4] = 0.00;
-      JangleIn[5] = 0.00;
+      const float home_positions[ROBOT_nDOFs] = {
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+      };
+      int home_steps[ROBOT_nDOFs] = {};
+      if (!primary_positions_to_future_steps(home_positions, home_steps)) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+        JangleIn[axis] = home_positions[axis];
+      }
 
 
       //calc destination motor steps
-      int J1futStepM = J1axisLimNeg * J1StepDeg;
-      int J2futStepM = J2axisLimNeg * J2StepDeg;
-      int J3futStepM = J3axisLimNeg * J3StepDeg;
-      int J4futStepM = J4axisLimNeg * J4StepDeg;
-      int J5futStepM = J5axisLimNeg * J5StepDeg;
-      int J6futStepM = J6axisLimNeg * J6StepDeg;
+      int J1futStepM = home_steps[0];
+      int J2futStepM = home_steps[1];
+      int J3futStepM = home_steps[2];
+      int J4futStepM = home_steps[3];
+      int J5futStepM = home_steps[4];
+      int J6futStepM = home_steps[5];
 
       //calc delta from current to destination
       int J1stepDif = J1StepM - J1futStepM;
@@ -3497,7 +3780,11 @@ void loop() {
 
 
       resetEncoders();
-      driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp);
+      if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, nullptr)) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
       checkEncoders();
       sendRobotPos();
       delay(5);
@@ -3596,84 +3883,230 @@ void loop() {
       int J5aDHparStart = inData.indexOf('}');
       int J6aDHparStart = inData.indexOf('~');
 
-      Robot_Kin_Tool[0] = inData.substring(TFxStart + 1, TFyStart).toFloat();
-      Robot_Kin_Tool[1] = inData.substring(TFyStart + 1, TFzStart).toFloat();
-      Robot_Kin_Tool[2] = inData.substring(TFzStart + 1, TFrzStart).toFloat();
-      Robot_Kin_Tool[3] = inData.substring(TFrzStart + 1, TFryStart).toFloat() * M_PI / 180;
-      Robot_Kin_Tool[4] = inData.substring(TFryStart + 1, TFrxStart).toFloat() * M_PI / 180;
-      Robot_Kin_Tool[5] = inData.substring(TFrxStart + 1).toFloat() * M_PI / 180;
-      J1MotDir = inData.substring(J1motDirStart + 1, J2motDirStart).toInt();
-      J2MotDir = inData.substring(J2motDirStart + 1, J3motDirStart).toInt();
-      J3MotDir = inData.substring(J3motDirStart + 1, J4motDirStart).toInt();
-      J4MotDir = inData.substring(J4motDirStart + 1, J5motDirStart).toInt();
-      J5MotDir = inData.substring(J5motDirStart + 1, J6motDirStart).toInt();
-      J6MotDir = inData.substring(J6motDirStart + 1, J7motDirStart).toInt();
-      J7MotDir = inData.substring(J7motDirStart + 1, J8motDirStart).toInt();
-      J8MotDir = inData.substring(J8motDirStart + 1, J9motDirStart).toInt();
-      J9MotDir = inData.substring(J9motDirStart + 1, J1calDirStart).toInt();
-      J1CalDir = inData.substring(J1calDirStart + 1, J2calDirStart).toInt();
-      J2CalDir = inData.substring(J2calDirStart + 1, J3calDirStart).toInt();
-      J3CalDir = inData.substring(J3calDirStart + 1, J4calDirStart).toInt();
-      J4CalDir = inData.substring(J4calDirStart + 1, J5calDirStart).toInt();
-      J5CalDir = inData.substring(J5calDirStart + 1, J6calDirStart).toInt();
-      J6CalDir = inData.substring(J6calDirStart + 1, J7calDirStart).toInt();
-      J7CalDir = inData.substring(J7calDirStart + 1, J8calDirStart).toInt();
-      J8CalDir = inData.substring(J8calDirStart + 1, J9calDirStart).toInt();
-      J9CalDir = inData.substring(J9calDirStart + 1, J1PosLimStart).toInt();
-      J1axisLimPos = inData.substring(J1PosLimStart + 1, J1NegLimStart).toFloat();
-      J1axisLimNeg = inData.substring(J1NegLimStart + 1, J2PosLimStart).toFloat();
-      J2axisLimPos = inData.substring(J2PosLimStart + 1, J2NegLimStart).toFloat();
-      J2axisLimNeg = inData.substring(J2NegLimStart + 1, J3PosLimStart).toFloat();
-      J3axisLimPos = inData.substring(J3PosLimStart + 1, J3NegLimStart).toFloat();
-      J3axisLimNeg = inData.substring(J3NegLimStart + 1, J4PosLimStart).toFloat();
-      J4axisLimPos = inData.substring(J4PosLimStart + 1, J4NegLimStart).toFloat();
-      J4axisLimNeg = inData.substring(J4NegLimStart + 1, J5PosLimStart).toFloat();
-      J5axisLimPos = inData.substring(J5PosLimStart + 1, J5NegLimStart).toFloat();
-      J5axisLimNeg = inData.substring(J5NegLimStart + 1, J6PosLimStart).toFloat();
-      J6axisLimPos = inData.substring(J6PosLimStart + 1, J6NegLimStart).toFloat();
-      J6axisLimNeg = inData.substring(J6NegLimStart + 1, J1StepDegStart).toFloat();
+      const int positions[] = {
+        TFxStart,
+        TFyStart,
+        TFzStart,
+        TFrzStart,
+        TFryStart,
+        TFrxStart,
+        J1motDirStart,
+        J2motDirStart,
+        J3motDirStart,
+        J4motDirStart,
+        J5motDirStart,
+        J6motDirStart,
+        J7motDirStart,
+        J8motDirStart,
+        J9motDirStart,
+        J1calDirStart,
+        J2calDirStart,
+        J3calDirStart,
+        J4calDirStart,
+        J5calDirStart,
+        J6calDirStart,
+        J7calDirStart,
+        J8calDirStart,
+        J9calDirStart,
+        J1PosLimStart,
+        J1NegLimStart,
+        J2PosLimStart,
+        J2NegLimStart,
+        J3PosLimStart,
+        J3NegLimStart,
+        J4PosLimStart,
+        J4NegLimStart,
+        J5PosLimStart,
+        J5NegLimStart,
+        J6PosLimStart,
+        J6NegLimStart,
+        J1StepDegStart,
+        J2StepDegStart,
+        J3StepDegStart,
+        J4StepDegStart,
+        J5StepDegStart,
+        J6StepDegStart,
+        J1EncMultStart,
+        J2EncMultStart,
+        J3EncMultStart,
+        J4EncMultStart,
+        J5EncMultStart,
+        J6EncMultStart,
+        J1tDHparStart,
+        J2tDHparStart,
+        J3tDHparStart,
+        J4tDHparStart,
+        J5tDHparStart,
+        J6tDHparStart,
+        J1uDHparStart,
+        J2uDHparStart,
+        J3uDHparStart,
+        J4uDHparStart,
+        J5uDHparStart,
+        J6uDHparStart,
+        J1dDHparStart,
+        J2dDHparStart,
+        J3dDHparStart,
+        J4dDHparStart,
+        J5dDHparStart,
+        J6dDHparStart,
+        J1aDHparStart,
+        J2aDHparStart,
+        J3aDHparStart,
+        J4aDHparStart,
+        J5aDHparStart,
+        J6aDHparStart,
+        static_cast<int>(inData.length()),
+      };
+      float stagedTool[ROBOT_nDOFs];
+      int stagedDirections[18];
+      float stagedLimits[12];
+      float stagedStepDegrees[ROBOT_nDOFs];
+      float stagedEncoderMultipliers[ROBOT_nDOFs];
+      float stagedDHTheta[ROBOT_nDOFs];
+      float stagedDHAlpha[ROBOT_nDOFs];
+      float stagedDHD[ROBOT_nDOFs];
+      float stagedDHA[ROBOT_nDOFs];
+      if (
+        !ar4_protocol::field_boundaries_cover_command(
+          inData.length(),
+          positions
+        )
+        || !parse_float_marker_fields(inData, positions, stagedTool)
+        || !parse_int_marker_fields(inData, positions + 6, stagedDirections)
+        || !ar4_protocol::values_are_binary(stagedDirections)
+        || !parse_float_marker_fields(inData, positions + 24, stagedLimits)
+        || !parse_float_marker_fields(inData, positions + 36, stagedStepDegrees)
+        || !parse_float_marker_fields(
+          inData,
+          positions + 42,
+          stagedEncoderMultipliers
+        )
+        || !parse_float_marker_fields(inData, positions + 48, stagedDHTheta)
+        || !parse_float_marker_fields(inData, positions + 54, stagedDHAlpha)
+        || !parse_float_marker_fields(inData, positions + 60, stagedDHD)
+        || !parse_float_marker_fields(inData, positions + 66, stagedDHA)
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
-      J1StepDeg = inData.substring(J1StepDegStart + 1, J2StepDegStart).toFloat();
-      J2StepDeg = inData.substring(J2StepDegStart + 1, J3StepDegStart).toFloat();
-      J3StepDeg = inData.substring(J3StepDegStart + 1, J4StepDegStart).toFloat();
-      J4StepDeg = inData.substring(J4StepDegStart + 1, J5StepDegStart).toFloat();
-      J5StepDeg = inData.substring(J5StepDegStart + 1, J6StepDegStart).toFloat();
-      J6StepDeg = inData.substring(J6StepDegStart + 1, J1EncMultStart).toFloat();
+      int stagedStepLimits[ROBOT_nDOFs];
+      int stagedZeroSteps[ROBOT_nDOFs];
+      for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
+        if (
+          stagedEncoderMultipliers[joint] <= 0.0f
+          || !ar4_protocol::validate_axis_calibration(
+            stagedLimits[joint * 2 + 1],
+            stagedLimits[joint * 2],
+            stagedStepDegrees[joint],
+            stagedStepLimits[joint],
+            stagedZeroSteps[joint]
+          )
+        ) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
+      }
 
-      J1encMult = inData.substring(J1EncMultStart + 1, J2EncMultStart).toFloat();
-      J2encMult = inData.substring(J2EncMultStart + 1, J3EncMultStart).toFloat();
-      J3encMult = inData.substring(J3EncMultStart + 1, J4EncMultStart).toFloat();
-      J4encMult = inData.substring(J4EncMultStart + 1, J5EncMultStart).toFloat();
-      J5encMult = inData.substring(J5EncMultStart + 1, J6EncMultStart).toFloat();
-      J6encMult = inData.substring(J6EncMultStart + 1, J1tDHparStart).toFloat();
+      float nativeToolRz = 0.0f;
+      float nativeToolRy = 0.0f;
+      float nativeToolRx = 0.0f;
+      if (
+        !ar4_protocol::degrees_to_radians(
+          stagedTool[3],
+          nativeToolRz
+        )
+        || !ar4_protocol::degrees_to_radians(
+          stagedTool[4],
+          nativeToolRy
+        )
+        || !ar4_protocol::degrees_to_radians(
+          stagedTool[5],
+          nativeToolRx
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
+        float nativeTheta = 0.0f;
+        float nativeAlpha = 0.0f;
+        if (
+          !ar4_protocol::degrees_to_radians(
+            stagedDHTheta[joint],
+            nativeTheta
+          )
+          || !ar4_protocol::degrees_to_radians(
+            stagedDHAlpha[joint],
+            nativeAlpha
+          )
+        ) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
+      }
+      Robot_Kin_Tool[0] = stagedTool[0];
+      Robot_Kin_Tool[1] = stagedTool[1];
+      Robot_Kin_Tool[2] = stagedTool[2];
+      Robot_Kin_Tool[5] = nativeToolRz;
+      Robot_Kin_Tool[4] = nativeToolRy;
+      Robot_Kin_Tool[3] = nativeToolRx;
+      J1MotDir = stagedDirections[0];
+      J2MotDir = stagedDirections[1];
+      J3MotDir = stagedDirections[2];
+      J4MotDir = stagedDirections[3];
+      J5MotDir = stagedDirections[4];
+      J6MotDir = stagedDirections[5];
+      J7MotDir = stagedDirections[6];
+      J8MotDir = stagedDirections[7];
+      J9MotDir = stagedDirections[8];
+      J1CalDir = stagedDirections[9];
+      J2CalDir = stagedDirections[10];
+      J3CalDir = stagedDirections[11];
+      J4CalDir = stagedDirections[12];
+      J5CalDir = stagedDirections[13];
+      J6CalDir = stagedDirections[14];
+      J7CalDir = stagedDirections[15];
+      J8CalDir = stagedDirections[16];
+      J9CalDir = stagedDirections[17];
+      J1axisLimPos = stagedLimits[0];
+      J1axisLimNeg = stagedLimits[1];
+      J2axisLimPos = stagedLimits[2];
+      J2axisLimNeg = stagedLimits[3];
+      J3axisLimPos = stagedLimits[4];
+      J3axisLimNeg = stagedLimits[5];
+      J4axisLimPos = stagedLimits[6];
+      J4axisLimNeg = stagedLimits[7];
+      J5axisLimPos = stagedLimits[8];
+      J5axisLimNeg = stagedLimits[9];
+      J6axisLimPos = stagedLimits[10];
+      J6axisLimNeg = stagedLimits[11];
 
-      DHparams[0][0] = inData.substring(J1tDHparStart + 1, J2tDHparStart).toFloat();
-      DHparams[1][0] = inData.substring(J2tDHparStart + 1, J3tDHparStart).toFloat();
-      DHparams[2][0] = inData.substring(J3tDHparStart + 1, J4tDHparStart).toFloat();
-      DHparams[3][0] = inData.substring(J4tDHparStart + 1, J5tDHparStart).toFloat();
-      DHparams[4][0] = inData.substring(J5tDHparStart + 1, J6tDHparStart).toFloat();
-      DHparams[5][0] = inData.substring(J6tDHparStart + 1, J1uDHparStart).toFloat();
+      J1StepDeg = stagedStepDegrees[0];
+      J2StepDeg = stagedStepDegrees[1];
+      J3StepDeg = stagedStepDegrees[2];
+      J4StepDeg = stagedStepDegrees[3];
+      J5StepDeg = stagedStepDegrees[4];
+      J6StepDeg = stagedStepDegrees[5];
 
-      DHparams[0][1] = inData.substring(J1uDHparStart + 1, J2uDHparStart).toFloat();
-      DHparams[1][1] = inData.substring(J2uDHparStart + 1, J3uDHparStart).toFloat();
-      DHparams[2][1] = inData.substring(J3uDHparStart + 1, J4uDHparStart).toFloat();
-      DHparams[3][1] = inData.substring(J4uDHparStart + 1, J5uDHparStart).toFloat();
-      DHparams[4][1] = inData.substring(J5uDHparStart + 1, J6uDHparStart).toFloat();
-      DHparams[5][1] = inData.substring(J6uDHparStart + 1, J1dDHparStart).toFloat();
+      J1encMult = stagedEncoderMultipliers[0];
+      J2encMult = stagedEncoderMultipliers[1];
+      J3encMult = stagedEncoderMultipliers[2];
+      J4encMult = stagedEncoderMultipliers[3];
+      J5encMult = stagedEncoderMultipliers[4];
+      J6encMult = stagedEncoderMultipliers[5];
 
-      DHparams[0][2] = inData.substring(J1dDHparStart + 1, J2dDHparStart).toFloat();
-      DHparams[1][2] = inData.substring(J2dDHparStart + 1, J3dDHparStart).toFloat();
-      DHparams[2][2] = inData.substring(J3dDHparStart + 1, J4dDHparStart).toFloat();
-      DHparams[3][2] = inData.substring(J4dDHparStart + 1, J5dDHparStart).toFloat();
-      DHparams[4][2] = inData.substring(J5dDHparStart + 1, J6dDHparStart).toFloat();
-      DHparams[5][2] = inData.substring(J6dDHparStart + 1, J1aDHparStart).toFloat();
-
-      DHparams[0][3] = inData.substring(J1aDHparStart + 1, J2aDHparStart).toFloat();
-      DHparams[1][3] = inData.substring(J2aDHparStart + 1, J3aDHparStart).toFloat();
-      DHparams[2][3] = inData.substring(J3aDHparStart + 1, J4aDHparStart).toFloat();
-      DHparams[3][3] = inData.substring(J4aDHparStart + 1, J5aDHparStart).toFloat();
-      DHparams[4][3] = inData.substring(J5aDHparStart + 1, J6aDHparStart).toFloat();
-      DHparams[5][3] = inData.substring(J6aDHparStart + 1).toFloat();
+      for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
+        DHparams[joint][0] = stagedDHTheta[joint];
+        DHparams[joint][1] = stagedDHAlpha[joint];
+        DHparams[joint][2] = stagedDHD[joint];
+        DHparams[joint][3] = stagedDHA[joint];
+      }
 
 
       //define total axis travel
@@ -3685,21 +4118,26 @@ void loop() {
       J6axisLim = J6axisLimPos + J6axisLimNeg;
 
       //steps full movement of each axis
-      J1StepLim = J1axisLim * J1StepDeg;
-      J2StepLim = J2axisLim * J2StepDeg;
-      J3StepLim = J3axisLim * J3StepDeg;
-      J4StepLim = J4axisLim * J4StepDeg;
-      J5StepLim = J5axisLim * J5StepDeg;
-      J6StepLim = J6axisLim * J6StepDeg;
+      J1StepLim = stagedStepLimits[0];
+      J2StepLim = stagedStepLimits[1];
+      J3StepLim = stagedStepLimits[2];
+      J4StepLim = stagedStepLimits[3];
+      J5StepLim = stagedStepLimits[4];
+      J6StepLim = stagedStepLimits[5];
 
       //step and axis zero
-      J1zeroStep = J1axisLimNeg * J1StepDeg;
-      J2zeroStep = J2axisLimNeg * J2StepDeg;
-      J3zeroStep = J3axisLimNeg * J3StepDeg;
-      J4zeroStep = J4axisLimNeg * J4StepDeg;
-      J5zeroStep = J5axisLimNeg * J5StepDeg;
-      J6zeroStep = J6axisLimNeg * J6StepDeg;
+      J1zeroStep = stagedZeroSteps[0];
+      J2zeroStep = stagedZeroSteps[1];
+      J3zeroStep = stagedZeroSteps[2];
+      J4zeroStep = stagedZeroSteps[3];
+      J5zeroStep = stagedZeroSteps[4];
+      J6zeroStep = stagedZeroSteps[5];
 
+      if (!robot_set_AR()) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
       Serial.print("Done");
     }
 
@@ -3716,35 +4154,75 @@ void loop() {
       int J9rotStart = inData.indexOf('H');
       int J9stepsStart = inData.indexOf('I');
 
-      J7length = inData.substring(J7lengthStart + 1, J7rotStart).toFloat();
-      J7rot = inData.substring(J7rotStart + 1, J7stepsStart).toFloat();
-      J7steps = inData.substring(J7stepsStart + 1, J8lengthStart).toFloat();
+      const int positions[] = {
+        J7lengthStart,
+        J7rotStart,
+        J7stepsStart,
+        J8lengthStart,
+        J8rotStart,
+        J8stepsStart,
+        J9lengthStart,
+        J9rotStart,
+        J9stepsStart,
+        static_cast<int>(inData.length()),
+      };
+      float parsed[9];
+      if (
+        !ar4_protocol::field_boundaries_cover_command(
+          inData.length(),
+          positions
+        )
+        || !parse_float_marker_fields(inData, positions, parsed)
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
-      J8length = inData.substring(J8lengthStart + 1, J8rotStart).toFloat();
-      J8rot = inData.substring(J8rotStart + 1, J8stepsStart).toFloat();
-      J8steps = inData.substring(J8stepsStart + 1, J9lengthStart).toFloat();
+      ar4_protocol::ExternalAxisCalibration stagedCalibration[3];
+      for (int axis = 0; axis < 3; ++axis) {
+        if (!ar4_protocol::validate_external_axis_calibration(
+            parsed[axis * 3],
+            parsed[axis * 3 + 1],
+            parsed[axis * 3 + 2],
+            stagedCalibration[axis]
+        )) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
+      }
 
-      J9length = inData.substring(J9lengthStart + 1, J9rotStart).toFloat();
-      J9rot = inData.substring(J9rotStart + 1, J9stepsStart).toFloat();
-      J9steps = inData.substring(J9stepsStart + 1).toFloat();
+      J7length = parsed[0];
+      J7rot = parsed[1];
+      J7steps = parsed[2];
+      J8length = parsed[3];
+      J8rot = parsed[4];
+      J8steps = parsed[5];
+      J9length = parsed[6];
+      J9rot = parsed[7];
+      J9steps = parsed[8];
 
       J7axisLimNeg = 0;
-      J7axisLimPos = J7length;
+      J7axisLimPos = stagedCalibration[0].positive_limit;
       J7axisLim = J7axisLimPos + J7axisLimNeg;
-      J7StepDeg = J7steps / J7rot;
-      J7StepLim = J7axisLim * J7StepDeg;
+      J7StepDeg = stagedCalibration[0].steps_per_unit;
+      J7StepLim = stagedCalibration[0].step_limit;
+      J7zeroStep = stagedCalibration[0].zero_step;
 
       J8axisLimNeg = 0;
-      J8axisLimPos = J8length;
+      J8axisLimPos = stagedCalibration[1].positive_limit;
       J8axisLim = J8axisLimPos + J8axisLimNeg;
-      J8StepDeg = J8steps / J8rot;
-      J8StepLim = J8axisLim * J8StepDeg;
+      J8StepDeg = stagedCalibration[1].steps_per_unit;
+      J8StepLim = stagedCalibration[1].step_limit;
+      J8zeroStep = stagedCalibration[1].zero_step;
 
       J9axisLimNeg = 0;
-      J9axisLimPos = J9length;
+      J9axisLimPos = stagedCalibration[2].positive_limit;
       J9axisLim = J9axisLimPos + J9axisLimNeg;
-      J9StepDeg = J9steps / J9rot;
-      J9StepLim = J9axisLim * J9StepDeg;
+      J9StepDeg = stagedCalibration[2].steps_per_unit;
+      J9StepLim = stagedCalibration[2].step_limit;
+      J9zeroStep = stagedCalibration[2].zero_step;
 
       delay(5);
       Serial.print("Done");
@@ -3776,30 +4254,36 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "WT") {
       int WTstart = inData.indexOf('S');
-      float WaitTime = inData.substring(WTstart + 1).toFloat();
-      int WaitTimeMS = WaitTime * 1000;
+      float WaitTime = 0.0f;
+      uint32_t WaitTimeMS = 0;
+      if (
+        WTstart != 0
+        || !parse_float_span(
+          inData,
+          WTstart + 1,
+          static_cast<int>(inData.length()),
+          WaitTime
+        )
+        || !ar4_protocol::wait_seconds_to_milliseconds(
+          WaitTime,
+          WaitTimeMS
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
       delay(WaitTimeMS);
       Serial.println("WTdone");
     }
 
 
-    //-----COMMAND SET OUTPUT ON---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "ON") {
-      int ONstart = inData.indexOf('X');
-      int outputNum = inData.substring(ONstart + 1).toInt();
-      digitalWrite(outputNum, HIGH);
-      delay(5);
-      Serial.println("Done");
-    }
-    //-----COMMAND SET OUTPUT OFF---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "OF") {
-      int ONstart = inData.indexOf('X');
-      int outputNum = inData.substring(ONstart + 1).toInt();
-      digitalWrite(outputNum, LOW);
-      delay(5);
-      Serial.println("Done");
+    // The Teensy GPIO map has no general-purpose output profile. ON/OF remain
+    // auxiliary-controller commands until a board-specific map is defined.
+    if (function == "ON" || function == "OF") {
+      Serial.println("ER");
+      consume_current_command();
+      return;
     }
 
     //-----COMMAND TO WAIT MODBUS COIL---------------------------------------------------
@@ -3811,11 +4295,37 @@ void loop() {
       int inputIndex = inData.indexOf('B');
       int valueIndex = inData.indexOf('C');
       int timoutIndex = inData.indexOf('D');
-      int slaveID = inData.substring(slaveIndex + 1, inputIndex).toInt();
-      int input = inData.substring(inputIndex + 1, valueIndex).toInt();
-      int value = inData.substring(valueIndex + 1, timoutIndex).toInt();
-      int timeout = inData.substring(timoutIndex + 1).toInt();
-      unsigned long timeoutMillis = timeout * 1000;
+      const int positions[] = {
+        slaveIndex,
+        inputIndex,
+        valueIndex,
+        timoutIndex,
+        static_cast<int>(inData.length()),
+      };
+      int parsed[4];
+      uint32_t timeoutMillis = 0;
+      if (
+        !ar4_protocol::field_boundaries_cover_command(
+          inData.length(),
+          positions
+        )
+        || !parse_int_marker_fields(inData, positions, parsed)
+        || !ar4_protocol::validate_modbus_wait(
+          ar4_protocol::ModbusOperation::kReadCoil,
+          parsed[0],
+          parsed[1],
+          parsed[2],
+          parsed[3],
+          timeoutMillis
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      int slaveID = parsed[0];
+      int input = parsed[1];
+      int value = parsed[2];
       unsigned long startTime = millis();
       MBquery = "A" + String(slaveID) + "B" + String(input) + "C1";
       while ((millis() - startTime < timeoutMillis) && (result != value)) {
@@ -3823,7 +4333,13 @@ void loop() {
         delay(100);
       }
       delay(5);
-      Serial.print("Done");
+      if (result == value) {
+        Serial.println("Done");
+      } else if (result == -1) {
+        Serial.println("Modbus Error");
+      } else {
+        Serial.println("ER");
+      }
     }
 
     //-----COMMAND TO WAIT MODBUS INPUT---------------------------------------------------
@@ -3835,11 +4351,37 @@ void loop() {
       int inputIndex = inData.indexOf('B');
       int valueIndex = inData.indexOf('C');
       int timoutIndex = inData.indexOf('D');
-      int slaveID = inData.substring(slaveIndex + 1, inputIndex).toInt();
-      int input = inData.substring(inputIndex + 1, valueIndex).toInt();
-      int value = inData.substring(valueIndex + 1, timoutIndex).toInt();
-      int timeout = inData.substring(timoutIndex + 1).toInt();
-      unsigned long timeoutMillis = timeout * 1000;
+      const int positions[] = {
+        slaveIndex,
+        inputIndex,
+        valueIndex,
+        timoutIndex,
+        static_cast<int>(inData.length()),
+      };
+      int parsed[4];
+      uint32_t timeoutMillis = 0;
+      if (
+        !ar4_protocol::field_boundaries_cover_command(
+          inData.length(),
+          positions
+        )
+        || !parse_int_marker_fields(inData, positions, parsed)
+        || !ar4_protocol::validate_modbus_wait(
+          ar4_protocol::ModbusOperation::kReadDiscreteInput,
+          parsed[0],
+          parsed[1],
+          parsed[2],
+          parsed[3],
+          timeoutMillis
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      int slaveID = parsed[0];
+      int input = parsed[1];
+      int value = parsed[2];
       unsigned long startTime = millis();
       MBquery = "A" + String(slaveID) + "B" + String(input) + "C1";
       while ((millis() - startTime < timeoutMillis) && (result != value)) {
@@ -3847,7 +4389,13 @@ void loop() {
         delay(100);
       }
       delay(5);
-      Serial.print("Done");
+      if (result == value) {
+        Serial.println("Done");
+      } else if (result == -1) {
+        Serial.println("Modbus Error");
+      } else {
+        Serial.println("ER");
+      }
     }
 
     //-----COMMAND TO SET MODBUS COIL---------------------------------------------------
@@ -3858,9 +4406,33 @@ void loop() {
       int slaveIndex = inData.indexOf('A');
       int inputIndex = inData.indexOf('B');
       int valueIndex = inData.indexOf('C');
-      int slaveID = inData.substring(slaveIndex + 1, inputIndex).toInt();
-      int input = inData.substring(inputIndex + 1, valueIndex).toInt();
-      int value = inData.substring(valueIndex + 1).toInt();
+      const int positions[] = {
+        slaveIndex,
+        inputIndex,
+        valueIndex,
+        static_cast<int>(inData.length()),
+      };
+      int parsed[3];
+      if (
+        !ar4_protocol::field_boundaries_cover_command(
+          inData.length(),
+          positions
+        )
+        || !parse_int_marker_fields(inData, positions, parsed)
+        || !ar4_protocol::validate_modbus_request(
+          ar4_protocol::ModbusOperation::kWriteCoil,
+          parsed[0],
+          parsed[1],
+          parsed[2]
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      int slaveID = parsed[0];
+      int input = parsed[1];
+      int value = parsed[2];
       MBquery = "A" + String(slaveID) + "B" + String(input) + "C" + String(value);
       result = modbusQuerry(MBquery, 15);
       delay(5);
@@ -3875,9 +4447,33 @@ void loop() {
       int slaveIndex = inData.indexOf('A');
       int inputIndex = inData.indexOf('B');
       int valueIndex = inData.indexOf('C');
-      int slaveID = inData.substring(slaveIndex + 1, inputIndex).toInt();
-      int input = inData.substring(inputIndex + 1, valueIndex).toInt();
-      int value = inData.substring(valueIndex + 1).toInt();
+      const int positions[] = {
+        slaveIndex,
+        inputIndex,
+        valueIndex,
+        static_cast<int>(inData.length()),
+      };
+      int parsed[3];
+      if (
+        !ar4_protocol::field_boundaries_cover_command(
+          inData.length(),
+          positions
+        )
+        || !parse_int_marker_fields(inData, positions, parsed)
+        || !ar4_protocol::validate_modbus_request(
+          ar4_protocol::ModbusOperation::kWriteRegister,
+          parsed[0],
+          parsed[1],
+          parsed[2]
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      int slaveID = parsed[0];
+      int input = parsed[1];
+      int value = parsed[2];
       MBquery = "A" + String(slaveID) + "B" + String(input) + "C" + String(value);
       result = modbusQuerry(MBquery, 6);
       delay(5);
@@ -3897,15 +4493,41 @@ void loop() {
       int J7angStart = inData.indexOf('G');
       int J8angStart = inData.indexOf('H');
       int J9angStart = inData.indexOf('I');
-      J1StepM = ((inData.substring(J1angStart + 1, J2angStart).toFloat()) + J1axisLimNeg) * J1StepDeg;
-      J2StepM = ((inData.substring(J2angStart + 1, J3angStart).toFloat()) + J2axisLimNeg) * J2StepDeg;
-      J3StepM = ((inData.substring(J3angStart + 1, J4angStart).toFloat()) + J3axisLimNeg) * J3StepDeg;
-      J4StepM = ((inData.substring(J4angStart + 1, J5angStart).toFloat()) + J4axisLimNeg) * J4StepDeg;
-      J5StepM = ((inData.substring(J5angStart + 1, J6angStart).toFloat()) + J5axisLimNeg) * J5StepDeg;
-      J6StepM = ((inData.substring(J6angStart + 1, J7angStart).toFloat()) + J6axisLimNeg) * J6StepDeg;
-      J7StepM = ((inData.substring(J7angStart + 1, J8angStart).toFloat()) + J7axisLimNeg) * J7StepDeg;
-      J8StepM = ((inData.substring(J8angStart + 1, J9angStart).toFloat()) + J8axisLimNeg) * J8StepDeg;
-      J9StepM = ((inData.substring(J9angStart + 1).toFloat()) + J9axisLimNeg) * J9StepDeg;
+      const int positions[] = {
+        J1angStart,
+        J2angStart,
+        J3angStart,
+        J4angStart,
+        J5angStart,
+        J6angStart,
+        J7angStart,
+        J8angStart,
+        J9angStart,
+        static_cast<int>(inData.length()),
+      };
+      float parsed[9];
+      int stagedStepMonitors[numJoints];
+      if (
+        !ar4_protocol::field_boundaries_cover_command(
+          inData.length(),
+          positions
+        )
+        || !parse_float_marker_fields(inData, positions, parsed)
+        || !joint_positions_to_future_steps(parsed, stagedStepMonitors)
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      J1StepM = stagedStepMonitors[0];
+      J2StepM = stagedStepMonitors[1];
+      J3StepM = stagedStepMonitors[2];
+      J4StepM = stagedStepMonitors[3];
+      J5StepM = stagedStepMonitors[4];
+      J6StepM = stagedStepMonitors[5];
+      J7StepM = stagedStepMonitors[6];
+      J8StepM = stagedStepMonitors[7];
+      J9StepM = stagedStepMonitors[8];
       delay(5);
       Serial.println("Done");
     }
@@ -3921,16 +4543,36 @@ void loop() {
       int J5start = inData.indexOf('E');
       int J6start = inData.indexOf('F');
       int WristConStart = inData.indexOf('W');
-      JangleIn[0] = inData.substring(J1start + 1, J2start).toFloat();
-      JangleIn[1] = inData.substring(J2start + 1, J3start).toFloat();
-      JangleIn[2] = inData.substring(J3start + 1, J4start).toFloat();
-      JangleIn[3] = inData.substring(J4start + 1, J5start).toFloat();
-      JangleIn[4] = inData.substring(J5start + 1, J6start).toFloat();
-      JangleIn[5] = inData.substring(J6start + 1, WristConStart).toFloat();
+      const int positions[] = {
+        J1start,
+        J2start,
+        J3start,
+        J4start,
+        J5start,
+        J6start,
+        WristConStart,
+      };
+      float parsed[ROBOT_nDOFs];
+      if (
+        !ar4_protocol::marker_positions_are_ordered_from(
+          inData.length(),
+          positions,
+          0
+        )
+        || WristConStart + 2 != static_cast<int>(inData.length())
+        || !ar4_protocol::valid_wrist_config(inData.charAt(WristConStart + 1))
+        || !parse_float_marker_fields(inData, positions, parsed)
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
+        JangleIn[joint] = parsed[joint];
+      }
       WristCon = inData.substring(WristConStart + 1);
-      WristCon.trim();
 
-      SolveInverseKinematics();
+      SolveInverseKinematics(inData.charAt(WristConStart + 1));
 
       String echo = "";
       delay(5);
@@ -3961,46 +4603,63 @@ void loop() {
       int J8calstart = inData.indexOf('Q');
       int J9calstart = inData.indexOf('R');
 
-      ///
-      int J1req = inData.substring(J1start + 1, J2start).toInt();
-      int J2req = inData.substring(J2start + 1, J3start).toInt();
-      int J3req = inData.substring(J3start + 1, J4start).toInt();
-      int J4req = inData.substring(J4start + 1, J5start).toInt();
-      int J5req = inData.substring(J5start + 1, J6start).toInt();
-      int J6req = inData.substring(J6start + 1, J7start).toInt();
-      int J7req = inData.substring(J7start + 1, J8start).toInt();
-      int J8req = inData.substring(J8start + 1, J9start).toInt();
-      int J9req = inData.substring(J9start + 1, J1calstart).toInt();
+      const int positions[] = {
+        J1start,
+        J2start,
+        J3start,
+        J4start,
+        J5start,
+        J6start,
+        J7start,
+        J8start,
+        J9start,
+        J1calstart,
+        J2calstart,
+        J3calstart,
+        J4calstart,
+        J5calstart,
+        J6calstart,
+        J7calstart,
+        J8calstart,
+        J9calstart,
+        static_cast<int>(inData.length()),
+      };
+      int requested[9];
+      float calibrationOffsets[9];
+      if (
+        !ar4_protocol::field_boundaries_cover_command(
+          inData.length(),
+          positions
+        )
+        || !parse_int_marker_fields(inData, positions, requested)
+        || !ar4_protocol::values_are_binary(requested)
+        || !parse_float_marker_fields(
+          inData,
+          positions + 9,
+          calibrationOffsets
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      int J1req = requested[0];
+      int J2req = requested[1];
+      int J3req = requested[2];
+      int J4req = requested[3];
+      int J5req = requested[4];
+      int J6req = requested[5];
+      int J7req = requested[6];
+      int J8req = requested[7];
+      int J9req = requested[8];
 
-
-
-      float J1calOff = inData.substring(J1calstart + 1, J2calstart).toFloat();
-      float J2calOff = inData.substring(J2calstart + 1, J3calstart).toFloat();
-      float J3calOff = inData.substring(J3calstart + 1, J4calstart).toFloat();
-      float J4calOff = inData.substring(J4calstart + 1, J5calstart).toFloat();
-      float J5calOff = inData.substring(J5calstart + 1, J6calstart).toFloat();
-      float J6calOff = inData.substring(J6calstart + 1, J7calstart).toFloat();
-      float J7calOff = inData.substring(J7calstart + 1, J8calstart).toFloat();
-      float J8calOff = inData.substring(J8calstart + 1, J9calstart).toFloat();
-      float J9calOff = inData.substring(J9calstart + 1).toFloat();
       ///
       float SpeedIn;
-      ///
-      int J1Step = 0;
-      int J2Step = 0;
-      int J3Step = 0;
-      int J4Step = 0;
-      int J5Step = 0;
-      int J6Step = 0;
-      int J7Step = 0;
-      int J8Step = 0;
-      int J9Step = 0;
       ///
       int J1stepCen = 0;
       int J2stepCen = 0;
       int J3stepCen = 0;
       int J4stepCen = 0;
-      int J5stepCen = 0;
       int J5step45 = 0;
       int J6stepCen = 0;
       int J7stepCen = 0;
@@ -4019,8 +4678,55 @@ void loop() {
 
       int Jreq[9] = { J1req, J2req, J3req, J4req, J5req, J6req, J7req, J8req, J9req };
       int JStepLim[9] = { J1StepLim, J2StepLim, J3StepLim, J4StepLim, J5StepLim, J6StepLim, J7StepLim, J8StepLim, J9StepLim };
-      int JcalPin[9] = { J1calPin, J2calPin, J3calPin, J4calPin, J5calPin, J6calPin, J7calPin, J8calPin, J9calPin };
       int JStep[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+      const int calibrationDirections[9] = {
+        J1CalDir, J2CalDir, J3CalDir, J4CalDir, J5CalDir,
+        J6CalDir, J7CalDir, J8CalDir, J9CalDir,
+      };
+      const float positiveLimits[9] = {
+        J1axisLimPos, J2axisLimPos, J3axisLimPos,
+        J4axisLimPos, J5axisLimPos, J6axisLimPos,
+        J7axisLimPos, J8axisLimPos, J9axisLimPos,
+      };
+      const float negativeLimits[9] = {
+        J1axisLimNeg, J2axisLimNeg, J3axisLimNeg,
+        J4axisLimNeg, J5axisLimNeg, J6axisLimNeg,
+        J7axisLimNeg, J8axisLimNeg, J9axisLimNeg,
+      };
+      const float stepsPerUnit[9] = {
+        J1StepDeg, J2StepDeg, J3StepDeg,
+        J4StepDeg, J5StepDeg, J6StepDeg,
+        J7StepDeg, J8StepDeg, J9StepDeg,
+      };
+      const float baseOffsets[9] = {
+        J1calBaseOff, J2calBaseOff, J3calBaseOff,
+        J4calBaseOff, J5calBaseOff, J6calBaseOff,
+        J7calBaseOff, J8calBaseOff, J9calBaseOff,
+      };
+      int stagedMasterSteps[9];
+      int stagedCenterSteps[9];
+      int stagedJointFiveSteps[9];
+      for (int axis = 0; axis < 9; ++axis) {
+        if (!ar4_protocol::calibration_reference_steps(
+            Jreq[axis],
+            calibrationDirections[axis],
+            positiveLimits[axis],
+            negativeLimits[axis],
+            stepsPerUnit[axis],
+            JStepLim[axis],
+            baseOffsets[axis],
+            calibrationOffsets[axis],
+            axis == 4,
+            stagedMasterSteps[axis],
+            stagedCenterSteps[axis],
+            stagedJointFiveSteps[axis]
+        )) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
+      }
 
       for (int i = 0; i < 9; i++) {
         if (Jreq[i] == 1) {
@@ -4047,91 +4753,22 @@ void loop() {
 
 
 
-      //set master steps and center step
-
-      if (J1req == 1) {
-        if (J1CalDir == 1) {
-          J1StepM = ((J1axisLim) + J1calBaseOff + J1calOff) * J1StepDeg;
-          J1stepCen = ((J1axisLimPos) + J1calBaseOff + J1calOff) * J1StepDeg;
-        } else {
-          J1StepM = (0 + J1calBaseOff + J1calOff) * J1StepDeg;
-          J1stepCen = ((J1axisLimNeg)-J1calBaseOff - J1calOff) * J1StepDeg;
-        }
+      int *stepMonitors[9] = {
+        &J1StepM, &J2StepM, &J3StepM, &J4StepM, &J5StepM,
+        &J6StepM, &J7StepM, &J8StepM, &J9StepM,
+      };
+      for (int axis = 0; axis < 9; ++axis) {
+        if (Jreq[axis] == 1) *stepMonitors[axis] = stagedMasterSteps[axis];
       }
-      if (J2req == 1) {
-        if (J2CalDir == 1) {
-          J2StepM = ((J2axisLim) + J2calBaseOff + J2calOff) * J2StepDeg;
-          J2stepCen = ((J2axisLimPos) + J2calBaseOff + J2calOff) * J2StepDeg;
-        } else {
-          J2StepM = (0 + J2calBaseOff + J2calOff) * J2StepDeg;
-          J2stepCen = ((J2axisLimNeg)-J2calBaseOff - J2calOff) * J2StepDeg;
-        }
-      }
-      if (J3req == 1) {
-        if (J3CalDir == 1) {
-          J3StepM = ((J3axisLim) + J3calBaseOff + J3calOff) * J3StepDeg;
-          J3stepCen = ((J3axisLimPos) + J3calBaseOff + J3calOff) * J3StepDeg;
-        } else {
-          J3StepM = (0 + J3calBaseOff + J3calOff) * J3StepDeg;
-          J3stepCen = ((J3axisLimNeg)-J3calBaseOff - J3calOff) * J3StepDeg;
-        }
-      }
-      if (J4req == 1) {
-        if (J4CalDir == 1) {
-          J4StepM = ((J4axisLim) + J4calBaseOff + J4calOff) * J4StepDeg;
-          J4stepCen = ((J4axisLimPos) + J4calBaseOff + J4calOff) * J4StepDeg;
-        } else {
-          J4StepM = (0 + J4calBaseOff + J4calOff) * J4StepDeg;
-          J4stepCen = ((J4axisLimNeg)-J4calBaseOff - J4calOff) * J4StepDeg;
-        }
-      }
-      if (J5req == 1) {
-        if (J5CalDir == 1) {
-          J5StepM = ((J5axisLim) + J5calBaseOff + J5calOff) * J5StepDeg;
-          J5stepCen = ((J5axisLimPos) + J5calBaseOff + J5calOff) * J5StepDeg;
-          J5step45 = (((J5axisLimNeg) + J5calBaseOff + J5calOff) - 45) * J5StepDeg;
-        } else {
-          J5StepM = (0 + J5calBaseOff + J5calOff) * J5StepDeg;
-          J5stepCen = ((J5axisLimNeg)-J5calBaseOff - J5calOff) * J5StepDeg;
-          J5step45 = (((J5axisLimNeg)-J5calBaseOff - J5calOff) + 45) * J5StepDeg;
-        }
-      }
-      if (J6req == 1) {
-        if (J6CalDir == 1) {
-          J6StepM = ((J6axisLim) + J6calBaseOff + J6calOff) * J6StepDeg;
-          J6stepCen = ((J6axisLimPos) + J6calBaseOff + J6calOff) * J6StepDeg;
-        } else {
-          J6StepM = (0 + J6calBaseOff + J6calOff) * J6StepDeg;
-          J6stepCen = ((J6axisLimNeg)-J6calBaseOff - J6calOff) * J6StepDeg;
-        }
-      }
-      if (J7req == 1) {
-        if (J7CalDir == 1) {
-          J7StepM = ((J7axisLim) + J7calBaseOff + J7calOff) * J7StepDeg;
-          J7stepCen = ((J7axisLimPos) + J7calBaseOff + J7calOff) * J7StepDeg;
-        } else {
-          J7StepM = (0 + J7calBaseOff + J7calOff) * J7StepDeg;
-          J7stepCen = ((J7axisLimNeg)-J7calBaseOff - J7calOff) * J7StepDeg;
-        }
-      }
-      if (J8req == 1) {
-        if (J8CalDir == 1) {
-          J8StepM = ((J8axisLim) + J8calBaseOff + J8calOff) * J8StepDeg;
-          J8stepCen = ((J8axisLimPos) + J8calBaseOff + J8calOff) * J8StepDeg;
-        } else {
-          J8StepM = (0 + J8calBaseOff + J8calOff) * J8StepDeg;
-          J8stepCen = ((J8axisLimNeg)-J8calBaseOff - J8calOff) * J8StepDeg;
-        }
-      }
-      if (J9req == 1) {
-        if (J9CalDir == 1) {
-          J9StepM = ((J9axisLim) + J9calBaseOff + J9calOff) * J9StepDeg;
-          J9stepCen = ((J9axisLimPos) + J9calBaseOff + J9calOff) * J9StepDeg;
-        } else {
-          J9StepM = (0 + J9calBaseOff + J9calOff) * J9StepDeg;
-          J9stepCen = ((J9axisLimNeg)-J9calBaseOff - J9calOff) * J9StepDeg;
-        }
-      }
+      J1stepCen = stagedCenterSteps[0];
+      J2stepCen = stagedCenterSteps[1];
+      J3stepCen = stagedCenterSteps[2];
+      J4stepCen = stagedCenterSteps[3];
+      J5step45 = stagedJointFiveSteps[4];
+      J6stepCen = stagedCenterSteps[5];
+      J7stepCen = stagedCenterSteps[6];
+      J8stepCen = stagedCenterSteps[7];
+      J9stepCen = stagedCenterSteps[8];
 
 
       //move to center
@@ -4197,7 +4834,11 @@ void loop() {
       float SpeedVal = 100;
       float ACCramp = 50;
 
-      driveMotorsJ(J1stepCen, J2stepCen, J3stepCen, J4stepCen, J5step45, J6stepCen, J7stepCen, J8stepCen, J9stepCen, J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp);
+      if (!driveMotorsJ(J1stepCen, J2stepCen, J3stepCen, J4stepCen, J5step45, J6stepCen, J7stepCen, J8stepCen, J9stepCen, J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, nullptr)) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
       sendRobotPos();
       inData = "";  // Clear recieved buffer
     }
@@ -4206,12 +4847,6 @@ void loop() {
     //----- LIVE CARTESIAN JOG  ---------------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "LC") {
-      delay(5);
-      Serial.println();
-
-
-      updatePos();
-
       int J1dir;
       int J2dir;
       int J3dir;
@@ -4229,37 +4864,42 @@ void loop() {
       int J5axisFault = 0;
       int J6axisFault = 0;
       int TotalAxisFault = 0;
+      ar4_protocol::LiveControlFrameStatus liveControlStatus =
+        ar4_protocol::LiveControlFrameStatus::kPending;
 
       bool JogInPoc = true;
       Alarm = "0";
 
 
-      int VStart = inData.indexOf("V");
-      int SPstart = inData.indexOf("S");
-      int AcStart = inData.indexOf("Ac");
-      int DcStart = inData.indexOf("Dc");
-      int RmStart = inData.indexOf("Rm");
-      int WristConStart = inData.indexOf("W");
-      int LoopModeStart = inData.indexOf("Lm");
+      ar4_protocol::LiveJogCommandFields commandFields = {};
+      if (!ar4_protocol::parse_live_jog_command(
+          inData,
+          ar4_protocol::LiveJogCommandKind::kCartesian,
+          commandFields
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
-
-      float Vector = inData.substring(VStart + 1, SPstart).toFloat();
-      String SpeedType = inData.substring(SPstart + 1, SPstart + 2);
-      float SpeedVal = inData.substring(SPstart + 2, AcStart).toFloat();
-      float ACCspd = 0;
-      float DCCspd = 0;
-      float ACCramp = 10;
-      WristCon = inData.substring(WristConStart + 1, LoopModeStart);
-      String LoopMode = inData.substring(LoopModeStart + 2);
-      LoopMode.trim();
-      J1LoopMode = LoopMode.substring(0, 1).toInt();
-      J2LoopMode = LoopMode.substring(1, 2).toInt();
-      J3LoopMode = LoopMode.substring(2, 3).toInt();
-      J4LoopMode = LoopMode.substring(3, 4).toInt();
-      J5LoopMode = LoopMode.substring(4, 5).toInt();
-      J6LoopMode = LoopMode.substring(5).toInt();
+      int Vector = commandFields.vector;
+      String SpeedType(commandFields.speed_mode);
+      float SpeedVal = commandFields.speed;
+      float ACCspd = commandFields.acceleration;
+      float DCCspd = commandFields.deceleration;
+      float ACCramp = commandFields.ramp;
+      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
+        WristCon,
+        JointLoopModes,
+        String(commandFields.wrist_config),
+        commandFields.loop_modes
+      );
 
       inData = "";  // Clear recieved buffer
+
+      delay(5);
+      Serial.println();
+      updatePos();
 
       xyzuvw_In[0] = xyzuvw_Out[0];
       xyzuvw_In[1] = xyzuvw_Out[1];
@@ -4313,15 +4953,23 @@ void loop() {
           xyzuvw_In[5] = xyzuvw_Out[5] + JogStepInc;
         }
 
-        SolveInverseKinematics();
+        SolveInverseKinematics(commandFields.wrist_config);
 
         //calc destination motor steps
-        int J1futStepM = (JangleOut[0] + J1axisLimNeg) * J1StepDeg;
-        int J2futStepM = (JangleOut[1] + J2axisLimNeg) * J2StepDeg;
-        int J3futStepM = (JangleOut[2] + J3axisLimNeg) * J3StepDeg;
-        int J4futStepM = (JangleOut[3] + J4axisLimNeg) * J4StepDeg;
-        int J5futStepM = (JangleOut[4] + J5axisLimNeg) * J5StepDeg;
-        int J6futStepM = (JangleOut[5] + J6axisLimNeg) * J6StepDeg;
+        int future_steps[ROBOT_nDOFs] = {};
+        if (
+          KinematicError != 0
+          || !primary_inverse_solution_to_future_steps(future_steps)
+        ) {
+          KinematicError = 1;
+          break;
+        }
+        int J1futStepM = future_steps[0];
+        int J2futStepM = future_steps[1];
+        int J3futStepM = future_steps[2];
+        int J4futStepM = future_steps[3];
+        int J5futStepM = future_steps[4];
+        int J6futStepM = future_steps[5];
 
         //calc delta from current to destination
         int J1stepDif = J1StepM - J1futStepM;
@@ -4347,22 +4995,22 @@ void loop() {
 
 
         //determine if requested position is within axis limits
-        if ((J1dir == 1 and (J1StepM + J1stepDif > J1StepLim)) or (J1dir == 0 and (J1StepM - J1stepDif < 0))) {
+        if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
           J1axisFault = 1;
         }
-        if ((J2dir == 1 and (J2StepM + J2stepDif > J2StepLim)) or (J2dir == 0 and (J2StepM - J2stepDif < 0))) {
+        if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
           J2axisFault = 1;
         }
-        if ((J3dir == 1 and (J3StepM + J3stepDif > J3StepLim)) or (J3dir == 0 and (J3StepM - J3stepDif < 0))) {
+        if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
           J3axisFault = 1;
         }
-        if ((J4dir == 1 and (J4StepM + J4stepDif > J4StepLim)) or (J4dir == 0 and (J4StepM - J4stepDif < 0))) {
+        if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
           J4axisFault = 1;
         }
-        if ((J5dir == 1 and (J5StepM + J5stepDif > J5StepLim)) or (J5dir == 0 and (J5StepM - J5stepDif < 0))) {
+        if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
           J5axisFault = 1;
         }
-        if ((J6dir == 1 and (J6StepM + J6stepDif > J6StepLim)) or (J6dir == 0 and (J6StepM - J6stepDif < 0))) {
+        if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
           J6axisFault = 1;
         }
         TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
@@ -4370,15 +5018,20 @@ void loop() {
 
         //send move command if no axis limit error
         if (TotalAxisFault == 0 && KinematicError == 0) {
-          driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp);
+          if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes)) {
+            KinematicError = 1;
+            break;
+          }
           updatePos();
         }
 
         //stop loop if any serial command is recieved - but the expected command is "S" to stop the loop.
 
-        char recieved = Serial.read();
-        inData += recieved;
-        if (recieved == '\n') {
+        liveControlStatus = read_live_control_frame();
+        if (
+          liveControlStatus
+          != ar4_protocol::LiveControlFrameStatus::kPending
+        ) {
           break;
         }
 
@@ -4390,20 +5043,14 @@ void loop() {
         flag = "EC" + String(J1collisionTrue) + String(J2collisionTrue) + String(J3collisionTrue) + String(J4collisionTrue) + String(J5collisionTrue) + String(J6collisionTrue);
       }
 
-      //send move command if no axis limit error
-      if (TotalAxisFault == 0 && KinematicError == 0) {
-        sendRobotPos();
-      } else if (KinematicError == 1) {
-        Alarm = "ER";
-        delay(5);
-        Serial.println(Alarm);
-        Alarm = "0";
-      } else {
-        Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault);
-        delay(5);
-        Serial.println(Alarm);
-        Alarm = "0";
-      }
+      send_live_terminal_response(
+        liveControlStatus,
+        KinematicError,
+        TotalAxisFault,
+        "EL" + String(J1axisFault) + String(J2axisFault)
+          + String(J3axisFault) + String(J4axisFault)
+          + String(J5axisFault) + String(J6axisFault)
+      );
 
       inData = "";  // Clear recieved buffer
       ////////MOVE COMPLETE///////////
@@ -4435,35 +5082,36 @@ void loop() {
       int J8axisFault = 0;
       int J9axisFault = 0;
       int TotalAxisFault = 0;
+      ar4_protocol::LiveControlFrameStatus liveControlStatus =
+        ar4_protocol::LiveControlFrameStatus::kPending;
 
       bool JogInPoc = true;
       Alarm = "0";
 
 
-      int VStart = inData.indexOf("V");
-      int SPstart = inData.indexOf("S");
-      int AcStart = inData.indexOf("Ac");
-      int DcStart = inData.indexOf("Dc");
-      int RmStart = inData.indexOf("Rm");
-      int WristConStart = inData.indexOf("W");
-      int LoopModeStart = inData.indexOf("Lm");
+      ar4_protocol::LiveJogCommandFields commandFields = {};
+      if (!ar4_protocol::parse_live_jog_command(
+          inData,
+          ar4_protocol::LiveJogCommandKind::kJoint,
+          commandFields
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
-
-      float Vector = inData.substring(VStart + 1, SPstart).toFloat();
-      String SpeedType = inData.substring(SPstart + 1, SPstart + 2);
-      float SpeedVal = inData.substring(SPstart + 2, AcStart).toFloat();
-      float ACCspd = 0;
-      float DCCspd = 0;
-      float ACCramp = 10;
-      WristCon = inData.substring(WristConStart + 1, LoopModeStart);
-      String LoopMode = inData.substring(LoopModeStart + 2);
-      LoopMode.trim();
-      J1LoopMode = LoopMode.substring(0, 1).toInt();
-      J2LoopMode = LoopMode.substring(1, 2).toInt();
-      J3LoopMode = LoopMode.substring(2, 3).toInt();
-      J4LoopMode = LoopMode.substring(3, 4).toInt();
-      J5LoopMode = LoopMode.substring(4, 5).toInt();
-      J6LoopMode = LoopMode.substring(5).toInt();
+      int Vector = commandFields.vector;
+      String SpeedType(commandFields.speed_mode);
+      float SpeedVal = commandFields.speed;
+      float ACCspd = commandFields.acceleration;
+      float DCCspd = commandFields.deceleration;
+      float ACCramp = commandFields.ramp;
+      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
+        WristCon,
+        JointLoopModes,
+        String(commandFields.wrist_config),
+        commandFields.loop_modes
+      );
 
       inData = "";  // Clear recieved buffer
 
@@ -4546,15 +5194,24 @@ void loop() {
         }
 
         //calc destination motor steps
-        int J1futStepM = (J1Angle + J1axisLimNeg) * J1StepDeg;
-        int J2futStepM = (J2Angle + J2axisLimNeg) * J2StepDeg;
-        int J3futStepM = (J3Angle + J3axisLimNeg) * J3StepDeg;
-        int J4futStepM = (J4Angle + J4axisLimNeg) * J4StepDeg;
-        int J5futStepM = (J5Angle + J5axisLimNeg) * J5StepDeg;
-        int J6futStepM = (J6Angle + J6axisLimNeg) * J6StepDeg;
-        int J7futStepM = (J7Angle + J7axisLimNeg) * J7StepDeg;
-        int J8futStepM = (J8Angle + J8axisLimNeg) * J8StepDeg;
-        int J9futStepM = (J9Angle + J9axisLimNeg) * J9StepDeg;
+        const float positions[numJoints] = {
+          J1Angle, J2Angle, J3Angle, J4Angle, J5Angle, J6Angle,
+          J7Angle, J8Angle, J9Angle,
+        };
+        int future_steps[numJoints] = {};
+        if (!joint_positions_to_future_steps(positions, future_steps)) {
+          KinematicError = 1;
+          break;
+        }
+        int J1futStepM = future_steps[0];
+        int J2futStepM = future_steps[1];
+        int J3futStepM = future_steps[2];
+        int J4futStepM = future_steps[3];
+        int J5futStepM = future_steps[4];
+        int J6futStepM = future_steps[5];
+        int J7futStepM = future_steps[6];
+        int J8futStepM = future_steps[7];
+        int J9futStepM = future_steps[8];
 
         //calc delta from current to destination
         int J1stepDif = J1StepM - J1futStepM;
@@ -4579,46 +5236,51 @@ void loop() {
         J9dir = (J9stepDif <= 0) ? 1 : 0;
 
         //determine if requested position is within axis limits
-        if ((J1dir == 1 and (J1StepM + J1stepDif > J1StepLim)) or (J1dir == 0 and (J1StepM - J1stepDif < 0))) {
+        if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
           J1axisFault = 1;
         }
-        if ((J2dir == 1 and (J2StepM + J2stepDif > J2StepLim)) or (J2dir == 0 and (J2StepM - J2stepDif < 0))) {
+        if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
           J2axisFault = 1;
         }
-        if ((J3dir == 1 and (J3StepM + J3stepDif > J3StepLim)) or (J3dir == 0 and (J3StepM - J3stepDif < 0))) {
+        if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
           J3axisFault = 1;
         }
-        if ((J4dir == 1 and (J4StepM + J4stepDif > J4StepLim)) or (J4dir == 0 and (J4StepM - J4stepDif < 0))) {
+        if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
           J4axisFault = 1;
         }
-        if ((J5dir == 1 and (J5StepM + J5stepDif > J5StepLim)) or (J5dir == 0 and (J5StepM - J5stepDif < 0))) {
+        if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
           J5axisFault = 1;
         }
-        if ((J6dir == 1 and (J6StepM + J6stepDif > J6StepLim)) or (J6dir == 0 and (J6StepM - J6stepDif < 0))) {
+        if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
           J6axisFault = 1;
         }
-        if ((J7dir == 1 and (J7StepM + J7stepDif > J7StepLim)) or (J7dir == 0 and (J7StepM - J7stepDif < 0))) {
+        if (future_step_is_outside_limit(J7futStepM, J7StepLim)) {
           J7axisFault = 1;
         }
-        if ((J8dir == 1 and (J8StepM + J8stepDif > J8StepLim)) or (J8dir == 0 and (J8StepM - J8stepDif < 0))) {
+        if (future_step_is_outside_limit(J8futStepM, J8StepLim)) {
           J8axisFault = 1;
         }
-        if ((J9dir == 1 and (J9StepM + J9stepDif > J9StepLim)) or (J9dir == 0 and (J9StepM - J9stepDif < 0))) {
+        if (future_step_is_outside_limit(J9futStepM, J9StepLim)) {
           J9axisFault = 1;
         }
         TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
 
         //send move command if no axis limit error
         if (TotalAxisFault == 0 && KinematicError == 0) {
-          driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp);
+          if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes)) {
+            KinematicError = 1;
+            break;
+          }
           updatePos();
         }
 
         //stop loop if any serial command is recieved - but the expected command is "S" to stop the loop.
 
-        char recieved = Serial.read();
-        inData += recieved;
-        if (recieved == '\n') {
+        liveControlStatus = read_live_control_frame();
+        if (
+          liveControlStatus
+          != ar4_protocol::LiveControlFrameStatus::kPending
+        ) {
           break;
         }
 
@@ -4630,20 +5292,16 @@ void loop() {
         flag = "EC" + String(J1collisionTrue) + String(J2collisionTrue) + String(J3collisionTrue) + String(J4collisionTrue) + String(J5collisionTrue) + String(J6collisionTrue);
       }
 
-      //send move command if no axis limit error
-      if (TotalAxisFault == 0 && KinematicError == 0) {
-        sendRobotPos();
-      } else if (KinematicError == 1) {
-        Alarm = "ER";
-        delay(5);
-        Serial.println(Alarm);
-        Alarm = "0";
-      } else {
-        Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault) + String(J7axisFault) + String(J8axisFault) + String(J9axisFault);
-        delay(5);
-        Serial.println(Alarm);
-        Alarm = "0";
-      }
+      send_live_terminal_response(
+        liveControlStatus,
+        KinematicError,
+        TotalAxisFault,
+        "EL" + String(J1axisFault) + String(J2axisFault)
+          + String(J3axisFault) + String(J4axisFault)
+          + String(J5axisFault) + String(J6axisFault)
+          + String(J7axisFault) + String(J8axisFault)
+          + String(J9axisFault)
+      );
 
       inData = "";  // Clear recieved buffer
       ////////MOVE COMPLETE///////////
@@ -4654,11 +5312,6 @@ void loop() {
     //----- LIVE TOOL JOG  ---------------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "LT") {
-      delay(5);
-      Serial.println();
-
-      updatePos();
-
       int J1dir;
       int J2dir;
       int J3dir;
@@ -4677,43 +5330,62 @@ void loop() {
       int J6axisFault = 0;
       int TRaxisFault = 0;
       int TotalAxisFault = 0;
+      ar4_protocol::LiveControlFrameStatus liveControlStatus =
+        ar4_protocol::LiveControlFrameStatus::kPending;
 
       float Xtool = Robot_Kin_Tool[0];
       float Ytool = Robot_Kin_Tool[1];
       float Ztool = Robot_Kin_Tool[2];
-      float RZtool = Robot_Kin_Tool[3];
+      float RZtool = Robot_Kin_Tool[5];
       float RYtool = Robot_Kin_Tool[4];
-      float RXtool = Robot_Kin_Tool[5];
+      float RXtool = Robot_Kin_Tool[3];
 
       bool JogInPoc = true;
       Alarm = "0";
 
-      int VStart = inData.indexOf("V");
-      int SPstart = inData.indexOf("S");
-      int AcStart = inData.indexOf("Ac");
-      int DcStart = inData.indexOf("Dc");
-      int RmStart = inData.indexOf("Rm");
-      int WristConStart = inData.indexOf("W");
-      int LoopModeStart = inData.indexOf("Lm");
+      ar4_protocol::LiveJogCommandFields commandFields = {};
+      if (!ar4_protocol::parse_live_jog_command(
+          inData,
+          ar4_protocol::LiveJogCommandKind::kTool,
+          commandFields
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
-      float Vector = inData.substring(VStart + 1, SPstart).toFloat();
-      String SpeedType = inData.substring(SPstart + 1, SPstart + 2);
-      float SpeedVal = inData.substring(SPstart + 2, AcStart).toFloat();
-      float ACCspd = 100;
-      float DCCspd = 100;
-      float ACCramp = 100;
-      WristCon = inData.substring(WristConStart + 1, LoopModeStart);
-      String LoopMode = inData.substring(LoopModeStart + 2);
-      LoopMode.trim();
-      J1LoopMode = LoopMode.substring(0, 1).toInt();
-      J2LoopMode = LoopMode.substring(1, 2).toInt();
-      J3LoopMode = LoopMode.substring(2, 3).toInt();
-      J4LoopMode = LoopMode.substring(3, 4).toInt();
-      J5LoopMode = LoopMode.substring(4, 5).toInt();
-      J6LoopMode = LoopMode.substring(5).toInt();
+      int Vector = commandFields.vector;
+      String SpeedType(commandFields.speed_mode);
+      float SpeedVal = commandFields.speed;
+      float ACCspd = commandFields.acceleration;
+      float DCCspd = commandFields.deceleration;
+      float ACCramp = commandFields.ramp;
+      int toolFrameIndex = -1;
+      float toolFrameOffset = 0.0f;
+      if (
+        !ar4_protocol::decode_live_tool_offset(
+          Vector,
+          ar4_protocol::kLiveToolJogIncrement,
+          toolFrameIndex,
+          toolFrameOffset
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
+        WristCon,
+        JointLoopModes,
+        String(commandFields.wrist_config),
+        commandFields.loop_modes
+      );
 
       inData = "";  // Clear recieved buffer
 
+      delay(5);
+      Serial.println();
+      updatePos();
 
       Xtool = Robot_Kin_Tool[0];
       Ytool = Robot_Kin_Tool[1];
@@ -4729,7 +5401,7 @@ void loop() {
       JangleIn[4] = (J5StepM - J5zeroStep) / J5StepDeg;
       JangleIn[5] = (J6StepM - J6zeroStep) / J6StepDeg;
 
-      while (JogInPoc == true) {
+      while (JogInPoc == true && KinematicError == 0) {
 
         Xtool = Robot_Kin_Tool[0];
         Ytool = Robot_Kin_Tool[1];
@@ -4738,47 +5410,7 @@ void loop() {
         RYtool = Robot_Kin_Tool[4];
         RZtool = Robot_Kin_Tool[5];
 
-        if (Vector == 10) {
-          Robot_Kin_Tool[0] = Robot_Kin_Tool[0] + .25;
-        }
-        if (Vector == 11) {
-          Robot_Kin_Tool[0] = Robot_Kin_Tool[0] - .25;
-        }
-
-        if (Vector == 20) {
-          Robot_Kin_Tool[1] = Robot_Kin_Tool[1] + .25;
-        }
-        if (Vector == 21) {
-          Robot_Kin_Tool[1] = Robot_Kin_Tool[1] - .25;
-        }
-
-        if (Vector == 30) {
-          Robot_Kin_Tool[2] = Robot_Kin_Tool[2] + .25;
-        }
-        if (Vector == 31) {
-          Robot_Kin_Tool[2] = Robot_Kin_Tool[2] - .25;
-        }
-
-        if (Vector == 60) {
-          Robot_Kin_Tool[3] = Robot_Kin_Tool[3] + .25 * M_PI / 180;
-        }
-        if (Vector == 61) {
-          Robot_Kin_Tool[3] = Robot_Kin_Tool[3] - .25 * M_PI / 180;
-        }
-
-        if (Vector == 50) {
-          Robot_Kin_Tool[4] = Robot_Kin_Tool[4] + .25 * M_PI / 180;
-        }
-        if (Vector == 51) {
-          Robot_Kin_Tool[4] = Robot_Kin_Tool[4] - .25 * M_PI / 180;
-        }
-
-        if (Vector == 40) {
-          Robot_Kin_Tool[5] = Robot_Kin_Tool[5] + .25 * M_PI / 180;
-        }
-        if (Vector == 41) {
-          Robot_Kin_Tool[5] = Robot_Kin_Tool[5] - .25 * M_PI / 180;
-        }
+        Robot_Kin_Tool[toolFrameIndex] += toolFrameOffset;
 
 
 
@@ -4789,7 +5421,7 @@ void loop() {
         xyzuvw_In[4] = xyzuvw_Out[4];
         xyzuvw_In[5] = xyzuvw_Out[5];
 
-        SolveInverseKinematics();
+        SolveInverseKinematics(commandFields.wrist_config);
 
         Robot_Kin_Tool[0] = Xtool;
         Robot_Kin_Tool[1] = Ytool;
@@ -4799,12 +5431,20 @@ void loop() {
         Robot_Kin_Tool[5] = RZtool;
 
         //calc destination motor steps
-        int J1futStepM = (JangleOut[0] + J1axisLimNeg) * J1StepDeg;
-        int J2futStepM = (JangleOut[1] + J2axisLimNeg) * J2StepDeg;
-        int J3futStepM = (JangleOut[2] + J3axisLimNeg) * J3StepDeg;
-        int J4futStepM = (JangleOut[3] + J4axisLimNeg) * J4StepDeg;
-        int J5futStepM = (JangleOut[4] + J5axisLimNeg) * J5StepDeg;
-        int J6futStepM = (JangleOut[5] + J6axisLimNeg) * J6StepDeg;
+        int future_steps[ROBOT_nDOFs] = {};
+        if (
+          KinematicError != 0
+          || !primary_inverse_solution_to_future_steps(future_steps)
+        ) {
+          KinematicError = 1;
+          break;
+        }
+        int J1futStepM = future_steps[0];
+        int J2futStepM = future_steps[1];
+        int J3futStepM = future_steps[2];
+        int J4futStepM = future_steps[3];
+        int J5futStepM = future_steps[4];
+        int J6futStepM = future_steps[5];
 
         //calc delta from current to destination
         int J1stepDif = J1StepM - J1futStepM;
@@ -4830,22 +5470,22 @@ void loop() {
 
 
         //determine if requested position is within axis limits
-        if ((J1dir == 1 and (J1StepM + J1stepDif > J1StepLim)) or (J1dir == 0 and (J1StepM - J1stepDif < 0))) {
+        if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
           J1axisFault = 1;
         }
-        if ((J2dir == 1 and (J2StepM + J2stepDif > J2StepLim)) or (J2dir == 0 and (J2StepM - J2stepDif < 0))) {
+        if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
           J2axisFault = 1;
         }
-        if ((J3dir == 1 and (J3StepM + J3stepDif > J3StepLim)) or (J3dir == 0 and (J3StepM - J3stepDif < 0))) {
+        if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
           J3axisFault = 1;
         }
-        if ((J4dir == 1 and (J4StepM + J4stepDif > J4StepLim)) or (J4dir == 0 and (J4StepM - J4stepDif < 0))) {
+        if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
           J4axisFault = 1;
         }
-        if ((J5dir == 1 and (J5StepM + J5stepDif > J5StepLim)) or (J5dir == 0 and (J5StepM - J5stepDif < 0))) {
+        if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
           J5axisFault = 1;
         }
-        if ((J6dir == 1 and (J6StepM + J6stepDif > J6StepLim)) or (J6dir == 0 and (J6StepM - J6stepDif < 0))) {
+        if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
           J6axisFault = 1;
         }
         TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
@@ -4853,15 +5493,20 @@ void loop() {
 
         //send move command if no axis limit error
         if (TotalAxisFault == 0 && KinematicError == 0) {
-          driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp);
+          if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes)) {
+            KinematicError = 1;
+            break;
+          }
           updatePos();
         }
 
         //stop loop if any serial command is recieved - but the expected command is "S" to stop the loop.
 
-        char recieved = Serial.read();
-        inData += recieved;
-        if (recieved == '\n') {
+        liveControlStatus = read_live_control_frame();
+        if (
+          liveControlStatus
+          != ar4_protocol::LiveControlFrameStatus::kPending
+        ) {
           break;
         }
 
@@ -4873,20 +5518,14 @@ void loop() {
         flag = "EC" + String(J1collisionTrue) + String(J2collisionTrue) + String(J3collisionTrue) + String(J4collisionTrue) + String(J5collisionTrue) + String(J6collisionTrue);
       }
 
-      //send move command if no axis limit error
-      if (TotalAxisFault == 0 && KinematicError == 0) {
-        sendRobotPos();
-      } else if (KinematicError == 1) {
-        Alarm = "ER";
-        delay(5);
-        Serial.println(Alarm);
-        Alarm = "0";
-      } else {
-        Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault);
-        delay(5);
-        Serial.println(Alarm);
-        Alarm = "0";
-      }
+      send_live_terminal_response(
+        liveControlStatus,
+        KinematicError,
+        TotalAxisFault,
+        "EL" + String(J1axisFault) + String(J2axisFault)
+          + String(J3axisFault) + String(J4axisFault)
+          + String(J5axisFault) + String(J6axisFault)
+      );
 
       inData = "";  // Clear recieved buffer
       ////////MOVE COMPLETE///////////
@@ -4910,9 +5549,9 @@ void loop() {
       float Xtool = Robot_Kin_Tool[0];
       float Ytool = Robot_Kin_Tool[1];
       float Ztool = Robot_Kin_Tool[2];
-      float RZtool = Robot_Kin_Tool[3];
+      float RZtool = Robot_Kin_Tool[5];
       float RYtool = Robot_Kin_Tool[4];
-      float RXtool = Robot_Kin_Tool[5];
+      float RXtool = Robot_Kin_Tool[3];
 
       int J1axisFault = 0;
       int J2axisFault = 0;
@@ -4924,53 +5563,41 @@ void loop() {
 
       String Alarm = "0";
 
-      int SPstart = inData.indexOf('S');
-      int AcStart = inData.indexOf('G');
-      int DcStart = inData.indexOf('H');
-      int RmStart = inData.indexOf('I');
-      int LoopModeStart = inData.indexOf("Lm");
-
-      String Dir = inData.substring(0, 2);  // this should be Z0 or Z1
-      float Dist = inData.substring(2, SPstart).toFloat();
-      String SpeedType = inData.substring(SPstart + 1, SPstart + 2);
-      float SpeedVal = inData.substring(SPstart + 2, AcStart).toFloat();
-      float ACCspd = inData.substring(AcStart + 1, DcStart).toInt();
-      float DCCspd = inData.substring(DcStart + 1, RmStart).toInt();
-      float ACCramp = inData.substring(RmStart + 1, LoopModeStart).toInt();
-      String LoopMode = inData.substring(LoopModeStart + 2);
-      LoopMode.trim();
-      J1LoopMode = LoopMode.substring(0, 1).toInt();
-      J2LoopMode = LoopMode.substring(1, 2).toInt();
-      J3LoopMode = LoopMode.substring(2, 3).toInt();
-      J4LoopMode = LoopMode.substring(3, 4).toInt();
-      J5LoopMode = LoopMode.substring(4, 5).toInt();
-      J6LoopMode = LoopMode.substring(5).toInt();
-
-      if (Dir == "X0") {
-        Robot_Kin_Tool[0] = Robot_Kin_Tool[0] - Dist;
-      } else if (Dir == "X1") {
-        Robot_Kin_Tool[0] = Robot_Kin_Tool[0] + Dist;
-      } else if (Dir == "Y0") {
-        Robot_Kin_Tool[1] = Robot_Kin_Tool[1] - Dist;
-      } else if (Dir == "Y1") {
-        Robot_Kin_Tool[1] = Robot_Kin_Tool[1] + Dist;
-      } else if (Dir == "Z0") {
-        Robot_Kin_Tool[2] = Robot_Kin_Tool[2] - Dist;
-      } else if (Dir == "Z1") {
-        Robot_Kin_Tool[2] = Robot_Kin_Tool[2] + Dist;
-      } else if (Dir == "R0") {
-        Robot_Kin_Tool[5] = Robot_Kin_Tool[5] - Dist * M_PI / 180;
-      } else if (Dir == "R1") {
-        Robot_Kin_Tool[5] = Robot_Kin_Tool[5] + Dist * M_PI / 180;
-      } else if (Dir == "P0") {
-        Robot_Kin_Tool[4] = Robot_Kin_Tool[4] - Dist * M_PI / 180;
-      } else if (Dir == "P1") {
-        Robot_Kin_Tool[4] = Robot_Kin_Tool[4] + Dist * M_PI / 180;
-      } else if (Dir == "W0") {
-        Robot_Kin_Tool[3] = Robot_Kin_Tool[3] - Dist * M_PI / 180;
-      } else if (Dir == "W1") {
-        Robot_Kin_Tool[3] = Robot_Kin_Tool[3] + Dist * M_PI / 180;
+      ar4_protocol::ToolJogCommandFields commandFields = {};
+      if (!ar4_protocol::parse_tool_jog_command(inData, commandFields)) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
       }
+      float Dist = commandFields.distance;
+      String SpeedType(commandFields.speed_mode);
+      float SpeedVal = commandFields.speed;
+      float ACCspd = commandFields.acceleration;
+      float DCCspd = commandFields.deceleration;
+      float ACCramp = commandFields.ramp;
+
+      int toolFrameIndex = -1;
+      float toolFrameOffset = 0.0f;
+      if (
+        !ar4_protocol::decode_discrete_tool_offset(
+          commandFields.axis,
+          static_cast<char>('0' + commandFields.direction),
+          Dist,
+          toolFrameIndex,
+          toolFrameOffset
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
+        WristCon,
+        JointLoopModes,
+        String(commandFields.wrist_config),
+        commandFields.loop_modes
+      );
+      Robot_Kin_Tool[toolFrameIndex] += toolFrameOffset;
 
 
       JangleIn[0] = (J1StepM - J1zeroStep) / J1StepDeg;
@@ -4988,23 +5615,30 @@ void loop() {
       xyzuvw_In[4] = xyzuvw_Out[4];
       xyzuvw_In[5] = xyzuvw_Out[5];
 
-      SolveInverseKinematics();
+      SolveInverseKinematics(commandFields.wrist_config);
 
       Robot_Kin_Tool[0] = Xtool;
       Robot_Kin_Tool[1] = Ytool;
       Robot_Kin_Tool[2] = Ztool;
-      Robot_Kin_Tool[3] = RZtool;
+      Robot_Kin_Tool[3] = RXtool;
       Robot_Kin_Tool[4] = RYtool;
-      Robot_Kin_Tool[5] = RXtool;
+      Robot_Kin_Tool[5] = RZtool;
 
 
       //calc destination motor steps
-      int J1futStepM = (JangleOut[0] + J1axisLimNeg) * J1StepDeg;
-      int J2futStepM = (JangleOut[1] + J2axisLimNeg) * J2StepDeg;
-      int J3futStepM = (JangleOut[2] + J3axisLimNeg) * J3StepDeg;
-      int J4futStepM = (JangleOut[3] + J4axisLimNeg) * J4StepDeg;
-      int J5futStepM = (JangleOut[4] + J5axisLimNeg) * J5StepDeg;
-      int J6futStepM = (JangleOut[5] + J6axisLimNeg) * J6StepDeg;
+      int future_steps[ROBOT_nDOFs] = {};
+      if (
+        KinematicError == 0
+        && !primary_inverse_solution_to_future_steps(future_steps)
+      ) {
+        KinematicError = 1;
+      }
+      int J1futStepM = future_steps[0];
+      int J2futStepM = future_steps[1];
+      int J3futStepM = future_steps[2];
+      int J4futStepM = future_steps[3];
+      int J5futStepM = future_steps[4];
+      int J6futStepM = future_steps[5];
 
       //calc delta from current to destination
       int J1stepDif = J1StepM - J1futStepM;
@@ -5029,22 +5663,22 @@ void loop() {
       J9dir = 0;
 
       //determine if requested position is within axis limits
-      if ((J1dir == 1 and (J1StepM + J1stepDif > J1StepLim)) or (J1dir == 0 and (J1StepM - J1stepDif < 0))) {
+      if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
         J1axisFault = 1;
       }
-      if ((J2dir == 1 and (J2StepM + J2stepDif > J2StepLim)) or (J2dir == 0 and (J2StepM - J2stepDif < 0))) {
+      if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
         J2axisFault = 1;
       }
-      if ((J3dir == 1 and (J3StepM + J3stepDif > J3StepLim)) or (J3dir == 0 and (J3StepM - J3stepDif < 0))) {
+      if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
         J3axisFault = 1;
       }
-      if ((J4dir == 1 and (J4StepM + J4stepDif > J4StepLim)) or (J4dir == 0 and (J4StepM - J4stepDif < 0))) {
+      if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
         J4axisFault = 1;
       }
-      if ((J5dir == 1 and (J5StepM + J5stepDif > J5StepLim)) or (J5dir == 0 and (J5StepM - J5stepDif < 0))) {
+      if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
         J5axisFault = 1;
       }
-      if ((J6dir == 1 and (J6StepM + J6stepDif > J6StepLim)) or (J6dir == 0 and (J6StepM - J6stepDif < 0))) {
+      if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
         J6axisFault = 1;
       }
       TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
@@ -5053,7 +5687,11 @@ void loop() {
       //send move command if no axis limit error
       if (TotalAxisFault == 0 && KinematicError == 0) {
         resetEncoders();
-        driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp);
+        if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes)) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
         checkEncoders();
         sendRobotPos();
       } else if (KinematicError == 1) {
@@ -5100,71 +5738,68 @@ void loop() {
       int J9axisFault = 0;
       int TotalAxisFault = 0;
 
-      int xStart = inData.indexOf("X");
-      int yStart = inData.indexOf("Y");
-      int zStart = inData.indexOf("Z");
-      int rzStart = inData.indexOf("Rz");
-      int ryStart = inData.indexOf("Ry");
-      int rxStart = inData.indexOf("Rx");
-      int J7Start = inData.indexOf("J7");
-      int J8Start = inData.indexOf("J8");
-      int J9Start = inData.indexOf("J9");
-      int SPstart = inData.indexOf("S");
-      int AcStart = inData.indexOf("Ac");
-      int DcStart = inData.indexOf("Dc");
-      int RmStart = inData.indexOf("Rm");
-      int RndStart = inData.indexOf("Rnd");
-      int WristConStart = inData.indexOf("W");
-      int VisRotStart = inData.indexOf("Vr");
-      int LoopModeStart = inData.indexOf("Lm");
+      ar4_protocol::CartesianMoveCommandFields commandFields = {};
+      if (!ar4_protocol::parse_vision_move_command(inData, commandFields)) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
-      xyzuvw_In[0] = inData.substring(xStart + 1, yStart).toFloat();
-      xyzuvw_In[1] = inData.substring(yStart + 1, zStart).toFloat();
-      xyzuvw_In[2] = inData.substring(zStart + 1, rzStart).toFloat();
-      xyzuvw_In[3] = inData.substring(rzStart + 2, ryStart).toFloat();
-      xyzuvw_In[4] = inData.substring(ryStart + 2, rxStart).toFloat();
-      xyzuvw_In[5] = inData.substring(rxStart + 2, J7Start).toFloat();
-      J7_In = inData.substring(J7Start + 2, J8Start).toFloat();
-      J8_In = inData.substring(J8Start + 2, J9Start).toFloat();
-      J9_In = inData.substring(J9Start + 2, SPstart).toFloat();
+      float vision_rotation_radians = 0.0f;
+      if (!ar4_protocol::degrees_to_radians(
+          commandFields.vision_rotation_degrees,
+          vision_rotation_radians
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
-      String SpeedType = inData.substring(SPstart + 1, SPstart + 2);
-      float SpeedVal = inData.substring(SPstart + 2, AcStart).toFloat();
-      float ACCspd = inData.substring(AcStart + 2, DcStart).toFloat();
-      float DCCspd = inData.substring(DcStart + 2, RmStart).toFloat();
-      float ACCramp = inData.substring(RmStart + 2, RndStart).toFloat();
-      float Rounding = inData.substring(RndStart + 3, WristConStart).toFloat();
-      WristCon = inData.substring(WristConStart + 1, VisRotStart);
-      float VisRot = inData.substring(VisRotStart + 2, LoopModeStart).toFloat();
-      String LoopMode = inData.substring(LoopModeStart + 2);
-      LoopMode.trim();
-      J1LoopMode = LoopMode.substring(0, 1).toInt();
-      J2LoopMode = LoopMode.substring(1, 2).toInt();
-      J3LoopMode = LoopMode.substring(2, 3).toInt();
-      J4LoopMode = LoopMode.substring(3, 4).toInt();
-      J5LoopMode = LoopMode.substring(4, 5).toInt();
-      J6LoopMode = LoopMode.substring(5).toInt();
+      for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+        xyzuvw_In[axis] = commandFields.pose[axis];
+      }
+      J7_In = commandFields.auxiliary[0];
+      J8_In = commandFields.auxiliary[1];
+      J9_In = commandFields.auxiliary[2];
+      String SpeedType(commandFields.speed_mode);
+      float SpeedVal = commandFields.speed;
+      float ACCspd = commandFields.acceleration;
+      float DCCspd = commandFields.deceleration;
+      float ACCramp = commandFields.ramp;
+      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
+        WristCon,
+        JointLoopModes,
+        String(commandFields.wrist_config),
+        commandFields.loop_modes
+      );
 
       //get current tool rotation
-      float RXtool = Robot_Kin_Tool[5];
+      float RXtool = Robot_Kin_Tool[3];
 
 
       // offset tool rotation by the found vision angle
-      Robot_Kin_Tool[5] = Robot_Kin_Tool[5] - VisRot * M_PI / 180;
+      Robot_Kin_Tool[3] = Robot_Kin_Tool[3] - vision_rotation_radians;
 
       //solve kinematics
-      SolveInverseKinematics();
+      SolveInverseKinematics(commandFields.wrist_config);
 
       //calc destination motor steps
-      int J1futStepM = (JangleOut[0] + J1axisLimNeg) * J1StepDeg;
-      int J2futStepM = (JangleOut[1] + J2axisLimNeg) * J2StepDeg;
-      int J3futStepM = (JangleOut[2] + J3axisLimNeg) * J3StepDeg;
-      int J4futStepM = (JangleOut[3] + J4axisLimNeg) * J4StepDeg;
-      int J5futStepM = (JangleOut[4] + J5axisLimNeg) * J5StepDeg;
-      int J6futStepM = (JangleOut[5] + J6axisLimNeg) * J6StepDeg;
-      int J7futStepM = (J7_In + J7axisLimNeg) * J7StepDeg;
-      int J8futStepM = (J8_In + J8axisLimNeg) * J8StepDeg;
-      int J9futStepM = (J9_In + J9axisLimNeg) * J9StepDeg;
+      int future_steps[numJoints] = {};
+      if (
+        KinematicError == 0
+        && !inverse_solution_to_future_steps(J7_In, J8_In, J9_In, future_steps)
+      ) {
+        KinematicError = 1;
+      }
+      int J1futStepM = future_steps[0];
+      int J2futStepM = future_steps[1];
+      int J3futStepM = future_steps[2];
+      int J4futStepM = future_steps[3];
+      int J5futStepM = future_steps[4];
+      int J6futStepM = future_steps[5];
+      int J7futStepM = future_steps[6];
+      int J8futStepM = future_steps[7];
+      int J9futStepM = future_steps[8];
 
 
       //calc delta from current to destination
@@ -5179,7 +5814,7 @@ void loop() {
       int J9stepDif = J9StepM - J9futStepM;
 
       // put tool roation back where it was
-      Robot_Kin_Tool[5] = RXtool;
+      Robot_Kin_Tool[3] = RXtool;
 
       //determine motor directions
       J1dir = (J1stepDif <= 0) ? 1 : 0;
@@ -5195,31 +5830,31 @@ void loop() {
 
 
       //determine if requested position is within axis limits
-      if ((J1dir == 1 and (J1StepM + J1stepDif > J1StepLim)) or (J1dir == 0 and (J1StepM - J1stepDif < 0))) {
+      if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
         J1axisFault = 1;
       }
-      if ((J2dir == 1 and (J2StepM + J2stepDif > J2StepLim)) or (J2dir == 0 and (J2StepM - J2stepDif < 0))) {
+      if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
         J2axisFault = 1;
       }
-      if ((J3dir == 1 and (J3StepM + J3stepDif > J3StepLim)) or (J3dir == 0 and (J3StepM - J3stepDif < 0))) {
+      if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
         J3axisFault = 1;
       }
-      if ((J4dir == 1 and (J4StepM + J4stepDif > J4StepLim)) or (J4dir == 0 and (J4StepM - J4stepDif < 0))) {
+      if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
         J4axisFault = 1;
       }
-      if ((J5dir == 1 and (J5StepM + J5stepDif > J5StepLim)) or (J5dir == 0 and (J5StepM - J5stepDif < 0))) {
+      if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
         J5axisFault = 1;
       }
-      if ((J6dir == 1 and (J6StepM + J6stepDif > J6StepLim)) or (J6dir == 0 and (J6StepM - J6stepDif < 0))) {
+      if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
         J6axisFault = 1;
       }
-      if ((J7dir == 1 and (J7StepM + J7stepDif > J7StepLim)) or (J7dir == 0 and (J7StepM - J7stepDif < 0))) {
+      if (future_step_is_outside_limit(J7futStepM, J7StepLim)) {
         J7axisFault = 1;
       }
-      if ((J8dir == 1 and (J8StepM + J8stepDif > J8StepLim)) or (J8dir == 0 and (J8StepM - J8stepDif < 0))) {
+      if (future_step_is_outside_limit(J8futStepM, J8StepLim)) {
         J8axisFault = 1;
       }
-      if ((J9dir == 1 and (J9StepM + J9stepDif > J9StepLim)) or (J9dir == 0 and (J9StepM - J9stepDif < 0))) {
+      if (future_step_is_outside_limit(J9futStepM, J9StepLim)) {
         J9axisFault = 1;
       }
       TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
@@ -5228,7 +5863,11 @@ void loop() {
       //send move command if no axis limit error
       if (TotalAxisFault == 0 && KinematicError == 0) {
         resetEncoders();
-        driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp);
+        if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes)) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
         checkEncoders();
         sendRobotPos();
       } else if (KinematicError == 1) {
@@ -5277,62 +5916,45 @@ void loop() {
       int J9axisFault = 0;
       int TotalAxisFault = 0;
 
-      int J1stepStart = inData.indexOf("A");
-      int J2stepStart = inData.indexOf("B");
-      int J3stepStart = inData.indexOf("C");
-      int J4stepStart = inData.indexOf("D");
-      int J5stepStart = inData.indexOf("E");
-      int J6stepStart = inData.indexOf("F");
-      int J7Start = inData.indexOf("J7");
-      int J8Start = inData.indexOf("J8");
-      int J9Start = inData.indexOf("J9");
-      int SPstart = inData.indexOf("S");
-      int AcStart = inData.indexOf("Ac");
-      int DcStart = inData.indexOf("Dc");
-      int RmStart = inData.indexOf("Rm");
-      int WristConStart = inData.indexOf("W");
-      int LoopModeStart = inData.indexOf("Lm");
+      ar4_protocol::JointMoveCommandFields commandFields = {};
+      if (!ar4_protocol::parse_joint_move_command(inData, commandFields)) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      int future_steps[numJoints] = {};
+      if (!joint_positions_to_future_steps(
+          commandFields.positions,
+          future_steps
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      J7_In = commandFields.positions[6];
+      J8_In = commandFields.positions[7];
+      J9_In = commandFields.positions[8];
+      String SpeedType(commandFields.speed_mode);
+      float SpeedVal = commandFields.speed;
+      float ACCspd = commandFields.acceleration;
+      float DCCspd = commandFields.deceleration;
+      float ACCramp = commandFields.ramp;
+      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
+        WristCon,
+        JointLoopModes,
+        String(commandFields.wrist_config),
+        commandFields.loop_modes
+      );
 
-      float J1Angle;
-      float J2Angle;
-      float J3Angle;
-      float J4Angle;
-      float J5Angle;
-      float J6Angle;
-
-      J1Angle = inData.substring(J1stepStart + 1, J2stepStart).toFloat();
-      J2Angle = inData.substring(J2stepStart + 1, J3stepStart).toFloat();
-      J3Angle = inData.substring(J3stepStart + 1, J4stepStart).toFloat();
-      J4Angle = inData.substring(J4stepStart + 1, J5stepStart).toFloat();
-      J5Angle = inData.substring(J5stepStart + 1, J6stepStart).toFloat();
-      J6Angle = inData.substring(J6stepStart + 1, J7Start).toFloat();
-      J7_In = inData.substring(J7Start + 2, J8Start).toFloat();
-      J8_In = inData.substring(J8Start + 2, J9Start).toFloat();
-      J9_In = inData.substring(J9Start + 2, SPstart).toFloat();
-      String SpeedType = inData.substring(SPstart + 1, SPstart + 2);
-      float SpeedVal = inData.substring(SPstart + 2, AcStart).toFloat();
-      float ACCspd = inData.substring(AcStart + 2, DcStart).toFloat();
-      float DCCspd = inData.substring(DcStart + 2, RmStart).toFloat();
-      float ACCramp = inData.substring(RmStart + 2, WristConStart).toFloat();
-      WristCon = inData.substring(WristConStart + 1, LoopModeStart);
-      String LoopMode = inData.substring(LoopModeStart + 2);
-      LoopMode.trim();
-      J1LoopMode = LoopMode.substring(0, 1).toInt();
-      J2LoopMode = LoopMode.substring(1, 2).toInt();
-      J3LoopMode = LoopMode.substring(2, 3).toInt();
-      J4LoopMode = LoopMode.substring(3, 4).toInt();
-      J5LoopMode = LoopMode.substring(4, 5).toInt();
-      J6LoopMode = LoopMode.substring(5).toInt();
-
-      int J1futStepM = (J1Angle + J1axisLimNeg) * J1StepDeg;
-      int J2futStepM = (J2Angle + J2axisLimNeg) * J2StepDeg;
-      int J3futStepM = (J3Angle + J3axisLimNeg) * J3StepDeg;
-      int J4futStepM = (J4Angle + J4axisLimNeg) * J4StepDeg;
-      int J5futStepM = (J5Angle + J5axisLimNeg) * J5StepDeg;
-      int J6futStepM = (J6Angle + J6axisLimNeg) * J6StepDeg;
-      int J7futStepM = (J7_In + J7axisLimNeg) * J7StepDeg;
-      int J8futStepM = (J8_In + J8axisLimNeg) * J8StepDeg;
-      int J9futStepM = (J9_In + J9axisLimNeg) * J9StepDeg;
+      int J1futStepM = future_steps[0];
+      int J2futStepM = future_steps[1];
+      int J3futStepM = future_steps[2];
+      int J4futStepM = future_steps[3];
+      int J5futStepM = future_steps[4];
+      int J6futStepM = future_steps[5];
+      int J7futStepM = future_steps[6];
+      int J8futStepM = future_steps[7];
+      int J9futStepM = future_steps[8];
 
       //calc delta from current to destination
       int J1stepDif = J1StepM - J1futStepM;
@@ -5359,31 +5981,31 @@ void loop() {
 
 
       //determine if requested position is within axis limits
-      if ((J1dir == 1 and (J1StepM + J1stepDif > J1StepLim)) or (J1dir == 0 and (J1StepM - J1stepDif < 0))) {
+      if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
         J1axisFault = 1;
       }
-      if ((J2dir == 1 and (J2StepM + J2stepDif > J2StepLim)) or (J2dir == 0 and (J2StepM - J2stepDif < 0))) {
+      if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
         J2axisFault = 1;
       }
-      if ((J3dir == 1 and (J3StepM + J3stepDif > J3StepLim)) or (J3dir == 0 and (J3StepM - J3stepDif < 0))) {
+      if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
         J3axisFault = 1;
       }
-      if ((J4dir == 1 and (J4StepM + J4stepDif > J4StepLim)) or (J4dir == 0 and (J4StepM - J4stepDif < 0))) {
+      if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
         J4axisFault = 1;
       }
-      if ((J5dir == 1 and (J5StepM + J5stepDif > J5StepLim)) or (J5dir == 0 and (J5StepM - J5stepDif < 0))) {
+      if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
         J5axisFault = 1;
       }
-      if ((J6dir == 1 and (J6StepM + J6stepDif > J6StepLim)) or (J6dir == 0 and (J6StepM - J6stepDif < 0))) {
+      if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
         J6axisFault = 1;
       }
-      if ((J7dir == 1 and (J7StepM + J7stepDif > J7StepLim)) or (J7dir == 0 and (J7StepM - J7stepDif < 0))) {
+      if (future_step_is_outside_limit(J7futStepM, J7StepLim)) {
         J7axisFault = 1;
       }
-      if ((J8dir == 1 and (J8StepM + J8stepDif > J8StepLim)) or (J8dir == 0 and (J8StepM - J8stepDif < 0))) {
+      if (future_step_is_outside_limit(J8futStepM, J8StepLim)) {
         J8axisFault = 1;
       }
-      if ((J9dir == 1 and (J9StepM + J9stepDif > J9StepLim)) or (J9dir == 0 and (J9StepM - J9stepDif < 0))) {
+      if (future_step_is_outside_limit(J9futStepM, J9StepLim)) {
         J9axisFault = 1;
       }
       TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
@@ -5392,7 +6014,11 @@ void loop() {
       //send move command if no axis limit error
       if (TotalAxisFault == 0 && KinematicError == 0) {
         resetEncoders();
-        driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp);
+        if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes)) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
         checkEncoders();
         sendRobotPos();
       } else if (KinematicError == 1) {
@@ -5453,60 +6079,59 @@ void loop() {
       float RYvect;
       float RXvect;
 
-      int xStart = inData.indexOf("X");
-      int yStart = inData.indexOf("Y");
-      int zStart = inData.indexOf("Z");
-      int rzStart = inData.indexOf("Rz");
-      int ryStart = inData.indexOf("Ry");
-      int rxStart = inData.indexOf("Rx");
-      int J7Start = inData.indexOf("J7");
-      int J8Start = inData.indexOf("J8");
-      int J9Start = inData.indexOf("J9");
-      int SPstart = inData.indexOf("S");
-      int AcStart = inData.indexOf("Ac");
-      int DcStart = inData.indexOf("Dc");
-      int RmStart = inData.indexOf("Rm");
-      int RndStart = inData.indexOf("Rnd");
-      int WristConStart = inData.indexOf("W");
-      int LoopModeStart = inData.indexOf("Lm");
-      int DisWristStart = inData.indexOf("Q");
+      ar4_protocol::CartesianMoveCommandFields commandFields = {};
+      if (!ar4_protocol::parse_linear_move_command(
+          inData,
+          commandFields
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      int external_target_steps[3] = {};
+      if (!external_positions_to_future_steps(
+          commandFields.auxiliary[0],
+          commandFields.auxiliary[1],
+          commandFields.auxiliary[2],
+          external_target_steps
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
-
-      xyzuvw_Temp[0] = inData.substring(xStart + 1, yStart).toFloat();
-      xyzuvw_Temp[1] = inData.substring(yStart + 1, zStart).toFloat();
-      xyzuvw_Temp[2] = inData.substring(zStart + 1, rzStart).toFloat();
-      xyzuvw_Temp[3] = inData.substring(rzStart + 2, ryStart).toFloat();
-      xyzuvw_Temp[4] = inData.substring(ryStart + 2, rxStart).toFloat();
-      xyzuvw_Temp[5] = inData.substring(rxStart + 2, J7Start).toFloat();
-      J7_In = inData.substring(J7Start + 2, J8Start).toFloat();
-      J8_In = inData.substring(J8Start + 2, J9Start).toFloat();
-      J9_In = inData.substring(J9Start + 2, SPstart).toFloat();
-
-      String SpeedType = inData.substring(SPstart + 1, SPstart + 2);
-      float SpeedVal = inData.substring(SPstart + 2, AcStart).toFloat();
-      float ACCspd = inData.substring(AcStart + 2, DcStart).toFloat();
-      float DCCspd = inData.substring(DcStart + 2, RmStart).toFloat();
-      float ACCramp = inData.substring(RmStart + 2, RndStart).toFloat();
-      float Rounding = inData.substring(RndStart + 3, WristConStart).toFloat();
-      WristCon = inData.substring(WristConStart + 1, LoopModeStart);
-      String LoopMode = inData.substring(LoopModeStart + 2, DisWristStart);
-      String DisWrist = inData.substring(DisWristStart + 1);
-      DisWrist.trim();
-
-      J1LoopMode = LoopMode.substring(0, 1).toInt();
-      J2LoopMode = LoopMode.substring(1, 2).toInt();
-      J3LoopMode = LoopMode.substring(2, 3).toInt();
-      J4LoopMode = LoopMode.substring(3, 4).toInt();
-      J5LoopMode = LoopMode.substring(4, 5).toInt();
-      J6LoopMode = LoopMode.substring(5).toInt();
+      for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+        xyzuvw_Temp[axis] = commandFields.pose[axis];
+      }
+      J7_In = commandFields.auxiliary[0];
+      J8_In = commandFields.auxiliary[1];
+      J9_In = commandFields.auxiliary[2];
+      String SpeedType(commandFields.speed_mode);
+      float SpeedVal = commandFields.speed;
+      float ACCspd = commandFields.acceleration;
+      float DCCspd = commandFields.deceleration;
+      float ACCramp = commandFields.ramp;
+      float Rounding = commandFields.rounding;
+      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
+        WristCon,
+        JointLoopModes,
+        String(commandFields.wrist_config),
+        commandFields.loop_modes
+      );
 
 
       ///// rounding logic /////
       if (cmdBuffer2 != "") {
-        checkData = cmdBuffer2;
-        checkData.trim();
-        nextCMDtype = checkData.substring(0, 1);
-        checkData = checkData.substring(2);
+        if (ar4_protocol::extract_serial_command_payload(
+            cmdBuffer2,
+            checkData
+        )) {
+          nextCMDtype = checkData.substring(0, 1);
+          checkData = checkData.substring(2);
+        } else {
+          nextCMDtype = "";
+          checkData = "";
+        }
       }
       if (splineTrue == true and Rounding > 0 and nextCMDtype == "M") {
         //calculate new end point before rounding arc
@@ -5527,6 +6152,11 @@ void loop() {
         float RXstart = xyzuvw_Out[5];
         //line dist
         float lineDist = pow((pow((Xvect), 2) + pow((Yvect), 2) + pow((Zvect), 2) + pow((RZvect), 2) + pow((RYvect), 2) + pow((RXvect), 2)), .5);
+        if (!isfinite(lineDist) || lineDist <= 0.0f) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
         if (Rounding > (lineDist * .45)) {
           Rounding = lineDist * .45;
         }
@@ -5538,22 +6168,18 @@ void loop() {
         xyzuvw_In[3] = RZstart + (RZvect * newDistPerc);
         xyzuvw_In[4] = RYstart + (RYvect * newDistPerc);
         xyzuvw_In[5] = RXstart + (RXvect * newDistPerc);
-        xStart = checkData.indexOf("X");
-        yStart = checkData.indexOf("Y");
-        zStart = checkData.indexOf("Z");
-        rzStart = checkData.indexOf("Rz");
-        ryStart = checkData.indexOf("Ry");
-        rxStart = checkData.indexOf("Rx");
-        J7Start = checkData.indexOf("J7");
-        J8Start = checkData.indexOf("J8");
-        J9Start = checkData.indexOf("J9");
-        //get arc end point (next move in queue)
-        rndArcEnd[0] = checkData.substring(xStart + 1, yStart).toFloat();
-        rndArcEnd[1] = checkData.substring(yStart + 1, zStart).toFloat();
-        rndArcEnd[2] = checkData.substring(zStart + 1, rzStart).toFloat();
-        rndArcEnd[3] = checkData.substring(rzStart + 2, ryStart).toFloat();
-        rndArcEnd[4] = checkData.substring(ryStart + 2, rxStart).toFloat();
-        rndArcEnd[5] = checkData.substring(rxStart + 2, J7Start).toFloat();
+        ar4_protocol::CartesianMoveCommandFields nextCommandFields = {};
+        if (!ar4_protocol::parse_linear_move_command(
+            checkData,
+            nextCommandFields
+        )) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
+        for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+          rndArcEnd[axis] = nextCommandFields.pose[axis];
+        }
         //arc vector
         Xvect = rndArcEnd[0] - xyzuvw_Temp[0];
         Yvect = rndArcEnd[1] - xyzuvw_Temp[1];
@@ -5570,6 +6196,11 @@ void loop() {
         RXstart = xyzuvw_Temp[5];
         //line dist
         lineDist = pow((pow((Xvect), 2) + pow((Yvect), 2) + pow((Zvect), 2) + pow((RZvect), 2) + pow((RYvect), 2) + pow((RXvect), 2)), .5);
+        if (!isfinite(lineDist) || lineDist <= 0.0f) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
         if (Rounding > (lineDist * .45)) {
           Rounding = lineDist * .45;
         }
@@ -5595,8 +6226,7 @@ void loop() {
         rndArcMid[4] = (xyzuvw_Temp[4] + rndCalcCen[4]) / 2;
         rndArcMid[5] = (xyzuvw_Temp[5] + rndCalcCen[5]) / 2;
         //set arc move to be executed
-        //rndData = "X" + String(rndArcMid[0]) + "Y" + String(rndArcMid[1]) + "Z" + String(rndArcMid[2]) + "Rz" + String(rndArcMid[3]) + "Ry" + String(rndArcMid[4]) + "Rx" + String(rndArcMid[5]) + "Ex" + String(rndArcEnd[0]) + "Ey" + String(rndArcEnd[1]) + "Ez" + String(rndArcEnd[2]) + "Tr" + String(xyzuvw_Temp[6]) + "S" + SpeedType + String(SpeedVal) + "Ac" + String(ACCspd) + "Dc" + String(DCCspd) + "Rm" + String(ACCramp) + "W" + WristCon;
-        rndData = "X" + String(rndArcMid[0]) + "Y" + String(rndArcMid[1]) + "Z" + String(rndArcMid[2]) + "Rz" + String(rndArcMid[3]) + "Ry" + String(rndArcMid[4]) + "Rx" + String(rndArcMid[5]) + "Ex" + String(rndArcEnd[0]) + "Ey" + String(rndArcEnd[1]) + "Ez" + String(rndArcEnd[2]) + "Tr" + String(xyzuvw_Temp[6]) + "S" + SpeedType + String(SpeedVal) + "Ac" + String(ACCspd) + "Dc" + String(DCCspd) + "Rm" + String(ACCramp) + "WA";
+        rndData = "X" + String(rndArcMid[0]) + "Y" + String(rndArcMid[1]) + "Z" + String(rndArcMid[2]) + "Rz" + String(rndArcMid[3]) + "Ry" + String(rndArcMid[4]) + "Rx" + String(rndArcMid[5]) + "Ex" + String(rndArcEnd[0]) + "Ey" + String(rndArcEnd[1]) + "Ez" + String(rndArcEnd[2]) + "Tr0S" + SpeedType + String(SpeedVal) + "Ac" + String(ACCspd) + "Dc" + String(DCCspd) + "Rm" + String(ACCramp) + "W" + String(commandFields.wrist_config) + "Lm" + String(commandFields.loop_modes[0]) + String(commandFields.loop_modes[1]) + String(commandFields.loop_modes[2]) + String(commandFields.loop_modes[3]) + String(commandFields.loop_modes[4]) + String(commandFields.loop_modes[5]);
         function = "MA";
         rndTrue = true;
       } else {
@@ -5631,21 +6261,40 @@ void loop() {
 
       //line dist and determine way point gap
       float lineDist = pow((pow((Xvect), 2) + pow((Yvect), 2) + pow((Zvect), 2) + pow((RZvect), 2) + pow((RYvect), 2) + pow((RXvect), 2)), .5);
+      int waypoint_count = 0;
+      if (!ar4_protocol::waypoint_count_for_path(
+          lineDist,
+          linWayDistSP,
+          waypoint_count
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
       if (lineDist > 0) {
 
-        float wayPts = lineDist / linWayDistSP;
-        float wayPerc = 1 / wayPts;
+        float wayPts = static_cast<float>(waypoint_count);
+        float wayPerc = 1.0f / wayPts;
 
         //pre calculate entire move and speeds
 
-        SolveInverseKinematics();
+        SolveInverseKinematics(commandFields.wrist_config);
         //calc destination motor steps for precalc
-        int J1futStepM = (JangleOut[0] + J1axisLimNeg) * J1StepDeg;
-        int J2futStepM = (JangleOut[1] + J2axisLimNeg) * J2StepDeg;
-        int J3futStepM = (JangleOut[2] + J3axisLimNeg) * J3StepDeg;
-        int J4futStepM = (JangleOut[3] + J4axisLimNeg) * J4StepDeg;
-        int J5futStepM = (JangleOut[4] + J5axisLimNeg) * J5StepDeg;
-        int J6futStepM = (JangleOut[5] + J6axisLimNeg) * J6StepDeg;
+        int destination_steps[ROBOT_nDOFs] = {};
+        if (
+          KinematicError != 0
+          || !primary_inverse_solution_to_future_steps(destination_steps)
+        ) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
+        int J1futStepM = destination_steps[0];
+        int J2futStepM = destination_steps[1];
+        int J3futStepM = destination_steps[2];
+        int J4futStepM = destination_steps[3];
+        int J5futStepM = destination_steps[4];
+        int J6futStepM = destination_steps[5];
 
         //calc delta from current to destination fpr precalc
         int J1stepDif = J1StepM - J1futStepM;
@@ -5656,22 +6305,30 @@ void loop() {
         int J6stepDif = J6StepM - J6futStepM;
 
         //FIND HIGHEST STEP FOR PRECALC
-        int HighStep = J1stepDif;
-        if (J2stepDif > HighStep) {
-          HighStep = J2stepDif;
+        int HighStep = abs(J1stepDif);
+        if (abs(J2stepDif) > HighStep) {
+          HighStep = abs(J2stepDif);
         }
-        if (J3stepDif > HighStep) {
-          HighStep = J3stepDif;
+        if (abs(J3stepDif) > HighStep) {
+          HighStep = abs(J3stepDif);
         }
-        if (J4stepDif > HighStep) {
-          HighStep = J4stepDif;
+        if (abs(J4stepDif) > HighStep) {
+          HighStep = abs(J4stepDif);
         }
-        if (J5stepDif > HighStep) {
-          HighStep = J5stepDif;
+        if (abs(J5stepDif) > HighStep) {
+          HighStep = abs(J5stepDif);
         }
-        if (J6stepDif > HighStep) {
-          HighStep = J6stepDif;
+        if (abs(J6stepDif) > HighStep) {
+          HighStep = abs(J6stepDif);
         }
+        const int external_start_steps[3] = { J7StepM, J8StepM, J9StepM };
+        for (int axis = 0; axis < 3; ++axis) {
+          const int external_difference = abs(
+            external_start_steps[axis] - external_target_steps[axis]
+          );
+          if (external_difference > HighStep) HighStep = external_difference;
+        }
+        if (HighStep < 1) HighStep = 1;
 
 
         /////PRE CALC SPEEDS//////
@@ -5688,6 +6345,14 @@ void loop() {
         } else if ((SpeedType == "m")) {
           speedSP = ((lineDist / SpeedVal) * 1000000) * 1.2;
         }
+        if (
+          (SpeedType == "s" || SpeedType == "m")
+          && (!isfinite(speedSP) || speedSP <= 0.0f)
+        ) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
 
         //calc step gap for seconds or mm per sec
         if (SpeedType == "s" or SpeedType == "m") {
@@ -5698,8 +6363,13 @@ void loop() {
           float zeroDCCstepInc = (zeroStepGap * (100 / ACCramp)) / DCCStep;
           float zeroDCCtime = ((DCCStep)*zeroStepGap) + ((DCCStep - 9) * (((DCCStep) * (zeroDCCstepInc / 2))));
           float zeroTOTtime = zeroACCtime + zeroNORtime + zeroDCCtime;
-          float overclockPerc = speedSP / zeroTOTtime;
-          calcStepGap = zeroStepGap * overclockPerc;
+          if (!isfinite(zeroTOTtime) || zeroTOTtime <= 0.0f) {
+            calcStepGap = minSpeedDelay;
+            speedViolation = "1";
+          } else {
+            float overclockPerc = speedSP / zeroTOTtime;
+            calcStepGap = zeroStepGap * overclockPerc;
+          }
           if (calcStepGap <= minSpeedDelay) {
             calcStepGap = minSpeedDelay;
             speedViolation = "1";
@@ -5709,6 +6379,11 @@ void loop() {
         //calc step gap for percentage
         else if (SpeedType == "p") {
           calcStepGap = minSpeedDelay / (SpeedVal / 100);
+        }
+        if (!isfinite(calcStepGap) || calcStepGap <= 0.0f) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
         }
 
         //calculate final step increments
@@ -5726,6 +6401,21 @@ void loop() {
         //calc way inc for lin way steps
         float ACCwayInc = (calcACCstartDel - calcStepGap) / ACCwayPts;
         float DCCwayInc = (calcDCCendDel - calcStepGap) / DCCwayPts;
+        if (
+          !isfinite(ACCwayInc)
+          || !isfinite(DCCwayInc)
+          || !ar4_protocol::valid_delay_envelope(
+            calcStepGap,
+            calcACCstartDel,
+            calcDCCendDel,
+            rndTrue,
+            rndSpeed
+          )
+        ) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
 
         //set starting delsy
         if (rndTrue == true) {
@@ -5735,50 +6425,19 @@ void loop() {
         }
 
 
-        // calc external axis way pt moves
-        int J7futStepM = (J7_In + J7axisLimNeg) * J7StepDeg;
-        int J7stepDif = (J7StepM - J7futStepM) / (wayPts - 1);
-        int J8futStepM = (J8_In + J8axisLimNeg) * J8StepDeg;
-        int J8stepDif = (J8StepM - J8futStepM) / (wayPts - 1);
-        int J9futStepM = (J9_In + J9axisLimNeg) * J9StepDeg;
-        int J9stepDif = (J9StepM - J9futStepM) / (wayPts - 1);
-
-
-        if (J7stepDif <= 0) {
-          J7dir = 1;
-        } else {
-          J7dir = 0;
-        }
-
-        if (J8stepDif <= 0) {
-          J8dir = 1;
-        } else {
-          J8dir = 0;
-        }
-
-        if (J9stepDif <= 0) {
-          J9dir = 1;
-        } else {
-          J9dir = 0;
-        }
-
-
         resetEncoders();
         /////////////////////////////////////////////////
         //loop through waypoints
-        for (int i = 0; i <= wayPts + 1; i++) {
+        for (int i = 1; i <= waypoint_count; i++) {
 
           ////DELAY CALC/////
           if (i <= ACCwayPts) {
-            curDelay = curDelay - (ACCwayInc);
+            curDelay = fmax(calcStepGap, curDelay - ACCwayInc);
           } else if (i >= (wayPts - DCCwayPts)) {
-            curDelay = curDelay + (DCCwayInc);
+            curDelay = fmin(calcDCCendDel, curDelay + DCCwayInc);
           } else {
             curDelay = calcStepGap;
           }
-
-
-          curDelay = calcStepGap;
 
           float curWayPerc = wayPerc * i;
           xyzuvw_In[0] = Xstart + (Xvect * curWayPerc);
@@ -5788,15 +6447,43 @@ void loop() {
           xyzuvw_In[4] = RYstart + (RYvect * curWayPerc);
           xyzuvw_In[5] = RXstart + (RXvect * curWayPerc);
 
-          SolveInverseKinematics();
+          SolveInverseKinematics(commandFields.wrist_config);
 
           //calc destination motor steps
-          int J1futStepM = (JangleOut[0] + J1axisLimNeg) * J1StepDeg;
-          int J2futStepM = (JangleOut[1] + J2axisLimNeg) * J2StepDeg;
-          int J3futStepM = (JangleOut[2] + J3axisLimNeg) * J3StepDeg;
-          int J4futStepM = (JangleOut[3] + J4axisLimNeg) * J4StepDeg;
-          int J5futStepM = (JangleOut[4] + J5axisLimNeg) * J5StepDeg;
-          int J6futStepM = (JangleOut[5] + J6axisLimNeg) * J6StepDeg;
+          int future_steps[ROBOT_nDOFs] = {};
+          if (
+            KinematicError != 0
+            || !primary_inverse_solution_to_future_steps(future_steps)
+          ) {
+            KinematicError = 1;
+            break;
+          }
+          int J1futStepM = future_steps[0];
+          int J2futStepM = future_steps[1];
+          int J3futStepM = future_steps[2];
+          int J4futStepM = future_steps[3];
+          int J5futStepM = future_steps[4];
+          int J6futStepM = future_steps[5];
+          int J7futStepM = 0;
+          int J8futStepM = 0;
+          int J9futStepM = 0;
+          if (
+            !ar4_protocol::interpolated_step_target(
+              external_start_steps[0], external_target_steps[0],
+              i, waypoint_count, J7StepLim, J7futStepM
+            )
+            || !ar4_protocol::interpolated_step_target(
+              external_start_steps[1], external_target_steps[1],
+              i, waypoint_count, J8StepLim, J8futStepM
+            )
+            || !ar4_protocol::interpolated_step_target(
+              external_start_steps[2], external_target_steps[2],
+              i, waypoint_count, J9StepLim, J9futStepM
+            )
+          ) {
+            KinematicError = 1;
+            break;
+          }
 
           //calc delta from current to destination
           int J1stepDif = J1StepM - J1futStepM;
@@ -5805,6 +6492,9 @@ void loop() {
           int J4stepDif = J4StepM - J4futStepM;
           int J5stepDif = J5StepM - J5futStepM;
           int J6stepDif = J6StepM - J6futStepM;
+          int J7stepDif = J7StepM - J7futStepM;
+          int J8stepDif = J8StepM - J8futStepM;
+          int J9stepDif = J9StepM - J9futStepM;
 
           //determine motor directions
           J1dir = (J1stepDif <= 0) ? 1 : 0;
@@ -5813,60 +6503,74 @@ void loop() {
           J4dir = (J4stepDif <= 0) ? 1 : 0;
           J5dir = (J5stepDif <= 0) ? 1 : 0;
           J6dir = (J6stepDif <= 0) ? 1 : 0;
+          J7dir = (J7stepDif <= 0) ? 1 : 0;
+          J8dir = (J8stepDif <= 0) ? 1 : 0;
+          J9dir = (J9stepDif <= 0) ? 1 : 0;
 
           //determine if requested position is within axis limits
-          if ((J1dir == 1 and (J1StepM + J1stepDif > J1StepLim)) or (J1dir == 0 and (J1StepM - J1stepDif < 0))) {
+          if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
             J1axisFault = 1;
           }
-          if ((J2dir == 1 and (J2StepM + J2stepDif > J2StepLim)) or (J2dir == 0 and (J2StepM - J2stepDif < 0))) {
+          if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
             J2axisFault = 1;
           }
-          if ((J3dir == 1 and (J3StepM + J3stepDif > J3StepLim)) or (J3dir == 0 and (J3StepM - J3stepDif < 0))) {
+          if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
             J3axisFault = 1;
           }
-          if ((J4dir == 1 and (J4StepM + J4stepDif > J4StepLim)) or (J4dir == 0 and (J4StepM - J4stepDif < 0))) {
+          if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
             J4axisFault = 1;
           }
-          if ((J5dir == 1 and (J5StepM + J5stepDif > J5StepLim)) or (J5dir == 0 and (J5StepM - J5stepDif < 0))) {
+          if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
             J5axisFault = 1;
           }
-          if ((J6dir == 1 and (J6StepM + J6stepDif > J6StepLim)) or (J6dir == 0 and (J6StepM - J6stepDif < 0))) {
+          if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
             J6axisFault = 1;
           }
-          if ((J7dir == 1 and (J7StepM + J7stepDif > J7StepLim)) or (J7dir == 0 and (J7StepM - J7stepDif < 0))) {
+          if (future_step_is_outside_limit(J7futStepM, J7StepLim)) {
             J7axisFault = 1;
           }
-          if ((J8dir == 1 and (J8StepM + J8stepDif > J8StepLim)) or (J8dir == 0 and (J8StepM - J8stepDif < 0))) {
+          if (future_step_is_outside_limit(J8futStepM, J8StepLim)) {
             J8axisFault = 1;
           }
-          if ((J9dir == 1 and (J9StepM + J9stepDif > J9StepLim)) or (J9dir == 0 and (J9StepM - J9stepDif < 0))) {
+          if (future_step_is_outside_limit(J9futStepM, J9StepLim)) {
             J9axisFault = 1;
           }
           TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
 
-          //send move command if no axis limit error
-          if (TotalAxisFault == 0 && KinematicError == 0) {
-            driveMotorsL(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, curDelay);
-            updatePos();
-            rndSpeed = curDelay;
-          } else if (KinematicError == 1) {
-            Alarm = "ER";
-            if (splineTrue == false) {
-              delay(5);
-              Serial.println(Alarm);
-            }
-          } else {
+          if (TotalAxisFault != 0) {
             Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault) + String(J7axisFault) + String(J8axisFault) + String(J9axisFault);
-            if (splineTrue == false) {
-              delay(5);
-              Serial.println(Alarm);
-            }
+            break;
           }
+
+          //send move command if no axis limit error
+          if (!driveMotorsL(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, curDelay, &motionModes)) {
+            KinematicError = 1;
+            break;
+          }
+          updatePos();
+          rndSpeed = curDelay;
         }
       }
 
-      checkEncoders();
-      if (splineTrue == false) {
+      if (KinematicError == 1) {
+        Alarm = "ER";
+        if (splineTrue == false) {
+          delay(5);
+          Serial.println(Alarm);
+        }
+      } else if (TotalAxisFault != 0) {
+        if (splineTrue == false) {
+          delay(5);
+          Serial.println(Alarm);
+        }
+      } else {
+        checkEncoders();
+      }
+      if (
+        splineTrue == false
+        && KinematicError == 0
+        && TotalAxisFault == 0
+      ) {
         sendRobotPos();
       }
       inData = "";  // Clear recieved buffer
@@ -5879,26 +6583,40 @@ void loop() {
     //----- MOVE J ---------------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "MJ") {
-      moveJ(inData, true, false, false);
+      if (!moveJ(inData, true, false, false)) Serial.println("ER");
     }
 
     //----- MOVE G ---------------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "MG") {
-      moveJ(inData, true, false, true);
+      if (!moveJ(inData, true, false, true)) Serial.println("ER");
     }
 
 
     //----- DELETE PROG FROM SD CARD ---------------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "DG") {
-      SD.begin(BUILTIN_SDCARD);
       int fileStart = inData.indexOf("Fn");
+      if (
+        fileStart != 0
+        || !ar4_protocol::valid_controller_filename(
+          inData,
+          fileStart + 2,
+          static_cast<int>(inData.length())
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      if (!initSD()) {
+        consume_current_command();
+        return;
+      }
       String filename = inData.substring(fileStart + 2);
       const char *fn = filename.c_str();
       if (SD.exists(fn)) {
-        deleteSD(filename);
-        Serial.println("P");
+        if (deleteSD(filename)) Serial.println("P");
       } else {
         Serial.println("F");
       }
@@ -5908,23 +6626,55 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "RG") {
       File root;
-      SD.begin(BUILTIN_SDCARD);
+      if (!initSD()) {
+        consume_current_command();
+        return;
+      }
       root = SD.open("/");
+      if (!root) {
+        Serial.println(egSD("open root fail"));
+        consume_current_command();
+        return;
+      }
       printDirectory(root, 0);
+      root.close();
     }
 
 
     //----- WRITE COMMAND TO SD CARD ---------------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "WC") {
-      SD.begin(BUILTIN_SDCARD);
       int fileStart = inData.indexOf("Fn");
+      if (
+        fileStart <= 0
+        || !ar4_protocol::valid_controller_filename(
+          inData,
+          fileStart + 2,
+          static_cast<int>(inData.length())
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
       String filename = inData.substring(fileStart + 2);
-      const char *fn = filename.c_str();
       String info = inData.substring(0, fileStart);
-      writeSD(fn, info);
-      //moveJ(info, false, true, false);
-      sendRobotPos();
+      ar4_protocol::CartesianMoveCommandFields stored_fields = {};
+      int stored_external_steps[3] = {};
+      if (
+        !ar4_protocol::parse_cartesian_move_command(info, stored_fields)
+        || !external_positions_to_future_steps(
+          stored_fields.auxiliary[0],
+          stored_fields.auxiliary[1],
+          stored_fields.auxiliary[2],
+          stored_external_steps
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      if (writeSD(filename, info)) sendRobotPos();
     }
 
     //----- PLAY FILE ON SD CARD ---------------------------------------------------
@@ -5932,25 +6682,52 @@ void loop() {
     if (function == "PG") {
       File gcFile;
       String Cmd;
-      SD.begin(BUILTIN_SDCARD);
+      String storedRow;
       int fileStart = inData.indexOf("Fn");
+      if (
+        fileStart != 0
+        || !ar4_protocol::valid_controller_filename(
+          inData,
+          fileStart + 2,
+          static_cast<int>(inData.length())
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      if (!initSD()) {
+        consume_current_command();
+        return;
+      }
       String filename = inData.substring(fileStart + 2);
       const char *fn = filename.c_str();
       gcFile = SD.open(fn);
       if (!gcFile) {
         Serial.println("EG");
-        // Preserve command-buffer rotation when loop() exits before its shared tail.
-        inData = "";
-        cmdBuffer1 = "";
-        shiftCMDarray();
+        consume_current_command();
         return;
       }
       while (gcFile.available() && estopActive == false) {
-        Cmd = gcFile.readStringUntil('\n');
+        if (
+          read_stored_command_row(gcFile, storedRow)
+              != ar4_protocol::StoredRowReadStatus::kComplete
+          || !ar4_protocol::extract_stored_command_payload(storedRow, Cmd)
+        ) {
+          Serial.println("ER");
+          gcFile.close();
+          consume_current_command();
+          return;
+        }
         //CARTESIAN CMD
         if (Cmd.substring(0, 1) == "X") {
           updatePos();
-          moveJ(Cmd, false, false, true);
+          if (!moveJ(Cmd, false, false, true)) {
+            Serial.println("ER");
+            gcFile.close();
+            consume_current_command();
+            return;
+          }
         }
         //PRECALC'D CMD - not currently used, needs position handling
         else {
@@ -5976,31 +6753,166 @@ void loop() {
           int i20 = Cmd.indexOf(',', i19 + 1);
           int i21 = Cmd.indexOf(',', i20 + 1);
           int i22 = Cmd.indexOf(',', i21 + 1);
-          int i23 = Cmd.indexOf(',', i22 + 1);
-          int J1step = Cmd.substring(0, i1).toInt();
-          int J2step = Cmd.substring(i1 + 1, i2).toInt();
-          int J3step = Cmd.substring(i2 + 1, i3).toInt();
-          int J4step = Cmd.substring(i3 + 1, i4).toInt();
-          int J5step = Cmd.substring(i4 + 1, i5).toInt();
-          int J6step = Cmd.substring(i5 + 1, i6).toInt();
-          int J7step = Cmd.substring(i6 + 1, i7).toInt();
-          int J8step = Cmd.substring(i7 + 1, i8).toInt();
-          int J9step = Cmd.substring(i8 + 1, i9).toInt();
-          int J1dir = Cmd.substring(i9 + 1, i10).toInt();
-          int J2dir = Cmd.substring(i10 + 1, i11).toInt();
-          int J3dir = Cmd.substring(i11 + 1, i12).toInt();
-          int J4dir = Cmd.substring(i12 + 1, i13).toInt();
-          int J5dir = Cmd.substring(i13 + 1, i14).toInt();
-          int J6dir = Cmd.substring(i14 + 1, i15).toInt();
-          int J7dir = Cmd.substring(i15 + 1, i16).toInt();
-          int J8dir = Cmd.substring(i16 + 1, i17).toInt();
-          int J9dir = Cmd.substring(i17 + 1, i18).toInt();
+          const int markers[] = {
+            i1,
+            i2,
+            i3,
+            i4,
+            i5,
+            i6,
+            i7,
+            i8,
+            i9,
+            i10,
+            i11,
+            i12,
+            i13,
+            i14,
+            i15,
+            i16,
+            i17,
+            i18,
+            i19,
+            i20,
+            i21,
+            i22,
+          };
+          const int intBegins[] = {
+            0,
+            i1 + 1,
+            i2 + 1,
+            i3 + 1,
+            i4 + 1,
+            i5 + 1,
+            i6 + 1,
+            i7 + 1,
+            i8 + 1,
+            i9 + 1,
+            i10 + 1,
+            i11 + 1,
+            i12 + 1,
+            i13 + 1,
+            i14 + 1,
+            i15 + 1,
+            i16 + 1,
+            i17 + 1,
+          };
+          const int intEnds[] = {
+            i1,
+            i2,
+            i3,
+            i4,
+            i5,
+            i6,
+            i7,
+            i8,
+            i9,
+            i10,
+            i11,
+            i12,
+            i13,
+            i14,
+            i15,
+            i16,
+            i17,
+            i18,
+          };
+          const int floatBegins[] = {
+            i19 + 1,
+            i20 + 1,
+            i21 + 1,
+            i22 + 1,
+          };
+          const int floatEnds[] = {
+            i20,
+            i21,
+            i22,
+            static_cast<int>(Cmd.length()),
+          };
+          int intFields[18];
+          float floatFields[4];
+          if (
+            !ar4_protocol::marker_positions_are_ordered(Cmd.length(), markers)
+            || Cmd.indexOf(',', i22 + 1) != -1
+            || i19 - i18 != 2
+            || !parse_int_spans(Cmd, intBegins, intEnds, intFields)
+            || !ar4_protocol::values_are_binary(intFields + 9, 9)
+            || !parse_float_spans(Cmd, floatBegins, floatEnds, floatFields)
+          ) {
+            Serial.println("ER");
+            gcFile.close();
+            consume_current_command();
+            return;
+          }
+          int J1step = intFields[0];
+          int J2step = intFields[1];
+          int J3step = intFields[2];
+          int J4step = intFields[3];
+          int J5step = intFields[4];
+          int J6step = intFields[5];
+          int J7step = intFields[6];
+          int J8step = intFields[7];
+          int J9step = intFields[8];
+          int J1dir = intFields[9];
+          int J2dir = intFields[10];
+          int J3dir = intFields[11];
+          int J4dir = intFields[12];
+          int J5dir = intFields[13];
+          int J6dir = intFields[14];
+          int J7dir = intFields[15];
+          int J8dir = intFields[16];
+          int J9dir = intFields[17];
           String SpeedType = Cmd.substring(i18 + 1, i19);
-          float SpeedVal = Cmd.substring(i19 + 1, i20).toFloat();
-          float ACCspd = Cmd.substring(i20 + 1, i21).toFloat();
-          float DCCspd = Cmd.substring(i21 + 1, i22).toFloat();
-          float ACCramp = Cmd.substring(i22 + 1).toFloat();
-          driveMotorsG(J1step, J2step, J3step, J4step, J5step, J6step, J7step, J8step, J9step, J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp);
+          float SpeedVal = floatFields[0];
+          float ACCspd = floatFields[1];
+          float DCCspd = floatFields[2];
+          float ACCramp = floatFields[3];
+          const char speed_mode = SpeedType.charAt(0);
+          const int step_counts[numJoints] = {
+            J1step, J2step, J3step, J4step, J5step,
+            J6step, J7step, J8step, J9step,
+          };
+          const int directions[numJoints] = {
+            J1dir, J2dir, J3dir, J4dir, J5dir,
+            J6dir, J7dir, J8dir, J9dir,
+          };
+          const int current_steps[numJoints] = {
+            J1StepM, J2StepM, J3StepM, J4StepM, J5StepM,
+            J6StepM, J7StepM, J8StepM, J9StepM,
+          };
+          const int step_limits[numJoints] = {
+            J1StepLim, J2StepLim, J3StepLim, J4StepLim, J5StepLim,
+            J6StepLim, J7StepLim, J8StepLim, J9StepLim,
+          };
+          int future_steps[numJoints] = {};
+          bool stored_move_is_valid = ar4_protocol::valid_motion_profile(
+            speed_mode,
+            SpeedVal,
+            ACCspd,
+            DCCspd,
+            ACCramp
+          );
+          for (int axis = 0; axis < numJoints && stored_move_is_valid; ++axis) {
+            stored_move_is_valid = ar4_protocol::stored_step_target(
+              current_steps[axis],
+              step_counts[axis],
+              directions[axis],
+              step_limits[axis],
+              future_steps[axis]
+            );
+          }
+          if (!stored_move_is_valid) {
+            Serial.println("ER");
+            gcFile.close();
+            consume_current_command();
+            return;
+          }
+          if (!driveMotorsG(J1step, J2step, J3step, J4step, J5step, J6step, J7step, J8step, J9step, J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, nullptr)) {
+            Serial.println("ER");
+            gcFile.close();
+            consume_current_command();
+            return;
+          }
         }
       }
       gcFile.close();
@@ -6035,63 +6947,74 @@ void loop() {
 
       String info;
 
-      int xStart = inData.indexOf("X");
-      int yStart = inData.indexOf("Y");
-      int zStart = inData.indexOf("Z");
-      int rzStart = inData.indexOf("Rz");
-      int ryStart = inData.indexOf("Ry");
-      int rxStart = inData.indexOf("Rx");
-      int J7Start = inData.indexOf("J7");
-      int J8Start = inData.indexOf("J8");
-      int J9Start = inData.indexOf("J9");
-      int SPstart = inData.indexOf("S");
-      int AcStart = inData.indexOf("Ac");
-      int DcStart = inData.indexOf("Dc");
-      int RmStart = inData.indexOf("Rm");
-      int RndStart = inData.indexOf("Rnd");
-      int WristConStart = inData.indexOf("W");
-      int LoopModeStart = inData.indexOf("Lm");
       int fileStart = inData.indexOf("Fn");
-
-      xyzuvw_In[0] = inData.substring(xStart + 1, yStart).toFloat();
-      xyzuvw_In[1] = inData.substring(yStart + 1, zStart).toFloat();
-      xyzuvw_In[2] = inData.substring(zStart + 1, rzStart).toFloat();
-      xyzuvw_In[3] = inData.substring(rzStart + 2, ryStart).toFloat();
-      xyzuvw_In[4] = inData.substring(ryStart + 2, rxStart).toFloat();
-      xyzuvw_In[5] = inData.substring(rxStart + 2, J7Start).toFloat();
-      J7_In = inData.substring(J7Start + 2, J8Start).toFloat();
-      J8_In = inData.substring(J8Start + 2, J9Start).toFloat();
-      J9_In = inData.substring(J9Start + 2, SPstart).toFloat();
-
-      String SpeedType = inData.substring(SPstart + 1, SPstart + 2);
-      float SpeedVal = inData.substring(SPstart + 2, AcStart).toFloat();
-      float ACCspd = inData.substring(AcStart + 2, DcStart).toFloat();
-      float DCCspd = inData.substring(DcStart + 2, RmStart).toFloat();
-      float ACCramp = inData.substring(RmStart + 2, RndStart).toFloat();
-      float Rounding = inData.substring(RndStart + 3, WristConStart).toFloat();
-      WristCon = inData.substring(WristConStart + 1, LoopModeStart);
-      String LoopMode = inData.substring(LoopModeStart + 2, fileStart);
+      if (
+        fileStart <= 0
+        || !ar4_protocol::valid_controller_filename(
+          inData,
+          fileStart + 2,
+          static_cast<int>(inData.length())
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      String motionInfo = inData.substring(0, fileStart);
+      ar4_protocol::CartesianMoveCommandFields commandFields = {};
+      if (!ar4_protocol::parse_cartesian_move_command(
+          motionInfo,
+          commandFields
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
       String filename = inData.substring(fileStart + 2);
+      for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+        xyzuvw_In[axis] = commandFields.pose[axis];
+      }
+      J7_In = commandFields.auxiliary[0];
+      J8_In = commandFields.auxiliary[1];
+      J9_In = commandFields.auxiliary[2];
+      String SpeedType(commandFields.speed_mode);
+      float SpeedVal = commandFields.speed;
+      float ACCspd = commandFields.acceleration;
+      float DCCspd = commandFields.deceleration;
+      float ACCramp = commandFields.ramp;
+      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
+        WristCon,
+        JointLoopModes,
+        String(commandFields.wrist_config),
+        commandFields.loop_modes
+      );
 
-      J1LoopMode = LoopMode.substring(0, 1).toInt();
-      J2LoopMode = LoopMode.substring(1, 2).toInt();
-      J3LoopMode = LoopMode.substring(2, 3).toInt();
-      J4LoopMode = LoopMode.substring(3, 4).toInt();
-      J5LoopMode = LoopMode.substring(4, 5).toInt();
-      J6LoopMode = LoopMode.substring(5).toInt();
-
-      SolveInverseKinematics();
+      SolveInverseKinematics(commandFields.wrist_config);
 
       //calc destination motor steps
-      int J1futStepM = (JangleOut[0] + J1axisLimNeg) * J1StepDeg;
-      int J2futStepM = (JangleOut[1] + J2axisLimNeg) * J2StepDeg;
-      int J3futStepM = (JangleOut[2] + J3axisLimNeg) * J3StepDeg;
-      int J4futStepM = (JangleOut[3] + J4axisLimNeg) * J4StepDeg;
-      int J5futStepM = (JangleOut[4] + J5axisLimNeg) * J5StepDeg;
-      int J6futStepM = (JangleOut[5] + J6axisLimNeg) * J6StepDeg;
-      int J7futStepM = (J7_In + J7axisLimNeg) * J7StepDeg;
-      int J8futStepM = (J8_In + J8axisLimNeg) * J8StepDeg;
-      int J9futStepM = (J9_In + J9axisLimNeg) * J9StepDeg;
+      int future_steps[numJoints] = {};
+      if (
+        KinematicError != 0
+        || !inverse_solution_to_future_steps(
+          J7_In,
+          J8_In,
+          J9_In,
+          future_steps
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      int J1futStepM = future_steps[0];
+      int J2futStepM = future_steps[1];
+      int J3futStepM = future_steps[2];
+      int J4futStepM = future_steps[3];
+      int J5futStepM = future_steps[4];
+      int J6futStepM = future_steps[5];
+      int J7futStepM = future_steps[6];
+      int J8futStepM = future_steps[7];
+      int J9futStepM = future_steps[8];
 
 
       //calc delta from current to destination
@@ -6104,17 +7027,6 @@ void loop() {
       int J7stepDif = J7StepM - J7futStepM;
       int J8stepDif = J8StepM - J8futStepM;
       int J9stepDif = J9StepM - J9futStepM;
-
-      //set step
-      J1StepM = J1futStepM;
-      J2StepM = J2futStepM;
-      J3StepM = J3futStepM;
-      J4StepM = J4futStepM;
-      J5StepM = J5futStepM;
-      J6StepM = J6futStepM;
-      J7StepM = J7futStepM;
-      J8StepM = J8futStepM;
-      J9StepM = J9futStepM;
 
       //determine motor directions
       J1dir = (J1stepDif <= 0) ? 1 : 0;
@@ -6129,31 +7041,31 @@ void loop() {
 
 
       //determine if requested position is within axis limits
-      if ((J1dir == 1 and (J1StepM + J1stepDif > J1StepLim)) or (J1dir == 0 and (J1StepM - J1stepDif < 0))) {
+      if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
         J1axisFault = 1;
       }
-      if ((J2dir == 1 and (J2StepM + J2stepDif > J2StepLim)) or (J2dir == 0 and (J2StepM - J2stepDif < 0))) {
+      if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
         J2axisFault = 1;
       }
-      if ((J3dir == 1 and (J3StepM + J3stepDif > J3StepLim)) or (J3dir == 0 and (J3StepM - J3stepDif < 0))) {
+      if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
         J3axisFault = 1;
       }
-      if ((J4dir == 1 and (J4StepM + J4stepDif > J4StepLim)) or (J4dir == 0 and (J4StepM - J4stepDif < 0))) {
+      if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
         J4axisFault = 1;
       }
-      if ((J5dir == 1 and (J5StepM + J5stepDif > J5StepLim)) or (J5dir == 0 and (J5StepM - J5stepDif < 0))) {
+      if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
         J5axisFault = 1;
       }
-      if ((J6dir == 1 and (J6StepM + J6stepDif > J6StepLim)) or (J6dir == 0 and (J6StepM - J6stepDif < 0))) {
+      if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
         J6axisFault = 1;
       }
-      if ((J7dir == 1 and (J7StepM + J7stepDif > J7StepLim)) or (J7dir == 0 and (J7StepM - J7stepDif < 0))) {
+      if (future_step_is_outside_limit(J7futStepM, J7StepLim)) {
         J7axisFault = 1;
       }
-      if ((J8dir == 1 and (J8StepM + J8stepDif > J8StepLim)) or (J8dir == 0 and (J8StepM - J8stepDif < 0))) {
+      if (future_step_is_outside_limit(J8futStepM, J8StepLim)) {
         J8axisFault = 1;
       }
-      if ((J9dir == 1 and (J9StepM + J9stepDif > J9StepLim)) or (J9dir == 0 and (J9StepM - J9stepDif < 0))) {
+      if (future_step_is_outside_limit(J9futStepM, J9StepLim)) {
         J9axisFault = 1;
       }
       TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
@@ -6162,8 +7074,18 @@ void loop() {
       //send move command if no axis limit error
       if (TotalAxisFault == 0 && KinematicError == 0) {
         info = String(abs(J1stepDif)) + "," + String(abs(J2stepDif)) + "," + String(abs(J3stepDif)) + "," + String(abs(J4stepDif)) + "," + String(abs(J5stepDif)) + "," + String(abs(J6stepDif)) + "," + String(abs(J7stepDif)) + "," + String(abs(J8stepDif)) + "," + String(abs(J9stepDif)) + "," + String(J1dir) + "," + String(J2dir) + "," + String(J3dir) + "," + String(J4dir) + "," + String(J5dir) + "," + String(J6dir) + "," + String(J7dir) + "," + String(J8dir) + "," + String(J9dir) + "," + String(SpeedType) + "," + String(SpeedVal) + "," + String(ACCspd) + "," + String(DCCspd) + "," + String(ACCramp);
-        writeSD(filename, info);
-        sendRobotPos();
+        if (writeSD(filename, info)) {
+          J1StepM = J1futStepM;
+          J2StepM = J2futStepM;
+          J3StepM = J3futStepM;
+          J4StepM = J4futStepM;
+          J5StepM = J5futStepM;
+          J6StepM = J6futStepM;
+          J7StepM = J7futStepM;
+          J8StepM = J8futStepM;
+          J9StepM = J9futStepM;
+          sendRobotPos();
+        }
       } else if (KinematicError == 1) {
         Alarm = "ER";
         delay(5);
@@ -6253,34 +7175,132 @@ void loop() {
       int WristConStart = inData.indexOf("W");
       int LoopModeStart = inData.indexOf("Lm");
 
+      const int markers[] = {
+        xStart,
+        yStart,
+        zStart,
+        rzStart,
+        ryStart,
+        rxStart,
+        xMidIndex,
+        yMidIndex,
+        zMidIndex,
+        xEndIndex,
+        yEndIndex,
+        zEndIndex,
+        tStart,
+        SPstart,
+        AcStart,
+        DcStart,
+        RmStart,
+        WristConStart,
+        LoopModeStart,
+      };
+      const int begins[] = {
+        xStart + 2,
+        yStart + 2,
+        zStart + 2,
+        rzStart + 2,
+        ryStart + 2,
+        rxStart + 2,
+        xMidIndex + 2,
+        yMidIndex + 2,
+        zMidIndex + 2,
+        xEndIndex + 2,
+        yEndIndex + 2,
+        zEndIndex + 2,
+        tStart + 2,
+        SPstart + 2,
+        AcStart + 2,
+        DcStart + 2,
+        RmStart + 2,
+      };
+      const int ends[] = {
+        yStart,
+        zStart,
+        rzStart,
+        ryStart,
+        rxStart,
+        xMidIndex,
+        yMidIndex,
+        zMidIndex,
+        xEndIndex,
+        yEndIndex,
+        zEndIndex,
+        tStart,
+        SPstart,
+        AcStart,
+        DcStart,
+        RmStart,
+        WristConStart,
+      };
+      float parsed[17];
+      int loopModes[ROBOT_nDOFs];
+      const char speed_mode = inData.charAt(SPstart + 1);
+      const char wrist_config = inData.charAt(WristConStart + 1);
+      if (
+        !ar4_protocol::marker_positions_are_ordered_from(
+          inData.length(),
+          markers,
+          0
+        )
+        || WristConStart + 2 != LoopModeStart
+        || LoopModeStart + 2 + ROBOT_nDOFs
+          != static_cast<int>(inData.length())
+        || !parse_float_spans(inData, begins, ends, parsed)
+        || !ar4_protocol::supported_trajectory_rotation(parsed[12])
+        || !parse_loop_modes(inData, LoopModeStart, loopModes)
+        || !ar4_protocol::valid_motion_profile(
+          speed_mode,
+          parsed[13],
+          parsed[14],
+          parsed[15],
+          parsed[16]
+        )
+        || !ar4_protocol::valid_wrist_config(wrist_config)
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
-      float xBeg = inData.substring(xStart + 2, yStart).toFloat();
-      float yBeg = inData.substring(yStart + 2, zStart).toFloat();
-      float zBeg = inData.substring(zStart + 2, rzStart).toFloat();
-      float rzBeg = inData.substring(rzStart + 2, ryStart).toFloat();
-      float ryBeg = inData.substring(ryStart + 2, rxStart).toFloat();
-      float rxBeg = inData.substring(rxStart + 2, xMidIndex).toFloat();
-      float xMid = inData.substring(xMidIndex + 2, yMidIndex).toFloat();
-      float yMid = inData.substring(yMidIndex + 2, zMidIndex).toFloat();
-      float zMid = inData.substring(zMidIndex + 2, xEndIndex).toFloat();
-      float xEnd = inData.substring(xEndIndex + 2, yEndIndex).toFloat();
-      float yEnd = inData.substring(yEndIndex + 2, zEndIndex).toFloat();
-      float zEnd = inData.substring(zEndIndex + 2, tStart).toFloat();
-      xyzuvw_In[6] = inData.substring(tStart + 2, SPstart).toFloat();
-      String SpeedType = inData.substring(SPstart + 1, SPstart + 2);
-      float SpeedVal = inData.substring(SPstart + 2, AcStart).toFloat();
-      float ACCspd = inData.substring(AcStart + 2, DcStart).toFloat();
-      float DCCspd = inData.substring(DcStart + 2, RmStart).toFloat();
-      float ACCramp = inData.substring(RmStart + 2, WristConStart).toFloat();
-      WristCon = inData.substring(WristConStart + 1, LoopModeStart);
-      String LoopMode = inData.substring(LoopModeStart + 2);
-      LoopMode.trim();
-      J1LoopMode = LoopMode.substring(0, 1).toInt();
-      J2LoopMode = LoopMode.substring(1, 2).toInt();
-      J3LoopMode = LoopMode.substring(2, 3).toInt();
-      J4LoopMode = LoopMode.substring(3, 4).toInt();
-      J5LoopMode = LoopMode.substring(4, 5).toInt();
-      J6LoopMode = LoopMode.substring(5).toInt();
+      float xBeg = parsed[0];
+      float yBeg = parsed[1];
+      float zBeg = parsed[2];
+      float rzBeg = parsed[3];
+      float ryBeg = parsed[4];
+      float rxBeg = parsed[5];
+      float xMid = parsed[6];
+      float yMid = parsed[7];
+      float zMid = parsed[8];
+      float xEnd = parsed[9];
+      float yEnd = parsed[10];
+      float zEnd = parsed[11];
+      String SpeedType(speed_mode);
+      float SpeedVal = parsed[13];
+      float ACCspd = parsed[14];
+      float DCCspd = parsed[15];
+      float ACCramp = parsed[16];
+      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
+        WristCon,
+        JointLoopModes,
+        String(wrist_config),
+        loopModes
+      );
+
+      const float circle_center[3] = { xBeg, yBeg, zBeg };
+      const float circle_start[3] = { xMid, yMid, zMid };
+      const float circle_end[3] = { xEnd, yEnd, zEnd };
+      if (!ar4_protocol::valid_circle_geometry(
+          circle_center,
+          circle_start,
+          circle_end,
+          linWayDistSP
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
       //calc vector from start point of circle (mid) to center of circle (beg)
       Xvect = xMid - xBeg;
@@ -6315,7 +7335,14 @@ void loop() {
       axis[1] = CrossY / sqrt((CrossX * CrossX) + (CrossY * CrossY) + (CrossZ * CrossZ));
       axis[2] = CrossZ / sqrt((CrossX * CrossX) + (CrossY * CrossY) + (CrossZ * CrossZ));
       //get radian angle between vectors using acos of dot product
-      float BCradians = acos((vect_Bx * vect_Cx + vect_By * vect_Cy + vect_Bz * vect_Cz) / (sqrt(pow(vect_Bx, 2) + pow(vect_Cy, 2) + pow(vect_Bz, 2)) * sqrt(pow(vect_Cx, 2) + pow(vect_Cy, 2) + pow(vect_Cz, 2))));
+      float circle_dot = (
+        vect_Bx * vect_Cx + vect_By * vect_Cy + vect_Bz * vect_Cz
+      ) / (
+        sqrt(pow(vect_Bx, 2) + pow(vect_By, 2) + pow(vect_Bz, 2))
+        * sqrt(pow(vect_Cx, 2) + pow(vect_Cy, 2) + pow(vect_Cz, 2))
+      );
+      circle_dot = fmax(-1.0f, fmin(1.0f, circle_dot));
+      float BCradians = acos(circle_dot);
       //get arc degree
       float ABdegrees = degrees(BCradians);
       //get direction from angle
@@ -6327,14 +7354,31 @@ void loop() {
 
       //get circumference and calc way pt gap
       float lineDist = 2 * 3.14159265359 * Radius;
-      float wayPts = lineDist / linWayDistSP;
+      int waypoint_count = 0;
+      int HighStep = 0;
+      if (
+        !ar4_protocol::waypoint_count_for_path(
+          lineDist,
+          linWayDistSP,
+          waypoint_count
+        )
+        || !ar4_protocol::waypoint_count_for_path(
+          lineDist,
+          0.05f,
+          HighStep
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      float wayPts = static_cast<float>(waypoint_count);
 
-      float wayPerc = 1 / wayPts;
+      float wayPerc = 1.0f / wayPts;
       //cacl way pt angle
       float theta_Deg = ((360 * Cdir) / (wayPts));
 
       //determine steps
-      int HighStep = lineDist / .05;
       float ACCStep = HighStep * (ACCspd / 100);
       float NORStep = HighStep * ((100 - ACCspd - DCCspd) / 100);
       float DCCStep = HighStep * (DCCspd / 100);
@@ -6344,6 +7388,14 @@ void loop() {
         speedSP = (SpeedVal * 1000000) * 1.75;
       } else if (SpeedType == "m") {
         speedSP = ((lineDist / SpeedVal) * 1000000) * 1.75;
+      }
+      if (
+        (SpeedType == "s" || SpeedType == "m")
+        && (!isfinite(speedSP) || speedSP <= 0.0f)
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
       }
 
       //calc step gap for seconds or mm per sec
@@ -6355,8 +7407,13 @@ void loop() {
         float zeroDCCstepInc = (zeroStepGap * (100 / ACCramp)) / DCCStep;
         float zeroDCCtime = ((DCCStep)*zeroStepGap) + ((DCCStep - 9) * (((DCCStep) * (zeroDCCstepInc / 2))));
         float zeroTOTtime = zeroACCtime + zeroNORtime + zeroDCCtime;
-        float overclockPerc = speedSP / zeroTOTtime;
-        calcStepGap = zeroStepGap * overclockPerc;
+        if (!isfinite(zeroTOTtime) || zeroTOTtime <= 0.0f) {
+          calcStepGap = minSpeedDelay;
+          speedViolation = "1";
+        } else {
+          float overclockPerc = speedSP / zeroTOTtime;
+          calcStepGap = zeroStepGap * overclockPerc;
+        }
         if (calcStepGap <= minSpeedDelay) {
           calcStepGap = minSpeedDelay;
           speedViolation = "1";
@@ -6366,6 +7423,11 @@ void loop() {
       //calc step gap for percentage
       else if (SpeedType == "p") {
         calcStepGap = minSpeedDelay / (SpeedVal / 100);
+      }
+      if (!isfinite(calcStepGap) || calcStepGap <= 0.0f) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
       }
 
       //calculate final step increments
@@ -6383,6 +7445,21 @@ void loop() {
       //calc way inc for lin way steps
       float ACCwayInc = (calcACCstartDel - calcStepGap) / ACCwayPts;
       float DCCwayInc = (calcDCCendDel - calcStepGap) / DCCwayPts;
+      if (
+        !isfinite(ACCwayInc)
+        || !isfinite(DCCwayInc)
+        || !ar4_protocol::valid_delay_envelope(
+          calcStepGap,
+          calcACCstartDel,
+          calcDCCendDel,
+          false,
+          rndSpeed
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
       //set starting delsy
       float curDelay = calcACCstartDel;
@@ -6396,7 +7473,7 @@ void loop() {
 
       resetEncoders();
 
-      for (int i = 1; i <= wayPts; i++) {
+      for (int i = 1; i <= waypoint_count; i++) {
 
         theta = radians(cur_deg);
         //use euler rodrigues formula to find rotation vector
@@ -6431,9 +7508,9 @@ void loop() {
 
         ////DELAY CALC/////
         if (i <= ACCwayPts) {
-          curDelay = curDelay - (ACCwayInc);
+          curDelay = fmax(calcStepGap, curDelay - ACCwayInc);
         } else if (i >= (wayPts - DCCwayPts)) {
-          curDelay = curDelay + (DCCwayInc);
+          curDelay = fmin(calcDCCendDel, curDelay + DCCwayInc);
         } else {
           curDelay = calcStepGap;
         }
@@ -6446,15 +7523,23 @@ void loop() {
         xyzuvw_In[4] = ryBeg;
         xyzuvw_In[5] = rxBeg;
 
-        SolveInverseKinematics();
+        SolveInverseKinematics(wrist_config);
 
         //calc destination motor steps
-        int J1futStepM = (JangleOut[0] + J1axisLimNeg) * J1StepDeg;
-        int J2futStepM = (JangleOut[1] + J2axisLimNeg) * J2StepDeg;
-        int J3futStepM = (JangleOut[2] + J3axisLimNeg) * J3StepDeg;
-        int J4futStepM = (JangleOut[3] + J4axisLimNeg) * J4StepDeg;
-        int J5futStepM = (JangleOut[4] + J5axisLimNeg) * J5StepDeg;
-        int J6futStepM = (JangleOut[5] + J6axisLimNeg) * J6StepDeg;
+        int future_steps[ROBOT_nDOFs] = {};
+        if (
+          KinematicError != 0
+          || !primary_inverse_solution_to_future_steps(future_steps)
+        ) {
+          KinematicError = 1;
+          break;
+        }
+        int J1futStepM = future_steps[0];
+        int J2futStepM = future_steps[1];
+        int J3futStepM = future_steps[2];
+        int J4futStepM = future_steps[3];
+        int J5futStepM = future_steps[4];
+        int J6futStepM = future_steps[5];
 
         //calc delta from current to destination
         int J1stepDif = J1StepM - J1futStepM;
@@ -6479,48 +7564,52 @@ void loop() {
         J9dir = 0;
 
         //determine if requested position is within axis limits
-        if ((J1dir == 1 and (J1StepM + J1stepDif > J1StepLim)) or (J1dir == 0 and (J1StepM - J1stepDif < 0))) {
+        if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
           J1axisFault = 1;
         }
-        if ((J2dir == 1 and (J2StepM + J2stepDif > J2StepLim)) or (J2dir == 0 and (J2StepM - J2stepDif < 0))) {
+        if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
           J2axisFault = 1;
         }
-        if ((J3dir == 1 and (J3StepM + J3stepDif > J3StepLim)) or (J3dir == 0 and (J3StepM - J3stepDif < 0))) {
+        if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
           J3axisFault = 1;
         }
-        if ((J4dir == 1 and (J4StepM + J4stepDif > J4StepLim)) or (J4dir == 0 and (J4StepM - J4stepDif < 0))) {
+        if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
           J4axisFault = 1;
         }
-        if ((J5dir == 1 and (J5StepM + J5stepDif > J5StepLim)) or (J5dir == 0 and (J5StepM - J5stepDif < 0))) {
+        if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
           J5axisFault = 1;
         }
-        if ((J6dir == 1 and (J6StepM + J6stepDif > J6StepLim)) or (J6dir == 0 and (J6StepM - J6stepDif < 0))) {
+        if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
           J6axisFault = 1;
         }
         TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
 
-
-
-        if (TotalAxisFault == 0 && KinematicError == 0) {
-          driveMotorsL(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, curDelay);
-          updatePos();
-        } else if (KinematicError == 1) {
-          Alarm = "ER";
-          delay(5);
-          Serial.println(Alarm);
-        } else {
+        if (TotalAxisFault != 0) {
           Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault);
-          delay(5);
-          Serial.println(Alarm);
+          break;
         }
 
+        if (!driveMotorsL(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, curDelay, &motionModes)) {
+          KinematicError = 1;
+          break;
+        }
+        updatePos();
 
         //increment angle
         cur_deg += theta_Deg;
       }
 
-      checkEncoders();
-      sendRobotPos();
+      if (KinematicError == 1) {
+        Alarm = "ER";
+        delay(5);
+        Serial.println(Alarm);
+      } else if (TotalAxisFault != 0) {
+        delay(5);
+        Serial.println(Alarm);
+      } else {
+        checkEncoders();
+        sendRobotPos();
+      }
 
 
       inData = "";  // Clear recieved buffer
@@ -6604,6 +7693,86 @@ void loop() {
       int WristConStart = inData.indexOf("W");
       int LoopModeStart = inData.indexOf("Lm");
 
+      const int markers[] = {
+        xMidIndex,
+        yMidIndex,
+        zMidIndex,
+        rzIndex,
+        ryIndex,
+        rxIndex,
+        xEndIndex,
+        yEndIndex,
+        zEndIndex,
+        tStart,
+        SPstart,
+        AcStart,
+        DcStart,
+        RmStart,
+        WristConStart,
+        LoopModeStart,
+      };
+      const int begins[] = {
+        xMidIndex + 1,
+        yMidIndex + 1,
+        zMidIndex + 1,
+        rzIndex + 2,
+        ryIndex + 2,
+        rxIndex + 2,
+        xEndIndex + 2,
+        yEndIndex + 2,
+        zEndIndex + 2,
+        tStart + 2,
+        SPstart + 2,
+        AcStart + 2,
+        DcStart + 2,
+        RmStart + 2,
+      };
+      const int ends[] = {
+        yMidIndex,
+        zMidIndex,
+        rzIndex,
+        ryIndex,
+        rxIndex,
+        xEndIndex,
+        yEndIndex,
+        zEndIndex,
+        tStart,
+        SPstart,
+        AcStart,
+        DcStart,
+        RmStart,
+        WristConStart,
+      };
+      float parsed[14];
+      int loopModes[ROBOT_nDOFs];
+      const char speed_mode = inData.charAt(SPstart + 1);
+      const char wrist_config = inData.charAt(WristConStart + 1);
+      if (
+        !ar4_protocol::marker_positions_are_ordered_from(
+          inData.length(),
+          markers,
+          0
+        )
+        || WristConStart + 2 != LoopModeStart
+        || LoopModeStart + 2 + ROBOT_nDOFs
+          != static_cast<int>(inData.length())
+        || !parse_float_spans(inData, begins, ends, parsed)
+        || !ar4_protocol::supported_trajectory_rotation(parsed[9])
+        || !parse_loop_modes(inData, LoopModeStart, loopModes)
+        || !ar4_protocol::valid_motion_profile(
+          speed_mode,
+          parsed[10],
+          parsed[11],
+          parsed[12],
+          parsed[13]
+        )
+        || !ar4_protocol::valid_wrist_config(wrist_config)
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+
       updatePos();
 
       float xBeg = xyzuvw_Out[0];
@@ -6613,108 +7782,89 @@ void loop() {
       float ryBeg = xyzuvw_Out[4];
       float rxBeg = xyzuvw_Out[5];
 
-
-      float xMid = inData.substring(xMidIndex + 1, yMidIndex).toFloat();
-      float yMid = inData.substring(yMidIndex + 1, zMidIndex).toFloat();
-      float zMid = inData.substring(zMidIndex + 1, rzIndex).toFloat();
-
-      float rz = inData.substring(rzIndex + 2, ryIndex).toFloat();
-      float ry = inData.substring(ryIndex + 2, rxIndex).toFloat();
-      float rx = inData.substring(rxIndex + 2, xEndIndex).toFloat();
+      float xMid = parsed[0];
+      float yMid = parsed[1];
+      float zMid = parsed[2];
+      float rz = parsed[3];
+      float ry = parsed[4];
+      float rx = parsed[5];
 
 
       float RZvect = rzBeg - rz;
       float RYvect = ryBeg - ry;
       float RXvect = rxBeg - rx;
 
-      float xEnd = inData.substring(xEndIndex + 2, yEndIndex).toFloat();
-      float yEnd = inData.substring(yEndIndex + 2, zEndIndex).toFloat();
-      float zEnd = inData.substring(zEndIndex + 2, tStart).toFloat();
+      float xEnd = parsed[6];
+      float yEnd = parsed[7];
+      float zEnd = parsed[8];
+      String SpeedType(speed_mode);
+      float SpeedVal = parsed[10];
+      float ACCspd = parsed[11];
+      float DCCspd = parsed[12];
+      float ACCramp = parsed[13];
+      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
+        WristCon,
+        JointLoopModes,
+        String(wrist_config),
+        loopModes
+      );
 
+      const float arc_start[3] = { xBeg, yBeg, zBeg };
+      const float arc_middle[3] = { xMid, yMid, zMid };
+      const float arc_end[3] = { xEnd, yEnd, zEnd };
+      ar4_protocol::OrderedArcGeometry arc_geometry = {};
+      if (!ar4_protocol::valid_arc_geometry(
+          arc_start,
+          arc_middle,
+          arc_end,
+          linWayDistSP,
+          &arc_geometry
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
-      xyzuvw_In[6] = inData.substring(tStart + 2, SPstart).toFloat();
-      String SpeedType = inData.substring(SPstart + 1, SPstart + 2);
-      float SpeedVal = inData.substring(SPstart + 2, AcStart).toFloat();
-      float ACCspd = inData.substring(AcStart + 2, DcStart).toFloat();
-      float DCCspd = inData.substring(DcStart + 2, RmStart).toFloat();
-      float ACCramp = inData.substring(RmStart + 2, WristConStart).toFloat();
-      WristCon = inData.substring(WristConStart + 1, LoopModeStart);
-      String LoopMode = inData.substring(LoopModeStart + 2);
-      LoopMode.trim();
-      J1LoopMode = LoopMode.substring(0, 1).toInt();
-      J2LoopMode = LoopMode.substring(1, 2).toInt();
-      J3LoopMode = LoopMode.substring(2, 3).toInt();
-      J4LoopMode = LoopMode.substring(3, 4).toInt();
-      J5LoopMode = LoopMode.substring(4, 5).toInt();
-      J6LoopMode = LoopMode.substring(5).toInt();
+      const float Px = static_cast<float>(arc_geometry.center[0]);
+      const float Py = static_cast<float>(arc_geometry.center[1]);
+      const float Pz = static_cast<float>(arc_geometry.center[2]);
+      startVect[0] = xBeg - Px;
+      startVect[1] = yBeg - Py;
+      startVect[2] = zBeg - Pz;
+      axis[0] = static_cast<float>(arc_geometry.axis[0]);
+      axis[1] = static_cast<float>(arc_geometry.axis[1]);
+      axis[2] = static_cast<float>(arc_geometry.axis[2]);
+      const float ABdegrees = degrees(
+        static_cast<float>(arc_geometry.radians)
+      );
+      const float lineDist = static_cast<float>(
+        arc_geometry.radius * arc_geometry.radians
+      );
+      int waypoint_count = 0;
+      int HighStep = 0;
+      if (
+        !ar4_protocol::waypoint_count_for_path(
+          lineDist,
+          linWayDistSP,
+          waypoint_count
+        )
+        || !ar4_protocol::waypoint_count_for_path(
+          lineDist,
+          0.05f,
+          HighStep
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
+      float wayPts = static_cast<float>(waypoint_count);
 
-
-      //determine length between each point (lengths of triangle)
-      Xvect = xEnd - xMid;
-      Yvect = yEnd - yMid;
-      Zvect = zEnd - zMid;
-      float aDist = pow((pow((Xvect), 2) + pow((Yvect), 2) + pow((Zvect), 2)), .5);
-      Xvect = xEnd - xBeg;
-      Yvect = yEnd - yBeg;
-      Zvect = zEnd - zBeg;
-      float bDist = pow((pow((Xvect), 2) + pow((Yvect), 2) + pow((Zvect), 2)), .5);
-      Xvect = xMid - xBeg;
-      Yvect = yMid - yBeg;
-      Zvect = zMid - zBeg;
-      float cDist = pow((pow((Xvect), 2) + pow((Yvect), 2) + pow((Zvect), 2)), .5);
-      //use lengths between each point (lengths of triangle) to determine radius
-      float s = (aDist + bDist + cDist) / 2;
-      float Radius = aDist * bDist * cDist / 4 / sqrt(s * (s - aDist) * (s - bDist) * (s - cDist));
-      //find barycentric coordinates of triangle (center of triangle)
-      float BCx = pow(aDist, 2) * (pow(bDist, 2) + pow(cDist, 2) - pow(aDist, 2));
-      float BCy = pow(bDist, 2) * (pow(cDist, 2) + pow(aDist, 2) - pow(bDist, 2));
-      float BCz = pow(cDist, 2) * (pow(aDist, 2) + pow(bDist, 2) - pow(cDist, 2));
-      //find center coordinates of circle - convert barycentric coordinates to cartesian coordinates - dot product of 3 points and barycentric coordiantes divided by sum of barycentric coordinates
-      float Px = ((BCx * xBeg) + (BCy * xMid) + (BCz * xEnd)) / (BCx + BCy + BCz);
-      float Py = ((BCx * yBeg) + (BCy * yMid) + (BCz * yEnd)) / (BCx + BCy + BCz);
-      float Pz = ((BCx * zBeg) + (BCy * zMid) + (BCz * zEnd)) / (BCx + BCy + BCz);
-      //define start vetor
-      startVect[0] = (xBeg - Px);
-      startVect[1] = (yBeg - Py);
-      startVect[2] = (zBeg - Pz);
-      //get 3 vectors from center of circle to begining target, mid target and end target then normalize
-      float vect_Amag = pow((pow((xBeg - Px), 2) + pow((yBeg - Py), 2) + pow((zBeg - Pz), 2)), .5);
-      float vect_Ax = (xBeg - Px) / vect_Amag;
-      float vect_Ay = (yBeg - Py) / vect_Amag;
-      float vect_Az = (zBeg - Pz) / vect_Amag;
-      float vect_Bmag = pow((pow((xMid - Px), 2) + pow((yMid - Py), 2) + pow((zMid - Pz), 2)), .5);
-      float vect_Bx = (xMid - Px) / vect_Bmag;
-      float vect_By = (yMid - Py) / vect_Bmag;
-      float vect_Bz = (zMid - Pz) / vect_Bmag;
-      float vect_Cmag = pow((pow((xEnd - Px), 2) + pow((yEnd - Py), 2) + pow((zEnd - Pz), 2)), .5);
-      float vect_Cx = (xEnd - Px) / vect_Cmag;
-      float vect_Cy = (yEnd - Py) / vect_Cmag;
-      float vect_Cz = (zEnd - Pz) / vect_Cmag;
-      //get cross product of vectors a & c than apply to axis matrix
-      float CrossX = (vect_Ay * vect_Bz) - (vect_Az * vect_By);
-      float CrossY = (vect_Az * vect_Bx) - (vect_Ax * vect_Bz);
-      float CrossZ = (vect_Ax * vect_By) - (vect_Ay * vect_Bx);
-      axis[0] = CrossX / sqrt((CrossX * CrossX) + (CrossY * CrossY) + (CrossZ * CrossZ));
-      axis[1] = CrossY / sqrt((CrossX * CrossX) + (CrossY * CrossY) + (CrossZ * CrossZ));
-      axis[2] = CrossZ / sqrt((CrossX * CrossX) + (CrossY * CrossY) + (CrossZ * CrossZ));
-      //get radian angle between vectors using acos of dot product
-      float ABradians = acos((vect_Ax * vect_Bx + vect_Ay * vect_By + vect_Az * vect_Bz) / (sqrt(pow(vect_Ax, 2) + pow(vect_Ay, 2) + pow(vect_Az, 2)) * sqrt(pow(vect_Bx, 2) + pow(vect_By, 2) + pow(vect_Bz, 2))));
-      float BCradians = acos((vect_Bx * vect_Cx + vect_By * vect_Cy + vect_Bz * vect_Cz) / (sqrt(pow(vect_Bx, 2) + pow(vect_By, 2) + pow(vect_Bz, 2)) * sqrt(pow(vect_Cx, 2) + pow(vect_Cy, 2) + pow(vect_Cz, 2))));
-      //get total degrees of both arcs
-      float ABdegrees = degrees(ABradians + BCradians);
-      //get arc length and calc way pt gap
-
-      float anglepercent = ABdegrees / 360;
-      float circumference = 2 * 3.14159265359 * Radius;
-      float lineDist = circumference * anglepercent;
-      float wayPts = lineDist / linWayDistSP;
-
-      float wayPerc = 1 / wayPts;
+      float wayPerc = 1.0f / wayPts;
       //cacl way pt angle
       float theta_Deg = (ABdegrees / wayPts);
 
       //determine steps
-      int HighStep = lineDist / .05;
       float ACCStep = HighStep * (ACCspd / 100);
       float NORStep = HighStep * ((100 - ACCspd - DCCspd) / 100);
       float DCCStep = HighStep * (DCCspd / 100);
@@ -6724,6 +7874,14 @@ void loop() {
         speedSP = (SpeedVal * 1000000) * 1.2;
       } else if (SpeedType == "m") {
         speedSP = ((lineDist / SpeedVal) * 1000000) * 1.2;
+      }
+      if (
+        (SpeedType == "s" || SpeedType == "m")
+        && (!isfinite(speedSP) || speedSP <= 0.0f)
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
       }
 
       //calc step gap for seconds or mm per sec
@@ -6735,8 +7893,13 @@ void loop() {
         float zeroDCCstepInc = (zeroStepGap * (100 / ACCramp)) / DCCStep;
         float zeroDCCtime = ((DCCStep)*zeroStepGap) + ((DCCStep - 9) * (((DCCStep) * (zeroDCCstepInc / 2))));
         float zeroTOTtime = zeroACCtime + zeroNORtime + zeroDCCtime;
-        float overclockPerc = speedSP / zeroTOTtime;
-        calcStepGap = zeroStepGap * overclockPerc;
+        if (!isfinite(zeroTOTtime) || zeroTOTtime <= 0.0f) {
+          calcStepGap = minSpeedDelay;
+          speedViolation = "1";
+        } else {
+          float overclockPerc = speedSP / zeroTOTtime;
+          calcStepGap = zeroStepGap * overclockPerc;
+        }
         if (calcStepGap <= minSpeedDelay) {
           calcStepGap = minSpeedDelay;
           speedViolation = "1";
@@ -6746,6 +7909,11 @@ void loop() {
       //calc step gap for percentage
       else if (SpeedType == "p") {
         calcStepGap = minSpeedDelay / (SpeedVal / 100);
+      }
+      if (!isfinite(calcStepGap) || calcStepGap <= 0.0f) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
       }
 
       //calculate final step increments
@@ -6763,6 +7931,21 @@ void loop() {
       //calc way inc for lin way steps
       float ACCwayInc = (calcACCstartDel - calcStepGap) / ACCwayPts;
       float DCCwayInc = (calcDCCendDel - calcStepGap) / DCCwayPts;
+      if (
+        !isfinite(ACCwayInc)
+        || !isfinite(DCCwayInc)
+        || !ar4_protocol::valid_delay_envelope(
+          calcStepGap,
+          calcACCstartDel,
+          calcDCCendDel,
+          rndTrue,
+          rndSpeed
+        )
+      ) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
       //set starting delsy
       if (rndTrue == true) {
@@ -6790,7 +7973,7 @@ void loop() {
 
       resetEncoders();
 
-      for (int i = 0; i <= wayPts - 1; i++) {
+      for (int i = 1; i <= waypoint_count; i++) {
 
         theta = radians(cur_deg);
         //use euler rodrigues formula to find rotation vector
@@ -6827,9 +8010,9 @@ void loop() {
         if (rndTrue == true) {
           curDelay = rndSpeed;
         } else if (i <= ACCwayPts) {
-          curDelay = curDelay - (ACCwayInc);
+          curDelay = fmax(calcStepGap, curDelay - ACCwayInc);
         } else if (i >= (wayPts - DCCwayPts)) {
-          curDelay = curDelay + (DCCwayInc);
+          curDelay = fmin(calcDCCendDel, curDelay + DCCwayInc);
         } else {
           curDelay = calcStepGap;
         }
@@ -6844,15 +8027,23 @@ void loop() {
         xyzuvw_In[5] = rxBeg - (RXvect * curWayPerc);
 
 
-        SolveInverseKinematics();
+        SolveInverseKinematics(wrist_config);
 
         //calc destination motor steps
-        int J1futStepM = (JangleOut[0] + J1axisLimNeg) * J1StepDeg;
-        int J2futStepM = (JangleOut[1] + J2axisLimNeg) * J2StepDeg;
-        int J3futStepM = (JangleOut[2] + J3axisLimNeg) * J3StepDeg;
-        int J4futStepM = (JangleOut[3] + J4axisLimNeg) * J4StepDeg;
-        int J5futStepM = (JangleOut[4] + J5axisLimNeg) * J5StepDeg;
-        int J6futStepM = (JangleOut[5] + J6axisLimNeg) * J6StepDeg;
+        int future_steps[ROBOT_nDOFs] = {};
+        if (
+          KinematicError != 0
+          || !primary_inverse_solution_to_future_steps(future_steps)
+        ) {
+          KinematicError = 1;
+          break;
+        }
+        int J1futStepM = future_steps[0];
+        int J2futStepM = future_steps[1];
+        int J3futStepM = future_steps[2];
+        int J4futStepM = future_steps[3];
+        int J5futStepM = future_steps[4];
+        int J6futStepM = future_steps[5];
 
         //calc delta from current to destination
         int J1stepDif = J1StepM - J1futStepM;
@@ -6878,44 +8069,37 @@ void loop() {
         J9dir = 0;
 
         //determine if requested position is within axis limits
-        if ((J1dir == 1 and (J1StepM + J1stepDif > J1StepLim)) or (J1dir == 0 and (J1StepM - J1stepDif < 0))) {
+        if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
           J1axisFault = 1;
         }
-        if ((J2dir == 1 and (J2StepM + J2stepDif > J2StepLim)) or (J2dir == 0 and (J2StepM - J2stepDif < 0))) {
+        if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
           J2axisFault = 1;
         }
-        if ((J3dir == 1 and (J3StepM + J3stepDif > J3StepLim)) or (J3dir == 0 and (J3StepM - J3stepDif < 0))) {
+        if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
           J3axisFault = 1;
         }
-        if ((J4dir == 1 and (J4StepM + J4stepDif > J4StepLim)) or (J4dir == 0 and (J4StepM - J4stepDif < 0))) {
+        if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
           J4axisFault = 1;
         }
-        if ((J5dir == 1 and (J5StepM + J5stepDif > J5StepLim)) or (J5dir == 0 and (J5StepM - J5stepDif < 0))) {
+        if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
           J5axisFault = 1;
         }
-        if ((J6dir == 1 and (J6StepM + J6stepDif > J6StepLim)) or (J6dir == 0 and (J6StepM - J6stepDif < 0))) {
+        if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
           J6axisFault = 1;
         }
         TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
 
+        if (TotalAxisFault != 0) {
+          Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault);
+          break;
+        }
 
         //send move command if no axis limit error
-        if (TotalAxisFault == 0 && KinematicError == 0) {
-          driveMotorsL(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, curDelay);
-          updatePos();
-        } else if (KinematicError == 1) {
-          Alarm = "ER";
-          if (splineTrue == false) {
-            delay(5);
-            Serial.println(Alarm);
-          }
-        } else {
-          Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault);
-          if (splineTrue == false) {
-            delay(5);
-            Serial.println(Alarm);
-          }
+        if (!driveMotorsL(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, curDelay, &motionModes)) {
+          KinematicError = 1;
+          break;
         }
+        updatePos();
 
         //increment angle
         cur_deg += theta_Deg;
@@ -6931,19 +8115,33 @@ void loop() {
         //writeSD(fn, cart_val);
         //writeSD(fn, joint_val);
       }
-      checkEncoders();
+      if (KinematicError == 1) {
+        Alarm = "ER";
+        if (splineTrue == false) {
+          delay(5);
+          Serial.println(Alarm);
+        }
+      } else if (TotalAxisFault != 0) {
+        if (splineTrue == false) {
+          delay(5);
+          Serial.println(Alarm);
+        }
+      } else {
+        checkEncoders();
+      }
       rndTrue = false;
       inData = "";  // Clear recieved buffer
-      if (splineTrue == false) {
+      if (
+        splineTrue == false
+        && KinematicError == 0
+        && TotalAxisFault == 0
+      ) {
         sendRobotPos();
       }
       ////////MOVE COMPLETE///////////
     }
 
 
-    //shift cmd buffer
-    inData = "";
-    cmdBuffer1 = "";
-    shiftCMDarray();
+    consume_current_command();
   }
 }

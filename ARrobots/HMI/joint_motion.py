@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from collections.abc import Mapping
 from enum import Enum
+import json
 import math
 from queue import Empty, Queue
 import re
@@ -37,8 +38,26 @@ CONTROL_POLL_INTERVAL_SECONDS = 0.05
 RESPONSE_TIMEOUT_SAFETY_SCALE = 1.25
 FIRMWARE_MINIMUM_RAMP_PERCENT = 10.0
 FIRMWARE_LEGACY_RAMP_NUMERATOR = 200.0
+CONTROLLER_MAXIMUM_RAMP_PERCENT = 100.0
 CONTROLLER_FLOAT_MAX = 3.4028234663852886e38
 CONTROLLER_SIGNED_INT_MAX = 2147483647
+CONTROLLER_RADIANS_PER_DEGREE = math.pi / 180.0
+CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1 = "JT_WRIST_CONFIG_V1"
+MAX_CONTROLLER_IDENTITY_FIELD_LENGTH = 31
+MAX_CONTROLLER_CAPABILITY_COUNT = 32
+MAX_CONTROLLER_FILENAME_BYTES = 255
+_FAT_RESERVED_FILENAME_CHARACTERS = frozenset('"*/:<>?\\|')
+_CONTROLLER_IDENTITY_FIELD_NAMES = (
+    ("DriverModel", "driver_model"),
+    ("FirmwareVersion", "firmware_version"),
+    ("RobotModel", "robot_model"),
+    ("RobotVersion", "robot_version"),
+    ("SerialNumber", "serial_number"),
+    ("AssetTag", "asset_tag"),
+)
+_CONTROLLER_IDENTITY_WIRE_FIELDS = frozenset(
+    wire_name for wire_name, _ in _CONTROLLER_IDENTITY_FIELD_NAMES
+) | {"ProtocolCapabilities"}
 _SERIAL_QUARANTINE_ATTRIBUTE = "_ar4_transport_quarantine_reason"
 _SERIAL_QUARANTINE_LOCK = threading.Lock()
 _SERIAL_QUARANTINED_PORTS = {}
@@ -301,7 +320,145 @@ class MotionTransportBusy(MotionQueueFault):
 
 
 class ProtocolResponseError(ValueError):
-    """A controller response does not satisfy the position-response contract."""
+    """A controller response violates the required protocol contract."""
+
+
+_CONTROLLER_MODBUS_READ_LIMITS = {
+    "BA": 65535,
+    "BB": 1,
+    "BC": 1,
+    "BH": 65535,
+    "BD": 65535,
+}
+_CONTROLLER_MODBUS_WRITE_RESPONSES = {
+    "BE": "Write Success",
+    "BF": "Write Success",
+    "SC": "1",
+    "SO": "1",
+    "WJ": "Done",
+    "WK": "Done",
+}
+
+
+def parse_controller_modbus_response(command, response):
+    if not isinstance(command, str) or len(command) < 2:
+        raise ProtocolResponseError("controller Modbus command is invalid")
+    if not isinstance(response, str) or not response:
+        raise ProtocolResponseError("controller Modbus response is empty or non-text")
+
+    opcode = command[:2]
+    maximum = _CONTROLLER_MODBUS_READ_LIMITS.get(opcode)
+    if maximum is not None:
+        if re.fullmatch(r"(?:0|[1-9][0-9]*)", response) is None:
+            raise ProtocolResponseError(
+                f"controller Modbus {opcode} response is not a canonical value"
+            )
+        value = int(response)
+        if value > maximum:
+            raise ProtocolResponseError(
+                f"controller Modbus {opcode} response exceeds the protocol range"
+            )
+        return response
+
+    expected = _CONTROLLER_MODBUS_WRITE_RESPONSES.get(opcode)
+    if expected is None:
+        raise ProtocolResponseError(
+            f"controller Modbus opcode {opcode!r} has no response contract"
+        )
+    if response != expected:
+        raise ProtocolResponseError(
+            f"controller Modbus {opcode} response is not {expected!r}"
+        )
+    return response
+
+
+@dataclass(frozen=True)
+class ControllerIdentity:
+    """Validated identity and protocol capabilities reported by a controller."""
+
+    driver_model: str
+    firmware_version: str
+    robot_model: str
+    robot_version: str
+    serial_number: str
+    asset_tag: str
+    protocol_capabilities: tuple
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for name, value in pairs:
+        if not isinstance(name, str) or name in result:
+            raise ProtocolResponseError(
+                "controller identity response contains a duplicated or invalid field"
+            )
+        result[name] = value
+    return result
+
+
+def parse_controller_identity_response(response):
+    if (
+        not isinstance(response, str)
+        or not response
+        or len(response) > MAX_RESPONSE_PAYLOAD_LENGTH
+        or "\n" in response
+        or "\r" in response
+    ):
+        raise ProtocolResponseError("controller identity response is invalid")
+    try:
+        payload = json.loads(response, object_pairs_hook=_unique_json_object)
+    except ProtocolResponseError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise ProtocolResponseError(
+            "controller identity response is not valid JSON"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ProtocolResponseError("controller identity response must be an object")
+    if frozenset(payload) != _CONTROLLER_IDENTITY_WIRE_FIELDS:
+        raise ProtocolResponseError(
+            "controller identity response fields do not match the protocol schema"
+        )
+
+    fields = {}
+    for wire_name, field_name in _CONTROLLER_IDENTITY_FIELD_NAMES:
+        value = payload.get(wire_name)
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > MAX_CONTROLLER_IDENTITY_FIELD_LENGTH
+            or not value.isascii()
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ProtocolResponseError(
+                f"controller identity field {wire_name} is invalid"
+            )
+        fields[field_name] = value
+
+    capabilities = payload.get("ProtocolCapabilities")
+    if (
+        not isinstance(capabilities, list)
+        or len(capabilities) > MAX_CONTROLLER_CAPABILITY_COUNT
+    ):
+        raise ProtocolResponseError(
+            "controller protocol capabilities must be a bounded list"
+        )
+    normalized_capabilities = []
+    for capability in capabilities:
+        if (
+            not isinstance(capability, str)
+            or re.fullmatch(r"[A-Z][A-Z0-9_]{0,30}", capability) is None
+            or capability in normalized_capabilities
+        ):
+            raise ProtocolResponseError(
+                "controller protocol capability is invalid or duplicated"
+            )
+        normalized_capabilities.append(capability)
+
+    return ControllerIdentity(
+        **fields,
+        protocol_capabilities=tuple(normalized_capabilities),
+    )
 
 
 class SerialTransportQuarantinedError(ConnectionError):
@@ -2018,6 +2175,24 @@ def _controller_float(value, field_name):
     return encoded
 
 
+def controller_degree_to_native_radians(value, field_name):
+    degrees = _controller_float(value, field_name)
+    radians = _controller_float(
+        degrees * CONTROLLER_RADIANS_PER_DEGREE,
+        f"{field_name} native radians",
+    )
+    controller_number(
+        radians / CONTROLLER_RADIANS_PER_DEGREE,
+        f"{field_name} native degrees",
+    )
+    return radians
+
+
+def _validate_controller_degree_value(value, field_name):
+    controller_degree_to_native_radians(value, field_name)
+    return _controller_float(value, field_name)
+
+
 def _controller_float_product(left, right, field_name):
     return _controller_float(left * right, field_name)
 
@@ -2104,8 +2279,11 @@ class MotionProfile:
             raise MotionInputError(
                 "acceleration and deceleration must not overlap"
             )
-        if not 0 < ramp <= 100:
-            raise MotionInputError("ramp must be in (0, 100]")
+        if not 0 < ramp <= CONTROLLER_MAXIMUM_RAMP_PERCENT:
+            raise MotionInputError(
+                "ramp must be in (0, "
+                f"{CONTROLLER_MAXIMUM_RAMP_PERCENT:g}]"
+            )
         if self.wrist_config not in ("N", "F"):
             raise MotionInputError("wrist_config must be 'N' or 'F'")
         if re.fullmatch(r"[01]{6}", self.loop_mode) is None:
@@ -2297,6 +2475,7 @@ class JointMove:
 
 
 _NUMBER = r"-?(?:\d+(?:\.\d*)?|\.\d+)"
+_NONNEGATIVE_NUMBER = r"(?:\d+(?:\.\d*)?|\.\d+)"
 
 
 def _numeric_fields(*fields):
@@ -2372,7 +2551,7 @@ _CIRCLE_FIELDS = _numeric_fields(
     ("Tr", "tr"),
 )
 _VALUE_FIELD = _numeric_fields(("V", "value"))
-_DISTANCE_FIELD = _numeric_fields(("", "distance"))
+_DISTANCE_FIELD = rf"(?P<distance>{_NONNEGATIVE_NUMBER})"
 _ROUNDING_FIELD = _numeric_fields(("", "rounding"))
 _VISION_ROTATION_FIELD = _numeric_fields(("", "vision_rotation"))
 _STANDARD_TIMING_PROFILE = re.compile(
@@ -2385,7 +2564,7 @@ _LEGACY_JOG_TIMING_PROFILE = re.compile(
     rf"S(?P<mode>[psm])(?P<speed>{_NUMBER})"
     rf"G(?P<acceleration>{_NUMBER})"
     rf"H(?P<deceleration>{_NUMBER})"
-    rf"I(?P<ramp>{_NUMBER})(?=Lm)"
+    rf"I(?P<ramp>{_NUMBER})(?=W)"
 )
 _FIELDLESS_COMMANDS = {
     "CP": re.compile(r"^CP\n\Z"),
@@ -2408,6 +2587,7 @@ _STANDARD_TIMING_ENVELOPES = {
 _VIRTUAL_TIMING_ENVELOPES = {
     "RJ": re.compile(rf"^RJ{_VIRTUAL_JOINT_FIELDS}(?=S)"),
     "MJ": re.compile(rf"^MJ{_VIRTUAL_CARTESIAN_FIELDS}(?=S)"),
+    "MV": re.compile(rf"^MV{_VIRTUAL_CARTESIAN_FIELDS}(?=S)"),
 }
 _LEGACY_TIMING_ENVELOPES = {
     "JT": re.compile(rf"^JT[XYZRPW][01]{_DISTANCE_FIELD}(?=S)"),
@@ -2418,24 +2598,28 @@ _STANDARD_TIMING_SUFFIXES = {
         for opcode in ("MA", "MC", "MG", "MJ", "RJ")
     },
     "ML": re.compile(
-        rf"Rnd{_ROUNDING_FIELD}W[NFA]Lm[01]{{6}}Q[01]\n\Z"
+        rf"Rnd{_ROUNDING_FIELD}W[NFA]Lm[01]{{6}}Q0\n\Z"
     ),
     "MV": re.compile(
         rf"W[NFA]Vr{_VISION_ROTATION_FIELD}Lm[01]{{6}}\n\Z"
     ),
+    "LJ": re.compile(r"WALm[01]{6}\n\Z"),
     **{
-        opcode: re.compile(r"WALm[01]{6}\n\Z")
-        for opcode in ("LC", "LJ", "LT")
+        opcode: re.compile(r"W[NFA]Lm[01]{6}\n\Z")
+        for opcode in ("LC", "LT")
     },
-    "WC": re.compile(
-        rf"(?:Rnd{_ROUNDING_FIELD})?W[NFA]Lm[01]{{6}}Fn[ -~]+\n\Z"
-    ),
-    "WG": re.compile(
-        rf"Rnd{_ROUNDING_FIELD}W[NFA]Lm[01]{{6}}Fn[ -~]+\n\Z"
-    ),
+    **{
+        opcode: re.compile(rf"W[NFA]Lm[01]{{6}}Fn[ -~]+\n\Z")
+        for opcode in ("WC", "WG")
+    },
+}
+_LIVE_JOG_MAXIMUM_AXES = {
+    "LC": 6,
+    "LJ": JOINT_COUNT,
+    "LT": 6,
 }
 _LEGACY_TIMING_SUFFIXES = {
-    "JT": re.compile(r"Lm[01]{6}\n\Z"),
+    "JT": re.compile(r"W[NFA]Lm[01]{6}\n\Z"),
 }
 _POSITION_RESPONSE = re.compile(
     rf"^A(?P<j1>{_NUMBER})B(?P<j2>{_NUMBER})C(?P<j3>{_NUMBER})"
@@ -2478,6 +2662,46 @@ def _canonicalize_protocol_numbers(command, *matches):
     return normalized, encoded_values
 
 
+def _validate_motion_angle_fields(command, opcode, encoded_values):
+    field_names = []
+    if opcode in ("MA", "MC", "MG", "MJ", "ML", "MV", "WC", "WG"):
+        field_names.extend(("rz", "ry", "rx"))
+    if opcode == "MV":
+        field_names.append("vision_rotation")
+    if opcode == "JT" and command[2:3] in ("W", "P", "R"):
+        field_names.append("distance")
+
+    for field_name in field_names:
+        if field_name not in encoded_values:
+            raise MotionInputError(
+                f"{opcode} command is missing angular field {field_name}"
+            )
+        _validate_controller_degree_value(
+            encoded_values[field_name],
+            f"command field {field_name}",
+        )
+
+
+def _validate_command_specific_motion_fields(opcode, mode, encoded_values):
+    if opcode == "ML" and encoded_values["rounding"] < 0:
+        raise MotionInputError("ML rounding must be non-negative")
+
+    maximum_axis = _LIVE_JOG_MAXIMUM_AXES.get(opcode)
+    if maximum_axis is None:
+        return
+    if mode != "p":
+        raise MotionInputError("live-jog speed mode must be Percent")
+
+    vector = encoded_values["value"]
+    if not vector.is_integer():
+        raise MotionInputError("live-jog vector must be an integer")
+    vector = int(vector)
+    axis = vector // 10
+    direction = vector % 10
+    if not 1 <= axis <= maximum_axis or direction not in (0, 1):
+        raise MotionInputError("live-jog vector is outside the controller domain")
+
+
 def _parse_timed_command(
     command,
     opcode,
@@ -2512,7 +2736,13 @@ def _parse_timed_command(
         match,
         suffix_match,
     )
+    _validate_motion_angle_fields(command, opcode, encoded_values)
+    if opcode in ("MA", "MC") and encoded_values.get("tr") != 0.0:
+        raise MotionInputError(
+            f"{opcode} trajectory rotation is unsupported and must be 0"
+        )
     mode = match.group("mode")
+    _validate_command_specific_motion_fields(opcode, mode, encoded_values)
     speed = encoded_values["speed"]
     acceleration = encoded_values["acceleration"]
     deceleration = encoded_values["deceleration"]
@@ -2529,8 +2759,11 @@ def _parse_timed_command(
         raise MotionInputError(
             "command acceleration and deceleration must not overlap"
         )
-    if ramp <= 0:
-        raise MotionInputError("command ramp must be positive")
+    if not 0 < ramp <= CONTROLLER_MAXIMUM_RAMP_PERCENT:
+        raise MotionInputError(
+            "command ramp must be in (0, "
+            f"{CONTROLLER_MAXIMUM_RAMP_PERCENT:g}]"
+        )
     return CommandTiming(mode, speed, acceleration, deceleration, ramp), normalized
 
 
@@ -2545,7 +2778,7 @@ def _parse_command_contract(command, virtual):
                     f"serial {opcode} command has an invalid fieldless contract"
                 )
             if opcode == "PG":
-                _validate_controller_filename(command[4:-1], "G-code filename")
+                validate_controller_filename(command[4:-1], "G-code filename")
             return None, command
     contract_name = "virtual" if virtual else "serial"
     envelopes = (
@@ -2576,25 +2809,30 @@ def _parse_command_contract(command, virtual):
         filename_index = normalized.find("Fn")
         if filename_index < 0:
             raise MotionInputError(f"serial {opcode} filename marker is missing")
-        _validate_controller_filename(
+        validate_controller_filename(
             normalized[filename_index + 2:-1],
             f"{opcode} filename",
         )
     return timing, normalized
 
 
-def _validate_controller_filename(filename, field_name):
+def validate_controller_filename(filename, field_name):
     if (
         not isinstance(filename, str)
         or not filename
         or filename in (".", "..")
-        or "/" in filename
-        or "\\" in filename
-        or ":" in filename
-        or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+        or any(
+            character in _FAT_RESERVED_FILENAME_CHARACTERS
+            for character in filename
+        )
+        or any(ord(character) < 32 or ord(character) > 126 for character in filename)
     ):
         raise MotionInputError(
-            f"{field_name} contains a path component or control character"
+            f"{field_name} contains a FAT-reserved or control character"
+        )
+    if len(filename.encode("ascii")) > MAX_CONTROLLER_FILENAME_BYTES:
+        raise MotionInputError(
+            f"{field_name} exceeds {MAX_CONTROLLER_FILENAME_BYTES} encoded bytes"
         )
     return filename
 
@@ -2649,6 +2887,16 @@ def parse_command_timing(command):
 def parse_virtual_command_timing(command):
     """Return timing from a validated simulator motion command."""
     return _parse_command_contract(command, virtual=True)[0]
+
+
+def parse_motion_wrist_config(command, virtual=False):
+    if not isinstance(virtual, bool):
+        raise TypeError("virtual wrist-config flag must be boolean")
+    normalized = _parse_command_contract(command, virtual=virtual)[1]
+    match = re.search(rf"W([NFA])(?:Vr{_NUMBER})?(?=Lm)", normalized)
+    if match is None:
+        raise MotionInputError("motion command is missing a wrist configuration")
+    return match.group(1)
 
 
 def parse_command_speed(command):
@@ -2729,8 +2977,11 @@ def motion_timing_response_timeout(
         raise MotionInputError(
             "command acceleration and deceleration must not overlap"
         )
-    if ramp <= 0:
-        raise MotionInputError("command ramp must be positive")
+    if not 0 < ramp <= CONTROLLER_MAXIMUM_RAMP_PERCENT:
+        raise MotionInputError(
+            "command ramp must be in (0, "
+            f"{CONTROLLER_MAXIMUM_RAMP_PERCENT:g}]"
+        )
 
     full_scale = finite_number(
         minimum_ramp_full_scale_seconds,

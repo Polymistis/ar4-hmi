@@ -1,3 +1,5 @@
+import json
+import math
 import re
 import struct
 import threading
@@ -10,13 +12,17 @@ from ARrobots.HMI.joint_motion import (
     AUXILIARY_BOARD_NANO,
     AUXILIARY_BOARD_NONE,
     AUXILIARY_BOARD_OUTPUT_PINS,
+    CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+    CONTROLLER_MAXIMUM_RAMP_PERCENT,
     CoalescingJointDispatcher,
     CommandTiming,
+    ControllerIdentity,
     ControllerJointCalibration,
     DeferredLiveMotionArbiter,
     LiveMotionScheduleResult,
     MAX_RESPONSE_FRAME_LENGTH,
     MAX_RESPONSE_PAYLOAD_LENGTH,
+    MAX_CONTROLLER_FILENAME_BYTES,
     DeferredJointAdjustments,
     MotionInputError,
     MotionProfile,
@@ -33,7 +39,9 @@ from ARrobots.HMI.joint_motion import (
     auxiliary_pneumatic_output_pin,
     build_robot_joint_command,
     canonicalize_serial_command,
+    canonicalize_virtual_command,
     command_response_timeout,
+    controller_degree_to_native_radians,
     controller_number,
     controller_protocol_decimal,
     decode_serial_response_line,
@@ -44,6 +52,9 @@ from ARrobots.HMI.joint_motion import (
     normalize_auxiliary_board_profile,
     parse_command_speed,
     parse_command_timing,
+    parse_controller_identity_response,
+    parse_controller_modbus_response,
+    parse_motion_wrist_config,
     parse_position_response,
     parse_virtual_command_timing,
     quarantine_serial_transport,
@@ -51,6 +62,7 @@ from ARrobots.HMI.joint_motion import (
     read_serial_line_response,
     read_serial_line_response_with_optional_followup,
     serial_transport_quarantined,
+    validate_controller_filename,
     validate_auxiliary_output_command,
     write_serial_control,
 )
@@ -2065,13 +2077,54 @@ class SerialLineExchangeTests(unittest.TestCase):
 
 
 class CommandResponseTimeoutTests(unittest.TestCase):
+    def test_modbus_response_contract_rejects_every_non_success_shape(self):
+        accepted = {
+            "BA": "65535",
+            "BB": "1",
+            "BC": "0",
+            "BH": "42",
+            "BD": "65535",
+            "BE": "Write Success",
+            "BF": "Write Success",
+            "SC": "1",
+            "SO": "1",
+            "WJ": "Done",
+            "WK": "Done",
+        }
+        for opcode, response in accepted.items():
+            with self.subTest(opcode=opcode):
+                self.assertEqual(
+                    parse_controller_modbus_response(
+                        f"{opcode}A1B0C1\n",
+                        response,
+                    ),
+                    response,
+                )
+
+        for opcode in accepted:
+            for response in ("ER", "Modbus Error", "-1", "", "Done "):
+                with self.subTest(opcode=opcode, response=response):
+                    with self.assertRaises(ProtocolResponseError):
+                        parse_controller_modbus_response(
+                            f"{opcode}A1B0C1\n",
+                            response,
+                        )
+
+        for opcode, response in (("BB", "2"), ("BC", "01"), ("BH", "65536")):
+            with self.subTest(opcode=opcode, response=response):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_controller_modbus_response(
+                        f"{opcode}A1B0C1\n",
+                        response,
+                    )
+
     @staticmethod
     def joint_command(timing):
         return f"RJA1B2C3D4E5F6J70J80J90{timing}WNLm000000\n"
 
     def test_parses_supported_timing_profiles(self):
         standard = self.joint_command("Ss200Ac10Dc20Rm25")
-        legacy_jog = "JTX11Sp50G10H20I25Lm000000\n"
+        legacy_jog = "JTX11Sp50G10H20I25WNLm000000\n"
 
         self.assertEqual(
             parse_command_timing(standard),
@@ -2086,6 +2139,106 @@ class CommandResponseTimeoutTests(unittest.TestCase):
             ("s", 200.0),
         )
         self.assertEqual(parse_command_speed("RP\n"), None)
+
+    def test_motion_wrist_config_comes_from_validated_command(self):
+        controller = self.joint_command("Sp50Ac10Dc20Rm25")
+        virtual = "JTX11Sp50G10H20I25WFLm000000\n"
+        vision = (
+            "MVX1Y2Z3Rz4Ry5Rx6J70J80J90"
+            "Sp50Ac10Dc20Rm25WNVr-12.5Lm000000\n"
+        )
+
+        self.assertEqual(parse_motion_wrist_config(controller), "N")
+        self.assertEqual(
+            parse_motion_wrist_config(virtual, virtual=True),
+            "F",
+        )
+        self.assertEqual(parse_motion_wrist_config(vision), "N")
+        with self.assertRaises(MotionInputError):
+            parse_motion_wrist_config(
+                "JTX11Sp50G10H20I25Lm000000\n",
+                virtual=True,
+            )
+
+    def test_tool_roll_direction_does_not_shadow_wrist_suffix(self):
+        command = "JTW11Sp50G10H20I25WFLm000000\n"
+
+        self.assertEqual(
+            parse_virtual_command_timing(command),
+            CommandTiming("p", 50.0, 10.0, 20.0, 25.0),
+        )
+        self.assertEqual(
+            parse_motion_wrist_config(command, virtual=True),
+            "F",
+        )
+
+    def test_negative_tool_distance_is_rejected_at_both_host_boundaries(self):
+        command = "JTW1-1Sp50G10H20I25WFLm000000\n"
+
+        with self.assertRaises(MotionInputError):
+            canonicalize_serial_command(command)
+        with self.assertRaises(MotionInputError):
+            canonicalize_virtual_command(command)
+
+    def test_motion_angles_reject_controller_radian_underflow(self):
+        tiny_angle = controller_protocol_decimal(1e-44, "tiny angle")
+        timing = "Sp50Ac10Dc20Rm25"
+        cartesian = (
+            f"MJX1Y2Z3Rz{tiny_angle}Ry0Rx0J70J80J90"
+            f"{timing}WNLm000000\n"
+        )
+        vision = (
+            "MVX1Y2Z3Rz0Ry0Rx0J70J80J90"
+            f"{timing}WNVr{tiny_angle}Lm000000\n"
+        )
+        discrete_tool = (
+            f"JTW1{tiny_angle}Sp50G10H20I25WFLm000000\n"
+        )
+        virtual_cartesian = (
+            f"MJX1Y2Z3Rz{tiny_angle}Ry0Rx0"
+            f"{timing}WNLm000000\n"
+        )
+
+        for command, virtual in (
+            (cartesian, False),
+            (vision, False),
+            (discrete_tool, False),
+            (virtual_cartesian, True),
+            (discrete_tool, True),
+        ):
+            with self.subTest(opcode=command[:2], virtual=virtual):
+                canonicalize = (
+                    canonicalize_virtual_command
+                    if virtual
+                    else canonicalize_serial_command
+                )
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "native radians",
+                ):
+                    canonicalize(command)
+
+        translation = f"JTX1{tiny_angle}Sp50G10H20I25WFLm000000\n"
+        self.assertIn(tiny_angle, canonicalize_serial_command(translation))
+        self.assertIn(tiny_angle, canonicalize_virtual_command(translation))
+
+    def test_controller_angle_conversion_rejects_native_degree_overflow(self):
+        largest_accepted_rotation = float.fromhex("0x1.fffffcp+127")
+        maximum_float32 = float.fromhex("0x1.fffffep+127")
+
+        self.assertTrue(
+            math.isfinite(
+                controller_degree_to_native_radians(
+                    largest_accepted_rotation,
+                    "test rotation",
+                )
+            )
+        )
+        with self.assertRaisesRegex(MotionInputError, "native degrees"):
+            controller_degree_to_native_radians(
+                maximum_float32,
+                "test rotation",
+            )
 
     def test_opcode_schema_ignores_timing_like_filename_payload(self):
         playback = "PGFnSampleGcode.txt\n"
@@ -2111,13 +2264,13 @@ class CommandResponseTimeoutTests(unittest.TestCase):
             f"ML{cartesian}{timing}Rnd0WNLm000000Q0\n",
             f"MV{cartesian}{timing}WNVr0Lm000000\n",
             f"WC{cartesian}{timing}WNLm000000Fndemo.txt\n",
-            f"WG{cartesian}{timing}Rnd0WNLm000000Fndemo.txt\n",
+            f"WG{cartesian}{timing}WNLm000000Fndemo.txt\n",
             (
-                "MAX1Y2Z3Rz4Ry5Rx6Ex7Ey8Ez9Tr10"
+                "MAX1Y2Z3Rz4Ry5Rx6Ex7Ey8Ez9Tr0"
                 f"{timing}WNLm000000\n"
             ),
             (
-                "MCCx1Cy2Cz3Rz4Ry5Rx6Bx7By8Bz9Px10Py11Pz12Tr13"
+                "MCCx1Cy2Cz3Rz4Ry5Rx6Bx7By8Bz9Px10Py11Pz12Tr0"
                 f"{timing}WNLm000000\n"
             ),
             f"LJV10{timing}WALm000000\n",
@@ -2128,6 +2281,71 @@ class CommandResponseTimeoutTests(unittest.TestCase):
         for command in commands:
             with self.subTest(command=command[:2]):
                 self.assertEqual(parse_command_timing(command), expected)
+
+    def test_live_jog_domains_match_firmware(self):
+        timing = "Sp50Ac10Dc20Rm25"
+        for opcode, maximum_axis, wrist in (
+            ("LC", 6, "N"),
+            ("LJ", 9, "A"),
+            ("LT", 6, "F"),
+        ):
+            for vector in (10, 11, maximum_axis * 10, maximum_axis * 10 + 1):
+                with self.subTest(opcode=opcode, vector=vector):
+                    command = (
+                        f"{opcode}V{vector}{timing}W{wrist}Lm000000\n"
+                    )
+                    self.assertEqual(
+                        parse_command_timing(command),
+                        CommandTiming("p", 50.0, 10.0, 20.0, 25.0),
+                    )
+
+        rejected = (
+            "LCV10Ss50Ac10Dc20Rm25WNLm000000\n",
+            "LJV10Sm50Ac10Dc20Rm25WALm000000\n",
+            "LTV0.1Sp50Ac10Dc20Rm25WFLm000000\n",
+            "LCV9Sp50Ac10Dc20Rm25WNLm000000\n",
+            "LJV100Sp50Ac10Dc20Rm25WALm000000\n",
+            "LTV62Sp50Ac10Dc20Rm25WFLm000000\n",
+        )
+        for command in rejected:
+            with self.subTest(command=command):
+                with self.assertRaises(MotionInputError):
+                    parse_command_timing(command)
+
+    def test_unsupported_motion_fields_fail_closed(self):
+        timing = "Sp50Ac10Dc20Rm25"
+        cartesian = "X1Y2Z3Rz4Ry5Rx6J70J80J90"
+
+        unsupported_suffixes = (
+            f"MG{cartesian}{timing}Rnd1WNLm000000\n",
+            f"MJ{cartesian}{timing}Rnd1WNLm000000\n",
+            f"ML{cartesian}{timing}Rnd0WNLm000000Q1\n",
+            f"MV{cartesian}{timing}Rnd1WNVr0Lm000000\n",
+            f"WC{cartesian}{timing}Rnd1WNLm000000Fndemo.txt\n",
+            f"WG{cartesian}{timing}Rnd1WNLm000000Fndemo.txt\n",
+            f"LJV10{timing}WNLm000000\n",
+            f"LJV10{timing}WFLm000000\n",
+        )
+        for command in unsupported_suffixes:
+            with self.subTest(command=command[:2]):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "invalid fields after timing",
+                ):
+                    parse_command_timing(command)
+        with self.assertRaisesRegex(MotionInputError, "trajectory rotation"):
+            parse_command_timing(
+                f"MAX1Y2Z3Rz4Ry5Rx6Ex7Ey8Ez9Tr1{timing}WNLm000000\n"
+            )
+        with self.assertRaisesRegex(MotionInputError, "trajectory rotation"):
+            parse_command_timing(
+                "MCCx1Cy2Cz3Rz4Ry5Rx6Bx7By8Bz9Px10Py11Pz12Tr-1"
+                f"{timing}WNLm000000\n"
+            )
+        with self.assertRaisesRegex(MotionInputError, "rounding"):
+            parse_command_timing(
+                f"ML{cartesian}{timing}Rnd-1WNLm000000Q0\n"
+            )
 
     def test_canonicalizes_every_controller_numeric_field(self):
         command = (
@@ -2180,24 +2398,62 @@ class CommandResponseTimeoutTests(unittest.TestCase):
         with self.assertRaisesRegex(MotionInputError, "J7 position"):
             canonicalize_serial_command(invalid_external, calibration)
 
-    def test_controller_filenames_reject_path_components(self):
+    def test_controller_filenames_reject_fat_reserved_characters(self):
         timing = "Sp50Ac10Dc20Rm25"
         cartesian = "X1Y2Z3Rz4Ry5Rx6J70J80J90"
         calibration = controller_calibration()
+        for reserved in '"*/:<>?\\|':
+            with self.subTest(reserved=reserved):
+                with self.assertRaisesRegex(MotionInputError, "FAT-reserved"):
+                    validate_controller_filename(
+                        f"demo{reserved}file.txt",
+                        "test filename",
+                    )
         commands = (
             "PGFn../demo.txt\n",
             "PGFnC:demo.txt\n",
             f"WC{cartesian}{timing}WNLm000000Fnfolder/demo.txt\n",
             f"WC{cartesian}{timing}WNLm000000Fnfolder/evilFndemo.txt\n",
-            f"WG{cartesian}{timing}Rnd0WNLm000000Fnfolder\\demo.txt\n",
+            f"WG{cartesian}{timing}WNLm000000Fnfolder\\demo.txt\n",
         )
 
         for command in commands:
             with self.subTest(opcode=command[:2]):
                 with self.assertRaisesRegex(
                     MotionInputError,
-                    "path component",
+                    "FAT-reserved",
                 ):
+                    canonicalize_serial_command(command, calibration)
+
+    def test_controller_filename_byte_limit_matches_storage_commands(self):
+        timing = "Sp50Ac10Dc20Rm25"
+        cartesian = "X1Y2Z3Rz4Ry5Rx6J70J80J90"
+        calibration = controller_calibration()
+        maximum = "a" * MAX_CONTROLLER_FILENAME_BYTES
+        oversized = maximum + "a"
+
+        self.assertEqual(
+            validate_controller_filename(maximum, "test filename"),
+            maximum,
+        )
+        for command in (
+            f"PGFn{maximum}\n",
+            f"WC{cartesian}{timing}WNLm000000Fn{maximum}\n",
+            f"WG{cartesian}{timing}WNLm000000Fn{maximum}\n",
+        ):
+            with self.subTest(accepted=command[:2]):
+                self.assertEqual(
+                    canonicalize_serial_command(command, calibration),
+                    command,
+                )
+
+        for command in (
+            f"PGFn{oversized}\n",
+            f"WC{cartesian}{timing}WNLm000000Fn{oversized}\n",
+            f"WG{cartesian}{timing}WNLm000000Fn{oversized}\n",
+        ):
+            with self.subTest(rejected=command[:2]):
+                with self.assertRaisesRegex(MotionInputError, "encoded bytes"):
                     canonicalize_serial_command(command, calibration)
 
     def test_rejects_ambiguous_or_unrepresentable_envelope_numbers(self):
@@ -2213,7 +2469,7 @@ class CommandResponseTimeoutTests(unittest.TestCase):
                 "MLX1Y2Z3Rz4Ry5Rx6J70J80J90"
                 f"{timing}Rnd{overflow}WNLm000000Q0\n"
             ),
-            f"JTX1{overflow}{timing}Lm000000\n",
+            f"JTX1{overflow}{timing}WNLm000000\n",
         )
 
         for command in commands:
@@ -2230,7 +2486,7 @@ class CommandResponseTimeoutTests(unittest.TestCase):
         virtual_commands = (
             f"RJA1B2C3D4E5F6{timing}WNLm000000\n",
             f"MJX1Y2Z3Rz4Ry5Rx6{timing}WALm000000\n",
-            "JTX11Sp50G10H20I25Lm000000\n",
+            "JTX11Sp50G10H20I25WNLm000000\n",
         )
         expected = CommandTiming("p", 50.0, 10.0, 20.0, 25.0)
 
@@ -2269,6 +2525,7 @@ class CommandResponseTimeoutTests(unittest.TestCase):
             "Sp50Ac10Dc100Rm25",
             "Sp50Ac60Dc41Rm25",
             "Sp50Ac10Dc20Rm0",
+            "Sp50Ac10Dc20Rm100.1",
             "SpnanAc10Dc20Rm25",
             "Sx50Ac10Dc20Rm25",
             "Sp50Ac10Dc20",
@@ -2278,13 +2535,41 @@ class CommandResponseTimeoutTests(unittest.TestCase):
                 with self.assertRaises(MotionInputError):
                     parse_command_timing(self.joint_command(timing))
 
+    def test_typed_and_raw_ramp_contracts_share_firmware_boundaries(self):
+        maximum = CONTROLLER_MAXIMUM_RAMP_PERCENT
+        command = self.joint_command(f"Sp50Ac10Dc20Rm{maximum:g}")
+
+        self.assertEqual(parse_command_timing(command).ramp, maximum)
+        self.assertEqual(
+            MotionProfile("Sp", 50, 10, 20, maximum, "N", "000000").ramp,
+            maximum,
+        )
+        for rejected in (0, maximum + 0.00001, 200):
+            with self.subTest(rejected=rejected):
+                with self.assertRaises(MotionInputError):
+                    parse_command_timing(
+                        self.joint_command(
+                            f"Sp50Ac10Dc20Rm{rejected:.17g}"
+                        )
+                    )
+                with self.assertRaises(MotionInputError):
+                    MotionProfile(
+                        "Sp",
+                        50,
+                        10,
+                        20,
+                        rejected,
+                        "N",
+                        "000000",
+                    )
+
     def test_opcode_schemas_reject_missing_required_suffix_fields(self):
         cartesian = "X1Y2Z3Rz4Ry5Rx6J70J80J90"
         timing = "Sp50Ac10Dc20Rm25"
 
         with self.assertRaises(MotionInputError):
             parse_command_timing(
-                f"WG{cartesian}{timing}WNLm000000Fndemo.txt\n"
+                f"WG{cartesian}{timing}WNLm000000\n"
             )
 
     def test_rejects_overlapping_acceleration_and_deceleration_regions(self):
@@ -2385,7 +2670,6 @@ class CommandResponseTimeoutTests(unittest.TestCase):
             ("Sp1Ac10Dc20Rm10", 250010.0),
             ("Sm2Ac10Dc20Rm10", 2510.0),
             ("Sp100Ac10Dc20Rm100", 1260.0),
-            ("Sp100Ac10Dc20Rm200", 2510.0),
         )
         for timing, expected in cases:
             with self.subTest(timing=timing):
@@ -2696,6 +2980,117 @@ class JointMotionProtocolTests(unittest.TestCase):
         self.assertTrue(parsed.speed_violation)
         self.assertEqual(parsed.debug, "42.5")
         self.assertEqual(parsed.flag, "EC000000")
+
+    def test_parses_controller_identity_and_capabilities(self):
+        response = json.dumps(
+            {
+                "DriverModel": "Teensy 4.1",
+                "FirmwareVersion": "6.7.1-ar4hmi.1",
+                "RobotModel": 'AR4\\"Model',
+                "RobotVersion": "MK3",
+                "SerialNumber": "SN\\42",
+                "AssetTag": "Unset",
+                "ProtocolCapabilities": ["JT_WRIST_CONFIG_V1"],
+            },
+            separators=(",", ":"),
+        )
+
+        identity = parse_controller_identity_response(response)
+
+        self.assertIsInstance(identity, ControllerIdentity)
+        self.assertEqual(identity.firmware_version, "6.7.1-ar4hmi.1")
+        self.assertEqual(identity.robot_model, 'AR4\\"Model')
+        self.assertEqual(identity.serial_number, "SN\\42")
+        self.assertIn(
+            CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+            identity.protocol_capabilities,
+        )
+
+    def test_controller_identity_fields_match_firmware_storage_contract(self):
+        payload = {
+            "DriverModel": "Teensy 4.1",
+            "FirmwareVersion": "6.7.1-ar4hmi.1",
+            "RobotModel": "A" * 31,
+            "RobotVersion": "MK3",
+            "SerialNumber": "Unset",
+            "AssetTag": "Unset",
+            "ProtocolCapabilities": ["JT_WRIST_CONFIG_V1"],
+        }
+        self.assertEqual(
+            parse_controller_identity_response(
+                json.dumps(payload, separators=(",", ":"))
+            ).robot_model,
+            "A" * 31,
+        )
+
+        for legacy_printable in (
+            " AR4",
+            "AR4 ",
+            "AR[4",
+            "AR]4",
+            "AR[M]4",
+            "AR[V]4",
+            "AR[B]4",
+            "AR[S]4",
+            "AR[A]4",
+        ):
+            with self.subTest(legacy_printable=legacy_printable):
+                payload["RobotModel"] = legacy_printable
+                self.assertEqual(
+                    parse_controller_identity_response(
+                        json.dumps(payload, separators=(",", ":"))
+                    ).robot_model,
+                    legacy_printable,
+                )
+
+        for invalid in ("", "A" * 32, "AR\n4", "ARé"):
+            with self.subTest(invalid=invalid):
+                payload["RobotModel"] = invalid
+                with self.assertRaises(ProtocolResponseError):
+                    parse_controller_identity_response(
+                        json.dumps(payload, separators=(",", ":"))
+                    )
+
+    def test_rejects_malformed_controller_identity_capabilities(self):
+        base = (
+            '{"DriverModel":"Teensy 4.1","FirmwareVersion":"version",'
+            '"RobotModel":"AR4","RobotVersion":"MK3",'
+            '"SerialNumber":"Unset","AssetTag":"Unset",'
+            '"ProtocolCapabilities":%s}'
+        )
+        malformed = (
+            "null",
+            '"JT_WRIST_CONFIG_V1"',
+            '["lowercase"]',
+            f'["{"A" * 32}"]',
+            '["JT_WRIST_CONFIG_V1","JT_WRIST_CONFIG_V1"]',
+        )
+
+        for capabilities in malformed:
+            with self.subTest(capabilities=capabilities):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_controller_identity_response(base % capabilities)
+
+    def test_controller_identity_requires_an_exact_unique_schema(self):
+        valid = (
+            '{"DriverModel":"Teensy 4.1","FirmwareVersion":"version",'
+            '"RobotModel":"AR4","RobotVersion":"MK3",'
+            '"SerialNumber":"Unset","AssetTag":"Unset",'
+            '"ProtocolCapabilities":["JT_WRIST_CONFIG_V1"]}'
+        )
+        malformed = (
+            valid.replace(',"AssetTag":"Unset"', ''),
+            valid[:-1] + ',"Unexpected":true}',
+            valid.replace(
+                '"RobotModel":"AR4"',
+                '"RobotModel":"AR4","RobotModel":"AR5"',
+            ),
+        )
+
+        for response in malformed:
+            with self.subTest(response=response):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_controller_identity_response(response)
 
     def test_rejects_non_firmware_debug_and_fault_payloads(self):
         raw = position_response((1, 2, 3, 4, 5, 6))

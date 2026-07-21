@@ -177,6 +177,7 @@ from ARrobots.HMI.joint_motion import (
   AUXILIARY_BOARD_MEGA,
   AUXILIARY_BOARD_NANO,
   AUXILIARY_BOARD_NONE,
+  CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
   CoalescingJointDispatcher,
   CONTROL_POLL_INTERVAL_SECONDS,
   ControllerJointCalibration,
@@ -204,6 +205,8 @@ from ARrobots.HMI.joint_motion import (
   canonicalize_serial_command,
   canonicalize_virtual_command,
   command_response_timeout,
+  controller_degree_to_native_radians,
+  controller_number,
   controller_protocol_decimal,
   controller_ratio,
   decode_serial_response_line,
@@ -213,6 +216,9 @@ from ARrobots.HMI.joint_motion import (
   motion_timing_response_timeout,
   normalize_auxiliary_board_profile,
   parse_command_timing,
+  parse_controller_identity_response,
+  parse_controller_modbus_response,
+  parse_motion_wrist_config,
   parse_position_response,
   parse_virtual_command_timing,
   quarantine_serial_transport,
@@ -221,6 +227,7 @@ from ARrobots.HMI.joint_motion import (
   read_serial_line_response_with_optional_followup,
   serial_transport_quarantined,
   validate_auxiliary_output_command,
+  validate_controller_filename,
   write_serial_control,
 )
 
@@ -395,6 +402,7 @@ drive_lock = threading.Lock()
 serial_lock = threading.Lock()
 main_serial_operation_state = threading.local()
 manual_motion_request_state = threading.local()
+motion_request_admission_state = threading.local()
 serial_write_lock = threading.Lock()
 serial_event_queue = Queue()
 auxiliary_serial_lock = threading.Lock()
@@ -422,6 +430,7 @@ controller_correction_requested = threading.Event()
 controller_correction_state_lock = threading.Lock()
 manual_motion_pose_pending = threading.Event()
 controller_position_resynchronization_required = threading.Event()
+kinematics_configuration_ready = threading.Event()
 acknowledged_forced_position_lock = threading.Lock()
 acknowledged_forced_position_target = None
 virtual_motion_event_queue = Queue()
@@ -582,11 +591,21 @@ def _main_serial_transmit_required(transmit=True):
   return transmit is not False
 
 
-def _synchronous_motion_request(name, rejection_result=False):
+def _synchronous_motion_request(
+  name,
+  rejection_result=False,
+  requires_kinematics=True,
+):
+  if not isinstance(requires_kinematics, bool):
+    raise TypeError("kinematics admission flag must be boolean")
+
   def decorate(callback):
     @wraps(callback)
     def guarded(*args, **kwargs):
-      request_lease = _acquire_motion_request(name)
+      request_lease = _acquire_motion_request(
+        name,
+        requires_kinematics=requires_kinematics,
+      )
       if request_lease is None:
         return rejection_result
       try:
@@ -1488,39 +1507,132 @@ CAL['DisableWristRotVal'] = tk.IntVar(value=0)
 #DEG2RAD = np.pi / 180
 #RAD2DEG = 180 / np.pi
 
-def _set_cpp_kinematics_from_values(values):
+def _validated_native_ordered_values(values, length, label):
+    if not isinstance(values, (list, tuple)):
+        raise MotionInputError(f"{label} must be an ordered numeric sequence")
+    if len(values) != length:
+        count = "six" if length == 6 else str(length)
+        raise MotionInputError(f"{label} must contain {count} values")
+    return tuple(
+        finite_number(value, f"{label} field {index}")
+        for index, value in enumerate(values, start=1)
+    )
+
+
+def _validated_native_tool_frame(values, label):
+    tool_frame = tuple(
+        controller_number(values[key], f"{label} {key}")
+        for key in ('TFx', 'TFy', 'TFz', 'TFrx', 'TFry', 'TFrz')
+    )
+    for key, degrees in zip(('TFrx', 'TFry', 'TFrz'), tool_frame[3:]):
+        controller_degree_to_native_radians(
+            degrees,
+            f"{label} {key}",
+        )
+    return tool_frame
+
+
+def _validated_native_kinematics_rotations(values):
     theta = tuple(
-        math.radians(finite_number(values[f'J{axis}ΘDHpar'], f"J{axis} theta"))
+        controller_degree_to_native_radians(
+            values[f'J{axis}ΘDHpar'],
+            f"J{axis} theta",
+        )
         for axis in range(1, 7)
     )
     alpha = tuple(
-        math.radians(finite_number(values[f'J{axis}αDHpar'], f"J{axis} alpha"))
+        controller_degree_to_native_radians(
+            values[f'J{axis}αDHpar'],
+            f"J{axis} alpha",
+        )
         for axis in range(1, 7)
     )
+    tool_frame = _validated_native_tool_frame(values, "tool-frame")
+    return theta, alpha, tool_frame
+
+
+def _active_tool_frame():
+    return _validated_native_tool_frame(CAL, "active tool-frame")
+
+
+def _prepare_cpp_kinematics_configuration(values):
+    (
+        theta,
+        alpha,
+        tool_frame,
+    ) = _validated_native_kinematics_rotations(values)
     link_a = tuple(
-        finite_number(values[f'J{axis}aDHpar'], f"J{axis} link a")
+        controller_number(values[f'J{axis}aDHpar'], f"J{axis} link a")
         for axis in range(1, 7)
     )
     link_d = tuple(
-        finite_number(values[f'J{axis}dDHpar'], f"J{axis} link d")
+        controller_number(values[f'J{axis}dDHpar'], f"J{axis} link d")
         for axis in range(1, 7)
     )
     positive_limits = tuple(
-        finite_number(values[f'J{axis}PosLim'], f"J{axis} positive limit")
+        controller_number(
+            values[f'J{axis}PosLim'],
+            f"J{axis} positive limit",
+        )
         for axis in range(1, 7)
     )
     negative_limits = tuple(
-        finite_number(values[f'J{axis}NegLim'], f"J{axis} negative limit")
+        controller_number(
+            values[f'J{axis}NegLim'],
+            f"J{axis} negative limit",
+        )
         for axis in range(1, 7)
     )
-    tool_frame = tuple(
-        finite_number(values[key], f"tool-frame {key}")
-        for key in ('TFx', 'TFy', 'TFz', 'TFrz', 'TFry', 'TFrx')
+    for axis, (positive, negative) in enumerate(
+        zip(positive_limits, negative_limits),
+        start=1,
+    ):
+        if positive < 0 or negative < 0:
+            raise MotionInputError(
+                f"J{axis} joint limits must be non-negative magnitudes"
+            )
+
+    configuration_writer = getattr(robot, 'set_robot_configuration', None)
+    configured_solver = getattr(robot, 'SolveInverseKinematicsConfigured', None)
+    missing = tuple(
+        name
+        for name, function in (
+            ('set_robot_configuration', configuration_writer),
+            ('SolveInverseKinematicsConfigured', configured_solver),
+        )
+        if not callable(function)
+    )
+    if missing:
+        raise MotionInputError(
+            "native kinematics module lacks the required configured API: "
+            + ", ".join(missing)
+        )
+    return (
+        configuration_writer,
+        theta + alpha + link_a + link_d,
+        positive_limits,
+        negative_limits,
+        tool_frame,
     )
 
-    robot.set_dh_parameters_explicit(*(theta + alpha + link_a + link_d))
-    robot.set_joint_limits(positive_limits, negative_limits)
-    robot.set_robot_tool_frame(*tool_frame)
+
+def _set_cpp_kinematics_from_values(values):
+    kinematics_configuration_ready.clear()
+    (
+        configuration_writer,
+        dh_parameters,
+        positive_limits,
+        negative_limits,
+        tool_frame,
+    ) = _prepare_cpp_kinematics_configuration(values)
+    configuration = (
+        dh_parameters,
+        positive_limits,
+        negative_limits,
+        tool_frame,
+    )
+    configuration_writer(*configuration)
+    kinematics_configuration_ready.set()
     return True
 
 
@@ -1545,7 +1657,7 @@ def update_CPP_kin_from_entries():
             'TFrz': TFrzEntryField.get(),
         })
         return _set_cpp_kinematics_from_values(values)
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, MotionInputError) as exc:
         logger.error("Invalid parameter input: %s", exc)
         return False
 
@@ -1574,16 +1686,13 @@ def refresh_gui_from_joint_angles(joint_angles):
             joint_angles,
             "virtual GUI refresh joints",
         )
-        fk_xyzuvw = _validated_virtual_six_vector(
-            robot.forward_kinematics(joints),
+        xyzuvw = _forward_kinematics_display_pose(
+            joints,
             "virtual GUI refresh Cartesian pose",
         )
     except Exception as exc:
         raise MotionInputError(f"Forward kinematics refresh failed: {exc}") from exc
 
-    xyzuvw = fk_xyzuvw[:3] + tuple(
-        math.degrees(value) for value in fk_xyzuvw[3:]
-    )
     RUN['VR_angles'] = list(joints)
     setStepMonitorsVR()
 
@@ -1714,6 +1823,178 @@ def _validated_virtual_six_vector(values, label):
     )
 
 
+def _external_cartesian_pose_to_native(values, label):
+    external = _validated_virtual_six_vector(values, label)
+    # Display and line protocol use Rz/Ry/Rx; native kinematics uses Rx/Ry/Rz.
+    return external[:3] + (external[5], external[4], external[3])
+
+
+def _native_cartesian_pose_to_external(values, label):
+    native = _validated_virtual_six_vector(values, label)
+    return native[:3] + (native[5], native[4], native[3])
+
+
+def _forward_kinematics_display_pose(joint_angles, label):
+    native_radians = _validated_virtual_six_vector(
+        robot.forward_kinematics(joint_angles),
+        label,
+    )
+    native_degrees = native_radians[:3] + tuple(
+        math.degrees(value) for value in native_radians[3:]
+    )
+    return _native_cartesian_pose_to_external(native_degrees, label)
+
+
+IK_POSITION_TOLERANCE_MILLIMETRES = 0.1
+IK_ROTATION_TOLERANCE_DEGREES = 0.1
+IK_JOINT_LIMIT_TOLERANCE_DEGREES = 0.001
+IK_WRIST_SINGULARITY_DEGREES = 2.0
+
+
+def _validated_wrist_config(value):
+    if not isinstance(value, str):
+        raise MotionInputError("wrist configuration must be text")
+    wrist_config = value.strip().upper()
+    if wrist_config not in ('A', 'F', 'N'):
+        raise MotionInputError("wrist configuration must be A, F, or N")
+    return wrist_config
+
+
+def _rotation_vector_matrix(rotation_vector):
+    vector = _validated_virtual_six_vector(
+        (0.0, 0.0, 0.0, *rotation_vector),
+        "rotation vector",
+    )[3:]
+    angle = math.sqrt(sum(component * component for component in vector))
+    if angle <= 1e-12:
+        return (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    x, y, z = (component / angle for component in vector)
+    sine = math.sin(angle)
+    cosine = math.cos(angle)
+    complement = 1.0 - cosine
+    return (
+        x * x * complement + cosine,
+        x * y * complement - z * sine,
+        x * z * complement + y * sine,
+        y * x * complement + z * sine,
+        y * y * complement + cosine,
+        y * z * complement - x * sine,
+        z * x * complement - y * sine,
+        z * y * complement + x * sine,
+        z * z * complement + cosine,
+    )
+
+
+def _rotation_error_degrees(target_rotation, actual_rotation):
+    target_matrix = _rotation_vector_matrix(target_rotation)
+    actual_matrix = _rotation_vector_matrix(actual_rotation)
+    chord = math.sqrt(sum(
+        (actual - target) ** 2
+        for actual, target in zip(actual_matrix, target_matrix)
+    ))
+    half_sine = min(1.0, chord / math.sqrt(8.0))
+    return math.degrees(2.0 * math.asin(half_sine))
+
+
+def _validate_inverse_kinematics_result(target, result, wrist_config):
+    if result is None:
+        return None
+    if isinstance(result, (list, tuple)) and not result:
+        return None
+    joints = _validated_native_ordered_values(
+        result,
+        6,
+        "inverse kinematics result",
+    )
+
+    for axis, joint in enumerate(joints, start=1):
+        positive = controller_number(
+            CAL[f'J{axis}PosLim'],
+            f"J{axis} positive limit",
+        )
+        negative = controller_number(
+            CAL[f'J{axis}NegLim'],
+            f"J{axis} negative limit",
+        )
+        if positive < 0 or negative < 0:
+            raise MotionInputError(
+                f"J{axis} joint limits must be non-negative magnitudes"
+            )
+        if (
+            joint < -negative - IK_JOINT_LIMIT_TOLERANCE_DEGREES
+            or joint > positive + IK_JOINT_LIMIT_TOLERANCE_DEGREES
+        ):
+            raise MotionInputError(
+                f"inverse kinematics result exceeds J{axis} limits"
+            )
+
+    if abs(joints[4]) > IK_WRIST_SINGULARITY_DEGREES:
+        if wrist_config == 'F' and joints[4] < 0:
+            raise MotionInputError(
+                "inverse kinematics result violates the F wrist branch"
+            )
+        if wrist_config == 'N' and joints[4] > 0:
+            raise MotionInputError(
+                "inverse kinematics result violates the N wrist branch"
+            )
+
+    actual_pose = _validated_native_ordered_values(
+        robot.forward_kinematics(joints),
+        6,
+        "inverse kinematics round-trip pose",
+    )
+    position_error = math.sqrt(sum(
+        (actual - expected) ** 2
+        for actual, expected in zip(actual_pose[:3], target[:3])
+    ))
+    rotation_error = _rotation_error_degrees(
+        tuple(math.radians(value) for value in target[3:]),
+        actual_pose[3:],
+    )
+    if position_error > IK_POSITION_TOLERANCE_MILLIMETRES:
+        raise MotionInputError(
+            "inverse kinematics result failed Cartesian position validation"
+        )
+    if rotation_error > IK_ROTATION_TOLERANCE_DEGREES:
+        raise MotionInputError(
+            "inverse kinematics result failed Cartesian rotation validation"
+        )
+    return joints
+
+
+def _solve_inverse_kinematics(target, estimate, wrist_config):
+    target_vector = _validated_virtual_six_vector(
+        target,
+        "inverse kinematics target",
+    )
+    estimate_vector = _validated_virtual_six_vector(
+        estimate,
+        "inverse kinematics estimate",
+    )
+    wrist_config = _validated_wrist_config(wrist_config)
+
+    configured_solver = getattr(
+        robot,
+        'SolveInverseKinematicsConfigured',
+        None,
+    )
+    if not callable(configured_solver):
+        raise MotionInputError(
+            "native kinematics module lacks the required configured solver"
+        )
+    result = configured_solver(
+        target_vector,
+        estimate_vector,
+        wrist_config,
+    )
+
+    return _validate_inverse_kinematics_result(
+        target_vector,
+        result,
+        wrist_config,
+    )
+
+
 def driveMotorsJ(
     J1step, J2step, J3step, J4step, J5step, J6step,
     J1dir, J2dir, J3dir, J4dir, J5dir, J6dir,
@@ -1734,8 +2015,6 @@ def driveMotorsJ(
             cartesian_target,
             "Cartesian timing target",
         )
-
-    limits = robot.get_joint_limits()
 
     steps = [int(round(J1step)), int(round(J2step)), int(round(J3step)),
              int(round(J4step)), int(round(J5step)), int(round(J6step))]
@@ -1895,22 +2174,67 @@ def parse_mj_command(inData):
 
     vals = [float(v) for v in match.groups()]
     return {
-        "xyzuvw": vals[:6],
+        "xyzuvw": _external_cartesian_pose_to_native(
+            vals[:6],
+            "MJ Cartesian pose",
+        ),
         "SpeedType": normalized[normalized.find("S") + 1],
         "Speed": vals[6],
         "Acc": vals[7],
         "Dec": vals[8],
-        "Ramp": vals[9]
+        "Ramp": vals[9],
+        "WristConfig": parse_motion_wrist_config(normalized, virtual=True),
     }
 
+
+def _vision_rotation_degrees(in_data):
+    normalized = canonicalize_virtual_command(in_data)
+    vision_start = normalized.find("Vr")
+    loop_mode_start = normalized.find("Lm", vision_start + 2)
+    if vision_start < 0 or loop_mode_start <= vision_start + 2:
+        raise MotionInputError("MV command is missing the vision rotation")
+    value = controller_number(
+        normalized[vision_start + 2:loop_mode_start],
+        "MV vision rotation",
+    )
+    controller_degree_to_native_radians(value, "MV vision rotation")
+    return value
+
+
+@contextmanager
+def _temporary_vision_tool_rotation(vision_rotation_degrees):
+    original_tool_frame = _validated_virtual_six_vector(
+        robot.get_robot_tool_frame(),
+        "MV tool frame",
+    )
+    adjusted_tool_frame = list(original_tool_frame)
+    adjusted_tool_frame[3] = controller_number(
+        adjusted_tool_frame[3] - vision_rotation_degrees,
+        "MV adjusted tool Rx",
+    )
+    controller_degree_to_native_radians(
+        adjusted_tool_frame[3],
+        "MV adjusted tool Rx",
+    )
+    robot.set_robot_tool_frame(*adjusted_tool_frame)
+    try:
+        yield
+    finally:
+        robot.set_robot_tool_frame(*original_tool_frame)
+
 def parse_mt_command(inData):
+    try:
+        normalized = canonicalize_virtual_command(inData)
+    except MotionInputError as exc:
+        logger.error("Tool jog command parse failed: %s", exc)
+        return None
     axis_map = {
         'JTX': 0, 'JTY': 1, 'JTZ': 2,
-        'JTR': 3, 'JTP': 4, 'JTW': 5
+        'JTW': 3, 'JTP': 4, 'JTR': 5
     }
 
     # Extract axis and direction (e.g., JTX1 or JTP0)
-    axis_match = re.search(r'(JT[XYZRPW])([01])([-+]?[0-9.]+)', inData)
+    axis_match = re.search(r'(JT[XYZRPW])([01])([-+]?[0-9.]+)', normalized)
     if not axis_match:
         logger.error("Tool jog command parse failed (axis part)")
         return None
@@ -1925,16 +2249,18 @@ def parse_mt_command(inData):
 
     axis_index = axis_map[axis_str]
     offset_vector = [0.0] * 6
-    offset_vector[axis_index] = -value if direction == 1 else value
+    offset_vector[axis_index] = value if direction == 1 else -value
 
     # Extract speed and ramp values
     try:
-        SpeedType = inData[inData.index("S") + 1]
-        Speed = float(inData[inData.index("S") + 2 : inData.index("G")])
-        Acc = float(inData[inData.index("G") + 1 : inData.index("H")])
-        Dec = float(inData[inData.index("H") + 1 : inData.index("I")])
-        Ramp = float(inData[inData.index("I") + 1 : inData.index("Lm")])
-        LoopMode = inData.split("Lm")[1].strip()
+        timing = parse_virtual_command_timing(normalized)
+        SpeedType = timing.mode
+        Speed = timing.speed
+        Acc = timing.acceleration
+        Dec = timing.deceleration
+        Ramp = timing.ramp
+        LoopMode = normalized.split("Lm")[1].strip()
+        wrist_config = parse_motion_wrist_config(normalized, virtual=True)
     except Exception as e:
         logger.error(f"Tool jog command parse failed (parameters): {e}")
         return None
@@ -1946,7 +2272,8 @@ def parse_mt_command(inData):
         "Acc": Acc,
         "Dec": Dec,
         "Ramp": Ramp,
-        "LoopMode": LoopMode
+        "LoopMode": LoopMode,
+        "WristConfig": wrist_config,
     }
 
 
@@ -2081,8 +2408,17 @@ def mj_command(inData):
 
     RUN['xyzuvw_In'] = target_xyzuvw
 
-    # IK call
-    RUN['JangleOut'] = robot.SolveInverseKinematics(RUN['xyzuvw_In'], RUN['VR_angles'])
+    try:
+        RUN['JangleOut'] = _solve_inverse_kinematics(
+            RUN['xyzuvw_In'],
+            RUN['VR_angles'],
+            result["WristConfig"],
+        )
+    except Exception as exc:
+        logger.error("Virtual Cartesian IK failed: %s", exc)
+        if RUN['offlineMode']:
+            ErrorHandler("ER")
+        return False
 
     if RUN['JangleOut'] is None:
         if RUN['offlineMode']:
@@ -2138,6 +2474,18 @@ def mj_command(inData):
     return False
 
 
+def mv_command(in_data):
+    try:
+        vision_rotation = _vision_rotation_degrees(in_data)
+        with _temporary_vision_tool_rotation(vision_rotation):
+            return mj_command(in_data)
+    except Exception as exc:
+        logger.error("Virtual vision move failed: %s", exc)
+        if RUN['offlineMode']:
+            ErrorHandler("ER")
+        return False
+
+
 
 
 def mt_command(inData):
@@ -2155,30 +2503,31 @@ def mt_command(inData):
         return
     
     offset = [float(v) for v in result["offset_vector"]]
-    original_tool_frame = tuple(
-        finite_number(field.get(), f"tool-frame field {index}")
-        for index, field in enumerate((
-            TFxEntryField,
-            TFyEntryField,
-            TFzEntryField,
-            TFrzEntryField,
-            TFryEntryField,
-            TFrxEntryField,
-        ), start=1)
+    original_tool_frame = _active_tool_frame()
+    jogged_tool_frame = tuple(
+        original + delta
+        for original, delta in zip(original_tool_frame, offset)
     )
-    robot.set_robot_tool_frame(*offset)
+    robot.set_robot_tool_frame(*jogged_tool_frame)
     try:
-        RUN['xyzuvw_In'] = np.array([
-            float(CAL['XcurPos']),
-            float(CAL['YcurPos']),
-            float(CAL['ZcurPos']),
-            float(CAL['RzcurPos']),
-            float(CAL['RycurPos']),
-            float(CAL['RxcurPos'])
-        ], dtype=float)
-        RUN['JangleOut'] = robot.SolveInverseKinematics(
+        RUN['xyzuvw_In'] = np.array(
+            _external_cartesian_pose_to_native(
+                (
+                    CAL['XcurPos'],
+                    CAL['YcurPos'],
+                    CAL['ZcurPos'],
+                    CAL['RzcurPos'],
+                    CAL['RycurPos'],
+                    CAL['RxcurPos'],
+                ),
+                "tool-jog current Cartesian pose",
+            ),
+            dtype=float,
+        )
+        RUN['JangleOut'] = _solve_inverse_kinematics(
             RUN['xyzuvw_In'],
             RUN['VR_angles'],
+            result["WristConfig"],
         )
     finally:
         robot.set_robot_tool_frame(*original_tool_frame)
@@ -2261,17 +2610,38 @@ def _await_offline_virtual_segment(operation):
     return succeeded
 
 
+def _parse_live_jog_drive_profile(in_data, expected_opcode):
+    if expected_opcode not in ("LC", "LJ", "LT"):
+        raise MotionInputError("offline live-jog opcode is invalid")
+    if not isinstance(in_data, str) or not in_data.startswith(expected_opcode):
+        raise MotionInputError(
+            f"offline live-jog command must use {expected_opcode}"
+        )
+    timing = parse_command_timing(in_data)
+    if timing is None or timing.mode != "p":
+        raise MotionInputError("live-jog speed mode must be Percent")
+    return timing
+
+
 def live_joint_jog(in_data, stop_event):
     #global J1StepM, J2StepM, J3StepM, J4StepM, J5StepM, J6StepM
     # global RUN['VR_angles'], RUN['J1axisLimNeg'], RUN['J2axisLimNeg'], RUN['J3axisLimNeg'], RUN['J4axisLimNeg'], RUN['J5axisLimNeg'], RUN['J6axisLimNeg']
     # global RUN['Alarm'], RUN['flag']
     #global liveJog, KinematicError
 
-    # Parse jog command components
+    try:
+        timing = _parse_live_jog_drive_profile(in_data, "LJ")
+    except MotionInputError as exc:
+        logger.error("Offline live joint jog rejected: %s", exc)
+        _queue_virtual_motion_error("ER")
+        return False
+
     Vector = float(in_data[in_data.index("V") + 1 : in_data.index("S")])
-    SpeedType = in_data[in_data.index("S") + 1]
-    SpeedVal = float(in_data[in_data.index("S") + 2 : in_data.index("Ac")])
-    ACCspd = DCCspd = ACCramp = 100  # Simplified for now
+    SpeedType = timing.mode
+    SpeedVal = timing.speed
+    ACCspd = timing.acceleration
+    DCCspd = timing.deceleration
+    ACCramp = timing.ramp
 
     LoopModeStr = in_data.split("Lm")[1].strip()
     LoopModes = [int(c) for c in LoopModeStr]
@@ -2357,28 +2727,51 @@ def live_cartesian_jog(in_data, stop_event):
     # global RUN['J1axisLimNeg'], RUN['J2axisLimNeg'], RUN['J3axisLimNeg'], RUN['J4axisLimNeg'], RUN['J5axisLimNeg'], RUN['J6axisLimNeg']
     #global liveJog
 
-    # Parse command
+    try:
+        timing = _parse_live_jog_drive_profile(in_data, "LC")
+    except MotionInputError as exc:
+        logger.error("Offline live Cartesian jog rejected: %s", exc)
+        _queue_virtual_motion_error("ER")
+        return False
+
     Vector = float(in_data[in_data.index("V") + 1:in_data.index("S")])
-    SpeedType = in_data[in_data.index("S") + 1]
-    SpeedVal = float(in_data[in_data.index("S") + 2:in_data.index("Ac")])
-    ACCspd = DCCspd = ACCramp = 100  # fixed for now
+    SpeedType = timing.mode
+    SpeedVal = timing.speed
+    ACCspd = timing.acceleration
+    DCCspd = timing.deceleration
+    ACCramp = timing.ramp
     LoopModeStr = in_data.split("Lm")[1].strip()
     LoopModes = [int(c) for c in LoopModeStr]
+    wrist_config = parse_motion_wrist_config(in_data)
 
     # Cartesian jog increment
     jog_step = 1  # mm or deg, depending on axis
 
-    RUN['xyzuvw_In'] = np.array([
-        float(CAL['XcurPos']),
-        float(CAL['YcurPos']),
-        float(CAL['ZcurPos']),
-        float(CAL['RzcurPos']),
-        float(CAL['RycurPos']),
-        float(CAL['RxcurPos'])
-    ], dtype=float)
+    RUN['xyzuvw_In'] = np.array(
+        _external_cartesian_pose_to_native(
+            (
+                CAL['XcurPos'],
+                CAL['YcurPos'],
+                CAL['ZcurPos'],
+                CAL['RzcurPos'],
+                CAL['RycurPos'],
+                CAL['RxcurPos'],
+            ),
+            "live Cartesian starting pose",
+        ),
+        dtype=float,
+    )
 
     while not stop_event.is_set():
-        idx = int(Vector // 10) - 1
+        vector_axis = {
+            10: 0,
+            20: 1,
+            30: 2,
+            40: 5,
+            50: 4,
+            60: 3,
+        }
+        idx = vector_axis.get(int(Vector // 10) * 10, -1)
         direction = 1 if int(Vector) % 10 == 1 else -1
 
         if 0 <= idx < 6:
@@ -2390,7 +2783,11 @@ def live_cartesian_jog(in_data, stop_event):
 
         # Inverse Kinematics
         try:
-            RUN['JangleOut'] = robot.SolveInverseKinematics(RUN['xyzuvw_In'], RUN['VR_angles'])
+            RUN['JangleOut'] = _solve_inverse_kinematics(
+                RUN['xyzuvw_In'],
+                RUN['VR_angles'],
+                wrist_config,
+            )
         except Exception as e:
             logger.error("Virtual Cartesian jog IK failed: %s", e)
             _queue_virtual_motion_error("ER")
@@ -2470,16 +2867,25 @@ def live_tool_jog(in_data, original_tool_frame, stop_event):
     #global liveJog
     #global offlineMode
 
-    # Parse command
+    try:
+        timing = _parse_live_jog_drive_profile(in_data, "LT")
+    except MotionInputError as exc:
+        logger.error("Offline live tool jog rejected: %s", exc)
+        _queue_virtual_motion_error("ER")
+        return False
+
     Vector = float(in_data[in_data.index("V") + 1:in_data.index("S")])
-    SpeedType = in_data[in_data.index("S") + 1]
-    SpeedVal = float(in_data[in_data.index("S") + 2:in_data.index("Ac")])
-    ACCspd = DCCspd = ACCramp = 100  # fixed acceleration values
+    SpeedType = timing.mode
+    SpeedVal = timing.speed
+    ACCspd = timing.acceleration
+    DCCspd = timing.deceleration
+    ACCramp = timing.ramp
     LoopModeStr = in_data.split("Lm")[1].strip()
     LoopModes = [int(c) for c in LoopModeStr]
+    wrist_config = parse_motion_wrist_config(in_data)
 
     # Tool frame jog step size
-    jog_step = 1  # mm or degrees depending on axis
+    jog_step = LIVE_TOOL_JOG_INCREMENT
 
     try:
         original_tool_frame = tuple(
@@ -2496,9 +2902,16 @@ def live_tool_jog(in_data, original_tool_frame, stop_event):
         return False
 
     while not stop_event.is_set():
-        idx = int(Vector // 10) - 1
-
-        direction = 1 if int(Vector) % 10 == 1 else -1
+        vector_axis = {
+            10: 0,
+            20: 1,
+            30: 2,
+            40: 5,
+            50: 4,
+            60: 3,
+        }
+        idx = vector_axis.get(int(Vector // 10) * 10, -1)
+        direction = 1 if int(Vector) % 10 == 0 else -1
 
         # Build pose from current position
         RUN['xyzuvw_In'] = robot.forward_kinematics(RUN['VR_angles'])
@@ -2515,7 +2928,11 @@ def live_tool_jog(in_data, original_tool_frame, stop_event):
             return False
 
         try:
-            RUN['JangleOut'] = robot.SolveInverseKinematics(RUN['xyzuvw_In'], RUN['VR_angles'])
+            RUN['JangleOut'] = _solve_inverse_kinematics(
+                RUN['xyzuvw_In'],
+                RUN['VR_angles'],
+                wrist_config,
+            )
         except Exception as e:
             logger.error("Virtual tool jog IK failed: %s", e)
             _queue_virtual_motion_error("ER")
@@ -2649,7 +3066,9 @@ def _set_offline_mode_status(offline):
 def toggle_offline_mode():
     request_lease = _acquire_motion_request("Mode transition")
     if request_lease is None:
-        message = "Mode change rejected while motion or recovery ownership is active"
+        message = _motion_request_rejection_message(
+            "Mode change rejected while motion or recovery ownership is active"
+        )
         logger.warning(message)
         almStatusLab.config(text=message, style="Warn.TLabel")
         almStatusLab2.config(text=message, style="Warn.TLabel")
@@ -3907,6 +4326,16 @@ def startup(startup_request, cancel_event=None):
   auxiliary_serial = None
   auxiliary_error = None
   try:
+    controller_identity = parse_controller_identity_response(
+      _startup_exchange_response("HO\n", cancel_event)
+    )
+    if (
+      CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1
+      not in controller_identity.protocol_capabilities
+    ):
+      raise ProtocolResponseError(
+        "controller firmware lacks command-local JT wrist configuration"
+      )
     if startup_request.auxiliary_port is None:
       _clear_unavailable_startup_auxiliary()
     elif startup_request.auxiliary_board is None:
@@ -3973,6 +4402,7 @@ def _prepare_controller_startup():
   merged_values = dict(CAL)
   merged_values.update(update_values)
   merged_values.update(external_values)
+  _prepare_cpp_kinematics_configuration(merged_values)
   request = ControllerStartupRequest(
     auxiliary_port=auxiliary_port,
     auxiliary_board=auxiliary_board,
@@ -4039,8 +4469,14 @@ def setCom(misc=None):
   request_lease = _acquire_motion_request(
     "Controller connection change",
     allow_position_recovery=True,
+    requires_kinematics=False,
   )
   if request_lease is None:
+    message = _motion_request_rejection_message(
+      "Controller connection change not started"
+    )
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
     return False
   request_state = {"transferred": False}
   try:
@@ -4337,7 +4773,10 @@ def _replace_auxiliary_serial(port, board_profile):
   return replacement
 
 
-@_synchronous_motion_request("Auxiliary connection change")
+@_synchronous_motion_request(
+  "Auxiliary connection change",
+  requires_kinematics=False,
+)
 def setCom2(misc=None):
   if application_closing.is_set():
     logger.warning(
@@ -4497,6 +4936,7 @@ VIRTUAL_COMPLETION_SAFETY_SCALE = 1.25
 VIRTUAL_JOINT_SECONDS_SCALE = 4.5
 VIRTUAL_CARTESIAN_SECONDS_SCALE = 4.7
 VIRTUAL_TOOL_SECONDS_SCALE = 5.1
+LIVE_TOOL_JOG_INCREMENT = 0.25
 
 
 @dataclass(frozen=True)
@@ -4572,6 +5012,7 @@ def _exchange_legacy_main_command(
 @_synchronous_motion_request(
   "Program controller command",
   rejection_result=(ROW_EXECUTION_REJECTED, None),
+  requires_kinematics=False,
 )
 @_tracked_serial_operation(
   "ser",
@@ -4589,7 +5030,14 @@ def _execute_row_main_command(command, **response_contract):
   return ROW_EXECUTION_COMPLETE, response
 
 
-def _execute_row_main_response(command, **response_contract):
+def _execute_row_main_response(
+  command,
+  *,
+  response_parser=None,
+  **response_contract,
+):
+  if response_parser is not None and not callable(response_parser):
+    raise TypeError("controller response parser must be callable or None")
   execution_state, response = _execute_row_main_command(
     command,
     **response_contract,
@@ -4597,6 +5045,16 @@ def _execute_row_main_response(command, **response_contract):
   if execution_state != ROW_EXECUTION_COMPLETE:
     _finish_execute_row()
     return execution_state, None
+  if response_parser is not None:
+    try:
+      response = response_parser(command, response)
+    except ProtocolResponseError as exc:
+      message = f"Program controller response rejected: {exc}"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED, None
   return execution_state, response
 
 
@@ -4774,9 +5232,13 @@ def _main_modbus_wait_timeout_seconds(value):
   text = str(value).strip()
   if not re.fullmatch(r"[0-9]+", text):
     raise MotionInputError(
-      "controller Modbus wait timeout must be a non-negative integer"
+      "controller Modbus wait timeout must be a positive integer"
     )
   timeout = int(text)
+  if timeout == 0:
+    raise MotionInputError(
+      "controller Modbus wait timeout must be a positive integer"
+    )
   if timeout > MAIN_FIRMWARE_WAIT_MAX_SECONDS:
     raise MotionInputError(
       "controller Modbus wait timeout exceeds the firmware range"
@@ -4836,27 +5298,53 @@ def _virtual_motion_active(ignored_request_lease=None):
   )
 
 
-def _acquire_motion_request(name, allow_position_recovery=False):
+def _motion_request_rejection_message(fallback):
+  if not isinstance(fallback, str) or not fallback:
+    raise TypeError("motion request rejection fallback must be non-empty text")
+  reason = getattr(motion_request_admission_state, "rejection_reason", None)
+  if isinstance(reason, str) and reason:
+    return reason
+  return fallback
+
+
+def _reject_motion_request(name, reason):
+  message = f"{name} not started; {reason}"
+  motion_request_admission_state.rejection_reason = message
+  logger.warning(message)
+  return None
+
+
+def _acquire_motion_request(
+  name,
+  allow_position_recovery=False,
+  requires_kinematics=True,
+):
   if not isinstance(allow_position_recovery, bool):
     raise TypeError("position-recovery admission flag must be boolean")
+  if not isinstance(requires_kinematics, bool):
+    raise TypeError("kinematics admission flag must be boolean")
+  motion_request_admission_state.rejection_reason = None
   if application_closing.is_set():
-    logger.warning("%s rejected during application shutdown", name)
-    return None
+    return _reject_motion_request(name, "application shutdown is active")
+  if requires_kinematics and not kinematics_configuration_ready.is_set():
+    return _reject_motion_request(
+      name,
+      "native kinematics configuration is unavailable",
+    )
   if not allow_position_recovery and (
     manual_motion_pose_pending.is_set()
     or controller_position_resynchronization_required.is_set()
   ):
-    logger.warning(
-      "%s rejected until controller position resynchronization completes",
+    return _reject_motion_request(
       name,
+      "controller position resynchronization is required",
     )
-    return None
   lease = motion_request_registry.acquire(name)
   if lease is None:
-    logger.warning(
-      "%s rejected while %s owns motion",
+    owner = motion_request_registry.active_name
+    return _reject_motion_request(
       name,
-      motion_request_registry.active_name,
+      f"{owner or 'another request'} owns motion",
     )
   return lease
 
@@ -4890,7 +5378,9 @@ def _manual_motion_request(name):
       # transfers this lease beyond the callback's synchronous lifetime.
       request_lease = _acquire_motion_request(name)
       if request_lease is None:
-        message = f"{name} not started; another motion request is active"
+        message = _motion_request_rejection_message(
+          f"{name} not started; another motion request is active"
+        )
         almStatusLab.config(text=message, style="Warn.TLabel")
         almStatusLab2.config(text=message, style="Warn.TLabel")
         return False
@@ -4922,6 +5412,27 @@ def _start_manual_motion(
     raise RuntimeError("manual motion requires matching request ownership")
   if not callable(virtual_dispatch):
     raise TypeError("manual virtual dispatch must be callable")
+
+  try:
+    virtual_wrist_config = parse_motion_wrist_config(
+      virtual_command,
+      virtual=True,
+    )
+    if physical_command is not None:
+      physical_wrist_config = parse_motion_wrist_config(
+        physical_command,
+        virtual=False,
+      )
+      if physical_wrist_config != virtual_wrist_config:
+        raise MotionInputError(
+          "physical and virtual wrist configurations must match"
+        )
+  except (TypeError, ValueError, MotionInputError) as exc:
+    message = f"{motion_name} rejected because the wrist mode is invalid: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
 
   try:
     if RUN['offlineMode']:
@@ -5532,7 +6043,9 @@ def _dispatch_program_controller_sequence(commands, completion_callback):
 
   request_lease = _acquire_motion_request("Program motion")
   if request_lease is None:
-    message = "Program motion not started; another motion request is active"
+    message = _motion_request_rejection_message(
+      "Program motion not started; another motion request is active"
+    )
     logger.warning(message)
     almStatusLab.config(text=message, style="Warn.TLabel")
     almStatusLab2.config(text=message, style="Warn.TLabel")
@@ -5656,6 +6169,15 @@ def _dispatch_program_motion(
     raise MotionInputError("program virtual motion contract is invalid")
   try:
     command = _canonicalize_main_serial_command(command)
+    physical_wrist_config = parse_motion_wrist_config(command, virtual=False)
+    virtual_wrist_config = parse_motion_wrist_config(
+      virtual_command,
+      virtual=True,
+    )
+    if physical_wrist_config != virtual_wrist_config:
+      raise MotionInputError(
+        "physical and virtual program commands require the same wrist configuration"
+      )
     virtual_completion_timeout = _virtual_completion_timeout(virtual_command)
     controller_completion_timeout = (
       None
@@ -5672,7 +6194,9 @@ def _dispatch_program_motion(
 
   request_lease = _acquire_motion_request("Program motion")
   if request_lease is None:
-    message = "Program motion not started; another motion request is active"
+    message = _motion_request_rejection_message(
+      "Program motion not started; another motion request is active"
+    )
     logger.warning(message)
     almStatusLab.config(text=message, style="Warn.TLabel")
     almStatusLab2.config(text=message, style="Warn.TLabel")
@@ -5889,24 +6413,9 @@ def _gcode_storage_filename(filename):
   if not isinstance(filename, str):
     raise MotionInputError("G-code filename must be text")
   filename = filename.strip()
-  if (
-    not filename
-    or filename in (".", "..")
-    or "/" in filename
-    or "\\" in filename
-    or ":" in filename
-    or any(ord(character) < 32 or ord(character) == 127 for character in filename)
-  ):
-    raise MotionInputError("G-code filename contains an invalid path or control character")
+  validate_controller_filename(filename, "G-code filename")
   storage_filename = f"{filename}.txt"
-  command = f"PGFn{storage_filename}\n"
-  try:
-    command.encode("ascii")
-  except UnicodeEncodeError as exc:
-    raise MotionInputError("G-code filename must contain ASCII characters") from exc
-  if len(command) > MAX_COMMAND_LENGTH:
-    raise MotionInputError("G-code playback command exceeds the size limit")
-  return storage_filename
+  return validate_controller_filename(storage_filename, "G-code filename")
 
 
 def _gcode_playback_command(filename):
@@ -6500,12 +7009,13 @@ def executeRow(motion_complete=None):
     slaveID = str(command[slavestartIndex+1:slaveendIndex])
     opVal = "1"
     subcommand = "BB"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
-    execution_state, response = _execute_row_main_response(subcommand)
+    execution_state, response = _execute_row_main_response(
+      subcommand,
+      response_parser=parse_controller_modbus_response,
+    )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
-    if (response == "Modbus Error"):
-      ErrorHandler(response)  
-    elif (response == valNum):
+    if (response == valNum):
       if(action == "Call"):
         tab1.lastRow = tab1.progView.curselection()[0]
         tab1.lastProg = ProgEntryField.get()
@@ -6545,12 +7055,13 @@ def executeRow(motion_complete=None):
     slaveID = str(command[slavestartIndex+1:slaveendIndex])
     opVal = "1"
     subcommand = "BC"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
-    execution_state, response = _execute_row_main_response(subcommand)
+    execution_state, response = _execute_row_main_response(
+      subcommand,
+      response_parser=parse_controller_modbus_response,
+    )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
-    if (response == "Modbus Error"):
-      ErrorHandler(response)  
-    elif (response == valNum):
+    if (response == valNum):
       if(action == "Call"):
         tab1.lastRow = tab1.progView.curselection()[0]
         tab1.lastProg = ProgEntryField.get()
@@ -6590,12 +7101,13 @@ def executeRow(motion_complete=None):
     slaveID = str(command[slavestartIndex+9:regNumstartIndex-2])
     opVal = str(command[regNumstartIndex+11:inputIndex-8])
     subcommand = "BH"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
-    execution_state, response = _execute_row_main_response(subcommand)
+    execution_state, response = _execute_row_main_response(
+      subcommand,
+      response_parser=parse_controller_modbus_response,
+    )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
-    if (response == "Modbus Error"):
-      ErrorHandler(response)  
-    elif (response == valNum):
+    if (response == valNum):
       if(action == "Call"):
         tab1.lastRow = tab1.progView.curselection()[0]
         tab1.lastProg = ProgEntryField.get()
@@ -6635,12 +7147,13 @@ def executeRow(motion_complete=None):
     slaveID = str(command[slavestartIndex+9:regNumstartIndex-2])
     opVal = str(command[regNumstartIndex+11:inputIndex-14])
     subcommand = "BD"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
-    execution_state, response = _execute_row_main_response(subcommand)
+    execution_state, response = _execute_row_main_response(
+      subcommand,
+      response_parser=parse_controller_modbus_response,
+    )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
-    if (response == "Modbus Error"):
-      ErrorHandler(response)  
-    elif (response == valNum):
+    if (response == valNum):
       if(action == "Call"):
         tab1.lastRow = tab1.progView.curselection()[0]
         tab1.lastProg = ProgEntryField.get()
@@ -6725,8 +7238,7 @@ def executeRow(motion_complete=None):
     cmdSentEntryField.insert(0,command)
     execution_state, _ = _execute_row_main_response(
       command,
-      read_line=False,
-      expected_response=b"Done",
+      response_parser=parse_controller_modbus_response,
       response_timeout=timeout + SERIAL_RESPONSE_MARGIN_SECONDS,
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
@@ -6760,8 +7272,7 @@ def executeRow(motion_complete=None):
     cmdSentEntryField.insert(0,command)
     execution_state, _ = _execute_row_main_response(
       command,
-      read_line=False,
-      expected_response=b"Done",
+      response_parser=parse_controller_modbus_response,
       response_timeout=timeout + SERIAL_RESPONSE_MARGIN_SECONDS,
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
@@ -6867,11 +7378,12 @@ def executeRow(motion_complete=None):
     command = "SC"+"A"+slaveID+"B"+inputNum+"C"+valNum+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    execution_state, response = _execute_row_main_response(command)
+    execution_state, _ = _execute_row_main_response(
+      command,
+      response_parser=parse_controller_modbus_response,
+    )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
-    if (response == "-1"):
-      ErrorHandler("Modbus Error")
 
   if (RUN['cmdTypeLong'] == "Set MBoutpu"):
     if RUN['offlineMode']:
@@ -6889,11 +7401,12 @@ def executeRow(motion_complete=None):
     command = "SO"+"A"+slaveID+"B"+inputNum+"C"+valNum+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    execution_state, response = _execute_row_main_response(command)
+    execution_state, _ = _execute_row_main_response(
+      command,
+      response_parser=parse_controller_modbus_response,
+    )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
-    if (response == "-1"):
-      ErrorHandler("Modbus Error")       
  
 
 
@@ -7154,10 +7667,10 @@ def executeRow(motion_complete=None):
     visRot = VisRetAngleEntryField.get()
     LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
     command = "MV"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Vr"+visRot+"Lm"+LoopMode+"\n"
-    commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
+    commandVR = "MV"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Vr"+visRot+"Lm"+LoopMode+"\n"
     motion_state = _dispatch_program_command(
       command,
-      mj_command,
+      mv_command,
       commandVR,
       motion_complete,
     )
@@ -7634,13 +8147,13 @@ if CE['Platform']['IS_WINDOWS']:
       if axis == 'X':  return 10 if d < 0 else 11
       if axis == 'Y':  return 20 if d < 0 else 21
       if axis == 'Z':  return 30 if d < 0 else 31
-      if axis == 'Rx': return 40 if d < 0 else 41
+      if axis == 'Rz': return 40 if d < 0 else 41
       if axis == 'Ry': return 50 if d < 0 else 51
-      if axis == 'Rz': return 60 if d < 0 else 61
+      if axis == 'Rx': return 60 if d < 0 else 61
       return None
 
   def _tool_code(axis, d):
-      if axis == 'Tz': return 30 if d < 0 else 31   # per your LiveToolJog mapping
+      if axis == 'Tz': return 30 if d < 0 else 31
       return None
 
   def _report_xbox_motion_error(message):
@@ -8753,6 +9266,7 @@ def _try_dispatch_controller_correction():
     request_lease = _acquire_motion_request(
       "Controller correction",
       allow_position_recovery=True,
+      requires_kinematics=False,
     )
     if request_lease is None:
       return False
@@ -9374,7 +9888,9 @@ def _try_dispatch_deferred_joint_adjustments(allow_current_generation=False):
       nonlocal request_lease, lease_created
       request_lease, lease_created = _reserve_joint_motion_request()
       if request_lease is None:
-        raise MotionTransportBusy("another motion request is active")
+        raise MotionTransportBusy(_motion_request_rejection_message(
+          "another motion request is active"
+        ))
       return joint_motion_dispatcher.submit_positions(
         target_positions,
         actual_positions,
@@ -9656,7 +10172,9 @@ def _queue_joint_motion(axis, value, absolute):
       if not _start_offline_joint_motion(
         build_virtual_joint_command(virtual_positions, profile)
       ):
-        raise MotionQueueFault("offline virtual joint motion did not start")
+        raise MotionQueueFault(_motion_request_rejection_message(
+          "offline virtual joint motion did not start"
+        ))
       coalesced = False
     elif (
       deferred_joint_adjustments.pending
@@ -9677,7 +10195,9 @@ def _queue_joint_motion(axis, value, absolute):
       try:
         request_lease, lease_created = _reserve_joint_motion_request()
         if request_lease is None:
-          raise MotionTransportBusy("another motion request is active")
+          raise MotionTransportBusy(_motion_request_rejection_message(
+            "another motion request is active"
+          ))
         if absolute:
           submission = joint_motion_dispatcher.submit_target(
             axis,
@@ -9908,7 +10428,9 @@ def _dispatch_live_jog(command, motion_name):
     return True
   request_lease = _acquire_motion_request(motion_name)
   if request_lease is None:
-    message = f"Controller busy; {motion_name} not started"
+    message = _motion_request_rejection_message(
+      f"Controller busy; {motion_name} not started"
+    )
     almStatusLab.config(text=message, style="Warn.TLabel")
     almStatusLab2.config(text=message, style="Warn.TLabel")
     return False
@@ -10097,7 +10619,9 @@ def LiveJointJog(value):
     f"Dc{deceleration}Rm{ramp}WALm{loop_mode}\n"
   )
   if RUN['offlineMode'] and not start_live_joint_jog_thread(command):
-    message = "Offline live joint jog not started; another live jog is active"
+    message = _motion_request_rejection_message(
+      "Offline live joint jog not started; another live jog is active"
+    )
     logger.warning(message)
     almStatusLab.config(text=message, style="Warn.TLabel")
     almStatusLab2.config(text=message, style="Warn.TLabel")
@@ -10116,6 +10640,14 @@ def start_live_cartesian_jog_thread(command):
 def LiveCarJog(value):
   if _live_jog_start_is_blocked():
     return False
+  try:
+    wrist_config = _validated_wrist_config(RUN.get('WC', 'A'))
+  except MotionInputError as exc:
+    message = f"Live Cartesian jog rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
   almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
   almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
   prepared = _prepare_live_jog(
@@ -10128,10 +10660,12 @@ def LiveCarJog(value):
   vector, speed_prefix, speed, acceleration, deceleration, ramp, loop_mode = prepared
   command = (
     f"LCV{vector}{speed_prefix}{speed}Ac{acceleration}"
-    f"Dc{deceleration}Rm{ramp}WALm{loop_mode}\n"
+    f"Dc{deceleration}Rm{ramp}W{wrist_config}Lm{loop_mode}\n"
   )
   if RUN['offlineMode'] and not start_live_cartesian_jog_thread(command):
-    message = "Offline live Cartesian jog not started; another live jog is active"
+    message = _motion_request_rejection_message(
+      "Offline live Cartesian jog not started; another live jog is active"
+    )
     logger.warning(message)
     almStatusLab.config(text=message, style="Warn.TLabel")
     almStatusLab2.config(text=message, style="Warn.TLabel")
@@ -10150,6 +10684,14 @@ def start_live_tool_jog_thread(command, original_tool_frame):
 def LiveToolJog(value):
   if _live_jog_start_is_blocked():
     return False
+  try:
+    wrist_config = _validated_wrist_config(RUN.get('WC', 'A'))
+  except MotionInputError as exc:
+    message = f"Live tool jog rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
   almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
   almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
   prepared = _prepare_live_jog(
@@ -10161,18 +10703,8 @@ def LiveToolJog(value):
     return False
   vector, speed_prefix, speed, acceleration, deceleration, ramp, loop_mode = prepared
   try:
-    original_tool_frame = tuple(
-      finite_number(field.get(), f"tool-frame field {index}")
-      for index, field in enumerate((
-        TFxEntryField,
-        TFyEntryField,
-        TFzEntryField,
-        TFrzEntryField,
-        TFryEntryField,
-        TFrxEntryField,
-      ), start=1)
-    )
-  except (TypeError, ValueError, tk.TclError) as exc:
+    original_tool_frame = _active_tool_frame()
+  except (KeyError, TypeError, ValueError, MotionInputError) as exc:
     message = f"Live tool jog rejected: {exc}"
     logger.error(message)
     almStatusLab.config(text=message, style="Alarm.TLabel")
@@ -10180,13 +10712,15 @@ def LiveToolJog(value):
     return False
   command = (
     f"LTV{vector}{speed_prefix}{speed}Ac{acceleration}"
-    f"Dc{deceleration}Rm{ramp}WALm{loop_mode}\n"
+    f"Dc{deceleration}Rm{ramp}W{wrist_config}Lm{loop_mode}\n"
   )
   if RUN['offlineMode'] and not start_live_tool_jog_thread(
     command,
     original_tool_frame,
   ):
-    message = "Offline live tool jog not started; another live jog is active"
+    message = _motion_request_rejection_message(
+      "Offline live tool jog not started; another live jog is active"
+    )
     logger.warning(message)
     almStatusLab.config(text=message, style="Warn.TLabel")
     almStatusLab2.config(text=message, style="Warn.TLabel")
@@ -10267,8 +10801,7 @@ def XjogNeg(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -10279,8 +10812,10 @@ def XjogNeg(value):
       commandVR,
     )
   else:
-    xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
-    xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
+    xyzuvw = _forward_kinematics_display_pose(
+      RUN['VR_angles'],
+      "offline Cartesian jog pose",
+    )
     CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [round(v, 3) for v in xyzuvw]
     CAL['XcurPos'] = CAL['XcurPos'] - value
     commandVR = (
@@ -10333,8 +10868,7 @@ def YjogNeg(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -10345,8 +10879,10 @@ def YjogNeg(value):
       commandVR,
     )
   else:
-    xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
-    xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
+    xyzuvw = _forward_kinematics_display_pose(
+      RUN['VR_angles'],
+      "offline Cartesian jog pose",
+    )
     CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [round(v, 3) for v in xyzuvw]
     CAL['YcurPos'] = CAL['YcurPos'] - value
     commandVR = (
@@ -10399,8 +10935,7 @@ def ZjogNeg(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -10411,8 +10946,10 @@ def ZjogNeg(value):
       commandVR,
     )
   else:
-    xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
-    xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
+    xyzuvw = _forward_kinematics_display_pose(
+      RUN['VR_angles'],
+      "offline Cartesian jog pose",
+    )
     CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [round(v, 3) for v in xyzuvw]
     CAL['ZcurPos'] = CAL['ZcurPos'] - value
     commandVR = (
@@ -10461,8 +10998,7 @@ def RxjogNeg(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -10473,8 +11009,10 @@ def RxjogNeg(value):
       commandVR,
     )
   else:
-    xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
-    xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
+    xyzuvw = _forward_kinematics_display_pose(
+      RUN['VR_angles'],
+      "offline Cartesian jog pose",
+    )
     CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [round(v, 3) for v in xyzuvw]
     CAL['RxcurPos'] = CAL['RxcurPos'] - value
     commandVR = (
@@ -10524,8 +11062,7 @@ def RyjogNeg(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -10536,8 +11073,10 @@ def RyjogNeg(value):
       commandVR,
     )
   else:
-    xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
-    xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
+    xyzuvw = _forward_kinematics_display_pose(
+      RUN['VR_angles'],
+      "offline Cartesian jog pose",
+    )
     CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [round(v, 3) for v in xyzuvw]
     CAL['RycurPos'] = CAL['RycurPos'] - value
     commandVR = (
@@ -10586,8 +11125,7 @@ def RzjogNeg(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -10598,8 +11136,10 @@ def RzjogNeg(value):
       commandVR,
     )
   else:
-    xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
-    xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
+    xyzuvw = _forward_kinematics_display_pose(
+      RUN['VR_angles'],
+      "offline Cartesian jog pose",
+    )
     CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [round(v, 3) for v in xyzuvw]
     CAL['RzcurPos'] = CAL['RzcurPos'] - value
     commandVR = (
@@ -10648,8 +11188,7 @@ def XjogPos(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -10660,8 +11199,10 @@ def XjogPos(value):
       commandVR,
     )
   else:
-    xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
-    xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
+    xyzuvw = _forward_kinematics_display_pose(
+      RUN['VR_angles'],
+      "offline Cartesian jog pose",
+    )
     CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [round(v, 3) for v in xyzuvw]
     CAL['XcurPos'] = CAL['XcurPos'] + value
     commandVR = (
@@ -10710,8 +11251,7 @@ def YjogPos(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -10722,8 +11262,10 @@ def YjogPos(value):
       commandVR,
     )
   else:
-    xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
-    xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
+    xyzuvw = _forward_kinematics_display_pose(
+      RUN['VR_angles'],
+      "offline Cartesian jog pose",
+    )
     CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [round(v, 3) for v in xyzuvw]
     CAL['YcurPos'] = CAL['YcurPos'] + value
     commandVR = (
@@ -10773,8 +11315,7 @@ def ZjogPos(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -10785,8 +11326,10 @@ def ZjogPos(value):
       commandVR,
     )
   else:
-    xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
-    xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
+    xyzuvw = _forward_kinematics_display_pose(
+      RUN['VR_angles'],
+      "offline Cartesian jog pose",
+    )
     CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [round(v, 3) for v in xyzuvw]
     CAL['ZcurPos'] = CAL['ZcurPos'] + value
     commandVR = (
@@ -10836,8 +11379,7 @@ def RxjogPos(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -10848,8 +11390,10 @@ def RxjogPos(value):
       commandVR,
     )
   else:
-    xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
-    xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
+    xyzuvw = _forward_kinematics_display_pose(
+      RUN['VR_angles'],
+      "offline Cartesian jog pose",
+    )
     CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [round(v, 3) for v in xyzuvw]
     CAL['RxcurPos'] = CAL['RxcurPos'] + value
     commandVR = (
@@ -10898,8 +11442,7 @@ def RyjogPos(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -10910,8 +11453,10 @@ def RyjogPos(value):
       commandVR,
     )
   else:
-    xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
-    xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
+    xyzuvw = _forward_kinematics_display_pose(
+      RUN['VR_angles'],
+      "offline Cartesian jog pose",
+    )
     CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [round(v, 3) for v in xyzuvw]
     CAL['RycurPos'] = CAL['RycurPos'] + value
     commandVR = (
@@ -10960,8 +11505,7 @@ def RzjogPos(value):
   j9Val = str(CAL['J9PosCur'])
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
   if not RUN['offlineMode']:
-    #command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"WA"+"Lm"+LoopMode+"\n"
+    command = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+j7Val+"J8"+j8Val+"J9"+j9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -10972,8 +11516,10 @@ def RzjogPos(value):
       commandVR,
     )
   else:
-    xyzuvw = robot.forward_kinematics(RUN['VR_angles'])
-    xyzuvw = xyzuvw[:3] + [math.degrees(v) for v in xyzuvw[3:]]
+    xyzuvw = _forward_kinematics_display_pose(
+      RUN['VR_angles'],
+      "offline Cartesian jog pose",
+    )
     CAL['XcurPos'], CAL['YcurPos'], CAL['ZcurPos'], CAL['RzcurPos'], CAL['RycurPos'], CAL['RxcurPos'] = [round(v, 3) for v in xyzuvw]
     CAL['RzcurPos'] = CAL['RzcurPos'] + value
     commandVR = (
@@ -11016,7 +11562,7 @@ def TXjogNeg(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "JTX1"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"Lm"+LoopMode+"\n"
+  command = "JTX1"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -11059,7 +11605,7 @@ def TYjogNeg(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "JTY1"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"Lm"+LoopMode+"\n"
+  command = "JTY1"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -11101,7 +11647,7 @@ def TZjogNeg(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "JTZ1"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"Lm"+LoopMode+"\n"
+  command = "JTZ1"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -11146,7 +11692,7 @@ def TRxjogNeg(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "JTW1"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"Lm"+LoopMode+"\n"
+  command = "JTW1"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -11188,7 +11734,7 @@ def TRyjogNeg(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "JTP1"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"Lm"+LoopMode+"\n"
+  command = "JTP1"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -11230,7 +11776,7 @@ def TRzjogNeg(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "JTR1"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"Lm"+LoopMode+"\n"
+  command = "JTR1"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -11272,7 +11818,7 @@ def TXjogPos(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "JTX0"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"Lm"+LoopMode+"\n"
+  command = "JTX0"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -11314,7 +11860,7 @@ def TYjogPos(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "JTY0"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"Lm"+LoopMode+"\n"
+  command = "JTY0"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -11356,7 +11902,7 @@ def TZjogPos(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "JTZ0"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"Lm"+LoopMode+"\n"
+  command = "JTZ0"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -11398,7 +11944,7 @@ def TRxjogPos(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "JTW0"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"Lm"+LoopMode+"\n"
+  command = "JTW0"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -11440,7 +11986,7 @@ def TRyjogPos(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "JTP0"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"Lm"+LoopMode+"\n"
+  command = "JTP0"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -11482,7 +12028,7 @@ def TRzjogPos(value):
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-  command = "JTR0"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"Lm"+LoopMode+"\n"
+  command = "JTR0"+str(value)+speedPrefix+Speed+"G"+ACCspd+"H"+DECspd+"I"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
   if not RUN['offlineMode']:
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0, command)
@@ -13212,6 +13758,7 @@ def _prepare_update_parameters_from_values(source_values):
       f"update-parameter values are missing {exc.args[0]}"
     ) from exc
 
+  _validated_native_kinematics_rotations(values)
   for axis in range(1, 10):
     for suffix in ('MotDir', 'CalDir'):
       values[f'J{axis}{suffix}'] = _binary_controller_flag(
@@ -13429,7 +13976,10 @@ def _apply_single_calibration_transaction(
   return True
 
 
-@_synchronous_motion_request("Update controller parameters")
+@_synchronous_motion_request(
+  "Update controller parameters",
+  requires_kinematics=False,
+)
 @_tracked_serial_operation(
   "ser",
   operation_required=_main_serial_transmit_required,
@@ -13575,7 +14125,10 @@ def _apply_controller_calibration(update_values, external_values):
     raise
   return True
 
-@_synchronous_motion_request("Apply external-axis calibration")
+@_synchronous_motion_request(
+  "Apply external-axis calibration",
+  requires_kinematics=False,
+)
 @_tracked_serial_operation(
   "ser",
   operation_required=_main_serial_transmit_required,
@@ -14791,7 +15344,10 @@ def _invalidate_uncertain_controller_calibration(reason):
   return False
 
 
-@_synchronous_motion_request("Save and apply controller calibration")
+@_synchronous_motion_request(
+  "Save and apply controller calibration",
+  requires_kinematics=False,
+)
 @_tracked_serial_operation("ser")
 def SaveAndApplyCalibration():
   snapshot = dict(CAL)
@@ -16089,7 +16645,9 @@ def GCplayProg(Filename, completion_callback=None):
   request_lease = _acquire_motion_request("G-code playback")
   if request_lease is None:
     GCalmStatusLab.config(
-      text="GCODE FILE NOT STARTED; ANOTHER MOTION REQUEST IS ACTIVE",
+      text=_motion_request_rejection_message(
+        "GCODE FILE NOT STARTED; ANOTHER MOTION REQUEST IS ACTIVE"
+      ),
       style="Warn.TLabel",
     )
     return False
@@ -16536,14 +17094,13 @@ def GCexecuteRow():
       ACCramp = "100"
 
 
-      Rounding = "0"
       RUN['WC'] = GC_ST_WC_EntryField.get()
       #LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
       LoopMode ="111111"
       #DisWrist = str(CAL['DisableWristRotVal'].get())
       Filename = _gcode_storage_filename(GcodeFilenameField.get())
 
-      command = "WC"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"Rnd"+Rounding+"W"+RUN['WC']+"Lm"+LoopMode+"Fn"+Filename+"\n"
+      command = "WC"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"Fn"+Filename+"\n"
       RUN['prevxVal'] = RUN['xVal']
       RUN['prevyVal'] = RUN['yVal']
       RUN['prevzVal'] = RUN['zVal']
@@ -17405,7 +17962,7 @@ def SelTXjogNeg(self):
   if (IncJogStatVal == 1):
     TXjogNeg(float(incrementEntryField.get()))
   else:
-    LiveToolJog(10)  
+    LiveToolJog(10)
 TXjogNegBut.bind("<ButtonPress>", SelTXjogNeg)
 TXjogNegBut.bind("<ButtonRelease>", StopJog)
 
@@ -17414,7 +17971,7 @@ def SelTXjogPos(self):
   if (IncJogStatVal == 1):
     TXjogPos(float(incrementEntryField.get()))
   else:
-    LiveToolJog(11)  
+    LiveToolJog(11)
 TXjogPosBut.bind("<ButtonPress>", SelTXjogPos)
 TXjogPosBut.bind("<ButtonRelease>", StopJog)
 
@@ -17423,7 +17980,7 @@ def SelTYjogNeg(self):
   if (IncJogStatVal == 1):
     TYjogNeg(float(incrementEntryField.get()))
   else:
-    LiveToolJog(20)  
+    LiveToolJog(20)
 TYjogNegBut.bind("<ButtonPress>", SelTYjogNeg)
 TYjogNegBut.bind("<ButtonRelease>", StopJog)
 
@@ -17432,7 +17989,7 @@ def SelTYjogPos(self):
   if (IncJogStatVal == 1):
     TYjogPos(float(incrementEntryField.get()))
   else:
-    LiveToolJog(21)  
+    LiveToolJog(21)
 TYjogPosBut.bind("<ButtonPress>", SelTYjogPos)
 TYjogPosBut.bind("<ButtonRelease>", StopJog)
 
@@ -17441,7 +17998,7 @@ def SelTZjogNeg(self):
   if (IncJogStatVal == 1):
     TZjogNeg(float(incrementEntryField.get()))
   else:
-    LiveToolJog(30)  
+    LiveToolJog(30)
 TZjogNegBut.bind("<ButtonPress>", SelTZjogNeg)
 TZjogNegBut.bind("<ButtonRelease>", StopJog)
 
@@ -17450,7 +18007,7 @@ def SelTZjogPos(self):
   if (IncJogStatVal == 1):
     TZjogPos(float(incrementEntryField.get()))
   else:
-    LiveToolJog(31)  
+    LiveToolJog(31)
 TZjogPosBut.bind("<ButtonPress>", SelTZjogPos)
 TZjogPosBut.bind("<ButtonRelease>", StopJog)
 
@@ -17459,7 +18016,7 @@ def SelTRzjogNeg(self):
   if (IncJogStatVal == 1):
     TRzjogNeg(float(incrementEntryField.get()))
   else:
-    LiveToolJog(40)  
+    LiveToolJog(40)
 TRzjogNegBut.bind("<ButtonPress>", SelTRzjogNeg)
 TRzjogNegBut.bind("<ButtonRelease>", StopJog)
 
@@ -17468,7 +18025,7 @@ def SelTRzjogPos(self):
   if (IncJogStatVal == 1):
     TRzjogPos(float(incrementEntryField.get()))
   else:
-    LiveToolJog(41)  
+    LiveToolJog(41)
 TRzjogPosBut.bind("<ButtonPress>", SelTRzjogPos)
 TRzjogPosBut.bind("<ButtonRelease>", StopJog)
 
@@ -17477,7 +18034,7 @@ def SelTRyjogNeg(self):
   if (IncJogStatVal == 1):
     TRyjogNeg(float(incrementEntryField.get()))
   else:
-    LiveToolJog(50)  
+    LiveToolJog(50)
 TRyjogNegBut.bind("<ButtonPress>", SelTRyjogNeg)
 TRyjogNegBut.bind("<ButtonRelease>", StopJog)
 
@@ -17486,7 +18043,7 @@ def SelTRyjogPos(self):
   if (IncJogStatVal == 1):
     TRyjogPos(float(incrementEntryField.get()))
   else:
-    LiveToolJog(51)  
+    LiveToolJog(51)
 TRyjogPosBut.bind("<ButtonPress>", SelTRyjogPos)
 TRyjogPosBut.bind("<ButtonRelease>", StopJog)
 
@@ -17495,7 +18052,7 @@ def SelTRxjogNeg(self):
   if (IncJogStatVal == 1):
     TRxjogNeg(float(incrementEntryField.get()))
   else:
-    LiveToolJog(60)  
+    LiveToolJog(60)
 TRxjogNegBut.bind("<ButtonPress>", SelTRxjogNeg)
 TRxjogNegBut.bind("<ButtonRelease>", StopJog)
 
@@ -17504,7 +18061,7 @@ def SelTRxjogPos(self):
   if (IncJogStatVal == 1):
     TRxjogPos(float(incrementEntryField.get()))
   else:
-    LiveToolJog(61)  
+    LiveToolJog(61)
 TRxjogPosBut.bind("<ButtonPress>", SelTRxjogPos)
 TRxjogPosBut.bind("<ButtonRelease>", StopJog)
 
@@ -21106,7 +21663,11 @@ J4aEntryField.insert(0,str(CAL['J4aDHpar']))
 J5aEntryField.insert(0,str(CAL['J5aDHpar']))
 J6aEntryField.insert(0,str(CAL['J6aDHpar']))
 
-update_CPP_kin_from_entries()
+if not update_CPP_kin_from_entries():
+  message = "MOTION DISABLED: NATIVE KINEMATICS CONFIGURATION FAILED"
+  logger.error(message)
+  almStatusLab.config(text=message, style="Alarm.TLabel")
+  almStatusLab2.config(text=message, style="Alarm.TLabel")
 RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
 RUN['JangleOut'] = np.array([float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])])
 RUN['negLim'] = [float(CAL['J1NegLim']), float(CAL['J2NegLim']), float(CAL['J3NegLim']), float(CAL['J4NegLim']), float(CAL['J5NegLim']), float(CAL['J6NegLim'])]

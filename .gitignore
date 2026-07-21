@@ -9,6 +9,7 @@ venv/
 CMakeFiles/
 cmake-build-*/
 build/
+build-windows-*/
 dist/
 
 # AR4 runtime and machine-specific state

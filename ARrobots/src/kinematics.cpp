@@ -1,10 +1,16 @@
 
 #include <cmath>
 #include <algorithm>  // for std::copy, std::abs
+#include <cctype>
 #include <cstring>   // for memcpy
 #include <vector>
 #include <array>     // optional for Matrix4x4
 #include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+#include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/wrist_selection_contract.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
@@ -18,14 +24,6 @@
 
 #define ROBOT_nDOFs 6
 #define Table_Size 6
-
-
-float xyzuvw_In[6];          
-float JangleIn[ROBOT_nDOFs];
-float JangleOut[ROBOT_nDOFs];
-float joints_estimate[ROBOT_nDOFs];
-float SolutionMatrix[ROBOT_nDOFs][6];  
-int KinematicError = 0;
 
 
 typedef float tRobot[11 * Table_Size];  // matches the memory layout used in your code
@@ -57,10 +55,8 @@ float* Robot_Kin_Base = Robot_Data + 6 * Table_Size;
 /// xyzwpr of the tool
 float* Robot_Kin_Tool = Robot_Data + 7 * Table_Size;
 
-/// Robot lower limits
 float* Robot_JointLimits_Upper = Robot_Data + 8 * Table_Size;
 
-/// Robot upper limits
 float* Robot_JointLimits_Lower = Robot_Data + 9 * Table_Size;
 
 /// Robot axis senses
@@ -93,10 +89,6 @@ float& Robot_Kin_DHM_Theta3(Robot_Kin_DHM_Table[2 * Table_Size + 2]);
 float& Robot_Kin_DHM_Theta4(Robot_Kin_DHM_Table[3 * Table_Size + 2]);
 float& Robot_Kin_DHM_Theta5(Robot_Kin_DHM_Table[4 * Table_Size + 2]);
 float& Robot_Kin_DHM_Theta6(Robot_Kin_DHM_Table[5 * Table_Size + 2]);
-
-
-float JointPosLimit[ROBOT_nDOFs];
-float JointNegLimit[ROBOT_nDOFs];
 
 
 template <typename T>
@@ -189,46 +181,138 @@ void pose_2_xyzuvw(const Matrix4x4 pose, T xyzwpr[6]);
 
 extern float* Robot_Kin_Tool;
 
-void set_robot_tool_frame(float x, float y, float z, float rz_deg, float ry_deg, float rx_deg) {
-    Robot_Kin_Tool[0] = x;
-    Robot_Kin_Tool[1] = y;
-    Robot_Kin_Tool[2] = z;
-    Robot_Kin_Tool[3] = rz_deg * M_PI / 180.0f;
-    Robot_Kin_Tool[4] = ry_deg * M_PI / 180.0f;
-    Robot_Kin_Tool[5] = rx_deg * M_PI / 180.0f;
+namespace {
+
+constexpr double kToolRadiansPerDegree =
+    0.017453292519943295769236907684886;
+
+float checked_tool_rotation_radians(float degrees) {
+    const double radians =
+        static_cast<double>(degrees) * kToolRadiansPerDegree;
+    if (
+        !std::isfinite(radians)
+        || std::fabs(radians) > std::numeric_limits<float>::max()
+    ) {
+        throw std::invalid_argument(
+            "Tool-frame rotation cannot be represented in native radians"
+        );
+    }
+    const float converted = static_cast<float>(radians);
+    if (degrees != 0.0f && converted == 0.0f) {
+        throw std::invalid_argument(
+            "Tool-frame rotation cannot be represented in native radians"
+        );
+    }
+    const double round_trip_degrees =
+        static_cast<double>(converted) / kToolRadiansPerDegree;
+    if (
+        !std::isfinite(round_trip_degrees)
+        || std::fabs(round_trip_degrees) > std::numeric_limits<float>::max()
+    ) {
+        throw std::invalid_argument(
+            "Tool-frame rotation cannot be represented in native degrees"
+        );
+    }
+    return converted;
+}
+
+float checked_tool_rotation_degrees(float radians) {
+    const double degrees =
+        static_cast<double>(radians) / kToolRadiansPerDegree;
+    if (
+        !std::isfinite(degrees)
+        || std::fabs(degrees) > std::numeric_limits<float>::max()
+    ) {
+        throw std::runtime_error(
+            "Native tool-frame rotation cannot be represented in degrees"
+        );
+    }
+    return static_cast<float>(degrees);
+}
+
+}  // namespace
+
+std::array<float, 6> BuildRobotToolFrame(
+    float x,
+    float y,
+    float z,
+    float rx_deg,
+    float ry_deg,
+    float rz_deg
+) {
+    const std::array<float, 6> input = {
+        x, y, z, rx_deg, ry_deg, rz_deg,
+    };
+    for (float value : input) {
+        if (!std::isfinite(value)) {
+            throw std::invalid_argument("Tool-frame values must be finite");
+        }
+    }
+    return {
+        x,
+        y,
+        z,
+        checked_tool_rotation_radians(rx_deg),
+        checked_tool_rotation_radians(ry_deg),
+        checked_tool_rotation_radians(rz_deg),
+    };
+}
+
+void ApplyRobotToolFrame(const std::array<float, 6>& native_tool_frame) {
+    std::copy(
+        native_tool_frame.begin(),
+        native_tool_frame.end(),
+        Robot_Kin_Tool
+    );
+}
+
+void set_robot_tool_frame(
+    float x,
+    float y,
+    float z,
+    float rx_deg,
+    float ry_deg,
+    float rz_deg
+) {
+    ApplyRobotToolFrame(
+        BuildRobotToolFrame(x, y, z, rx_deg, ry_deg, rz_deg)
+    );
 }
 
 std::vector<float> get_robot_tool_frame() {
     std::vector<float> tool(6);
+    for (int index = 0; index < 6; ++index) {
+        if (!std::isfinite(Robot_Kin_Tool[index])) {
+            throw std::runtime_error("Native tool-frame state is non-finite");
+        }
+    }
     tool[0] = Robot_Kin_Tool[0];
     tool[1] = Robot_Kin_Tool[1];
     tool[2] = Robot_Kin_Tool[2];
-    tool[3] = Robot_Kin_Tool[3] * 180.0f / M_PI;
-    tool[4] = Robot_Kin_Tool[4] * 180.0f / M_PI;
-    tool[5] = Robot_Kin_Tool[5] * 180.0f / M_PI;
+    tool[3] = checked_tool_rotation_degrees(Robot_Kin_Tool[3]);
+    tool[4] = checked_tool_rotation_degrees(Robot_Kin_Tool[4]);
+    tool[5] = checked_tool_rotation_degrees(Robot_Kin_Tool[5]);
     return tool;
 }
 
 
 void robot_data_reset() {
-    // Reset user base and tool frames
+    std::fill(Robot_Data, Robot_Data + (11 * Table_Size), 0.0f);
+
     Matrix_Eye(Robot_BaseFrame);
     Matrix_Eye(Robot_ToolFrame);
 
-    // Reset internal base frame and tool frames
     for (int i = 0; i < 6; i++) {
         Robot_Kin_Base[i] = 0.0;
         Robot_Kin_Tool[i] = 0.0;
     }
 
-    // Reset joint senses and joint limits
     for (int i = 0; i < ROBOT_nDOFs; i++) {
         Robot_Senses[i] = +1.0;
-        Robot_JointLimits_Lower[i] = -180.0;
+        Robot_JointLimits_Lower[i] = +180.0;
         Robot_JointLimits_Upper[i] = +180.0;
     }
 
-    // Alpha parameters
     Robot_Kin_DHM_L1[DHM_Alpha] = 0.0;
     Robot_Kin_DHM_L2[DHM_Alpha] = -0.5 * M_PI;
     Robot_Kin_DHM_L3[DHM_Alpha] = 0.0;
@@ -236,7 +320,6 @@ void robot_data_reset() {
     Robot_Kin_DHM_L5[DHM_Alpha] = 0.5 * M_PI;
     Robot_Kin_DHM_L6[DHM_Alpha] = -0.5 * M_PI;
 
-    // Theta parameters
     Robot_Kin_DHM_L1[DHM_Theta] = 0.0;
     Robot_Kin_DHM_L2[DHM_Theta] = 0.0;
     Robot_Kin_DHM_L3[DHM_Theta] = -0.5 * M_PI;
@@ -244,29 +327,25 @@ void robot_data_reset() {
     Robot_Kin_DHM_L5[DHM_Theta] = 0.0;
     Robot_Kin_DHM_L6[DHM_Theta] = M_PI;
 
-    // A parameters
     Robot_Kin_DHM_L1[DHM_A] = 0.0;
-    Robot_Kin_DHM_L2[DHM_A] = 0.0; // this value can be different from 0
-    Robot_Kin_DHM_L3[DHM_A] = 0.0; // this value can be different from 0
-    Robot_Kin_DHM_L4[DHM_A] = 0.0; // this value can be different from 0
+    Robot_Kin_DHM_L2[DHM_A] = 0.0;
+    Robot_Kin_DHM_L3[DHM_A] = 0.0;
+    Robot_Kin_DHM_L4[DHM_A] = 0.0;
     Robot_Kin_DHM_L5[DHM_A] = 0.0;
     Robot_Kin_DHM_L6[DHM_A] = 0.0;
 
-    // D parameters
-    Robot_Kin_DHM_L1[DHM_D] = 0.0; // this value can be different from 0
-    Robot_Kin_DHM_L2[DHM_D] = 0.0; // this value can be different from 0
+    Robot_Kin_DHM_L1[DHM_D] = 0.0;
+    Robot_Kin_DHM_L2[DHM_D] = 0.0;
     Robot_Kin_DHM_L3[DHM_D] = 0.0;
-    Robot_Kin_DHM_L4[DHM_D] = 0.0; // this value can be different from 0
+    Robot_Kin_DHM_L4[DHM_D] = 0.0;
     Robot_Kin_DHM_L5[DHM_D] = 0.0;
-    Robot_Kin_DHM_L6[DHM_D] = 0.0; // this value can be different from 0
+    Robot_Kin_DHM_L6[DHM_D] = 0.0;
 
 }
 
-/// Set the robot (according to 3D model)
 void robot_set() {
     robot_data_reset();
 
-    // Alpha (link twist)
     Robot_Kin_DHM_L1[DHM_Alpha] = 0.0;
     Robot_Kin_DHM_L2[DHM_Alpha] = -0.5f * M_PI;
     Robot_Kin_DHM_L3[DHM_Alpha] = 0.0;
@@ -274,25 +353,21 @@ void robot_set() {
     Robot_Kin_DHM_L5[DHM_Alpha] = 0.5f * M_PI;
     Robot_Kin_DHM_L6[DHM_Alpha] = M_PI;
 
-    // Theta (joint mastering offsets)
     Robot_Kin_DHM_L1[DHM_Theta] = 0.0f;
-    Robot_Kin_DHM_L2[DHM_Theta] = -0.5f * M_PI;  // -90 deg
+    Robot_Kin_DHM_L2[DHM_Theta] = -0.5f * M_PI;
     Robot_Kin_DHM_L3[DHM_Theta] = 0.0f;
     Robot_Kin_DHM_L4[DHM_Theta] = 0.0f;
     Robot_Kin_DHM_L5[DHM_Theta] = 0.0f;
-    Robot_Kin_DHM_L6[DHM_Theta] = M_PI;          // +180 deg
+    Robot_Kin_DHM_L6[DHM_Theta] = M_PI;
 
-    // A parameters
-    Robot_Kin_DHM_L2[DHM_A] = 64.2;
-    Robot_Kin_DHM_L3[DHM_A] = 305;
+    Robot_Kin_DHM_L2[DHM_A] = 64.2f;
+    Robot_Kin_DHM_L3[DHM_A] = 305.0f;
 
-    // D parameters
-    Robot_Kin_DHM_L1[DHM_D] = 169.77;
-    Robot_Kin_DHM_L2[DHM_D] = 0;
-    Robot_Kin_DHM_L4[DHM_D] = 222.63;
-    Robot_Kin_DHM_L6[DHM_D] = 41;
+    Robot_Kin_DHM_L1[DHM_D] = 169.77f;
+    Robot_Kin_DHM_L2[DHM_D] = 0.0f;
+    Robot_Kin_DHM_L4[DHM_D] = 222.63f;
+    Robot_Kin_DHM_L6[DHM_D] = 41.0f;
 
-    // Define joint limits in degrees (match Teensy)
     Robot_JointLimits_Upper[0] = 170.0f;
     Robot_JointLimits_Lower[0] = 170.0f;
 
@@ -311,28 +386,7 @@ void robot_set() {
     Robot_JointLimits_Upper[5] = 180.0f;
     Robot_JointLimits_Lower[5] = 180.0f;
 
-    // Theta parameters
-    // (default)
-
 }
-void robot_set_kinematics() {
-
-}
-
-
-
-
-
-template <typename T>
-bool robot_joints_valid(const T joints[ROBOT_nDOFs]) {
-    for (int i = 0; i < ROBOT_nDOFs; i++) {
-        if (joints[i] < -Robot_JointLimits_Lower[i] || joints[i] > Robot_JointLimits_Upper[i]) {
-            return false;
-        }
-    }
-    return true;
-}
-
 /// Returns the pose given the position (mm) and Euler angles (rad) as an array [x,y,z,rx,ry,rz].
 /// The result is the same as calling: H = transl(x,y,z)*rotx(rx)*roty(ry)*rotz(rz)
 template <typename T>
@@ -371,8 +425,6 @@ void xyzwpr_2_pose(const T xyzwpr[6], Matrix4x4 pose)
     pose[15] = 1.0;
 }
 
-/// Calculate the robot forward kinematics (ignores the customized base frame and tool frame)
-/// The calculation is from the robot base frame to the tool flange, ignoring the TCP
 template <typename T>
 void forward_kinematics_arm(const T* joints, Matrix4x4 pose) {
     xyzwpr_2_pose(Robot_Kin_Base, pose);
@@ -407,7 +459,7 @@ int inverse_kinematics_robot(const Matrix4x4 target, T joints[ROBOT_nDOFs], cons
     Matrix4x4 invToolFrame;
     Matrix4x4 pose_arm;
     int nsol;
-    Matrix_Inv(invToolFrame, Robot_ToolFrame); // invRobot_Tool could be precalculated, the tool does not change so often
+    Matrix_Inv(invToolFrame, Robot_ToolFrame);
     Matrix_Multiply(pose_arm, Robot_BaseFrame, target);
     Matrix_Multiply_Cumul(pose_arm, invToolFrame);
     if (joints_estimate != nullptr) {
@@ -515,7 +567,7 @@ template <typename T>
 void forward_kinematics_robot(const T joints[ROBOT_nDOFs], Matrix4x4 target) {
     Matrix4x4 invBaseFrame;
     Matrix4x4 pose_arm;
-    Matrix_Inv(invBaseFrame, Robot_BaseFrame); // invRobot_Tool could be precalculated, the tool does not change so often
+    Matrix_Inv(invBaseFrame, Robot_BaseFrame);
     forward_kinematics_arm(joints, pose_arm);
     Matrix_Multiply(target, invBaseFrame, pose_arm);
     Matrix_Multiply_Cumul(target, Robot_ToolFrame);
@@ -533,101 +585,160 @@ void forward_kinematics_robot_xyzuvw(const T joints[ROBOT_nDOFs], T target_xyzuv
 
 
 
-void JointEstimate() {
-    for (int i = 0; i < ROBOT_nDOFs; i++) {
-        joints_estimate[i] = JangleIn[i];
+namespace {
+
+using JointSolution = std::array<float, ROBOT_nDOFs>;
+
+constexpr float kPositionValidationMillimetres = 0.1f;
+constexpr float kRotationValidationDegrees = 0.1f;
+constexpr float kRadiansPerDegree = 0.01745329251994329577f;
+
+bool all_finite(const std::vector<float>& values) {
+    return std::all_of(values.begin(), values.end(), [](float value) {
+        return std::isfinite(value);
+    });
+}
+
+char parse_wrist_config(const std::string& wrist_config) {
+    if (wrist_config.size() != 1) {
+        throw std::invalid_argument("Wrist configuration must be A, F, or N");
     }
+    const char parsed = static_cast<char>(
+        std::toupper(static_cast<unsigned char>(wrist_config.front()))
+    );
+    if (!ar4_protocol::wrist_config_valid(parsed)) {
+        throw std::invalid_argument("Wrist configuration must be A, F, or N");
+    }
+    return parsed;
+}
+
+bool reaches_target(
+    const JointSolution& joints,
+    const Matrix4x4 target_pose,
+    float position_tolerance,
+    float rotation_tolerance
+) {
+    Matrix4x4 candidate_pose;
+    forward_kinematics_robot(joints.data(), candidate_pose);
+    return ar4_protocol::wrist_pose_matches(
+        candidate_pose,
+        target_pose,
+        position_tolerance,
+        rotation_tolerance
+    );
 }
 
 
+}  // namespace
 
-std::vector<float> SolveInverseKinematics(const std::vector<float>& xyzuvw_In,
-                                          const std::vector<float>& JangleIn_in) {
-    float joints[ROBOT_nDOFs];
-    float target[6];
-
-    float solbuffer[ROBOT_nDOFs] = { 0 };
-    int NumberOfSol = 0;
-    int solVal = 0;
-
-    KinematicError = 0;
-
-    for (int i = 0; i < ROBOT_nDOFs; i++) {
-        JangleIn[i] = JangleIn_in[i];
+std::vector<float> SolveInverseKinematicsConfigured(
+    const std::vector<float>& xyzuvw_in,
+    const std::vector<float>& joint_estimate,
+    const std::string& wrist_config
+) {
+    if (xyzuvw_in.size() != ROBOT_nDOFs) {
+        throw std::invalid_argument("Expected 6-element xyzuvw input");
     }
-
-    JointEstimate();  // updates joints_estimate with best guess
-
-    // Copy and convert target orientation to radians
-    target[0] = xyzuvw_In[0];
-    target[1] = xyzuvw_In[1];
-    target[2] = xyzuvw_In[2];
-    target[3] = xyzuvw_In[3] * M_PI / 180.0f;
-    target[4] = xyzuvw_In[4] * M_PI / 180.0f;
-    target[5] = xyzuvw_In[5] * M_PI / 180.0f;
-
-    
-    for (int i = -3; i <= 3; i++) {
-        joints_estimate[4] = i * 30;  // sweep J5 to get multiple solutions
-        int success = inverse_kinematics_robot_xyzuvw(target, joints, joints_estimate);
-        if (success) {
-            if (solbuffer[4] != joints[4]) {
-                if (robot_joints_valid(joints)) {
-                    for (int j = 0; j < ROBOT_nDOFs; j++) {
-                        solbuffer[j] = joints[j];
-                        SolutionMatrix[j][NumberOfSol] = solbuffer[j];
-                    }
-                    if (NumberOfSol <= 6) {
-                        NumberOfSol++;
-                    }
-                }
-            }
-        } else {
-            KinematicError = 1;
+    if (joint_estimate.size() != ROBOT_nDOFs) {
+        throw std::invalid_argument("Expected 6-element joint estimate");
+    }
+    if (!all_finite(xyzuvw_in) || !all_finite(joint_estimate)) {
+        throw std::invalid_argument("Kinematics input values must be finite");
+    }
+    for (std::size_t index = 3; index < ROBOT_nDOFs; ++index) {
+        if (
+            xyzuvw_in[index] != 0.0f
+            && xyzuvw_in[index] * kRadiansPerDegree == 0.0f
+        ) {
+            throw std::invalid_argument(
+                "Cartesian rotation cannot be represented in native radians"
+            );
         }
     }
-
-    joints_estimate[4] = JangleIn[4];  // restore original J5 guess
-
-    solVal = 0;
-    for (int i = 0; i < ROBOT_nDOFs; i++) {
-        if ((std::abs(joints_estimate[i] - SolutionMatrix[i][0]) > 20.0f) && NumberOfSol > 1) {
-            solVal = 1;
-        } else if ((std::abs(joints_estimate[i] - SolutionMatrix[i][1]) > 20.0f) && NumberOfSol > 1) {
-            solVal = 0;
+    for (float value : joint_estimate) {
+        if (value != 0.0f && value * kRadiansPerDegree == 0.0f) {
+            throw std::invalid_argument(
+                "Joint estimate cannot be represented in native radians"
+            );
         }
     }
+    const char parsed_wrist_config = parse_wrist_config(wrist_config);
 
-    if (NumberOfSol == 0) {
-        KinematicError = 1;
-    }
+    std::array<float, ROBOT_nDOFs> target = {
+        xyzuvw_in[0],
+        xyzuvw_in[1],
+        xyzuvw_in[2],
+        xyzuvw_in[3] * kRadiansPerDegree,
+        xyzuvw_in[4] * kRadiansPerDegree,
+        xyzuvw_in[5] * kRadiansPerDegree,
+    };
+    Matrix4x4 target_pose;
+    xyzuvw_2_pose(target.data(), target_pose);
 
-    for (int i = 0; i < ROBOT_nDOFs; i++) {
-        JangleOut[i] = SolutionMatrix[i][solVal];
-    }
-   return std::vector<float>(JangleOut, JangleOut + ROBOT_nDOFs); 
-
-   
-
-    /* 
-    int success = inverse_kinematics_robot_xyzuvw(target, joints, joints_estimate);
-    if (success) {
-        std::cout << "IK succeeded\n";
-        for (int j = 0; j < ROBOT_nDOFs; j++) {
-            JangleOut[j] = joints[j];
-            std::cout << "J" << j+1 << ": " << joints[j] << "\n";
+    float solutions[
+        ar4_protocol::kWristJointCount
+    ][ar4_protocol::kMaximumWristSolutions] = {};
+    const int solution_count = ar4_protocol::generate_wrist_solutions(
+        solutions,
+        target.data(),
+        joint_estimate.data(),
+        Robot_JointLimits_Upper,
+        Robot_JointLimits_Lower,
+        [&target_pose](
+            const float*,
+            const float* candidate,
+            float position_tolerance,
+            float rotation_tolerance
+        ) {
+            JointSolution candidate_joints{};
+            std::copy(
+                candidate,
+                candidate + ROBOT_nDOFs,
+                candidate_joints.begin()
+            );
+            return reaches_target(
+                candidate_joints,
+                target_pose,
+                position_tolerance,
+                rotation_tolerance
+            );
+        },
+        [](const float* solver_target, float* candidate, const float* seed) {
+            return inverse_kinematics_robot_xyzuvw<float>(
+                solver_target,
+                candidate,
+                seed
+            ) != 0;
         }
-    } else {
-        std::cout << "IK failed\n";
-        KinematicError = 1;
-        throw std::runtime_error("IK failed for initial estimate");
+    );
+    const int selected_solution = ar4_protocol::select_wrist_solution(
+        solutions,
+        solution_count,
+        joint_estimate.data(),
+        parsed_wrist_config
+    );
+    if (selected_solution < 0) return {};
+
+    JointSolution selected{};
+    for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
+        selected[joint] = solutions[joint][selected_solution];
     }
+    if (!reaches_target(
+        selected,
+        target_pose,
+        kPositionValidationMillimetres,
+        kRotationValidationDegrees
+    )) {
+        return {};
+    }
+    return std::vector<float>(selected.begin(), selected.end());
+}
 
-    
-
-    return std::vector<float>(JangleOut, JangleOut + ROBOT_nDOFs);
-    */
-
+std::vector<float> SolveInverseKinematics(
+    const std::vector<float>& xyzuvw_in,
+    const std::vector<float>& joint_estimate
+) {
+    return SolveInverseKinematicsConfigured(xyzuvw_in, joint_estimate, "A");
 }
 
 
@@ -764,7 +875,7 @@ void inverse_kinematics_raw(const T pose[16], const tRobot DK, const T joints_ap
     bool guard1 = false;
     T make_sqrt;
     T P04[4];
-    T q1;
+    T q1 = 0;
     int i1;
     T c_Hout[16];
     T k2;
@@ -992,7 +1103,7 @@ void inverse_kinematics_raw(const T pose[16], const tRobot DK, const T joints_ap
                 joints[i0] = DK[60 + i0] * (joints[i0] * 180.0 / 3.1415926535897931);
             }
 
-            *nsol = 1.0;
+            *nsol = 1;
         }
         else {
             for (i = 0; i < 6; i++) {
