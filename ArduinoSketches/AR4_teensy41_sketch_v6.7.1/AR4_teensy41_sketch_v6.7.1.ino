@@ -2892,6 +2892,10 @@ ar4_protocol::MotionCommandStatus moveJ(
         return ar4_protocol::MotionCommandStatus::kRejected;
       }
       checkEncoders();
+      if (TotalCollision > 0) {
+        sendRobotPos();
+        return ar4_protocol::MotionCommandStatus::kTerminalFaultReported;
+      }
       if (response == true) {
         sendRobotPos();
       }

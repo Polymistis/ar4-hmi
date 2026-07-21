@@ -49,6 +49,8 @@ The complete elevated Windows rerun on 2026-07-20 passed after rounded-motion wr
 
 The 2026-07-21 complete elevated Windows rerun passed after stored-program playback gained explicit completed, rejected, and terminal-fault-reported outcomes. Source-contract coverage confirms that a reported Cartesian row fault closes playback without emitting a second error response.
 
+The 2026-07-21 encoder-collision follow-up passed the complete elevated Windows suite after the ordinary sandbox denied access to a temporary persistence fixture. Source-contract coverage binds each reported `moveJ` fault to an emitted response, binds caller-condition polarity to the shared status policy, and confirms that an encoder collision emits the `EC`-bearing position response before stored playback stops.
+
 ## Windows native extension
 
 Toolchain:
@@ -167,3 +169,5 @@ The 2026-07-20 no-upload compile after live terminal-response ownership, rounded
 The 2026-07-21 no-upload compile after Modbus span validation, pre-acknowledgement live-command validation, single-response finite-trajectory faults, volatile emergency-stop polling state, and bounded SD playback rows succeeded with ample flash and RAM headroom. Upstream ModbusMaster warnings remained; no tracked-source warning was emitted.
 
 The 2026-07-21 playback-policy no-upload compile succeeded after `moveJ` gained explicit completed, rejected, and terminal-fault-reported results and PG stopped on every non-completed Cartesian row. Upstream ModbusMaster warnings remained; no tracked-source warning was emitted.
+
+The 2026-07-21 encoder-collision no-upload compile succeeded after `moveJ` propagated the reported collision outcome to direct and stored-program callers. Upstream ModbusMaster warnings remained; no tracked-source warning was emitted.

@@ -10933,11 +10933,24 @@ class HmiSourceContractTests(unittest.TestCase):
         move_start = firmware.index("MotionCommandStatus moveJ(")
         move_end = firmware.index("const int32_t MODBUS_PARSE_ERROR", move_start)
         move = firmware[move_start:move_end]
-        axis_fault = move.index('Alarm = "EL"')
-        self.assertIn(
-            "return ar4_protocol::MotionCommandStatus::"
-            "kTerminalFaultReported;",
-            move[axis_fault:],
+        reported_responses = re.findall(
+            r'Serial\.println\(Alarm\);\s*Alarm = "0";\s*'
+            r"return ar4_protocol::MotionCommandStatus::"
+            r"kTerminalFaultReported;",
+            move,
+        )
+        self.assertEqual(len(reported_responses), 2)
+        collision_start = move.index("checkEncoders();")
+        normal_response = move.index("if (response == true)", collision_start)
+        collision = move[collision_start:normal_response]
+        self.assertIn("if (TotalCollision > 0)", collision)
+        self.assertLess(
+            collision.index("sendRobotPos();"),
+            collision.index("kTerminalFaultReported"),
+        )
+        self.assertLess(
+            normal_response,
+            move.index("kCompleted", normal_response),
         )
 
         playback_start = firmware.index('if (function == "PG")')
@@ -10952,21 +10965,51 @@ class HmiSourceContractTests(unittest.TestCase):
             cartesian_start,
         )
         cartesian = playback[cartesian_start:cartesian_end]
-        stop_start = cartesian.index("should_continue_stored_playback(status)")
+        status_assignment = cartesian.index(
+            "const ar4_protocol::MotionCommandStatus status ="
+        )
+        move_call = cartesian.index(
+            "moveJ(Cmd, false, false, true);",
+            status_assignment,
+        )
+        stop_start = cartesian.index(
+            "if (!ar4_protocol::should_continue_stored_playback(status))"
+        )
+        self.assertLess(move_call, stop_start)
         stop_end = cartesian.index("return;", stop_start)
         stop_branch = cartesian[stop_start:stop_end]
-        self.assertIn("should_emit_generic_motion_error(status)", stop_branch)
+        self.assertIn(
+            "if (ar4_protocol::should_emit_generic_motion_error(status))",
+            stop_branch,
+        )
         self.assertIn("gcFile.close();", stop_branch)
         self.assertIn("consume_current_command();", stop_branch)
 
-        direct_start = firmware.index('if (function == "MJ")')
-        direct_end = firmware.index('if (function == "DG")', direct_start)
-        direct = firmware[direct_start:direct_end]
-        self.assertEqual(
-            direct.count("should_emit_generic_motion_error(status)"),
-            2,
-        )
-        self.assertNotIn("if (!moveJ(", direct)
+        for function, next_function, expected_call in (
+            ("MJ", "MG", "moveJ(inData, true, false, false);"),
+            ("MG", "DG", "moveJ(inData, true, false, true);"),
+        ):
+            direct_start = firmware.index(f'if (function == "{function}")')
+            direct_end = firmware.index(
+                f'if (function == "{next_function}")',
+                direct_start,
+            )
+            direct = firmware[direct_start:direct_end]
+            status_assignment = direct.index(
+                "const ar4_protocol::MotionCommandStatus status ="
+            )
+            move_call = direct.index(expected_call, status_assignment)
+            response_policy = direct.index(
+                "if (ar4_protocol::should_emit_generic_motion_error(status))",
+                move_call,
+            )
+            generic_error = direct.index(
+                'Serial.println("ER");',
+                response_policy,
+            )
+            self.assertLess(move_call, response_policy)
+            self.assertLess(response_policy, generic_error)
+            self.assertNotIn("if (!moveJ(", direct)
 
     def test_tool_jog_wrist_mode_is_paired_with_firmware_parser(self):
         firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
