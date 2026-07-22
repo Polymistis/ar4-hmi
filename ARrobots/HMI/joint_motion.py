@@ -969,13 +969,17 @@ def _raise_quarantined_transport(
     raise error
 
 
-def _validate_write_lock(write_lock):
+def _validate_write_lock(write_lock, parameter_name="write_lock"):
+    if not isinstance(parameter_name, str) or not parameter_name:
+        raise TypeError("write-lock parameter name must be non-empty text")
     if write_lock is None:
         return
     if not callable(getattr(write_lock, "acquire", None)) or not callable(
         getattr(write_lock, "release", None)
     ):
-        raise MotionInputError("write_lock must satisfy the lock contract")
+        raise MotionInputError(
+            f"{parameter_name} must satisfy the lock contract"
+        )
 
 
 def _write_serial_bytes(
@@ -985,6 +989,7 @@ def _write_serial_bytes(
     reset_input=None,
     write_admission_check=None,
     write_started_event=None,
+    write_boundary_lock=None,
 ):
     write = getattr(serial_port, "write", None)
     flush = getattr(serial_port, "flush", None)
@@ -996,6 +1001,11 @@ def _write_serial_bytes(
         getattr(write_started_event, "set", None)
     ):
         raise TypeError("serial write-start event must satisfy the event contract")
+    _validate_write_lock(write_boundary_lock, "write_boundary_lock")
+    if write_boundary_lock is not None and write_boundary_lock is write_lock:
+        raise MotionInputError(
+            "serial write and write-boundary locks must be distinct"
+        )
 
     acquired = False
     if write_lock is not None:
@@ -1007,10 +1017,19 @@ def _write_serial_bytes(
             write_admission_check()
         if reset_input is not None:
             reset_input()
+        boundary_acquired = False
+        if write_boundary_lock is not None:
+            boundary_acquired = write_boundary_lock.acquire()
+            if boundary_acquired is False:
+                raise RuntimeError("serial write-boundary lock acquisition failed")
+        try:
             if write_admission_check is not None:
                 write_admission_check()
-        if write_started_event is not None:
-            write_started_event.set()
+            if write_started_event is not None:
+                write_started_event.set()
+        finally:
+            if write_boundary_lock is not None and boundary_acquired is not False:
+                write_boundary_lock.release()
         written = write(command_bytes)
         if written != len(command_bytes):
             raise OSError(
@@ -1625,11 +1644,13 @@ def exchange_serial_line_until_cancelled(
     write_lock=None,
     poll_interval_seconds=CONTROL_POLL_INTERVAL_SECONDS,
     write_started_event=None,
+    write_boundary_lock=None,
 ):
     """Own a framed exchange until terminal data or explicit cancellation.
 
-    A write-start event is set after admission and reset checks, immediately
-    before the initial serial write call.
+    A write-commitment event is set after admission and reset checks while the
+    optional boundary lock remains held. Callers requiring latched post-commit
+    ownership must provide cancellation semantics that observe that event.
     """
     if not callable(getattr(cancellation_event, "is_set", None)):
         raise MotionInputError("cancellation_event must satisfy the event contract")
@@ -1650,6 +1671,7 @@ def exchange_serial_line_until_cancelled(
     command_bytes = _serial_command_bytes(command)
     _require_open_serial_port(serial_port)
     _validate_write_lock(write_lock)
+    _validate_write_lock(write_boundary_lock, "write_boundary_lock")
     try:
         original_timeout = serial_port.timeout
     except Exception as exc:
@@ -1694,6 +1716,7 @@ def exchange_serial_line_until_cancelled(
             reset_input=reset_input,
             write_admission_check=require_write_admission,
             write_started_event=write_started_event,
+            write_boundary_lock=write_boundary_lock,
         )
         transmitted = True
         while True:

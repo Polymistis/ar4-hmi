@@ -347,12 +347,12 @@ tab9 = ttk_bootstrap.Frame(nb)
 
 def on_closing():
   closing_event = globals().get('application_closing')
-  if closing_event is not None and closing_event.is_set():
-    return False
-
-  serial_activity_registry.begin_shutdown()
-  if closing_event is not None:
-    closing_event.set()
+  with application_lifecycle_lock:
+    if closing_event is not None and closing_event.is_set():
+      return False
+    serial_activity_registry.begin_shutdown()
+    if closing_event is not None:
+      closing_event.set()
   runtime_state = globals().get('RUN')
   if isinstance(runtime_state, dict):
     runtime_state['xboxUse'] = 0
@@ -393,6 +393,7 @@ RUN['selectedTemplate'].set("")
 live_jog_lock = threading.Lock()
 live_cartesian_lock = threading.Lock()
 live_tool_lock = threading.Lock()
+application_lifecycle_lock = threading.Lock()
 offline_live_jog_lock = threading.Lock()
 offline_live_jog_state_lock = threading.Lock()
 offline_live_jog_stop_event = threading.Event()
@@ -405,6 +406,13 @@ manual_motion_request_state = threading.local()
 motion_request_admission_state = threading.local()
 serial_write_lock = threading.Lock()
 serial_event_queue = Queue()
+calibration_serial_event_queue = Queue()
+calibration_operation_lock = threading.Lock()
+calibration_operation = None
+calibration_next_request_id = 0
+calibration_terminal_owner_lock = threading.Lock()
+calibration_terminal_response_pending = threading.Event()
+calibration_serial_write_committed = threading.Event()
 auxiliary_serial_lock = threading.Lock()
 auxiliary_serial_write_lock = threading.Lock()
 auxiliary_serial_event_queue = Queue()
@@ -449,6 +457,48 @@ motion_request_registry = MotionRequestRegistry()
 joint_motion_request_lock = threading.Lock()
 joint_motion_request_lease = None
 offline_live_jog_motion_lease = None
+
+
+class CalibrationCancellationBoundary:
+  def __init__(self, shutdown_event, write_started_event):
+    if not callable(getattr(shutdown_event, "is_set", None)):
+      raise TypeError("calibration shutdown event must satisfy the event contract")
+    if not callable(getattr(write_started_event, "is_set", None)):
+      raise TypeError("calibration write-start event must satisfy the event contract")
+    self._shutdown_event = shutdown_event
+    self._write_started_event = write_started_event
+
+  def is_set(self):
+    write_started = self._write_started_event.is_set()
+    if not isinstance(write_started, bool):
+      raise TypeError("calibration write-start state must be boolean")
+    if write_started:
+      return False
+    shutdown_started = self._shutdown_event.is_set()
+    if not isinstance(shutdown_started, bool):
+      raise TypeError("calibration shutdown state must be boolean")
+    return shutdown_started
+
+
+class CalibrationWriteCommitment:
+  def __init__(self, shared_event):
+    if not all(
+      callable(getattr(shared_event, method_name, None))
+      for method_name in ("set", "clear", "is_set")
+    ):
+      raise TypeError("calibration commitment event contract is invalid")
+    self._shared_event = shared_event
+    self._local_event = threading.Event()
+
+  def set(self):
+    self._shared_event.set()
+    self._local_event.set()
+
+  def is_set(self):
+    committed = self._local_event.is_set()
+    if not isinstance(committed, bool):
+      raise TypeError("calibration commitment state must be boolean")
+    return committed
 
 SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS = 120
 SERIAL_RESPONSE_MARGIN_SECONDS = 10
@@ -1212,6 +1262,7 @@ def _poll_application_close():
   global application_shutdown_started_at
 
   _poll_serial_events()
+  _poll_calibration_events()
   _poll_auxiliary_serial_events()
   _poll_joint_motion_events()
   _poll_virtual_motion_events()
@@ -1230,6 +1281,8 @@ def _poll_application_close():
     root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
     return False
 
+  calibration_shutdown_pending = _calibration_shutdown_pending()
+  calibration_write_committed = calibration_serial_write_committed.is_set()
   if not serial_activity_registry.idle():
     now = time.monotonic()
     if application_shutdown_started_at is None:
@@ -1239,7 +1292,16 @@ def _poll_application_close():
       >= SERIAL_SHUTDOWN_ACTIVITY_GRACE_SECONDS
     ):
       for serial_name in ("ser", "ser2"):
+        if calibration_write_committed and serial_name == "ser":
+          continue
         _interrupt_tracked_serial_activity(serial_name)
+
+  if calibration_shutdown_pending:
+    message = "SHUTDOWN WAITING FOR CALIBRATION RESPONSE"
+    almStatusLab.config(text=message, style="Warn.TLabel")
+    almStatusLab2.config(text=message, style="Warn.TLabel")
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
 
   with offline_live_jog_state_lock:
     offline_motion_pending = offline_live_jog_operation is not None
@@ -7490,16 +7552,16 @@ def executeRow(motion_complete=None):
     "Cal_J5", "Cal_J6", "Cal_J7", "Cal_J8", "Cal_J9",
   }:
     calibration_action = {
-      "Calibr": calRobotAll,
-      "Cal_J1": calRobotJ1,
-      "Cal_J2": calRobotJ2,
-      "Cal_J3": calRobotJ3,
-      "Cal_J4": calRobotJ4,
-      "Cal_J5": calRobotJ5,
-      "Cal_J6": calRobotJ6,
-      "Cal_J7": calRobotJ7,
-      "Cal_J8": calRobotJ8,
-      "Cal_J9": calRobotJ9,
+      "Calibr": _run_program_calibration_all,
+      "Cal_J1": _run_program_calibration_j1,
+      "Cal_J2": _run_program_calibration_j2,
+      "Cal_J3": _run_program_calibration_j3,
+      "Cal_J4": _run_program_calibration_j4,
+      "Cal_J5": _run_program_calibration_j5,
+      "Cal_J6": _run_program_calibration_j6,
+      "Cal_J7": _run_program_calibration_j7,
+      "Cal_J8": _run_program_calibration_j8,
+      "Cal_J9": _run_program_calibration_j9,
     }[RUN['cmdType']]
     if RUN['moveInProc'] == 1:
       RUN['moveInProc'] = 2
@@ -13469,6 +13531,796 @@ def _record_calibration_response(
   return succeeded
 
 
+@dataclass(frozen=True)
+class CalibrationStage:
+  command: str
+  success_message: str
+  failure_message: str
+  update_virtual: bool = True
+
+  def __post_init__(self):
+    object.__setattr__(
+      self,
+      "command",
+      _validated_startup_command(self.command, "LL"),
+    )
+    for field_name in ("success_message", "failure_message"):
+      value = getattr(self, field_name)
+      if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+      ):
+        raise MotionInputError(
+          f"calibration {field_name.replace('_', ' ')} must be normalized text"
+        )
+    if not isinstance(self.update_virtual, bool):
+      raise MotionInputError("calibration virtual-update state must be boolean")
+
+
+@dataclass(frozen=True)
+class CalibrationWorkerResult:
+  worker_token: object
+  request_id: object
+  stage_index: object
+  event_type: object
+  response: object
+  error: object
+  write_started: object
+
+
+CALIBRATION_POSITION_KEYS = (
+  'J1AngCur', 'J2AngCur', 'J3AngCur',
+  'J4AngCur', 'J5AngCur', 'J6AngCur',
+  'XcurPos', 'YcurPos', 'ZcurPos',
+  'RzcurPos', 'RycurPos', 'RxcurPos',
+  'J7PosCur', 'J8PosCur', 'J9PosCur',
+)
+
+
+@dataclass(frozen=True)
+class CalibrationPoseSnapshot:
+  calibration_values: tuple
+  wrist_config: str
+  virtual_angles: tuple
+  step_monitors: tuple
+  step_values: tuple
+  entry_values: tuple
+  slider_values: tuple
+  manual_debug: object
+  confirmed_generation: int
+  acknowledged_forced_target: object
+  resynchronization_required: bool
+  persistence_dirty: bool
+  persistence_job: object
+
+
+@dataclass
+class CalibrationOperation:
+  request_id: int
+  name: str
+  stages: tuple
+  request_lease: object
+  activity_lease: object
+  serial_port: object
+  completion_callback: object = None
+  stage_index: int = 0
+  worker_token: object = None
+  worker_active: bool = False
+  stage_snapshot: object = None
+  settled: bool = False
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError("calibration request ID must be positive")
+    if (
+      not isinstance(self.name, str)
+      or not self.name.strip()
+      or self.name != self.name.strip()
+    ):
+      raise MotionInputError("calibration request name must be normalized text")
+    if (
+      not isinstance(self.stages, tuple)
+      or not self.stages
+      or not all(isinstance(stage, CalibrationStage) for stage in self.stages)
+    ):
+      raise MotionInputError("calibration operation requires validated stages")
+    if not isinstance(self.request_lease, MotionRequestLease):
+      raise MotionInputError("calibration operation requires a motion lease")
+    if not callable(getattr(self.activity_lease, "close", None)):
+      raise MotionInputError("calibration operation requires a serial activity lease")
+    if self.serial_port is None or not getattr(self.serial_port, "is_open", False):
+      raise ConnectionError("calibration requires an open controller connection")
+    if self.completion_callback is not None and not callable(
+      self.completion_callback
+    ):
+      raise MotionInputError("calibration completion callback must be callable")
+    if (
+      self.stage_index != 0
+      or self.worker_token is not None
+      or self.worker_active
+      or self.stage_snapshot is not None
+      or self.settled
+    ):
+      raise MotionInputError("calibration operation initial state is invalid")
+
+
+def _set_calibration_status(message, style):
+  if (
+    not isinstance(message, str)
+    or not message.strip()
+    or message != message.strip()
+  ):
+    raise TypeError("calibration status must be normalized text")
+  if not isinstance(style, str) or not style:
+    raise TypeError("calibration status style must be non-empty text")
+  almStatusLab.config(text=message, style=style)
+  almStatusLab2.config(text=message, style=style)
+
+
+def _calibration_pose_widget_groups():
+  return (
+    (
+      J1curAngEntryField, J2curAngEntryField, J3curAngEntryField,
+      J4curAngEntryField, J5curAngEntryField, J6curAngEntryField,
+      XcurEntryField, YcurEntryField, ZcurEntryField,
+      RzcurEntryField, RycurEntryField, RxcurEntryField,
+      J7curAngEntryField, J8curAngEntryField, J9curAngEntryField,
+    ),
+    (
+      J1jogslide, J2jogslide, J3jogslide,
+      J4jogslide, J5jogslide, J6jogslide,
+      J7jogslide, J8jogslide, J9jogslide,
+    ),
+  )
+
+
+def _capture_calibration_pose_snapshot():
+  calibration_values = tuple(
+    (key, CAL[key])
+    for key in CALIBRATION_POSITION_KEYS
+  )
+  wrist_config = RUN['WC']
+  if wrist_config not in ("F", "N"):
+    raise RuntimeError("calibration pose wrist state is invalid")
+  virtual_angles = tuple(
+    finite_number(value, f"saved virtual joint {axis}")
+    for axis, value in enumerate(RUN['VR_angles'], start=1)
+  )
+  step_monitors = tuple(
+    finite_number(value, f"saved step monitor {axis}")
+    for axis, value in enumerate(RUN['StepMonitors'], start=1)
+  )
+  step_values = tuple(
+    finite_number(RUN[f'J{axis}StepM'], f"saved J{axis} step monitor")
+    for axis in range(1, 7)
+  )
+  if len(virtual_angles) != 6 or len(step_monitors) != 6:
+    raise RuntimeError("calibration pose runtime vectors must contain six values")
+
+  entry_fields, jog_sliders = _calibration_pose_widget_groups()
+  entry_values = tuple(entry_field.get() for entry_field in entry_fields)
+  slider_values = tuple(jog_slider.get() for jog_slider in jog_sliders)
+  manual_debug = manEntryField.get()
+  generation = confirmed_position_generation
+  if (
+    isinstance(generation, bool)
+    or not isinstance(generation, int)
+    or generation < 0
+  ):
+    raise RuntimeError("confirmed position generation is invalid")
+  resynchronization_required = (
+    controller_position_resynchronization_required.is_set()
+  )
+  if not isinstance(resynchronization_required, bool):
+    raise RuntimeError("controller resynchronization state is invalid")
+  persistence_dirty = _calibration_dirty
+  if not isinstance(persistence_dirty, bool):
+    raise RuntimeError("calibration persistence state is invalid")
+  if _calibration_save_job is not None and not persistence_dirty:
+    raise RuntimeError("calibration persistence job has no dirty state")
+
+  return CalibrationPoseSnapshot(
+    calibration_values,
+    wrist_config,
+    virtual_angles,
+    step_monitors,
+    step_values,
+    entry_values,
+    slider_values,
+    manual_debug,
+    generation,
+    _acknowledged_forced_position_target_value(),
+    resynchronization_required,
+    persistence_dirty,
+    _calibration_save_job,
+  )
+
+
+def _restore_calibration_pose_snapshot(snapshot):
+  global _calibration_dirty
+  global _calibration_save_job
+  global acknowledged_forced_position_target
+  global confirmed_position_generation
+
+  if not isinstance(snapshot, CalibrationPoseSnapshot):
+    raise TypeError("calibration pose snapshot has an invalid type")
+  snapshot_keys = tuple(key for key, _ in snapshot.calibration_values)
+  if snapshot_keys != CALIBRATION_POSITION_KEYS:
+    raise RuntimeError("calibration pose snapshot keys are invalid")
+  if (
+    len(snapshot.virtual_angles) != 6
+    or len(snapshot.step_monitors) != 6
+    or len(snapshot.step_values) != 6
+    or len(snapshot.entry_values) != 15
+    or len(snapshot.slider_values) != 9
+  ):
+    raise RuntimeError("calibration pose snapshot dimensions are invalid")
+  if not isinstance(snapshot.resynchronization_required, bool):
+    raise RuntimeError("calibration resynchronization snapshot is invalid")
+  if not isinstance(snapshot.persistence_dirty, bool):
+    raise RuntimeError("calibration persistence snapshot is invalid")
+
+  for key, value in snapshot.calibration_values:
+    CAL[key] = value
+  RUN['WC'] = snapshot.wrist_config
+  RUN['VR_angles'] = list(snapshot.virtual_angles)
+  RUN['StepMonitors'] = list(snapshot.step_monitors)
+  for axis, value in enumerate(snapshot.step_values, start=1):
+    RUN[f'J{axis}StepM'] = value
+  confirmed_position_generation = snapshot.confirmed_generation
+  with acknowledged_forced_position_lock:
+    acknowledged_forced_position_target = snapshot.acknowledged_forced_target
+  if snapshot.resynchronization_required:
+    controller_position_resynchronization_required.set()
+  else:
+    controller_position_resynchronization_required.clear()
+
+  restoration_errors = []
+  entry_fields, jog_sliders = _calibration_pose_widget_groups()
+  for entry_field, value in zip(entry_fields, snapshot.entry_values):
+    try:
+      entry_field.delete(0, 'end')
+      entry_field.insert(0, value)
+    except Exception as exc:
+      restoration_errors.append(f"pose entry restoration failed: {exc}")
+  for jog_slider, value in zip(jog_sliders, snapshot.slider_values):
+    try:
+      jog_slider.set(value)
+    except Exception as exc:
+      restoration_errors.append(f"pose slider restoration failed: {exc}")
+  try:
+    manEntryField.delete(0, 'end')
+    manEntryField.insert(0, snapshot.manual_debug)
+  except Exception as exc:
+    restoration_errors.append(f"manual debug restoration failed: {exc}")
+
+  persistence_changed = (
+    _calibration_dirty != snapshot.persistence_dirty
+    or _calibration_save_job is not snapshot.persistence_job
+  )
+  if persistence_changed:
+    pending_job = _calibration_save_job
+    if pending_job is not None:
+      try:
+        root.after_cancel(pending_job)
+      except Exception as exc:
+        restoration_errors.append(
+          f"calibration persistence cancellation failed: {exc}"
+        )
+    _calibration_save_job = None
+    _calibration_dirty = True
+    try:
+      shutdown_started = application_closing.is_set()
+      if not isinstance(shutdown_started, bool):
+        raise TypeError("application shutdown state must be boolean")
+      if not shutdown_started:
+        repair_job = root.after(
+          CALIBRATION_SAVE_DEBOUNCE_MS,
+          _write_pending_calibration,
+        )
+        if repair_job is None:
+          raise RuntimeError(
+            "calibration persistence repair scheduler returned no job"
+          )
+        _calibration_save_job = repair_job
+    except Exception as exc:
+      restoration_errors.append(
+        f"calibration persistence repair scheduling failed: {exc}"
+      )
+
+  if restoration_errors:
+    raise RuntimeError("; ".join(restoration_errors))
+  return True
+
+
+def _calibration_result_failure_details(failure):
+  if not isinstance(failure, BaseException):
+    raise TypeError("calibration result failure requires an exception")
+  details = " ".join(str(failure).split())
+  return details or failure.__class__.__name__
+
+
+def _handle_calibration_result_application_failure(snapshot, failure):
+  details = _calibration_result_failure_details(failure)
+  reason = (
+    "calibration result application failed after controller "
+    f"transmission: {details}"
+  )
+  try:
+    _restore_calibration_pose_snapshot(snapshot)
+  except Exception as exc:
+    rollback_details = " ".join(str(exc).split()) or exc.__class__.__name__
+    reason = f"{reason}; local pose rollback failed: {rollback_details}"
+    logger.exception("Unable to restore the pre-command calibration pose")
+  try:
+    _invalidate_uncertain_controller_calibration(reason)
+  except Exception:
+    logger.exception(
+      "Unable to quarantine a failed calibration result application"
+    )
+  return details
+
+
+def _calibration_shutdown_pending():
+  if (
+    calibration_terminal_response_pending.is_set()
+    or calibration_serial_write_committed.is_set()
+  ):
+    return True
+  with calibration_operation_lock:
+    return calibration_operation is not None
+
+
+@contextmanager
+def _require_calibration_terminal_response(write_commitment):
+  if not isinstance(write_commitment, CalibrationWriteCommitment):
+    raise TypeError("calibration exchange requires a write commitment")
+  if write_commitment._shared_event is not calibration_serial_write_committed:
+    raise TypeError("calibration write commitment is bound to the wrong state")
+  response_boundary = CalibrationCancellationBoundary(
+    application_closing,
+    write_commitment,
+  )
+  if response_boundary.is_set():
+    raise SerialActivityRejected(
+      "calibration exchange rejected during application shutdown"
+    )
+  if not calibration_terminal_owner_lock.acquire(blocking=False):
+    raise RuntimeError("another calibration exchange requires a terminal response")
+  calibration_terminal_response_pending.set()
+  try:
+    yield response_boundary
+  finally:
+    calibration_terminal_response_pending.clear()
+    calibration_terminal_owner_lock.release()
+
+
+def _finish_calibration_operation(operation, succeeded):
+  global calibration_operation
+
+  if not isinstance(operation, CalibrationOperation):
+    raise TypeError("calibration completion requires a valid operation")
+  if not isinstance(succeeded, bool):
+    raise TypeError("calibration completion state must be boolean")
+
+  with calibration_operation_lock:
+    if calibration_operation is not operation or operation.settled:
+      raise RuntimeError("calibration operation ownership changed before completion")
+    if (
+      operation.worker_active
+      or operation.worker_token is not None
+      or operation.stage_snapshot is not None
+    ):
+      raise RuntimeError("calibration operation cannot finish with active stage state")
+    operation.settled = True
+    calibration_operation = None
+    calibration_serial_write_committed.clear()
+
+  cleanup_errors = []
+  try:
+    if operation.activity_lease.close() is not True:
+      cleanup_errors.append("serial activity lease was already released")
+  except Exception as exc:
+    cleanup_errors.append(f"serial activity cleanup failed: {exc}")
+  try:
+    if serial_lock.locked():
+      serial_lock.release()
+    else:
+      cleanup_errors.append("controller transport ownership was already released")
+  except Exception as exc:
+    cleanup_errors.append(f"controller transport cleanup failed: {exc}")
+
+  final_result = succeeded and not cleanup_errors
+  try:
+    _finish_motion_request(
+      operation.request_lease,
+      completion_callback=operation.completion_callback,
+      succeeded=final_result,
+    )
+  except Exception as exc:
+    cleanup_errors.append(f"motion request cleanup failed: {exc}")
+    final_result = False
+
+  if cleanup_errors:
+    message = "Calibration cleanup failed: " + "; ".join(cleanup_errors)
+    logger.error(message)
+    try:
+      _set_calibration_status(message, "Alarm.TLabel")
+    except Exception:
+      logger.exception("Unable to display calibration cleanup failure")
+  return final_result
+
+
+def _run_calibration_stage_safe(
+  request_id,
+  stage_index,
+  worker_token,
+  serial_port,
+  command,
+):
+  write_commitment = CalibrationWriteCommitment(
+    calibration_serial_write_committed
+  )
+  try:
+    with _require_calibration_terminal_response(
+      write_commitment
+    ) as response_requirement:
+      response = exchange_serial_line_until_cancelled(
+        serial_port,
+        command,
+        response_requirement,
+        write_lock=serial_write_lock,
+        write_boundary_lock=application_lifecycle_lock,
+        write_started_event=write_commitment,
+      )
+    event = CalibrationWorkerResult(
+      worker_token,
+      request_id,
+      stage_index,
+      "completed",
+      response,
+      None,
+      write_commitment.is_set(),
+    )
+  except Exception as exc:
+    message = str(exc).strip() or "calibration exchange failed without details"
+    event = CalibrationWorkerResult(
+      worker_token,
+      request_id,
+      stage_index,
+      "failed",
+      None,
+      message,
+      write_commitment.is_set(),
+    )
+  calibration_serial_event_queue.put(event)
+
+
+def _start_calibration_stage_worker(operation):
+  if not isinstance(operation, CalibrationOperation):
+    raise TypeError("calibration worker requires a valid operation")
+  with application_lifecycle_lock:
+    if application_closing.is_set():
+      raise SerialActivityRejected(
+        "calibration stage rejected during application shutdown"
+      )
+    with calibration_operation_lock:
+      if calibration_operation is not operation or operation.settled:
+        raise RuntimeError("calibration worker operation is no longer active")
+      if operation.worker_active:
+        raise RuntimeError("calibration stage already has an active worker")
+      if not 0 <= operation.stage_index < len(operation.stages):
+        raise RuntimeError("calibration stage index is out of range")
+      stage_index = operation.stage_index
+      stage = operation.stages[stage_index]
+      stage_snapshot = _capture_calibration_pose_snapshot()
+      calibration_serial_write_committed.clear()
+      worker_token = object()
+      operation.stage_snapshot = stage_snapshot
+      operation.worker_token = worker_token
+      operation.worker_active = True
+
+  try:
+    cmdSentEntryField.delete(0, 'end')
+    cmdSentEntryField.insert(0, stage.command)
+    _set_calibration_status(
+      f"{operation.name.upper()} IN PROGRESS",
+      "OK.TLabel",
+    )
+    thread = threading.Thread(
+      target=_run_calibration_stage_safe,
+      args=(
+        operation.request_id,
+        stage_index,
+        worker_token,
+        operation.serial_port,
+        stage.command,
+      ),
+      daemon=True,
+    )
+    thread.start()
+  except Exception:
+    with calibration_operation_lock:
+      if calibration_operation is operation and not operation.settled:
+        operation.stage_snapshot = None
+        operation.worker_token = None
+        operation.worker_active = False
+    raise
+  return True
+
+
+def _start_calibration_sequence(name, stages, completion_callback=None):
+  global calibration_next_request_id
+  global calibration_operation
+
+  if not isinstance(name, str) or not name.strip() or name != name.strip():
+    raise MotionInputError("calibration request name must be normalized text")
+  if isinstance(stages, (str, bytes)):
+    raise MotionInputError("calibration stages must be a sequence")
+  try:
+    stages = tuple(stages)
+  except TypeError as exc:
+    raise MotionInputError("calibration stages must be a sequence") from exc
+  if not stages or not all(isinstance(stage, CalibrationStage) for stage in stages):
+    raise MotionInputError("calibration stages must contain validated stages")
+  if completion_callback is not None and not callable(completion_callback):
+    raise MotionInputError("calibration completion callback must be callable")
+
+  request_lease = _acquire_motion_request(name)
+  if request_lease is None:
+    message = _motion_request_rejection_message(
+      f"{name} not started; another motion request is active"
+    )
+    _set_calibration_status(message, "Warn.TLabel")
+    return False
+  if not serial_lock.acquire(blocking=False):
+    _finish_motion_request(request_lease)
+    message = f"{name} not started; controller transport is busy"
+    logger.warning(message)
+    _set_calibration_status(message, "Warn.TLabel")
+    return False
+
+  activity_lease = None
+  operation = None
+  try:
+    activity_lease = serial_activity_registry.lease("ser")
+    serial_port = RUN.get('ser')
+    if serial_port is None or not getattr(serial_port, "is_open", False):
+      raise ConnectionError("calibration requires an open controller connection")
+    if serial_transport_quarantined(serial_port):
+      raise SerialTransportQuarantinedError(
+        "calibration requires a reconnected controller transport"
+      )
+    with calibration_operation_lock:
+      if calibration_operation is not None:
+        raise RuntimeError("another calibration operation is already active")
+      if (
+        isinstance(calibration_next_request_id, bool)
+        or not isinstance(calibration_next_request_id, int)
+        or calibration_next_request_id < 0
+      ):
+        raise RuntimeError("calibration request counter is invalid")
+      calibration_next_request_id += 1
+      operation = CalibrationOperation(
+        calibration_next_request_id,
+        name,
+        stages,
+        request_lease,
+        activity_lease,
+        serial_port,
+        completion_callback,
+      )
+      calibration_operation = operation
+    _start_calibration_stage_worker(operation)
+  except Exception as exc:
+    if operation is not None:
+      try:
+        _finish_calibration_operation(operation, False)
+      except Exception:
+        logger.exception("Unable to clean up rejected calibration operation")
+    else:
+      if activity_lease is not None:
+        try:
+          activity_lease.close()
+        except Exception:
+          logger.exception("Unable to release rejected calibration activity")
+      if serial_lock.locked():
+        serial_lock.release()
+      _finish_motion_request(request_lease)
+    message = str(exc).strip() or "calibration request failed without details"
+    logger.exception("Unable to start calibration")
+    _set_calibration_status(f"Calibration not started: {message}", "Alarm.TLabel")
+    return False
+  return True
+
+
+def _claim_calibration_worker_result(event):
+  if not isinstance(event, CalibrationWorkerResult):
+    raise RuntimeError("calibration worker emitted an invalid event")
+  event_type = event.event_type
+  request_id = event.request_id
+  stage_index = event.stage_index
+  response = event.response
+  error = event.error
+  write_started = event.write_started
+  if event_type not in ("completed", "failed"):
+    raise RuntimeError("calibration worker emitted an unknown event type")
+  if (
+    isinstance(request_id, bool)
+    or not isinstance(request_id, int)
+    or request_id <= 0
+  ):
+    raise RuntimeError("calibration worker emitted an invalid request ID")
+  if (
+    isinstance(stage_index, bool)
+    or not isinstance(stage_index, int)
+    or stage_index < 0
+  ):
+    raise RuntimeError("calibration worker emitted an invalid stage index")
+  if not isinstance(write_started, bool):
+    raise RuntimeError("calibration worker emitted an invalid write-start state")
+  if event_type == "completed":
+    if (
+      not write_started
+      or not isinstance(response, str)
+      or error is not None
+    ):
+      raise RuntimeError("calibration worker emitted an invalid success result")
+  elif (
+    response is not None
+    or not isinstance(error, str)
+    or not error.strip()
+    or error != error.strip()
+  ):
+    raise RuntimeError("calibration worker emitted an invalid failure result")
+
+  with calibration_operation_lock:
+    operation = calibration_operation
+    if operation is None or operation.settled:
+      raise RuntimeError("calibration result has no active operation")
+    if (
+      operation.request_id != request_id
+      or operation.stage_index != stage_index
+      or operation.worker_token is not event.worker_token
+      or not operation.worker_active
+      or operation.stage_snapshot is None
+    ):
+      raise RuntimeError("calibration result does not own the active stage")
+    stage_snapshot = operation.stage_snapshot
+    operation.stage_snapshot = None
+    operation.worker_token = None
+    operation.worker_active = False
+  return (
+    operation,
+    operation.stages[stage_index],
+    stage_snapshot,
+    event_type,
+    response,
+    error,
+    write_started,
+  )
+
+
+def _settle_rejected_calibration_worker_result(event, failure):
+  if not isinstance(failure, BaseException):
+    raise TypeError("calibration result rejection requires an exception")
+  if not isinstance(event, CalibrationWorkerResult):
+    return False
+
+  with calibration_operation_lock:
+    operation = calibration_operation
+    if operation is None or operation.settled or not operation.worker_active:
+      return False
+    if event.worker_token is not operation.worker_token:
+      return False
+    operation.stage_snapshot = None
+    operation.worker_token = None
+    operation.worker_active = False
+
+  details = str(failure).strip() or failure.__class__.__name__
+  reason = f"calibration worker result rejected: {details}"
+  try:
+    _invalidate_uncertain_controller_calibration(reason)
+  except Exception:
+    logger.exception("Unable to quarantine a rejected calibration result")
+  try:
+    return _finish_calibration_operation(operation, False)
+  except Exception:
+    logger.exception("Unable to settle a rejected calibration result")
+    return False
+
+
+def _apply_calibration_worker_result(event):
+  (
+    operation,
+    stage,
+    stage_snapshot,
+    event_type,
+    response,
+    error,
+    write_started,
+  ) = _claim_calibration_worker_result(event)
+  try:
+    cmdRecEntryField.delete(0, 'end')
+    cmdRecEntryField.insert(0, response if event_type == "completed" else error)
+    if event_type == "failed":
+      logger.error("Calibration controller exchange failed: %s", error)
+    succeeded = _record_calibration_response(
+      response,
+      stage.success_message,
+      stage.failure_message,
+      update_virtual=stage.update_virtual,
+      controller_write_started=write_started,
+      uncertainty_reason=(
+        "calibration response failed after controller transmission"
+        if event_type == "failed" and write_started
+        else None
+      ),
+    )
+    if not succeeded:
+      return _finish_calibration_operation(operation, False)
+
+    with calibration_operation_lock:
+      if calibration_operation is not operation or operation.settled:
+        raise RuntimeError("calibration operation changed while applying a result")
+      operation.stage_index += 1
+      complete = operation.stage_index == len(operation.stages)
+    if complete:
+      return _finish_calibration_operation(operation, True)
+    return _start_calibration_stage_worker(operation)
+  except Exception as exc:
+    details = _calibration_result_failure_details(exc)
+    if write_started:
+      details = _handle_calibration_result_application_failure(
+        stage_snapshot,
+        exc,
+      )
+    with calibration_operation_lock:
+      can_finish = (
+        calibration_operation is operation
+        and not operation.settled
+        and not operation.worker_active
+      )
+    if can_finish:
+      try:
+        _finish_calibration_operation(operation, False)
+      except Exception:
+        logger.exception("Unable to clean up a failed calibration result")
+    message = details
+    try:
+      _set_calibration_status(
+        f"Calibration result failed to settle: {message}",
+        "Alarm.TLabel",
+      )
+    except Exception:
+      logger.exception("Unable to display calibration settlement failure")
+    raise
+
+
+def _poll_calibration_events():
+  try:
+    while True:
+      try:
+        event = calibration_serial_event_queue.get_nowait()
+      except Empty:
+        break
+      try:
+        _apply_calibration_worker_result(event)
+      except Exception as exc:
+        logger.exception(
+          "Unable to apply a calibration result on the Tk event thread"
+        )
+        _settle_rejected_calibration_worker_result(event, exc)
+  finally:
+    if not application_closing.is_set():
+      root.after(25, _poll_calibration_events)
+
+
 def _execute_calibration_command(
   command,
   success_message,
@@ -13476,40 +14328,65 @@ def _execute_calibration_command(
   *,
   update_virtual=True,
 ):
-  write_started_event = threading.Event()
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0, command)
+  try:
+    pose_snapshot = _capture_calibration_pose_snapshot()
+  except Exception:
+    logger.exception("Unable to capture the pre-command calibration pose")
+    return False
+  write_commitment = CalibrationWriteCommitment(
+    calibration_serial_write_committed
+  )
+  calibration_serial_write_committed.clear()
+  response = None
   uncertainty_reason = None
   try:
-    response = exchange_serial_line_until_cancelled(
-      RUN.get('ser'),
-      command,
-      application_closing,
-      write_lock=serial_write_lock,
-      write_started_event=write_started_event,
-    )
-  except Exception:
-    response = None
-    if write_started_event.is_set():
-      uncertainty_reason = (
-        "calibration response failed after controller transmission"
+    try:
+      with _require_calibration_terminal_response(
+        write_commitment
+      ) as response_requirement:
+        cmdSentEntryField.delete(0, 'end')
+        cmdSentEntryField.insert(0, command)
+        response = exchange_serial_line_until_cancelled(
+          RUN.get('ser'),
+          command,
+          response_requirement,
+          write_lock=serial_write_lock,
+          write_boundary_lock=application_lifecycle_lock,
+          write_started_event=write_commitment,
+        )
+    except Exception:
+      if write_commitment.is_set():
+        uncertainty_reason = (
+          "calibration response failed after controller transmission"
+        )
+      logger.exception("Calibration controller exchange failed")
+
+    try:
+      cmdRecEntryField.delete(0, 'end')
+      cmdRecEntryField.insert(0, "" if response is None else response)
+      return _record_calibration_response(
+        response,
+        success_message,
+        failure_message,
+        update_virtual=update_virtual,
+        controller_write_started=write_commitment.is_set(),
+        uncertainty_reason=uncertainty_reason,
       )
-    logger.exception("Calibration controller exchange failed")
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0, "" if response is None else response)
-  return _record_calibration_response(
-    response,
-    success_message,
-    failure_message,
-    update_virtual=update_virtual,
-    controller_write_started=write_started_event.is_set(),
-    uncertainty_reason=uncertainty_reason,
-  )
+    except Exception as exc:
+      if write_commitment.is_set():
+        _handle_calibration_result_application_failure(
+          pose_snapshot,
+          exc,
+        )
+      logger.exception("Unable to apply calibration controller result")
+      return False
+  finally:
+    calibration_serial_write_committed.clear()
 
 
 @_synchronous_motion_request("Automatic calibration")
 @_tracked_serial_operation("ser")
-def calRobotAll():
+def _run_program_calibration_all():
   if not _calibration_available():
     return False
   first_stage = tuple(
@@ -13547,7 +14424,7 @@ def calRobotAll():
 
 @_synchronous_motion_request("J1 calibration")
 @_tracked_serial_operation("ser")
-def calRobotJ1():
+def _run_program_calibration_j1():
   if not _calibration_available():
     return False
   command = _prepare_calibration_command((1, 0, 0, 0, 0, 0, 0, 0, 0))
@@ -13560,7 +14437,7 @@ def calRobotJ1():
 
 @_synchronous_motion_request("J2 calibration")
 @_tracked_serial_operation("ser")
-def calRobotJ2():
+def _run_program_calibration_j2():
   if not _calibration_available():
     return False
   command = _prepare_calibration_command((0, 1, 0, 0, 0, 0, 0, 0, 0))
@@ -13573,7 +14450,7 @@ def calRobotJ2():
 
 @_synchronous_motion_request("J3 calibration")
 @_tracked_serial_operation("ser")
-def calRobotJ3():
+def _run_program_calibration_j3():
   if not _calibration_available():
     return False
   command = _prepare_calibration_command((0, 0, 1, 0, 0, 0, 0, 0, 0))
@@ -13586,7 +14463,7 @@ def calRobotJ3():
 
 @_synchronous_motion_request("J4 calibration")
 @_tracked_serial_operation("ser")
-def calRobotJ4():
+def _run_program_calibration_j4():
   if not _calibration_available():
     return False
   command = _prepare_calibration_command((0, 0, 0, 1, 0, 0, 0, 0, 0))
@@ -13599,7 +14476,7 @@ def calRobotJ4():
 
 @_synchronous_motion_request("J5 calibration")
 @_tracked_serial_operation("ser")
-def calRobotJ5():
+def _run_program_calibration_j5():
   if not _calibration_available():
     return False
   command = _prepare_calibration_command((0, 0, 0, 0, 1, 0, 0, 0, 0))
@@ -13612,7 +14489,7 @@ def calRobotJ5():
 
 @_synchronous_motion_request("J6 calibration")
 @_tracked_serial_operation("ser")
-def calRobotJ6():
+def _run_program_calibration_j6():
   if not _calibration_available():
     return False
   command = _prepare_calibration_command((0, 0, 0, 0, 0, 1, 0, 0, 0))
@@ -13625,7 +14502,7 @@ def calRobotJ6():
 
 @_synchronous_motion_request("J7 calibration")
 @_tracked_serial_operation("ser")
-def calRobotJ7():
+def _run_program_calibration_j7():
   if not _calibration_available():
     return False
   command = _prepare_calibration_command((0, 0, 0, 0, 0, 0, 1, 0, 0))
@@ -13639,7 +14516,7 @@ def calRobotJ7():
 
 @_synchronous_motion_request("J8 calibration")
 @_tracked_serial_operation("ser")
-def calRobotJ8():
+def _run_program_calibration_j8():
   if not _calibration_available():
     return False
   command = _prepare_calibration_command((0, 0, 0, 0, 0, 0, 0, 1, 0))
@@ -13653,7 +14530,7 @@ def calRobotJ8():
 
 @_synchronous_motion_request("J9 calibration")
 @_tracked_serial_operation("ser")
-def calRobotJ9():
+def _run_program_calibration_j9():
   if not _calibration_available():
     return False
   command = _prepare_calibration_command((0, 0, 0, 0, 0, 0, 0, 0, 1))
@@ -13663,6 +14540,101 @@ def calRobotJ9():
     "J9 Calibration Failed",
     update_virtual=False,
   )
+
+
+def startCalRobotAll():
+  if not _calibration_available():
+    return False
+  try:
+    first_stage = tuple(
+      CAL[f'J{joint}CalStatVal'].get()
+      for joint in range(1, 10)
+    )
+    second_stage = tuple(
+      _binary_controller_flag(
+        CAL[f'J{joint}CalStatVal2'].get(),
+        f"J{joint} second-stage calibration selection",
+      )
+      for joint in range(1, 10)
+    )
+    stages = [
+      CalibrationStage(
+        _prepare_calibration_command(first_stage),
+        "Auto Calibration Stage 1 Successful",
+        "Auto Calibration Stage 1 Failed - See Log",
+      )
+    ]
+    if sum(second_stage) > 0:
+      stages.append(
+        CalibrationStage(
+          _prepare_calibration_command(second_stage),
+          "Auto Calibration Stage 2 Successful",
+          "Auto Calibration Stage 2 Failed - See Log",
+        )
+      )
+    return _start_calibration_sequence("Automatic calibration", stages)
+  except Exception as exc:
+    message = str(exc).strip() or "automatic calibration input is invalid"
+    logger.exception("Unable to prepare automatic calibration")
+    _set_calibration_status(f"Calibration not started: {message}", "Alarm.TLabel")
+    return False
+
+
+def _start_single_joint_calibration(joint):
+  if not _calibration_available():
+    return False
+  if isinstance(joint, bool) or not isinstance(joint, int) or not 1 <= joint <= 9:
+    raise MotionInputError("calibration joint must be between 1 and 9")
+  try:
+    selections = tuple(1 if axis == joint else 0 for axis in range(1, 10))
+    stage = CalibrationStage(
+      _prepare_calibration_command(selections),
+      f"J{joint} Calibrated Successfully",
+      f"J{joint} Calibration Failed",
+      update_virtual=joint <= 6,
+    )
+    return _start_calibration_sequence(f"J{joint} calibration", (stage,))
+  except Exception as exc:
+    message = str(exc).strip() or f"J{joint} calibration input is invalid"
+    logger.exception("Unable to prepare J%s calibration", joint)
+    _set_calibration_status(f"Calibration not started: {message}", "Alarm.TLabel")
+    return False
+
+
+def startCalRobotJ1():
+  return _start_single_joint_calibration(1)
+
+
+def startCalRobotJ2():
+  return _start_single_joint_calibration(2)
+
+
+def startCalRobotJ3():
+  return _start_single_joint_calibration(3)
+
+
+def startCalRobotJ4():
+  return _start_single_joint_calibration(4)
+
+
+def startCalRobotJ5():
+  return _start_single_joint_calibration(5)
+
+
+def startCalRobotJ6():
+  return _start_single_joint_calibration(6)
+
+
+def startCalRobotJ7():
+  return _start_single_joint_calibration(7)
+
+
+def startCalRobotJ8():
+  return _start_single_joint_calibration(8)
+
+
+def startCalRobotJ9():
+  return _start_single_joint_calibration(9)
 	
 
 
@@ -14443,10 +15415,15 @@ def _schedule_calibration_save():
   _calibration_dirty = True
   if _calibration_save_job is not None:
     root.after_cancel(_calibration_save_job)
-  _calibration_save_job = root.after(
+    _calibration_save_job = None
+  scheduled_job = root.after(
     CALIBRATION_SAVE_DEBOUNCE_MS,
     _write_pending_calibration,
   )
+  if scheduled_job is None:
+    raise RuntimeError("calibration persistence scheduler returned no job")
+  _calibration_save_job = scheduled_job
+  return scheduled_job
 
 
 def _flush_calibration_save():
@@ -14521,42 +15498,19 @@ def displayPosition(response, parsed=None, synchronize_dispatcher=True):
   cmdRecEntryField.delete(0, 'end')
   cmdRecEntryField.insert(0, parsed.raw)
 
-  joint_keys = (
-    'J1AngCur', 'J2AngCur', 'J3AngCur',
-    'J4AngCur', 'J5AngCur', 'J6AngCur',
+  position_values = (
+    parsed.joint_text + parsed.cartesian_text + parsed.external_text
   )
-  cartesian_keys = (
-    'XcurPos', 'YcurPos', 'ZcurPos',
-    'RzcurPos', 'RycurPos', 'RxcurPos',
-  )
-  external_keys = ('J7PosCur', 'J8PosCur', 'J9PosCur')
-
-  for key, value in zip(joint_keys, parsed.joint_text):
-    CAL[key] = value
-  for key, value in zip(cartesian_keys, parsed.cartesian_text):
-    CAL[key] = value
-  for key, value in zip(external_keys, parsed.external_text):
+  for key, value in zip(CALIBRATION_POSITION_KEYS, position_values):
     CAL[key] = value
 
   RUN['WC'] = "F" if parsed.joints[4] > 0 else "N"
 
-  entry_fields = (
-    J1curAngEntryField, J2curAngEntryField, J3curAngEntryField,
-    J4curAngEntryField, J5curAngEntryField, J6curAngEntryField,
-    XcurEntryField, YcurEntryField, ZcurEntryField,
-    RzcurEntryField, RycurEntryField, RxcurEntryField,
-    J7curAngEntryField, J8curAngEntryField, J9curAngEntryField,
-  )
-  entry_values = parsed.joint_text + parsed.cartesian_text + parsed.external_text
-  for entry_field, value in zip(entry_fields, entry_values):
+  entry_fields, jog_sliders = _calibration_pose_widget_groups()
+  for entry_field, value in zip(entry_fields, position_values):
     entry_field.delete(0, 'end')
     entry_field.insert(0, value)
 
-  jog_sliders = (
-    J1jogslide, J2jogslide, J3jogslide,
-    J4jogslide, J5jogslide, J6jogslide,
-    J7jogslide, J8jogslide, J9jogslide,
-  )
   for jog_slider, value in zip(
     jog_sliders,
     parsed.joint_text + parsed.external_text,
@@ -18591,7 +19545,7 @@ calFrame.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
 calFrame.grid_columnconfigure(0, weight=1)
 
 # Auto Calibrate button
-autoCalBut = Button(calFrame, text="  Auto Calibrate  ", command=calRobotAll)
+autoCalBut = Button(calFrame, text="  Auto Calibrate  ", command=startCalRobotAll)
 autoCalBut.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
 
 # First set of checkboxes (J1-J9)
@@ -18665,22 +19619,22 @@ J9calCbut2 = Checkbutton(checkFrame2, text="J9", variable=CAL['J9CalStatVal2'])
 J9calCbut2.grid(row=2, column=2, sticky="w", padx=2)
 
 # Individual calibration buttons (EXACT names from original)
-CalJ1But = Button(calFrame, text="Calibrate J1 Only", command=calRobotJ1)
+CalJ1But = Button(calFrame, text="Calibrate J1 Only", command=startCalRobotJ1)
 CalJ1But.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
 
-CalJ2But = Button(calFrame, text="Calibrate J2 Only", command=calRobotJ2)
+CalJ2But = Button(calFrame, text="Calibrate J2 Only", command=startCalRobotJ2)
 CalJ2But.grid(row=4, column=0, sticky="ew", padx=5, pady=2)
 
-CalJ3But = Button(calFrame, text="Calibrate J3 Only", command=calRobotJ3)
+CalJ3But = Button(calFrame, text="Calibrate J3 Only", command=startCalRobotJ3)
 CalJ3But.grid(row=5, column=0, sticky="ew", padx=5, pady=2)
 
-CalJ4But = Button(calFrame, text="Calibrate J4 Only", command=calRobotJ4)
+CalJ4But = Button(calFrame, text="Calibrate J4 Only", command=startCalRobotJ4)
 CalJ4But.grid(row=6, column=0, sticky="ew", padx=5, pady=2)
 
-CalJ5But = Button(calFrame, text="Calibrate J5 Only", command=calRobotJ5)
+CalJ5But = Button(calFrame, text="Calibrate J5 Only", command=startCalRobotJ5)
 CalJ5But.grid(row=7, column=0, sticky="ew", padx=5, pady=2)
 
-CalJ6But = Button(calFrame, text="Calibrate J6 Only", command=calRobotJ6)
+CalJ6But = Button(calFrame, text="Calibrate J6 Only", command=startCalRobotJ6)
 CalJ6But.grid(row=8, column=0, sticky="ew", padx=5, pady=(5,20))
 
 ForceCalHomeBut = Button(calFrame, text="Force Cal Home", command=CalZeroPos)
@@ -18878,7 +19832,7 @@ axis7stepsEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
 J7zerobut = Button(externalAxesFrame, text="Set Axis 7 Calibration to Zero", width=28, command=zeroAxis7)
 J7zerobut.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
-J7calbut = Button(externalAxesFrame, text="Autocalibrate Axis 7", width=28, command=calRobotJ7)
+J7calbut = Button(externalAxesFrame, text="Autocalibrate Axis 7", width=28, command=startCalRobotJ7)
 J7calbut.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
 axis7pinsetLab = Label(externalAxesFrame, font=("Arial", 8), text="StepPin = 12 / DirPin = 13 / CalPin = 36")
@@ -18906,7 +19860,7 @@ axis8stepsEntryField.grid(row=10, column=1, sticky="w", padx=5, pady=2)
 J8zerobut = Button(externalAxesFrame, text="Set Axis 8 Calibration to Zero", width=28, command=zeroAxis8)
 J8zerobut.grid(row=11, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
-J8calbut = Button(externalAxesFrame, text="Autocalibrate Axis 8", width=28, command=calRobotJ8)
+J8calbut = Button(externalAxesFrame, text="Autocalibrate Axis 8", width=28, command=startCalRobotJ8)
 J8calbut.grid(row=12, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
 axis8pinsetLab = Label(externalAxesFrame, font=("Arial", 8), text="StepPin = 32 / DirPin = 33 / CalPin = 37")
@@ -18934,7 +19888,7 @@ axis9stepsEntryField.grid(row=17, column=1, sticky="w", padx=5, pady=2)
 J9zerobut = Button(externalAxesFrame, text="Set Axis 9 Calibration to Zero", width=28, command=zeroAxis9)
 J9zerobut.grid(row=18, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
-J9calbut = Button(externalAxesFrame, text="Autocalibrate Axis 9", width=28, command=calRobotJ9)
+J9calbut = Button(externalAxesFrame, text="Autocalibrate Axis 9", width=28, command=startCalRobotJ9)
 J9calbut.grid(row=19, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
 axis9pinsetLab = Label(externalAxesFrame, font=("Arial", 8), text="StepPin = 34 / DirPin = 35 / CalPin = 38")
@@ -21737,6 +22691,7 @@ RUN['xboxUse'] = 0
 tab1.lastProg = ""
 tab1.after(25, _poll_joint_motion_events)
 tab1.after(25, _poll_serial_events)
+tab1.after(25, _poll_calibration_events)
 tab1.after(25, _poll_auxiliary_serial_events)
 tab1.after(25, _poll_xbox_auxiliary_events)
 tab1.after(25, _poll_virtual_motion_events)

@@ -211,6 +211,49 @@ class HmiSourceContractTests(unittest.TestCase):
 
     def compile_function(self, name, namespace, *, preserve_decorators=False):
         self.add_motion_request_dependencies(namespace)
+        namespace.setdefault("dataclass", dataclass)
+        namespace.setdefault("threading", threading)
+        namespace.setdefault("contextmanager", contextmanager)
+        namespace.setdefault("application_lifecycle_lock", threading.Lock())
+        namespace.setdefault("calibration_terminal_owner_lock", threading.Lock())
+        namespace.setdefault(
+            "calibration_terminal_response_pending",
+            threading.Event(),
+        )
+        namespace.setdefault(
+            "calibration_serial_write_committed",
+            threading.Event(),
+        )
+        namespace.setdefault(
+            "CALIBRATION_POSITION_KEYS",
+            (
+                "J1AngCur", "J2AngCur", "J3AngCur",
+                "J4AngCur", "J5AngCur", "J6AngCur",
+                "XcurPos", "YcurPos", "ZcurPos",
+                "RzcurPos", "RycurPos", "RxcurPos",
+                "J7PosCur", "J8PosCur", "J9PosCur",
+            ),
+        )
+        namespace.setdefault("_capture_calibration_pose_snapshot", lambda: object())
+        namespace.setdefault("SerialActivityRejected", SerialActivityRejected)
+        if name == "_require_calibration_terminal_response":
+            for class_name in (
+                "CalibrationCancellationBoundary",
+                "CalibrationWriteCommitment",
+            ):
+                if class_name not in namespace:
+                    namespace[class_name] = self.compile_class(
+                        class_name,
+                        namespace,
+                    )
+        if name in (
+            "_capture_calibration_pose_snapshot",
+            "_restore_calibration_pose_snapshot",
+        ) and "CalibrationPoseSnapshot" not in namespace:
+            namespace["CalibrationPoseSnapshot"] = self.compile_class(
+                "CalibrationPoseSnapshot",
+                namespace,
+            )
         if (
             name != "_motion_request_rejection_message"
             and "_motion_request_rejection_message" not in namespace
@@ -419,11 +462,35 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_prepare_forced_position_request",
             ),
             "_gcode_playback_command": ("_gcode_storage_filename",),
-            "displayPosition": ("_clear_acknowledged_forced_position_target",),
+            "displayPosition": (
+                "_clear_acknowledged_forced_position_target",
+                "_calibration_pose_widget_groups",
+            ),
+            "_execute_calibration_command": (
+                "_require_calibration_terminal_response",
+                "_calibration_result_failure_details",
+                "_handle_calibration_result_application_failure",
+            ),
+            "_run_calibration_stage_safe": (
+                "_require_calibration_terminal_response",
+            ),
+            "_apply_calibration_worker_result": (
+                "_calibration_result_failure_details",
+                "_handle_calibration_result_application_failure",
+            ),
+            "_handle_calibration_result_application_failure": (
+                "_calibration_result_failure_details",
+            ),
         }
         for dependency in dependencies.get(name, ()):
             if dependency not in namespace:
-                self.compile_function(dependency, namespace)
+                self.compile_function(
+                    dependency,
+                    namespace,
+                    preserve_decorators=(
+                        dependency == "_require_calibration_terminal_response"
+                    ),
+                )
         if name == "_poll_application_close":
             self.add_shutdown_dependencies(namespace)
         function = copy.deepcopy(self.module_functions[name])
@@ -547,6 +614,8 @@ class HmiSourceContractTests(unittest.TestCase):
 
     @staticmethod
     def add_shutdown_dependencies(namespace):
+        namespace.setdefault("_calibration_shutdown_pending", lambda: False)
+        namespace.setdefault("_poll_calibration_events", lambda: None)
         namespace.setdefault("_poll_virtual_motion_events", lambda: None)
         namespace.setdefault("startup_controller_cleanup_lock", threading.Lock())
         namespace.setdefault("startup_controller_cleanup_pending", {})
@@ -608,6 +677,196 @@ class HmiSourceContractTests(unittest.TestCase):
         compiled = compile(ast.fix_missing_locations(module), str(AR4_SOURCE), "exec")
         exec(compiled, namespace)
         return namespace[name]
+
+    def compile_async_calibration_lifecycle(self, exchange):
+        class Entry:
+            def __init__(self, value=""):
+                self.value = value
+
+            def get(self, *args):
+                return self.value
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+        class Label:
+            def __init__(self):
+                self.text = None
+                self.style = None
+
+            def config(self, **kwargs):
+                self.text = kwargs.get("text")
+                self.style = kwargs.get("style")
+
+        class Root:
+            def __init__(self):
+                self.jobs = []
+
+            def after(self, delay, callback):
+                self.jobs.append((delay, callback))
+
+        class Port:
+            is_open = True
+
+        calibration = {}
+        for axis in range(1, 10):
+            calibration[f"J{axis}CalStatVal"] = Entry("1" if axis <= 3 else "0")
+            calibration[f"J{axis}CalStatVal2"] = Entry(
+                "1" if 4 <= axis <= 6 else "0"
+            )
+            calibration[f"J{axis}calOff"] = "0"
+        for axis in range(1, 7):
+            calibration[f"J{axis}AngCur"] = str(axis)
+
+        state = {
+            "activity_registry": SerialActivityRegistry(("ser",)),
+            "motion_registry": MotionRequestRegistry(),
+            "transport_lock": threading.Lock(),
+            "event_queue": Queue(),
+            "invalidations": [],
+            "captured_pose_snapshots": [],
+            "restored_pose_snapshots": [],
+            "applied_positions": [],
+            "monitor_updates": [],
+            "first_label": Label(),
+            "second_label": Label(),
+        }
+
+        def capture_pose_snapshot():
+            snapshot = object()
+            state["captured_pose_snapshots"].append(snapshot)
+            return snapshot
+
+        def restore_pose_snapshot(snapshot):
+            state["restored_pose_snapshots"].append(snapshot)
+            return True
+
+        namespace = {
+            "dataclass": dataclass,
+            "MotionInputError": MotionInputError,
+            "MotionRequestLease": MotionRequestLease,
+            "SerialActivityRejected": SerialActivityRejected,
+            "SerialTransportQuarantinedError": ConnectionError,
+            "finite_number": finite_number,
+            "calibration_serial_event_queue": state["event_queue"],
+            "calibration_operation_lock": threading.Lock(),
+            "calibration_operation": None,
+            "calibration_next_request_id": 0,
+            "calibration_terminal_owner_lock": threading.Lock(),
+            "calibration_terminal_response_pending": threading.Event(),
+            "calibration_serial_write_committed": threading.Event(),
+            "application_lifecycle_lock": threading.Lock(),
+            "serial_lock": state["transport_lock"],
+            "serial_write_lock": threading.Lock(),
+            "serial_activity_registry": state["activity_registry"],
+            "motion_request_registry": state["motion_registry"],
+            "application_closing": threading.Event(),
+            "RUN": {
+                "offlineMode": False,
+                "ser": Port(),
+                "VR_angles": [0.0] * 6,
+            },
+            "CAL": calibration,
+            "cmdSentEntryField": Entry(),
+            "cmdRecEntryField": Entry(),
+            "almStatusLab": state["first_label"],
+            "almStatusLab2": state["second_label"],
+            "tab8": SimpleNamespace(ElogView=Entry()),
+            "END": "end",
+            "pickle": SimpleNamespace(dump=lambda *args: None),
+            "open": lambda *args: object(),
+            "logger": SimpleNamespace(
+                info=lambda *args: None,
+                warning=lambda *args: None,
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "ErrorHandler": lambda response: None,
+            "ProtocolResponseError": ProtocolResponseError,
+            "parse_position_response": parse_position_response,
+            "_current_controller_joint_calibration": (
+                lambda: ControllerJointCalibration(
+                    negative_limits=(180.0,) * 9,
+                    positive_limits=(180.0,) * 9,
+                    steps_per_unit=(1.0,) * 9,
+                )
+            ),
+            "displayPosition": (
+                lambda response, parsed=None: state["applied_positions"].append(parsed)
+                or parsed
+            ),
+            "_invalidate_uncertain_controller_calibration": state[
+                "invalidations"
+            ].append,
+            "_capture_calibration_pose_snapshot": capture_pose_snapshot,
+            "_restore_calibration_pose_snapshot": restore_pose_snapshot,
+            "setStepMonitorsVR": lambda: state["monitor_updates"].append(True),
+            "exchange_serial_line_until_cancelled": exchange,
+            "serial_transport_quarantined": lambda serial_port: False,
+            "threading": threading,
+            "Empty": Empty,
+            "root": Root(),
+        }
+        self.add_startup_command_dependencies(namespace)
+        namespace["_binary_controller_flag"] = self.compile_function(
+            "_binary_controller_flag",
+            namespace,
+        )
+        namespace["_prepare_calibration_command"] = self.compile_function(
+            "_prepare_calibration_command",
+            namespace,
+        )
+        namespace["_calibration_available"] = self.compile_function(
+            "_calibration_available",
+            namespace,
+        )
+        namespace["_apply_valid_position_response"] = self.compile_function(
+            "_apply_valid_position_response",
+            namespace,
+        )
+        namespace["CalibrationStage"] = self.compile_class(
+            "CalibrationStage",
+            namespace,
+        )
+        namespace["CalibrationWorkerResult"] = self.compile_class(
+            "CalibrationWorkerResult",
+            namespace,
+        )
+        namespace["CalibrationOperation"] = self.compile_class(
+            "CalibrationOperation",
+            namespace,
+        )
+        for function_name in (
+            "_set_calibration_status",
+            "_finish_calibration_operation",
+            "_run_calibration_stage_safe",
+            "_start_calibration_stage_worker",
+            "_claim_calibration_worker_result",
+            "_record_calibration_response",
+            "_apply_calibration_worker_result",
+            "_settle_rejected_calibration_worker_result",
+            "_poll_calibration_events",
+            "_start_calibration_sequence",
+            "startCalRobotAll",
+            "_start_single_joint_calibration",
+            "startCalRobotJ1",
+            "startCalRobotJ2",
+            "startCalRobotJ3",
+            "startCalRobotJ4",
+            "startCalRobotJ5",
+            "startCalRobotJ6",
+            "startCalRobotJ7",
+            "startCalRobotJ8",
+            "startCalRobotJ9",
+        ):
+            namespace[function_name] = self.compile_function(
+                function_name,
+                namespace,
+            )
+        return namespace, state
 
     @staticmethod
     def _valid_update_parameter_values():
@@ -3858,6 +4117,7 @@ class HmiSourceContractTests(unittest.TestCase):
             exception=lambda *args: None,
         )
         namespace = {
+            "dataclass": dataclass,
             "threading": threading,
             "serial_event_queue": result_queue,
             "_exchange_serial_line": exchange,
@@ -4355,6 +4615,191 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(closed_ports, ["ser", "ser2"])
         self.assertEqual(root.destroy_count, 1)
 
+    def test_shutdown_retains_calibration_terminal_response_ownership(self):
+        class Port:
+            def __init__(self):
+                self.is_open = True
+                self.cancel_count = 0
+
+            def cancel_read(self):
+                self.cancel_count += 1
+
+        class Label:
+            def __init__(self):
+                self.text = None
+
+            def config(self, **kwargs):
+                self.text = kwargs.get("text")
+
+        class Root:
+            def __init__(self):
+                self.jobs = []
+
+            def after(self, delay, callback):
+                self.jobs.append((delay, callback))
+
+        root = Root()
+        first_label = Label()
+        second_label = Label()
+        main_port = Port()
+        auxiliary_port = Port()
+        activity = SerialActivityRegistry(("ser", "ser2"))
+        activity.begin("ser")
+        activity.begin("ser2")
+        terminal_pending = threading.Event()
+        terminal_pending.set()
+        write_committed = threading.Event()
+        write_committed.set()
+        monotonic_values = iter((0.0, 2.0))
+        namespace = {
+            "calibration_terminal_response_pending": terminal_pending,
+            "calibration_serial_write_committed": write_committed,
+            "calibration_operation_lock": threading.Lock(),
+            "calibration_operation": None,
+            "serial_activity_registry": activity,
+            "RUN": {"ser": main_port, "ser2": auxiliary_port},
+            "shutdown_serial_cancel_requested": set(),
+            "application_shutdown_started_at": None,
+            "time": SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+            "SERIAL_SHUTDOWN_ACTIVITY_GRACE_SECONDS": 1.0,
+            "_poll_serial_events": lambda: None,
+            "_poll_calibration_events": lambda: None,
+            "_poll_auxiliary_serial_events": lambda: None,
+            "_poll_joint_motion_events": lambda: None,
+            "_poll_virtual_motion_events": lambda: None,
+            "_close_serial_port": lambda *args: self.fail(
+                "calibration shutdown closed a tracked port"
+            ),
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "almStatusLab": first_label,
+            "almStatusLab2": second_label,
+            "root": root,
+            "SERIAL_SHUTDOWN_POLL_MS": 25,
+        }
+        namespace["_calibration_shutdown_pending"] = self.compile_function(
+            "_calibration_shutdown_pending",
+            namespace,
+        )
+        namespace["_interrupt_tracked_serial_activity"] = self.compile_function(
+            "_interrupt_tracked_serial_activity",
+            namespace,
+        )
+        poll_close = self.compile_function("_poll_application_close", namespace)
+
+        self.assertFalse(poll_close())
+        self.assertEqual(main_port.cancel_count, 0)
+        self.assertEqual(auxiliary_port.cancel_count, 0)
+        self.assertEqual(len(root.jobs), 1)
+
+        _, retry = root.jobs.pop(0)
+        self.assertFalse(retry())
+        self.assertEqual(main_port.cancel_count, 0)
+        self.assertEqual(auxiliary_port.cancel_count, 1)
+        self.assertEqual(namespace["shutdown_serial_cancel_requested"], {"ser2"})
+        self.assertEqual(
+            first_label.text,
+            "SHUTDOWN WAITING FOR CALIBRATION RESPONSE",
+        )
+        self.assertEqual(second_label.text, first_label.text)
+        self.assertEqual(root.jobs, [(25, poll_close)])
+
+    def test_shutdown_interrupts_prewrite_calibration_activity(self):
+        class Port:
+            def __init__(self):
+                self.is_open = True
+                self.cancel_count = 0
+
+            def cancel_read(self):
+                self.cancel_count += 1
+
+        class Label:
+            def __init__(self):
+                self.text = None
+
+            def config(self, **kwargs):
+                self.text = kwargs.get("text")
+
+        class Root:
+            def __init__(self):
+                self.jobs = []
+
+            def after(self, delay, callback):
+                self.jobs.append((delay, callback))
+
+        root = Root()
+        first_label = Label()
+        second_label = Label()
+        main_port = Port()
+        activity = SerialActivityRegistry(("ser", "ser2"))
+        activity.begin("ser")
+        terminal_pending = threading.Event()
+        terminal_pending.set()
+        monotonic_values = iter((0.0, 2.0, 3.0))
+        close_calls = []
+        namespace = {
+            "calibration_terminal_response_pending": terminal_pending,
+            "calibration_serial_write_committed": threading.Event(),
+            "calibration_operation_lock": threading.Lock(),
+            "calibration_operation": None,
+            "serial_activity_registry": activity,
+            "RUN": {"ser": main_port, "ser2": None},
+            "shutdown_serial_cancel_requested": set(),
+            "application_shutdown_started_at": None,
+            "time": SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+            "SERIAL_SHUTDOWN_ACTIVITY_GRACE_SECONDS": 1.0,
+            "_poll_serial_events": lambda: None,
+            "_poll_calibration_events": lambda: None,
+            "_poll_auxiliary_serial_events": lambda: None,
+            "_poll_joint_motion_events": lambda: None,
+            "_poll_virtual_motion_events": lambda: None,
+            "_close_serial_port": lambda *args: close_calls.append(args) or True,
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "almStatusLab": first_label,
+            "almStatusLab2": second_label,
+            "root": root,
+            "SERIAL_SHUTDOWN_POLL_MS": 25,
+        }
+        namespace["_calibration_shutdown_pending"] = self.compile_function(
+            "_calibration_shutdown_pending",
+            namespace,
+        )
+        namespace["_interrupt_tracked_serial_activity"] = self.compile_function(
+            "_interrupt_tracked_serial_activity",
+            namespace,
+        )
+        poll_close = self.compile_function("_poll_application_close", namespace)
+
+        self.assertFalse(poll_close())
+        self.assertEqual(main_port.cancel_count, 0)
+
+        _, retry = root.jobs.pop(0)
+        self.assertFalse(retry())
+        self.assertEqual(main_port.cancel_count, 1)
+        self.assertEqual(namespace["shutdown_serial_cancel_requested"], {"ser"})
+        self.assertEqual(
+            first_label.text,
+            "SHUTDOWN WAITING FOR CALIBRATION RESPONSE",
+        )
+        self.assertEqual(second_label.text, first_label.text)
+        self.assertEqual(root.jobs, [(25, poll_close)])
+
+        _, retry = root.jobs.pop(0)
+        self.assertFalse(retry())
+        self.assertEqual(main_port.cancel_count, 1)
+        self.assertEqual(
+            close_calls,
+            [("ser", "tracked activity shutdown interruption")],
+        )
+        self.assertEqual(root.jobs, [(25, poll_close)])
+
     def test_connection_switch_closes_only_inside_transport_reservation(self):
         function = self.module_functions["_set_com_admitted"]
         calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
@@ -4520,16 +4965,16 @@ class HmiSourceContractTests(unittest.TestCase):
 
     def test_position_calibration_and_port_mutators_reject_logical_motion(self):
         callback_names = (
-            "calRobotAll",
-            "calRobotJ1",
-            "calRobotJ2",
-            "calRobotJ3",
-            "calRobotJ4",
-            "calRobotJ5",
-            "calRobotJ6",
-            "calRobotJ7",
-            "calRobotJ8",
-            "calRobotJ9",
+            "_run_program_calibration_all",
+            "_run_program_calibration_j1",
+            "_run_program_calibration_j2",
+            "_run_program_calibration_j3",
+            "_run_program_calibration_j4",
+            "_run_program_calibration_j5",
+            "_run_program_calibration_j6",
+            "_run_program_calibration_j7",
+            "_run_program_calibration_j8",
+            "_run_program_calibration_j9",
             "updateParams",
             "calExtAxis",
             "zeroAxis7",
@@ -4559,6 +5004,13 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_tracked_serial_operation",
                 callback_name,
             )
+
+        execute_row_names = {
+            node.id
+            for node in ast.walk(self.module_functions["executeRow"])
+            if isinstance(node, ast.Name)
+        }
+        self.assertTrue(set(callback_names[:10]).issubset(execute_row_names))
 
         set_com_calls = [
             node
@@ -6316,6 +6768,7 @@ class HmiSourceContractTests(unittest.TestCase):
             # Calibration commands run only inside the tracked public
             # calibration operation that owns the main transport.
             "_execute_calibration_command": {"ser"},
+            "_start_calibration_sequence": {"ser"},
             "_invalidate_uncertain_controller_calibration": {"ser"},
             "_preflight_controller_calibration_transport": {"ser"},
             # The Tk callback serializes auxiliary replacement with the
@@ -6454,6 +6907,50 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertEqual(len(lease_calls("_set_com_admitted")), 1)
         self.assertEqual(len(lease_calls("start_send_serial_thread")), 1)
+        self.assertEqual(len(lease_calls("_start_calibration_sequence")), 1)
+
+        calibration_start = self.module_functions["_start_calibration_sequence"]
+        lock_lines = [
+            node.lineno
+            for node in ast.walk(calibration_start)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "serial_lock"
+            and node.func.attr == "acquire"
+        ]
+        lease_lines = [
+            node.lineno
+            for node in ast.walk(calibration_start)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "serial_activity_registry"
+            and node.func.attr == "lease"
+            and any(
+                isinstance(argument, ast.Constant) and argument.value == "ser"
+                for argument in node.args
+            )
+        ]
+        handle_lines = [
+            node.lineno
+            for node in ast.walk(calibration_start)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "RUN"
+            and node.func.attr == "get"
+            and any(
+                isinstance(argument, ast.Constant) and argument.value == "ser"
+                for argument in node.args
+            )
+        ]
+        self.assertEqual(
+            (len(lock_lines), len(lease_lines), len(handle_lines)),
+            (1, 1, 1),
+        )
+        self.assertLess(lock_lines[0], lease_lines[0])
+        self.assertLess(lease_lines[0], handle_lines[0])
 
         dispatcher_calls = [
             node.value
@@ -7806,16 +8303,16 @@ class HmiSourceContractTests(unittest.TestCase):
                 "moveInProc": 0,
             },
             "tab1": SimpleNamespace(progView=ProgramView()),
-            "calRobotAll": lambda: True,
-            "calRobotJ1": fail_calibration,
-            "calRobotJ2": lambda: True,
-            "calRobotJ3": lambda: True,
-            "calRobotJ4": lambda: True,
-            "calRobotJ5": lambda: True,
-            "calRobotJ6": lambda: True,
-            "calRobotJ7": lambda: True,
-            "calRobotJ8": lambda: True,
-            "calRobotJ9": lambda: True,
+            "_run_program_calibration_all": lambda: True,
+            "_run_program_calibration_j1": fail_calibration,
+            "_run_program_calibration_j2": lambda: True,
+            "_run_program_calibration_j3": lambda: True,
+            "_run_program_calibration_j4": lambda: True,
+            "_run_program_calibration_j5": lambda: True,
+            "_run_program_calibration_j6": lambda: True,
+            "_run_program_calibration_j7": lambda: True,
+            "_run_program_calibration_j8": lambda: True,
+            "_run_program_calibration_j9": lambda: True,
             "_finish_execute_row": lambda: finishes.append(True),
             "ROW_EXECUTION_REJECTED": "rejected",
             "ROW_EXECUTION_PENDING": "pending",
@@ -7957,7 +8454,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_execute_calibration_command",
             namespace,
         )
-        calibrate = self.compile_function("calRobotAll", namespace)
+        calibrate = self.compile_function("_run_program_calibration_all", namespace)
 
         self.assertFalse(calibrate())
         self.assertEqual(len(namespace["RUN"]["ser"].writes), 1)
@@ -8139,7 +8636,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_execute_calibration_command",
             namespace,
         )
-        calibrate = self.compile_function("calRobotAll", namespace)
+        calibrate = self.compile_function("_run_program_calibration_all", namespace)
 
         self.assertFalse(calibrate())
         self.assertEqual(len(port.writes), 1)
@@ -8230,12 +8727,984 @@ class HmiSourceContractTests(unittest.TestCase):
             "_binary_controller_flag",
             namespace,
         )
-        calibrate = self.compile_function("calRobotAll", namespace)
+        calibrate = self.compile_function("_run_program_calibration_all", namespace)
 
         with self.assertRaisesRegex(MotionInputError, "J8 second-stage"):
             calibrate()
 
         self.assertEqual(executions, [])
+
+    def test_calibration_ui_callbacks_dispatch_only_async_workers(self):
+        expected_commands = {
+            "autoCalBut": "startCalRobotAll",
+            "CalJ1But": "startCalRobotJ1",
+            "CalJ2But": "startCalRobotJ2",
+            "CalJ3But": "startCalRobotJ3",
+            "CalJ4But": "startCalRobotJ4",
+            "CalJ5But": "startCalRobotJ5",
+            "CalJ6But": "startCalRobotJ6",
+            "J7calbut": "startCalRobotJ7",
+            "J8calbut": "startCalRobotJ8",
+            "J9calbut": "startCalRobotJ9",
+        }
+        actual_commands = {}
+        for statement in self.tree.body:
+            if (
+                not isinstance(statement, ast.Assign)
+                or len(statement.targets) != 1
+                or not isinstance(statement.targets[0], ast.Name)
+                or statement.targets[0].id not in expected_commands
+                or not isinstance(statement.value, ast.Call)
+            ):
+                continue
+            command_values = [
+                keyword.value
+                for keyword in statement.value.keywords
+                if keyword.arg == "command"
+            ]
+            if len(command_values) == 1 and isinstance(command_values[0], ast.Name):
+                actual_commands[statement.targets[0].id] = command_values[0].id
+
+        self.assertEqual(actual_commands, expected_commands)
+
+        worker = self.module_functions["_run_calibration_stage_safe"]
+        referenced_names = {
+            node.id for node in ast.walk(worker) if isinstance(node, ast.Name)
+        }
+        self.assertFalse(
+            referenced_names
+            & {
+                "root",
+                "tab1",
+                "cmdSentEntryField",
+                "cmdRecEntryField",
+                "almStatusLab",
+                "almStatusLab2",
+            }
+        )
+        self.assertIn("exchange_serial_line_until_cancelled", referenced_names)
+
+        for callback_name in expected_commands.values():
+            callback_names = {
+                node.id
+                for node in ast.walk(self.module_functions[callback_name])
+                if isinstance(node, ast.Name)
+            }
+            self.assertNotIn(
+                "exchange_serial_line_until_cancelled",
+                callback_names,
+                callback_name,
+            )
+
+    def test_calibration_worker_reports_post_write_failure_without_tk_access(self):
+        events = Queue()
+
+        def fail_exchange(
+            serial_port,
+            command,
+            control_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            write_started_event.set()
+            raise TimeoutError("controller response timed out")
+
+        namespace = {
+            "dataclass": dataclass,
+            "threading": threading,
+            "exchange_serial_line_until_cancelled": fail_exchange,
+            "application_closing": threading.Event(),
+            "serial_write_lock": threading.Lock(),
+            "calibration_serial_event_queue": events,
+        }
+        namespace["CalibrationWorkerResult"] = self.compile_class(
+            "CalibrationWorkerResult",
+            namespace,
+        )
+        worker = self.compile_function("_run_calibration_stage_safe", namespace)
+        worker_token = object()
+
+        worker(7, 1, worker_token, object(), "LLA1\n")
+
+        event = events.get_nowait()
+        self.assertIsInstance(event, namespace["CalibrationWorkerResult"])
+        self.assertIs(event.worker_token, worker_token)
+        self.assertEqual(event.request_id, 7)
+        self.assertEqual(event.stage_index, 1)
+        self.assertEqual(event.event_type, "failed")
+        self.assertIsNone(event.response)
+        self.assertEqual(event.error, "controller response timed out")
+        self.assertTrue(event.write_started)
+
+    def test_calibration_shutdown_wins_before_atomic_write_boundary(self):
+        class Port:
+            def __init__(self):
+                self.is_open = True
+                self.timeout = None
+                self.commands = []
+
+            def reset_input_buffer(self):
+                pass
+
+            def write(self, command):
+                self.commands.append(command)
+                return len(command)
+
+            def flush(self):
+                pass
+
+            def read_until(self, delimiter=b"\n", size=None):
+                return b""
+
+            def read(self, size=1):
+                return b""
+
+        class ClosingBoundaryLock:
+            def __init__(self, closing):
+                self.closing = closing
+
+            def acquire(self):
+                self.closing.set()
+                return True
+
+            def release(self):
+                pass
+
+        closing = threading.Event()
+        namespace = {
+            "application_closing": closing,
+            "calibration_terminal_owner_lock": threading.Lock(),
+            "calibration_terminal_response_pending": threading.Event(),
+        }
+        require_terminal = self.compile_function(
+            "_require_calibration_terminal_response",
+            namespace,
+            preserve_decorators=True,
+        )
+        write_commitment = namespace["CalibrationWriteCommitment"](
+            namespace["calibration_serial_write_committed"]
+        )
+        port = Port()
+
+        with self.assertRaisesRegex(
+            SerialActivityRejected,
+            "cancelled before transmission",
+        ):
+            with require_terminal(write_commitment) as cancellation_boundary:
+                exchange_serial_line_until_cancelled(
+                    port,
+                    "LLA1\n",
+                    cancellation_boundary,
+                    write_lock=threading.Lock(),
+                    write_boundary_lock=ClosingBoundaryLock(closing),
+                    poll_interval_seconds=0.001,
+                    write_started_event=write_commitment,
+                )
+
+        self.assertEqual(port.commands, [])
+        self.assertFalse(write_commitment.is_set())
+        self.assertFalse(namespace["calibration_serial_write_committed"].is_set())
+        self.assertFalse(namespace["calibration_terminal_response_pending"].is_set())
+
+    def test_calibration_write_boundary_latches_terminal_response(self):
+        class Port:
+            def __init__(self):
+                self.is_open = True
+                self.timeout = None
+                self.commands = []
+                self.response = bytearray(
+                    b"A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9\n"
+                )
+
+            def reset_input_buffer(self):
+                pass
+
+            def write(self, command):
+                self.commands.append(command)
+                return len(command)
+
+            def flush(self):
+                pass
+
+            def read_until(self, delimiter=b"\n", size=None):
+                limit = len(self.response) if size is None else min(
+                    size,
+                    len(self.response),
+                )
+                available = bytes(self.response[:limit])
+                delimiter_index = available.find(delimiter)
+                count = limit if delimiter_index < 0 else delimiter_index + 1
+                return self.read(count)
+
+            def read(self, size=1):
+                response = bytes(self.response[:size])
+                del self.response[:size]
+                return response
+
+        class ClosingAfterCommitLock:
+            def __init__(self, closing):
+                self.closing = closing
+
+            def acquire(self):
+                return True
+
+            def release(self):
+                self.closing.set()
+
+        closing = threading.Event()
+        namespace = {
+            "application_closing": closing,
+            "calibration_terminal_owner_lock": threading.Lock(),
+            "calibration_terminal_response_pending": threading.Event(),
+        }
+        require_terminal = self.compile_function(
+            "_require_calibration_terminal_response",
+            namespace,
+            preserve_decorators=True,
+        )
+        write_commitment = namespace["CalibrationWriteCommitment"](
+            namespace["calibration_serial_write_committed"]
+        )
+        port = Port()
+
+        with require_terminal(write_commitment) as cancellation_boundary:
+            response = exchange_serial_line_until_cancelled(
+                port,
+                "LLA1\n",
+                cancellation_boundary,
+                write_lock=threading.Lock(),
+                write_boundary_lock=ClosingAfterCommitLock(closing),
+                poll_interval_seconds=0.001,
+                write_started_event=write_commitment,
+            )
+
+        self.assertEqual(response, "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9")
+        self.assertEqual(port.commands, [b"LLA1\n"])
+        self.assertTrue(closing.is_set())
+        self.assertTrue(write_commitment.is_set())
+        self.assertTrue(namespace["calibration_serial_write_committed"].is_set())
+        self.assertFalse(namespace["calibration_terminal_response_pending"].is_set())
+
+    def test_async_calibration_stages_settle_transport_and_motion_once(self):
+        class Entry:
+            def __init__(self):
+                self.value = ""
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+        class Label:
+            def __init__(self):
+                self.configurations = []
+
+            def config(self, **kwargs):
+                self.configurations.append(kwargs)
+
+        class Port:
+            is_open = True
+
+        motion_registry = MotionRequestRegistry()
+        request_lease = motion_registry.acquire("Automatic calibration")
+        activity_registry = SerialActivityRegistry(("ser",))
+        activity_lease = activity_registry.lease("ser")
+        transport_lock = threading.Lock()
+        self.assertTrue(transport_lock.acquire(blocking=False))
+        callbacks = []
+        records = []
+        dispatches = []
+        namespace = {
+            "dataclass": dataclass,
+            "MotionInputError": MotionInputError,
+            "MotionRequestLease": MotionRequestLease,
+            "_validated_startup_command": lambda command, prefix: command,
+            "calibration_operation_lock": threading.Lock(),
+            "calibration_operation": None,
+            "serial_lock": transport_lock,
+            "motion_request_registry": motion_registry,
+            "virtual_motion_event_queue": Queue(),
+            "cmdRecEntryField": Entry(),
+            "almStatusLab": Label(),
+            "almStatusLab2": Label(),
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+        }
+        namespace["CalibrationStage"] = self.compile_class(
+            "CalibrationStage",
+            namespace,
+        )
+        namespace["CalibrationWorkerResult"] = self.compile_class(
+            "CalibrationWorkerResult",
+            namespace,
+        )
+        namespace["CalibrationOperation"] = self.compile_class(
+            "CalibrationOperation",
+            namespace,
+        )
+        namespace["_set_calibration_status"] = self.compile_function(
+            "_set_calibration_status",
+            namespace,
+        )
+        namespace["_finish_motion_request"] = self.compile_function(
+            "_finish_motion_request",
+            namespace,
+        )
+        namespace["_finish_calibration_operation"] = self.compile_function(
+            "_finish_calibration_operation",
+            namespace,
+        )
+        namespace["_claim_calibration_worker_result"] = self.compile_function(
+            "_claim_calibration_worker_result",
+            namespace,
+        )
+
+        def record(response, success, failure, **kwargs):
+            records.append((response, success, failure, kwargs))
+            return True
+
+        def start_stage(operation):
+            dispatches.append(operation.stage_index)
+            operation.stage_snapshot = object()
+            operation.worker_token = object()
+            operation.worker_active = True
+            return True
+
+        namespace["_record_calibration_response"] = record
+        namespace["_start_calibration_stage_worker"] = start_stage
+        apply_result = self.compile_function(
+            "_apply_calibration_worker_result",
+            namespace,
+        )
+
+        stages = (
+            namespace["CalibrationStage"]("LLA1\n", "Stage 1 OK", "Stage 1 failed"),
+            namespace["CalibrationStage"]("LLA0\n", "Stage 2 OK", "Stage 2 failed"),
+        )
+        operation = namespace["CalibrationOperation"](
+            1,
+            "Automatic calibration",
+            stages,
+            request_lease,
+            activity_lease,
+            Port(),
+            callbacks.append,
+        )
+        operation.stage_snapshot = object()
+        operation.worker_token = object()
+        operation.worker_active = True
+        namespace["calibration_operation"] = operation
+
+        self.assertTrue(
+            apply_result(
+                namespace["CalibrationWorkerResult"](
+                    operation.worker_token,
+                    1,
+                    0,
+                    "completed",
+                    "stage-one",
+                    None,
+                    True,
+                )
+            )
+        )
+        self.assertEqual(dispatches, [1])
+        self.assertTrue(transport_lock.locked())
+        self.assertTrue(activity_registry.active("ser"))
+        self.assertTrue(motion_registry.active)
+
+        self.assertTrue(
+            apply_result(
+                namespace["CalibrationWorkerResult"](
+                    operation.worker_token,
+                    1,
+                    1,
+                    "completed",
+                    "stage-two",
+                    None,
+                    True,
+                )
+            )
+        )
+        self.assertFalse(transport_lock.locked())
+        self.assertFalse(activity_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+        self.assertEqual(callbacks, [True])
+        self.assertEqual([record[0] for record in records], ["stage-one", "stage-two"])
+        self.assertIsNone(namespace["calibration_operation"])
+
+    def test_async_calibration_failure_runs_complete_production_lifecycle(self):
+        exchanges = []
+
+        def failed_exchange(
+            serial_port,
+            command,
+            cancellation_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            self.assertFalse(cancellation_event.is_set())
+            self.assertTrue(callable(getattr(write_boundary_lock, "acquire", None)))
+            exchanges.append(command)
+            write_started_event.set()
+            raise TimeoutError("calibration response unavailable")
+
+        namespace, state = self.compile_async_calibration_lifecycle(failed_exchange)
+        self.assertTrue(namespace["startCalRobotAll"]())
+        event = state["event_queue"].get(timeout=2)
+        state["event_queue"].put(event)
+        namespace["_poll_calibration_events"]()
+
+        self.assertEqual(len(exchanges), 1)
+        self.assertTrue(exchanges[0].startswith("LL"))
+        self.assertEqual(len(state["captured_pose_snapshots"]), 1)
+        self.assertEqual(state["restored_pose_snapshots"], [])
+        self.assertEqual(
+            state["invalidations"],
+            ["calibration response failed after controller transmission"],
+        )
+        self.assertFalse(state["transport_lock"].locked())
+        self.assertFalse(state["activity_registry"].active("ser"))
+        self.assertFalse(state["motion_registry"].active)
+        self.assertIsNone(namespace["calibration_operation"])
+        self.assertFalse(namespace["calibration_terminal_response_pending"].is_set())
+        self.assertEqual(
+            state["first_label"].text,
+            "Auto Calibration Stage 1 Failed - See Log",
+        )
+        self.assertEqual(state["second_label"].text, state["first_label"].text)
+
+    def test_async_calibration_success_runs_both_production_stages(self):
+        exchanges = []
+        response = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+
+        def successful_exchange(
+            serial_port,
+            command,
+            cancellation_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            self.assertFalse(cancellation_event.is_set())
+            self.assertTrue(callable(getattr(write_boundary_lock, "acquire", None)))
+            exchanges.append(command)
+            write_started_event.set()
+            return response
+
+        namespace, state = self.compile_async_calibration_lifecycle(
+            successful_exchange
+        )
+        self.assertTrue(namespace["startCalRobotAll"]())
+        deadline = time.monotonic() + 2
+        while state["motion_registry"].active and time.monotonic() < deadline:
+            event = state["event_queue"].get(timeout=2)
+            state["event_queue"].put(event)
+            namespace["_poll_calibration_events"]()
+
+        self.assertEqual(len(exchanges), 2)
+        self.assertNotEqual(exchanges[0], exchanges[1])
+        self.assertTrue(all(command.startswith("LL") for command in exchanges))
+        self.assertEqual(len(state["captured_pose_snapshots"]), 2)
+        self.assertEqual(state["restored_pose_snapshots"], [])
+        self.assertEqual(len(state["applied_positions"]), 2)
+        self.assertEqual(state["invalidations"], [])
+        self.assertEqual(len(state["monitor_updates"]), 2)
+        self.assertFalse(state["transport_lock"].locked())
+        self.assertFalse(state["activity_registry"].active("ser"))
+        self.assertFalse(state["motion_registry"].active)
+        self.assertIsNone(namespace["calibration_operation"])
+        self.assertEqual(
+            state["first_label"].text,
+            "Auto Calibration Stage 2 Successful",
+        )
+
+    def test_completed_calibration_event_requires_write_commitment(self):
+        exchanges = []
+        response = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+
+        def successful_exchange(
+            serial_port,
+            command,
+            cancellation_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            exchanges.append(command)
+            write_started_event.set()
+            return response
+
+        namespace, state = self.compile_async_calibration_lifecycle(
+            successful_exchange
+        )
+        self.assertTrue(namespace["startCalRobotAll"]())
+        event = state["event_queue"].get(timeout=2)
+        rejected_event = namespace["CalibrationWorkerResult"](
+            event.worker_token,
+            event.request_id,
+            event.stage_index,
+            "completed",
+            event.response,
+            None,
+            False,
+        )
+        state["event_queue"].put(rejected_event)
+        namespace["_poll_calibration_events"]()
+
+        self.assertEqual(len(exchanges), 1)
+        self.assertEqual(state["applied_positions"], [])
+        self.assertEqual(state["monitor_updates"], [])
+        self.assertEqual(
+            state["invalidations"],
+            [
+                "calibration worker result rejected: "
+                "calibration worker emitted an invalid success result"
+            ],
+        )
+        self.assertFalse(state["transport_lock"].locked())
+        self.assertFalse(state["activity_registry"].active("ser"))
+        self.assertFalse(state["motion_registry"].active)
+        self.assertIsNone(namespace["calibration_operation"])
+
+    def test_postwrite_calibration_result_failure_quarantines_before_release(self):
+        response = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+        pose_state = {"value": "pre-command"}
+
+        def successful_exchange(
+            serial_port,
+            command,
+            cancellation_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            write_started_event.set()
+            return response
+
+        namespace, state = self.compile_async_calibration_lifecycle(
+            successful_exchange
+        )
+        invalidation_observations = []
+        restoration_observations = []
+
+        def capture_pose():
+            return pose_state["value"]
+
+        def restore_pose(snapshot):
+            restoration_observations.append(
+                (
+                    snapshot,
+                    pose_state["value"],
+                    state["transport_lock"].locked(),
+                    state["activity_registry"].active("ser"),
+                    state["motion_registry"].active,
+                )
+            )
+            pose_state["value"] = snapshot
+            return True
+
+        def display_position(raw_response, parsed=None):
+            pose_state["value"] = "applied-controller-position"
+            state["applied_positions"].append(parsed)
+            return parsed
+
+        def fail_after_position_application():
+            self.assertEqual(pose_state["value"], "applied-controller-position")
+            raise RuntimeError("injected post-position refresh failure")
+
+        def invalidate(reason):
+            invalidation_observations.append(
+                (
+                    reason,
+                    pose_state["value"],
+                    state["transport_lock"].locked(),
+                    state["activity_registry"].active("ser"),
+                    state["motion_registry"].active,
+                )
+            )
+
+        namespace["_capture_calibration_pose_snapshot"] = capture_pose
+        namespace["_restore_calibration_pose_snapshot"] = restore_pose
+        namespace["displayPosition"] = display_position
+        namespace["setStepMonitorsVR"] = fail_after_position_application
+        namespace["_invalidate_uncertain_controller_calibration"] = invalidate
+        self.assertTrue(namespace["startCalRobotAll"]())
+        event = state["event_queue"].get(timeout=2)
+        self.assertTrue(namespace["calibration_serial_write_committed"].is_set())
+        state["event_queue"].put(event)
+        namespace["_poll_calibration_events"]()
+
+        self.assertEqual(
+            restoration_observations,
+            [
+                (
+                    "pre-command",
+                    "applied-controller-position",
+                    True,
+                    True,
+                    True,
+                )
+            ],
+        )
+        self.assertEqual(
+            invalidation_observations,
+            [
+                (
+                    "calibration result application failed after controller "
+                    "transmission: injected post-position refresh failure",
+                    "pre-command",
+                    True,
+                    True,
+                    True,
+                )
+            ],
+        )
+        self.assertEqual(len(state["applied_positions"]), 1)
+        self.assertEqual(pose_state["value"], "pre-command")
+        self.assertFalse(state["transport_lock"].locked())
+        self.assertFalse(state["activity_registry"].active("ser"))
+        self.assertFalse(state["motion_registry"].active)
+        self.assertIsNone(namespace["calibration_operation"])
+        self.assertFalse(namespace["calibration_serial_write_committed"].is_set())
+
+    def test_synchronous_postwrite_calibration_result_failure_quarantines(self):
+        response = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+        pose_state = {"value": "pre-command"}
+
+        def exchange(
+            serial_port,
+            command,
+            cancellation_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            write_started_event.set()
+            return response
+
+        namespace, state = self.compile_async_calibration_lifecycle(exchange)
+        invalidations = []
+        restorations = []
+
+        def restore_pose(snapshot):
+            restorations.append((snapshot, pose_state["value"]))
+            pose_state["value"] = snapshot
+            return True
+
+        def display_position(raw_response, parsed=None):
+            pose_state["value"] = "applied-controller-position"
+            state["applied_positions"].append(parsed)
+            return parsed
+
+        def fail_after_position_application():
+            self.assertEqual(pose_state["value"], "applied-controller-position")
+            raise RuntimeError("injected synchronous post-position failure")
+
+        def invalidate(reason):
+            invalidations.append(
+                (
+                    reason,
+                    pose_state["value"],
+                    namespace["calibration_serial_write_committed"].is_set(),
+                )
+            )
+
+        namespace["_capture_calibration_pose_snapshot"] = (
+            lambda: pose_state["value"]
+        )
+        namespace["_restore_calibration_pose_snapshot"] = restore_pose
+        namespace["displayPosition"] = display_position
+        namespace["setStepMonitorsVR"] = fail_after_position_application
+        namespace["_invalidate_uncertain_controller_calibration"] = invalidate
+        execute = self.compile_function("_execute_calibration_command", namespace)
+
+        self.assertFalse(execute("LLA1\n", "success", "failure"))
+        self.assertEqual(
+            restorations,
+            [("pre-command", "applied-controller-position")],
+        )
+        self.assertEqual(
+            invalidations,
+            [
+                (
+                    "calibration result application failed after controller "
+                    "transmission: injected synchronous post-position failure",
+                    "pre-command",
+                    True,
+                )
+            ],
+        )
+        self.assertEqual(len(state["applied_positions"]), 1)
+        self.assertEqual(pose_state["value"], "pre-command")
+        self.assertFalse(namespace["calibration_serial_write_committed"].is_set())
+
+    def test_calibration_pose_rollback_restores_state_and_replaces_bad_save(self):
+        class Widget:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+            def set(self, value):
+                self.value = value
+
+        class Root:
+            def __init__(self):
+                self.cancelled = []
+                self.jobs = []
+
+            def after_cancel(self, job):
+                self.cancelled.append(job)
+
+            def after(self, delay, callback):
+                job = f"repair-job-{len(self.jobs) + 1}"
+                self.jobs.append((job, delay, callback))
+                return job
+
+        position_keys = (
+            "J1AngCur", "J2AngCur", "J3AngCur",
+            "J4AngCur", "J5AngCur", "J6AngCur",
+            "XcurPos", "YcurPos", "ZcurPos",
+            "RzcurPos", "RycurPos", "RxcurPos",
+            "J7PosCur", "J8PosCur", "J9PosCur",
+        )
+        entry_names = (
+            "J1curAngEntryField", "J2curAngEntryField", "J3curAngEntryField",
+            "J4curAngEntryField", "J5curAngEntryField", "J6curAngEntryField",
+            "XcurEntryField", "YcurEntryField", "ZcurEntryField",
+            "RzcurEntryField", "RycurEntryField", "RxcurEntryField",
+            "J7curAngEntryField", "J8curAngEntryField", "J9curAngEntryField",
+        )
+        slider_names = tuple(f"J{axis}jogslide" for axis in range(1, 10))
+        root = Root()
+        acknowledged_target = tuple(float(axis) for axis in range(1, 10))
+        namespace = {
+            "CALIBRATION_POSITION_KEYS": position_keys,
+            "CAL": {
+                key: f"saved-position-{index}"
+                for index, key in enumerate(position_keys, start=1)
+            },
+            "RUN": {
+                "WC": "N",
+                "VR_angles": [float(value) for value in range(1, 7)],
+                "StepMonitors": [float(value) for value in range(11, 17)],
+                **{
+                    f"J{axis}StepM": float(axis + 20)
+                    for axis in range(1, 7)
+                },
+            },
+            "confirmed_position_generation": 4,
+            "acknowledged_forced_position_lock": threading.Lock(),
+            "acknowledged_forced_position_target": acknowledged_target,
+            "controller_position_resynchronization_required": threading.Event(),
+            "_calibration_dirty": False,
+            "_calibration_save_job": None,
+            "application_closing": threading.Event(),
+            "CALIBRATION_SAVE_DEBOUNCE_MS": 250,
+            "_write_pending_calibration": lambda: True,
+            "root": root,
+            "manEntryField": Widget("saved-debug"),
+            "finite_number": finite_number,
+        }
+        namespace.update({
+            name: Widget(f"saved-entry-{index}")
+            for index, name in enumerate(entry_names, start=1)
+        })
+        namespace.update({
+            name: Widget(float(index))
+            for index, name in enumerate(slider_names, start=1)
+        })
+        namespace["_acknowledged_forced_position_target_value"] = (
+            self.compile_function(
+                "_acknowledged_forced_position_target_value",
+                namespace,
+            )
+        )
+        namespace["_calibration_pose_widget_groups"] = self.compile_function(
+            "_calibration_pose_widget_groups",
+            namespace,
+        )
+        capture = self.compile_function(
+            "_capture_calibration_pose_snapshot",
+            namespace,
+        )
+        restore = self.compile_function(
+            "_restore_calibration_pose_snapshot",
+            namespace,
+        )
+        snapshot = capture()
+
+        for key in position_keys:
+            namespace["CAL"][key] = "uncommitted-position"
+        namespace["RUN"]["WC"] = "F"
+        namespace["RUN"]["VR_angles"] = [90.0] * 6
+        namespace["RUN"]["StepMonitors"] = [900.0] * 6
+        for axis in range(1, 7):
+            namespace["RUN"][f"J{axis}StepM"] = 900.0
+        for name in entry_names + slider_names:
+            namespace[name].set("uncommitted-widget")
+        namespace["manEntryField"].set("uncommitted-debug")
+        namespace["confirmed_position_generation"] = 5
+        namespace["acknowledged_forced_position_target"] = None
+        namespace["controller_position_resynchronization_required"].set()
+        namespace["_calibration_dirty"] = True
+        namespace["_calibration_save_job"] = "bad-result-save"
+
+        self.assertTrue(restore(snapshot))
+        self.assertEqual(
+            tuple(namespace["CAL"][key] for key in position_keys),
+            tuple(f"saved-position-{index}" for index in range(1, 16)),
+        )
+        self.assertEqual(namespace["RUN"]["WC"], "N")
+        self.assertEqual(namespace["RUN"]["VR_angles"], list(range(1, 7)))
+        self.assertEqual(namespace["RUN"]["StepMonitors"], list(range(11, 17)))
+        self.assertEqual(
+            tuple(namespace["RUN"][f"J{axis}StepM"] for axis in range(1, 7)),
+            tuple(range(21, 27)),
+        )
+        self.assertEqual(
+            tuple(namespace[name].get() for name in entry_names),
+            tuple(f"saved-entry-{index}" for index in range(1, 16)),
+        )
+        self.assertEqual(
+            tuple(namespace[name].get() for name in slider_names),
+            tuple(float(index) for index in range(1, 10)),
+        )
+        self.assertEqual(namespace["manEntryField"].get(), "saved-debug")
+        self.assertEqual(namespace["confirmed_position_generation"], 4)
+        self.assertEqual(
+            namespace["acknowledged_forced_position_target"],
+            acknowledged_target,
+        )
+        self.assertFalse(
+            namespace["controller_position_resynchronization_required"].is_set()
+        )
+        self.assertEqual(root.cancelled, ["bad-result-save"])
+        self.assertTrue(namespace["_calibration_dirty"])
+        self.assertEqual(namespace["_calibration_save_job"], "repair-job-1")
+        self.assertEqual(len(root.jobs), 1)
+
+    def test_unowned_malformed_calibration_event_retains_active_ownership(self):
+        response = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+        worker_started = threading.Event()
+        worker_release = threading.Event()
+
+        def blocked_exchange(
+            serial_port,
+            command,
+            cancellation_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            write_started_event.set()
+            worker_started.set()
+            if not worker_release.wait(2):
+                raise TimeoutError("test worker release timed out")
+            return response
+
+        namespace, state = self.compile_async_calibration_lifecycle(
+            blocked_exchange
+        )
+        try:
+            self.assertTrue(namespace["startCalRobotAll"]())
+            self.assertTrue(worker_started.wait(2))
+            state["event_queue"].put(("malformed",))
+            namespace["_poll_calibration_events"]()
+
+            operation = namespace["calibration_operation"]
+            self.assertIsNotNone(operation)
+            self.assertTrue(operation.worker_active)
+            self.assertIsNotNone(operation.worker_token)
+            self.assertTrue(state["transport_lock"].locked())
+            self.assertTrue(state["activity_registry"].active("ser"))
+            self.assertTrue(state["motion_registry"].active)
+            self.assertEqual(state["applied_positions"], [])
+            self.assertEqual(state["invalidations"], [])
+        finally:
+            worker_release.set()
+
+        deadline = time.monotonic() + 2
+        while state["motion_registry"].active and time.monotonic() < deadline:
+            event = state["event_queue"].get(timeout=2)
+            state["event_queue"].put(event)
+            namespace["_poll_calibration_events"]()
+
+        self.assertEqual(len(state["applied_positions"]), 2)
+        self.assertFalse(state["transport_lock"].locked())
+        self.assertFalse(state["activity_registry"].active("ser"))
+        self.assertFalse(state["motion_registry"].active)
+        self.assertIsNone(namespace["calibration_operation"])
+
+    def test_async_single_joint_calibration_uses_one_hot_selection_policy(self):
+        exchanges = []
+        response = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+
+        def successful_exchange(
+            serial_port,
+            command,
+            cancellation_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            self.assertFalse(cancellation_event.is_set())
+            self.assertTrue(callable(getattr(write_boundary_lock, "acquire", None)))
+            exchanges.append(command)
+            write_started_event.set()
+            return response
+
+        namespace, state = self.compile_async_calibration_lifecycle(
+            successful_exchange
+        )
+        for joint in range(1, 10):
+            with self.subTest(joint=joint):
+                monitor_count = len(state["monitor_updates"])
+                callback = namespace[f"startCalRobotJ{joint}"]
+                self.assertTrue(callback())
+                deadline = time.monotonic() + 2
+                while state["motion_registry"].active and time.monotonic() < deadline:
+                    event = state["event_queue"].get(timeout=2)
+                    state["event_queue"].put(event)
+                    namespace["_poll_calibration_events"]()
+
+                selection_prefix = "LL" + "".join(
+                    f"{label}{int(axis == joint)}"
+                    for axis, label in enumerate("ABCDEFGHI", start=1)
+                )
+                self.assertTrue(exchanges[-1].startswith(selection_prefix + "J"))
+                expected_monitor_count = monitor_count + int(joint <= 6)
+                self.assertEqual(
+                    len(state["monitor_updates"]),
+                    expected_monitor_count,
+                )
+                self.assertFalse(state["transport_lock"].locked())
+                self.assertFalse(state["activity_registry"].active("ser"))
+                self.assertFalse(state["motion_registry"].active)
+                self.assertIsNone(namespace["calibration_operation"])
+
+        self.assertEqual(len(exchanges), 9)
 
     def test_position_resynchronization_consumers_stop_on_failure(self):
         class Port:

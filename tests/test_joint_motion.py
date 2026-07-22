@@ -1384,6 +1384,79 @@ class SerialLineExchangeTests(unittest.TestCase):
         self.assertTrue(serial_port.is_open)
         self.assertFalse(serial_transport_quarantined(serial_port))
 
+    def test_cancellation_bound_exchange_serializes_final_write_admission(self):
+        cancellation = threading.Event()
+        write_started = threading.Event()
+
+        class ClosingBoundaryLock:
+            def __init__(self):
+                self.locked = False
+
+            def acquire(self):
+                self.locked = True
+                cancellation.set()
+                return True
+
+            def release(self):
+                self.locked = False
+
+        serial_port = FakeSerial()
+        boundary_lock = ClosingBoundaryLock()
+        with self.assertRaisesRegex(
+            SerialActivityRejected,
+            "cancelled before transmission",
+        ):
+            exchange_serial_line_until_cancelled(
+                serial_port,
+                "LLA1\n",
+                cancellation,
+                write_boundary_lock=boundary_lock,
+                poll_interval_seconds=0.001,
+                write_started_event=write_started,
+            )
+
+        self.assertFalse(boundary_lock.locked)
+        self.assertEqual(serial_port.commands, [])
+        self.assertFalse(write_started.is_set())
+        self.assertTrue(serial_port.is_open)
+        self.assertFalse(serial_transport_quarantined(serial_port))
+
+    def test_cancellation_bound_exchange_rejects_shared_write_boundary_lock(self):
+        serial_port = FakeSerial()
+        shared_lock = threading.Lock()
+
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "write and write-boundary locks must be distinct",
+        ):
+            exchange_serial_line_until_cancelled(
+                serial_port,
+                "LLA1\n",
+                threading.Event(),
+                write_lock=shared_lock,
+                write_boundary_lock=shared_lock,
+                poll_interval_seconds=0.001,
+            )
+
+        self.assertEqual(serial_port.commands, [])
+
+    def test_cancellation_bound_exchange_names_invalid_write_boundary_lock(self):
+        serial_port = FakeSerial()
+
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "write_boundary_lock must satisfy the lock contract",
+        ):
+            exchange_serial_line_until_cancelled(
+                serial_port,
+                "LLA1\n",
+                threading.Event(),
+                write_boundary_lock=object(),
+                poll_interval_seconds=0.001,
+            )
+
+        self.assertEqual(serial_port.commands, [])
+
     def test_control_write_preserves_response_ownership(self):
         serial_port = FakeSerial()
         write_lock = threading.Lock()
