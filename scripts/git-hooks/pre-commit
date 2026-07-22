@@ -30,7 +30,12 @@
 #   -> Claude review). REVIEW_BACKEND is REQUIRED -- bare `git commit`
 #   without an explicit setting is rejected, so a forgotten env var
 #   cannot silently route a commit to self-review. The commit wrappers
-#   set REVIEW_BACKEND for you; use them as the default path.
+#   set REVIEW_BACKEND for you; use them as the default path. When Claude
+#   usage capacity is confirmed exhausted, first-position
+#   scripts/codex/commit.ps1 -NoClaude explicitly selects Codex review and sets
+#   CROSS_REVIEW_FALLBACK=codex-no-claude.
+#   The fallback never occurs automatically and remains a mandatory,
+#   fail-closed review path with a local audit record.
 #
 # Security: when staged changes touch a backend's wrapper or the shared
 # prompt template, THAT backend's wrapper + prompt run from HEAD's
@@ -108,6 +113,7 @@ if [ "$1" = "--self-test" ]; then
       -u GIT_CEILING_DIRECTORIES -u GIT_CONFIG -u GIT_CONFIG_GLOBAL \
       -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_NOSYSTEM \
       -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
+      -u CROSS_REVIEW_FALLBACK \
       CROSS_REVIEW_SELFTEST_SCRUBBED=1 sh "$0" --self-test
   fi
   HOOK_ABS=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
@@ -132,6 +138,7 @@ if [ "$1" = "--self-test" ]; then
   (
     cd "$ST_REPO" || exit 1
     git init -q .
+    git symbolic-ref HEAD refs/heads/crg-selftest
     git config user.email selftest@local
     git config user.name selftest
     # Hermetic isolation from AMBIENT hooks: a user/global core.hooksPath or
@@ -172,7 +179,7 @@ if [ "$1" = "--self-test" ]; then
   # line + an exit code.
   st_case() {
     ST_NAME="$1"; ST_WANT_EXIT="$2"; ST_WANT_MARK="$3"; ST_WANT_MARK2="$4"; ST_FORBID_MARK="$5"; shift 5
-    ST_OUT=$(cd "$ST_REPO" && env -u REVIEW_BACKEND -u CROSS_REVIEW_SKIP -u CROSS_REVIEW_SKIP_AUTHOR_LINT -u CROSS_REVIEW_COMMIT_EFFORT -u CROSS_REVIEW_FOLLOWUPS_PENDING "$@" sh "$HOOK_ABS" 2>&1)
+    ST_OUT=$(cd "$ST_REPO" && env -u REVIEW_BACKEND -u CROSS_REVIEW_SKIP -u CROSS_REVIEW_SKIP_AUTHOR_LINT -u CROSS_REVIEW_COMMIT_EFFORT -u CROSS_REVIEW_FOLLOWUPS_PENDING -u CROSS_REVIEW_FALLBACK "$@" sh "$HOOK_ABS" 2>&1)
     ST_EXIT=$?
     ST_OK=1
     [ "$ST_EXIT" -eq "$ST_WANT_EXIT" ] || ST_OK=0
@@ -213,9 +220,83 @@ if [ "$1" = "--self-test" ]; then
   ( cd "$ST_REPO" && git reset -q )
   st_case 'backend-required precedes empty-commit exemption' 1 'REVIEW_BACKEND is not set' '' ''
   st_case 'empty commit with backend set passes the exemption' 0 'no staged changes' '' "$ST_BACKEND_RAN" REVIEW_BACKEND=codex
+  st_case 'reviewer fallback rejects an empty commit' 1 'requires staged changes' '' "$ST_BACKEND_RAN" REVIEW_BACKEND=codex CROSS_REVIEW_FALLBACK=codex-no-claude
 
   st_stage
   st_case 'clean staged run passes (stub backend, clean author-lint)' 0 "$ST_BACKEND_PASS" '' '' REVIEW_BACKEND=codex
+  st_case 'invalid reviewer fallback marker fails closed' 1 'CROSS_REVIEW_FALLBACK' '' "$ST_BACKEND_RAN" REVIEW_BACKEND=codex CROSS_REVIEW_FALLBACK=invalid
+  st_case 'reviewer fallback cannot combine with a full-review skip' 1 'cannot be combined' '' "$ST_BACKEND_RAN" CROSS_REVIEW_SKIP=1 CROSS_REVIEW_FALLBACK=codex-no-claude
+  st_case 'reviewer fallback rejects a non-Codex backend' 1 'requires final REVIEW_BACKEND=codex' '' "$ST_BACKEND_RAN" REVIEW_BACKEND=claude CROSS_REVIEW_FALLBACK=codex-no-claude
+  if ( cd "$ST_REPO" && printf '# staged route edit\n' >> scripts/codex/commit.ps1 && git -c core.excludesfile= add scripts/codex/commit.ps1 ); then
+    st_case 'reviewer fallback cannot weaken forced dual review' 1 'Review-infrastructure edits require both backends' '' "$ST_BACKEND_RAN" REVIEW_BACKEND=codex CROSS_REVIEW_FALLBACK=codex-no-claude
+    if ! ( cd "$ST_REPO" && git restore --staged --worktree -- scripts/codex/commit.ps1 ); then
+      echo '[SelfTest] FAIL could not restore the forced-dual-review fixture'
+      ST_FAILURES=$((ST_FAILURES + 1))
+    fi
+  else
+    echo '[SelfTest] FAIL could not create the forced-dual-review fixture'
+    ST_FAILURES=$((ST_FAILURES + 1))
+  fi
+  st_case 'explicit Codex reviewer fallback remains gated' 0 'Codex-only reviewer fallback requested' "$ST_BACKEND_PASS" '' REVIEW_BACKEND=codex CROSS_REVIEW_FALLBACK=codex-no-claude
+  ST_FALLBACK_LOG="$ST_REPO/logs/review-fallbacks/reviewer-fallback-log.txt"
+  ST_EXPECT_TREE=$(git -C "$ST_REPO" write-tree)
+  ST_EXPECT_BRANCH=crg-selftest
+  if [ -f "$ST_FALLBACK_LOG" ] && grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z event=reviewer-fallback fallback=codex-no-claude backend=codex branch=$ST_EXPECT_BRANCH staged-tree=$ST_EXPECT_TREE$" "$ST_FALLBACK_LOG"; then
+    echo '[SelfTest] PASS explicit Codex reviewer fallback writes a complete audit record'
+  else
+    echo '[SelfTest] FAIL explicit Codex reviewer fallback audit metadata is missing or malformed'
+    ST_FAILURES=$((ST_FAILURES + 1))
+  fi
+  if rm -f "$ST_FALLBACK_LOG" && mkdir "$ST_FALLBACK_LOG"; then
+    st_case 'reviewer fallback aborts when the audit record cannot be appended' 1 'could not append reviewer-fallback audit' '' "$ST_BACKEND_RAN" REVIEW_BACKEND=codex CROSS_REVIEW_FALLBACK=codex-no-claude
+    if ! rmdir "$ST_FALLBACK_LOG"; then
+      echo '[SelfTest] FAIL could not remove the reviewer-fallback audit fixture'
+      ST_FAILURES=$((ST_FAILURES + 1))
+    fi
+  else
+    echo '[SelfTest] FAIL could not create the reviewer-fallback audit fixture'
+    ST_FAILURES=$((ST_FAILURES + 1))
+  fi
+  ST_SKIP_LOG="$ST_REPO/logs/review-skips/review-skip-log.txt"
+  st_case 'explicit full-review skip remains audit-logged' 0 'adversarial review skipped' '' "$ST_BACKEND_RAN" CROSS_REVIEW_SKIP=1
+  if [ -f "$ST_SKIP_LOG" ] && grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z event=review-skip backend=none branch=$ST_EXPECT_BRANCH staged-tree=$ST_EXPECT_TREE$" "$ST_SKIP_LOG"; then
+    echo '[SelfTest] PASS explicit full-review skip writes a complete audit record'
+  else
+    echo '[SelfTest] FAIL explicit full-review skip audit metadata is missing or malformed'
+    ST_FAILURES=$((ST_FAILURES + 1))
+  fi
+  ST_UNBORN_REPO="$ST_ROOT/unborn"
+  if (
+    mkdir -p "$ST_UNBORN_REPO" &&
+    cd "$ST_UNBORN_REPO" &&
+    git init -q . &&
+    git symbolic-ref HEAD refs/heads/crg-unborn &&
+    git config user.email selftest@local &&
+    git config user.name selftest &&
+    printf 'unborn\n' > f.txt &&
+    git -c core.excludesfile= add f.txt
+  ); then
+    ST_UNBORN_OUT=$(cd "$ST_UNBORN_REPO" && env -u REVIEW_BACKEND -u CROSS_REVIEW_SKIP_AUTHOR_LINT -u CROSS_REVIEW_FALLBACK CROSS_REVIEW_SKIP=1 sh "$HOOK_ABS" 2>&1)
+    ST_UNBORN_EXIT=$?
+    ST_UNBORN_TREE=$(git -C "$ST_UNBORN_REPO" write-tree)
+    ST_UNBORN_LOG="$ST_UNBORN_REPO/logs/review-skips/review-skip-log.txt"
+    ST_UNBORN_OK=1
+    [ "$ST_UNBORN_EXIT" -eq 0 ] || ST_UNBORN_OK=0
+    case "$ST_UNBORN_OUT" in *'adversarial review skipped'*) ;; *) ST_UNBORN_OK=0 ;; esac
+    if [ ! -f "$ST_UNBORN_LOG" ] || ! grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z event=review-skip backend=none branch=crg-unborn staged-tree=$ST_UNBORN_TREE$" "$ST_UNBORN_LOG"; then
+      ST_UNBORN_OK=0
+    fi
+    if [ "$ST_UNBORN_OK" -eq 1 ]; then
+      echo '[SelfTest] PASS initial bootstrap skip supports an unborn branch and writes a complete audit record'
+    else
+      echo "[SelfTest] FAIL initial bootstrap skip on an unborn branch: exit=$ST_UNBORN_EXIT; output:"
+      echo "$ST_UNBORN_OUT" | sed 's/^/    /'
+      ST_FAILURES=$((ST_FAILURES + 1))
+    fi
+  else
+    echo '[SelfTest] FAIL could not create the unborn-branch bootstrap fixture'
+    ST_FAILURES=$((ST_FAILURES + 1))
+  fi
   st_case 'effort forward: comment mention is NOT a declaration' 0 'does not declare -ReasoningEffort' "$ST_BACKEND_PASS" '-> -ReasoningEffort' REVIEW_BACKEND=codex CROSS_REVIEW_COMMIT_EFFORT=xhigh
   # (The tier validation sits inside run_backend AFTER its "Running..."
   # banner, so the banner appears; what must NOT appear is a backend PASS.)
@@ -378,6 +459,54 @@ if [ "$1" = "--self-test" ]; then
   fi
 fi
 
+write_review_audit_record() {
+  AUDIT_LOG="$1"
+  AUDIT_EVENT="$2"
+  AUDIT_BACKEND="$3"
+  AUDIT_FALLBACK="$4"
+
+  case "$AUDIT_EVENT:$AUDIT_BACKEND:$AUDIT_FALLBACK" in
+    'review-skip:none:'|'reviewer-fallback:codex:codex-no-claude') ;;
+    *) return 1 ;;
+  esac
+
+  AUDIT_TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+  printf '%s\n' "$AUDIT_TIMESTAMP" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || return 1
+  if ! AUDIT_BRANCH=$(git symbolic-ref --quiet --short HEAD 2>/dev/null); then
+    AUDIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
+  fi
+  [ -n "$AUDIT_BRANCH" ] || return 1
+  AUDIT_STAGED_TREE=$(git write-tree 2>/dev/null) || return 1
+  case "$AUDIT_STAGED_TREE" in
+    ''|*[!0-9a-f]*) return 1 ;;
+  esac
+  case "${#AUDIT_STAGED_TREE}" in
+    40|64) ;;
+    *) return 1 ;;
+  esac
+
+  if [ -n "$AUDIT_FALLBACK" ]; then
+    AUDIT_RECORD="$AUDIT_TIMESTAMP event=$AUDIT_EVENT fallback=$AUDIT_FALLBACK backend=$AUDIT_BACKEND branch=$AUDIT_BRANCH staged-tree=$AUDIT_STAGED_TREE"
+  else
+    AUDIT_RECORD="$AUDIT_TIMESTAMP event=$AUDIT_EVENT backend=$AUDIT_BACKEND branch=$AUDIT_BRANCH staged-tree=$AUDIT_STAGED_TREE"
+  fi
+  printf '%s\n' "$AUDIT_RECORD" >> "$AUDIT_LOG" || return 1
+}
+
+REVIEW_FALLBACK_VAL="${CROSS_REVIEW_FALLBACK:-}"
+case "$REVIEW_FALLBACK_VAL" in
+  ''|codex-no-claude) ;;
+  *)
+    echo "[pre-commit] ERROR: CROSS_REVIEW_FALLBACK='$REVIEW_FALLBACK_VAL' is not valid (expected codex-no-claude or unset)" >&2
+    exit 1
+    ;;
+esac
+
+if [ "$CROSS_REVIEW_SKIP" = "1" ] && [ -n "$REVIEW_FALLBACK_VAL" ]; then
+  echo "[pre-commit] ERROR: CROSS_REVIEW_FALLBACK cannot be combined with CROSS_REVIEW_SKIP=1." >&2
+  exit 1
+fi
+
 if [ "$CROSS_REVIEW_SKIP" = "1" ]; then
   SKIP_LOG_DIR="$(git rev-parse --show-toplevel)/logs/review-skips"
   SKIP_LOG="$SKIP_LOG_DIR/review-skip-log.txt"
@@ -386,7 +515,7 @@ if [ "$CROSS_REVIEW_SKIP" = "1" ]; then
     echo "[pre-commit] Skip cannot proceed without audit trail. Aborting commit." >&2
     exit 1
   fi
-  if ! echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) skip on $(git rev-parse --abbrev-ref HEAD) sha-staged=$(git diff --cached | git hash-object --stdin)" >> "$SKIP_LOG"; then
+  if ! write_review_audit_record "$SKIP_LOG" 'review-skip' 'none' ''; then
     echo "[pre-commit] ERROR: could not append to $SKIP_LOG" >&2
     echo "[pre-commit] Skip cannot proceed without audit trail. Aborting commit." >&2
     exit 1
@@ -429,10 +558,21 @@ case "$REVIEW_BACKEND_VAL" in
     ;;
 esac
 
+if [ -n "$REVIEW_FALLBACK_VAL" ] && [ "$REVIEW_BACKEND_VAL" != "codex" ]; then
+  echo "[pre-commit] ERROR: CROSS_REVIEW_FALLBACK=codex-no-claude requires final REVIEW_BACKEND=codex; current route is '$REVIEW_BACKEND_VAL'." >&2
+  echo "[pre-commit] Clear the stale fallback marker or invoke scripts/codex/commit.ps1 with -NoClaude in the first argument position." >&2
+  exit 1
+fi
+
 # Empty commits (no staged changes) are not subject to review. This
 # exemption sits AFTER the REVIEW_BACKEND guard: it skips the review,
 # never the routing declaration.
 if git diff --cached --quiet; then
+  if [ -n "$REVIEW_FALLBACK_VAL" ]; then
+    echo "[pre-commit] ERROR: CROSS_REVIEW_FALLBACK requires staged changes and a completed Codex review." >&2
+    echo "[pre-commit] Retry the empty commit without -NoClaude." >&2
+    exit 1
+  fi
   echo "[pre-commit] no staged changes - nothing to review"
   exit 0
 fi
@@ -543,6 +683,35 @@ done
 if [ "$STAGED_WRAPPER" -eq 1 ] && [ "$REVIEW_BACKEND_VAL" != "both" ]; then
   echo "[pre-commit] commit-wrapper edit detected -- forcing REVIEW_BACKEND=both (cannot trust a wrapper to honestly route its own review)"
   REVIEW_BACKEND_VAL="both"
+fi
+
+# `codex-no-claude` records confirmed Claude usage-capacity exhaustion,
+# never an automatic substitution after a failed invocation.
+# Commit-wrapper edits still force both backends above; a fallback request cannot
+# weaken that protection.
+# Audit failure aborts before either reviewer so no fallback can proceed without
+# a durable local record.
+if [ "$REVIEW_FALLBACK_VAL" = "codex-no-claude" ]; then
+  if [ "$REVIEW_BACKEND_VAL" != "codex" ]; then
+    echo "[pre-commit] ERROR: CROSS_REVIEW_FALLBACK=codex-no-claude requires final REVIEW_BACKEND=codex; current route is '$REVIEW_BACKEND_VAL'." >&2
+    if [ "$STAGED_WRAPPER" -eq 1 ]; then
+      echo "[pre-commit] Review-infrastructure edits require both backends; retry without -NoClaude." >&2
+    else
+      echo "[pre-commit] Clear the stale fallback marker or invoke scripts/codex/commit.ps1 with -NoClaude in the first argument position." >&2
+    fi
+    exit 1
+  fi
+  FALLBACK_LOG_DIR="$REPO_ROOT/logs/review-fallbacks"
+  FALLBACK_LOG="$FALLBACK_LOG_DIR/reviewer-fallback-log.txt"
+  if ! mkdir -p "$FALLBACK_LOG_DIR"; then
+    echo "[pre-commit] ERROR: could not create $FALLBACK_LOG_DIR for reviewer-fallback audit" >&2
+    exit 1
+  fi
+  if ! write_review_audit_record "$FALLBACK_LOG" 'reviewer-fallback' 'codex' 'codex-no-claude'; then
+    echo "[pre-commit] ERROR: could not append reviewer-fallback audit to $FALLBACK_LOG" >&2
+    exit 1
+  fi
+  echo "[pre-commit] Codex-only reviewer fallback requested; mandatory review continues (logged to $FALLBACK_LOG)"
 fi
 
 # Path translator for powershell.exe under git-for-windows sh.

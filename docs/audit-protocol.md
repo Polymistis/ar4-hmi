@@ -10,7 +10,7 @@ warrant its own automation layer.
 > **packaged** scripts under `cross-review-gate/scripts/`. As of v1.7.0 the
 > packaged scripts carry the full cross-provider feature set: a Claude
 > cross-provider merge pass, the `Resolve-MergePassMix` pass-mix resolver,
-> the `-NoClaude` switch, the verdict identity header block (`DIFF-SHA256`
+> the merge `-NoClaude` switch, the verdict identity header block (`DIFF-SHA256`
 > + `REVIEW-TREE-OID` + `REVIEW-BACKEND` + `REVIEW-EFFORT` +
 > `REVIEW-SEVERITY-CONTRACT`, stamped via
 > `Get-DiffSha256` / `Resolve-EffectiveCodexEffort` -- provenance/forensics
@@ -20,6 +20,10 @@ warrant its own automation layer.
 > `auto-merge.ps1 -SelfTest` mode, and the two author-side tools
 > (`author-lint.ps1`, `dispatch-checklist.ps1`). Audit the packaged scripts
 > directly.
+
+This project-local installation additionally provides the Codex-author commit
+`-NoClaude` route documented below. Audit that extension with the installed
+scripts rather than attributing the extension to the v1.7.0 package snapshot.
 
 ## Why this exists
 
@@ -42,7 +46,7 @@ Claude backend:
 
 Shared:
 - `scripts/git-hooks/pre-commit` (the trigger; routes by `REVIEW_BACKEND`)
-- `scripts/codex/commit.ps1` (cross-review wrapper used by Codex-as-implementer; sets `REVIEW_BACKEND=claude`)
+- `scripts/codex/commit.ps1` (Codex-as-implementer wrapper; defaults to `REVIEW_BACKEND=claude`, while first-position `-NoClaude` selects audit-logged `REVIEW_BACKEND=codex` after confirmed Claude usage-capacity exhaustion without skipping review)
 - `scripts/claude/commit.ps1` (cross-review wrapper used by Claude-as-implementer; sets `REVIEW_BACKEND=codex`)
 - `AGENTS.md` (the human-facing contract description)
 - `scripts/codex/author-lint.ps1` (author-side MECHANICAL pre-pass, NOT a review
@@ -134,9 +138,17 @@ Each audit run consumes:
    `CROSS_REVIEW_CONSISTENCY_DOC`). Run its `-SelfTest`.
 5a. **`scripts/codex/commit.ps1`** AND **`scripts/claude/commit.ps1`** —
    cross-review routing wrappers. These run BEFORE the pre-commit hook
-   and set `REVIEW_BACKEND` to the OTHER backend (Codex implementer →
-   Claude reviewer, and vice versa). Check the bypass-flag parser
-   (`Test-Bypass-Args`) for parity between the two wrapper copies, and the
+   and normally set `REVIEW_BACKEND` to the OTHER backend (Codex implementer →
+   Claude reviewer, and vice versa). After confirmed Claude usage-capacity
+   exhaustion, the Codex wrapper's first-position `-NoClaude`
+   route instead selects Codex review, sets the validated
+   `CROSS_REVIEW_FALLBACK=codex-no-claude` marker, and relies on the hook to
+   append the local audit record before review. Check `Resolve-CodexCommitRoute`
+   for position-zero recognition, exact removal of that wrapper flag, and opaque
+   forwarding of every later argument.
+   Confirm that reviewer invocation failures never activate the fallback
+   automatically. Check the bypass-flag parser (`Test-Bypass-Args`) for parity
+   across the wrapper copies, and the
    `core.hooksPath` config-redirect guard (`Resolve-HooksPathGuard`
    classifier) for parity across every hand-kept copy -- both commit
    wrappers AND `bootstrap.ps1` (the installer classifies `core.hooksPath`
@@ -144,14 +156,17 @@ Each audit run consumes:
    abort on). Run both `--self-test` suites (which also spawn a subprocess
    E2E pinning the production guard's abort on both a NON-empty and an
    empty/`core.hooksPath=` value),
-   verify `REVIEW_BACKEND` save/restore + the `GIT_CONFIG*` scrub
+   verify `REVIEW_BACKEND` and `CROSS_REVIEW_FALLBACK` save/restore + the `GIT_CONFIG*` scrub
    error-handling are not regressed, and confirm the `core.hooksPath`
    guard still runs INSIDE the commit `try/finally` so an abort restores
    the scrubbed env. The pre-
    commit hook forces `REVIEW_BACKEND=both` when a staged change
    touches either commit wrapper, defending against a malicious
    wrapper edit that would otherwise route its own review to itself;
-   verify that defense is intact.
+   verify that defense is intact and that a simultaneous fallback request fails
+   rather than weakening the forced dual-backend route. Run the pre-commit
+   self-test coverage for invalid markers, backend mismatches, mandatory Codex
+   review, and durable fallback-log creation.
 5b. **`scripts/codex/author-lint.ps1`** — the author-side mechanical
    pre-pass. Runs no AI review (the AI gate stays authoritative), but the
    pre-commit hook runs it as a fail-fast pre-pass: author-lint EXITS 3 on

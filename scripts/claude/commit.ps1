@@ -8,11 +8,10 @@
 # before forwarding. The wrapper exists to enforce cross-review
 # routing, so it refuses to participate in a hook-bypass path; use
 # CROSS_REVIEW_SKIP=1 (audited per your project's AGENTS.md) for the
-# documented skip case. Exits with git's exit code, or 1 on a pre-commit
-# abort before `git commit` runs: a bypass-flag rejection, a failed
-# hook-bypass env-var scrub, a set core.hooksPath that would redirect
-# the pre-commit dispatcher, or a failure to prepare the Git Unix-tool
-# PATH the dispatcher needs.
+# documented skip case. Exits with git's exit code, or 1 on an ambiguous
+# argument, a bypass-flag rejection, a guarded-environment failure, a failed
+# hook-bypass env-var scrub, a set core.hooksPath that would redirect the
+# pre-commit dispatcher, or a pre-commit abort.
 #
 # Usage examples (run from the Claude session):
 #   scripts/claude/commit.ps1 -m "task X: short summary"
@@ -60,12 +59,16 @@ function Test-Bypass-Args {
   $skipNext = $false
   $afterDoubleDash = $false
   $bypass = $false
+  $invalid = $false
   $offending = ''
   foreach ($a in $ArgList) {
     if ($afterDoubleDash) { continue }
     if ($skipNext) { $skipNext = $false; continue }
     if ($a -eq '--') { $afterDoubleDash = $true; continue }
     if ($valueTakingLongOpts -contains $a) { $skipNext = $true; continue }
+    if (Test-AbbreviatedValueLongOption -Token $a) {
+      $invalid = $true; $offending = $a; break
+    }
     if ($a -match '^-([a-zA-Z])$' -and ($alwaysValueShort -ccontains $matches[1])) {
       $skipNext = $true; continue
     }
@@ -86,13 +89,36 @@ function Test-Bypass-Args {
       if ($bypass) { break }
     }
   }
-  return @{ Bypass = $bypass; Offending = $offending }
+  return @{ Bypass = $bypass; Invalid = $invalid; Offending = $offending }
 }
 $valueTakingLongOpts = @(
   '--message', '--file', '--author', '--date', '--template',
   '--reuse-message', '--reedit-message', '--fixup', '--squash',
   '--cleanup', '--pathspec-from-file', '--trailer'
 )
+
+# Keep value ownership unambiguous across Git versions. Git accepts long-option
+# prefixes, but a wrapper cannot safely infer whether the following token is a
+# value without the complete version-specific option inventory.
+function Test-AbbreviatedValueLongOption {
+  param([string]$Token)
+  if (
+    [string]::IsNullOrEmpty($Token) -or
+    -not $Token.StartsWith('--', [System.StringComparison]::Ordinal) -or
+    $Token.Contains('=')
+  ) {
+    return $false
+  }
+  foreach ($fullOption in $valueTakingLongOpts) {
+    if (
+      $Token.Length -lt $fullOption.Length -and
+      $fullOption.StartsWith($Token, [System.StringComparison]::Ordinal)
+    ) {
+      return $true
+    }
+  }
+  return $false
+}
 # `--gpg-sign` and `--untracked-files` take OPTIONAL values only --
 # see scripts/codex/commit.ps1 for the full rationale. Both must use
 # the attached `=<value>` form, not the separate-argv form.
@@ -173,6 +199,33 @@ function Get-UnionProcessPathParts {
 
 # Apply bypass check via the shared Test-Bypass-Args function.
 $bypassResult = Test-Bypass-Args -ArgList $args
+if ($bypassResult.Invalid) {
+  Write-Error "scripts/claude/commit.ps1: abbreviated value-taking long option '$($bypassResult.Offending)' is unsupported; spell the Git option in full so argument ownership remains unambiguous."
+  exit 1
+}
+
+function Set-ProcessEnvironmentValueVerified {
+  param([string]$Name, [string]$Value)
+  if ([string]::IsNullOrWhiteSpace($Name) -or $null -eq $Value) {
+    throw 'environment assignment requires a name and non-null value'
+  }
+  Set-Item -LiteralPath "Env:$Name" -Value $Value -ErrorAction Stop
+  $actual = [Environment]::GetEnvironmentVariable($Name, 'Process')
+  if ($actual -cne $Value) {
+    throw "environment value '$Name' did not match after assignment"
+  }
+}
+
+function Clear-ProcessEnvironmentValueVerified {
+  param([string]$Name)
+  if ([string]::IsNullOrWhiteSpace($Name)) {
+    throw 'environment removal requires a name'
+  }
+  Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+  if ($null -ne [Environment]::GetEnvironmentVariable($Name, 'Process')) {
+    throw "environment value '$Name' persisted after removal"
+  }
+}
 if ($bypassResult.Bypass) {
   Write-Error "scripts/claude/commit.ps1: refusing $($bypassResult.Offending) -- this wrapper exists to enforce cross-review routing; --no-verify / -n / clustered -n* short options / --no-v[erify] prefix abbreviations would bypass the pre-commit hook entirely. Use CROSS_REVIEW_SKIP=1 (audited per your project's AGENTS.md) for the documented skip path; never --no-verify."
   exit 1
@@ -192,27 +245,47 @@ $gitConfigEnvNames = @(
   'GIT_CONFIG_COUNT'
 )
 
-# --self-test mode mirrors scripts/codex/commit.ps1 (bypass-parser + hooksPath
-# classifier + PATH-assembly (Get-PrependedToolPathParts, Get-UnionProcessPathParts,
-# Get-ProcessPathSpellings) fixtures plus the subprocess E2E that pins the production guard).
-# The fixtures are pure; the E2E case spawns a child of THIS wrapper against a
-# throwaway scratch repo whose core.hooksPath is set (no real commit, no review
-# pipeline) and TEMPORARILY scrubs $gitConfigEnvNames around its scratch-repo
-# setup so that setup runs against the same effective config as production.
 if ($args.Count -ge 1 -and $args[0] -eq '--self-test') {
   function Test-Bypass {
-    param([string[]]$ArgList, [bool]$ExpectBypass, [string]$Name)
+    param(
+      [string[]]$ArgList,
+      [bool]$ExpectBypass,
+      [string]$Name,
+      [bool]$ExpectInvalid = $false
+    )
     # Calls the shared Test-Bypass-Args function above; no local copy.
     $r = Test-Bypass-Args -ArgList $ArgList
-    if ($r.Bypass -eq $ExpectBypass) {
+    if ($r.Bypass -eq $ExpectBypass -and $r.Invalid -eq $ExpectInvalid) {
       Write-Host ("[SelfTest] PASS $Name" + $(if ($r.Offending) { " ($($r.Offending))" } else { '' }))
       return $true
     } else {
-      Write-Host "[SelfTest] FAIL ${Name}: expected bypass=$ExpectBypass got $($r.Bypass)"
+      Write-Host "[SelfTest] FAIL ${Name}: expected bypass=$ExpectBypass invalid=$ExpectInvalid got bypass=$($r.Bypass) invalid=$($r.Invalid)"
       return $false
     }
   }
   $ok = $true
+  $environmentProbeName = 'CROSS_REVIEW_ENV_PROBE_' + [guid]::NewGuid().ToString('N')
+  try {
+    Set-ProcessEnvironmentValueVerified -Name $environmentProbeName -Value 'probe-value'
+    $environmentSetPassed = (
+      [Environment]::GetEnvironmentVariable($environmentProbeName, 'Process') -ceq 'probe-value'
+    )
+    Clear-ProcessEnvironmentValueVerified -Name $environmentProbeName
+    $environmentClearPassed = (
+      $null -eq [Environment]::GetEnvironmentVariable($environmentProbeName, 'Process')
+    )
+  } catch {
+    $environmentSetPassed = $false
+    $environmentClearPassed = $false
+  } finally {
+    Remove-Item -LiteralPath "Env:$environmentProbeName" -ErrorAction SilentlyContinue
+  }
+  if ($environmentSetPassed -and $environmentClearPassed) {
+    Write-Host '[SelfTest] PASS verified environment assignment and removal helpers'
+  } else {
+    Write-Host '[SelfTest] FAIL verified environment assignment and removal helpers'
+    $ok = $false
+  }
   $ok = (Test-Bypass @('--no-verify') $true 'reject --no-verify') -and $ok
   $ok = (Test-Bypass @('--no-v') $true 'reject --no-v prefix') -and $ok
   $ok = (Test-Bypass @('--no-verify-message') $true 'reject --no-verify-message (over-reject acceptable)') -and $ok
@@ -231,6 +304,8 @@ if ($args.Count -ge 1 -and $args[0] -eq '--self-test') {
   $ok = (Test-Bypass @('-am', 'message') $false 'accept -am cluster (no n)') -and $ok
   $ok = (Test-Bypass @('-am', '-n: message') $false 'accept -am "-n: msg" (m is terminal, msg is value not option)') -and $ok
   $ok = (Test-Bypass @('--message=value') $false 'accept --message=value') -and $ok
+  $ok = (Test-Bypass @('--mess', '--no-verify') $false 'reject abbreviated value-taking long option before ambiguous data' $true) -and $ok
+  $ok = (Test-Bypass @('--message', '--no-verify') $false 'accept bypass-like text as a full-option value') -and $ok
   # Standalone optional-value reject fixtures.
   $ok = (Test-Bypass @('-S', '--no-verify') $true 'reject -S then --no-verify (S optional-value, no skipNext)') -and $ok
   $ok = (Test-Bypass @('-u', '--no-verify') $true 'reject -u then --no-verify (u optional-value, no skipNext)') -and $ok
@@ -382,16 +457,14 @@ if ($args.Count -ge 1 -and $args[0] -eq '--self-test') {
           }
           Push-Location -LiteralPath $guardScratch
           try {
-            $guardOut = (& powershell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -m 'guard probe' 2>&1 | Out-String)
+            $guardOut = (& powershell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -m 'guard probe' 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
             $guardExit = $LASTEXITCODE
           } finally { Pop-Location }
-          # Whitespace-normalize before matching: the child's Write-Error renders
-          # through PowerShell's error formatter, which HARD-WRAPS at the console
-          # width. The matched phrase sits behind a long, variable-length prefix
-          # (`<full-script-path> : scripts/.../commit.ps1: ABORT -- core.hooksPath is `),
-          # so at a narrow console (80 cols) or a deep path a line-break can split the
-          # phrase and defeat a literal regex -- a SPURIOUS FAIL on a correct guard.
-          # Collapsing all whitespace runs to single spaces makes the match wrap-immune.
+          # Convert child output objects to raw text before Out-String above.
+          # Windows PowerShell otherwise formats redirected native stderr as rich
+          # ErrorRecord data and can inject formatter metadata between wrapped
+          # message fragments. Whitespace normalization then makes ordinary console
+          # wrapping irrelevant without accepting unrelated formatter text.
           $guardOk = (($guardExit -eq 1) -and (($guardOut -replace '\s+', ' ') -match 'core\.hooksPath is SET'))
           if ($guardOk) {
             Write-Host "[SelfTest] PASS E2E: production guard aborts (exit 1) when core.hooksPath is SET -- $($gc.Label)"
@@ -400,43 +473,116 @@ if ($args.Count -ge 1 -and $args[0] -eq '--self-test') {
           }
           $ok = $guardOk -and $ok
         }
+
+        & git -C $guardScratch config --local --unset-all core.hooksPath 2>&1 | Out-Null
+        $routeUnsetExit = $LASTEXITCODE
+        & git -C $guardScratch config --local user.email selftest@local 2>&1 | Out-Null
+        $routeEmailExit = $LASTEXITCODE
+        & git -C $guardScratch config --local user.name selftest 2>&1 | Out-Null
+        $routeNameExit = $LASTEXITCODE
+        $routeHookPath = Join-Path $guardScratch '.git/hooks/pre-commit'
+        $routeRecordPath = Join-Path $guardScratch '.git/route-probe.txt'
+        $routeProbePath = Join-Path $guardScratch 'route-probe.txt'
+        $routeFileSetupOk = $true
+        try {
+          Set-Content -LiteralPath $routeProbePath -Value 'route probe' -Encoding Ascii -ErrorAction Stop
+          $routeHookBody = @'
+#!/bin/sh
+printf '%s|%s|%s|%s\n' "${REVIEW_BACKEND-}" "${CROSS_REVIEW_FALLBACK+x}" "${CROSS_REVIEW_FALLBACK-}" "${GIT_CONFIG_NOSYSTEM+x}" > .git/route-probe.txt
+exit 1
+'@
+          Set-Content -LiteralPath $routeHookPath -Value $routeHookBody -Encoding Ascii -NoNewline -ErrorAction Stop
+          & git -C $guardScratch -c core.excludesfile= add route-probe.txt 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { $routeFileSetupOk = $false }
+        } catch {
+          $routeFileSetupOk = $false
+        }
+        $routeSetupOk = (
+          ($routeUnsetExit -eq 0) -and
+          ($routeEmailExit -eq 0) -and
+          ($routeNameExit -eq 0) -and
+          $routeFileSetupOk
+        )
+        if (-not $routeSetupOk) {
+          Write-Host '[SelfTest] FAIL E2E: production Claude-author route scratch setup failed'
+          $ok = $false
+        } else {
+          $routeSavedFallback = [Environment]::GetEnvironmentVariable('CROSS_REVIEW_FALLBACK')
+          $routeSavedFallbackWasSet = $null -ne $routeSavedFallback
+          try {
+            Set-ProcessEnvironmentValueVerified -Name 'CROSS_REVIEW_FALLBACK' -Value 'codex-no-claude'
+            Set-ProcessEnvironmentValueVerified -Name 'GIT_CONFIG_NOSYSTEM' -Value '1'
+            Push-Location -LiteralPath $guardScratch
+            try {
+              $routeOut = (& powershell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -m 'route probe' 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
+              $routeExit = $LASTEXITCODE
+            } finally { Pop-Location }
+          } finally {
+            try {
+              if ($routeSavedFallbackWasSet) {
+                Set-ProcessEnvironmentValueVerified -Name 'CROSS_REVIEW_FALLBACK' -Value $routeSavedFallback
+              } else {
+                Clear-ProcessEnvironmentValueVerified -Name 'CROSS_REVIEW_FALLBACK'
+              }
+            } finally {
+              Clear-ProcessEnvironmentValueVerified -Name 'GIT_CONFIG_NOSYSTEM'
+            }
+          }
+          $routeRecord = if (Test-Path -LiteralPath $routeRecordPath -PathType Leaf) {
+            (Get-Content -LiteralPath $routeRecordPath -Raw).Trim()
+          } else {
+            ''
+          }
+          $routeOk = (($routeExit -eq 1) -and ($routeRecord -ceq 'codex|||'))
+          if ($routeOk) {
+            Write-Host '[SelfTest] PASS E2E: production Claude-author route clears inherited fallback state at the hook boundary'
+          } else {
+            $routeDiagnostic = ($routeOut -replace '\s+', ' ').Trim()
+            Write-Host "[SelfTest] FAIL E2E: production Claude-author route boundary (exit=$routeExit record=[$routeRecord] output=[$routeDiagnostic])"
+          }
+          $ok = $routeOk -and $ok
+        }
       }
     }
   } finally {
-    foreach ($n in $gitConfigEnvNames) {
-      if ($e2eSavedGitCfg.ContainsKey($n) -and $null -ne $e2eSavedGitCfg[$n]) { Set-Item -LiteralPath "Env:$n" -Value $e2eSavedGitCfg[$n] -ErrorAction SilentlyContinue }
-    }
-    if (Test-Path -LiteralPath $guardScratch) {
-      Get-ChildItem -LiteralPath $guardScratch -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
-      Get-ChildItem -LiteralPath $guardScratch -Recurse -Directory -Force -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
-      Remove-Item -LiteralPath $guardScratch -Force -ErrorAction SilentlyContinue
+    try {
+      foreach ($n in $gitConfigEnvNames) {
+        try {
+          if ($e2eSavedGitCfg.ContainsKey($n) -and $null -ne $e2eSavedGitCfg[$n]) {
+            Set-ProcessEnvironmentValueVerified -Name $n -Value $e2eSavedGitCfg[$n]
+          } else {
+            Clear-ProcessEnvironmentValueVerified -Name $n
+          }
+        } catch {
+          Write-Host "[SelfTest] FAIL E2E: could not restore $n ($($_.Exception.Message))"
+          $ok = $false
+        }
+      }
+    } finally {
+      if (Test-Path -LiteralPath $guardScratch) {
+        Get-ChildItem -LiteralPath $guardScratch -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        Get-ChildItem -LiteralPath $guardScratch -Recurse -Directory -Force -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $guardScratch -Force -ErrorAction SilentlyContinue
+      }
     }
   }
 
-  if ($ok) { Write-Host '[SelfTest] All bypass-parser + hooksPath-guard + PATH-assembly fixtures passed.'; exit 0 } else { exit 1 }
+  if ($ok) { Write-Host '[SelfTest] All commit-wrapper fixtures passed.'; exit 0 } else { exit 1 }
 }
 
 $prevBackend = [Environment]::GetEnvironmentVariable('REVIEW_BACKEND')
 $prevBackendWasSet = $null -ne $prevBackend
+$prevFallback = [Environment]::GetEnvironmentVariable('CROSS_REVIEW_FALLBACK')
+$prevFallbackWasSet = $null -ne $prevFallback
 
-# Scrub the hook-affecting git config env vars ($gitConfigEnvNames, defined near
+# Capture the hook-affecting git config env vars ($gitConfigEnvNames, defined near
 # the top and shared with the --self-test E2E) before invoking git commit. See
 # scripts/codex/commit.ps1 for the full rationale (historical regression on the
-# GIT_CONFIG_* core.hooksPath bypass vector). Scrub before; restore in finally.
+# GIT_CONFIG_* core.hooksPath bypass vector). Mutation begins inside the
+# restore-covered try below.
 $savedGitConfigEnv = @{}
 foreach ($n in $gitConfigEnvNames) {
   $savedGitConfigEnv[$n] = [Environment]::GetEnvironmentVariable($n)
-  if ($null -ne $savedGitConfigEnv[$n]) {
-    try { Remove-Item -LiteralPath "Env:$n" -ErrorAction Stop }
-    catch {
-      Write-Error "scripts/claude/commit.ps1: ABORT -- failed to scrub hook-bypass env var $n ($($_.Exception.Message)); refusing to invoke git with a possible core.hooksPath override still active."
-      exit 1
-    }
-    if ($null -ne [Environment]::GetEnvironmentVariable($n)) {
-      Write-Error "scripts/claude/commit.ps1: ABORT -- env var $n persisted after Remove-Item; refusing to invoke git with a possible core.hooksPath override still active."
-      exit 1
-    }
-  }
 }
 
 function Enable-GitUnixToolPathForHook {
@@ -487,19 +633,14 @@ function Enable-GitUnixToolPathForHook {
   # the second is an EXPECTED no-op once the first clears the single case-
   # insensitive Env:PATH item, and a failed first clear is corrected by the Set.)
   $joinedPath = [string]::Join([System.IO.Path]::PathSeparator, $pathParts)
-  Set-Item -LiteralPath Env:PATH -Value $joinedPath -ErrorAction Stop
-  if ([Environment]::GetEnvironmentVariable('PATH', 'Process') -ne $joinedPath) {
-    throw "Env:PATH did not take the prepared Git-Unix-tool value after Set-Item (locked-down provider?)"
-  }
+  Set-ProcessEnvironmentValueVerified -Name 'PATH' -Value $joinedPath
 }
 
 # Capture the ORIGINAL process PATH BEFORE the try so the finally can restore it
 # even if Enable-GitUnixToolPathForHook throws MID-mutation (a partial Env:PATH
 # edit would otherwise leak into the caller). Enable-... is invoked INSIDE the try
-# below -- NOT here -- so a PATH-prep failure runs the restore finally: the
-# GIT_CONFIG_* scrub above is already active, and exiting before the finally would
-# leak the scrubbed git-config env into the caller's shell (the exact class the
-# config-redirect-guard comment below documents). Mirrors auto-merge.ps1's
+# below -- NOT here -- so a PATH-prep or git-config scrub failure runs the restore
+# finally and cannot leak partial process-environment mutation. Mirrors auto-merge.ps1's
 # save-before-try discipline around Normalize-ProcessPathEnvForStartProcess. The
 # capture UNIONS every PATH spelling from the raw process block (Get-ProcessPathSpellings)
 # so the finally restores every dir even when the process carried a duplicate
@@ -507,8 +648,19 @@ function Enable-GitUnixToolPathForHook {
 # other's dirs).
 $savedProcessPath = (Get-UnionProcessPathParts -Spellings (Get-ProcessPathSpellings)) -join [System.IO.Path]::PathSeparator
 
-$env:REVIEW_BACKEND = 'codex'
 try {
+  foreach ($n in $gitConfigEnvNames) {
+    if ($null -ne $savedGitConfigEnv[$n]) {
+      try {
+        Clear-ProcessEnvironmentValueVerified -Name $n
+      } catch {
+        throw "failed to scrub hook-bypass env var $n ($($_.Exception.Message))"
+      }
+    }
+  }
+  Set-ProcessEnvironmentValueVerified -Name 'REVIEW_BACKEND' -Value 'codex'
+  Clear-ProcessEnvironmentValueVerified -Name 'CROSS_REVIEW_FALLBACK'
+
   # Prepare the Git Unix-tool PATH for the pre-commit dispatcher, INSIDE this
   # restore-covered try: a throw here runs the finally (restoring GIT_CONFIG_* +
   # REVIEW_BACKEND + PATH) before the abort propagates via the catch below.
@@ -554,22 +706,29 @@ try {
   & git commit @args
   $gitExit = $LASTEXITCODE
 } catch {
-  # A PATH-prep (Enable-GitUnixToolPathForHook) failure reaches here; the finally
-  # below still restores the environment, then the commit aborts with exit 1.
-  Write-Error "scripts/claude/commit.ps1: ABORT -- failed to prepare Git Unix-tool PATH for the pre-commit dispatcher ($($_.Exception.Message))."
+  # Routing or PATH preparation failures reach here; the finally below restores
+  # the environment before the commit aborts.
+  Write-Error "scripts/claude/commit.ps1: ABORT -- failed to prepare the guarded commit environment ($($_.Exception.Message))."
   $gitExit = 1
 } finally {
   if ($prevBackendWasSet) {
-    try { $env:REVIEW_BACKEND = $prevBackend }
-    catch { Write-Warning "scripts/claude/commit.ps1: failed to restore REVIEW_BACKEND='$prevBackend' ($($_.Exception.Message))." }
+    try { Set-ProcessEnvironmentValueVerified -Name 'REVIEW_BACKEND' -Value $prevBackend }
+    catch { Write-Warning "scripts/claude/commit.ps1: failed to restore REVIEW_BACKEND='$prevBackend' ($($_.Exception.Message))."; $gitExit = 1 }
   } else {
-    try { Remove-Item -LiteralPath Env:REVIEW_BACKEND -ErrorAction Stop }
-    catch { Write-Warning "scripts/claude/commit.ps1: failed to clear REVIEW_BACKEND ($($_.Exception.Message))." }
+    try { Clear-ProcessEnvironmentValueVerified -Name 'REVIEW_BACKEND' }
+    catch { Write-Warning "scripts/claude/commit.ps1: failed to clear REVIEW_BACKEND ($($_.Exception.Message))."; $gitExit = 1 }
+  }
+  if ($prevFallbackWasSet) {
+    try { Set-ProcessEnvironmentValueVerified -Name 'CROSS_REVIEW_FALLBACK' -Value $prevFallback }
+    catch { Write-Warning "scripts/claude/commit.ps1: failed to restore CROSS_REVIEW_FALLBACK='$prevFallback' ($($_.Exception.Message))."; $gitExit = 1 }
+  } else {
+    try { Clear-ProcessEnvironmentValueVerified -Name 'CROSS_REVIEW_FALLBACK' }
+    catch { Write-Warning "scripts/claude/commit.ps1: failed to clear CROSS_REVIEW_FALLBACK ($($_.Exception.Message))."; $gitExit = 1 }
   }
   foreach ($n in $gitConfigEnvNames) {
     if ($null -ne $savedGitConfigEnv[$n]) {
-      try { Set-Item -LiteralPath "Env:$n" -Value $savedGitConfigEnv[$n] -ErrorAction Stop }
-      catch { Write-Warning "scripts/claude/commit.ps1: failed to restore $n ($($_.Exception.Message))." }
+      try { Set-ProcessEnvironmentValueVerified -Name $n -Value $savedGitConfigEnv[$n] }
+      catch { Write-Warning "scripts/claude/commit.ps1: failed to restore $n ($($_.Exception.Message))."; $gitExit = 1 }
     }
   }
   # Restore the pre-Enable PATH (the Unix-tool prepend was only for the hook).
@@ -581,8 +740,8 @@ try {
       Remove-Item -LiteralPath Env:PATH -ErrorAction SilentlyContinue
       # -ErrorAction Stop so a provider failure reaches the catch below and the
       # restore warning actually fires (default 'Continue' would swallow it).
-      Set-Item -LiteralPath Env:PATH -Value $savedProcessPath -ErrorAction Stop
-    } catch { Write-Warning "scripts/claude/commit.ps1: failed to restore PATH after the commit ($($_.Exception.Message)); later commands in this shell may retain the Git-Unix-tool-prepended PATH." }
+      Set-ProcessEnvironmentValueVerified -Name 'PATH' -Value $savedProcessPath
+    } catch { Write-Warning "scripts/claude/commit.ps1: failed to restore PATH after the commit ($($_.Exception.Message)); later commands in this shell may retain the Git-Unix-tool-prepended PATH."; $gitExit = 1 }
   }
 }
 exit $gitExit

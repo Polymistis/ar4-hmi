@@ -26,5 +26,5 @@ dist/
 .DS_Store
 Thumbs.db
 
-# cross-review-gate generated artifacts (verdict logs, dispatch-checklist, skip log)
+# cross-review-gate generated artifacts (verdict logs, dispatch-checklist, skip and reviewer-fallback logs)
 logs/

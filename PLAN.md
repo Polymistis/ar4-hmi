@@ -308,7 +308,7 @@ Acceptance criteria:
 - Queue semantic targets, not raw input events. Joint, Cartesian, and tool-frame intents cannot be merged across coordinate spaces without recomputation from confirmed state.
 - Keep desktop command coalescing separate from future real-time servo and trajectory-control loops.
 - Retain the current hardened baseline and use delivered 7.0/2.0 sources only as isolated selective-integration input under M4A4.
-- Route post-bootstrap commits through the role-appropriate cross-review wrapper.
+- Route post-bootstrap commits through the role-appropriate cross-review wrapper. After Claude usage capacity is confirmed exhausted, the explicit first-position Codex-author `-NoClaude` route preserves mandatory fail-closed Codex review and records the fallback locally; missing authentication must be repaired, and reviewer failure never causes automatic substitution.
 - Route branch integrations through `scripts/codex/auto-merge.ps1`; bare merge into the integration base is prohibited.
 
 ## Current implementation boundary

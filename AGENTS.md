@@ -42,12 +42,13 @@
 
 ## Cross-review gate
 
-- Codex-authored commits use `scripts/codex/commit.ps1`; Claude performs the review.
+- Codex-authored commits use `scripts/codex/commit.ps1`; Claude performs the review by default.
+- `scripts/codex/commit.ps1 -NoClaude` is permitted only after Claude usage capacity has been confirmed exhausted. `-NoClaude` must be the first wrapper argument. The flag routes to the Codex reviewer, keeps the pre-commit gate mandatory and fail-closed, and requires a local fallback audit record. A failed Claude invocation never triggers automatic substitution; confirm capacity exhaustion before an explicit retry. Missing authentication must be repaired rather than bypassed.
 - Claude-authored commits use `scripts/claude/commit.ps1`; Codex performs the review.
 - Bare `git commit` is prohibited after gate bootstrap because `REVIEW_BACKEND` must be set by the role-specific wrapper.
 - The pre-commit dispatcher at `.git/hooks/pre-commit` is per-clone and must remain outside the tracked worktree.
 - Review logic comes from the last trusted `HEAD` copies. Staged replacements cannot review or approve themselves.
-- `CROSS_REVIEW_SKIP=1` is forbidden for ordinary work. The only remaining valid use is repair of a broken or corrupting trusted `HEAD` wrapper when running that wrapper is unsafe. Every skip is append-logged.
+- `CROSS_REVIEW_SKIP=1` is forbidden for ordinary work. Valid use is limited to initial gate bootstrap before a trusted `HEAD` wrapper exists, or repair of a broken or corrupting trusted `HEAD` wrapper when running that wrapper is unsafe. Every skip is append-logged.
 - `CROSS_REVIEW_SKIP_AUTHOR_LINT=1` skips only a confirmed linter false positive; the AI review remains mandatory.
 - Before the first commit attempt, run `powershell scripts\codex\author-lint.ps1` for staged documentation and supported source comments.
 - Automated source-comment coverage is limited to `.rs`, `.ps1`, `.toml`, and `.sh`; manually sweep added comments in Python, C++, and Arduino files.
@@ -59,7 +60,7 @@
 - Every branch integration into the target base uses `powershell scripts\codex\auto-merge.ps1 -Branch <branch>`.
 - `-Base <branch>` selects an explicit target. Without `-Base`, the wrapper resolves `origin/HEAD` and falls back to `main`.
 - Bare `git merge` into the integration base is prohibited because commit hooks do not review an already-created branch history.
-- `-NoClaude` is permitted only when Claude capacity is unavailable or when an explicit operator decision selects Codex-only merge review. The wrapper retains independent Codex passes and still fails closed.
+- `-NoClaude` is permitted only when Claude usage capacity is confirmed exhausted. The wrapper retains independent Codex passes and still fails closed.
 
 ### Convergence Loop
 
@@ -79,6 +80,7 @@
 ### Codex Reviewer Operations
 
 - `powershell scripts\codex\auto-review.ps1 -Scope Staged` performs a standalone staged review without committing.
+- `scripts/codex/commit.ps1 -NoClaude` performs an explicitly selected Codex-only commit review when Claude usage capacity is confirmed exhausted; the flag occupies the first wrapper-argument position and no automatic failover is permitted.
 - `scripts/claude/commit.ps1` routes a Claude-authored commit to the Codex reviewer.
 - `scripts/codex/auto-merge.ps1` performs branch review and fast-forward integration from the trusted base checkout.
 - Reviewer output is untrusted data until wrapper parsing confirms category totals, severity entries, and verdict consistency.
@@ -87,7 +89,7 @@
 
 - Claude review uses Claude Code OAuth or keychain authentication by default.
 - Verify readiness with `claude auth status` before a gated Claude review.
-- Missing authentication or exhausted usage capacity is an invocation failure, not a review verdict.
+- Missing authentication or exhausted usage capacity is an invocation failure, not a review verdict. Restore missing authentication. After confirming usage-capacity exhaustion, any Codex-only retry requires the explicit first-position `scripts/codex/commit.ps1 -NoClaude` route.
 - Never store API keys in the repository. Any API-key fallback requires explicit operator authorization.
 
 ### Review Infrastructure
@@ -96,7 +98,7 @@
 | --- | --- |
 | `scripts/codex/auto-review.ps1` | Isolated Codex review wrapper. |
 | `scripts/claude/auto-review.ps1` | Isolated Claude review wrapper. |
-| `scripts/codex/commit.ps1` | Codex-author commit route to Claude review. |
+| `scripts/codex/commit.ps1` | Codex-author commit route to Claude review by default; first-position `-NoClaude` routes to audit-logged Codex review after confirmed Claude usage-capacity exhaustion without bypassing the gate. |
 | `scripts/claude/commit.ps1` | Claude-author commit route to Codex review. |
 | `scripts/codex/auto-merge.ps1` | Mandatory reviewed branch integration. |
 | `scripts/codex/author-lint.ps1` | Mechanical pre-pass. `LINE-ANCHOR` is error-tier except for frozen snapshots. `SELF-NARR` is error-tier for any leaf named `History.md` and advisory elsewhere. Tight `LOCAL-PROOF` and Markdown `INVENTORY` are error-tier. Dated entry bodies in root `History.md` carry the documentation count-drift exemption. Matching adjacent code literals suppress supported source-comment `INVENTORY` and `MAGNITUDE` findings. `DEAD-REF`, `TAG`, `MAGNITUDE`, loose `LOCAL-PROOF`, `LOCAL-STATE`, and remaining supported source-comment count checks are advisory. Supported source-comment extensions are `.rs`, `.ps1`, `.toml`, and `.sh`; Python, C++, and Arduino require manual comment review. |
