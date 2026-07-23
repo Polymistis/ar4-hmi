@@ -1742,6 +1742,18 @@ def setStepMonitorsVR():
     RUN['J6StepM'] = RUN['StepMonitors'][5]
 
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+def _joint_entry_is_being_edited(entry):
+    return getattr(entry, "_joint_target_editing", False) is True
+
+
+def _write_joint_position_entry(entry, value):
+    if _joint_entry_is_being_edited(entry):
+        return False
+    entry.delete(0, 'end')
+    entry.insert(0, value)
+    return True
+
+
 def refresh_gui_from_joint_angles(joint_angles):
     try:
         joints = _validated_virtual_six_vector(
@@ -1812,8 +1824,7 @@ def refresh_gui_from_joint_angles(joint_angles):
         ),
         joint_values,
     ):
-        field.delete(0, 'end')
-        field.insert(0, value)
+        _write_joint_position_entry(field, value)
         slider.set(value)
     return True
 
@@ -10330,6 +10341,76 @@ def _queue_joint_target(axis, target):
   return _queue_joint_motion(axis, target, absolute=True)
 
 
+def _primary_joint_position_key(axis):
+  if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis < 6:
+    raise ValueError("primary joint axis must be an integer in [0, 5]")
+  return f"J{axis + 1}AngCur"
+
+
+def _restore_joint_entry_value(axis, entry):
+  position_key = _primary_joint_position_key(axis)
+  entry._joint_target_editing = False
+  entry._joint_target_replace_on_key = True
+  return _write_joint_position_entry(entry, CAL[position_key])
+
+
+def _submit_joint_entry_target(axis, entry):
+  _primary_joint_position_key(axis)
+  accepted = _queue_joint_target(axis, entry.get())
+  entry._joint_target_editing = not accepted
+  entry._joint_target_replace_on_key = accepted
+  return accepted
+
+
+def _bind_joint_target_entry(axis, entry):
+  _primary_joint_position_key(axis)
+  entry._joint_target_editing = False
+  entry._joint_target_replace_on_key = True
+  non_editing_keys = frozenset((
+    "Return", "KP_Enter", "Escape", "Tab", "ISO_Left_Tab",
+    "Shift_L", "Shift_R", "Control_L", "Control_R",
+    "Alt_L", "Alt_R", "Caps_Lock", "Num_Lock",
+  ))
+
+  def begin_focus_edit(_event):
+    entry._joint_target_editing = True
+    entry._joint_target_replace_on_key = False
+    entry.selection_range(0, 'end')
+
+  def begin_pointer_edit(_event):
+    entry._joint_target_editing = True
+    entry._joint_target_replace_on_key = False
+
+  def begin_key_edit(event):
+    if getattr(event, "keysym", "") in non_editing_keys:
+      return
+    if entry._joint_target_replace_on_key:
+      entry.selection_range(0, 'end')
+    entry._joint_target_editing = True
+    entry._joint_target_replace_on_key = False
+
+  def submit_target(_event):
+    _submit_joint_entry_target(axis, entry)
+    entry.selection_range(0, 'end')
+    return "break"
+
+  def cancel_edit(_event):
+    _restore_joint_entry_value(axis, entry)
+    entry.selection_range(0, 'end')
+    return "break"
+
+  def restore_on_blur(_event):
+    _restore_joint_entry_value(axis, entry)
+
+  entry.bind("<FocusIn>", begin_focus_edit)
+  entry.bind("<Button-1>", begin_pointer_edit)
+  entry.bind("<KeyPress>", begin_key_edit)
+  entry.bind("<Return>", submit_target)
+  entry.bind("<KP_Enter>", submit_target)
+  entry.bind("<Escape>", cancel_edit)
+  entry.bind("<FocusOut>", restore_on_blur)
+
+
 def J1jogNeg(value):
   _queue_joint_jog(0, -value)
 
@@ -15507,9 +15588,12 @@ def displayPosition(response, parsed=None, synchronize_dispatcher=True):
   RUN['WC'] = "F" if parsed.joints[4] > 0 else "N"
 
   entry_fields, jog_sliders = _calibration_pose_widget_groups()
-  for entry_field, value in zip(entry_fields, position_values):
-    entry_field.delete(0, 'end')
-    entry_field.insert(0, value)
+  for index, (entry_field, value) in enumerate(zip(entry_fields, position_values)):
+    if index < 6:
+      _write_joint_position_entry(entry_field, value)
+    else:
+      entry_field.delete(0, 'end')
+      entry_field.insert(0, value)
 
   for jog_slider, value in zip(
     jog_sliders,
@@ -18508,7 +18592,11 @@ rightPanel.grid_columnconfigure(0, weight=1)
 rightPanel.grid_columnconfigure(1, weight=1)
 
 # Joint controls container (J1-J6)
-jointFrame = LabelFrame(rightPanel, text="Joint Control (J1-J6)", padding=5)
+jointFrame = LabelFrame(
+    rightPanel,
+    text="Joint Control (J1-J6) - type target, press Enter",
+    padding=5,
+)
 jointFrame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
 
 jointFrame.grid_columnconfigure(0, weight=1)
@@ -18516,7 +18604,7 @@ jointFrame.grid_columnconfigure(1, weight=1)
 
 # Helper function to create joint control widgets
 def create_joint_jog_frame(parent, row, col, joint_name, joint_num):
-    """Create a joint jog control frame with label, entry, buttons, and slider"""
+    """Create a joint jog control frame with an exact-target entry."""
     frame = Frame(parent)
     frame.grid(row=row, column=col, sticky="ew", padx=2, pady=2)
     
@@ -18531,9 +18619,10 @@ def create_joint_jog_frame(parent, row, col, joint_name, joint_num):
     lab = Label(frame, font=("Arial", 14), text=joint_name)
     lab.grid(row=0, column=0, padx=2)
     
-    # Current angle entry
-    entry = Entry(frame, width=6, justify="center")
+    # Confirmed angle display and exact-target entry
+    entry = Entry(frame, width=8, justify="center")
     entry.grid(row=0, column=1, padx=2)
+    _bind_joint_target_entry(joint_num - 1, entry)
     
     # Negative jog button
     neg_but = Button(frame, text="-", width=3)

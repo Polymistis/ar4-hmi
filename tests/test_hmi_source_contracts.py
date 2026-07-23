@@ -410,8 +410,12 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_validated_virtual_six_vector",
                 "_native_cartesian_pose_to_external",
             ),
+            "_write_joint_position_entry": (
+                "_joint_entry_is_being_edited",
+            ),
             "refresh_gui_from_joint_angles": (
                 "_forward_kinematics_display_pose",
+                "_write_joint_position_entry",
             ),
             **{
                 function_name: ("_forward_kinematics_display_pose",)
@@ -465,6 +469,19 @@ class HmiSourceContractTests(unittest.TestCase):
             "displayPosition": (
                 "_clear_acknowledged_forced_position_target",
                 "_calibration_pose_widget_groups",
+                "_write_joint_position_entry",
+            ),
+            "_restore_joint_entry_value": (
+                "_primary_joint_position_key",
+                "_write_joint_position_entry",
+            ),
+            "_submit_joint_entry_target": (
+                "_primary_joint_position_key",
+            ),
+            "_bind_joint_target_entry": (
+                "_primary_joint_position_key",
+                "_restore_joint_entry_value",
+                "_submit_joint_entry_target",
             ),
             "_execute_calibration_command": (
                 "_require_calibration_terminal_response",
@@ -7552,6 +7569,9 @@ class HmiSourceContractTests(unittest.TestCase):
             name: Widget()
             for name in entry_names + slider_names
         }
+        edited_entry_name = "J3curAngEntryField"
+        widgets[edited_entry_name].value = "-4.25"
+        widgets[edited_entry_name]._joint_target_editing = True
         scheduled = []
         faults = []
         virtual_updates = []
@@ -7618,9 +7638,11 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(scheduled, [True])
         self.assertEqual(namespace["manEntryField"].value, "42.5")
+        expected_entry_values = list(str(value) for value in range(1, 16))
+        expected_entry_values[entry_names.index(edited_entry_name)] = "-4.25"
         self.assertEqual(
             tuple(widgets[name].value for name in entry_names),
-            tuple(str(value) for value in range(1, 16)),
+            tuple(expected_entry_values),
         )
         self.assertEqual(
             tuple(widgets[name].value for name in slider_names),
@@ -10281,6 +10303,40 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(all(len(field.events) == 2 for field in joint_fields))
         self.assertTrue(all(len(slider.events) == 1 for slider in sliders))
 
+    def test_joint_position_entry_refresh_preserves_active_edit(self):
+        class Entry:
+            def __init__(self, value):
+                self.value = value
+                self.events = []
+
+            def delete(self, *args):
+                self.events.append(("delete", args))
+                self.value = ""
+
+            def insert(self, index, value):
+                self.events.append(("insert", index, value))
+                self.value = value
+
+        namespace = {}
+        write_position = self.compile_function(
+            "_write_joint_position_entry",
+            namespace,
+        )
+        entry = Entry("-4.25")
+        entry._joint_target_editing = True
+
+        self.assertFalse(write_position(entry, "3.0"))
+        self.assertEqual(entry.value, "-4.25")
+        self.assertEqual(entry.events, [])
+
+        entry._joint_target_editing = False
+        self.assertTrue(write_position(entry, "3.0"))
+        self.assertEqual(entry.value, "3.0")
+        self.assertEqual(
+            entry.events,
+            [("delete", (0, "end")), ("insert", 0, "3.0")],
+        )
+
     def test_mode_transition_rejects_fk_refresh_failure(self):
         class Widget:
             def config(self, **kwargs):
@@ -10587,6 +10643,130 @@ class HmiSourceContractTests(unittest.TestCase):
             self.assertEqual(len(target_calls), 1, name)
             self.assertIsInstance(target_calls[0].args[0], ast.Constant, name)
             self.assertEqual(target_calls[0].args[0].value, axis, name)
+
+    def test_primary_joint_entry_factory_binds_typed_absolute_targets(self):
+        function = self.module_functions["create_joint_jog_frame"]
+        bind_calls = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_bind_joint_target_entry"
+        ]
+
+        self.assertEqual(len(bind_calls), 1)
+        axis_argument, entry_argument = bind_calls[0].args
+        self.assertIsInstance(axis_argument, ast.BinOp)
+        self.assertIsInstance(axis_argument.left, ast.Name)
+        self.assertEqual(axis_argument.left.id, "joint_num")
+        self.assertIsInstance(axis_argument.op, ast.Sub)
+        self.assertIsInstance(axis_argument.right, ast.Constant)
+        self.assertEqual(axis_argument.right.value, 1)
+        self.assertIsInstance(entry_argument, ast.Name)
+        self.assertEqual(entry_argument.id, "entry")
+
+    def test_primary_joint_entry_bindings_submit_and_preserve_edits(self):
+        class Entry:
+            def __init__(self, value):
+                self.value = value
+                self.bindings = {}
+                self.selections = []
+
+            def bind(self, sequence, callback):
+                self.bindings[sequence] = callback
+
+            def get(self):
+                return self.value
+
+            def selection_range(self, start, end):
+                self.selections.append((start, end))
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+        accepted = {"value": True}
+        submissions = []
+
+        def queue_target(axis, value):
+            submissions.append((axis, value))
+            return accepted["value"]
+
+        namespace = {
+            "CAL": {"J3AngCur": "12.5"},
+            "_queue_joint_target": queue_target,
+        }
+        bind_target = self.compile_function(
+            "_bind_joint_target_entry",
+            namespace,
+        )
+        write_position = namespace["_write_joint_position_entry"]
+        entry = Entry("3.0")
+
+        bind_target(2, entry)
+
+        self.assertEqual(
+            set(entry.bindings),
+            {
+                "<FocusIn>",
+                "<Button-1>",
+                "<KeyPress>",
+                "<Return>",
+                "<KP_Enter>",
+                "<Escape>",
+                "<FocusOut>",
+            },
+        )
+        entry.bindings["<FocusIn>"](SimpleNamespace())
+        entry.value = "-4.25"
+        self.assertTrue(entry._joint_target_editing)
+        self.assertFalse(write_position(entry, "8.0"))
+        self.assertEqual(entry.value, "-4.25")
+
+        self.assertEqual(
+            entry.bindings["<Return>"](SimpleNamespace()),
+            "break",
+        )
+        self.assertEqual(submissions, [(2, "-4.25")])
+        self.assertFalse(entry._joint_target_editing)
+        self.assertTrue(entry._joint_target_replace_on_key)
+        self.assertTrue(write_position(entry, "8.0"))
+        self.assertEqual(entry.value, "8.0")
+
+        entry.bindings["<KeyPress>"](SimpleNamespace(keysym="1"))
+        entry.value = "1"
+        self.assertTrue(entry._joint_target_editing)
+        self.assertFalse(entry._joint_target_replace_on_key)
+        self.assertFalse(write_position(entry, "9.0"))
+        self.assertEqual(entry.value, "1")
+
+        entry.bindings["<FocusOut>"](SimpleNamespace())
+        self.assertEqual(entry.value, "12.5")
+        self.assertFalse(entry._joint_target_editing)
+
+        accepted["value"] = False
+        entry.bindings["<FocusIn>"](SimpleNamespace())
+        entry.value = "invalid"
+        self.assertEqual(
+            entry.bindings["<KP_Enter>"](SimpleNamespace()),
+            "break",
+        )
+        self.assertEqual(submissions[-1], (2, "invalid"))
+        self.assertTrue(entry._joint_target_editing)
+        self.assertFalse(write_position(entry, "10.0"))
+        self.assertEqual(entry.value, "invalid")
+
+        self.assertEqual(
+            entry.bindings["<Escape>"](SimpleNamespace()),
+            "break",
+        )
+        self.assertEqual(entry.value, "12.5")
+        self.assertFalse(entry._joint_target_editing)
+
+        with self.assertRaisesRegex(ValueError, r"\[0, 5\]"):
+            bind_target(6, Entry("0"))
 
     def test_joint_motion_host_routing_uses_semantic_target(self):
         class Label:

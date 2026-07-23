@@ -194,13 +194,18 @@ Acceptance criteria:
 
 Implemented portion:
 
+- J1-J6 confirmed-position fields accept exact absolute targets through Enter
+  or keypad Enter and route through the existing semantic motion queue.
+  Controller and virtual position refreshes preserve an active edit. Invalid
+  submissions remain editable, while Escape or focus loss restores the latest
+  confirmed position. Hardware-free source-contract coverage passes; live
+  verification requires a later controlled HMI relaunch.
 - Automatic and single-axis calibration buttons prepare validated commands on Tk, launch worker-owned serial exchanges, and apply terminal results on Tk without serial reads or controller waits.
 - Multi-stage automatic calibration retains shared motion ownership, main transport reservation, and a shutdown-activity lease until the final successful stage or first failure settles.
 - Calibration shutdown cannot cancel an active `LL` read because current Teensy firmware exposes no paired abort command. Pre-write shutdown rejects transmission at the shared lifecycle boundary and interrupts stalled pre-write activity after the normal drain interval. Post-write shutdown remains supervised until an applied terminal controller frame or explicit quarantine and verified-close handling settles the operation, while unrelated auxiliary activity continues through normal shutdown interruption. A later protocol pass must define preemption before claiming immediate calibration cancellation.
 
-Remaining scope includes exact joint-target entry, program, camera, Modbus,
-auxiliary-board, application-lifecycle, timing, and calibration-preemption
-work.
+Remaining scope includes program, camera, Modbus, auxiliary-board,
+application-lifecycle, timing, and calibration-preemption work.
 
 ### M4A3 - Delivered 7.0/2.0 baseline audit
 
@@ -341,6 +346,10 @@ Known M5 deviations:
   diagnostic position and jog commands departed from the fail-closed
   calibration invariant. Motion then stopped until the physical driver
   configuration was corrected and J1 was recalibrated.
+- The coordinated-motion procedure changed from scripted absolute-slider
+  targets to rapid incremental jog input. The resulting observation established
+  responsive input and physical multi-axis execution but did not verify exact
+  target coalescing or controller command count.
 
 ## Architectural decisions
 
@@ -356,6 +365,10 @@ Known M5 deviations:
 ## Current implementation boundary
 
 - Incremental J1-J9, absolute slider routing, offline external-axis rejection, and live-jog desktop wiring are statically or behaviorally checked without importing `AR4.py`; dispatcher coalescing, deferred intent ordering, controller and six-axis simulator command schemas, framed responses, optional protocol-authorized follow-up frames, full quiet-boundary acknowledgements, trailing-byte quarantine, retained failed-close ownership, configured Linux and Windows Xbox validation, watchdog scheduler failure, startup acknowledgement variants, startup finalizer rejection, set-position acknowledgement sequencing, live-stop injection and request ownership, pre-write cancellation admission, bounded-command timeout quarantine and restoration, cancellation-bound G-code playback, request-scoped virtual results, late virtual settlement, virtual-worker failures, program-worker startup failure, long Seconds-mode virtual deadlines, direct program and calibration response propagation, non-blocking calibration button dispatch, terminal-response-required calibration shutdown, calibration transport preflight and write-boundary recovery, binary and finite calibration validation, combined automatic-calibration preflight, native tool-frame order, offline position synchronization, forced calibration-position rejection, completion-only G-code navigation, legacy and dispatcher transport-release ordering, shutdown waits for virtual and retained cleanup owners, nested direct-operation transport admission, asynchronous worker reservation transfer and rollback, direct-operation shutdown tracking, applied program-motion results, G-code local stop admission, post-release collision correction, interruptible auxiliary-wait stop handoff with a single shared post-transmission acknowledgement deadline, optional auxiliary startup, controller-buffer-reset failure handling, combined close-and-scheduler cleanup failure, startup timeout handling, non-preempting program-halt status, and response ownership are tested with deterministic fakes.
+- Exact J1-J6 keyboard targets share the absolute semantic queue used by
+  sliders. Active text edits survive controller and virtual position refreshes;
+  accepted submissions resume confirmed-position display updates, and
+  cancelled or abandoned edits restore the latest confirmed position.
 - Simple program movement routes now share request-scoped controller ownership, raw target validation, and offline physical-write rejection. The broader typed program state machine, non-motion row migration, Cartesian and tool-frame coalescing, complete main-controller response ownership, application lifecycle separation, and dynamic controller work remain incomplete.
 - Tracked Teensy `6.7.1-ar4hmi.1` `MA` and `MC` parsing stages `Tr` in a command-local value instead of writing beyond the six-element Cartesian array and accepts only the supported zero value. `ML` accepts only `Q0` because wrist-suppression semantics remain unimplemented. The corrected source passes the Teensy toolchain compile. Host arc and circle program transmission remains disabled until deterministic trajectory simulation and an authorized hardware-validation plan cover the broader algorithms. Spline program transmission also remains disabled until one terminal response-owner contract replaces speculative acknowledgements.
 - Teensy coordinated pulse scheduling and E-stop response ownership were inspected but not changed. The `6.7.1-ar4hmi.1` E-stop protocol can race speculative spline responses and remains unsafe for claimed single-frame ownership. Drive routines also report completion after an E-stop terminates a pulse loop; changing only the return value would cause current callers to emit a competing `ER` after the interrupt-side `EB` position frame. Remediation requires a separate single-owner protocol design and hardware-validation plan. The missing-file behavior has a source-contract assertion, and the current line-oriented compatibility source passes a Teensy 4.1 syntax/toolchain compile. That compile does not satisfy the later correlated JSON safety prerequisite; simulation and live-arm verification remain pending.
