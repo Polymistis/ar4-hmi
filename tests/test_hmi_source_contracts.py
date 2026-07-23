@@ -4924,23 +4924,39 @@ class HmiSourceContractTests(unittest.TestCase):
             if isinstance(node.func, ast.Attribute)
             and node.func.attr == "close"
         ]
-        protected_releases = [
+        release_calls = [
             node
-            for node in ast.walk(function)
-            if isinstance(node, ast.Try)
-            and any(
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Name)
-                and child.func.id == "_release_async_main_serial_transport"
-                for statement in node.finalbody
-                for child in ast.walk(statement)
+            for node in calls
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "_release_async_main_serial_transport"
             )
         ]
+        guarded_release_calls = []
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Try):
+                continue
+            for statement in node.finalbody:
+                if not (
+                    isinstance(statement, ast.If)
+                    and isinstance(statement.test, ast.Name)
+                    and statement.test.id == "release_transport"
+                    and len(statement.body) == 1
+                    and isinstance(statement.body[0], ast.Expr)
+                    and isinstance(statement.body[0].value, ast.Call)
+                    and isinstance(statement.body[0].value.func, ast.Name)
+                    and statement.body[0].value.func.id
+                    == "_release_async_main_serial_transport"
+                ):
+                    continue
+                guarded_release_calls.append(statement.body[0].value)
 
         self.assertEqual(len(acquisitions), 1)
         self.assertTrue(closes)
         self.assertLess(acquisitions[0].lineno, min(node.lineno for node in closes))
-        self.assertEqual(len(protected_releases), 1)
+        self.assertTrue(release_calls)
+        self.assertEqual(len(guarded_release_calls), 1)
+        self.assertIn(guarded_release_calls[0], release_calls)
 
     def test_direct_main_serial_operations_share_dispatcher_transport_reservation(self):
         transport_lock = threading.Lock()
@@ -18784,19 +18800,16 @@ class HmiSourceContractTests(unittest.TestCase):
                 if isinstance(statement, ast.Try)
             ]
             self.assertEqual(len(outer_tries), 1, function_name)
-            finally_supervisor_calls = [
-                node
-                for statement in outer_tries[0].finalbody
-                for node in ast.walk(statement)
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id == "_reschedule_event_poll"
-                )
-            ]
-            self.assertEqual(
-                finally_supervisor_calls,
-                supervisor_calls,
+            self.assertTrue(outer_tries[0].finalbody, function_name)
+            first_finally_statement = outer_tries[0].finalbody[0]
+            self.assertIsInstance(
+                first_finally_statement,
+                ast.Expr,
+                function_name,
+            )
+            self.assertIs(
+                first_finally_statement.value,
+                supervisor_calls[0],
                 function_name,
             )
             self.assertIsInstance(

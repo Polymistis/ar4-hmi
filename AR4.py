@@ -10627,6 +10627,7 @@ def _poll_auxiliary_serial_events():
   except Exception:
     logger.exception("Unable to apply an auxiliary serial result on the Tk event thread")
   finally:
+    _reschedule_event_poll("auxiliary-serial")
     try:
       _apply_program_stop_status_events()
     except Exception:
@@ -10636,7 +10637,6 @@ def _poll_auxiliary_serial_events():
     _try_dispatch_controller_correction()
     _try_dispatch_auxiliary_stop()
     _ensure_startup_auxiliary_cleanup()
-    _reschedule_event_poll("auxiliary-serial")
 
 
 def _poll_manual_auxiliary_events():
@@ -10715,6 +10715,7 @@ def _poll_manual_auxiliary_events():
       "Alarm.TLabel",
     )
   finally:
+    _reschedule_event_poll("manual-auxiliary")
     if application_closing.is_set():
       with manual_auxiliary_state_lock:
         discarded = len(manual_auxiliary_request_queue)
@@ -10742,7 +10743,6 @@ def _poll_manual_auxiliary_events():
         logger.exception(
           "Unable to dispatch a queued manual auxiliary command"
         )
-    _reschedule_event_poll("manual-auxiliary")
 
 
 def _poll_xbox_auxiliary_events():
