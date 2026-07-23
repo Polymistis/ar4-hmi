@@ -188,6 +188,9 @@ Acceptance criteria:
 - Worker threads do not read or mutate Tk widgets.
 - Discrete motion, program execution, and remaining stop paths have explicit preemption and response ownership; the live-jog path has that ownership now.
 - Baseline and post-change event-loop, serial, render, and persistence timings are recorded.
+- J1-J6 position fields provide validated exact keyboard targets through the
+  existing semantic queue, and asynchronous position refreshes do not overwrite
+  active edits.
 
 Implemented portion:
 
@@ -195,7 +198,9 @@ Implemented portion:
 - Multi-stage automatic calibration retains shared motion ownership, main transport reservation, and a shutdown-activity lease until the final successful stage or first failure settles.
 - Calibration shutdown cannot cancel an active `LL` read because current Teensy firmware exposes no paired abort command. Pre-write shutdown rejects transmission at the shared lifecycle boundary and interrupts stalled pre-write activity after the normal drain interval. Post-write shutdown remains supervised until an applied terminal controller frame or explicit quarantine and verified-close handling settles the operation, while unrelated auxiliary activity continues through normal shutdown interruption. A later protocol pass must define preemption before claiming immediate calibration cancellation.
 
-Remaining scope includes program, camera, Modbus, auxiliary-board, application-lifecycle, timing, and calibration-preemption work.
+Remaining scope includes exact joint-target entry, program, camera, Modbus,
+auxiliary-board, application-lifecycle, timing, and calibration-preemption
+work.
 
 ### M4A3 - Delivered 7.0/2.0 baseline audit
 
@@ -213,7 +218,9 @@ Audit result:
 
 - `docs/delivered-v7-baseline-audit.md` records the frozen archive intake, provenance, HMI and packaging review, host-controller contract comparison, firmware findings, native-kinematics review, configuration differences, current-change classification, validation limits, and scored recommendation.
 - Selective integration into the current hardened baseline scored 4.25/5 and is approved. Porting current work onto the delivered host scored 2.85/5; full replacement scored 1.60/5.
-- Delivered source remains isolated audit input. No application entry point or executable was run, and no controller write, calibration, firmware flash, or robot motion occurred.
+- Delivered source remains isolated audit input. During the M4A3
+  delivered-source audit, no application entry point or executable was run and
+  no controller write, calibration, firmware flash, or robot motion occurred.
 
 ### M4A4 - Selective 7.0/2.0 integration
 
@@ -291,7 +298,11 @@ Research and staged decisions are tracked in `docs/dynamic-motion-research.md`.
 
 ### M5 - Controlled hardware validation
 
-Status: `Proposed`
+Status: `Blocked`
+
+Blocking condition: explicit work-envelope confirmation and powered
+verification of the independent hardware stop path are required before another
+powered M5 procedure.
 
 Acceptance criteria:
 
@@ -299,6 +310,37 @@ Acceptance criteria:
 - Physical emergency stop is tested before commanded movement.
 - Results distinguish observed hardware behavior from software-only evidence.
 - Deviations become tracked requirements or defects before broader operation.
+- Commissioning verifies physical driver microstep settings or measured motion
+  scale against the active profile before accepting a calibration reference;
+  matching host and firmware configuration alone is insufficient.
+
+Initial commissioning evidence is recorded in
+`docs/hardware-verification-2026-07-22.md` and
+`docs/hardware-verification-2026-07-23.md`. The first powered J1 calibration
+exposed a factor-of-two driver-microstep mismatch after the software upgrade.
+After all six physical driver settings were updated to match the active
+per-joint profile, including J5 at `1600` microsteps and the other primary
+joints at `800`, operator-observed single-joint calibration and apparent jog
+scale passed for J1-J6. A rapid jog sequence also demonstrated responsive HMI
+input during motion and simultaneous physical J1-J3 execution, but the
+unrecorded input sequence did not verify exact deferred-target coalescing or
+controller command count. An approximate absolute-slider return followed
+without an accepted final pose. Instrumented accuracy, repeatability, speed
+characterization, and fault response remain unverified.
+
+Known M5 deviations:
+
+- Hardware emergency-stop availability was checked by engaging the stop with
+  drive power off. No controller E-stop frame, HMI alarm, or powered
+  interruption independent of desktop GUI state was recorded before commanded
+  motion. A cleared work envelope was confirmed earlier in commissioning, but
+  no separate confirmation was recorded immediately before powered checks. The
+  powered observations remain exploratory evidence rather than
+  acceptance-criterion completion.
+- After the initial J1 scale failure made the reference untrusted, subsequent
+  diagnostic position and jog commands departed from the fail-closed
+  calibration invariant. Motion then stopped until the physical driver
+  configuration was corrected and J1 was recalibrated.
 
 ## Architectural decisions
 
@@ -318,4 +360,10 @@ Acceptance criteria:
 - Tracked Teensy `6.7.1-ar4hmi.1` `MA` and `MC` parsing stages `Tr` in a command-local value instead of writing beyond the six-element Cartesian array and accepts only the supported zero value. `ML` accepts only `Q0` because wrist-suppression semantics remain unimplemented. The corrected source passes the Teensy toolchain compile. Host arc and circle program transmission remains disabled until deterministic trajectory simulation and an authorized hardware-validation plan cover the broader algorithms. Spline program transmission also remains disabled until one terminal response-owner contract replaces speculative acknowledgements.
 - Teensy coordinated pulse scheduling and E-stop response ownership were inspected but not changed. The `6.7.1-ar4hmi.1` E-stop protocol can race speculative spline responses and remains unsafe for claimed single-frame ownership. Drive routines also report completion after an E-stop terminates a pulse loop; changing only the return value would cause current callers to emit a competing `ER` after the interrupt-side `EB` position frame. Remediation requires a separate single-owner protocol design and hardware-validation plan. The missing-file behavior has a source-contract assertion, and the current line-oriented compatibility source passes a Teensy 4.1 syntax/toolchain compile. That compile does not satisfy the later correlated JSON safety prerequisite; simulation and live-arm verification remain pending.
 - M4A3 found that delivered 7.0 retains busy-input loss, blocking Tk paths, incomplete response ownership, firmware array-bound defects, and emergency-event races. Selective integration is approved because delivered inverse-kinematics, MK5 calibration-switch, JSON auxiliary-controller, and optional CAD/EOAT changes can be isolated without replacing the hardened HMI baseline.
-- No live-arm command, firmware flash, calibration cycle, or movement was performed.
+- Authorized controller flashing, drive-off communication, HMI startup, and
+  exploratory powered single-joint calibration, jog checks, and simultaneous
+  J1-J3 motion have been performed and recorded, followed by an approximate
+  absolute-slider return without a captured final pose. Known M5 deviations
+  prevent those observations from satisfying the controlled-hardware
+  acceptance criteria. Broader live-arm behavior remains unverified outside the
+  documented observations.
