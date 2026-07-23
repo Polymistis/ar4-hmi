@@ -408,6 +408,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "_acknowledge_program_stop_status_for_manual_auxiliary": (
                 "_manual_auxiliary_stop_in_progress",
             ),
+            "_manual_auxiliary_program_active": (
+                "_program_execution_active",
+            ),
             "_poll_manual_auxiliary_events": (
                 "_manual_auxiliary_error_detail",
                 "_manual_auxiliary_program_active",
@@ -5993,12 +5996,14 @@ class HmiSourceContractTests(unittest.TestCase):
             "programStopStatusLatched": False,
             "estopActive": False,
             "posOutreach": False,
+            "progRunning": False,
         }
         first_label = Widget()
         second_label = Widget()
         sent = Widget()
         received = Widget()
         tab = SimpleNamespace(runTrue=0)
+        program_active = {"value": False}
         registry = Registry()
         event_queue = Queue()
         scheduled = []
@@ -6031,6 +6036,9 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "RUN": runtime,
             "tab1": tab,
+            "_program_execution_active": (
+                lambda: program_active["value"]
+            ),
             "manual_auxiliary_event_queue": event_queue,
             "manual_auxiliary_request_queue": [],
             "manual_auxiliary_active_request": None,
@@ -6446,17 +6454,17 @@ class HmiSourceContractTests(unittest.TestCase):
             "AUXILIARY COMMAND COMPLETE",
         )
 
-        tab.runTrue = 1
+        program_active["value"] = True
         self.assertFalse(request_output(1, True, Entry("8")))
         self.assertEqual(
             received.value,
             "AUXILIARY COMMAND REJECTED WHILE PROGRAM IS RUNNING",
         )
-        tab.runTrue = 0
+        program_active["value"] = False
 
         self.assertTrue(request_output(1, True, Entry("8")))
         self.assertTrue(request_output(2, True, Entry("9")))
-        tab.runTrue = 1
+        program_active["value"] = True
         poll_results()
         self.assertIsNone(namespace["manual_auxiliary_active_request"])
         self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
@@ -6466,7 +6474,7 @@ class HmiSourceContractTests(unittest.TestCase):
             received.value,
             "AUXILIARY COMMANDS REJECTED WHILE PROGRAM IS RUNNING",
         )
-        tab.runTrue = 0
+        program_active["value"] = False
 
         expected_response = namespace["_manual_auxiliary_expected_response"]
         request_count = namespace["manual_auxiliary_next_request_id"]
@@ -6693,8 +6701,10 @@ class HmiSourceContractTests(unittest.TestCase):
             raise OSError("write failed")
 
         namespace["_write_legacy_auxiliary_command"] = fail_write
+        close_count = len(closes)
         with self.assertRaisesRegex(OSError, "write failed"):
             exchange("SV0P45\n", b"Servo Done", port)
+        self.assertEqual(len(closes), close_count + 1)
         self.assertEqual(
             closes[-1],
             ("ser2", "manual auxiliary response failure"),
@@ -8166,6 +8176,383 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertCountEqual(exact_responses, (b"Servo Done", b"Done"))
 
+    def test_program_entry_points_reserve_request_scoped_execution(self):
+        expected_modes = {
+            "runProg": "run",
+            "stepFwd": "step-forward",
+            "stepRev": "step-reverse",
+        }
+        for function_name, expected_mode in expected_modes.items():
+            function = self.module_functions[function_name]
+            begin_calls = [
+                node
+                for node in ast.walk(function)
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "_begin_program_execution"
+                )
+            ]
+            finish_calls = [
+                node
+                for node in ast.walk(function)
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "_finish_program_execution"
+                )
+            ]
+            self.assertEqual(len(begin_calls), 1)
+            self.assertIsInstance(begin_calls[0].args[0], ast.Constant)
+            self.assertEqual(begin_calls[0].args[0].value, expected_mode)
+            self.assertTrue(finish_calls)
+
+    def test_program_execution_owner_covers_start_and_reverse_completion(self):
+        constant_node = next(
+            copy.deepcopy(node)
+            for node in self.tree.body
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "PROGRAM_EXECUTION_MODES"
+            )
+        )
+        namespace = {
+            "dataclass": dataclass,
+            "frozenset": frozenset,
+            "MotionInputError": MotionInputError,
+            "program_execution_state_lock": threading.Lock(),
+            "program_execution_next_request_id": 0,
+            "program_execution_active_request": None,
+        }
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=[constant_node], type_ignores=[])
+                ),
+                str(AR4_SOURCE),
+                "exec",
+            ),
+            namespace,
+        )
+        namespace["ProgramExecutionRequest"] = self.compile_class(
+            "ProgramExecutionRequest",
+            namespace,
+        )
+        begin_execution = self.compile_function(
+            "_begin_program_execution",
+            namespace,
+        )
+        finish_execution = self.compile_function(
+            "_finish_program_execution",
+            namespace,
+        )
+        execution_active = self.compile_function(
+            "_program_execution_active",
+            namespace,
+        )
+        request_active = self.compile_function(
+            "_program_execution_request_active",
+            namespace,
+        )
+        self.compile_function(
+            "_program_execution_busy_message",
+            namespace,
+        )
+
+        with self.assertRaises(MotionInputError):
+            namespace["ProgramExecutionRequest"](0, "run")
+        with self.assertRaises(MotionInputError):
+            begin_execution("invalid")
+
+        first_request = begin_execution("run")
+        self.assertTrue(execution_active())
+        self.assertTrue(request_active(first_request))
+        self.assertIsNone(begin_execution("step-forward"))
+        stale_request = namespace["ProgramExecutionRequest"](99, "run")
+        self.assertFalse(finish_execution(stale_request))
+        self.assertTrue(request_active(first_request))
+        self.assertTrue(finish_execution(first_request))
+        self.assertFalse(execution_active())
+
+        second_request = begin_execution("step-forward")
+        self.assertFalse(finish_execution(first_request))
+        self.assertTrue(request_active(second_request))
+        self.assertTrue(finish_execution(second_request))
+
+        class Widget:
+            def __init__(self):
+                self.configurations = []
+
+            def config(self, **kwargs):
+                self.configurations.append(kwargs)
+
+        class CapturedThread:
+            target = None
+
+            def __init__(self, target):
+                type(self).target = target
+
+            def start(self):
+                pass
+
+        tab = SimpleNamespace(runTrue=0, progView=object())
+        first_label = Widget()
+        second_label = Widget()
+        logged = []
+        runtime = {
+            "programStopRequestId": None,
+            "programStopStatusLatched": False,
+            "programStopState": "completed",
+            "estopActive": False,
+            "posOutreach": False,
+            "progRunning": False,
+        }
+        namespace.update(
+            {
+                "RUN": runtime,
+                "program_stop_state_lock": threading.RLock(),
+                "tab1": tab,
+                "almStatusLab": first_label,
+                "almStatusLab2": second_label,
+                "logger": SimpleNamespace(
+                    warning=lambda *args: logged.append(("warning", args)),
+                    error=lambda *args: logged.append(("error", args)),
+                    exception=lambda *args: logged.append(("exception", args)),
+                ),
+                "threading": SimpleNamespace(Thread=CapturedThread),
+                "_set_program_stop_status": lambda state: True,
+            }
+        )
+        namespace["_manual_auxiliary_status_reserved"] = lambda: bool(
+            runtime["programStopStatusLatched"]
+            or runtime["programStopRequestId"] is not None
+            or runtime["estopActive"]
+            or runtime["posOutreach"]
+        )
+        self.compile_function("_set_manual_auxiliary_status", namespace)
+        self.compile_function("_queue_program_execution_status", namespace)
+        self.compile_function(
+            "_abort_program_row_execution",
+            namespace,
+        )
+        run_program = self.compile_function("runProg", namespace)
+        manual_program_active = self.compile_function(
+            "_manual_auxiliary_program_active",
+            namespace,
+        )
+
+        runtime["progRunning"] = True
+        self.assertTrue(manual_program_active())
+        runtime["progRunning"] = False
+        self.assertTrue(run_program())
+        self.assertEqual(tab.runTrue, 1)
+        self.assertTrue(execution_active())
+        self.assertTrue(manual_program_active())
+        runtime["estopActive"] = True
+        runtime["posOutreach"] = True
+        status_count = len(first_label.configurations)
+        self.assertFalse(run_program())
+        self.assertTrue(runtime["estopActive"])
+        self.assertTrue(runtime["posOutreach"])
+        self.assertEqual(len(first_label.configurations), status_count)
+        self.assertEqual(
+            namespace["_program_execution_busy_message"](),
+            "PROGRAM EXECUTION ALREADY ACTIVE: RUN",
+        )
+        runtime["estopActive"] = False
+        runtime["posOutreach"] = False
+        runtime["progRunning"] = True
+        runtime["rowinproc"] = 1
+        CapturedThread.target()
+        self.assertFalse(runtime["progRunning"])
+        self.assertEqual(runtime["rowinproc"], 0)
+        self.assertFalse(execution_active())
+        self.assertEqual(
+            namespace["program_stop_status_event_queue"].get_nowait(),
+            ("PROGRAM EXECUTION FAILED", "Alarm.TLabel"),
+        )
+
+        runtime["programStopRequestId"] = 7
+        self.assertFalse(run_program())
+        self.assertFalse(execution_active())
+        runtime["programStopRequestId"] = None
+
+        class FailingThread:
+            def __init__(self, target):
+                raise RuntimeError("thread unavailable")
+
+        namespace["threading"] = SimpleNamespace(Thread=FailingThread)
+        self.assertFalse(run_program())
+        self.assertEqual(tab.runTrue, 0)
+        self.assertFalse(execution_active())
+
+        namespace["threading"] = SimpleNamespace(Thread=CapturedThread)
+        step_forward = self.compile_function("stepFwd", namespace)
+        self.assertTrue(step_forward())
+        runtime["progRunning"] = True
+        runtime["rowinproc"] = 1
+        CapturedThread.target()
+        self.assertFalse(runtime["progRunning"])
+        self.assertEqual(runtime["rowinproc"], 0)
+        self.assertFalse(execution_active())
+        self.assertEqual(
+            namespace["program_stop_status_event_queue"].get_nowait(),
+            ("PROGRAM STEP FORWARD FAILED", "Alarm.TLabel"),
+        )
+
+        callbacks = []
+        completions = []
+        selections = []
+
+        class ProgramView:
+            @staticmethod
+            def curselection():
+                return (4,)
+
+            @staticmethod
+            def selection_clear(*args):
+                pass
+
+            @staticmethod
+            def select_set(*args):
+                pass
+
+        tab.progView = ProgramView()
+        namespace["threading"] = threading
+        namespace["ROW_EXECUTION_COMPLETE"] = "complete"
+        namespace["ROW_EXECUTION_PENDING"] = "pending"
+        namespace["ROW_EXECUTION_REJECTED"] = "rejected"
+        namespace["executeRow"] = (
+            lambda motion_complete=None: (
+                callbacks.append(motion_complete) or "pending"
+            )
+        )
+        namespace["_complete_step_reverse_motion"] = (
+            lambda row, succeeded: completions.append((row, succeeded))
+        )
+        namespace["_finish_step_reverse_selection"] = selections.append
+        step_reverse = self.compile_function("stepRev", namespace)
+
+        self.assertTrue(step_reverse())
+        self.assertTrue(execution_active())
+        self.assertTrue(manual_program_active())
+        callbacks[0](True)
+        self.assertEqual(completions, [(4, True)])
+        self.assertEqual(selections, [])
+        self.assertFalse(execution_active())
+        callbacks[0](True)
+        self.assertEqual(completions, [(4, True)])
+        self.assertTrue(
+            any(
+                level == "warning"
+                and "stale program step-reverse completion" in args[0]
+                for level, args in logged
+            )
+        )
+
+        namespace["executeRow"] = lambda motion_complete=None: "complete"
+        self.assertTrue(step_reverse())
+        self.assertEqual(selections, [4])
+        self.assertFalse(execution_active())
+
+        namespace["executeRow"] = lambda motion_complete=None: "rejected"
+        self.assertFalse(step_reverse())
+        self.assertEqual(selections, [4])
+        self.assertFalse(execution_active())
+
+        ownership_errors = sum(
+            level == "error"
+            and "owner was already released" in args[0]
+            for level, args in logged
+        )
+
+        def reject_after_synchronous_completion(motion_complete=None):
+            motion_complete(False)
+            return "rejected"
+
+        namespace["executeRow"] = reject_after_synchronous_completion
+        self.assertFalse(step_reverse())
+        self.assertFalse(execution_active())
+        self.assertEqual(
+            sum(
+                level == "error"
+                and "owner was already released" in args[0]
+                for level, args in logged
+            ),
+            ownership_errors,
+        )
+
+        namespace["executeRow"] = lambda motion_complete=None: "invalid"
+        self.assertFalse(step_reverse())
+        self.assertFalse(execution_active())
+        self.assertTrue(
+            any(
+                level == "exception"
+                and args[0] == "PROGRAM STEP REVERSE FAILED"
+                for level, args in logged
+            )
+        )
+
+        busy_request = begin_execution("run")
+        self.assertFalse(step_forward())
+        self.assertFalse(step_reverse())
+        self.assertTrue(finish_execution(busy_request))
+
+        namespace["threading"] = SimpleNamespace(Thread=FailingThread)
+        self.assertFalse(step_forward())
+        self.assertFalse(execution_active())
+        namespace["threading"] = threading
+
+        def fail_row(motion_complete=None):
+            runtime["progRunning"] = True
+            runtime["rowinproc"] = 1
+            raise ValueError("malformed program row")
+
+        namespace["executeRow"] = fail_row
+        self.assertFalse(step_reverse())
+        self.assertFalse(runtime["progRunning"])
+        self.assertEqual(runtime["rowinproc"], 0)
+        self.assertFalse(execution_active())
+
+        runtime["progRunning"] = True
+        runtime["rowinproc"] = 1
+        namespace["CAL"] = {
+            f"J{axis}AngCur": str(axis)
+            for axis in range(1, 7)
+        }
+        namespace["setStepMonitorsVR"] = (
+            lambda: (_ for _ in ()).throw(
+                RuntimeError("monitor refresh failed")
+            )
+        )
+        finish_row = self.compile_function("_finish_execute_row", namespace)
+        with self.assertRaisesRegex(RuntimeError, "monitor refresh failed"):
+            finish_row()
+        self.assertFalse(runtime["progRunning"])
+        self.assertEqual(runtime["rowinproc"], 0)
+
+        def fail_stop_status(state):
+            raise RuntimeError("stop status failed")
+
+        namespace["_set_program_stop_status"] = fail_stop_status
+        runtime["programStopRequestId"] = 8
+        self.assertFalse(run_program())
+        self.assertFalse(execution_active())
+        self.assertFalse(step_forward())
+        self.assertFalse(execution_active())
+        runtime["programStopRequestId"] = None
+
+        class FailingWidget:
+            @staticmethod
+            def config(**kwargs):
+                raise RuntimeError("status widget failed")
+
+        namespace["almStatusLab"] = FailingWidget()
+        self.assertFalse(step_reverse())
+        self.assertFalse(execution_active())
+
     def test_program_stop_remains_pending_until_auxiliary_terminal_event(self):
         class Label:
             def __init__(self):
@@ -8287,7 +8674,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(len(rendered), 2)
         self.assertFalse(apply_status())
 
-    def test_program_fault_flags_are_written_under_stop_state_lock(self):
+    def test_program_shared_state_is_written_under_stop_state_lock(self):
         writes = []
 
         class FlagWriteVisitor(ast.NodeVisitor):
@@ -8308,6 +8695,19 @@ class HmiSourceContractTests(unittest.TestCase):
                 if locked:
                     self.lock_depth -= 1
 
+            def _visit_function(self, node):
+                outer_depth = self.lock_depth
+                self.lock_depth = 0
+                for statement in node.body:
+                    self.visit(statement)
+                self.lock_depth = outer_depth
+
+            def visit_FunctionDef(self, node):
+                self._visit_function(node)
+
+            def visit_AsyncFunctionDef(self, node):
+                self._visit_function(node)
+
             def visit_Assign(self, node):
                 for target in node.targets:
                     if (
@@ -8316,7 +8716,12 @@ class HmiSourceContractTests(unittest.TestCase):
                         and target.value.id == "RUN"
                         and isinstance(target.slice, ast.Constant)
                         and target.slice.value
-                        in ("estopActive", "posOutreach")
+                        in (
+                            "estopActive",
+                            "posOutreach",
+                            "progRunning",
+                            "rowinproc",
+                        )
                     ):
                         writes.append(
                             (
@@ -8327,8 +8732,13 @@ class HmiSourceContractTests(unittest.TestCase):
                         )
                 self.generic_visit(node.value)
 
-        for function_name, function in self.module_functions.items():
-            FlagWriteVisitor(function_name).visit(function)
+        functions = (
+            node
+            for node in ast.walk(self.tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        for function in functions:
+            FlagWriteVisitor(function.name).visit(function)
 
         self.assertTrue(writes)
         self.assertTrue(
@@ -8426,14 +8836,23 @@ class HmiSourceContractTests(unittest.TestCase):
 
     def test_program_launch_rejects_unacknowledged_stop_request(self):
         statuses = []
+        execution_request = object()
+        released = []
         namespace = {
             "RUN": {"programStopRequestId": 12},
             "_set_program_stop_status": statuses.append,
+            "_begin_program_execution": (
+                lambda mode: execution_request if mode == "run" else None
+            ),
+            "_finish_program_execution": (
+                lambda request: released.append(request) or True
+            ),
         }
         run_program = self.compile_function("runProg", namespace)
 
         self.assertFalse(run_program())
         self.assertEqual(statuses, ["pending"])
+        self.assertEqual(released, [execution_request])
 
     def test_program_halt_status_never_claims_unconfirmed_motion_stop(self):
         stopped_claim_owners = []
@@ -18141,6 +18560,9 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(serial_transport_quarantined(serial_port))
 
     def test_auxiliary_stop_results_are_applied_on_tk_poll(self):
+        class TclError(Exception):
+            pass
+
         class Widget:
             def __init__(self):
                 self.value = None
@@ -18178,7 +18600,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 error=lambda *args: None,
                 exception=lambda *args: logged_exceptions.append(args),
             ),
-            "tk": SimpleNamespace(TclError=RuntimeError),
+            "tk": SimpleNamespace(TclError=TclError),
             "RUN": runtime,
             "manual_auxiliary_stop_barrier": stop_barrier,
             "_set_program_stop_status": stop_statuses.append,
@@ -18235,6 +18657,15 @@ class HmiSourceContractTests(unittest.TestCase):
                 for arguments in logged_exceptions
             )
         )
+
+        logged_count = len(logged_exceptions)
+        namespace["root"] = SimpleNamespace(
+            after=lambda *args: (_ for _ in ()).throw(
+                TclError("Tk scheduler unavailable")
+            )
+        )
+        poll_events()
+        self.assertEqual(len(logged_exceptions), logged_count + 1)
 
     def test_startup_timeout_is_async_and_waits_for_worker_termination(self):
         class Request:

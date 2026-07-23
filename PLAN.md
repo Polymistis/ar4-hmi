@@ -211,17 +211,28 @@ Implemented portion:
   and only confirmed settings are persisted. Malformed input, stale
   connections, invalid board pins, response failures, queue saturation, stop
   rejection, and transport contention remain visible. Manual I/O is rejected
-  while a `.ar4` program is running instead of being deferred into a later
-  program gap. Program stop and E-stop discard queued requests, and manual
-  status cannot replace an active stop alarm. A later manual-panel interaction
-  acknowledges a terminal stop-status reservation only when no stop, E-stop,
-  or position fault remains active.
+  while a request-scoped `.ar4` Run, Step Forward, or Step Reverse owner is
+  active, including worker startup and asynchronous reverse completion, and
+  while direct row execution remains active. Rejected overlapping program
+  admission cannot clear active fault flags, and a pending program-stop request
+  blocks new program admission. Setup and worker failures release matching
+  program owners, and malformed row failures clear direct row-active state.
+  Worker failures publish alarms through the Tk status queue, synchronous
+  reverse-motion rejection cannot produce a false ownership error, and
+  execution contention or failure status cannot replace an active stop alarm.
+  Program stop and E-stop discard queued requests, and manual status cannot
+  replace an active stop alarm. A later manual-panel interaction acknowledges a
+  terminal stop-status reservation only when no stop, E-stop, or position fault
+  remains active.
 - Automatic and single-axis calibration buttons prepare validated commands on Tk, launch worker-owned serial exchanges, and apply terminal results on Tk without serial reads or controller waits.
 - Multi-stage automatic calibration retains shared motion ownership, main transport reservation, and a shutdown-activity lease until the final successful stage or first failure settles.
 - Calibration shutdown cannot cancel an active `LL` read because current Teensy firmware exposes no paired abort command. Pre-write shutdown rejects transmission at the shared lifecycle boundary and interrupts stalled pre-write activity after the normal drain interval. Post-write shutdown remains supervised until an applied terminal controller frame or explicit quarantine and verified-close handling settles the operation, while unrelated auxiliary activity continues through normal shutdown interruption. A later protocol pass must define preemption before claiming immediate calibration cancellation.
 
-Remaining scope includes program, camera, Modbus, auxiliary connection and
-device paths, application-lifecycle, timing, and calibration-preemption work.
+Remaining scope includes program, G-code-tab execution admission, camera,
+Modbus, auxiliary connection and device paths, durable manual-auxiliary poll
+supervision after Tk scheduling failure, request-scoped program-owner watchdog
+and recovery semantics for a lost worker or completion callback,
+application-lifecycle, timing, and calibration-preemption work.
 
 ### M4A3 - Delivered 7.0/2.0 baseline audit
 

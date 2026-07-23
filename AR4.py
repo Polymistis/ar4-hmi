@@ -426,6 +426,9 @@ manual_auxiliary_active_request = None
 manual_auxiliary_next_request_id = 0
 manual_auxiliary_state_lock = threading.Lock()
 manual_auxiliary_stop_barrier = threading.Event()
+program_execution_state_lock = threading.Lock()
+program_execution_next_request_id = 0
+program_execution_active_request = None
 startup_auxiliary_cleanup_lock = threading.Lock()
 startup_auxiliary_cleanup_pending = {}
 startup_auxiliary_cleanup_worker = None
@@ -559,12 +562,29 @@ XBOX_AUXILIARY_FIXED_EXCHANGES = frozenset(
   for exchange in commands.values()
 )
 MANUAL_AUXILIARY_QUEUE_LIMIT = 64
+PROGRAM_EXECUTION_MODES = frozenset(("run", "step-forward", "step-reverse"))
 MANUAL_AUXILIARY_CALIBRATION_KEYS = frozenset(
   (
     *(f"Servo{channel}{state}" for channel in range(4) for state in ("on", "off")),
     *(f"DO{row}{state}" for row in range(1, 7) for state in ("on", "off")),
   )
 )
+
+
+@dataclass(frozen=True)
+class ProgramExecutionRequest:
+  request_id: int
+  mode: str
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError("program execution request ID must be positive")
+    if self.mode not in PROGRAM_EXECUTION_MODES:
+      raise MotionInputError("program execution mode is invalid")
 
 
 @dataclass(frozen=True)
@@ -1205,17 +1225,89 @@ def _manual_auxiliary_status_reserved():
     return bool(RUN.get('programStopStatusLatched'))
 
 
+def _begin_program_execution(mode):
+  global program_execution_next_request_id
+  global program_execution_active_request
+
+  if mode not in PROGRAM_EXECUTION_MODES:
+    raise MotionInputError("program execution mode is invalid")
+  with program_execution_state_lock:
+    if program_execution_active_request is not None:
+      if not isinstance(
+        program_execution_active_request,
+        ProgramExecutionRequest,
+      ):
+        raise RuntimeError("active program execution request is invalid")
+      return None
+    if (
+      isinstance(program_execution_next_request_id, bool)
+      or not isinstance(program_execution_next_request_id, int)
+      or program_execution_next_request_id < 0
+    ):
+      raise RuntimeError("program execution request counter is invalid")
+    request = ProgramExecutionRequest(
+      program_execution_next_request_id + 1,
+      mode,
+    )
+    program_execution_next_request_id = request.request_id
+    program_execution_active_request = request
+  return request
+
+
+def _finish_program_execution(request):
+  global program_execution_active_request
+
+  if not isinstance(request, ProgramExecutionRequest):
+    raise TypeError("program execution completion request is invalid")
+  with program_execution_state_lock:
+    if program_execution_active_request is not request:
+      return False
+    program_execution_active_request = None
+  return True
+
+
+def _program_execution_active():
+  with program_execution_state_lock:
+    request = program_execution_active_request
+    if request is None:
+      return False
+    if not isinstance(request, ProgramExecutionRequest):
+      raise RuntimeError("active program execution request is invalid")
+    return True
+
+
+def _program_execution_request_active(request):
+  if not isinstance(request, ProgramExecutionRequest):
+    raise TypeError("program execution request is invalid")
+  with program_execution_state_lock:
+    active_request = program_execution_active_request
+    if active_request is not None and not isinstance(
+      active_request,
+      ProgramExecutionRequest,
+    ):
+      raise RuntimeError("active program execution request is invalid")
+    return active_request is request
+
+
+def _program_execution_busy_message():
+  with program_execution_state_lock:
+    request = program_execution_active_request
+    if request is None:
+      return "PROGRAM EXECUTION STATE CHANGED; RETRY"
+    if not isinstance(request, ProgramExecutionRequest):
+      raise RuntimeError("active program execution request is invalid")
+    mode = request.mode.replace("-", " ").upper()
+  return f"PROGRAM EXECUTION ALREADY ACTIVE: {mode}"
+
+
 def _manual_auxiliary_program_active():
-  program_state = getattr(tab1, "runTrue", 0)
-  if isinstance(program_state, bool):
-    return program_state
-  if (
-    isinstance(program_state, int)
-    and not isinstance(program_state, bool)
-    and program_state in (0, 1)
-  ):
-    return bool(program_state)
-  raise RuntimeError("program execution state is invalid")
+  if _program_execution_active():
+    return True
+  with program_stop_state_lock:
+    row_active = RUN.get('progRunning', False)
+  if not isinstance(row_active, bool):
+    raise RuntimeError("program row execution state is invalid")
+  return row_active
 
 
 def _acknowledge_program_stop_status_for_manual_auxiliary():
@@ -1245,6 +1337,21 @@ def _set_manual_auxiliary_status(message, style):
     return False
   almStatusLab.config(text=message, style=style)
   almStatusLab2.config(text=message, style=style)
+  return True
+
+
+def _queue_program_execution_status(message, style):
+  if (
+    not isinstance(message, str)
+    or not message.strip()
+    or message != message.strip()
+  ):
+    raise TypeError("program execution status must be normalized text")
+  if not isinstance(style, str) or not style:
+    raise TypeError("program execution status style must be non-empty text")
+  if _manual_auxiliary_status_reserved():
+    return False
+  program_stop_status_event_queue.put((message, style))
   return True
 
 
@@ -5728,17 +5835,24 @@ def _apply_controller_position_response(response):
 
 
 def _finish_execute_row():
-  RUN['VR_angles'] = [
-    float(CAL['J1AngCur']),
-    float(CAL['J2AngCur']),
-    float(CAL['J3AngCur']),
-    float(CAL['J4AngCur']),
-    float(CAL['J5AngCur']),
-    float(CAL['J6AngCur']),
-  ]
-  setStepMonitorsVR()
-  RUN['progRunning'] = False
-  RUN['rowinproc'] = 0
+  try:
+    RUN['VR_angles'] = [
+      float(CAL['J1AngCur']),
+      float(CAL['J2AngCur']),
+      float(CAL['J3AngCur']),
+      float(CAL['J4AngCur']),
+      float(CAL['J5AngCur']),
+      float(CAL['J6AngCur']),
+    ]
+    setStepMonitorsVR()
+  finally:
+    _abort_program_row_execution()
+
+
+def _abort_program_row_execution():
+  with program_stop_state_lock:
+    RUN['progRunning'] = False
+    RUN['rowinproc'] = 0
 
 
 def _execute_row_auxiliary_command(
@@ -7142,14 +7256,30 @@ def _dispatch_program_gcode(filename, completion_callback):
   return ROW_EXECUTION_COMPLETE
 
 def runProg():
-  with program_stop_state_lock:
-    if RUN.get('programStopRequestId') is not None:
-      _set_program_stop_status("pending")
-      return False
-    RUN['programStopStatusLatched'] = False
-    RUN['programStopState'] = "completed"
-    RUN['estopActive'] = False
-    RUN['posOutreach'] = False
+  execution_request = _begin_program_execution("run")
+  if execution_request is None:
+    message = _program_execution_busy_message()
+    logger.warning(message)
+    _set_manual_auxiliary_status(message, "Warn.TLabel")
+    return False
+
+  try:
+    with program_stop_state_lock:
+      stop_pending = RUN.get('programStopRequestId') is not None
+      if stop_pending:
+        _set_program_stop_status("pending")
+      else:
+        RUN['programStopStatusLatched'] = False
+        RUN['programStopState'] = "completed"
+        RUN['estopActive'] = False
+        RUN['posOutreach'] = False
+  except Exception:
+    _finish_program_execution(execution_request)
+    logger.exception("Program execution admission failed")
+    return False
+  if stop_pending:
+    _finish_program_execution(execution_request)
+    return False
 
   def threadProg():
     last = tab1.progView.index('end')
@@ -7164,14 +7294,14 @@ def runProg():
       curRow=1
       tab1.progView.selection_clear(0, END)
       tab1.progView.select_set(curRow)
-    tab1.runTrue = 1
     while tab1.runTrue == 1:
       if (tab1.runTrue == 0):
         _set_program_stop_status(RUN['programStopState'])
       else:
         almStatusLab.config(text="PROGRAM RUNNING",  style="OK.TLabel")
         almStatusLab2.config(text="PROGRAM RUNNING",  style="OK.TLabel")
-      RUN['rowinproc'] = 1
+      with program_stop_state_lock:
+        RUN['rowinproc'] = 1
       try:
         selRow = tab1.progView.curselection()[0]
       except:
@@ -7200,10 +7330,14 @@ def runProg():
         execution_state = executeRow()
         if execution_state == ROW_EXECUTION_REJECTED:
           tab1.runTrue = 0
-          RUN['rowinproc'] = 0
+          _abort_program_row_execution()
           break
 
-        while RUN['rowinproc'] == 1:
+        while True:
+          with program_stop_state_lock:
+            row_in_process = RUN['rowinproc']
+          if row_in_process != 1:
+            break
           time.sleep(.1)
 
         try:
@@ -7220,15 +7354,60 @@ def runProg():
         time.sleep(.1)
 
     _set_program_stop_status(RUN['programStopState'])
-  t = threading.Thread(target=threadProg)
-  t.start()
+
+  def run_program_worker():
+    try:
+      threadProg()
+    except Exception:
+      tab1.runTrue = 0
+      _abort_program_row_execution()
+      logger.exception("Program execution worker failed")
+      _queue_program_execution_status(
+        "PROGRAM EXECUTION FAILED",
+        "Alarm.TLabel",
+      )
+    finally:
+      if not _finish_program_execution(execution_request):
+        logger.error("Program execution owner was already released")
+
+  try:
+    tab1.runTrue = 1
+    t = threading.Thread(target=run_program_worker)
+    t.start()
+  except Exception:
+    tab1.runTrue = 0
+    _finish_program_execution(execution_request)
+    message = "UNABLE TO START PROGRAM EXECUTION"
+    logger.exception(message)
+    _set_manual_auxiliary_status(message, "Alarm.TLabel")
+    return False
   return True
 
 def stepFwd():
-    with program_stop_state_lock:
-      RUN['programStopStatusLatched'] = False
-      RUN['estopActive'] = False
-      RUN['posOutreach'] = False
+    execution_request = _begin_program_execution("step-forward")
+    if execution_request is None:
+      message = _program_execution_busy_message()
+      logger.warning(message)
+      _set_manual_auxiliary_status(message, "Warn.TLabel")
+      return False
+
+    try:
+      with program_stop_state_lock:
+        stop_pending = RUN.get('programStopRequestId') is not None
+        if stop_pending:
+          _set_program_stop_status("pending")
+        else:
+          RUN['programStopStatusLatched'] = False
+          RUN['estopActive'] = False
+          RUN['posOutreach'] = False
+    except Exception:
+      _finish_program_execution(execution_request)
+      logger.exception("Program step-forward admission failed")
+      return False
+    if stop_pending:
+      _finish_program_execution(execution_request)
+      return False
+
     def threadProg():
       almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
       almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
@@ -7280,30 +7459,110 @@ def stepFwd():
         time.sleep(.1)
       except Exception:
         pass
-    t = threading.Thread(target=threadProg)
-    t.start()
+
+    def step_forward_worker():
+      try:
+        threadProg()
+      except Exception:
+        _abort_program_row_execution()
+        logger.exception("Program step-forward worker failed")
+        _queue_program_execution_status(
+          "PROGRAM STEP FORWARD FAILED",
+          "Alarm.TLabel",
+        )
+      finally:
+        if not _finish_program_execution(execution_request):
+          logger.error("Program step-forward owner was already released")
+
+    try:
+      t = threading.Thread(target=step_forward_worker)
+      t.start()
+    except Exception:
+      _finish_program_execution(execution_request)
+      message = "UNABLE TO START PROGRAM STEP FORWARD"
+      logger.exception(message)
+      _set_manual_auxiliary_status(message, "Alarm.TLabel")
+      return False
+    return True
 
 def stepRev():
-    with program_stop_state_lock:
-      RUN['programStopStatusLatched'] = False
-      RUN['estopActive'] = False
-      RUN['posOutreach'] = False
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel") 
+    execution_request = _begin_program_execution("step-reverse")
+    if execution_request is None:
+      message = _program_execution_busy_message()
+      logger.warning(message)
+      _set_manual_auxiliary_status(message, "Warn.TLabel")
+      return False
+
     try:
-      selRow = tab1.progView.curselection()[0]
-    except:
-      selRow = 1
-      tab1.progView.selection_clear(0, END)
-      tab1.progView.select_set(selRow) 
-    execution_state = executeRow(
-      motion_complete=lambda succeeded: _complete_step_reverse_motion(
-        selRow,
-        succeeded,
+      with program_stop_state_lock:
+        stop_pending = RUN.get('programStopRequestId') is not None
+        if stop_pending:
+          _set_program_stop_status("pending")
+        else:
+          RUN['programStopStatusLatched'] = False
+          RUN['estopActive'] = False
+          RUN['posOutreach'] = False
+    except Exception:
+      _finish_program_execution(execution_request)
+      logger.exception("Program step-reverse admission failed")
+      return False
+    if stop_pending:
+      _finish_program_execution(execution_request)
+      return False
+
+    try:
+      completion_callback_invoked = threading.Event()
+      almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
+      almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+      try:
+        selRow = tab1.progView.curselection()[0]
+      except Exception:
+        selRow = 1
+        tab1.progView.selection_clear(0, END)
+        tab1.progView.select_set(selRow)
+    except Exception:
+      _finish_program_execution(execution_request)
+      logger.exception("Program step-reverse setup failed")
+      return False
+
+    def complete_step_reverse(succeeded):
+      if not _program_execution_request_active(execution_request):
+        logger.warning("Ignoring a stale program step-reverse completion")
+        return
+      completion_callback_invoked.set()
+      try:
+        _complete_step_reverse_motion(selRow, succeeded)
+      except Exception:
+        logger.exception("Unable to complete program step reverse")
+      finally:
+        if not _finish_program_execution(execution_request):
+          logger.error("Program step-reverse owner was already released")
+
+    try:
+      execution_state = executeRow(
+        motion_complete=complete_step_reverse
       )
-    )
-    if execution_state == ROW_EXECUTION_COMPLETE:
-      _finish_step_reverse_selection(selRow)
+      if execution_state == ROW_EXECUTION_COMPLETE:
+        _finish_step_reverse_selection(selRow)
+      elif execution_state == ROW_EXECUTION_PENDING:
+        return True
+      elif execution_state != ROW_EXECUTION_REJECTED:
+        raise RuntimeError("program step reverse returned an invalid state")
+    except Exception:
+      _abort_program_row_execution()
+      _finish_program_execution(execution_request)
+      message = "PROGRAM STEP REVERSE FAILED"
+      logger.exception(message)
+      _set_manual_auxiliary_status(message, "Alarm.TLabel")
+      return False
+
+    if (
+      not completion_callback_invoked.is_set()
+      and not _finish_program_execution(execution_request)
+    ):
+      logger.error("Program step-reverse owner was already released")
+      return False
+    return execution_state == ROW_EXECUTION_COMPLETE
 
 
 def _set_program_stop_status(auxiliary_state):
@@ -7407,7 +7666,8 @@ def stopProg():
 
 
 def executeRow(motion_complete=None):
-  RUN['progRunning'] = True
+  with program_stop_state_lock:
+    RUN['progRunning'] = True
   try:
     selRow = tab1.progView.curselection()[0]
     tab1.progView.see(selRow+2)
