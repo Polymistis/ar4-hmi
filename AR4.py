@@ -1757,6 +1757,7 @@ def _write_joint_position_entry(entry, value):
 def _reset_joint_position_entry(entry, value):
     entry._joint_target_editing = False
     entry._joint_target_replace_on_key = True
+    entry._joint_target_pointer_focus = False
     entry.delete(0, 'end')
     entry.insert(0, value)
     return True
@@ -10350,16 +10351,9 @@ def _queue_joint_target(axis, target):
 
 
 def _primary_joint_position_key(axis):
-  if (
-    isinstance(axis, bool)
-    or not isinstance(axis, int)
-    or not 0 <= axis < len(PRIMARY_JOINT_POSITION_KEYS)
-  ):
-    raise ValueError(
-      "primary joint axis must be an integer in "
-      f"[0, {len(PRIMARY_JOINT_POSITION_KEYS) - 1}]"
-    )
-  return PRIMARY_JOINT_POSITION_KEYS[axis]
+  if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis < 6:
+    raise ValueError("primary joint axis must be an integer in [0, 5]")
+  return f"J{axis + 1}AngCur"
 
 
 def _restore_joint_entry_value(axis, entry):
@@ -10372,6 +10366,7 @@ def _submit_joint_entry_target(axis, entry):
   accepted = _queue_joint_target(axis, entry.get())
   entry._joint_target_editing = not accepted
   entry._joint_target_replace_on_key = accepted
+  entry._joint_target_pointer_focus = False
   return accepted
 
 
@@ -10379,6 +10374,7 @@ def _bind_joint_target_entry(axis, entry):
   _primary_joint_position_key(axis)
   entry._joint_target_editing = False
   entry._joint_target_replace_on_key = True
+  entry._joint_target_pointer_focus = False
   non_editing_keys = frozenset((
     "Tab", "ISO_Left_Tab",
     "Shift_L", "Shift_R", "Control_L", "Control_R",
@@ -10386,12 +10382,22 @@ def _bind_joint_target_entry(axis, entry):
   ))
 
   def begin_focus_edit(_event):
+    pointer_focus = entry._joint_target_pointer_focus
+    entry._joint_target_pointer_focus = False
     entry._joint_target_editing = True
-    entry._joint_target_replace_on_key = True
+    entry._joint_target_replace_on_key = not pointer_focus
+    if not pointer_focus:
+      entry.selection_range(0, 'end')
+
+  def begin_pointer_edit(_event):
+    entry._joint_target_pointer_focus = True
+    entry._joint_target_editing = True
+    entry._joint_target_replace_on_key = False
 
   def begin_key_edit(event):
     if getattr(event, "keysym", "") in non_editing_keys:
       return
+    entry._joint_target_pointer_focus = False
     if entry._joint_target_replace_on_key:
       entry.selection_range(0, 'end')
     entry._joint_target_editing = True
@@ -10411,6 +10417,7 @@ def _bind_joint_target_entry(axis, entry):
     _restore_joint_entry_value(axis, entry)
 
   entry.bind("<FocusIn>", begin_focus_edit)
+  entry.bind("<Button-1>", begin_pointer_edit)
   entry.bind("<KeyPress>", begin_key_edit)
   entry.bind("<Return>", submit_target)
   entry.bind("<KP_Enter>", submit_target)
@@ -13657,13 +13664,9 @@ class CalibrationWorkerResult:
   write_started: object
 
 
-PRIMARY_JOINT_POSITION_KEYS = (
+CALIBRATION_POSITION_KEYS = (
   'J1AngCur', 'J2AngCur', 'J3AngCur',
   'J4AngCur', 'J5AngCur', 'J6AngCur',
-)
-
-
-CALIBRATION_POSITION_KEYS = PRIMARY_JOINT_POSITION_KEYS + (
   'XcurPos', 'YcurPos', 'ZcurPos',
   'RzcurPos', 'RycurPos', 'RxcurPos',
   'J7PosCur', 'J8PosCur', 'J9PosCur',
@@ -13677,7 +13680,7 @@ class CalibrationPoseSnapshot:
   virtual_angles: tuple
   step_monitors: tuple
   step_values: tuple
-  entry_values: tuple
+  non_primary_entry_values: tuple
   slider_values: tuple
   manual_debug: object
   confirmed_generation: int
@@ -13795,13 +13798,10 @@ def _capture_calibration_pose_snapshot():
     raise RuntimeError("calibration pose runtime vectors must contain six values")
 
   entry_fields, jog_sliders = _calibration_pose_widget_groups()
-  primary_joint_count = len(PRIMARY_JOINT_POSITION_KEYS)
-  entry_values = (
-    tuple(CAL[key] for key in PRIMARY_JOINT_POSITION_KEYS)
-    + tuple(
-      entry_field.get()
-      for entry_field in entry_fields[primary_joint_count:]
-    )
+  primary_joint_count = len(virtual_angles)
+  non_primary_entry_values = tuple(
+    entry_field.get()
+    for entry_field in entry_fields[primary_joint_count:]
   )
   slider_values = tuple(jog_slider.get() for jog_slider in jog_sliders)
   manual_debug = manEntryField.get()
@@ -13829,7 +13829,7 @@ def _capture_calibration_pose_snapshot():
     virtual_angles,
     step_monitors,
     step_values,
-    entry_values,
+    non_primary_entry_values,
     slider_values,
     manual_debug,
     generation,
@@ -13855,7 +13855,9 @@ def _restore_calibration_pose_snapshot(snapshot):
     len(snapshot.virtual_angles) != 6
     or len(snapshot.step_monitors) != 6
     or len(snapshot.step_values) != 6
-    or len(snapshot.entry_values) != 15
+    or len(snapshot.non_primary_entry_values) != (
+      len(CALIBRATION_POSITION_KEYS) - len(snapshot.virtual_angles)
+    )
     or len(snapshot.slider_values) != 9
   ):
     raise RuntimeError("calibration pose snapshot dimensions are invalid")
@@ -13881,10 +13883,10 @@ def _restore_calibration_pose_snapshot(snapshot):
 
   restoration_errors = []
   entry_fields, jog_sliders = _calibration_pose_widget_groups()
-  primary_joint_count = len(PRIMARY_JOINT_POSITION_KEYS)
-  for entry_field, value in zip(
+  primary_joint_count = len(snapshot.virtual_angles)
+  for entry_field, (_, value) in zip(
     entry_fields[:primary_joint_count],
-    snapshot.entry_values[:primary_joint_count],
+    snapshot.calibration_values[:primary_joint_count],
   ):
     try:
       _reset_joint_position_entry(entry_field, value)
@@ -13892,7 +13894,7 @@ def _restore_calibration_pose_snapshot(snapshot):
       restoration_errors.append(f"pose entry restoration failed: {exc}")
   for entry_field, value in zip(
     entry_fields[primary_joint_count:],
-    snapshot.entry_values[primary_joint_count:],
+    snapshot.non_primary_entry_values,
   ):
     try:
       entry_field.delete(0, 'end')
@@ -18628,7 +18630,6 @@ jointFrame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
 jointFrame.grid_columnconfigure(0, weight=1)
 jointFrame.grid_columnconfigure(1, weight=1)
 
-# Helper function to create joint control widgets
 def create_joint_jog_frame(parent, row, col, joint_name, joint_num):
     frame = Frame(parent)
     frame.grid(row=row, column=col, sticky="ew", padx=2, pady=2)

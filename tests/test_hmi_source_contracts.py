@@ -225,13 +225,6 @@ class HmiSourceContractTests(unittest.TestCase):
             threading.Event(),
         )
         namespace.setdefault(
-            "PRIMARY_JOINT_POSITION_KEYS",
-            (
-                "J1AngCur", "J2AngCur", "J3AngCur",
-                "J4AngCur", "J5AngCur", "J6AngCur",
-            ),
-        )
-        namespace.setdefault(
             "CALIBRATION_POSITION_KEYS",
             (
                 "J1AngCur", "J2AngCur", "J3AngCur",
@@ -9530,7 +9523,6 @@ class HmiSourceContractTests(unittest.TestCase):
         root = Root()
         acknowledged_target = tuple(float(axis) for axis in range(1, 10))
         namespace = {
-            "PRIMARY_JOINT_POSITION_KEYS": position_keys[:6],
             "CALIBRATION_POSITION_KEYS": position_keys,
             "CAL": {
                 key: f"saved-position-{index}"
@@ -9627,6 +9619,7 @@ class HmiSourceContractTests(unittest.TestCase):
         for name in entry_names[:6]:
             self.assertFalse(namespace[name]._joint_target_editing)
             self.assertTrue(namespace[name]._joint_target_replace_on_key)
+            self.assertFalse(namespace[name]._joint_target_pointer_focus)
         self.assertEqual(
             tuple(namespace[name].get() for name in slider_names),
             tuple(float(index) for index in range(1, 10)),
@@ -10696,6 +10689,41 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIsInstance(entry_argument, ast.Name)
         self.assertEqual(entry_argument.id, "entry")
 
+    def test_primary_joint_pose_keys_match_widget_group_order(self):
+        position_keys_assignment = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "CALIBRATION_POSITION_KEYS"
+                for target in node.targets
+            )
+        )
+        position_keys = ast.literal_eval(position_keys_assignment.value)
+        widget_groups = self.module_functions["_calibration_pose_widget_groups"]
+        return_node = next(
+            node
+            for node in widget_groups.body
+            if isinstance(node, ast.Return)
+        )
+        entry_names = tuple(
+            entry.id
+            for entry in return_node.value.elts[0].elts
+        )
+
+        self.assertEqual(
+            position_keys[:6],
+            tuple(f"J{axis}AngCur" for axis in range(1, 7)),
+        )
+        self.assertEqual(
+            entry_names[:6],
+            tuple(
+                f"J{axis}curAngEntryField"
+                for axis in range(1, 7)
+            ),
+        )
+
     def test_primary_joint_entry_bindings_submit_and_preserve_edits(self):
         class Entry:
             def __init__(self, value):
@@ -10745,6 +10773,7 @@ class HmiSourceContractTests(unittest.TestCase):
             set(entry.bindings),
             {
                 "<FocusIn>",
+                "<Button-1>",
                 "<KeyPress>",
                 "<Return>",
                 "<KP_Enter>",
@@ -10752,8 +10781,12 @@ class HmiSourceContractTests(unittest.TestCase):
                 "<FocusOut>",
             },
         )
+        entry.bindings["<Button-1>"](SimpleNamespace())
         entry.bindings["<FocusIn>"](SimpleNamespace())
-        self.assertTrue(entry._joint_target_replace_on_key)
+        self.assertFalse(entry._joint_target_pointer_focus)
+        self.assertFalse(entry._joint_target_replace_on_key)
+        self.assertEqual(entry.selections, [])
+        entry.bindings["<KeyPress>"](SimpleNamespace(keysym="BackSpace"))
         self.assertEqual(entry.selections, [])
         entry.value = "-4.25"
         self.assertTrue(entry._joint_target_editing)
@@ -10789,6 +10822,10 @@ class HmiSourceContractTests(unittest.TestCase):
 
         accepted["value"] = False
         entry.bindings["<FocusIn>"](SimpleNamespace())
+        self.assertEqual(
+            entry.selections,
+            [(0, "end"), (0, "end"), (0, "end")],
+        )
         entry.value = "invalid"
         self.assertEqual(
             entry.bindings["<KP_Enter>"](SimpleNamespace()),
