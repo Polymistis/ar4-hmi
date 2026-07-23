@@ -18778,6 +18778,27 @@ class HmiSourceContractTests(unittest.TestCase):
             self.assertEqual(len(supervisor_calls), 1, function_name)
             self.assertEqual(len(supervisor_calls[0].args), 1)
             self.assertEqual(supervisor_calls[0].keywords, [])
+            outer_tries = [
+                statement
+                for statement in function.body
+                if isinstance(statement, ast.Try)
+            ]
+            self.assertEqual(len(outer_tries), 1, function_name)
+            finally_supervisor_calls = [
+                node
+                for statement in outer_tries[0].finalbody
+                for node in ast.walk(statement)
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "_reschedule_event_poll"
+                )
+            ]
+            self.assertEqual(
+                finally_supervisor_calls,
+                supervisor_calls,
+                function_name,
+            )
             self.assertIsInstance(
                 supervisor_calls[0].args[0],
                 ast.Constant,
