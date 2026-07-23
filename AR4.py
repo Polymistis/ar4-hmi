@@ -10634,9 +10634,24 @@ def _poll_auxiliary_serial_events():
       logger.exception(
         "Unable to apply a program-stop status on the Tk event thread"
       )
-    _try_dispatch_controller_correction()
-    _try_dispatch_auxiliary_stop()
-    _ensure_startup_auxiliary_cleanup()
+    try:
+      _try_dispatch_controller_correction()
+    except Exception:
+      logger.exception(
+        "Unable to dispatch controller correction on the Tk event thread"
+      )
+    try:
+      _try_dispatch_auxiliary_stop()
+    except Exception:
+      logger.exception(
+        "Unable to dispatch auxiliary stop on the Tk event thread"
+      )
+    try:
+      _ensure_startup_auxiliary_cleanup()
+    except Exception:
+      logger.exception(
+        "Unable to supervise auxiliary startup cleanup on the Tk event thread"
+      )
 
 
 def _poll_manual_auxiliary_events():
@@ -10717,12 +10732,17 @@ def _poll_manual_auxiliary_events():
   finally:
     _reschedule_event_poll("manual-auxiliary")
     if application_closing.is_set():
-      with manual_auxiliary_state_lock:
-        discarded = len(manual_auxiliary_request_queue)
-        manual_auxiliary_request_queue.clear()
-      if discarded:
-        logger.warning(
-          "Discarded queued manual auxiliary commands during shutdown"
+      try:
+        with manual_auxiliary_state_lock:
+          discarded = len(manual_auxiliary_request_queue)
+          manual_auxiliary_request_queue.clear()
+        if discarded:
+          logger.warning(
+            "Discarded queued manual auxiliary commands during shutdown"
+          )
+      except Exception:
+        logger.exception(
+          "Unable to discard manual auxiliary requests during shutdown"
         )
     else:
       try:

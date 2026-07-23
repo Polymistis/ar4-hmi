@@ -4950,13 +4950,35 @@ class HmiSourceContractTests(unittest.TestCase):
                 ):
                     continue
                 guarded_release_calls.append(statement.body[0].value)
+        finish_startup_functions = [
+            node
+            for node in ast.walk(function)
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "finish_startup"
+            )
+        ]
+        self.assertEqual(len(finish_startup_functions), 1)
+        completion_release_calls = [
+            node
+            for node in ast.walk(finish_startup_functions[0])
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_release_async_main_serial_transport"
+            )
+        ]
 
         self.assertEqual(len(acquisitions), 1)
         self.assertTrue(closes)
         self.assertLess(acquisitions[0].lineno, min(node.lineno for node in closes))
-        self.assertTrue(release_calls)
+        self.assertEqual(len(release_calls), 2)
         self.assertEqual(len(guarded_release_calls), 1)
-        self.assertIn(guarded_release_calls[0], release_calls)
+        self.assertEqual(len(completion_release_calls), 1)
+        self.assertCountEqual(
+            release_calls,
+            guarded_release_calls + completion_release_calls,
+        )
 
     def test_direct_main_serial_operations_share_dispatcher_transport_reservation(self):
         transport_lock = threading.Lock()
@@ -6624,6 +6646,44 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
         self.assertEqual(len(scheduled), scheduled_count)
         namespace["application_closing"].clear()
+
+        class BrokenManualQueue:
+            def __len__(self):
+                raise RuntimeError("manual queue unavailable")
+
+            def clear(self):
+                raise AssertionError(
+                    "queue clear must not follow a failed length read"
+                )
+
+        original_queue = namespace["manual_auxiliary_request_queue"]
+        original_logger = namespace["logger"]
+        original_reschedule = namespace["_reschedule_event_poll"]
+        closing_logs = []
+        closing_reschedules = []
+        namespace["manual_auxiliary_request_queue"] = BrokenManualQueue()
+        namespace["logger"] = SimpleNamespace(
+            error=lambda *args: None,
+            warning=lambda *args: None,
+            exception=lambda *args: closing_logs.append(args),
+        )
+        namespace["_reschedule_event_poll"] = closing_reschedules.append
+        namespace["application_closing"].set()
+        poll_results()
+        self.assertEqual(closing_reschedules, ["manual-auxiliary"])
+        self.assertEqual(
+            closing_logs,
+            [
+                (
+                    "Unable to discard manual auxiliary requests "
+                    "during shutdown",
+                )
+            ],
+        )
+        namespace["application_closing"].clear()
+        namespace["manual_auxiliary_request_queue"] = original_queue
+        namespace["logger"] = original_logger
+        namespace["_reschedule_event_poll"] = original_reschedule
 
         def fail_dispatch():
             raise RuntimeError("dispatch failed")
@@ -18994,6 +19054,66 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(
             reschedules,
             ["auxiliary-serial"],
+        )
+
+        cleanup_calls = []
+        cleanup_logs = []
+
+        def failed_cleanup(name):
+            def cleanup():
+                cleanup_calls.append(name)
+                raise RuntimeError(f"{name} failed")
+
+            return cleanup
+
+        namespace["_apply_program_stop_status_events"] = failed_cleanup(
+            "program-status"
+        )
+        namespace["_try_dispatch_controller_correction"] = failed_cleanup(
+            "controller-correction"
+        )
+        namespace["_try_dispatch_auxiliary_stop"] = failed_cleanup(
+            "auxiliary-stop"
+        )
+        namespace["_ensure_startup_auxiliary_cleanup"] = failed_cleanup(
+            "startup-cleanup"
+        )
+        namespace["logger"] = SimpleNamespace(
+            error=lambda *args: None,
+            exception=lambda *args: cleanup_logs.append(args),
+        )
+        reschedules.clear()
+        poll_events()
+        self.assertEqual(reschedules, ["auxiliary-serial"])
+        self.assertEqual(
+            cleanup_calls,
+            [
+                "program-status",
+                "controller-correction",
+                "auxiliary-stop",
+                "startup-cleanup",
+            ],
+        )
+        self.assertEqual(
+            cleanup_logs,
+            [
+                (
+                    "Unable to apply a program-stop status "
+                    "on the Tk event thread",
+                ),
+                (
+                    "Unable to dispatch controller correction "
+                    "on the Tk event thread",
+                ),
+                (
+                    "Unable to dispatch auxiliary stop "
+                    "on the Tk event thread",
+                ),
+                (
+                    "Unable to supervise auxiliary startup cleanup "
+                    "on the Tk event thread",
+                ),
+            ],
         )
 
     def test_startup_timeout_is_async_and_waits_for_worker_termination(self):
