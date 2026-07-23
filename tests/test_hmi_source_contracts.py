@@ -211,9 +211,50 @@ class HmiSourceContractTests(unittest.TestCase):
             for node in cls.tree.body
             if isinstance(node, ast.ClassDef)
         }
+        cls.module_assignments = {
+            node.targets[0].id: node
+            for node in cls.tree.body
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            )
+        }
+
+    def module_literal(self, name):
+        assignment = self.module_assignments.get(name)
+        self.assertIsNotNone(assignment, name)
+        return ast.literal_eval(assignment.value)
 
     def compile_function(self, name, namespace, *, preserve_decorators=False):
         self.add_motion_request_dependencies(namespace)
+        namespace.setdefault(
+            "EVENT_POLL_INTERVAL_MS",
+            self.module_literal("EVENT_POLL_INTERVAL_MS"),
+        )
+        namespace.setdefault(
+            "EVENT_POLL_CALLBACK_NAMES",
+            self.module_literal("EVENT_POLL_CALLBACK_NAMES"),
+        )
+
+        def reschedule_event_poll(poll_name):
+            if namespace["application_closing"].is_set():
+                return
+            callback_name = namespace["EVENT_POLL_CALLBACK_NAMES"][poll_name]
+            callback = namespace.get(callback_name)
+            if not callable(callback):
+                raise AssertionError(
+                    f"missing compiled event poll callback: {callback_name}"
+                )
+            namespace["root"].after(
+                namespace["EVENT_POLL_INTERVAL_MS"],
+                callback,
+            )
+
+        namespace.setdefault(
+            "_reschedule_event_poll",
+            reschedule_event_poll,
+        )
         namespace.setdefault("dataclass", dataclass)
         namespace.setdefault("threading", threading)
         namespace.setdefault("contextmanager", contextmanager)
@@ -682,6 +723,7 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault("_poll_calibration_events", lambda: None)
         namespace.setdefault("_poll_manual_auxiliary_events", lambda: None)
         namespace.setdefault("_poll_virtual_motion_events", lambda: None)
+        namespace.setdefault("_poll_xbox_auxiliary_events", lambda: None)
         namespace.setdefault("startup_controller_cleanup_lock", threading.Lock())
         namespace.setdefault("startup_controller_cleanup_pending", {})
         namespace.setdefault("_ensure_startup_controller_cleanup", lambda: True)
@@ -8280,6 +8322,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(finish_execution(first_request))
         self.assertTrue(request_active(second_request))
         self.assertTrue(finish_execution(second_request))
+        self.assertEqual(
+            namespace["_program_execution_busy_message"](),
+            "PROGRAM EXECUTION STATE CHANGED; RETRY",
+        )
 
         class Widget:
             def __init__(self):
@@ -8332,7 +8378,10 @@ class HmiSourceContractTests(unittest.TestCase):
             or runtime["posOutreach"]
         )
         self.compile_function("_set_manual_auxiliary_status", namespace)
-        self.compile_function("_queue_program_execution_status", namespace)
+        queue_program_status = self.compile_function(
+            "_queue_program_execution_status",
+            namespace,
+        )
         self.compile_function(
             "_abort_program_row_execution",
             namespace,
@@ -8343,6 +8392,15 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace,
         )
 
+        runtime["estopActive"] = True
+        self.assertFalse(
+            queue_program_status(
+                "PROGRAM EXECUTION FAILED",
+                "Alarm.TLabel",
+            )
+        )
+        self.assertTrue(namespace["program_stop_status_event_queue"].empty())
+        runtime["estopActive"] = False
         runtime["progRunning"] = True
         self.assertTrue(manual_program_active())
         runtime["progRunning"] = False
@@ -18559,10 +18617,265 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(serial_port.is_open)
         self.assertTrue(serial_transport_quarantined(serial_port))
 
-    def test_auxiliary_stop_results_are_applied_on_tk_poll(self):
+    def test_event_poll_supervisor_retries_failed_sibling_schedulers(self):
         class TclError(Exception):
             pass
 
+        failures = {}
+
+        class Root:
+            def __init__(self):
+                self.attempts = []
+                self.jobs = []
+
+            def after(self, delay, callback):
+                self.attempts.append((delay, callback))
+                pending_failures = failures.get(callback.__name__, [])
+                if pending_failures:
+                    raise pending_failures.pop(0)
+                self.jobs.append((delay, callback))
+                return f"job-{len(self.jobs)}"
+
+        def _poll_serial_events():
+            pass
+
+        def _poll_auxiliary_serial_events():
+            pass
+
+        def _poll_manual_auxiliary_events():
+            pass
+
+        root = Root()
+        closing = threading.Event()
+        exception_logs = []
+        error_logs = []
+        namespace = {
+            "event_poll_retry_lock": threading.Lock(),
+            "event_poll_retry_pending": set(),
+            "application_closing": closing,
+            "root": root,
+            "tk": SimpleNamespace(TclError=TclError),
+            "logger": SimpleNamespace(
+                exception=lambda *args: exception_logs.append(args),
+                error=lambda *args: error_logs.append(args),
+            ),
+            "_poll_serial_events": _poll_serial_events,
+            "_poll_auxiliary_serial_events": (
+                _poll_auxiliary_serial_events
+            ),
+            "_poll_manual_auxiliary_events": (
+                _poll_manual_auxiliary_events
+            ),
+            "EVENT_POLL_INTERVAL_MS": self.module_literal(
+                "EVENT_POLL_INTERVAL_MS"
+            ),
+            "EVENT_POLL_CALLBACK_NAMES": self.module_literal(
+                "EVENT_POLL_CALLBACK_NAMES"
+            ),
+        }
+        self.compile_function(
+            "_event_poll_callback",
+            namespace,
+        )
+        schedule_poll = self.compile_function(
+            "_schedule_event_poll",
+            namespace,
+        )
+        retry_polls = self.compile_function(
+            "_retry_failed_event_polls",
+            namespace,
+        )
+        reschedule_poll = self.compile_function(
+            "_reschedule_event_poll",
+            namespace,
+        )
+
+        failures["_poll_manual_auxiliary_events"] = [
+            RuntimeError("scheduler busy")
+        ]
+        self.assertFalse(schedule_poll("manual-auxiliary"))
+        self.assertEqual(
+            namespace["event_poll_retry_pending"],
+            {"manual-auxiliary"},
+        )
+
+        self.assertIsNone(reschedule_poll("serial"))
+        interval = namespace["EVENT_POLL_INTERVAL_MS"]
+        self.assertEqual(
+            root.jobs,
+            [
+                (interval, _poll_serial_events),
+                (interval, _poll_manual_auxiliary_events),
+            ],
+        )
+        self.assertEqual(namespace["event_poll_retry_pending"], set())
+
+        failures["_poll_auxiliary_serial_events"] = [
+            TclError("Tk scheduler unavailable")
+        ]
+        self.assertFalse(schedule_poll("auxiliary-serial"))
+        self.assertTrue(retry_polls("serial"))
+        self.assertEqual(
+            root.jobs[-1],
+            (interval, _poll_auxiliary_serial_events),
+        )
+        self.assertEqual(namespace["event_poll_retry_pending"], set())
+        self.assertEqual(
+            exception_logs,
+            [
+                ("Unable to schedule manual-auxiliary event polling",),
+                ("Unable to schedule auxiliary-serial event polling",),
+            ],
+        )
+
+        self.assertFalse(schedule_poll("unknown"))
+        self.assertFalse(retry_polls("unknown"))
+        serial_callback = namespace["_poll_serial_events"]
+        namespace["_poll_serial_events"] = object()
+        self.assertFalse(schedule_poll("serial"))
+        namespace["_poll_serial_events"] = serial_callback
+        self.assertEqual(
+            error_logs,
+            [
+                ("Unable to resolve unknown event poll: %r", "unknown"),
+                (
+                    "Unable to retry event polls with invalid exclusion: %r",
+                    "unknown",
+                ),
+                (
+                    "Unable to resolve event poll callback %s for %s",
+                    "_poll_serial_events",
+                    "serial",
+                ),
+            ],
+        )
+
+        namespace["event_poll_retry_pending"].add("manual-auxiliary")
+        closing.set()
+        self.assertIsNone(reschedule_poll("serial"))
+        self.assertEqual(namespace["event_poll_retry_pending"], set())
+
+    def test_event_polls_use_shared_rescheduling_supervisor(self):
+        expected_polls = self.module_literal("EVENT_POLL_CALLBACK_NAMES")
+        self.assertIsInstance(expected_polls, dict)
+        self.assertEqual(len(expected_polls), len(set(expected_polls.values())))
+        self.assertEqual(
+            set(expected_polls.values()) - set(self.module_functions),
+            set(),
+        )
+
+        for poll_name, function_name in expected_polls.items():
+            function = self.module_functions[function_name]
+            supervisor_calls = [
+                node
+                for node in ast.walk(function)
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "_reschedule_event_poll"
+                )
+            ]
+            self.assertEqual(len(supervisor_calls), 1, function_name)
+            self.assertEqual(len(supervisor_calls[0].args), 1)
+            self.assertEqual(supervisor_calls[0].keywords, [])
+            self.assertIsInstance(
+                supervisor_calls[0].args[0],
+                ast.Constant,
+            )
+            self.assertEqual(
+                supervisor_calls[0].args[0].value,
+                poll_name,
+            )
+            direct_after_calls = [
+                node
+                for node in ast.walk(function)
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "after"
+                )
+            ]
+            self.assertEqual(direct_after_calls, [], function_name)
+
+        registered_callbacks = set(expected_polls.values())
+        bootstrap_calls = [
+            statement.value
+            for statement in self.tree.body
+            if (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Name)
+                and statement.value.func.id == "_schedule_event_poll"
+            )
+        ]
+        self.assertEqual(len(bootstrap_calls), len(expected_polls))
+        self.assertEqual(
+            {
+                call.args[0].value
+                for call in bootstrap_calls
+                if (
+                    len(call.args) == 1
+                    and isinstance(call.args[0], ast.Constant)
+                )
+            },
+            set(expected_polls),
+        )
+        for call in bootstrap_calls:
+            self.assertEqual(len(call.args), 1)
+            self.assertEqual(call.keywords, [])
+            self.assertIsInstance(call.args[0], ast.Constant)
+
+        schedule_after_calls = []
+        schedule_function = self.module_functions["_schedule_event_poll"]
+        for node in ast.walk(schedule_function):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "after"
+            ):
+                continue
+            schedule_after_calls.append(node)
+        self.assertEqual(len(schedule_after_calls), 1)
+        schedule_after = schedule_after_calls[0]
+        self.assertEqual(len(schedule_after.args), 2)
+        self.assertEqual(schedule_after.keywords, [])
+        self.assertIsInstance(schedule_after.args[0], ast.Name)
+        self.assertEqual(
+            schedule_after.args[0].id,
+            "EVENT_POLL_INTERVAL_MS",
+        )
+
+        direct_bootstrap_calls = []
+        for statement in self.tree.body:
+            call = statement.value if isinstance(statement, ast.Expr) else None
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "after"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "tab1"
+                and len(call.args) == 2
+                and isinstance(call.args[1], ast.Name)
+                and call.args[1].id in registered_callbacks
+            ):
+                continue
+            direct_bootstrap_calls.append(call)
+        self.assertEqual(direct_bootstrap_calls, [])
+
+        close_poll_names = {
+            node.func.id
+            for node in ast.walk(
+                self.module_functions["_poll_application_close"]
+            )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in registered_callbacks
+            )
+        }
+        self.assertEqual(close_poll_names, registered_callbacks)
+
+    def test_auxiliary_stop_results_are_applied_on_tk_poll(self):
         class Widget:
             def __init__(self):
                 self.value = None
@@ -18585,7 +18898,6 @@ class HmiSourceContractTests(unittest.TestCase):
         second_label = Widget()
         recovery_attempts = []
         stop_statuses = []
-        logged_exceptions = []
         stop_barrier = threading.Event()
         stop_barrier.set()
         runtime = {"programStopRequestId": 41}
@@ -18598,9 +18910,8 @@ class HmiSourceContractTests(unittest.TestCase):
             "almStatusLab2": second_label,
             "logger": SimpleNamespace(
                 error=lambda *args: None,
-                exception=lambda *args: logged_exceptions.append(args),
+                exception=lambda *args: None,
             ),
-            "tk": SimpleNamespace(TclError=TclError),
             "RUN": runtime,
             "manual_auxiliary_stop_barrier": stop_barrier,
             "_set_program_stop_status": stop_statuses.append,
@@ -18641,31 +18952,15 @@ class HmiSourceContractTests(unittest.TestCase):
             ],
         )
 
-        namespace["application_closing"] = SimpleNamespace(
-            is_set=lambda: False
-        )
-        namespace["root"] = SimpleNamespace(
-            after=lambda *args: (_ for _ in ()).throw(
-                RuntimeError("scheduler unavailable")
-            )
+        reschedules = []
+        namespace["_reschedule_event_poll"] = (
+            lambda poll_name: reschedules.append(poll_name)
         )
         poll_events()
-        self.assertTrue(
-            any(
-                "Unable to schedule auxiliary serial result polling"
-                in arguments[0]
-                for arguments in logged_exceptions
-            )
+        self.assertEqual(
+            reschedules,
+            ["auxiliary-serial"],
         )
-
-        logged_count = len(logged_exceptions)
-        namespace["root"] = SimpleNamespace(
-            after=lambda *args: (_ for _ in ()).throw(
-                TclError("Tk scheduler unavailable")
-            )
-        )
-        poll_events()
-        self.assertEqual(len(logged_exceptions), logged_count + 1)
 
     def test_startup_timeout_is_async_and_waits_for_worker_termination(self):
         class Request:

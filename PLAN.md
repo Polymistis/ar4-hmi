@@ -224,15 +224,22 @@ Implemented portion:
   replace an active stop alarm. A later manual-panel interaction acknowledges a
   terminal stop-status reservation only when no stop, E-stop, or position fault
   remains active.
+- Serial, auxiliary serial, manual auxiliary, Xbox auxiliary, virtual-motion,
+  joint-motion, and calibration event queues share a Tk sibling-retry registry.
+  A scheduling failure records the registered poll name, and each still-running
+  sibling poll retries registered failures without calling Tk from a worker
+  thread. This mechanism depends on at least one live Tk poll and does not
+  recover when the Tk scheduler or interpreter is unavailable. Application
+  shutdown drains every registered queue and clears pending retry state.
 - Automatic and single-axis calibration buttons prepare validated commands on Tk, launch worker-owned serial exchanges, and apply terminal results on Tk without serial reads or controller waits.
 - Multi-stage automatic calibration retains shared motion ownership, main transport reservation, and a shutdown-activity lease until the final successful stage or first failure settles.
 - Calibration shutdown cannot cancel an active `LL` read because current Teensy firmware exposes no paired abort command. Pre-write shutdown rejects transmission at the shared lifecycle boundary and interrupts stalled pre-write activity after the normal drain interval. Post-write shutdown remains supervised until an applied terminal controller frame or explicit quarantine and verified-close handling settles the operation, while unrelated auxiliary activity continues through normal shutdown interruption. A later protocol pass must define preemption before claiming immediate calibration cancellation.
 
 Remaining scope includes program, G-code-tab execution admission, camera,
-Modbus, auxiliary connection and device paths, durable manual-auxiliary poll
-supervision after Tk scheduling failure, request-scoped program-owner watchdog
-and recovery semantics for a lost worker or completion callback,
-application-lifecycle, timing, and calibration-preemption work.
+Modbus, auxiliary connection and device paths, request-scoped program-owner
+watchdog and recovery semantics for a lost worker or completion callback,
+durable event-poll failure handling when the Tk scheduler or interpreter is
+unavailable, application-lifecycle, timing, and calibration-preemption work.
 
 ### M4A3 - Delivered 7.0/2.0 baseline audit
 

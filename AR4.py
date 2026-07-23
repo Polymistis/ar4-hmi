@@ -429,6 +429,8 @@ manual_auxiliary_stop_barrier = threading.Event()
 program_execution_state_lock = threading.Lock()
 program_execution_next_request_id = 0
 program_execution_active_request = None
+event_poll_retry_lock = threading.Lock()
+event_poll_retry_pending = set()
 startup_auxiliary_cleanup_lock = threading.Lock()
 startup_auxiliary_cleanup_pending = {}
 startup_auxiliary_cleanup_worker = None
@@ -563,6 +565,16 @@ XBOX_AUXILIARY_FIXED_EXCHANGES = frozenset(
 )
 MANUAL_AUXILIARY_QUEUE_LIMIT = 64
 PROGRAM_EXECUTION_MODES = frozenset(("run", "step-forward", "step-reverse"))
+EVENT_POLL_INTERVAL_MS = 25
+EVENT_POLL_CALLBACK_NAMES = {
+  "serial": "_poll_serial_events",
+  "auxiliary-serial": "_poll_auxiliary_serial_events",
+  "manual-auxiliary": "_poll_manual_auxiliary_events",
+  "xbox-auxiliary": "_poll_xbox_auxiliary_events",
+  "virtual-motion": "_poll_virtual_motion_events",
+  "joint-motion": "_poll_joint_motion_events",
+  "calibration": "_poll_calibration_events",
+}
 MANUAL_AUXILIARY_CALIBRATION_KEYS = frozenset(
   (
     *(f"Servo{channel}{state}" for channel in range(4) for state in ("on", "off")),
@@ -1951,6 +1963,7 @@ def _poll_application_close():
   _poll_manual_auxiliary_events()
   _poll_joint_motion_events()
   _poll_virtual_motion_events()
+  _poll_xbox_auxiliary_events()
 
   with startup_controller_cleanup_lock:
     controller_cleanup_pending = bool(startup_controller_cleanup_pending)
@@ -10390,6 +10403,68 @@ def _apply_legacy_serial_response(response):
   return applied_position
 
 
+def _event_poll_callback(poll_name):
+  if not isinstance(poll_name, str) or poll_name not in EVENT_POLL_CALLBACK_NAMES:
+    logger.error("Unable to resolve unknown event poll: %r", poll_name)
+    return None
+  callback_name = EVENT_POLL_CALLBACK_NAMES[poll_name]
+  callback = globals().get(callback_name)
+  if not callable(callback):
+    logger.error(
+      "Unable to resolve event poll callback %s for %s",
+      callback_name,
+      poll_name,
+    )
+    return None
+  return callback
+
+
+def _schedule_event_poll(poll_name):
+  if application_closing.is_set():
+    with event_poll_retry_lock:
+      event_poll_retry_pending.clear()
+    return False
+  callback = _event_poll_callback(poll_name)
+  if callback is None:
+    return False
+  try:
+    root.after(EVENT_POLL_INTERVAL_MS, callback)
+  except (RuntimeError, tk.TclError):
+    with event_poll_retry_lock:
+      event_poll_retry_pending.add(poll_name)
+    logger.exception(f"Unable to schedule {poll_name} event polling")
+    return False
+  with event_poll_retry_lock:
+    event_poll_retry_pending.discard(poll_name)
+  return True
+
+
+def _retry_failed_event_polls(excluded_poll_name):
+  if (
+    not isinstance(excluded_poll_name, str)
+    or excluded_poll_name not in EVENT_POLL_CALLBACK_NAMES
+  ):
+    logger.error(
+      "Unable to retry event polls with invalid exclusion: %r",
+      excluded_poll_name,
+    )
+    return False
+  with event_poll_retry_lock:
+    pending = tuple(event_poll_retry_pending)
+  retried = False
+  for poll_name in pending:
+    if poll_name == excluded_poll_name:
+      continue
+    if _schedule_event_poll(poll_name):
+      retried = True
+  return retried
+
+
+def _reschedule_event_poll(poll_name):
+  _schedule_event_poll(poll_name)
+  _retry_failed_event_polls(poll_name)
+
+
 def _poll_serial_events():
   try:
     while True:
@@ -10503,8 +10578,7 @@ def _poll_serial_events():
   except Exception:
     logger.exception("Unable to apply a serial worker result on the Tk event thread")
   finally:
-    if not application_closing.is_set():
-      root.after(25, _poll_serial_events)
+    _reschedule_event_poll("serial")
 
 
 def _poll_auxiliary_serial_events():
@@ -10562,13 +10636,7 @@ def _poll_auxiliary_serial_events():
     _try_dispatch_controller_correction()
     _try_dispatch_auxiliary_stop()
     _ensure_startup_auxiliary_cleanup()
-    if not application_closing.is_set():
-      try:
-        root.after(25, _poll_auxiliary_serial_events)
-      except (RuntimeError, tk.TclError):
-        logger.exception(
-          "Unable to schedule auxiliary serial result polling"
-        )
+    _reschedule_event_poll("auxiliary-serial")
 
 
 def _poll_manual_auxiliary_events():
@@ -10674,12 +10742,7 @@ def _poll_manual_auxiliary_events():
         logger.exception(
           "Unable to dispatch a queued manual auxiliary command"
         )
-      try:
-        root.after(25, _poll_manual_auxiliary_events)
-      except (RuntimeError, tk.TclError):
-        logger.exception(
-          "Unable to schedule manual auxiliary result polling"
-        )
+    _reschedule_event_poll("manual-auxiliary")
 
 
 def _poll_xbox_auxiliary_events():
@@ -10739,8 +10802,7 @@ def _poll_xbox_auxiliary_events():
   except Exception:
     logger.exception("Unable to apply an Xbox auxiliary result on the Tk event thread")
   finally:
-    if not application_closing.is_set():
-      root.after(25, _poll_xbox_auxiliary_events)
+    _reschedule_event_poll("xbox-auxiliary")
 
 
 def _poll_virtual_motion_events():
@@ -10791,8 +10853,7 @@ def _poll_virtual_motion_events():
   except Exception:
     logger.exception("Unable to apply a virtual-motion result on the Tk event thread")
   finally:
-    if not application_closing.is_set():
-      root.after(25, _poll_virtual_motion_events)
+    _reschedule_event_poll("virtual-motion")
 
 
 def _current_joint_positions():
@@ -11244,8 +11305,7 @@ def _poll_joint_motion_events():
     if not _finish_joint_motion_request_if_idle():
       _try_dispatch_deferred_joint_adjustments()
   finally:
-    if not application_closing.is_set():
-      root.after(25, _poll_joint_motion_events)
+    _reschedule_event_poll("joint-motion")
 
 
 def _queue_joint_motion(axis, value, absolute):
@@ -15368,8 +15428,7 @@ def _poll_calibration_events():
         )
         _settle_rejected_calibration_worker_result(event, exc)
   finally:
-    if not application_closing.is_set():
-      root.after(25, _poll_calibration_events)
+    _reschedule_event_poll("calibration")
 
 
 def _execute_calibration_command(
@@ -23749,13 +23808,13 @@ Copyright © 2022 by Annin Robotics. All Rights Reserved"
 RUN['xboxUse'] = 0
 
 tab1.lastProg = ""
-tab1.after(25, _poll_joint_motion_events)
-tab1.after(25, _poll_serial_events)
-tab1.after(25, _poll_calibration_events)
-tab1.after(25, _poll_auxiliary_serial_events)
-tab1.after(25, _poll_manual_auxiliary_events)
-tab1.after(25, _poll_xbox_auxiliary_events)
-tab1.after(25, _poll_virtual_motion_events)
+_schedule_event_poll("joint-motion")
+_schedule_event_poll("serial")
+_schedule_event_poll("calibration")
+_schedule_event_poll("auxiliary-serial")
+_schedule_event_poll("manual-auxiliary")
+_schedule_event_poll("xbox-auxiliary")
+_schedule_event_poll("virtual-motion")
 tab1.after(100, setCom)
 
 #tab1.mainloop()
