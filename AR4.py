@@ -10350,9 +10350,19 @@ def _queue_joint_target(axis, target):
   return _queue_joint_motion(axis, target, absolute=True)
 
 
+PRIMARY_JOINT_COUNT = 6
+
+
 def _primary_joint_position_key(axis):
-  if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis < 6:
-    raise ValueError("primary joint axis must be an integer in [0, 5]")
+  if (
+    isinstance(axis, bool)
+    or not isinstance(axis, int)
+    or not 0 <= axis < PRIMARY_JOINT_COUNT
+  ):
+    raise ValueError(
+      "primary joint axis must be an integer in "
+      f"[0, {PRIMARY_JOINT_COUNT - 1}]"
+    )
   return f"J{axis + 1}AngCur"
 
 
@@ -13792,13 +13802,16 @@ def _capture_calibration_pose_snapshot():
   )
   step_values = tuple(
     finite_number(RUN[f'J{axis}StepM'], f"saved J{axis} step monitor")
-    for axis in range(1, 7)
+    for axis in range(1, PRIMARY_JOINT_COUNT + 1)
   )
-  if len(virtual_angles) != 6 or len(step_monitors) != 6:
+  if (
+    len(virtual_angles) != PRIMARY_JOINT_COUNT
+    or len(step_monitors) != PRIMARY_JOINT_COUNT
+  ):
     raise RuntimeError("calibration pose runtime vectors must contain six values")
 
   entry_fields, jog_sliders = _calibration_pose_widget_groups()
-  primary_joint_count = len(virtual_angles)
+  primary_joint_count = PRIMARY_JOINT_COUNT
   non_primary_entry_values = tuple(
     entry_field.get()
     for entry_field in entry_fields[primary_joint_count:]
@@ -13852,11 +13865,11 @@ def _restore_calibration_pose_snapshot(snapshot):
   if snapshot_keys != CALIBRATION_POSITION_KEYS:
     raise RuntimeError("calibration pose snapshot keys are invalid")
   if (
-    len(snapshot.virtual_angles) != 6
-    or len(snapshot.step_monitors) != 6
-    or len(snapshot.step_values) != 6
+    len(snapshot.virtual_angles) != PRIMARY_JOINT_COUNT
+    or len(snapshot.step_monitors) != PRIMARY_JOINT_COUNT
+    or len(snapshot.step_values) != PRIMARY_JOINT_COUNT
     or len(snapshot.non_primary_entry_values) != (
-      len(CALIBRATION_POSITION_KEYS) - len(snapshot.virtual_angles)
+      len(CALIBRATION_POSITION_KEYS) - PRIMARY_JOINT_COUNT
     )
     or len(snapshot.slider_values) != 9
   ):
@@ -13883,7 +13896,7 @@ def _restore_calibration_pose_snapshot(snapshot):
 
   restoration_errors = []
   entry_fields, jog_sliders = _calibration_pose_widget_groups()
-  primary_joint_count = len(snapshot.virtual_angles)
+  primary_joint_count = PRIMARY_JOINT_COUNT
   for entry_field, (_, value) in zip(
     entry_fields[:primary_joint_count],
     snapshot.calibration_values[:primary_joint_count],

@@ -224,6 +224,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "calibration_serial_write_committed",
             threading.Event(),
         )
+        namespace.setdefault("PRIMARY_JOINT_COUNT", 6)
         namespace.setdefault(
             "CALIBRATION_POSITION_KEYS",
             (
@@ -10690,6 +10691,16 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(entry_argument.id, "entry")
 
     def test_primary_joint_pose_keys_match_widget_group_order(self):
+        primary_count_assignment = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "PRIMARY_JOINT_COUNT"
+                for target in node.targets
+            )
+        )
         position_keys_assignment = next(
             node
             for node in self.tree.body
@@ -10700,6 +10711,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 for target in node.targets
             )
         )
+        primary_joint_count = ast.literal_eval(primary_count_assignment.value)
         position_keys = ast.literal_eval(position_keys_assignment.value)
         widget_groups = self.module_functions["_calibration_pose_widget_groups"]
         return_node = next(
@@ -10712,12 +10724,14 @@ class HmiSourceContractTests(unittest.TestCase):
             for entry in return_node.value.elts[0].elts
         )
 
+        self.assertEqual(primary_joint_count, 6)
+        self.assertEqual(len(position_keys), len(entry_names))
         self.assertEqual(
-            position_keys[:6],
+            position_keys[:primary_joint_count],
             tuple(f"J{axis}AngCur" for axis in range(1, 7)),
         )
         self.assertEqual(
-            entry_names[:6],
+            entry_names[:primary_joint_count],
             tuple(
                 f"J{axis}curAngEntryField"
                 for axis in range(1, 7)
@@ -10781,6 +10795,22 @@ class HmiSourceContractTests(unittest.TestCase):
                 "<FocusOut>",
             },
         )
+        keyboard_entry = Entry("8.0")
+        bind_target(2, keyboard_entry)
+        keyboard_entry.bindings["<FocusIn>"](SimpleNamespace())
+        self.assertTrue(keyboard_entry._joint_target_editing)
+        self.assertTrue(keyboard_entry._joint_target_replace_on_key)
+        self.assertEqual(keyboard_entry.selections, [(0, "end")])
+        keyboard_entry.bindings["<Button-1>"](SimpleNamespace())
+        self.assertTrue(keyboard_entry._joint_target_pointer_focus)
+        self.assertTrue(keyboard_entry._joint_target_editing)
+        self.assertFalse(keyboard_entry._joint_target_replace_on_key)
+        keyboard_entry.bindings["<KeyPress>"](
+            SimpleNamespace(keysym="BackSpace")
+        )
+        self.assertFalse(keyboard_entry._joint_target_pointer_focus)
+        self.assertFalse(keyboard_entry._joint_target_replace_on_key)
+
         entry.bindings["<Button-1>"](SimpleNamespace())
         entry.bindings["<FocusIn>"](SimpleNamespace())
         self.assertFalse(entry._joint_target_pointer_focus)
@@ -10822,6 +10852,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         accepted["value"] = False
         entry.bindings["<FocusIn>"](SimpleNamespace())
+        self.assertTrue(entry._joint_target_replace_on_key)
         self.assertEqual(
             entry.selections,
             [(0, "end"), (0, "end"), (0, "end")],

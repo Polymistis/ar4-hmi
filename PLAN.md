@@ -198,8 +198,10 @@ Implemented portion:
   or keypad Enter and route through the existing semantic motion queue.
   Controller and virtual position refreshes preserve an active edit. Invalid
   submissions remain editable, while Escape or focus loss restores the latest
-  confirmed position. Hardware-free source-contract coverage passes; live
-  verification requires a later controlled HMI relaunch.
+  confirmed position. Pointer focus preserves caret editing, while keyboard
+  focus selects the complete value before replacement. Hardware-free
+  source-contract coverage passes; live verification requires a later
+  controlled HMI relaunch.
 - Automatic and single-axis calibration buttons prepare validated commands on Tk, launch worker-owned serial exchanges, and apply terminal results on Tk without serial reads or controller waits.
 - Multi-stage automatic calibration retains shared motion ownership, main transport reservation, and a shutdown-activity lease until the final successful stage or first failure settles.
 - Calibration shutdown cannot cancel an active `LL` read because current Teensy firmware exposes no paired abort command. Pre-write shutdown rejects transmission at the shared lifecycle boundary and interrupts stalled pre-write activity after the normal drain interval. Post-write shutdown remains supervised until an applied terminal controller frame or explicit quarantine and verified-close handling settles the operation, while unrelated auxiliary activity continues through normal shutdown interruption. A later protocol pass must define preemption before claiming immediate calibration cancellation.
