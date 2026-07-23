@@ -225,6 +225,13 @@ class HmiSourceContractTests(unittest.TestCase):
             threading.Event(),
         )
         namespace.setdefault(
+            "PRIMARY_JOINT_POSITION_KEYS",
+            (
+                "J1AngCur", "J2AngCur", "J3AngCur",
+                "J4AngCur", "J5AngCur", "J6AngCur",
+            ),
+        )
+        namespace.setdefault(
             "CALIBRATION_POSITION_KEYS",
             (
                 "J1AngCur", "J2AngCur", "J3AngCur",
@@ -473,7 +480,7 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_restore_joint_entry_value": (
                 "_primary_joint_position_key",
-                "_write_joint_position_entry",
+                "_reset_joint_position_entry",
             ),
             "_submit_joint_entry_target": (
                 "_primary_joint_position_key",
@@ -482,6 +489,9 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_primary_joint_position_key",
                 "_restore_joint_entry_value",
                 "_submit_joint_entry_target",
+            ),
+            "_restore_calibration_pose_snapshot": (
+                "_reset_joint_position_entry",
             ),
             "_execute_calibration_command": (
                 "_require_calibration_terminal_response",
@@ -9520,6 +9530,7 @@ class HmiSourceContractTests(unittest.TestCase):
         root = Root()
         acknowledged_target = tuple(float(axis) for axis in range(1, 10))
         namespace = {
+            "PRIMARY_JOINT_POSITION_KEYS": position_keys[:6],
             "CALIBRATION_POSITION_KEYS": position_keys,
             "CAL": {
                 key: f"saved-position-{index}"
@@ -9551,6 +9562,9 @@ class HmiSourceContractTests(unittest.TestCase):
             name: Widget(f"saved-entry-{index}")
             for index, name in enumerate(entry_names, start=1)
         })
+        namespace["J3curAngEntryField"].value = "unsubmitted-target"
+        namespace["J3curAngEntryField"]._joint_target_editing = True
+        namespace["J3curAngEntryField"]._joint_target_replace_on_key = False
         namespace.update({
             name: Widget(float(index))
             for index, name in enumerate(slider_names, start=1)
@@ -9605,8 +9619,14 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(
             tuple(namespace[name].get() for name in entry_names),
-            tuple(f"saved-entry-{index}" for index in range(1, 16)),
+            (
+                *(f"saved-position-{index}" for index in range(1, 7)),
+                *(f"saved-entry-{index}" for index in range(7, 16)),
+            ),
         )
+        for name in entry_names[:6]:
+            self.assertFalse(namespace[name]._joint_target_editing)
+            self.assertTrue(namespace[name]._joint_target_replace_on_key)
         self.assertEqual(
             tuple(namespace[name].get() for name in slider_names),
             tuple(float(index) for index in range(1, 10)),
@@ -10206,14 +10226,17 @@ class HmiSourceContractTests(unittest.TestCase):
 
     def test_virtual_gui_refresh_applies_validated_pose_once(self):
         class Widget:
-            def __init__(self):
+            def __init__(self, value=""):
+                self.value = value
                 self.events = []
 
             def delete(self, *args):
                 self.events.append(("delete", args))
+                self.value = ""
 
-            def insert(self, *args):
-                self.events.append(("insert", args))
+            def insert(self, index, value):
+                self.events.append(("insert", (index, value)))
+                self.value = value
 
             def set(self, value):
                 self.events.append(("set", value))
@@ -10225,6 +10248,8 @@ class HmiSourceContractTests(unittest.TestCase):
         cartesian_fields = [Widget() for _ in range(6)]
         joint_fields = [Widget() for _ in range(6)]
         sliders = [Widget() for _ in range(6)]
+        joint_fields[2].value = "-4.25"
+        joint_fields[2]._joint_target_editing = True
         namespace = {
             "RUN": runtime,
             "CAL": calibration,
@@ -10300,7 +10325,13 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(
             all(len(field.events) == 2 for field in cartesian_fields)
         )
-        self.assertTrue(all(len(field.events) == 2 for field in joint_fields))
+        self.assertTrue(
+            all(
+                len(field.events) == (0 if index == 2 else 2)
+                for index, field in enumerate(joint_fields)
+            )
+        )
+        self.assertEqual(joint_fields[2].value, "-4.25")
         self.assertTrue(all(len(slider.events) == 1 for slider in sliders))
 
     def test_joint_position_entry_refresh_preserves_active_edit(self):
@@ -10702,7 +10733,10 @@ class HmiSourceContractTests(unittest.TestCase):
             "_bind_joint_target_entry",
             namespace,
         )
-        write_position = namespace["_write_joint_position_entry"]
+        write_position = self.compile_function(
+            "_write_joint_position_entry",
+            namespace,
+        )
         entry = Entry("3.0")
 
         bind_target(2, entry)
@@ -10711,7 +10745,6 @@ class HmiSourceContractTests(unittest.TestCase):
             set(entry.bindings),
             {
                 "<FocusIn>",
-                "<Button-1>",
                 "<KeyPress>",
                 "<Return>",
                 "<KP_Enter>",
@@ -10720,6 +10753,8 @@ class HmiSourceContractTests(unittest.TestCase):
             },
         )
         entry.bindings["<FocusIn>"](SimpleNamespace())
+        self.assertTrue(entry._joint_target_replace_on_key)
+        self.assertEqual(entry.selections, [])
         entry.value = "-4.25"
         self.assertTrue(entry._joint_target_editing)
         self.assertFalse(write_position(entry, "8.0"))
@@ -10735,10 +10770,16 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(write_position(entry, "8.0"))
         self.assertEqual(entry.value, "8.0")
 
+        entry.bindings["<KeyPress>"](SimpleNamespace(keysym="Shift_L"))
+        self.assertFalse(entry._joint_target_editing)
+        self.assertTrue(entry._joint_target_replace_on_key)
+        self.assertEqual(entry.selections, [(0, "end")])
+
         entry.bindings["<KeyPress>"](SimpleNamespace(keysym="1"))
         entry.value = "1"
         self.assertTrue(entry._joint_target_editing)
         self.assertFalse(entry._joint_target_replace_on_key)
+        self.assertEqual(entry.selections, [(0, "end"), (0, "end")])
         self.assertFalse(write_position(entry, "9.0"))
         self.assertEqual(entry.value, "1")
 

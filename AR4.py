@@ -1754,6 +1754,14 @@ def _write_joint_position_entry(entry, value):
     return True
 
 
+def _reset_joint_position_entry(entry, value):
+    entry._joint_target_editing = False
+    entry._joint_target_replace_on_key = True
+    entry.delete(0, 'end')
+    entry.insert(0, value)
+    return True
+
+
 def refresh_gui_from_joint_angles(joint_angles):
     try:
         joints = _validated_virtual_six_vector(
@@ -10342,16 +10350,21 @@ def _queue_joint_target(axis, target):
 
 
 def _primary_joint_position_key(axis):
-  if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis < 6:
-    raise ValueError("primary joint axis must be an integer in [0, 5]")
-  return f"J{axis + 1}AngCur"
+  if (
+    isinstance(axis, bool)
+    or not isinstance(axis, int)
+    or not 0 <= axis < len(PRIMARY_JOINT_POSITION_KEYS)
+  ):
+    raise ValueError(
+      "primary joint axis must be an integer in "
+      f"[0, {len(PRIMARY_JOINT_POSITION_KEYS) - 1}]"
+    )
+  return PRIMARY_JOINT_POSITION_KEYS[axis]
 
 
 def _restore_joint_entry_value(axis, entry):
   position_key = _primary_joint_position_key(axis)
-  entry._joint_target_editing = False
-  entry._joint_target_replace_on_key = True
-  return _write_joint_position_entry(entry, CAL[position_key])
+  return _reset_joint_position_entry(entry, CAL[position_key])
 
 
 def _submit_joint_entry_target(axis, entry):
@@ -10367,19 +10380,14 @@ def _bind_joint_target_entry(axis, entry):
   entry._joint_target_editing = False
   entry._joint_target_replace_on_key = True
   non_editing_keys = frozenset((
-    "Return", "KP_Enter", "Escape", "Tab", "ISO_Left_Tab",
+    "Tab", "ISO_Left_Tab",
     "Shift_L", "Shift_R", "Control_L", "Control_R",
     "Alt_L", "Alt_R", "Caps_Lock", "Num_Lock",
   ))
 
   def begin_focus_edit(_event):
     entry._joint_target_editing = True
-    entry._joint_target_replace_on_key = False
-    entry.selection_range(0, 'end')
-
-  def begin_pointer_edit(_event):
-    entry._joint_target_editing = True
-    entry._joint_target_replace_on_key = False
+    entry._joint_target_replace_on_key = True
 
   def begin_key_edit(event):
     if getattr(event, "keysym", "") in non_editing_keys:
@@ -10403,7 +10411,6 @@ def _bind_joint_target_entry(axis, entry):
     _restore_joint_entry_value(axis, entry)
 
   entry.bind("<FocusIn>", begin_focus_edit)
-  entry.bind("<Button-1>", begin_pointer_edit)
   entry.bind("<KeyPress>", begin_key_edit)
   entry.bind("<Return>", submit_target)
   entry.bind("<KP_Enter>", submit_target)
@@ -13650,9 +13657,13 @@ class CalibrationWorkerResult:
   write_started: object
 
 
-CALIBRATION_POSITION_KEYS = (
+PRIMARY_JOINT_POSITION_KEYS = (
   'J1AngCur', 'J2AngCur', 'J3AngCur',
   'J4AngCur', 'J5AngCur', 'J6AngCur',
+)
+
+
+CALIBRATION_POSITION_KEYS = PRIMARY_JOINT_POSITION_KEYS + (
   'XcurPos', 'YcurPos', 'ZcurPos',
   'RzcurPos', 'RycurPos', 'RxcurPos',
   'J7PosCur', 'J8PosCur', 'J9PosCur',
@@ -13784,7 +13795,14 @@ def _capture_calibration_pose_snapshot():
     raise RuntimeError("calibration pose runtime vectors must contain six values")
 
   entry_fields, jog_sliders = _calibration_pose_widget_groups()
-  entry_values = tuple(entry_field.get() for entry_field in entry_fields)
+  primary_joint_count = len(PRIMARY_JOINT_POSITION_KEYS)
+  entry_values = (
+    tuple(CAL[key] for key in PRIMARY_JOINT_POSITION_KEYS)
+    + tuple(
+      entry_field.get()
+      for entry_field in entry_fields[primary_joint_count:]
+    )
+  )
   slider_values = tuple(jog_slider.get() for jog_slider in jog_sliders)
   manual_debug = manEntryField.get()
   generation = confirmed_position_generation
@@ -13863,7 +13881,19 @@ def _restore_calibration_pose_snapshot(snapshot):
 
   restoration_errors = []
   entry_fields, jog_sliders = _calibration_pose_widget_groups()
-  for entry_field, value in zip(entry_fields, snapshot.entry_values):
+  primary_joint_count = len(PRIMARY_JOINT_POSITION_KEYS)
+  for entry_field, value in zip(
+    entry_fields[:primary_joint_count],
+    snapshot.entry_values[:primary_joint_count],
+  ):
+    try:
+      _reset_joint_position_entry(entry_field, value)
+    except Exception as exc:
+      restoration_errors.append(f"pose entry restoration failed: {exc}")
+  for entry_field, value in zip(
+    entry_fields[primary_joint_count:],
+    snapshot.entry_values[primary_joint_count:],
+  ):
     try:
       entry_field.delete(0, 'end')
       entry_field.insert(0, value)
@@ -15588,12 +15618,8 @@ def displayPosition(response, parsed=None, synchronize_dispatcher=True):
   RUN['WC'] = "F" if parsed.joints[4] > 0 else "N"
 
   entry_fields, jog_sliders = _calibration_pose_widget_groups()
-  for index, (entry_field, value) in enumerate(zip(entry_fields, position_values)):
-    if index < 6:
-      _write_joint_position_entry(entry_field, value)
-    else:
-      entry_field.delete(0, 'end')
-      entry_field.insert(0, value)
+  for entry_field, value in zip(entry_fields, position_values):
+    _write_joint_position_entry(entry_field, value)
 
   for jog_slider, value in zip(
     jog_sliders,
@@ -18604,39 +18630,31 @@ jointFrame.grid_columnconfigure(1, weight=1)
 
 # Helper function to create joint control widgets
 def create_joint_jog_frame(parent, row, col, joint_name, joint_num):
-    """Create a joint jog control frame with an exact-target entry."""
     frame = Frame(parent)
     frame.grid(row=row, column=col, sticky="ew", padx=2, pady=2)
     
-    # Configure internal grid
-    frame.grid_columnconfigure(0, weight=0)  # Label
-    frame.grid_columnconfigure(1, weight=0)  # Entry
-    frame.grid_columnconfigure(2, weight=0)  # Neg button
-    frame.grid_columnconfigure(3, weight=1)  # Slider
-    frame.grid_columnconfigure(4, weight=0)  # Pos button
+    frame.grid_columnconfigure(0, weight=0)
+    frame.grid_columnconfigure(1, weight=0)
+    frame.grid_columnconfigure(2, weight=0)
+    frame.grid_columnconfigure(3, weight=1)
+    frame.grid_columnconfigure(4, weight=0)
     
-    # Joint label
     lab = Label(frame, font=("Arial", 14), text=joint_name)
     lab.grid(row=0, column=0, padx=2)
     
-    # Confirmed angle display and exact-target entry
     entry = Entry(frame, width=8, justify="center")
     entry.grid(row=0, column=1, padx=2)
     _bind_joint_target_entry(joint_num - 1, entry)
     
-    # Negative jog button
     neg_but = Button(frame, text="-", width=3)
     neg_but.grid(row=0, column=2, padx=2)
     
-    # Slider
     slider = Scale(frame, from_=-170, to=170, orient=HORIZONTAL, length=150)
     slider.grid(row=0, column=3, sticky="ew", padx=2)
     
-    # Positive jog button
     pos_but = Button(frame, text="+", width=3)
     pos_but.grid(row=0, column=4, padx=2)
     
-    # Limit labels (second row)
     neg_lim_lab = Label(frame, font=("Arial", 8), text="-170", style="Jointlim.TLabel")
     neg_lim_lab.grid(row=1, column=2, sticky="w")
     
