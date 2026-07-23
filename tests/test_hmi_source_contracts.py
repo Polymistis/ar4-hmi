@@ -59,6 +59,8 @@ from ARrobots.HMI.joint_motion import (
     finite_number,
     motion_timing_response_timeout,
     normalize_auxiliary_board_profile,
+    parse_auxiliary_output_command,
+    parse_auxiliary_servo_command,
     parse_command_timing,
     parse_controller_identity_response,
     parse_controller_modbus_response,
@@ -71,6 +73,7 @@ from ARrobots.HMI.joint_motion import (
     read_serial_line_response_with_optional_followup,
     serial_transport_quarantined,
     validate_auxiliary_output_command,
+    validate_auxiliary_servo_command,
     validate_controller_filename,
     write_serial_control,
 )
@@ -214,6 +217,16 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault("dataclass", dataclass)
         namespace.setdefault("threading", threading)
         namespace.setdefault("contextmanager", contextmanager)
+        namespace.setdefault(
+            "manual_auxiliary_stop_barrier",
+            threading.Event(),
+        )
+        namespace.setdefault(
+            "program_stop_state_lock",
+            threading.RLock(),
+        )
+        namespace.setdefault("program_stop_status_event_queue", Queue())
+        namespace.setdefault("Empty", Empty)
         namespace.setdefault("application_lifecycle_lock", threading.Lock())
         namespace.setdefault("calibration_terminal_owner_lock", threading.Lock())
         namespace.setdefault(
@@ -375,6 +388,20 @@ class HmiSourceContractTests(unittest.TestCase):
                 namespace,
             )
         dependencies = {
+            **{
+                function_name: ("_manual_auxiliary_error_detail",)
+                for function_name in (
+                    "_run_manual_auxiliary_request",
+                    "_try_dispatch_manual_auxiliary_request",
+                    "_queue_manual_auxiliary_command",
+                    "_request_manual_servo",
+                    "_request_manual_output",
+                    "_poll_manual_auxiliary_events",
+                )
+            },
+            "_poll_auxiliary_serial_events": (
+                "_apply_program_stop_status_events",
+            ),
             "_set_cpp_kinematics_from_values": (
                 "_prepare_cpp_kinematics_configuration",
             ),
@@ -637,6 +664,7 @@ class HmiSourceContractTests(unittest.TestCase):
     def add_shutdown_dependencies(namespace):
         namespace.setdefault("_calibration_shutdown_pending", lambda: False)
         namespace.setdefault("_poll_calibration_events", lambda: None)
+        namespace.setdefault("_poll_manual_auxiliary_events", lambda: None)
         namespace.setdefault("_poll_virtual_motion_events", lambda: None)
         namespace.setdefault("startup_controller_cleanup_lock", threading.Lock())
         namespace.setdefault("startup_controller_cleanup_pending", {})
@@ -5652,10 +5680,11 @@ class HmiSourceContractTests(unittest.TestCase):
                 if isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
             }
-            self.assertIn("_write_legacy_auxiliary_command", called_names)
+            self.assertEqual(called_names, {"_request_manual_output"})
 
         for function_name in (
             "_execute_row_auxiliary_command",
+            "_exchange_manual_auxiliary_command",
             "_exchange_xbox_auxiliary_command",
         ):
             called_names = {
@@ -5709,6 +5738,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "validate_auxiliary_output_command": (
                 validate_auxiliary_output_command
             ),
+            "validate_auxiliary_servo_command": (
+                validate_auxiliary_servo_command
+            ),
             "write_serial_control": write_serial_control,
             "auxiliary_serial_write_lock": threading.Lock(),
             "_clear_auxiliary_board_profile": lambda serial_port=None: True,
@@ -5738,8 +5770,775 @@ class HmiSourceContractTests(unittest.TestCase):
         runtime["ser2BoardProfile"] = None
         with self.assertRaisesRegex(MotionInputError, "not bound"):
             write_output("ONX28\n")
+        with self.assertRaisesRegex(MotionInputError, "not bound"):
+            write_output("SV0P0\n")
+        runtime["ser2BoardProfile"] = (port, AUXILIARY_BOARD_NANO)
         write_output("SV0P0\n")
         self.assertEqual(port.commands[-1], b"SV0P0\n")
+        write_output("SV00P090\n")
+        self.assertEqual(port.commands[-1], b"SV00P090\n")
+
+    def test_manual_auxiliary_buttons_are_nonblocking_thin_wrappers(self):
+        for channel in range(4):
+            for state_name, expected_state in (("on", True), ("off", False)):
+                function_name = f"Servo{channel}{state_name}"
+                function = self.module_functions[function_name]
+                calls = [
+                    node
+                    for node in ast.walk(function)
+                    if isinstance(node, ast.Call)
+                ]
+                self.assertEqual(len(calls), 1, function_name)
+                self.assertIsInstance(calls[0].func, ast.Name, function_name)
+                self.assertEqual(
+                    calls[0].func.id,
+                    "_request_manual_servo",
+                    function_name,
+                )
+                self.assertEqual(calls[0].args[0].value, channel)
+                self.assertEqual(calls[0].args[1].value, expected_state)
+                self.assertIsInstance(calls[0].args[2], ast.Name)
+                self.assertEqual(
+                    calls[0].args[2].id,
+                    f"servo{channel}{state_name}EntryField",
+                )
+
+        for row in range(1, 7):
+            for state_name, expected_state in (("on", True), ("off", False)):
+                function_name = f"DO{row}{state_name}"
+                function = self.module_functions[function_name]
+                calls = [
+                    node
+                    for node in ast.walk(function)
+                    if isinstance(node, ast.Call)
+                ]
+                self.assertEqual(len(calls), 1, function_name)
+                self.assertIsInstance(calls[0].func, ast.Name, function_name)
+                self.assertEqual(
+                    calls[0].func.id,
+                    "_request_manual_output",
+                    function_name,
+                )
+                self.assertEqual(calls[0].args[0].value, row)
+                self.assertEqual(calls[0].args[1].value, expected_state)
+                self.assertIsInstance(calls[0].args[2], ast.Name)
+                self.assertEqual(
+                    calls[0].args[2].id,
+                    f"DO{row}{state_name}EntryField",
+                )
+
+    def test_manual_auxiliary_expected_response_validates_profile_and_command(self):
+        class Port:
+            is_open = True
+
+        port = Port()
+        runtime = {
+            "ser2": port,
+            "ser2BoardProfile": (port, AUXILIARY_BOARD_NANO),
+        }
+        namespace = {
+            "RUN": runtime,
+            "MotionInputError": MotionInputError,
+            "normalize_auxiliary_board_profile": (
+                normalize_auxiliary_board_profile
+            ),
+            "validate_auxiliary_output_command": (
+                validate_auxiliary_output_command
+            ),
+            "validate_auxiliary_servo_command": (
+                validate_auxiliary_servo_command
+            ),
+        }
+        namespace["_connected_auxiliary_board_profile"] = self.compile_function(
+            "_connected_auxiliary_board_profile",
+            namespace,
+        )
+        expected_response = self.compile_function(
+            "_manual_auxiliary_expected_response",
+            namespace,
+        )
+
+        self.assertEqual(
+            expected_response("SV3P180\n", port),
+            b"Servo Done",
+        )
+        self.assertEqual(
+            expected_response("SV03P090\n", port),
+            b"Servo Done",
+        )
+        self.assertEqual(expected_response("ONX8\n", port), b"Done")
+        with self.assertRaises(MotionInputError):
+            expected_response("SV3P181\n", port)
+        with self.assertRaises(MotionInputError):
+            expected_response("ONX28\n", port)
+        with self.assertRaises(MotionInputError):
+            expected_response("BAD\n", port)
+
+        runtime["ser2BoardProfile"] = None
+        with self.assertRaisesRegex(MotionInputError, "not bound"):
+            expected_response("SV0P0\n", port)
+
+    def test_manual_auxiliary_error_detail_normalizes_exception_text(self):
+        class UnprintableError(Exception):
+            def __str__(self):
+                raise RuntimeError("formatting failed")
+
+        detail = self.compile_function(
+            "_manual_auxiliary_error_detail",
+            {},
+        )
+
+        self.assertEqual(
+            detail(RuntimeError("  invalid value\n"), "fallback"),
+            "invalid value",
+        )
+        self.assertEqual(detail(RuntimeError(""), "fallback"), "fallback")
+        self.assertEqual(detail(UnprintableError(), "fallback"), "fallback")
+        with self.assertRaises(TypeError):
+            detail(RuntimeError("invalid"), " fallback ")
+
+    def test_manual_auxiliary_requests_queue_and_apply_results_on_tk(self):
+        class Port:
+            is_open = True
+
+        class Entry:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class Widget:
+            def __init__(self):
+                self.value = None
+                self.configurations = []
+
+            def delete(self, *args):
+                self.value = None
+
+            def insert(self, index, value):
+                self.value = value
+
+            def config(self, **kwargs):
+                self.configurations.append(kwargs)
+
+        class Registry:
+            def __init__(self):
+                self.busy = True
+                self.on_active = None
+
+            def active(self, serial_name):
+                self.test_serial_name = serial_name
+                if self.on_active is not None:
+                    self.on_active()
+                return self.busy
+
+        class ImmediateThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def start(self):
+                self.target(*self.args)
+
+        constant_names = {
+            "MANUAL_AUXILIARY_CALIBRATION_KEYS",
+            "MANUAL_AUXILIARY_QUEUE_LIMIT",
+        }
+        constant_nodes = [
+            copy.deepcopy(node)
+            for node in self.tree.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in constant_names
+        ]
+        self.assertEqual(
+            {node.targets[0].id for node in constant_nodes},
+            constant_names,
+        )
+        constants = {"frozenset": frozenset, "range": range}
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=constant_nodes, type_ignores=[])
+                ),
+                str(AR4_SOURCE),
+                "exec",
+            ),
+            constants,
+        )
+        manual_keys = constants["MANUAL_AUXILIARY_CALIBRATION_KEYS"]
+        queue_limit = constants["MANUAL_AUXILIARY_QUEUE_LIMIT"]
+        port = Port()
+        runtime = {
+            "ser2": port,
+            "ser2BoardProfile": (port, AUXILIARY_BOARD_NANO),
+            "offlineMode": False,
+            "programStopRequestId": None,
+            "programStopStatusLatched": False,
+            "estopActive": False,
+            "posOutreach": False,
+        }
+        first_label = Widget()
+        second_label = Widget()
+        sent = Widget()
+        received = Widget()
+        registry = Registry()
+        event_queue = Queue()
+        scheduled = []
+        persisted = []
+        exchanges = []
+        closed = []
+        logged_errors = []
+        namespace = {
+            "dataclass": dataclass,
+            "re": re,
+            "MAX_COMMAND_LENGTH": MAX_COMMAND_LENGTH,
+            "MANUAL_AUXILIARY_CALIBRATION_KEYS": manual_keys,
+            "MANUAL_AUXILIARY_QUEUE_LIMIT": queue_limit,
+            "MotionInputError": MotionInputError,
+            "ProtocolResponseError": ProtocolResponseError,
+            "parse_auxiliary_servo_command": (
+                parse_auxiliary_servo_command
+            ),
+            "parse_auxiliary_output_command": (
+                parse_auxiliary_output_command
+            ),
+            "validate_auxiliary_servo_command": (
+                validate_auxiliary_servo_command
+            ),
+            "validate_auxiliary_output_command": (
+                validate_auxiliary_output_command
+            ),
+            "normalize_auxiliary_board_profile": (
+                normalize_auxiliary_board_profile
+            ),
+            "RUN": runtime,
+            "manual_auxiliary_event_queue": event_queue,
+            "manual_auxiliary_request_queue": [],
+            "manual_auxiliary_active_request": None,
+            "manual_auxiliary_next_request_id": 0,
+            "manual_auxiliary_state_lock": threading.Lock(),
+            "manual_auxiliary_stop_barrier": threading.Event(),
+            "application_closing": threading.Event(),
+            "auxiliary_stop_requested": threading.Event(),
+            "auxiliary_stop_state_lock": threading.Lock(),
+            "auxiliary_stop_pending_request_id": None,
+            "auxiliary_stop_active_request_id": None,
+            "serial_activity_registry": registry,
+            "auxiliary_serial_lock": threading.Lock(),
+            "threading": SimpleNamespace(Thread=ImmediateThread),
+            "almStatusLab": first_label,
+            "almStatusLab2": second_label,
+            "cmdSentEntryField": sent,
+            "cmdRecEntryField": received,
+            "CAL": {},
+            "_retain_calibration_persistence_retry": (
+                lambda: persisted.append(True) or True
+            ),
+            "_close_serial_port": (
+                lambda *args: closed.append(args) or True
+            ),
+            "logger": SimpleNamespace(
+                error=lambda *args: logged_errors.append(args),
+                warning=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "Empty": Empty,
+            "root": SimpleNamespace(
+                after=lambda *args: scheduled.append(args) or len(scheduled)
+            ),
+        }
+        namespace["ManualAuxiliaryRequest"] = self.compile_class(
+            "ManualAuxiliaryRequest",
+            namespace,
+        )
+        namespace["ManualAuxiliaryResult"] = self.compile_class(
+            "ManualAuxiliaryResult",
+            namespace,
+        )
+        namespace["_connected_auxiliary_board_profile"] = self.compile_function(
+            "_connected_auxiliary_board_profile",
+            namespace,
+        )
+        namespace["_manual_auxiliary_expected_response"] = self.compile_function(
+            "_manual_auxiliary_expected_response",
+            namespace,
+        )
+        stop_in_progress = self.compile_function(
+            "_manual_auxiliary_stop_in_progress",
+            namespace,
+        )
+        namespace["_manual_auxiliary_stop_in_progress"] = stop_in_progress
+        self.assertFalse(stop_in_progress())
+        namespace["manual_auxiliary_stop_barrier"].set()
+        self.assertTrue(stop_in_progress())
+        namespace["manual_auxiliary_stop_barrier"].clear()
+        namespace["auxiliary_stop_requested"].set()
+        self.assertTrue(stop_in_progress())
+        namespace["auxiliary_stop_requested"].clear()
+        namespace["auxiliary_stop_pending_request_id"] = 1
+        self.assertTrue(stop_in_progress())
+        namespace["auxiliary_stop_pending_request_id"] = None
+        namespace["auxiliary_stop_active_request_id"] = 2
+        self.assertTrue(stop_in_progress())
+        namespace["auxiliary_stop_active_request_id"] = None
+        runtime["programStopRequestId"] = 3
+        self.assertTrue(stop_in_progress())
+        runtime["programStopRequestId"] = None
+        runtime["estopActive"] = True
+        self.assertTrue(stop_in_progress())
+        runtime["estopActive"] = False
+        runtime["posOutreach"] = True
+        self.assertTrue(stop_in_progress())
+        runtime["posOutreach"] = False
+        self.assertFalse(stop_in_progress())
+        namespace["_manual_auxiliary_status_reserved"] = self.compile_function(
+            "_manual_auxiliary_status_reserved",
+            namespace,
+        )
+        namespace["_set_manual_auxiliary_status"] = self.compile_function(
+            "_set_manual_auxiliary_status",
+            namespace,
+        )
+        namespace["_set_manual_auxiliary_feedback"] = self.compile_function(
+            "_set_manual_auxiliary_feedback",
+            namespace,
+        )
+        namespace["_render_manual_auxiliary_rejection"] = self.compile_function(
+            "_render_manual_auxiliary_rejection",
+            namespace,
+        )
+        namespace["_begin_manual_auxiliary_stop"] = (
+            self.compile_function(
+                "_begin_manual_auxiliary_stop",
+                namespace,
+            )
+        )
+        namespace["_reject_queued_manual_auxiliary_requests"] = (
+            self.compile_function(
+                "_reject_queued_manual_auxiliary_requests",
+                namespace,
+            )
+        )
+
+        def exchange(command, expected_response, expected_serial_port):
+            exchanges.append(
+                (command, expected_response, expected_serial_port)
+            )
+            return expected_response.decode("ascii")
+
+        namespace["_exchange_manual_auxiliary_command"] = exchange
+        namespace["_run_manual_auxiliary_request"] = self.compile_function(
+            "_run_manual_auxiliary_request",
+            namespace,
+        )
+        namespace["_try_dispatch_manual_auxiliary_request"] = (
+            self.compile_function(
+                "_try_dispatch_manual_auxiliary_request",
+                namespace,
+            )
+        )
+        namespace["_queue_manual_auxiliary_command"] = self.compile_function(
+            "_queue_manual_auxiliary_command",
+            namespace,
+        )
+        request_servo = self.compile_function(
+            "_request_manual_servo",
+            namespace,
+        )
+        request_output = self.compile_function(
+            "_request_manual_output",
+            namespace,
+        )
+        poll_results = self.compile_function(
+            "_poll_manual_auxiliary_events",
+            namespace,
+        )
+
+        registry.busy = False
+        self.assertTrue(request_servo(2, True, Entry("090")))
+        self.assertTrue(request_output(1, False, Entry("8")))
+        self.assertEqual(len(namespace["manual_auxiliary_request_queue"]), 1)
+        self.assertIsNotNone(namespace["manual_auxiliary_active_request"])
+        self.assertEqual(
+            exchanges,
+            [("SV2P090\n", b"Servo Done", port)],
+        )
+        poll_results()
+        self.assertEqual(namespace["CAL"], {"Servo2on": "090"})
+        self.assertEqual(
+            exchanges,
+            [
+                ("SV2P090\n", b"Servo Done", port),
+                ("OFX8\n", b"Done", port),
+            ],
+        )
+        poll_results()
+        self.assertEqual(
+            namespace["CAL"],
+            {"Servo2on": "090", "DO1off": "8"},
+        )
+        self.assertEqual(persisted, [True, True])
+        self.assertEqual(sent.value, "OFX8\n")
+        self.assertEqual(received.value, "Done")
+        self.assertIsNone(namespace["manual_auxiliary_active_request"])
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+        self.assertEqual(closed, [])
+        self.assertTrue(scheduled)
+
+        rejected_attempts = []
+
+        def reject_transport(command, *args):
+            rejected_attempts.append(command)
+            return False
+
+        namespace["_exchange_manual_auxiliary_command"] = reject_transport
+        self.assertTrue(request_output(2, True, Entry("9")))
+        poll_results()
+        self.assertEqual(rejected_attempts, ["ONX9\n"])
+        self.assertNotIn("DO2on", namespace["CAL"])
+        self.assertIsNone(namespace["manual_auxiliary_active_request"])
+
+        registry.busy = True
+        self.assertFalse(request_output(1, True, Entry("8")))
+        self.assertEqual(
+            received.value,
+            "AUXILIARY COMMAND REJECTED WHILE TRANSPORT IS BUSY",
+        )
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+        registry.busy = False
+
+        request_count = namespace["manual_auxiliary_next_request_id"]
+        self.assertFalse(request_servo(2, True, Entry("181")))
+        self.assertEqual(
+            namespace["manual_auxiliary_next_request_id"],
+            request_count,
+        )
+        runtime["offlineMode"] = True
+        self.assertFalse(request_output(1, True, Entry("8")))
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+        runtime["offlineMode"] = False
+        failing_entry = SimpleNamespace(
+            get=lambda: (
+                _ for _ in ()
+            ).throw(RuntimeError(" entry unavailable\n"))
+        )
+        self.assertFalse(request_servo(0, True, failing_entry))
+        self.assertEqual(
+            received.value,
+            "Manual servo entry could not be read: entry unavailable",
+        )
+        self.assertFalse(request_output(1, True, failing_entry))
+        self.assertEqual(
+            received.value,
+            "Manual output entry could not be read: entry unavailable",
+        )
+        self.assertEqual(
+            first_label.configurations[-1]["style"],
+            "Alarm.TLabel",
+        )
+
+        persistence_count = len(persisted)
+
+        def fail_exchange(*args):
+            raise ProtocolResponseError("response failed")
+
+        namespace["_exchange_manual_auxiliary_command"] = fail_exchange
+        self.assertTrue(request_output(3, True, Entry("10")))
+        self.assertTrue(request_output(4, True, Entry("11")))
+        poll_results()
+        self.assertIsNone(namespace["manual_auxiliary_active_request"])
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+        self.assertNotIn("DO3on", namespace["CAL"])
+        self.assertNotIn("DO4on", namespace["CAL"])
+        self.assertEqual(len(persisted), persistence_count)
+        self.assertIn(
+            "1 queued command(s) discarded",
+            received.value,
+        )
+        self.assertTrue(
+            any(
+                "1 queued command(s) discarded" in str(arguments[0])
+                for arguments in logged_errors
+            )
+        )
+        self.assertEqual(
+            first_label.configurations[-1]["style"],
+            "Alarm.TLabel",
+        )
+
+        namespace["_exchange_manual_auxiliary_command"] = exchange
+        self.assertTrue(request_output(1, True, Entry("08")))
+        event_queue.get_nowait()
+        event_queue.put(object())
+        poll_results()
+        self.assertIsNone(namespace["manual_auxiliary_active_request"])
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+        self.assertEqual(
+            closed[-1],
+            ("ser2", "invalid manual auxiliary worker result"),
+        )
+
+        self.assertTrue(request_output(1, True, Entry("8")))
+        accepted = [
+            request_output(1, True, Entry("8"))
+            for _ in range(queue_limit - 1)
+        ]
+        self.assertTrue(all(accepted))
+        self.assertEqual(
+            len(namespace["manual_auxiliary_request_queue"]),
+            queue_limit - 1,
+        )
+        self.assertFalse(request_output(1, True, Entry("8")))
+        self.assertEqual(
+            first_label.configurations[-1]["style"],
+            "Alarm.TLabel",
+        )
+        self.assertEqual(
+            namespace["_begin_manual_auxiliary_stop"](
+                "test stop"
+            ),
+            queue_limit - 1,
+        )
+        poll_results()
+        self.assertIsNone(namespace["manual_auxiliary_active_request"])
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+
+        configuration_count = len(first_label.configurations)
+        runtime["programStopStatusLatched"] = True
+        self.assertFalse(request_output(1, True, Entry("8")))
+        self.assertEqual(
+            received.value,
+            "AUXILIARY COMMAND REJECTED WHILE STOPPED",
+        )
+        self.assertFalse(
+            namespace["_set_manual_auxiliary_status"](
+                "AUXILIARY COMMAND COMPLETE",
+                "OK.TLabel",
+            )
+        )
+        self.assertEqual(
+            len(first_label.configurations),
+            configuration_count,
+        )
+        namespace["manual_auxiliary_stop_barrier"].clear()
+
+        configuration_count = len(first_label.configurations)
+        self.assertTrue(request_output(1, True, Entry("8")))
+        poll_results()
+        self.assertTrue(runtime["programStopStatusLatched"])
+        self.assertEqual(
+            len(first_label.configurations),
+            configuration_count,
+        )
+        runtime["programStopStatusLatched"] = False
+
+        expected_response = namespace["_manual_auxiliary_expected_response"]
+        request_count = namespace["manual_auxiliary_next_request_id"]
+
+        def stop_during_validation(command, serial_port):
+            namespace["manual_auxiliary_stop_barrier"].set()
+            return expected_response(command, serial_port)
+
+        namespace["_manual_auxiliary_expected_response"] = (
+            stop_during_validation
+        )
+        self.assertFalse(request_output(1, True, Entry("8")))
+        self.assertEqual(
+            namespace["manual_auxiliary_next_request_id"],
+            request_count,
+        )
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+        namespace["manual_auxiliary_stop_barrier"].clear()
+        namespace["_manual_auxiliary_expected_response"] = expected_response
+
+        namespace["_exchange_manual_auxiliary_command"] = exchange
+        self.assertTrue(request_output(1, True, Entry("8")))
+        self.assertTrue(request_output(2, True, Entry("9")))
+        registry.busy = True
+        poll_results()
+        self.assertIsNone(namespace["manual_auxiliary_active_request"])
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+        self.assertEqual(
+            received.value,
+            "AUXILIARY COMMANDS REJECTED WHILE TRANSPORT IS BUSY",
+        )
+        registry.busy = False
+
+        self.assertTrue(request_output(1, True, Entry("8")))
+        self.assertTrue(request_output(2, True, Entry("9")))
+        registry.on_active = namespace["manual_auxiliary_stop_barrier"].set
+        poll_results()
+        self.assertIsNone(namespace["manual_auxiliary_active_request"])
+        self.assertEqual(len(namespace["manual_auxiliary_request_queue"]), 1)
+        registry.on_active = None
+        self.assertEqual(
+            namespace["_begin_manual_auxiliary_stop"]("test stop"),
+            1,
+        )
+        namespace["manual_auxiliary_stop_barrier"].clear()
+
+        dispatch_request = namespace["_try_dispatch_manual_auxiliary_request"]
+
+        def cancel_after_append():
+            with namespace["manual_auxiliary_state_lock"]:
+                namespace["manual_auxiliary_request_queue"].clear()
+            return False
+
+        namespace["_try_dispatch_manual_auxiliary_request"] = (
+            cancel_after_append
+        )
+        self.assertFalse(request_output(1, True, Entry("8")))
+        self.assertEqual(
+            received.value,
+            "AUXILIARY COMMAND CANCELLED BEFORE DISPATCH",
+        )
+        namespace["_try_dispatch_manual_auxiliary_request"] = dispatch_request
+
+        stopped_attempts = []
+
+        def reject_after_stop(command, *args):
+            stopped_attempts.append(command)
+            return False
+
+        namespace["_exchange_manual_auxiliary_command"] = reject_after_stop
+        self.assertTrue(request_output(2, True, Entry("9")))
+        namespace["_begin_manual_auxiliary_stop"](
+            "test stop"
+        )
+        poll_results()
+        self.assertEqual(stopped_attempts, ["ONX9\n"])
+        self.assertIsNone(namespace["manual_auxiliary_active_request"])
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+        namespace["manual_auxiliary_stop_barrier"].clear()
+
+        namespace["_exchange_manual_auxiliary_command"] = exchange
+        runtime["programStopStatusLatched"] = False
+        self.assertTrue(request_output(1, True, Entry("8")))
+        self.assertTrue(request_output(2, True, Entry("9")))
+        scheduled_count = len(scheduled)
+        namespace["application_closing"].set()
+        poll_results()
+        self.assertIsNone(namespace["manual_auxiliary_active_request"])
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+        self.assertEqual(len(scheduled), scheduled_count)
+        namespace["application_closing"].clear()
+
+        def fail_dispatch():
+            raise RuntimeError("dispatch failed")
+
+        namespace["_try_dispatch_manual_auxiliary_request"] = fail_dispatch
+        scheduled_count = len(scheduled)
+        poll_results()
+        self.assertEqual(len(scheduled), scheduled_count + 1)
+        namespace["_try_dispatch_manual_auxiliary_request"] = dispatch_request
+
+        class FailingThread:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError(" thread construction failed\n")
+
+        namespace["threading"] = SimpleNamespace(Thread=FailingThread)
+        namespace["_try_dispatch_manual_auxiliary_request"] = (
+            self.compile_function(
+                "_try_dispatch_manual_auxiliary_request",
+                namespace,
+            )
+        )
+        namespace["_queue_manual_auxiliary_command"] = self.compile_function(
+            "_queue_manual_auxiliary_command",
+            namespace,
+        )
+        registry.busy = False
+        self.assertTrue(request_output(1, True, Entry("8")))
+        poll_results()
+        self.assertIsNone(namespace["manual_auxiliary_active_request"])
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+        self.assertEqual(
+            first_label.configurations[-1]["style"],
+            "Alarm.TLabel",
+        )
+        self.assertEqual(
+            received.value,
+            "Manual auxiliary command failed: "
+            "Unable to start manual auxiliary worker: "
+            "thread construction failed",
+        )
+        namespace["_run_manual_auxiliary_request"](object())
+        self.assertIsNone(event_queue.get_nowait())
+
+    def test_manual_auxiliary_exchange_checks_identity_and_exact_contract(self):
+        class Port:
+            is_open = True
+
+        port = Port()
+        replacement = Port()
+        runtime = {
+            "ser2": port,
+            "ser2BoardProfile": (port, AUXILIARY_BOARD_NANO),
+        }
+        writes = []
+        reads = []
+        closes = []
+        namespace = {
+            "RUN": runtime,
+            "MotionInputError": MotionInputError,
+            "normalize_auxiliary_board_profile": (
+                normalize_auxiliary_board_profile
+            ),
+            "validate_auxiliary_output_command": (
+                validate_auxiliary_output_command
+            ),
+            "validate_auxiliary_servo_command": (
+                validate_auxiliary_servo_command
+            ),
+            "SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS": 5,
+            "_write_legacy_auxiliary_command": (
+                lambda command: writes.append(command) or True
+            ),
+            "read_serial_exact_response": (
+                lambda serial_port, expected, timeout: (
+                    reads.append((serial_port, expected, timeout))
+                    or expected.decode("ascii")
+                )
+            ),
+            "_close_serial_port": (
+                lambda *args: closes.append(args) or True
+            ),
+        }
+        namespace["_connected_auxiliary_board_profile"] = self.compile_function(
+            "_connected_auxiliary_board_profile",
+            namespace,
+        )
+        namespace["_manual_auxiliary_expected_response"] = self.compile_function(
+            "_manual_auxiliary_expected_response",
+            namespace,
+        )
+        exchange = self.compile_function(
+            "_exchange_manual_auxiliary_command",
+            namespace,
+        )
+
+        self.assertEqual(
+            exchange("SV0P45\n", b"Servo Done", port),
+            "Servo Done",
+        )
+        self.assertEqual(writes, ["SV0P45\n"])
+        self.assertEqual(reads, [(port, b"Servo Done", 5)])
+        with self.assertRaises(MotionInputError):
+            exchange("SV0P45\n", b"Done", port)
+        self.assertEqual(writes, ["SV0P45\n"])
+
+        runtime["ser2"] = replacement
+        runtime["ser2BoardProfile"] = (
+            replacement,
+            AUXILIARY_BOARD_NANO,
+        )
+        with self.assertRaisesRegex(ConnectionError, "connection changed"):
+            exchange("SV0P45\n", b"Servo Done", port)
+        self.assertEqual(closes, [])
 
     def test_auxiliary_connection_binds_and_clears_one_board_profile(self):
         class Port:
@@ -6783,6 +7582,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_write_legacy_auxiliary_command": {"ser2"},
             # Admission helpers capture connection identity before dispatching
             # work through an operation-owning transport path.
+            "_queue_manual_auxiliary_command": {"ser2"},
             "_start_xbox_auxiliary_request": {"ser2"},
             "_try_dispatch_controller_correction": {"ser"},
             "send_xbox_auxiliary": {"ser2"},
@@ -7216,36 +8016,204 @@ class HmiSourceContractTests(unittest.TestCase):
 
         first_label = Label()
         second_label = Label()
+        cancelled = []
+        stop_barrier = threading.Event()
+
+        def begin_stop(reason):
+            stop_barrier.set()
+            cancelled.append(reason)
+            return 2
+
         runtime = {
             "estopActive": False,
             "posOutreach": False,
             "programStopRequestId": None,
         }
+
+        def request_stop(on_reserved):
+            on_reserved(8)
+            return "pending", 8
+
         namespace = {
-            "_request_auxiliary_stop": lambda: ("pending", 8),
+            "_request_auxiliary_stop": request_stop,
             "tab1": SimpleNamespace(runTrue=1),
             "RUN": runtime,
             "logger": SimpleNamespace(exception=lambda *args: None),
             "almStatusLab": first_label,
             "almStatusLab2": second_label,
             "AUXILIARY_STOP_NOT_REQUIRED": "not-required",
+            "manual_auxiliary_stop_barrier": stop_barrier,
+            "_begin_manual_auxiliary_stop": begin_stop,
         }
         namespace["_set_program_stop_status"] = self.compile_function(
             "_set_program_stop_status",
             namespace,
         )
+        apply_status = self.compile_function(
+            "_apply_program_stop_status_events",
+            namespace,
+        )
         stop_program = self.compile_function("stopProg", namespace)
 
         stop_program()
+        apply_status()
 
         self.assertEqual(runtime["programStopRequestId"], 8)
         self.assertEqual(runtime["programStopState"], "pending")
+        self.assertTrue(runtime["programStopStatusLatched"])
+        self.assertTrue(stop_barrier.is_set())
+        self.assertEqual(cancelled, ["program stop requested"])
         self.assertEqual(
             first_label.text,
             "PROGRAM HALT REQUESTED; AUXILIARY STOP PENDING; "
             "ACTIVE MAIN MOTION NOT PREEMPTED",
         )
         self.assertEqual(second_label.text, first_label.text)
+
+    def test_program_stop_status_renders_only_when_tk_poll_applies_queue(self):
+        class StateLock:
+            def __init__(self):
+                self.lock = threading.RLock()
+                self.depth = 0
+
+            def __enter__(self):
+                self.lock.acquire()
+                self.depth += 1
+                return self
+
+            def __exit__(self, *args):
+                self.depth -= 1
+                self.lock.release()
+
+        state_lock = StateLock()
+        rendered = []
+
+        class Label:
+            def config(self, **kwargs):
+                self.assert_unlocked()
+                rendered.append(kwargs)
+
+            def assert_unlocked(self):
+                if state_lock.depth:
+                    raise AssertionError(
+                        "program-stop status rendered while state lock was held"
+                    )
+
+        namespace = {
+            "program_stop_state_lock": state_lock,
+            "RUN": {
+                "estopActive": False,
+                "posOutreach": False,
+            },
+            "almStatusLab": Label(),
+            "almStatusLab2": Label(),
+        }
+        set_status = self.compile_function(
+            "_set_program_stop_status",
+            namespace,
+        )
+        apply_status = self.compile_function(
+            "_apply_program_stop_status_events",
+            namespace,
+        )
+
+        worker = threading.Thread(target=lambda: set_status("pending"))
+        worker.start()
+        worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(rendered, [])
+        self.assertTrue(apply_status())
+        self.assertEqual(len(rendered), 2)
+        self.assertFalse(apply_status())
+
+    def test_program_stop_registration_precedes_a_fast_terminal_event(self):
+        stop_barrier = threading.Event()
+        state_lock = threading.RLock()
+        runtime = {
+            "estopActive": False,
+            "posOutreach": False,
+            "programStopRequestId": None,
+        }
+        namespace = {
+            "manual_auxiliary_stop_barrier": stop_barrier,
+            "program_stop_state_lock": state_lock,
+            "_begin_manual_auxiliary_stop": (
+                lambda reason: stop_barrier.set() or 0
+            ),
+            "tab1": SimpleNamespace(runTrue=1),
+            "RUN": runtime,
+            "logger": SimpleNamespace(exception=lambda *args: None),
+            "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
+            "almStatusLab2": SimpleNamespace(config=lambda **kwargs: None),
+            "AUXILIARY_STOP_NOT_REQUIRED": "not-required",
+        }
+        namespace["_set_program_stop_status"] = self.compile_function(
+            "_set_program_stop_status",
+            namespace,
+        )
+
+        def finish_during_request(on_reserved):
+            on_reserved(8)
+            with state_lock:
+                self.assertEqual(runtime["programStopRequestId"], 8)
+                runtime["programStopRequestId"] = None
+                stop_barrier.clear()
+                namespace["_set_program_stop_status"]("completed")
+            return "dispatched", 8
+
+        namespace["_request_auxiliary_stop"] = finish_during_request
+        stop_program = self.compile_function("stopProg", namespace)
+
+        stop_program()
+
+        self.assertIsNone(runtime["programStopRequestId"])
+        self.assertFalse(stop_barrier.is_set())
+        self.assertEqual(runtime["programStopState"], "completed")
+
+    def test_program_stop_releases_manual_barrier_when_auxiliary_is_absent(self):
+        stop_barrier = threading.Event()
+        runtime = {
+            "estopActive": False,
+            "posOutreach": False,
+            "programStopRequestId": None,
+        }
+
+        def begin_stop(reason):
+            self.assertEqual(reason, "program stop requested")
+            stop_barrier.set()
+            return 0
+
+        namespace = {
+            "_request_auxiliary_stop": (
+                lambda on_reserved=None: ("not-required", None)
+            ),
+            "_begin_manual_auxiliary_stop": begin_stop,
+            "manual_auxiliary_stop_barrier": stop_barrier,
+            "tab1": SimpleNamespace(runTrue=1),
+            "RUN": runtime,
+            "logger": SimpleNamespace(exception=lambda *args: None),
+            "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
+            "almStatusLab2": SimpleNamespace(config=lambda **kwargs: None),
+            "AUXILIARY_STOP_NOT_REQUIRED": "not-required",
+        }
+        namespace["_set_program_stop_status"] = self.compile_function(
+            "_set_program_stop_status",
+            namespace,
+        )
+        apply_status = self.compile_function(
+            "_apply_program_stop_status_events",
+            namespace,
+        )
+        stop_program = self.compile_function("stopProg", namespace)
+
+        stop_program()
+        apply_status()
+
+        self.assertFalse(stop_barrier.is_set())
+        self.assertIsNone(runtime["programStopRequestId"])
+        self.assertEqual(runtime["programStopState"], "completed")
+        self.assertTrue(runtime["programStopStatusLatched"])
 
     def test_program_launch_rejects_unacknowledged_stop_request(self):
         statuses = []
@@ -7316,8 +8284,22 @@ class HmiSourceContractTests(unittest.TestCase):
             com2Port="COM2",
             auxiliaryBoard=AUXILIARY_BOARD_NANO,
         )
-        namespace["_try_dispatch_auxiliary_stop"] = lambda: False
-        self.assertEqual(request_stop(), ("pending", 1))
+        registered = []
+
+        def register_stop(request_id):
+            registered.append(request_id)
+            namespace["RUN"]["programStopRequestId"] = request_id
+
+        def reject_dispatch():
+            self.assertEqual(registered, [1])
+            self.assertEqual(namespace["RUN"]["programStopRequestId"], 1)
+            return False
+
+        namespace["_try_dispatch_auxiliary_stop"] = reject_dispatch
+        self.assertEqual(
+            request_stop(register_stop),
+            ("pending", 1),
+        )
         self.assertTrue(namespace["auxiliary_stop_requested"].is_set())
 
     def test_auxiliary_stop_request_remains_pending_behind_owned_operation(self):
@@ -7354,7 +8336,12 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace,
         )
 
-        self.assertEqual(request_stop(), ("pending", 1))
+        registered = []
+        self.assertEqual(
+            request_stop(registered.append),
+            ("pending", 1),
+        )
+        self.assertEqual(registered, [1])
         self.assertTrue(requested.is_set())
         self.assertEqual(namespace["auxiliary_stop_pending_request_id"], 1)
         self.assertIsNone(namespace["auxiliary_stop_active_request_id"])
@@ -7406,8 +8393,9 @@ class HmiSourceContractTests(unittest.TestCase):
         first_label = Label()
         second_label = Label()
         tab = SimpleNamespace(runTrue=1)
+        stop_barrier = threading.Event()
         namespace = {
-            "_request_auxiliary_stop": lambda: (_ for _ in ()).throw(
+            "_request_auxiliary_stop": lambda *args: (_ for _ in ()).throw(
                 RuntimeError("thread construction failed")
             ),
             "tab1": tab,
@@ -7416,16 +8404,26 @@ class HmiSourceContractTests(unittest.TestCase):
             "almStatusLab": first_label,
             "almStatusLab2": second_label,
             "AUXILIARY_STOP_NOT_REQUIRED": "not-required",
+            "manual_auxiliary_stop_barrier": stop_barrier,
+            "_begin_manual_auxiliary_stop": (
+                lambda reason: stop_barrier.set() or 0
+            ),
         }
         namespace["_set_program_stop_status"] = self.compile_function(
             "_set_program_stop_status",
             namespace,
         )
+        apply_status = self.compile_function(
+            "_apply_program_stop_status_events",
+            namespace,
+        )
         stop_program = self.compile_function("stopProg", namespace)
 
         stop_program()
+        apply_status()
 
         self.assertEqual(tab.runTrue, 0)
+        self.assertFalse(stop_barrier.is_set())
         self.assertEqual(
             first_label.text,
             "PROGRAM SCHEDULING HALTED; AUXILIARY STOP FAILED; "
@@ -15899,7 +16897,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "start_send_serial_thread": lambda command, **kwargs: controller_starts.append(
                 (command, kwargs)
             ) or True,
-            "_request_auxiliary_stop": lambda: auxiliary_stops.append(True) or True,
+            "_request_auxiliary_stop": (
+                lambda *args: auxiliary_stops.append(True) or True
+            ),
             "joint_motion_dispatcher": dispatcher,
             "deferred_joint_adjustments": SimpleNamespace(pending=False),
             "_try_set_virtual_joint_target": lambda target: True,
@@ -16954,6 +17954,8 @@ class HmiSourceContractTests(unittest.TestCase):
         second_label = Widget()
         recovery_attempts = []
         stop_statuses = []
+        stop_barrier = threading.Event()
+        stop_barrier.set()
         runtime = {"programStopRequestId": 41}
         namespace = {
             "auxiliary_serial_event_queue": event_queue,
@@ -16967,6 +17969,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 exception=lambda *args: None,
             ),
             "RUN": runtime,
+            "manual_auxiliary_stop_barrier": stop_barrier,
             "_set_program_stop_status": stop_statuses.append,
             "_try_dispatch_controller_correction": lambda: recovery_attempts.append(
                 "controller"
@@ -16986,14 +17989,17 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(received.value, "Nano Inactive Stopped")
         self.assertEqual(stop_statuses, ["pending", "completed"])
         self.assertIsNone(runtime["programStopRequestId"])
+        self.assertFalse(stop_barrier.is_set())
         self.assertEqual(recovery_attempts, ["controller", "auxiliary"])
 
         runtime["programStopRequestId"] = 42
+        stop_barrier.set()
         event_queue.put(("failed", 42, "auxiliary offline"))
         poll_events()
 
         self.assertEqual(stop_statuses[-1], "failed")
         self.assertIsNone(runtime["programStopRequestId"])
+        self.assertFalse(stop_barrier.is_set())
         self.assertEqual(
             recovery_attempts,
             [

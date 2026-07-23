@@ -215,6 +215,8 @@ from ARrobots.HMI.joint_motion import (
   finite_number,
   motion_timing_response_timeout,
   normalize_auxiliary_board_profile,
+  parse_auxiliary_output_command,
+  parse_auxiliary_servo_command,
   parse_command_timing,
   parse_controller_identity_response,
   parse_controller_modbus_response,
@@ -227,6 +229,7 @@ from ARrobots.HMI.joint_motion import (
   read_serial_line_response_with_optional_followup,
   serial_transport_quarantined,
   validate_auxiliary_output_command,
+  validate_auxiliary_servo_command,
   validate_controller_filename,
   write_serial_control,
 )
@@ -416,6 +419,13 @@ calibration_serial_write_committed = threading.Event()
 auxiliary_serial_lock = threading.Lock()
 auxiliary_serial_write_lock = threading.Lock()
 auxiliary_serial_event_queue = Queue()
+program_stop_status_event_queue = Queue()
+manual_auxiliary_event_queue = Queue()
+manual_auxiliary_request_queue = []
+manual_auxiliary_active_request = None
+manual_auxiliary_next_request_id = 0
+manual_auxiliary_state_lock = threading.Lock()
+manual_auxiliary_stop_barrier = threading.Event()
 startup_auxiliary_cleanup_lock = threading.Lock()
 startup_auxiliary_cleanup_pending = {}
 startup_auxiliary_cleanup_worker = None
@@ -425,6 +435,7 @@ startup_controller_cleanup_worker = None
 xbox_auxiliary_event_queue = Queue()
 auxiliary_stop_requested = threading.Event()
 auxiliary_stop_state_lock = threading.Lock()
+program_stop_state_lock = threading.RLock()
 auxiliary_stop_next_request_id = 0
 auxiliary_stop_pending_request_id = None
 auxiliary_stop_active_request_id = None
@@ -547,6 +558,103 @@ XBOX_AUXILIARY_FIXED_EXCHANGES = frozenset(
   for commands in XBOX_AUXILIARY_FIXED_TOGGLE_COMMANDS.values()
   for exchange in commands.values()
 )
+MANUAL_AUXILIARY_QUEUE_LIMIT = 64
+MANUAL_AUXILIARY_CALIBRATION_KEYS = frozenset(
+  (
+    *(f"Servo{channel}{state}" for channel in range(4) for state in ("on", "off")),
+    *(f"DO{row}{state}" for row in range(1, 7) for state in ("on", "off")),
+  )
+)
+
+
+@dataclass(frozen=True)
+class ManualAuxiliaryRequest:
+  request_id: int
+  serial_port: object
+  command: str
+  expected_response: bytes
+  calibration_key: str
+  calibration_value: str
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError("manual auxiliary request ID must be positive")
+    if self.serial_port is None or not getattr(self.serial_port, "is_open", False):
+      raise ConnectionError(
+        "manual auxiliary request requires an open connection"
+      )
+    if (
+      not isinstance(self.command, str)
+      or not self.command
+      or len(self.command) > MAX_COMMAND_LENGTH
+      or not self.command.isascii()
+    ):
+      raise MotionInputError("manual auxiliary command is invalid")
+    if self.expected_response not in (b"Servo Done", b"Done"):
+      raise MotionInputError(
+        "manual auxiliary expected response is invalid"
+      )
+    if self.calibration_key not in MANUAL_AUXILIARY_CALIBRATION_KEYS:
+      raise MotionInputError("manual auxiliary calibration key is invalid")
+    if (
+      not isinstance(self.calibration_value, str)
+      or not self.calibration_value
+      or self.calibration_value != self.calibration_value.strip()
+      or not self.calibration_value.isdecimal()
+    ):
+      raise MotionInputError("manual auxiliary calibration value is invalid")
+
+    if self.expected_response == b"Servo Done":
+      _connected_auxiliary_board_profile(self.serial_port)
+      channel, position = parse_auxiliary_servo_command(self.command)
+      if (
+        self.calibration_key
+        not in (f"Servo{channel}on", f"Servo{channel}off")
+        or int(self.calibration_value) != position
+      ):
+        raise MotionInputError(
+          "manual auxiliary servo persistence contract is invalid"
+        )
+    else:
+      board_profile = _connected_auxiliary_board_profile(self.serial_port)
+      validate_auxiliary_output_command(self.command, board_profile)
+      prefix, output_pin = parse_auxiliary_output_command(self.command)
+      expected_suffix = "on" if prefix == "ON" else "off"
+      if (
+        not self.calibration_key.startswith("DO")
+        or not self.calibration_key.endswith(expected_suffix)
+        or int(self.calibration_value) != output_pin
+      ):
+        raise MotionInputError(
+          "manual auxiliary output persistence contract is invalid"
+        )
+
+
+@dataclass(frozen=True)
+class ManualAuxiliaryResult:
+  request_id: int
+  outcome: str
+  value: str
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError("manual auxiliary result ID must be positive")
+    if self.outcome not in ("completed", "failed"):
+      raise MotionInputError("manual auxiliary result outcome is invalid")
+    if (
+      not isinstance(self.value, str)
+      or not self.value.strip()
+      or self.value != self.value.strip()
+    ):
+      raise MotionInputError("manual auxiliary result value is invalid")
 
 
 def _bind_auxiliary_board_profile(serial_port, board_profile):
@@ -847,9 +955,13 @@ def _tracked_auxiliary_operation(control_injectable=False):
 def _write_legacy_auxiliary_command(command):
   serial_port = RUN.get('ser2')
   try:
-    if isinstance(command, str) and command[:2] in ("ON", "OF"):
-      board_profile = _connected_auxiliary_board_profile(serial_port)
-      validate_auxiliary_output_command(command, board_profile)
+    if isinstance(command, str) and command[:2] in ("ON", "OF", "SV"):
+      if command[:2] == "SV":
+        _connected_auxiliary_board_profile(serial_port)
+        validate_auxiliary_servo_command(command)
+      else:
+        board_profile = _connected_auxiliary_board_profile(serial_port)
+        validate_auxiliary_output_command(command, board_profile)
     return write_serial_control(
       serial_port,
       command,
@@ -863,6 +975,52 @@ def _write_legacy_auxiliary_command(command):
     ):
       RUN['ser2'] = None
       _clear_auxiliary_board_profile(serial_port)
+
+
+def _manual_auxiliary_expected_response(command, serial_port=None):
+  if isinstance(command, str) and command.startswith("SV"):
+    _connected_auxiliary_board_profile(serial_port)
+    validate_auxiliary_servo_command(command)
+    return b"Servo Done"
+  profile = _connected_auxiliary_board_profile(serial_port)
+  validate_auxiliary_output_command(command, profile)
+  return b"Done"
+
+
+@_tracked_serial_operation("ser2")
+def _exchange_manual_auxiliary_command(
+  command,
+  expected_response,
+  expected_serial_port,
+):
+  if not isinstance(expected_response, bytes):
+    raise MotionInputError(
+      "manual auxiliary exchange response contract is invalid"
+    )
+  serial_port = RUN.get('ser2')
+  if serial_port is not expected_serial_port:
+    raise ConnectionError(
+      "manual auxiliary connection changed before request dispatch"
+    )
+  if expected_response != _manual_auxiliary_expected_response(
+    command,
+    serial_port,
+  ):
+    raise MotionInputError(
+      "manual auxiliary expected response does not match the command"
+    )
+
+  try:
+    _write_legacy_auxiliary_command(command)
+    return read_serial_exact_response(
+      serial_port,
+      expected_response,
+      SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+    )
+  except Exception:
+    if RUN.get('ser2') is serial_port:
+      _close_serial_port('ser2', "manual auxiliary response failure")
+    raise
 
 
 @_tracked_serial_operation("ser2")
@@ -1018,6 +1176,386 @@ def _request_xbox_auxiliary_toggle(state_name):
     RUN[pending_name] = None
     return False
   return True
+
+
+def _manual_auxiliary_stop_in_progress():
+  with auxiliary_stop_state_lock:
+    controller_stop_pending = (
+      auxiliary_stop_pending_request_id is not None
+      or auxiliary_stop_active_request_id is not None
+    )
+  with program_stop_state_lock:
+    program_stop_pending = RUN.get('programStopRequestId') is not None
+    estop_active = bool(RUN.get('estopActive'))
+    position_fault = bool(RUN.get('posOutreach'))
+  return (
+    manual_auxiliary_stop_barrier.is_set()
+    or auxiliary_stop_requested.is_set()
+    or controller_stop_pending
+    or program_stop_pending
+    or estop_active
+    or position_fault
+  )
+
+
+def _manual_auxiliary_status_reserved():
+  if _manual_auxiliary_stop_in_progress():
+    return True
+  with program_stop_state_lock:
+    return bool(RUN.get('programStopStatusLatched'))
+
+
+def _set_manual_auxiliary_status(message, style):
+  if (
+    not isinstance(message, str)
+    or not message.strip()
+    or message != message.strip()
+  ):
+    raise TypeError("manual auxiliary status must be normalized text")
+  if not isinstance(style, str) or not style:
+    raise TypeError("manual auxiliary status style must be non-empty text")
+  if _manual_auxiliary_status_reserved():
+    return False
+  almStatusLab.config(text=message, style=style)
+  almStatusLab2.config(text=message, style=style)
+  return True
+
+
+def _set_manual_auxiliary_feedback(message):
+  if (
+    not isinstance(message, str)
+    or not message.strip()
+    or message != message.strip()
+  ):
+    raise TypeError("manual auxiliary feedback must be normalized text")
+  cmdRecEntryField.delete(0, 'end')
+  cmdRecEntryField.insert(0, message)
+  return True
+
+
+def _render_manual_auxiliary_rejection(message):
+  _set_manual_auxiliary_feedback(message)
+  _set_manual_auxiliary_status(message, "Alarm.TLabel")
+  return False
+
+
+def _manual_auxiliary_error_detail(error, fallback):
+  if (
+    not isinstance(fallback, str)
+    or not fallback.strip()
+    or fallback != fallback.strip()
+  ):
+    raise TypeError("manual auxiliary error fallback must be normalized text")
+  try:
+    detail = str(error).strip()
+  except Exception:
+    return fallback
+  return detail or fallback
+
+
+def _begin_manual_auxiliary_stop(reason):
+  if (
+    not isinstance(reason, str)
+    or not reason.strip()
+    or reason != reason.strip()
+  ):
+    raise TypeError("manual auxiliary cancellation reason must be normalized text")
+  with manual_auxiliary_state_lock:
+    manual_auxiliary_stop_barrier.set()
+    discarded = len(manual_auxiliary_request_queue)
+    manual_auxiliary_request_queue.clear()
+  if discarded:
+    logger.warning(
+      "Discarded %s queued manual auxiliary command(s): %s",
+      discarded,
+      reason,
+    )
+  return discarded
+
+
+def _reject_queued_manual_auxiliary_requests(message):
+  if (
+    not isinstance(message, str)
+    or not message.strip()
+    or message != message.strip()
+  ):
+    raise TypeError("manual auxiliary rejection must be normalized text")
+  with manual_auxiliary_state_lock:
+    if manual_auxiliary_active_request is not None:
+      return 0
+    discarded = len(manual_auxiliary_request_queue)
+    manual_auxiliary_request_queue.clear()
+  if discarded:
+    logger.warning("%s; discarded %s queued command(s)", message, discarded)
+    _render_manual_auxiliary_rejection(message)
+  return discarded
+
+
+def _run_manual_auxiliary_request(request):
+  try:
+    if not isinstance(request, ManualAuxiliaryRequest):
+      raise TypeError("manual auxiliary worker request is invalid")
+    response = _exchange_manual_auxiliary_command(
+      request.command,
+      request.expected_response,
+      request.serial_port,
+    )
+    if response is False:
+      raise SerialActivityRejected(
+        "auxiliary controller transport changed before dispatch"
+      )
+    elif response != request.expected_response.decode("ascii"):
+      raise ProtocolResponseError(
+        "manual auxiliary acknowledgement did not match the request"
+      )
+    else:
+      result = ManualAuxiliaryResult(
+        request.request_id,
+        "completed",
+        response,
+      )
+  except Exception as exc:
+    logger.exception("Manual auxiliary command failed")
+    message = _manual_auxiliary_error_detail(
+      exc,
+      "manual auxiliary command failed without details",
+    )
+    request_id = getattr(request, "request_id", None)
+    if (
+      isinstance(request_id, bool)
+      or not isinstance(request_id, int)
+      or request_id <= 0
+    ):
+      logger.error("Manual auxiliary worker could not publish an invalid request")
+      manual_auxiliary_event_queue.put(None)
+      return
+    result = ManualAuxiliaryResult(request_id, "failed", message)
+  manual_auxiliary_event_queue.put(result)
+
+
+def _try_dispatch_manual_auxiliary_request():
+  global manual_auxiliary_active_request
+
+  if application_closing.is_set() or _manual_auxiliary_stop_in_progress():
+    return False
+  if (
+    serial_activity_registry.active("ser2")
+    or auxiliary_serial_lock.locked()
+  ):
+    return False
+
+  with manual_auxiliary_state_lock:
+    if application_closing.is_set() or manual_auxiliary_stop_barrier.is_set():
+      return False
+    if manual_auxiliary_active_request is not None:
+      if not isinstance(
+        manual_auxiliary_active_request,
+        ManualAuxiliaryRequest,
+      ):
+        raise RuntimeError("manual auxiliary active request is invalid")
+      return False
+    if not manual_auxiliary_request_queue:
+      return False
+    request = manual_auxiliary_request_queue.pop(0)
+    if not isinstance(request, ManualAuxiliaryRequest):
+      raise RuntimeError("manual auxiliary queued request is invalid")
+    manual_auxiliary_active_request = request
+    try:
+      thread = threading.Thread(
+        target=_run_manual_auxiliary_request,
+        args=(request,),
+        daemon=True,
+      )
+      thread.start()
+    except Exception as exc:
+      detail = _manual_auxiliary_error_detail(
+        exc,
+        "worker startup failed without details",
+      )
+      message = f"Unable to start manual auxiliary worker: {detail}"
+      logger.exception(message)
+      manual_auxiliary_event_queue.put(
+        ManualAuxiliaryResult(request.request_id, "failed", message)
+      )
+
+  cmdSentEntryField.delete(0, 'end')
+  cmdSentEntryField.insert(0, request.command)
+  _set_manual_auxiliary_status(
+    "AUXILIARY COMMAND IN PROGRESS",
+    "Warn.TLabel",
+  )
+  return True
+
+
+def _queue_manual_auxiliary_command(
+  command,
+  calibration_key,
+  calibration_value,
+):
+  global manual_auxiliary_next_request_id
+
+  if application_closing.is_set():
+    return _render_manual_auxiliary_rejection(
+      "AUXILIARY COMMAND REJECTED DURING SHUTDOWN"
+    )
+  if _manual_auxiliary_stop_in_progress():
+    message = "AUXILIARY COMMAND REJECTED WHILE STOPPED"
+    logger.warning(message)
+    return _render_manual_auxiliary_rejection(message)
+  if RUN['offlineMode']:
+    return _render_manual_auxiliary_rejection(
+      "AUXILIARY COMMAND REQUIRES AN ONLINE CONTROLLER"
+    )
+  with manual_auxiliary_state_lock:
+    manual_request_active = manual_auxiliary_active_request is not None
+  if not manual_request_active and (
+    serial_activity_registry.active("ser2")
+    or auxiliary_serial_lock.locked()
+  ):
+    message = "AUXILIARY COMMAND REJECTED WHILE TRANSPORT IS BUSY"
+    logger.warning(message)
+    return _render_manual_auxiliary_rejection(message)
+
+  try:
+    serial_port = RUN.get('ser2')
+    expected_response = _manual_auxiliary_expected_response(
+      command,
+      serial_port,
+    )
+  except Exception as exc:
+    detail = _manual_auxiliary_error_detail(
+      exc,
+      "command validation failed without details",
+    )
+    message = f"Manual auxiliary command rejected: {detail}"
+    logger.error(message)
+    return _render_manual_auxiliary_rejection(message)
+
+  try:
+    with manual_auxiliary_state_lock:
+      if (
+        application_closing.is_set()
+        or manual_auxiliary_stop_barrier.is_set()
+        or auxiliary_stop_requested.is_set()
+      ):
+        raise SerialActivityRejected(
+          "manual auxiliary command rejected while a stop is active"
+        )
+      if manual_auxiliary_active_request is None and (
+        serial_activity_registry.active("ser2")
+        or auxiliary_serial_lock.locked()
+      ):
+        raise SerialActivityRejected(
+          "manual auxiliary command rejected while transport is busy"
+        )
+      queued_count = len(manual_auxiliary_request_queue)
+      if manual_auxiliary_active_request is not None:
+        queued_count += 1
+      if queued_count >= MANUAL_AUXILIARY_QUEUE_LIMIT:
+        queue_full = True
+        request = None
+      else:
+        queue_full = False
+        if (
+          isinstance(manual_auxiliary_next_request_id, bool)
+          or not isinstance(manual_auxiliary_next_request_id, int)
+          or manual_auxiliary_next_request_id < 0
+        ):
+          raise RuntimeError("manual auxiliary request counter is invalid")
+        request_id = manual_auxiliary_next_request_id + 1
+        request = ManualAuxiliaryRequest(
+          request_id,
+          serial_port,
+          command,
+          expected_response,
+          calibration_key,
+          calibration_value,
+        )
+        manual_auxiliary_next_request_id = request_id
+        manual_auxiliary_request_queue.append(request)
+  except Exception as exc:
+    detail = _manual_auxiliary_error_detail(
+      exc,
+      "command admission failed without details",
+    )
+    message = f"Manual auxiliary command rejected: {detail}"
+    logger.error(message)
+    return _render_manual_auxiliary_rejection(message)
+  if queue_full:
+    return _render_manual_auxiliary_rejection(
+      "AUXILIARY COMMAND QUEUE IS FULL"
+    )
+
+  if not _try_dispatch_manual_auxiliary_request():
+    with manual_auxiliary_state_lock:
+      request_queued = request in manual_auxiliary_request_queue
+    if request_queued:
+      _set_manual_auxiliary_status(
+        "AUXILIARY COMMAND QUEUED",
+        "Warn.TLabel",
+      )
+      return True
+    message = "AUXILIARY COMMAND CANCELLED BEFORE DISPATCH"
+    logger.warning(message)
+    return _render_manual_auxiliary_rejection(message)
+  return True
+
+
+def _request_manual_servo(channel, on_state, entry):
+  if (
+    isinstance(channel, bool)
+    or not isinstance(channel, int)
+    or not 0 <= channel < 4
+  ):
+    raise MotionInputError("manual servo channel must be in [0, 3]")
+  if not isinstance(on_state, bool):
+    raise TypeError("manual servo state must be boolean")
+  get_value = getattr(entry, "get", None)
+  if not callable(get_value):
+    raise TypeError("manual servo entry must provide get()")
+  try:
+    value = get_value()
+  except Exception as exc:
+    detail = _manual_auxiliary_error_detail(
+      exc,
+      "entry read failed without details",
+    )
+    message = f"Manual servo entry could not be read: {detail}"
+    logger.error(message)
+    return _render_manual_auxiliary_rejection(message)
+  state_name = "on" if on_state else "off"
+  return _queue_manual_auxiliary_command(
+    f"SV{channel}P{value}\n",
+    f"Servo{channel}{state_name}",
+    value,
+  )
+
+
+def _request_manual_output(row, on_state, entry):
+  if isinstance(row, bool) or not isinstance(row, int) or not 1 <= row <= 6:
+    raise MotionInputError("manual output row must be in [1, 6]")
+  if not isinstance(on_state, bool):
+    raise TypeError("manual output state must be boolean")
+  get_value = getattr(entry, "get", None)
+  if not callable(get_value):
+    raise TypeError("manual output entry must provide get()")
+  try:
+    value = get_value()
+  except Exception as exc:
+    detail = _manual_auxiliary_error_detail(
+      exc,
+      "entry read failed without details",
+    )
+    message = f"Manual output entry could not be read: {detail}"
+    logger.error(message)
+    return _render_manual_auxiliary_rejection(message)
+  prefix = "ON" if on_state else "OF"
+  state_name = "on" if on_state else "off"
+  return _queue_manual_auxiliary_command(
+    f"{prefix}X{value}\n",
+    f"DO{row}{state_name}",
+    value,
+  )
 
 
 def _close_serial_port(serial_name, context="application shutdown"):
@@ -1264,6 +1802,7 @@ def _poll_application_close():
   _poll_serial_events()
   _poll_calibration_events()
   _poll_auxiliary_serial_events()
+  _poll_manual_auxiliary_events()
   _poll_joint_motion_events()
   _poll_virtual_motion_events()
 
@@ -1395,6 +1934,7 @@ RUN['pickClosest'] = IntVar()
 RUN['autoBG'] = IntVar()
 RUN['estopActive'] = False
 RUN['posOutreach'] = False
+RUN['programStopStatusLatched'] = False
 RUN['gcodeSpeed'] = "10"
 
 RUN['inchTrue'] = False
@@ -6563,10 +7103,12 @@ def _dispatch_program_gcode(filename, completion_callback):
   return ROW_EXECUTION_COMPLETE
 
 def runProg():
-  if RUN.get('programStopRequestId') is not None:
-    _set_program_stop_status("pending")
-    return False
-  RUN['programStopState'] = "completed"
+  with program_stop_state_lock:
+    if RUN.get('programStopRequestId') is not None:
+      _set_program_stop_status("pending")
+      return False
+    RUN['programStopStatusLatched'] = False
+    RUN['programStopState'] = "completed"
 
   def threadProg():
     RUN['estopActive'] = False
@@ -6645,6 +7187,8 @@ def runProg():
   return True
 
 def stepFwd():
+    with program_stop_state_lock:
+      RUN['programStopStatusLatched'] = False
     def threadProg():
       RUN['estopActive'] = False
       RUN['posOutreach'] = False
@@ -6702,6 +7246,8 @@ def stepFwd():
     t.start()
 
 def stepRev():
+    with program_stop_state_lock:
+      RUN['programStopStatusLatched'] = False
     RUN['estopActive'] = False
     RUN['posOutreach'] = False
     almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
@@ -6725,52 +7271,100 @@ def stepRev():
 def _set_program_stop_status(auxiliary_state):
   if auxiliary_state not in ("pending", "completed", "failed"):
     raise ValueError("unknown auxiliary program-stop state")
-  RUN['programStopState'] = auxiliary_state
-  if RUN['estopActive']:
-    message = "Estop Button was Pressed"
-    style = "Alarm.TLabel"
-  elif RUN['posOutreach']:
-    message = "Position Out of Reach"
-    style = "Alarm.TLabel"
-  elif auxiliary_state == "pending":
-    message = (
-      "PROGRAM HALT REQUESTED; AUXILIARY STOP PENDING; "
-      "ACTIVE MAIN MOTION NOT PREEMPTED"
-    )
-    style = "Warn.TLabel"
-  elif auxiliary_state == "failed":
-    message = (
-      "PROGRAM SCHEDULING HALTED; AUXILIARY STOP FAILED; "
-      "ACTIVE MAIN MOTION NOT PREEMPTED"
-    )
-    style = "Alarm.TLabel"
-  else:
-    message = (
-      "PROGRAM SCHEDULING HALTED; ACTIVE MAIN MOTION NOT PREEMPTED"
-    )
-    style = "Alarm.TLabel"
-  almStatusLab.config(text=message, style=style)
-  almStatusLab2.config(text=message, style=style)
+  with program_stop_state_lock:
+    RUN['programStopState'] = auxiliary_state
+    RUN['programStopStatusLatched'] = True
+    if RUN['estopActive']:
+      message = "Estop Button was Pressed"
+      style = "Alarm.TLabel"
+    elif RUN['posOutreach']:
+      message = "Position Out of Reach"
+      style = "Alarm.TLabel"
+    elif auxiliary_state == "pending":
+      message = (
+        "PROGRAM HALT REQUESTED; AUXILIARY STOP PENDING; "
+        "ACTIVE MAIN MOTION NOT PREEMPTED"
+      )
+      style = "Warn.TLabel"
+    elif auxiliary_state == "failed":
+      message = (
+        "PROGRAM SCHEDULING HALTED; AUXILIARY STOP FAILED; "
+        "ACTIVE MAIN MOTION NOT PREEMPTED"
+      )
+      style = "Alarm.TLabel"
+    else:
+      message = (
+        "PROGRAM SCHEDULING HALTED; ACTIVE MAIN MOTION NOT PREEMPTED"
+      )
+      style = "Alarm.TLabel"
+    program_stop_status_event_queue.put((message, style))
+  return True
+
+
+def _apply_program_stop_status_events():
+  applied = False
+  while True:
+    try:
+      event = program_stop_status_event_queue.get_nowait()
+    except Empty:
+      break
+    if (
+      not isinstance(event, tuple)
+      or len(event) != 2
+      or not isinstance(event[0], str)
+      or not event[0].strip()
+      or event[0] != event[0].strip()
+      or not isinstance(event[1], str)
+      or not event[1]
+    ):
+      raise RuntimeError("program stop status queue emitted an invalid event")
+    message, style = event
+    almStatusLab.config(text=message, style=style)
+    almStatusLab2.config(text=message, style=style)
+    applied = True
+  return applied
 
 
 def stopProg():
-  tab1.runTrue = 0
-  if RUN.get('programStopRequestId') is not None:
-    _set_program_stop_status("pending")
-    return
   try:
-    auxiliary_state, request_id = _request_auxiliary_stop()
+    _begin_manual_auxiliary_stop("program stop requested")
+  except Exception:
+    logger.exception(
+      "Unable to cancel queued manual auxiliary commands during program stop"
+    )
+  tab1.runTrue = 0
+  with program_stop_state_lock:
+    if RUN.get('programStopRequestId') is not None:
+      _set_program_stop_status("pending")
+      return
+
+  def register_stop_request(request_id):
+    if (
+      isinstance(request_id, bool)
+      or not isinstance(request_id, int)
+      or request_id <= 0
+    ):
+      raise RuntimeError("auxiliary stop registration received an invalid ID")
+    with program_stop_state_lock:
+      RUN['programStopRequestId'] = request_id
+      _set_program_stop_status("pending")
+
+  try:
+    auxiliary_state, request_id = _request_auxiliary_stop(
+      register_stop_request
+    )
   except Exception:
     logger.exception("Unable to dispatch the auxiliary program stop")
-    RUN['programStopRequestId'] = None
-    _set_program_stop_status("failed")
+    with program_stop_state_lock:
+      RUN['programStopRequestId'] = None
+      manual_auxiliary_stop_barrier.clear()
+      _set_program_stop_status("failed")
     return
   if auxiliary_state == AUXILIARY_STOP_NOT_REQUIRED:
-    RUN['programStopRequestId'] = None
-    _set_program_stop_status("completed")
-  else:
-    RUN['programStopRequestId'] = request_id
-    _set_program_stop_status("pending")
+    with program_stop_state_lock:
+      RUN['programStopRequestId'] = None
+      manual_auxiliary_stop_barrier.clear()
+      _set_program_stop_status("completed")
 
 
 
@@ -9232,20 +9826,31 @@ def _try_dispatch_auxiliary_stop():
   return True
 
 
-def _request_auxiliary_stop():
+def _request_auxiliary_stop(on_reserved=None):
   global auxiliary_stop_next_request_id
   global auxiliary_stop_pending_request_id
 
+  if on_reserved is not None and not callable(on_reserved):
+    raise TypeError("auxiliary stop reservation callback must be callable")
   if _auxiliary_stop_not_required():
     return AUXILIARY_STOP_NOT_REQUIRED, None
   with auxiliary_stop_state_lock:
     if auxiliary_stop_active_request_id is not None:
-      return AUXILIARY_STOP_DISPATCHED, auxiliary_stop_active_request_id
+      request_id = auxiliary_stop_active_request_id
+      if on_reserved is not None:
+        on_reserved(request_id)
+      return AUXILIARY_STOP_DISPATCHED, request_id
     if auxiliary_stop_pending_request_id is None:
-      auxiliary_stop_next_request_id += 1
-      auxiliary_stop_pending_request_id = auxiliary_stop_next_request_id
+      request_id = auxiliary_stop_next_request_id + 1
+      if on_reserved is not None:
+        on_reserved(request_id)
+      auxiliary_stop_next_request_id = request_id
+      auxiliary_stop_pending_request_id = request_id
       auxiliary_stop_requested.set()
-    request_id = auxiliary_stop_pending_request_id
+    else:
+      request_id = auxiliary_stop_pending_request_id
+      if on_reserved is not None:
+        on_reserved(request_id)
 
   if _try_dispatch_auxiliary_stop():
     return AUXILIARY_STOP_DISPATCHED, request_id
@@ -9624,32 +10229,150 @@ def _poll_auxiliary_serial_events():
         raise RuntimeError("auxiliary serial worker emitted an invalid event")
 
       event_type, request_id, value = event
-      current_request_id = RUN.get('programStopRequestId')
+      with program_stop_state_lock:
+        current_request_id = RUN.get('programStopRequestId')
+        if event_type == "started":
+          if current_request_id == request_id:
+            _set_program_stop_status("pending")
+        elif event_type == "completed":
+          if current_request_id == request_id:
+            RUN['programStopRequestId'] = None
+            manual_auxiliary_stop_barrier.clear()
+            _set_program_stop_status("completed")
+        else:
+          message = f"Auxiliary stop failed: {value}"
+          logger.error(message)
+          if current_request_id == request_id:
+            RUN['programStopRequestId'] = None
+            manual_auxiliary_stop_barrier.clear()
+            _set_program_stop_status("failed")
       if event_type == "started":
         cmdSentEntryField.delete(0, 'end')
         cmdSentEntryField.insert(0, value)
-        if current_request_id == request_id:
-          _set_program_stop_status("pending")
       elif event_type == "completed":
         cmdRecEntryField.delete(0, 'end')
         cmdRecEntryField.insert(0, value)
-        if current_request_id == request_id:
-          RUN['programStopRequestId'] = None
-          _set_program_stop_status("completed")
-      else:
-        message = f"Auxiliary stop failed: {value}"
-        logger.error(message)
-        if current_request_id == request_id:
-          RUN['programStopRequestId'] = None
-          _set_program_stop_status("failed")
   except Exception:
     logger.exception("Unable to apply an auxiliary serial result on the Tk event thread")
   finally:
+    try:
+      _apply_program_stop_status_events()
+    except Exception:
+      logger.exception(
+        "Unable to apply a program-stop status on the Tk event thread"
+      )
     _try_dispatch_controller_correction()
     _try_dispatch_auxiliary_stop()
     _ensure_startup_auxiliary_cleanup()
     if not application_closing.is_set():
       root.after(25, _poll_auxiliary_serial_events)
+
+
+def _poll_manual_auxiliary_events():
+  global manual_auxiliary_active_request
+
+  try:
+    while True:
+      try:
+        result = manual_auxiliary_event_queue.get_nowait()
+      except Empty:
+        break
+      if not isinstance(result, ManualAuxiliaryResult):
+        raise RuntimeError("manual auxiliary worker emitted an invalid result")
+      with manual_auxiliary_state_lock:
+        request = manual_auxiliary_active_request
+        if (
+          not isinstance(request, ManualAuxiliaryRequest)
+          or request.request_id != result.request_id
+        ):
+          raise RuntimeError(
+            "manual auxiliary worker result ownership is invalid"
+          )
+        manual_auxiliary_active_request = None
+
+      if result.outcome == "completed":
+        expected_response = request.expected_response.decode("ascii")
+        if result.value != expected_response:
+          raise RuntimeError(
+            "manual auxiliary worker result response is invalid"
+          )
+        cmdRecEntryField.delete(0, 'end')
+        cmdRecEntryField.insert(0, result.value)
+        CAL[request.calibration_key] = request.calibration_value
+        if _retain_calibration_persistence_retry():
+          _set_manual_auxiliary_status(
+            "AUXILIARY COMMAND COMPLETE",
+            "OK.TLabel",
+          )
+        else:
+          _set_manual_auxiliary_status(
+            "AUXILIARY COMMAND COMPLETE; SETTINGS SAVE DEFERRED",
+            "Warn.TLabel",
+          )
+      else:
+        with manual_auxiliary_state_lock:
+          discarded = len(manual_auxiliary_request_queue)
+          manual_auxiliary_request_queue.clear()
+        message = f"Manual auxiliary command failed: {result.value}"
+        if discarded:
+          message = (
+            f"{message}; {discarded} queued command(s) discarded"
+          )
+        logger.error(message)
+        _set_manual_auxiliary_feedback(message)
+        _set_manual_auxiliary_status(message, "Alarm.TLabel")
+  except Exception as exc:
+    logger.exception(
+      "Unable to apply a manual auxiliary result on the Tk event thread"
+    )
+    with manual_auxiliary_state_lock:
+      manual_auxiliary_active_request = None
+      discarded = len(manual_auxiliary_request_queue)
+      manual_auxiliary_request_queue.clear()
+    _close_serial_port('ser2', "invalid manual auxiliary worker result")
+    detail = _manual_auxiliary_error_detail(
+      exc,
+      "manual auxiliary result handling failed",
+    )
+    message = f"Manual auxiliary command failed: {detail}"
+    if discarded:
+      message = f"{message}; {discarded} queued command(s) discarded"
+    logger.error(message)
+    _set_manual_auxiliary_feedback(message)
+    _set_manual_auxiliary_status(
+      message,
+      "Alarm.TLabel",
+    )
+  finally:
+    if application_closing.is_set():
+      with manual_auxiliary_state_lock:
+        discarded = len(manual_auxiliary_request_queue)
+        manual_auxiliary_request_queue.clear()
+      if discarded:
+        logger.warning(
+          "Discarded queued manual auxiliary commands during shutdown"
+        )
+    else:
+      try:
+        if (
+          serial_activity_registry.active("ser2")
+          or auxiliary_serial_lock.locked()
+        ):
+          _reject_queued_manual_auxiliary_requests(
+            "AUXILIARY COMMANDS REJECTED WHILE TRANSPORT IS BUSY"
+          )
+        else:
+          _try_dispatch_manual_auxiliary_request()
+      except Exception:
+        logger.exception(
+          "Unable to dispatch a queued manual auxiliary command"
+        )
+      try:
+        root.after(25, _poll_manual_auxiliary_events)
+      except (RuntimeError, tk.TclError):
+        logger.exception(
+          "Unable to schedule manual auxiliary result polling"
+        )
 
 
 def _poll_xbox_auxiliary_events():
@@ -13295,189 +14018,84 @@ def getSel():
   manEntryField.delete(0, 'end')
   manEntryField.insert(0, command)  
   
-@_tracked_serial_operation("ser2")
 def Servo0on():
-  save_calibration(CAL) 
-  servoPos = servo0onEntryField.get()
-  command = "SV0P"+servoPos+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read()
+  return _request_manual_servo(0, True, servo0onEntryField)
 
 
-@_tracked_serial_operation("ser2")
 def Servo0off():
-  save_calibration(CAL) 
-  servoPos = servo0offEntryField.get()
-  command = "SV0P"+servoPos+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read()
+  return _request_manual_servo(0, False, servo0offEntryField)
 
 
-@_tracked_serial_operation("ser2")
 def Servo1on():
-  save_calibration(CAL) 
-  servoPos = servo1onEntryField.get()
-  command = "SV1P"+servoPos+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read() 
+  return _request_manual_servo(1, True, servo1onEntryField)
 
 
-@_tracked_serial_operation("ser2")
 def Servo1off():
-  save_calibration(CAL) 
-  servoPos = servo1offEntryField.get()
-  command = "SV1P"+servoPos+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read()
- 
+  return _request_manual_servo(1, False, servo1offEntryField)
 
-@_tracked_serial_operation("ser2")
+
 def Servo2on():
-  save_calibration(CAL) 
-  servoPos = servo2onEntryField.get()
-  command = "SV2P"+servoPos+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read() 
+  return _request_manual_servo(2, True, servo2onEntryField)
 
 
-@_tracked_serial_operation("ser2")
 def Servo2off():
-  save_calibration(CAL) 
-  servoPos = servo2offEntryField.get()
-  command = "SV2P"+servoPos+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read()
+  return _request_manual_servo(2, False, servo2offEntryField)
 
-@_tracked_serial_operation("ser2")
+
 def Servo3on():
-  save_calibration(CAL) 
-  servoPos = servo3onEntryField.get()
-  command = "SV3P"+servoPos+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read() 
+  return _request_manual_servo(3, True, servo3onEntryField)
 
-@_tracked_serial_operation("ser2")
+
 def Servo3off():
-  save_calibration(CAL) 
-  servoPos = servo3offEntryField.get()
-  command = "SV3P"+servoPos+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read()
+  return _request_manual_servo(3, False, servo3offEntryField)
 
-@_tracked_serial_operation("ser2")
+
 def DO1on():
-  outputNum = DO1onEntryField.get()
-  command = "ONX"+outputNum+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read() 
+  return _request_manual_output(1, True, DO1onEntryField)
 
 
-@_tracked_serial_operation("ser2")
 def DO1off():
-  outputNum = DO1offEntryField.get()
-  command = "OFX"+outputNum+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read() 
- 
+  return _request_manual_output(1, False, DO1offEntryField)
 
-@_tracked_serial_operation("ser2")
+
 def DO2on():
-  outputNum = DO2onEntryField.get()
-  command = "ONX"+outputNum+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read()
- 
+  return _request_manual_output(2, True, DO2onEntryField)
 
-@_tracked_serial_operation("ser2")
+
 def DO2off():
-  outputNum = DO2offEntryField.get()
-  command = "OFX"+outputNum+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read() 
+  return _request_manual_output(2, False, DO2offEntryField)
 
 
-@_tracked_serial_operation("ser2")
 def DO3on():
-  outputNum = DO3onEntryField.get()
-  command = "ONX"+outputNum+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read() 
+  return _request_manual_output(3, True, DO3onEntryField)
 
 
-@_tracked_serial_operation("ser2")
 def DO3off():
-  outputNum = DO3offEntryField.get()
-  command = "OFX"+outputNum+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read() 
- 
+  return _request_manual_output(3, False, DO3offEntryField)
 
-@_tracked_serial_operation("ser2")
+
 def DO4on():
-  outputNum = DO4onEntryField.get()
-  command = "ONX"+outputNum+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read()
- 
+  return _request_manual_output(4, True, DO4onEntryField)
 
-@_tracked_serial_operation("ser2")
+
 def DO4off():
-  outputNum = DO4offEntryField.get()
-  command = "OFX"+outputNum+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read() 
+  return _request_manual_output(4, False, DO4offEntryField)
 
 
-@_tracked_serial_operation("ser2")
 def DO5on():
-  outputNum = DO5onEntryField.get()
-  command = "ONX"+outputNum+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read() 
+  return _request_manual_output(5, True, DO5onEntryField)
 
 
-@_tracked_serial_operation("ser2")
 def DO5off():
-  outputNum = DO5offEntryField.get()
-  command = "OFX"+outputNum+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read() 
- 
+  return _request_manual_output(5, False, DO5offEntryField)
 
-@_tracked_serial_operation("ser2")
+
 def DO6on():
-  outputNum = DO6onEntryField.get()
-  command = "ONX"+outputNum+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read()
- 
+  return _request_manual_output(6, True, DO6onEntryField)
 
-@_tracked_serial_operation("ser2")
+
 def DO6off():
-  outputNum = DO6offEntryField.get()
-  command = "OFX"+outputNum+"\n"
-  _write_legacy_auxiliary_command(command)
-  time.sleep(.1)
-  RUN['ser2'].read() 
+  return _request_manual_output(6, False, DO6offEntryField)
 
 def CalcLinDist(X2,Y2,Z2):
   # global RUN['LineDist']
@@ -22552,10 +23170,22 @@ servo0onEntryField.insert(0,str(CAL['Servo0on']))
 servo0offEntryField.insert(0,str(CAL['Servo0off']))
 servo1onEntryField.insert(0,str(CAL['Servo1on']))
 servo1offEntryField.insert(0,str(CAL['Servo1off']))
+servo2onEntryField.insert(0,str(CAL.get('Servo2on', '')))
+servo2offEntryField.insert(0,str(CAL.get('Servo2off', '')))
+servo3onEntryField.insert(0,str(CAL.get('Servo3on', '')))
+servo3offEntryField.insert(0,str(CAL.get('Servo3off', '')))
 DO1onEntryField.insert(0,str(CAL['DO1on']))
 DO1offEntryField.insert(0,str(CAL['DO1off']))
 DO2onEntryField.insert(0,str(CAL['DO2on']))
 DO2offEntryField.insert(0,str(CAL['DO2off']))
+DO3onEntryField.insert(0,str(CAL.get('DO3on', '')))
+DO3offEntryField.insert(0,str(CAL.get('DO3off', '')))
+DO4onEntryField.insert(0,str(CAL.get('DO4on', '')))
+DO4offEntryField.insert(0,str(CAL.get('DO4off', '')))
+DO5onEntryField.insert(0,str(CAL.get('DO5on', '')))
+DO5offEntryField.insert(0,str(CAL.get('DO5off', '')))
+DO6onEntryField.insert(0,str(CAL.get('DO6on', '')))
+DO6offEntryField.insert(0,str(CAL.get('DO6off', '')))
 TFxEntryField.insert(0,str(CAL['TFx']))
 TFyEntryField.insert(0,str(CAL['TFy']))
 TFzEntryField.insert(0,str(CAL['TFz']))
@@ -22814,6 +23444,7 @@ tab1.after(25, _poll_joint_motion_events)
 tab1.after(25, _poll_serial_events)
 tab1.after(25, _poll_calibration_events)
 tab1.after(25, _poll_auxiliary_serial_events)
+tab1.after(25, _poll_manual_auxiliary_events)
 tab1.after(25, _poll_xbox_auxiliary_events)
 tab1.after(25, _poll_virtual_motion_events)
 tab1.after(100, setCom)

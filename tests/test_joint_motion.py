@@ -50,6 +50,8 @@ from ARrobots.HMI.joint_motion import (
     finite_number,
     motion_timing_response_timeout,
     normalize_auxiliary_board_profile,
+    parse_auxiliary_output_command,
+    parse_auxiliary_servo_command,
     parse_command_speed,
     parse_command_timing,
     parse_controller_identity_response,
@@ -64,6 +66,7 @@ from ARrobots.HMI.joint_motion import (
     serial_transport_quarantined,
     validate_controller_filename,
     validate_auxiliary_output_command,
+    validate_auxiliary_servo_command,
     write_serial_control,
 )
 
@@ -160,6 +163,14 @@ class AuxiliaryBoardProfileTests(unittest.TestCase):
                             validate_auxiliary_output_command(command, profile),
                             command,
                         )
+                        self.assertEqual(
+                            parse_auxiliary_output_command(command),
+                            (prefix, output_pin),
+                        )
+        self.assertEqual(
+            parse_auxiliary_output_command("ONX08\n"),
+            ("ON", 8),
+        )
 
     def test_each_board_rejects_every_other_board_output_pin(self):
         profile_pairs = (
@@ -198,6 +209,48 @@ class AuxiliaryBoardProfileTests(unittest.TestCase):
                         command,
                         AUXILIARY_BOARD_NANO,
                     )
+
+    def test_servo_validation_accepts_supported_channels_and_positions(self):
+        for channel in range(7):
+            for position in (0, 1, 90, 179, 180):
+                command = f"SV{channel}P{position}\n"
+                with self.subTest(channel=channel, position=position):
+                    self.assertEqual(
+                        validate_auxiliary_servo_command(command),
+                        command,
+                    )
+                    self.assertEqual(
+                        parse_auxiliary_servo_command(command),
+                        (channel, position),
+                    )
+        self.assertEqual(
+            parse_auxiliary_servo_command("SV00P090\n"),
+            (0, 90),
+        )
+        self.assertEqual(
+            validate_auxiliary_servo_command("SV00P090\n"),
+            "SV00P090\n",
+        )
+
+    def test_servo_validation_rejects_malformed_or_out_of_range_commands(self):
+        malformed_commands = (
+            "SV0P0",
+            "SV0P0\r\n",
+            " SV0P0\n",
+            "SV+0P0\n",
+            "SV0P+1\n",
+            "SV0P-1\n",
+            "SV0P181\n",
+            "SV7P0\n",
+            "SV0P0\nSV1P0\n",
+            "ONX8\n",
+            "",
+            None,
+        )
+        for command in malformed_commands:
+            with self.subTest(command=command):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_servo_command(command)
 
     def test_pneumatic_mapping_uses_a_valid_pin_for_each_board(self):
         expected_pins = {

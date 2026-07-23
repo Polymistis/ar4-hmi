@@ -34,6 +34,9 @@ AUXILIARY_BOARD_PNEUMATIC_PINS = {
     AUXILIARY_BOARD_NANO: 8,
     AUXILIARY_BOARD_MEGA: 28,
 }
+AUXILIARY_SERVO_CHANNELS = frozenset(range(7))
+AUXILIARY_SERVO_MINIMUM_POSITION = 0
+AUXILIARY_SERVO_MAXIMUM_POSITION = 180
 CONTROL_POLL_INTERVAL_SECONDS = 0.05
 RESPONSE_TIMEOUT_SAFETY_SCALE = 1.25
 FIRMWARE_MINIMUM_RAMP_PERCENT = 10.0
@@ -88,22 +91,63 @@ def normalize_auxiliary_board_profile(value, allow_none=False):
     return profile
 
 
-def validate_auxiliary_output_command(command, board_profile):
-    profile = normalize_auxiliary_board_profile(board_profile)
+def parse_auxiliary_output_command(command):
     if (
         not isinstance(command, str)
         or not command
         or len(command) > MAX_COMMAND_LENGTH
     ):
         raise MotionInputError("auxiliary output command is invalid")
-    match = re.fullmatch(r"(?:ON|OF)X([0-9]+)\n", command)
+    match = re.fullmatch(r"(ON|OF)X([0-9]+)\n", command)
     if match is None:
         raise MotionInputError("auxiliary output command is malformed")
-    output_pin = int(match.group(1))
+    return match.group(1), int(match.group(2))
+
+
+def validate_auxiliary_output_command(command, board_profile):
+    profile = normalize_auxiliary_board_profile(board_profile)
+    _, output_pin = parse_auxiliary_output_command(command)
     if output_pin not in AUXILIARY_BOARD_OUTPUT_PINS[profile]:
         raise MotionInputError(
             f"auxiliary output pin {output_pin} is not valid for {profile}"
         )
+    return command
+
+
+def parse_auxiliary_servo_command(command):
+    if (
+        not isinstance(command, str)
+        or not command
+        or len(command) > MAX_COMMAND_LENGTH
+    ):
+        raise MotionInputError("auxiliary servo command is invalid")
+    match = re.fullmatch(
+        r"SV([0-9]+)P([0-9]+)\n",
+        command,
+    )
+    if match is None:
+        raise MotionInputError("auxiliary servo command is malformed")
+    channel = int(match.group(1))
+    position = int(match.group(2))
+    if channel not in AUXILIARY_SERVO_CHANNELS:
+        raise MotionInputError(
+            f"auxiliary servo channel {channel} is not supported"
+        )
+    if not (
+        AUXILIARY_SERVO_MINIMUM_POSITION
+        <= position
+        <= AUXILIARY_SERVO_MAXIMUM_POSITION
+    ):
+        raise MotionInputError(
+            "auxiliary servo position must be between "
+            f"{AUXILIARY_SERVO_MINIMUM_POSITION} and "
+            f"{AUXILIARY_SERVO_MAXIMUM_POSITION}"
+        )
+    return channel, position
+
+
+def validate_auxiliary_servo_command(command):
+    parse_auxiliary_servo_command(command)
     return command
 
 
