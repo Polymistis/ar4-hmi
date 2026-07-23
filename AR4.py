@@ -1205,6 +1205,33 @@ def _manual_auxiliary_status_reserved():
     return bool(RUN.get('programStopStatusLatched'))
 
 
+def _manual_auxiliary_program_active():
+  program_state = getattr(tab1, "runTrue", 0)
+  if isinstance(program_state, bool):
+    return program_state
+  if (
+    isinstance(program_state, int)
+    and not isinstance(program_state, bool)
+    and program_state in (0, 1)
+  ):
+    return bool(program_state)
+  raise RuntimeError("program execution state is invalid")
+
+
+def _acknowledge_program_stop_status_for_manual_auxiliary():
+  if _manual_auxiliary_stop_in_progress():
+    return False
+  with program_stop_state_lock:
+    if (
+      RUN.get('programStopRequestId') is not None
+      or RUN.get('estopActive')
+      or RUN.get('posOutreach')
+    ):
+      return False
+    RUN['programStopStatusLatched'] = False
+  return True
+
+
 def _set_manual_auxiliary_status(message, style):
   if (
     not isinstance(message, str)
@@ -1336,7 +1363,11 @@ def _run_manual_auxiliary_request(request):
 def _try_dispatch_manual_auxiliary_request():
   global manual_auxiliary_active_request
 
-  if application_closing.is_set() or _manual_auxiliary_stop_in_progress():
+  if (
+    application_closing.is_set()
+    or _manual_auxiliary_stop_in_progress()
+    or _manual_auxiliary_program_active()
+  ):
     return False
   if (
     serial_activity_registry.active("ser2")
@@ -1399,6 +1430,14 @@ def _queue_manual_auxiliary_command(
       "AUXILIARY COMMAND REJECTED DURING SHUTDOWN"
     )
   if _manual_auxiliary_stop_in_progress():
+    message = "AUXILIARY COMMAND REJECTED WHILE STOPPED"
+    logger.warning(message)
+    return _render_manual_auxiliary_rejection(message)
+  if _manual_auxiliary_program_active():
+    message = "AUXILIARY COMMAND REJECTED WHILE PROGRAM IS RUNNING"
+    logger.warning(message)
+    return _render_manual_auxiliary_rejection(message)
+  if not _acknowledge_program_stop_status_for_manual_auxiliary():
     message = "AUXILIARY COMMAND REJECTED WHILE STOPPED"
     logger.warning(message)
     return _render_manual_auxiliary_rejection(message)
@@ -7109,11 +7148,10 @@ def runProg():
       return False
     RUN['programStopStatusLatched'] = False
     RUN['programStopState'] = "completed"
-
-  def threadProg():
     RUN['estopActive'] = False
     RUN['posOutreach'] = False
 
+  def threadProg():
     last = tab1.progView.index('end')
     for row in range (0,last):
       tab1.progView.itemconfig(row, {'fg': "#FFFFFF"})
@@ -7189,9 +7227,9 @@ def runProg():
 def stepFwd():
     with program_stop_state_lock:
       RUN['programStopStatusLatched'] = False
-    def threadProg():
       RUN['estopActive'] = False
       RUN['posOutreach'] = False
+    def threadProg():
       almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
       almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
       try:
@@ -7248,8 +7286,8 @@ def stepFwd():
 def stepRev():
     with program_stop_state_lock:
       RUN['programStopStatusLatched'] = False
-    RUN['estopActive'] = False
-    RUN['posOutreach'] = False
+      RUN['estopActive'] = False
+      RUN['posOutreach'] = False
     almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
     almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel") 
     try:
@@ -10265,7 +10303,12 @@ def _poll_auxiliary_serial_events():
     _try_dispatch_auxiliary_stop()
     _ensure_startup_auxiliary_cleanup()
     if not application_closing.is_set():
-      root.after(25, _poll_auxiliary_serial_events)
+      try:
+        root.after(25, _poll_auxiliary_serial_events)
+      except (RuntimeError, tk.TclError):
+        logger.exception(
+          "Unable to schedule auxiliary serial result polling"
+        )
 
 
 def _poll_manual_auxiliary_events():
@@ -10354,7 +10397,11 @@ def _poll_manual_auxiliary_events():
         )
     else:
       try:
-        if (
+        if _manual_auxiliary_program_active():
+          _reject_queued_manual_auxiliary_requests(
+            "AUXILIARY COMMANDS REJECTED WHILE PROGRAM IS RUNNING"
+          )
+        elif (
           serial_activity_registry.active("ser2")
           or auxiliary_serial_lock.locked()
         ):
@@ -17245,7 +17292,8 @@ def ErrorHandler(response):
 
   ##REACH ERROR   
   elif (response[1:2] == 'R'):
-    RUN['posOutreach'] = TRUE
+    with program_stop_state_lock:
+      RUN['posOutreach'] = TRUE
     stopProg()
     message = "Position Out of Reach"
     messages.append(message)
@@ -17267,7 +17315,8 @@ def ErrorHandler(response):
 
   ##ESTOP BUTTON   
   elif (response[1:2] == 'B'):
-    RUN['estopActive'] = TRUE
+    with program_stop_state_lock:
+      RUN['estopActive'] = TRUE
     stopProg()
     message = "Estop Button was Pressed"
     messages.append(message)

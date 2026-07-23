@@ -392,13 +392,26 @@ class HmiSourceContractTests(unittest.TestCase):
                 function_name: ("_manual_auxiliary_error_detail",)
                 for function_name in (
                     "_run_manual_auxiliary_request",
-                    "_try_dispatch_manual_auxiliary_request",
-                    "_queue_manual_auxiliary_command",
                     "_request_manual_servo",
                     "_request_manual_output",
-                    "_poll_manual_auxiliary_events",
                 )
             },
+            "_try_dispatch_manual_auxiliary_request": (
+                "_manual_auxiliary_error_detail",
+                "_manual_auxiliary_program_active",
+            ),
+            "_queue_manual_auxiliary_command": (
+                "_manual_auxiliary_error_detail",
+                "_manual_auxiliary_program_active",
+                "_acknowledge_program_stop_status_for_manual_auxiliary",
+            ),
+            "_acknowledge_program_stop_status_for_manual_auxiliary": (
+                "_manual_auxiliary_stop_in_progress",
+            ),
+            "_poll_manual_auxiliary_events": (
+                "_manual_auxiliary_error_detail",
+                "_manual_auxiliary_program_active",
+            ),
             "_poll_auxiliary_serial_events": (
                 "_apply_program_stop_status_events",
             ),
@@ -5985,6 +5998,7 @@ class HmiSourceContractTests(unittest.TestCase):
         second_label = Widget()
         sent = Widget()
         received = Widget()
+        tab = SimpleNamespace(runTrue=0)
         registry = Registry()
         event_queue = Queue()
         scheduled = []
@@ -6016,6 +6030,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 normalize_auxiliary_board_profile
             ),
             "RUN": runtime,
+            "tab1": tab,
             "manual_auxiliary_event_queue": event_queue,
             "manual_auxiliary_request_queue": [],
             "manual_auxiliary_active_request": None,
@@ -6063,6 +6078,98 @@ class HmiSourceContractTests(unittest.TestCase):
             "_connected_auxiliary_board_profile",
             namespace,
         )
+        request_type = namespace["ManualAuxiliaryRequest"]
+        result_type = namespace["ManualAuxiliaryResult"]
+        self.assertEqual(
+            request_type(
+                1,
+                port,
+                "SV0P045\n",
+                b"Servo Done",
+                "Servo0on",
+                "045",
+            ).calibration_value,
+            "045",
+        )
+        self.assertEqual(
+            request_type(
+                2,
+                port,
+                "ONX8\n",
+                b"Done",
+                "DO1on",
+                "8",
+            ).calibration_value,
+            "8",
+        )
+        invalid_requests = (
+            (
+                (0, port, "SV0P45\n", b"Servo Done", "Servo0on", "45"),
+                MotionInputError,
+                "request ID",
+            ),
+            (
+                (
+                    1,
+                    SimpleNamespace(is_open=False),
+                    "SV0P45\n",
+                    b"Servo Done",
+                    "Servo0on",
+                    "45",
+                ),
+                ConnectionError,
+                "open connection",
+            ),
+            (
+                (1, port, "", b"Servo Done", "Servo0on", "45"),
+                MotionInputError,
+                "command is invalid",
+            ),
+            (
+                (1, port, "SV0P45\n", b"Invalid", "Servo0on", "45"),
+                MotionInputError,
+                "expected response",
+            ),
+            (
+                (1, port, "SV0P45\n", b"Servo Done", "invalid", "45"),
+                MotionInputError,
+                "calibration key",
+            ),
+            (
+                (1, port, "SV0P45\n", b"Servo Done", "Servo0on", " 45"),
+                MotionInputError,
+                "calibration value",
+            ),
+            (
+                (1, port, "SV0P45\n", b"Servo Done", "Servo1on", "45"),
+                MotionInputError,
+                "servo persistence contract",
+            ),
+            (
+                (1, port, "ONX8\n", b"Done", "DO1off", "8"),
+                MotionInputError,
+                "output persistence contract",
+            ),
+        )
+        for arguments, exception_type, message in invalid_requests:
+            with self.subTest(manual_request_error=message):
+                with self.assertRaisesRegex(exception_type, message):
+                    request_type(*arguments)
+
+        self.assertEqual(
+            result_type(1, "completed", "Done").value,
+            "Done",
+        )
+        invalid_results = (
+            ((0, "completed", "Done"), "result ID"),
+            ((1, "unknown", "Done"), "outcome"),
+            ((1, "failed", " failure "), "value"),
+        )
+        for arguments, message in invalid_results:
+            with self.subTest(manual_result_error=message):
+                with self.assertRaisesRegex(MotionInputError, message):
+                    result_type(*arguments)
+
         namespace["_manual_auxiliary_expected_response"] = self.compile_function(
             "_manual_auxiliary_expected_response",
             namespace,
@@ -6329,12 +6436,37 @@ class HmiSourceContractTests(unittest.TestCase):
         configuration_count = len(first_label.configurations)
         self.assertTrue(request_output(1, True, Entry("8")))
         poll_results()
-        self.assertTrue(runtime["programStopStatusLatched"])
-        self.assertEqual(
+        self.assertFalse(runtime["programStopStatusLatched"])
+        self.assertGreater(
             len(first_label.configurations),
             configuration_count,
         )
-        runtime["programStopStatusLatched"] = False
+        self.assertEqual(
+            first_label.configurations[-1]["text"],
+            "AUXILIARY COMMAND COMPLETE",
+        )
+
+        tab.runTrue = 1
+        self.assertFalse(request_output(1, True, Entry("8")))
+        self.assertEqual(
+            received.value,
+            "AUXILIARY COMMAND REJECTED WHILE PROGRAM IS RUNNING",
+        )
+        tab.runTrue = 0
+
+        self.assertTrue(request_output(1, True, Entry("8")))
+        self.assertTrue(request_output(2, True, Entry("9")))
+        tab.runTrue = 1
+        poll_results()
+        self.assertIsNone(namespace["manual_auxiliary_active_request"])
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+        self.assertIn("DO1on", namespace["CAL"])
+        self.assertNotIn("DO2on", namespace["CAL"])
+        self.assertEqual(
+            received.value,
+            "AUXILIARY COMMANDS REJECTED WHILE PROGRAM IS RUNNING",
+        )
+        tab.runTrue = 0
 
         expected_response = namespace["_manual_auxiliary_expected_response"]
         request_count = namespace["manual_auxiliary_next_request_id"]
@@ -6539,6 +6671,34 @@ class HmiSourceContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ConnectionError, "connection changed"):
             exchange("SV0P45\n", b"Servo Done", port)
         self.assertEqual(closes, [])
+
+        runtime["ser2"] = port
+        runtime["ser2BoardProfile"] = (
+            port,
+            AUXILIARY_BOARD_NANO,
+        )
+
+        def fail_read(*args):
+            raise TimeoutError("response timeout")
+
+        namespace["read_serial_exact_response"] = fail_read
+        with self.assertRaisesRegex(TimeoutError, "response timeout"):
+            exchange("SV0P45\n", b"Servo Done", port)
+        self.assertEqual(
+            closes[-1],
+            ("ser2", "manual auxiliary response failure"),
+        )
+
+        def fail_write(command):
+            raise OSError("write failed")
+
+        namespace["_write_legacy_auxiliary_command"] = fail_write
+        with self.assertRaisesRegex(OSError, "write failed"):
+            exchange("SV0P45\n", b"Servo Done", port)
+        self.assertEqual(
+            closes[-1],
+            ("ser2", "manual auxiliary response failure"),
+        )
 
     def test_auxiliary_connection_binds_and_clears_one_board_profile(self):
         class Port:
@@ -8126,6 +8286,55 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(apply_status())
         self.assertEqual(len(rendered), 2)
         self.assertFalse(apply_status())
+
+    def test_program_fault_flags_are_written_under_stop_state_lock(self):
+        writes = []
+
+        class FlagWriteVisitor(ast.NodeVisitor):
+            def __init__(self, function_name):
+                self.function_name = function_name
+                self.lock_depth = 0
+
+            def visit_With(self, node):
+                locked = any(
+                    isinstance(item.context_expr, ast.Name)
+                    and item.context_expr.id == "program_stop_state_lock"
+                    for item in node.items
+                )
+                if locked:
+                    self.lock_depth += 1
+                for statement in node.body:
+                    self.visit(statement)
+                if locked:
+                    self.lock_depth -= 1
+
+            def visit_Assign(self, node):
+                for target in node.targets:
+                    if (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "RUN"
+                        and isinstance(target.slice, ast.Constant)
+                        and target.slice.value
+                        in ("estopActive", "posOutreach")
+                    ):
+                        writes.append(
+                            (
+                                self.function_name,
+                                target.slice.value,
+                                self.lock_depth > 0,
+                            )
+                        )
+                self.generic_visit(node.value)
+
+        for function_name, function in self.module_functions.items():
+            FlagWriteVisitor(function_name).visit(function)
+
+        self.assertTrue(writes)
+        self.assertTrue(
+            all(locked for _, _, locked in writes),
+            writes,
+        )
 
     def test_program_stop_registration_precedes_a_fast_terminal_event(self):
         stop_barrier = threading.Event()
@@ -17954,6 +18163,7 @@ class HmiSourceContractTests(unittest.TestCase):
         second_label = Widget()
         recovery_attempts = []
         stop_statuses = []
+        logged_exceptions = []
         stop_barrier = threading.Event()
         stop_barrier.set()
         runtime = {"programStopRequestId": 41}
@@ -17966,8 +18176,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "almStatusLab2": second_label,
             "logger": SimpleNamespace(
                 error=lambda *args: None,
-                exception=lambda *args: None,
+                exception=lambda *args: logged_exceptions.append(args),
             ),
+            "tk": SimpleNamespace(TclError=RuntimeError),
             "RUN": runtime,
             "manual_auxiliary_stop_barrier": stop_barrier,
             "_set_program_stop_status": stop_statuses.append,
@@ -18006,6 +18217,23 @@ class HmiSourceContractTests(unittest.TestCase):
                 "controller", "auxiliary",
                 "controller", "auxiliary",
             ],
+        )
+
+        namespace["application_closing"] = SimpleNamespace(
+            is_set=lambda: False
+        )
+        namespace["root"] = SimpleNamespace(
+            after=lambda *args: (_ for _ in ()).throw(
+                RuntimeError("scheduler unavailable")
+            )
+        )
+        poll_events()
+        self.assertTrue(
+            any(
+                "Unable to schedule auxiliary serial result polling"
+                in arguments[0]
+                for arguments in logged_exceptions
+            )
         )
 
     def test_startup_timeout_is_async_and_waits_for_worker_termination(self):
