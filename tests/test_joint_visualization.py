@@ -292,10 +292,10 @@ class GhostSliderMarkerTests(unittest.TestCase):
             binding_before = root.bind_all("<ButtonRelease-1>")
             marker = GhostSliderMarker(parent, slider)
             # Tk drops synthetic pointer events for withdrawn widgets; a
-            # one-pixel override-redirect root bounds the mapped test surface.
+            # one-pixel override-redirect root keeps a mapped event surface
+            # without presenting a normal window.
             root.overrideredirect(True)
             root.geometry("1x1+0+0")
-            root.attributes("-alpha", 0.0)
             root.deiconify()
             root.update()
 
@@ -308,12 +308,27 @@ class GhostSliderMarkerTests(unittest.TestCase):
                 root.bind_all("<ButtonRelease-1>"),
                 binding_before,
             )
+            marker._marker.event_generate("<ButtonPress-1>", x=0, y=0)
+            root.update()
+            self.assertTrue(
+                getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
+            )
+            marker._marker.event_generate(
+                "<ButtonRelease-1>",
+                x=0,
+                y=0,
+            )
+            root.update()
+            self.assertFalse(
+                getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
+            )
             setattr(slider, _SLIDER_DRAG_ATTRIBUTE, True)
             sibling.event_generate("<ButtonRelease-1>", x=0, y=0)
             root.update()
             self.assertFalse(
                 getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
             )
+            root.unbind_all("<ButtonRelease-1>")
             setattr(slider, _SLIDER_DRAG_ATTRIBUTE, True)
             slider.event_generate("<ButtonRelease-1>", x=0, y=0)
             root.update()
