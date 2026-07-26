@@ -557,8 +557,10 @@ Implemented evidence:
   tests exercise placement, pointer forwarding, drag preservation, redraw
   suppression, and cleanup without opening the application entry point or a
   serial transport. A hidden real-Tk integration test verifies that the
-  place-managed marker can overlay and clear from a grid-managed scale on
-  display-capable test hosts and skips explicitly when no Tk display exists.
+  place-managed marker can overlay and clear from a grid-managed scale and
+  registers the global release binding shared by sibling widgets on
+  display-capable test hosts; the test skips explicitly when no Tk display
+  exists.
 
 ### M4B - Repeatability and dynamic interception pass
 
