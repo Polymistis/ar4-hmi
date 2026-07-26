@@ -265,7 +265,7 @@ class SliderMarkerGeometryTests(unittest.TestCase):
 
 
 class GhostSliderMarkerTests(unittest.TestCase):
-    def test_real_tk_marker_geometry_and_pointer_routing(self):
+    def test_real_tk_marker_geometry_routing_and_global_release(self):
         try:
             root = tk.Tk()
         except tk.TclError as exc:
@@ -439,12 +439,23 @@ class GhostSliderMarkerTests(unittest.TestCase):
         self.assertEqual(marker._marker.lift_count, 1)
 
         event = SimpleNamespace(x_root=130, y_root=235)
-        result = marker._marker.bindings["<ButtonPress-1>"](event)
+        results = [
+            marker._marker.bindings[sequence](event)
+            for sequence in (
+                "<ButtonPress-1>",
+                "<B1-Motion>",
+                "<ButtonRelease-1>",
+            )
+        ]
 
-        self.assertEqual(result, "break")
+        self.assertEqual(results, ["break", "break", "break"])
         self.assertEqual(
-            slider.generated_events[-1],
-            ("<ButtonPress-1>", {"x": 20, "y": 15}),
+            slider.generated_events[-3:],
+            [
+                ("<ButtonPress-1>", {"x": 20, "y": 15}),
+                ("<B1-Motion>", {"x": 20, "y": 15}),
+                ("<ButtonRelease-1>", {"x": 20, "y": 15}),
+            ],
         )
         self.assertTrue(marker.hide())
         self.assertFalse(marker.hide())
