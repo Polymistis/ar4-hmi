@@ -74,10 +74,12 @@ class FakeMarkerFrame:
 
 
 class OverlaySlider(FakeSlider):
-    def __init__(self, value=0):
+    def __init__(self, value=0, global_bindings=None):
         super().__init__(value)
         self.bindings = {}
-        self.global_bindings = {}
+        self.global_bindings = (
+            {} if global_bindings is None else global_bindings
+        )
         self.generated_events = []
 
     def bind(self, sequence, callback, add=None):
@@ -286,28 +288,14 @@ class GhostSliderMarkerTests(unittest.TestCase):
                 orient=tk.HORIZONTAL,
             )
             slider.grid(row=0, column=0)
-            sibling = tk.Button(parent, text="sibling")
-            sibling.grid(row=1, column=0)
             marker = GhostSliderMarker(parent, slider)
-            root.geometry("+100000+100000")
-            root.deiconify()
-            root.update()
+            root.update_idletasks()
 
             self.assertTrue(marker.show(25))
             root.update_idletasks()
 
             self.assertEqual(slider.winfo_manager(), "grid")
             self.assertEqual(marker._marker.winfo_manager(), "place")
-            slider.event_generate(
-                "<ButtonPress-1>",
-                x=slider.winfo_width() // 2,
-                y=slider.winfo_height() // 2,
-            )
-            root.update()
-            self.assertTrue(slider._ar4_joint_slider_drag_active)
-            sibling.event_generate("<ButtonRelease-1>", x=1, y=1)
-            root.update()
-            self.assertFalse(slider._ar4_joint_slider_drag_active)
             self.assertTrue(marker.hide())
             root.update_idletasks()
             self.assertEqual(marker._marker.winfo_manager(), "")
@@ -385,7 +373,9 @@ class GhostSliderMarkerTests(unittest.TestCase):
         )
 
     def test_global_release_clears_a_stale_drag(self):
-        slider = OverlaySlider()
+        global_bindings = {}
+        slider = OverlaySlider(global_bindings=global_bindings)
+        sibling = OverlaySlider(global_bindings=global_bindings)
         with patch(
             "ARrobots.HMI.joint_visualization.tk.Frame",
             FakeMarkerFrame,
@@ -395,8 +385,7 @@ class GhostSliderMarkerTests(unittest.TestCase):
         marker._marker.bindings["<ButtonPress-1>"](pointer)
         self.assertTrue(slider._ar4_joint_slider_drag_active)
 
-        for callback in slider.global_bindings["<ButtonRelease-1>"]:
-            callback(SimpleNamespace())
+        sibling.event_generate("<ButtonRelease-1>", x=0, y=0)
 
         self.assertFalse(slider._ar4_joint_slider_drag_active)
 
