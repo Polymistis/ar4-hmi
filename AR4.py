@@ -77,6 +77,8 @@
 
 import sys
 import os
+import json
+import secrets
 from datetime import datetime
 
 ################################################################################################
@@ -177,13 +179,20 @@ from ARrobots.HMI.joint_motion import (
   AUXILIARY_BOARD_MEGA,
   AUXILIARY_BOARD_NANO,
   AUXILIARY_BOARD_NONE,
+  CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
+  CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
+  CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
   CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+  CONTROLLER_HARDWARE_ID_LENGTH,
+  CONTROLLER_MEDIA_ID_LENGTH,
   CoalescingJointDispatcher,
   CONTROL_POLL_INTERVAL_SECONDS,
+  ControllerIdentity,
   ControllerJointCalibration,
   DeferredLiveMotionArbiter,
   LiveMotionScheduleResult,
   DeferredJointAdjustments,
+  MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES,
   MAX_COMMAND_LENGTH,
   MAX_RESPONSE_FRAME_LENGTH,
   MAX_RESPONSE_PAYLOAD_LENGTH,
@@ -231,6 +240,8 @@ from ARrobots.HMI.joint_motion import (
   validate_auxiliary_output_command,
   validate_auxiliary_servo_command,
   validate_controller_filename,
+  validate_controller_hardware_id,
+  validate_controller_media_id,
   write_serial_control,
 )
 
@@ -360,6 +371,24 @@ def on_closing():
   if isinstance(runtime_state, dict):
     runtime_state['xboxUse'] = 0
 
+  conversion_active = globals().get('gcode_conversion_active')
+  conversion_tab = globals().get('tab7')
+  if (
+    conversion_active is not None
+    and conversion_active.is_set()
+    and conversion_tab is not None
+  ):
+    acquired = gcode_conversion_cancel_lock.acquire()
+    if acquired is False:
+      raise RuntimeError(
+        "G-code conversion cancellation lock acquisition failed"
+      )
+    try:
+      gcode_conversion_cancel_requested.set()
+      conversion_tab.GCrunTrue = 0
+    finally:
+      gcode_conversion_cancel_lock.release()
+
   live_pending = globals().get('live_serial_result_pending')
   live_stop = globals().get('live_jog_stop_requested')
   if (
@@ -426,9 +455,29 @@ manual_auxiliary_active_request = None
 manual_auxiliary_next_request_id = 0
 manual_auxiliary_state_lock = threading.Lock()
 manual_auxiliary_stop_barrier = threading.Event()
+gcode_storage_event_queue = Queue()
+gcode_storage_state_lock = threading.Lock()
+gcode_storage_active_request = None
+gcode_storage_next_request_id = 0
+gcode_storage_cleanup_lock = threading.Lock()
+gcode_storage_cleanup_pending = {}
+gcode_storage_cleanup_completed = {}
+gcode_storage_cleanup_worker = None
+gcode_storage_cleanup_next_id = 0
+gcode_storage_pending_delete_reconciliation = None
+gcode_storage_persistent_state_loaded = False
+gcode_storage_persistent_state_error = None
+gcode_storage_state_path_override = None
+main_controller_identity_binding = None
+gcode_storage_media_binding = None
+gcode_view_generation = 0
+gcode_conversion_active = threading.Event()
+gcode_conversion_cancel_requested = threading.Event()
+gcode_conversion_cancel_lock = threading.Lock()
 program_execution_state_lock = threading.Lock()
 program_execution_next_request_id = 0
 program_execution_active_request = None
+gcode_storage_program_admission_active = False
 event_poll_retry_lock = threading.Lock()
 event_poll_retry_pending = set()
 startup_auxiliary_cleanup_lock = threading.Lock()
@@ -565,11 +614,40 @@ XBOX_AUXILIARY_FIXED_EXCHANGES = frozenset(
 )
 MANUAL_AUXILIARY_QUEUE_LIMIT = 64
 PROGRAM_EXECUTION_MODES = frozenset(("run", "step-forward", "step-reverse"))
+GCODE_STORAGE_OPERATIONS = frozenset(("delete", "list"))
+GCODE_STORAGE_DELETE_TERMINAL_RESPONSES = frozenset(("P", "F", "ER"))
+GCODE_STORAGE_DETAILED_ERROR_PREFIX = "EG: "
+GCODE_STORAGE_DIRECTORY_IDENTITY_PREFIX = "MID:"
+GCODE_STORAGE_DIRECTORY_IDENTITY_SEPARATOR = "|"
+GCODE_STORAGE_MEDIA_MARKER = "Mi"
+GCODE_STORAGE_FILENAME_MARKER = "Fn"
+GCODE_STORAGE_STATE_SCHEMA_VERSION = 1
+GCODE_STORAGE_STATE_DIRECTORY_NAME = "AR4HMI"
+GCODE_STORAGE_STATE_FILENAME = "gcode-storage-state.json"
+GCODE_STORAGE_STATE_LOCK_SUFFIX = ".lock"
+GCODE_STORAGE_STATE_MAXIMUM_BYTES = 8192
+GCODE_STORAGE_STATE_TEMPORARY_ATTEMPTS = 16
+MAX_LOCAL_GCODE_PROGRAM_BYTES = 8 * 1024 * 1024
+MAX_LOCAL_GCODE_PROGRAM_ROWS = 10000
+MAX_LOCAL_GCODE_SOURCE_LINE_BYTES = MAX_COMMAND_LENGTH + 2
+GCODE_LISTBOX_STYLE_OPTIONS = (
+  "background",
+  "foreground",
+  "selectbackground",
+  "selectforeground",
+)
+CONTROLLER_STARTUP_REQUIRED_CAPABILITIES = (
+  CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+  CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
+  CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
+  CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+)
 EVENT_POLL_INTERVAL_MS = 25
 EVENT_POLL_CALLBACK_NAMES = {
   "serial": "_poll_serial_events",
   "auxiliary-serial": "_poll_auxiliary_serial_events",
   "manual-auxiliary": "_poll_manual_auxiliary_events",
+  "gcode-storage": "_poll_gcode_storage_events",
   "xbox-auxiliary": "_poll_xbox_auxiliary_events",
   "virtual-motion": "_poll_virtual_motion_events",
   "joint-motion": "_poll_joint_motion_events",
@@ -689,6 +767,538 @@ class ManualAuxiliaryResult:
       raise MotionInputError("manual auxiliary result value is invalid")
 
 
+@dataclass(frozen=True)
+class MainControllerIdentityBinding:
+  serial_port: object
+  identity: ControllerIdentity
+
+  def __post_init__(self):
+    if self.serial_port is None or not getattr(self.serial_port, "is_open", False):
+      raise ConnectionError(
+        "main controller identity requires an open serial connection"
+      )
+    if not isinstance(self.identity, ControllerIdentity):
+      raise MotionInputError("main controller identity binding is invalid")
+    validate_controller_hardware_id(
+      self.identity.controller_hardware_id
+    )
+
+
+class GCodeStorageStateLockError(RuntimeError):
+  pass
+
+
+class GCodeStorageCleanupRetainedError(RuntimeError):
+  pass
+
+
+@dataclass(frozen=True)
+class GCodeStorageCleanupResult:
+  cleanup_id: int
+
+  def __post_init__(self):
+    if (
+      isinstance(self.cleanup_id, bool)
+      or not isinstance(self.cleanup_id, int)
+      or self.cleanup_id <= 0
+    ):
+      raise MotionInputError("G-code storage cleanup result ID must be positive")
+
+
+class GCodeStorageCleanup:
+  def __init__(
+    self,
+    cleanup_id,
+    activity_lease,
+    serial_lock_owned,
+    motion_lease,
+    storage_admission_owned,
+    active_request=None,
+    settlement_callback=None,
+  ):
+    if (
+      isinstance(cleanup_id, bool)
+      or not isinstance(cleanup_id, int)
+      or cleanup_id <= 0
+    ):
+      raise MotionInputError("G-code storage cleanup ID must be positive")
+    if activity_lease is not None and not callable(
+      getattr(activity_lease, "close", None)
+    ):
+      raise MotionInputError(
+        "G-code storage cleanup activity lease is invalid"
+      )
+    if not isinstance(serial_lock_owned, bool):
+      raise MotionInputError(
+        "G-code storage cleanup serial ownership must be boolean"
+      )
+    if motion_lease is not None and not isinstance(
+      motion_lease,
+      MotionRequestLease,
+    ):
+      raise MotionInputError(
+        "G-code storage cleanup motion lease is invalid"
+      )
+    if storage_admission_owned is not True:
+      raise MotionInputError(
+        "G-code storage cleanup requires storage admission ownership"
+      )
+    if active_request is not None and not isinstance(
+      active_request,
+      GCodeStorageRequest,
+    ):
+      raise MotionInputError(
+        "G-code storage cleanup active request is invalid"
+      )
+    if settlement_callback is not None and not callable(
+      settlement_callback
+    ):
+      raise MotionInputError(
+        "G-code storage cleanup settlement callback is invalid"
+      )
+    if activity_lease is not None and (
+      not serial_lock_owned or motion_lease is None
+    ):
+      raise MotionInputError(
+        "G-code storage cleanup activity ownership is incomplete"
+      )
+    if serial_lock_owned and motion_lease is None:
+      raise MotionInputError(
+        "G-code storage cleanup serial ownership lacks motion ownership"
+      )
+    if active_request is not None and (
+      activity_lease is None
+      or not serial_lock_owned
+      or motion_lease is None
+    ):
+      raise MotionInputError(
+        "G-code storage request cleanup ownership is incomplete"
+      )
+
+    self.cleanup_id = cleanup_id
+    self.settlement_callback = settlement_callback
+    self._activity_lease = activity_lease
+    self._serial_lock_owned = serial_lock_owned
+    self._motion_lease = motion_lease
+    self._storage_admission_owned = storage_admission_owned
+    self._active_request = active_request
+    self._state_lock = threading.Lock()
+
+  @property
+  def complete(self):
+    with self._state_lock:
+      return not (
+        self._activity_lease is not None
+        or self._serial_lock_owned
+        or self._motion_lease is not None
+        or self._active_request is not None
+        or self._storage_admission_owned
+      )
+
+  def release(self):
+    global gcode_storage_active_request
+
+    with self._state_lock:
+      # Stop at the first failed release so every lower-level gate remains
+      # available to block conflicting work until the retry owner succeeds.
+      if self._activity_lease is not None:
+        if self._activity_lease.close() is not True:
+          raise RuntimeError(
+            "G-code storage cleanup activity lease was already released"
+          )
+        self._activity_lease = None
+      if self._serial_lock_owned:
+        if not serial_lock.locked():
+          raise RuntimeError(
+            "G-code storage cleanup serial reservation was already released"
+          )
+        serial_lock.release()
+        self._serial_lock_owned = False
+      if self._motion_lease is not None:
+        if not motion_request_registry.owns(self._motion_lease):
+          raise RuntimeError(
+            "G-code storage cleanup motion ownership was already released"
+          )
+        _finish_motion_request(self._motion_lease)
+        self._motion_lease = None
+      if self._active_request is not None:
+        with gcode_storage_state_lock:
+          if gcode_storage_active_request is not self._active_request:
+            raise RuntimeError(
+              "G-code storage cleanup request ownership changed"
+            )
+          gcode_storage_active_request = None
+        self._active_request = None
+      if self._storage_admission_owned:
+        _finish_gcode_storage_program_admission()
+        self._storage_admission_owned = False
+      return True
+
+
+@dataclass(frozen=True)
+class GCodeStorageMediaBinding:
+  serial_port: object
+  controller_hardware_id: str
+  media_id: str
+
+  def __post_init__(self):
+    if self.serial_port is None or not getattr(self.serial_port, "is_open", False):
+      raise ConnectionError(
+        "G-code storage media requires an open controller connection"
+      )
+    validate_controller_hardware_id(self.controller_hardware_id)
+    validate_controller_media_id(self.media_id)
+
+
+@dataclass(frozen=True)
+class GCodeStorageRequest:
+  request_id: int
+  operation: str
+  serial_port: object
+  command: str
+  filename: Optional[str]
+  announce_listing: bool
+  view_generation: int
+  activity_lease: object
+  motion_lease: MotionRequestLease
+  controller_hardware_id: Optional[str] = None
+  media_id: Optional[str] = None
+  completion_callback: object = None
+  cancellation_event: object = None
+  cancellation_lock: object = None
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError("G-code storage request ID must be positive")
+    if (
+      not isinstance(self.operation, str)
+      or self.operation not in GCODE_STORAGE_OPERATIONS
+    ):
+      raise MotionInputError("G-code storage operation is invalid")
+    if self.serial_port is None or not getattr(self.serial_port, "is_open", False):
+      raise ConnectionError(
+        "G-code storage request requires an open controller connection"
+      )
+    if not isinstance(self.announce_listing, bool):
+      raise MotionInputError(
+        "G-code storage listing announcement flag must be boolean"
+      )
+    if (
+      isinstance(self.view_generation, bool)
+      or not isinstance(self.view_generation, int)
+      or self.view_generation < 0
+    ):
+      raise MotionInputError(
+        "G-code storage view generation must be a nonnegative integer"
+      )
+    if not callable(getattr(self.activity_lease, "close", None)):
+      raise MotionInputError(
+        "G-code storage request activity lease is invalid"
+      )
+    if not isinstance(self.motion_lease, MotionRequestLease):
+      raise MotionInputError(
+        "G-code storage request motion lease is invalid"
+      )
+    validate_controller_hardware_id(self.controller_hardware_id)
+    if (
+      self.completion_callback is not None
+      and not callable(self.completion_callback)
+    ):
+      raise MotionInputError(
+        "G-code storage completion callback must be callable"
+      )
+    cancellation_methods = (
+      callable(getattr(self.cancellation_event, "is_set", None)),
+      callable(getattr(self.cancellation_lock, "acquire", None)),
+      callable(getattr(self.cancellation_lock, "release", None)),
+    )
+    if self.cancellation_event is None and self.cancellation_lock is None:
+      cancellation_enabled = False
+    elif all(cancellation_methods):
+      cancellation_enabled = True
+      try:
+        cancellation_requested = self.cancellation_event.is_set()
+      except Exception as exc:
+        raise MotionInputError(
+          "G-code storage cancellation state could not be read"
+        ) from exc
+      if not isinstance(cancellation_requested, bool):
+        raise MotionInputError(
+          "G-code storage cancellation state must be boolean"
+        )
+    else:
+      raise MotionInputError(
+        "G-code storage cancellation boundary is invalid"
+      )
+
+    if self.operation == "list":
+      if (
+        self.command != "RG\n"
+        or self.filename is not None
+        or self.media_id is not None
+        or self.completion_callback is not None
+        or cancellation_enabled
+      ):
+        raise MotionInputError(
+          "G-code storage list request contract is invalid"
+        )
+      return
+
+    filename = _validate_gcode_storage_filename(
+      self.filename,
+      "G-code storage filename",
+    )
+    media_id = validate_controller_media_id(self.media_id)
+    if (
+      self.command != _gcode_storage_delete_command(media_id, filename)
+      or self.announce_listing
+      or cancellation_enabled != (self.completion_callback is not None)
+    ):
+      raise MotionInputError(
+        "G-code storage delete request contract is invalid"
+      )
+
+
+@dataclass(frozen=True)
+class GCodeStorageResult:
+  request_id: int
+  outcome: str
+  value: str
+  filenames: tuple
+  write_started: bool
+  media_id: Optional[str] = None
+  pending_delete: object = None
+  reconciliation: object = None
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError("G-code storage result ID must be positive")
+    if (
+      not isinstance(self.outcome, str)
+      or self.outcome not in ("completed", "failed", "indeterminate")
+    ):
+      raise MotionInputError("G-code storage result outcome is invalid")
+    if not isinstance(self.write_started, bool):
+      raise MotionInputError(
+        "G-code storage result write state must be boolean"
+      )
+    if (
+      self.outcome in ("completed", "indeterminate")
+      and not self.write_started
+    ):
+      raise MotionInputError(
+        "G-code storage result outcome requires a committed write"
+      )
+    if (
+      not isinstance(self.value, str)
+      or self.value != self.value.strip()
+      or "\r" in self.value
+      or "\n" in self.value
+      or len(self.value) > MAX_RESPONSE_PAYLOAD_LENGTH
+      or (self.outcome == "completed" and not self.value.isascii())
+      or (self.outcome != "completed" and not self.value)
+    ):
+      raise MotionInputError("G-code storage result value is invalid")
+    if not isinstance(self.filenames, tuple):
+      raise MotionInputError("G-code storage result filenames must be a tuple")
+    validated_filenames = tuple(
+      validate_controller_filename(filename, "G-code storage filename")
+      for filename in self.filenames
+    )
+    if validated_filenames != self.filenames:
+      raise MotionInputError("G-code storage result filenames are invalid")
+    normalized_names = tuple(
+      filename.casefold()
+      for filename in validated_filenames
+    )
+    if len(set(normalized_names)) != len(normalized_names):
+      raise MotionInputError(
+        "G-code storage result contains duplicate filenames"
+      )
+    if any(
+      not filename.casefold().endswith(".txt")
+      or filename[:-len(".txt")] in ("", ".", "..")
+      for filename in validated_filenames
+    ):
+      raise MotionInputError(
+        "G-code storage result contains a non-actionable filename"
+      )
+    if self.outcome != "completed" and self.filenames:
+      raise MotionInputError(
+        "non-completed G-code storage results cannot contain filenames"
+      )
+    if self.media_id is not None:
+      validate_controller_media_id(self.media_id)
+    if self.outcome != "completed" and self.media_id is not None:
+      raise MotionInputError(
+        "non-completed G-code storage results cannot contain a media ID"
+      )
+    if self.pending_delete is not None and not isinstance(
+      self.pending_delete,
+      GCodeDeleteReconciliation,
+    ):
+      raise MotionInputError(
+        "G-code storage result pending delete is invalid"
+      )
+    if self.outcome == "indeterminate":
+      if self.pending_delete is None:
+        raise MotionInputError(
+          "indeterminate G-code delete lacks pending reconciliation"
+        )
+    elif self.outcome == "completed" and self.pending_delete is not None:
+      raise MotionInputError(
+        "settled G-code storage result cannot retain a pending delete"
+      )
+    if self.reconciliation is not None:
+      if (
+        not isinstance(self.reconciliation, tuple)
+        or len(self.reconciliation) != 2
+        or not isinstance(
+          self.reconciliation[0],
+          GCodeDeleteReconciliation,
+        )
+        or (
+          self.reconciliation[1] is not None
+          and not isinstance(self.reconciliation[1], bool)
+        )
+      ):
+        raise MotionInputError(
+          "G-code storage result reconciliation is invalid"
+        )
+      if self.outcome != "completed" or self.media_id is None:
+        raise MotionInputError(
+          "only a completed directory result can reconcile deletion"
+        )
+
+
+@dataclass(frozen=True)
+class GCodeDeleteReconciliation:
+  request_id: int
+  controller_hardware_id: str
+  media_id: str
+  filename: str
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError(
+        "G-code delete reconciliation ID must be positive"
+      )
+    validate_controller_hardware_id(self.controller_hardware_id)
+    validate_controller_media_id(self.media_id)
+    validated = validate_controller_filename(
+      self.filename,
+      "G-code delete reconciliation filename",
+    )
+    if (
+      validated != self.filename
+      or not validated.casefold().endswith(".txt")
+      or validated[:-len(".txt")] in ("", ".", "..")
+    ):
+      raise MotionInputError(
+        "G-code delete reconciliation filename is invalid"
+      )
+
+
+@dataclass(frozen=True)
+class GCodeProgramViewSnapshot:
+  rows: tuple
+  row_styles: tuple
+  selected_rows: tuple
+  active_row: Optional[int]
+  anchor_row: Optional[int]
+  xview: tuple
+  yview: tuple
+  program_path: str
+  program_path_state: str
+  current_row: str
+
+  def __post_init__(self):
+    if not isinstance(self.rows, tuple) or any(
+      not isinstance(row, (str, bytes))
+      for row in self.rows
+    ):
+      raise MotionInputError("G-code view snapshot rows are invalid")
+    if (
+      not isinstance(self.row_styles, tuple)
+      or len(self.row_styles) != len(self.rows)
+      or any(
+        not isinstance(style, tuple)
+        or len(style) != len(GCODE_LISTBOX_STYLE_OPTIONS)
+        or any(not isinstance(value, str) for value in style)
+        for style in self.row_styles
+      )
+    ):
+      raise MotionInputError("G-code view snapshot styles are invalid")
+    if (
+      not isinstance(self.selected_rows, tuple)
+      or any(
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or not 0 <= index < len(self.rows)
+        for index in self.selected_rows
+      )
+      or len(set(self.selected_rows)) != len(self.selected_rows)
+    ):
+      raise MotionInputError("G-code view snapshot selection is invalid")
+    for field_name, index in (
+      ("active row", self.active_row),
+      ("anchor row", self.anchor_row),
+    ):
+      if index is not None and (
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or not 0 <= index < len(self.rows)
+      ):
+        raise MotionInputError(
+          f"G-code view snapshot {field_name} is invalid"
+        )
+    for field_name, values in (("xview", self.xview), ("yview", self.yview)):
+      if (
+        not isinstance(values, tuple)
+        or len(values) != 2
+        or any(
+          isinstance(value, bool)
+          or not isinstance(value, (int, float))
+          or not math.isfinite(float(value))
+          or not 0.0 <= float(value) <= 1.0
+          for value in values
+        )
+        or float(values[0]) > float(values[1])
+      ):
+        raise MotionInputError(
+          f"G-code view snapshot {field_name} is invalid"
+        )
+    for field_name, value in (
+      ("program path", self.program_path),
+      ("current row", self.current_row),
+    ):
+      if (
+        not isinstance(value, str)
+        or "\x00" in value
+        or "\r" in value
+        or "\n" in value
+      ):
+        raise MotionInputError(
+          f"G-code view snapshot {field_name} is invalid"
+        )
+    if self.program_path_state not in ("normal", "readonly", "disabled"):
+      raise MotionInputError(
+        "G-code view snapshot program path state is invalid"
+      )
+
+
 def _bind_auxiliary_board_profile(serial_port, board_profile):
   if serial_port is None or not getattr(serial_port, "is_open", False):
     raise ConnectionError(
@@ -785,13 +1395,35 @@ def _synchronous_motion_request(
   name,
   rejection_result=False,
   requires_kinematics=True,
+  inherited_lease_keyword=None,
 ):
   if not isinstance(requires_kinematics, bool):
     raise TypeError("kinematics admission flag must be boolean")
+  if (
+    inherited_lease_keyword is not None
+    and (
+      not isinstance(inherited_lease_keyword, str)
+      or not inherited_lease_keyword.isidentifier()
+    )
+  ):
+    raise TypeError(
+      "inherited motion-lease keyword must be a valid identifier"
+    )
 
   def decorate(callback):
     @wraps(callback)
     def guarded(*args, **kwargs):
+      inherited_lease = (
+        kwargs.get(inherited_lease_keyword)
+        if inherited_lease_keyword is not None
+        else None
+      )
+      if inherited_lease is not None:
+        if not motion_request_registry.owns(inherited_lease):
+          raise RuntimeError(
+            "inherited motion request ownership is invalid"
+          )
+        return callback(*args, **kwargs)
       request_lease = _acquire_motion_request(
         name,
         requires_kinematics=requires_kinematics,
@@ -1244,6 +1876,12 @@ def _begin_program_execution(mode):
   if mode not in PROGRAM_EXECUTION_MODES:
     raise MotionInputError("program execution mode is invalid")
   with program_execution_state_lock:
+    if not isinstance(gcode_storage_program_admission_active, bool):
+      raise RuntimeError("G-code storage program admission state is invalid")
+    if gcode_conversion_active.is_set():
+      return None
+    if gcode_storage_program_admission_active:
+      return None
     if program_execution_active_request is not None:
       if not isinstance(
         program_execution_active_request,
@@ -1303,13 +1941,104 @@ def _program_execution_request_active(request):
 
 def _program_execution_busy_message():
   with program_execution_state_lock:
+    if not isinstance(gcode_storage_program_admission_active, bool):
+      raise RuntimeError("G-code storage program admission state is invalid")
     request = program_execution_active_request
     if request is None:
+      if gcode_conversion_active.is_set():
+        return "PROGRAM EXECUTION REJECTED DURING G-CODE CONVERSION"
+      if gcode_storage_program_admission_active:
+        return "PROGRAM EXECUTION REJECTED DURING G-CODE STORAGE"
       return "PROGRAM EXECUTION STATE CHANGED; RETRY"
     if not isinstance(request, ProgramExecutionRequest):
       raise RuntimeError("active program execution request is invalid")
     mode = request.mode.replace("-", " ").upper()
   return f"PROGRAM EXECUTION ALREADY ACTIVE: {mode}"
+
+
+def _begin_gcode_conversion_admission():
+  with program_execution_state_lock:
+    if not isinstance(gcode_storage_program_admission_active, bool):
+      raise RuntimeError("G-code storage program admission state is invalid")
+    request = program_execution_active_request
+    if request is not None and not isinstance(
+      request,
+      ProgramExecutionRequest,
+    ):
+      raise RuntimeError("active program execution request is invalid")
+    if request is not None:
+      return "program-active"
+    if gcode_conversion_active.is_set():
+      return "conversion-active"
+    if gcode_storage_program_admission_active:
+      return "storage-active"
+    gcode_conversion_active.set()
+  return "admitted"
+
+
+def _finish_gcode_conversion_admission():
+  with program_execution_state_lock:
+    if not isinstance(gcode_storage_program_admission_active, bool):
+      raise RuntimeError("G-code storage program admission state is invalid")
+    if not gcode_conversion_active.is_set():
+      raise RuntimeError("G-code conversion admission is not active")
+    if gcode_storage_program_admission_active:
+      raise RuntimeError(
+        "G-code conversion cannot finish during a storage request"
+      )
+    gcode_conversion_active.clear()
+  return True
+
+
+def _begin_gcode_storage_program_admission(conversion_request):
+  global gcode_storage_program_admission_active
+
+  if not isinstance(conversion_request, bool):
+    raise MotionInputError(
+      "G-code storage conversion admission flag must be boolean"
+    )
+  with program_execution_state_lock:
+    if not isinstance(gcode_storage_program_admission_active, bool):
+      raise RuntimeError("G-code storage program admission state is invalid")
+    request = program_execution_active_request
+    if request is not None and not isinstance(
+      request,
+      ProgramExecutionRequest,
+    ):
+      raise RuntimeError("active program execution request is invalid")
+    if request is not None:
+      return "program-active"
+    conversion_active = gcode_conversion_active.is_set()
+    if conversion_active and not conversion_request:
+      return "conversion-active"
+    if conversion_request and not conversion_active:
+      return "conversion-inactive"
+    if gcode_storage_program_admission_active:
+      return "storage-active"
+    gcode_storage_program_admission_active = True
+  return "admitted"
+
+
+def _finish_gcode_storage_program_admission():
+  global gcode_storage_program_admission_active
+
+  with program_execution_state_lock:
+    if not isinstance(gcode_storage_program_admission_active, bool):
+      raise RuntimeError("G-code storage program admission state is invalid")
+    if not gcode_storage_program_admission_active:
+      raise RuntimeError("G-code storage program admission is not active")
+    request = program_execution_active_request
+    if request is not None and not isinstance(
+      request,
+      ProgramExecutionRequest,
+    ):
+      raise RuntimeError("active program execution request is invalid")
+    if request is not None:
+      raise RuntimeError(
+        "G-code storage program admission overlaps program execution"
+      )
+    gcode_storage_program_admission_active = False
+  return True
 
 
 def _manual_auxiliary_program_active():
@@ -1716,6 +2445,116 @@ def _request_manual_output(row, on_state, entry):
   )
 
 
+def _bind_main_controller_identity(serial_port, identity):
+  global main_controller_identity_binding
+  global gcode_storage_media_binding
+
+  binding = MainControllerIdentityBinding(serial_port, identity)
+  if RUN.get('ser') is not serial_port:
+    raise ConnectionError(
+      "main controller changed before identity binding"
+    )
+  with gcode_storage_state_lock:
+    main_controller_identity_binding = binding
+    gcode_storage_media_binding = None
+  return binding
+
+
+def _clear_main_controller_identity(serial_port=None):
+  global main_controller_identity_binding
+  global gcode_storage_media_binding
+
+  with gcode_storage_state_lock:
+    binding = main_controller_identity_binding
+    if (
+      serial_port is not None
+      and isinstance(binding, MainControllerIdentityBinding)
+      and binding.serial_port is not serial_port
+    ):
+      logger.error(
+        "Main-controller identity cleanup rejected because the bound "
+        "controller changed"
+      )
+      return False
+    main_controller_identity_binding = None
+    media_binding = gcode_storage_media_binding
+    if (
+      serial_port is None
+      or not isinstance(media_binding, GCodeStorageMediaBinding)
+      or media_binding.serial_port is serial_port
+    ):
+      gcode_storage_media_binding = None
+  return True
+
+
+def _require_main_controller_identity_cleanup(serial_port, context):
+  if _clear_main_controller_identity(serial_port):
+    return True
+  raise RuntimeError(
+    f"main-controller identity cleanup invariant failed during {context}"
+  )
+
+
+def _current_main_controller_identity(serial_port=None):
+  with gcode_storage_state_lock:
+    binding = main_controller_identity_binding
+  if not isinstance(binding, MainControllerIdentityBinding):
+    return None
+  if (
+    RUN.get('ser') is not binding.serial_port
+    or not getattr(binding.serial_port, "is_open", False)
+    or (serial_port is not None and binding.serial_port is not serial_port)
+  ):
+    return None
+  return binding
+
+
+def _bind_gcode_storage_media(
+  serial_port,
+  controller_hardware_id,
+  media_id,
+):
+  global gcode_storage_media_binding
+
+  controller_binding = _current_main_controller_identity(serial_port)
+  if (
+    controller_binding is None
+    or controller_binding.identity.controller_hardware_id
+      != controller_hardware_id
+  ):
+    raise ConnectionError(
+      "G-code storage listing controller identity changed"
+    )
+  binding = GCodeStorageMediaBinding(
+    serial_port,
+    controller_hardware_id,
+    media_id,
+  )
+  with gcode_storage_state_lock:
+    gcode_storage_media_binding = binding
+  return binding
+
+
+def _current_gcode_storage_media(serial_port=None):
+  with gcode_storage_state_lock:
+    binding = gcode_storage_media_binding
+  if not isinstance(binding, GCodeStorageMediaBinding):
+    return None
+  controller_binding = _current_main_controller_identity(
+    binding.serial_port
+  )
+  if (
+    controller_binding is None
+    or RUN.get('ser') is not binding.serial_port
+    or not getattr(binding.serial_port, "is_open", False)
+    or (serial_port is not None and binding.serial_port is not serial_port)
+    or controller_binding.identity.controller_hardware_id
+      != binding.controller_hardware_id
+  ):
+    return None
+  return binding
+
+
 def _close_serial_port(serial_name, context="application shutdown"):
   serial_port = RUN.get(serial_name)
   if serial_port is None:
@@ -1730,7 +2569,12 @@ def _close_serial_port(serial_name, context="application shutdown"):
     return False
   if RUN.get(serial_name) is serial_port:
     RUN[serial_name] = None
-    if serial_name == 'ser2':
+    if serial_name == 'ser':
+      try:
+        _require_main_controller_identity_cleanup(serial_port, context)
+      except RuntimeError:
+        return False
+    elif serial_name == 'ser2':
       _clear_auxiliary_board_profile(serial_port)
   return True
 
@@ -1785,14 +2629,204 @@ def _release_async_main_serial_transport(activity_lease, request_lease):
   _finish_motion_request(request_lease)
 
 
+def _new_gcode_storage_cleanup(
+  activity_lease,
+  serial_lock_owned,
+  motion_lease,
+  *,
+  active_request=None,
+  settlement_callback=None,
+):
+  global gcode_storage_cleanup_next_id
+
+  with gcode_storage_cleanup_lock:
+    if (
+      isinstance(gcode_storage_cleanup_next_id, bool)
+      or not isinstance(gcode_storage_cleanup_next_id, int)
+      or gcode_storage_cleanup_next_id < 0
+    ):
+      raise RuntimeError("G-code storage cleanup counter is invalid")
+    cleanup_id = gcode_storage_cleanup_next_id + 1
+    cleanup = GCodeStorageCleanup(
+      cleanup_id,
+      activity_lease,
+      serial_lock_owned,
+      motion_lease,
+      True,
+      active_request=active_request,
+      settlement_callback=settlement_callback,
+    )
+    gcode_storage_cleanup_next_id = cleanup_id
+  return cleanup
+
+
+def _run_gcode_storage_cleanup():
+  global gcode_storage_cleanup_worker
+
+  last_failures = {}
+  while True:
+    with gcode_storage_cleanup_lock:
+      pending = tuple(gcode_storage_cleanup_pending.items())
+      if not pending:
+        gcode_storage_cleanup_worker = None
+        return
+
+    completed_any = False
+    for cleanup_id, cleanup in pending:
+      if not isinstance(cleanup, GCodeStorageCleanup):
+        raise RuntimeError("pending G-code storage cleanup is invalid")
+      try:
+        if cleanup.release() is not True or not cleanup.complete:
+          raise RuntimeError("G-code storage cleanup did not settle")
+      except Exception as exc:
+        detail = _gcode_storage_error_detail(
+          exc,
+          "G-code storage cleanup retry failed without details",
+        )
+        if last_failures.get(cleanup_id) != detail:
+          logger.error(
+            "G-code storage cleanup %s remains pending: %s",
+            cleanup_id,
+            detail,
+          )
+          last_failures[cleanup_id] = detail
+        continue
+
+      publish_result = False
+      with gcode_storage_cleanup_lock:
+        current = gcode_storage_cleanup_pending.get(cleanup_id)
+        if current is not cleanup:
+          raise RuntimeError("G-code storage cleanup ownership changed")
+        del gcode_storage_cleanup_pending[cleanup_id]
+        if cleanup.settlement_callback is not None:
+          if cleanup_id in gcode_storage_cleanup_completed:
+            raise RuntimeError(
+              "G-code storage cleanup completion ID is duplicated"
+            )
+          gcode_storage_cleanup_completed[cleanup_id] = cleanup
+          publish_result = True
+      if publish_result:
+        gcode_storage_event_queue.put(
+          GCodeStorageCleanupResult(cleanup_id)
+        )
+      last_failures.pop(cleanup_id, None)
+      completed_any = True
+
+    if not completed_any:
+      time.sleep(SERIAL_SHUTDOWN_RETRY_MS / 1000.0)
+
+
+def _ensure_gcode_storage_cleanup():
+  global gcode_storage_cleanup_worker
+
+  with gcode_storage_cleanup_lock:
+    if not gcode_storage_cleanup_pending:
+      return True
+    worker = gcode_storage_cleanup_worker
+    if worker is not None and worker.is_alive():
+      return True
+    try:
+      worker = threading.Thread(
+        target=_run_gcode_storage_cleanup,
+        name="ar4-gcode-storage-cleanup",
+        daemon=True,
+      )
+      gcode_storage_cleanup_worker = worker
+      worker.start()
+    except Exception:
+      gcode_storage_cleanup_worker = None
+      logger.exception("Unable to start G-code storage cleanup retry")
+      return False
+  return True
+
+
+def _retain_gcode_storage_cleanup(cleanup):
+  if not isinstance(cleanup, GCodeStorageCleanup):
+    raise TypeError("retained G-code storage cleanup is invalid")
+  if cleanup.complete:
+    raise RuntimeError("completed G-code storage cleanup cannot be retained")
+  with gcode_storage_cleanup_lock:
+    cleanup_id = cleanup.cleanup_id
+    existing = gcode_storage_cleanup_pending.get(cleanup_id)
+    if existing is not None and existing is not cleanup:
+      raise RuntimeError("G-code storage cleanup ID collision")
+    if cleanup_id in gcode_storage_cleanup_completed:
+      raise RuntimeError("G-code storage cleanup is already completed")
+    gcode_storage_cleanup_pending[cleanup_id] = cleanup
+  _ensure_gcode_storage_cleanup()
+  return True
+
+
+def _release_or_retain_gcode_storage_cleanup(cleanup):
+  if not isinstance(cleanup, GCodeStorageCleanup):
+    raise TypeError("G-code storage cleanup is invalid")
+  try:
+    if cleanup.release() is not True or not cleanup.complete:
+      raise RuntimeError("G-code storage cleanup did not settle")
+  except Exception as exc:
+    try:
+      _retain_gcode_storage_cleanup(cleanup)
+    except Exception as retention_exc:
+      raise RuntimeError(
+        "G-code storage cleanup failed and durable retry retention also "
+        f"failed: {retention_exc}"
+      ) from exc
+    detail = _gcode_storage_error_detail(
+      exc,
+      "G-code storage cleanup failed without details",
+    )
+    logger.exception(
+      "G-code storage cleanup retained for retry: %s",
+      detail,
+    )
+    raise GCodeStorageCleanupRetainedError(detail) from exc
+  return True
+
+
+def _apply_gcode_storage_cleanup_result(result):
+  if not isinstance(result, GCodeStorageCleanupResult):
+    raise TypeError("G-code storage cleanup result is invalid")
+  with gcode_storage_cleanup_lock:
+    cleanup = gcode_storage_cleanup_completed.get(result.cleanup_id)
+    if not isinstance(cleanup, GCodeStorageCleanup):
+      raise RuntimeError(
+        "G-code storage cleanup completion ownership is invalid"
+      )
+    callback = cleanup.settlement_callback
+    if not callable(callback) or not cleanup.complete:
+      raise RuntimeError(
+        "G-code storage cleanup completion contract is invalid"
+      )
+  try:
+    callback()
+  except Exception:
+    gcode_storage_event_queue.put(result)
+    raise
+  with gcode_storage_cleanup_lock:
+    if gcode_storage_cleanup_completed.get(result.cleanup_id) is not cleanup:
+      raise RuntimeError(
+        "G-code storage cleanup completion ownership changed"
+      )
+    del gcode_storage_cleanup_completed[result.cleanup_id]
+  return True
+
+
 def _close_failed_controller_startup(
   serial_port,
   activity_lease,
   request_lease,
 ):
+  identity_invariant_error = None
   if not getattr(serial_port, "is_open", False):
     if RUN.get('ser') is serial_port:
       RUN['ser'] = None
+      try:
+        _require_main_controller_identity_cleanup(
+          serial_port,
+          "failed controller connection cleanup",
+        )
+      except RuntimeError as exc:
+        identity_invariant_error = exc
     closed = True
   elif RUN.get('ser') is serial_port:
     closed = _close_serial_port('ser', "failed controller connection cleanup")
@@ -1814,6 +2848,11 @@ def _close_failed_controller_startup(
   except Exception:
     logger.exception("Unable to release failed controller startup ownership")
     return False
+  if identity_invariant_error is not None:
+    logger.error(
+      "Failed controller startup cleanup encountered an identity invariant: %s",
+      identity_invariant_error,
+    )
   return True
 
 
@@ -1961,9 +3000,17 @@ def _poll_application_close():
   _poll_calibration_events()
   _poll_auxiliary_serial_events()
   _poll_manual_auxiliary_events()
+  _poll_gcode_storage_events()
   _poll_joint_motion_events()
   _poll_virtual_motion_events()
   _poll_xbox_auxiliary_events()
+
+  with gcode_storage_cleanup_lock:
+    storage_cleanup_pending = bool(gcode_storage_cleanup_pending)
+  if storage_cleanup_pending:
+    _ensure_gcode_storage_cleanup()
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
 
   with startup_controller_cleanup_lock:
     controller_cleanup_pending = bool(startup_controller_cleanup_pending)
@@ -2004,6 +3051,11 @@ def _poll_application_close():
   with offline_live_jog_state_lock:
     offline_motion_pending = offline_live_jog_operation is not None
   if offline_motion_pending or _virtual_motion_active():
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
+
+  conversion_active = globals().get('gcode_conversion_active')
+  if conversion_active is not None and conversion_active.is_set():
     root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
     return False
 
@@ -4568,12 +5620,17 @@ class ControllerStartupResult:
     position: PositionResponse
     visual_options: tuple
     auxiliary_serial: object
+    controller_identity: ControllerIdentity
     auxiliary_error: Optional[str] = None
 
     def __post_init__(self):
         if not isinstance(self.position, PositionResponse):
             raise ProtocolResponseError(
                 "controller startup position has an invalid type"
+            )
+        if not isinstance(self.controller_identity, ControllerIdentity):
+            raise ProtocolResponseError(
+                "controller startup identity has an invalid type"
             )
         if isinstance(self.visual_options, (str, bytes)):
             raise ProtocolResponseError("visual options must be a sequence")
@@ -5110,12 +6167,15 @@ def startup(startup_request, cancel_event=None):
     controller_identity = parse_controller_identity_response(
       _startup_exchange_response("HO\n", cancel_event)
     )
-    if (
-      CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1
-      not in controller_identity.protocol_capabilities
-    ):
+    missing_capabilities = tuple(
+      capability
+      for capability in CONTROLLER_STARTUP_REQUIRED_CAPABILITIES
+      if capability not in controller_identity.protocol_capabilities
+    )
+    if missing_capabilities:
       raise ProtocolResponseError(
-        "controller firmware lacks command-local JT wrist configuration"
+        "controller firmware lacks required protocol capabilities: "
+        + ", ".join(missing_capabilities)
       )
     if startup_request.auxiliary_port is None:
       _clear_unavailable_startup_auxiliary()
@@ -5156,6 +6216,7 @@ def startup(startup_request, cancel_event=None):
       position=position,
       visual_options=_startup_visual_options(),
       auxiliary_serial=auxiliary_serial,
+      controller_identity=controller_identity,
       auxiliary_error=auxiliary_error,
     )
   except BaseException:
@@ -5230,6 +6291,10 @@ def _apply_controller_startup_result(
     CAL['com2Port'] = startup_request.auxiliary_port
     CAL['auxiliaryBoard'] = (
       startup_request.auxiliary_board or AUXILIARY_BOARD_NONE
+    )
+    _bind_main_controller_identity(
+      startup_serial,
+      result.controller_identity,
     )
   except Exception:
     if calibration_applied:
@@ -5309,6 +6374,10 @@ def _set_com_admitted(request_lease, request_state, misc=None):
         time.sleep(0.2)  # Windows can retain a just-closed COM handle briefly.
       if RUN.get('ser') is existing_serial:
         RUN['ser'] = None
+        _require_main_controller_identity_cleanup(
+          existing_serial,
+          "controller connection replacement",
+        )
 
     if selected_main_port in ("", "None"):
       raise ValueError("No COM port selected")
@@ -5788,6 +6857,10 @@ def _exchange_legacy_main_command(
       and not getattr(serial_port, "is_open", False)
     ):
       RUN['ser'] = None
+      _require_main_controller_identity_cleanup(
+        serial_port,
+        "legacy controller exchange cleanup",
+      )
 
 
 @_synchronous_motion_request(
@@ -6106,14 +7179,28 @@ def _acquire_motion_request(
   name,
   allow_position_recovery=False,
   requires_kinematics=True,
+  allow_gcode_conversion=False,
 ):
   if not isinstance(allow_position_recovery, bool):
     raise TypeError("position-recovery admission flag must be boolean")
   if not isinstance(requires_kinematics, bool):
     raise TypeError("kinematics admission flag must be boolean")
+  if not isinstance(allow_gcode_conversion, bool):
+    raise TypeError("G-code conversion admission flag must be boolean")
   motion_request_admission_state.rejection_reason = None
   if application_closing.is_set():
     return _reject_motion_request(name, "application shutdown is active")
+  conversion_active = gcode_conversion_active.is_set()
+  if conversion_active and not allow_gcode_conversion:
+    return _reject_motion_request(
+      name,
+      "G-code conversion owns motion admission",
+    )
+  if allow_gcode_conversion and not conversion_active:
+    return _reject_motion_request(
+      name,
+      "G-code conversion admission is unavailable",
+    )
   if requires_kinematics and not kinematics_configuration_ready.is_set():
     return _reject_motion_request(
       name,
@@ -7197,13 +8284,2443 @@ def _dispatch_program_command(
   )
 
 
+def _current_gcode_view_generation():
+  if (
+    isinstance(gcode_view_generation, bool)
+    or not isinstance(gcode_view_generation, int)
+    or gcode_view_generation < 0
+  ):
+    raise RuntimeError("G-code view generation is invalid")
+  return gcode_view_generation
+
+
+def _advance_gcode_view_generation():
+  global gcode_view_generation
+
+  generation = _current_gcode_view_generation()
+  gcode_view_generation = generation + 1
+  return gcode_view_generation
+
+
 def _gcode_storage_filename(filename):
   if not isinstance(filename, str):
     raise MotionInputError("G-code filename must be text")
-  filename = filename.strip()
-  validate_controller_filename(filename, "G-code filename")
+  if not filename or filename in (".", ".."):
+    raise MotionInputError("G-code filename must identify a program")
   storage_filename = f"{filename}.txt"
-  return validate_controller_filename(storage_filename, "G-code filename")
+  return _validate_gcode_storage_filename(
+    storage_filename,
+    "G-code filename",
+  )
+
+
+def _validate_gcode_storage_filename(filename, field_name):
+  return validate_controller_filename(filename, field_name)
+
+
+def _gcode_storage_delete_command(media_id, filename):
+  media_id = validate_controller_media_id(media_id)
+  filename = _validate_gcode_storage_filename(
+    filename,
+    "G-code storage filename",
+  )
+  command = (
+    f"DG{GCODE_STORAGE_MEDIA_MARKER}{media_id}"
+    f"{GCODE_STORAGE_FILENAME_MARKER}{filename}\n"
+  )
+  if len(command.encode("ascii")) > MAX_COMMAND_LENGTH:
+    raise MotionInputError(
+      "G-code delete command exceeds the controller frame limit"
+    )
+  return command
+
+
+def _gcode_storage_write_target(filename, media_id=None):
+  filename = _validate_gcode_storage_filename(
+    filename,
+    "G-code storage filename",
+  )
+  if media_id is None:
+    media_binding = _current_gcode_storage_media()
+    if media_binding is None:
+      raise MotionInputError(
+        "G-code storage write requires a directory refresh "
+        "for the active SD card"
+      )
+    media_id = media_binding.media_id
+  media_id = validate_controller_media_id(media_id)
+  return (
+    f"{GCODE_STORAGE_MEDIA_MARKER}{media_id}"
+    f"{GCODE_STORAGE_FILENAME_MARKER}{filename}"
+  )
+
+
+def _gcode_storage_selection_name(filename):
+  filename = _validate_gcode_storage_filename(
+    filename,
+    "G-code storage filename",
+  )
+  if not filename.casefold().endswith(".txt"):
+    raise MotionInputError(
+      "G-code storage selection requires a .txt program"
+    )
+  selection_name = filename[:-len(".txt")]
+  try:
+    reconstructed = _gcode_storage_filename(selection_name)
+  except MotionInputError as exc:
+    raise MotionInputError(
+      "G-code storage selection requires a reversible .txt program name"
+    ) from exc
+  if reconstructed.casefold() != filename.casefold():
+    raise MotionInputError(
+      "G-code storage selection requires a reversible .txt program name"
+    )
+  return selection_name
+
+
+def _parse_gcode_storage_listing(response):
+  if not isinstance(response, str):
+    raise ProtocolResponseError("G-code storage listing must be text")
+  if len(response) > MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES:
+    raise ProtocolResponseError(
+      "G-code storage listing exceeds the protocol payload limit"
+    )
+  if not response.isascii() or "\r" in response or "\n" in response:
+    raise ProtocolResponseError(
+      "G-code storage listing contains invalid response text"
+    )
+  if response != response.strip():
+    raise ProtocolResponseError(
+      "G-code storage listing contains payload whitespace"
+    )
+  media_begin = len(GCODE_STORAGE_DIRECTORY_IDENTITY_PREFIX)
+  media_end = media_begin + CONTROLLER_MEDIA_ID_LENGTH
+  listing_begin = media_end + len(
+    GCODE_STORAGE_DIRECTORY_IDENTITY_SEPARATOR
+  )
+  if (
+    not response.startswith(GCODE_STORAGE_DIRECTORY_IDENTITY_PREFIX)
+    or len(response) < listing_begin
+    or response[media_end:listing_begin]
+      != GCODE_STORAGE_DIRECTORY_IDENTITY_SEPARATOR
+  ):
+    raise ProtocolResponseError(
+      "G-code storage listing identity framing is invalid"
+    )
+  try:
+    media_id = validate_controller_media_id(
+      response[media_begin:media_end]
+    )
+  except MotionInputError as exc:
+    raise ProtocolResponseError(
+      "G-code storage listing media identity is invalid"
+    ) from exc
+
+  listing = response[listing_begin:]
+  if listing == "":
+    return media_id, ()
+  if not listing.endswith(","):
+    raise ProtocolResponseError(
+      "G-code storage listing is missing the terminal separator"
+    )
+  filenames = tuple(listing.split(",")[:-1])
+  if not filenames or any(not filename for filename in filenames):
+    raise ProtocolResponseError(
+      "G-code storage listing contains an empty filename"
+    )
+  try:
+    filenames = tuple(
+      validate_controller_filename(filename, "G-code storage filename")
+      for filename in filenames
+    )
+  except MotionInputError as exc:
+    raise ProtocolResponseError(
+      f"G-code storage listing contains an invalid filename: {exc}"
+    ) from exc
+  normalized_names = tuple(filename.casefold() for filename in filenames)
+  if len(set(normalized_names)) != len(normalized_names):
+    raise ProtocolResponseError(
+      "G-code storage listing contains duplicate filenames"
+    )
+  actionable_filenames = []
+  for filename in filenames:
+    if not filename.casefold().endswith(".txt"):
+      continue
+    try:
+      _gcode_storage_selection_name(filename)
+    except MotionInputError as exc:
+      raise ProtocolResponseError(
+        "G-code storage listing contains a non-actionable .txt filename: "
+        f"{exc}"
+      ) from exc
+    actionable_filenames.append(filename)
+  return media_id, tuple(actionable_filenames)
+
+
+def _gcode_storage_error_detail(error, fallback):
+  if (
+    not isinstance(fallback, str)
+    or not fallback.strip()
+    or fallback != fallback.strip()
+  ):
+    raise TypeError("G-code storage error fallback must be normalized text")
+  try:
+    detail = " ".join(str(error).split())
+  except Exception:
+    return fallback
+  if len(detail) > MAX_RESPONSE_PAYLOAD_LENGTH:
+    return fallback
+  return detail or fallback
+
+
+def _is_gcode_storage_detailed_error(response):
+  if not isinstance(response, str):
+    raise ProtocolResponseError(
+      "G-code storage response must be text"
+    )
+  if not response.startswith(GCODE_STORAGE_DETAILED_ERROR_PREFIX):
+    return False
+  detail = response[len(GCODE_STORAGE_DETAILED_ERROR_PREFIX):]
+  return (
+    bool(detail)
+    and detail == detail.strip()
+    and detail.isascii()
+    and all(32 <= ord(character) <= 126 for character in detail)
+  )
+
+
+def _gcode_storage_detailed_error_message(response):
+  if not _is_gcode_storage_detailed_error(response):
+    raise ProtocolResponseError(
+      "G-code storage response is not a detailed controller error"
+    )
+  return (
+    "G-CODE STORAGE CONTROLLER ERROR: "
+    f"{response[len(GCODE_STORAGE_DETAILED_ERROR_PREFIX):]}"
+  )
+
+
+def _is_gcode_storage_controller_error(request, response):
+  if not isinstance(request, GCodeStorageRequest):
+    raise TypeError(
+      "G-code storage error classification requires a valid request"
+    )
+  if _is_gcode_storage_detailed_error(response):
+    return True
+  return request.operation == "delete" and response == "ER"
+
+
+def _gcode_storage_estop_position(response):
+  if not isinstance(response, str):
+    raise ProtocolResponseError(
+      "G-code storage response must be text"
+    )
+  try:
+    parsed = parse_position_response(response)
+  except ProtocolResponseError:
+    return None
+  if parsed.flag != "EB":
+    return None
+  return parsed
+
+
+def _gcode_storage_controller_error_message(request, response):
+  if not _is_gcode_storage_controller_error(request, response):
+    raise ProtocolResponseError(
+      "G-code storage response is not a controller error"
+    )
+  if response == "ER":
+    return "G-CODE STORAGE COMMAND REJECTED BY CONTROLLER"
+  return _gcode_storage_detailed_error_message(response)
+
+
+def _render_gcode_storage_controller_error(request, response):
+  message = _gcode_storage_controller_error_message(request, response)
+  logger.error("%s [%s]", message, response)
+  cmdRecEntryField.delete(0, 'end')
+  cmdRecEntryField.insert(0, response)
+  GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+  return False
+
+
+def _render_gcode_storage_detailed_error(response):
+  message = _gcode_storage_detailed_error_message(response)
+  logger.error("%s [%s]", message, response)
+  cmdRecEntryField.delete(0, 'end')
+  cmdRecEntryField.insert(0, response)
+  GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+  return False
+
+
+def _validate_gcode_storage_response(request, response):
+  if not isinstance(request, GCodeStorageRequest):
+    raise TypeError("G-code storage response requires a valid request")
+  if not isinstance(response, str):
+    raise ProtocolResponseError(
+      "G-code storage response must be text"
+    )
+  if _gcode_storage_estop_position(response) is not None:
+    reason = (
+      "G-code storage response was interrupted by a physical E-stop; "
+      "additional controller output remains possible"
+    )
+    quarantine_serial_transport(request.serial_port, reason)
+    raise SerialTransportQuarantinedError(
+      f"{reason}; reconnect required"
+    )
+  if _is_gcode_storage_controller_error(request, response):
+    if (
+      request.operation == "delete"
+      and _is_gcode_storage_detailed_error(response)
+    ):
+      raise ProtocolResponseError(
+        "G-code delete returned an indeterminate controller error: "
+        f"{response}"
+      )
+    return None, ()
+  if request.operation == "list":
+    try:
+      return _parse_gcode_storage_listing(response)
+    except ProtocolResponseError as exc:
+      quarantine_serial_transport(request.serial_port, str(exc))
+      raise
+  if response not in GCODE_STORAGE_DELETE_TERMINAL_RESPONSES:
+    error = ProtocolResponseError(
+      f"G-code delete returned an unexpected response: {response!r}"
+    )
+    quarantine_serial_transport(request.serial_port, str(error))
+    raise error
+  return None, ()
+
+
+def _render_gcode_storage_rejection(message):
+  if (
+    not isinstance(message, str)
+    or not message.strip()
+    or message != message.strip()
+  ):
+    raise TypeError("G-code storage rejection must be normalized text")
+  logger.warning(message)
+  GCalmStatusLab.config(text=message, style="Warn.TLabel")
+  return False
+
+
+def _gcode_storage_default_state_directory():
+  if os.name == "nt":
+    base_directory = os.environ.get("LOCALAPPDATA")
+    if not base_directory:
+      home_directory = os.path.expanduser("~")
+      base_directory = os.path.join(
+        home_directory,
+        "AppData",
+        "Local",
+      )
+  elif os.name == "posix":
+    configured_directory = os.environ.get("XDG_STATE_HOME")
+    if configured_directory and os.path.isabs(configured_directory):
+      base_directory = configured_directory
+    else:
+      home_directory = os.path.expanduser("~")
+      base_directory = os.path.join(
+        home_directory,
+        ".local",
+        "state",
+      )
+  else:
+    raise OSError(
+      f"G-code storage state is unsupported on {os.name!r}"
+    )
+  if (
+    not isinstance(base_directory, str)
+    or not base_directory
+    or not os.path.isabs(base_directory)
+    or "\x00" in base_directory
+    or "\r" in base_directory
+    or "\n" in base_directory
+  ):
+    raise OSError("G-code storage base state directory is invalid")
+  os.makedirs(base_directory, mode=0o700, exist_ok=True)
+  state_directory = os.path.join(
+    base_directory,
+    GCODE_STORAGE_STATE_DIRECTORY_NAME,
+  )
+  try:
+    os.mkdir(state_directory, 0o700)
+  except FileExistsError:
+    pass
+  state_path = os.path.join(
+    state_directory,
+    GCODE_STORAGE_STATE_FILENAME,
+  )
+  _validate_gcode_storage_state_directory(state_path)
+  return state_directory
+
+
+def _gcode_storage_state_path():
+  override = gcode_storage_state_path_override
+  if override is None:
+    state_path = os.path.join(
+      _gcode_storage_default_state_directory(),
+      GCODE_STORAGE_STATE_FILENAME,
+    )
+  else:
+    try:
+      state_path = os.fspath(override)
+    except TypeError as exc:
+      raise MotionInputError(
+        "G-code storage state path override is invalid"
+      ) from exc
+  if (
+    not isinstance(state_path, str)
+    or not state_path
+    or "\x00" in state_path
+    or "\r" in state_path
+    or "\n" in state_path
+  ):
+    raise MotionInputError("G-code storage state path is invalid")
+  return os.path.abspath(state_path)
+
+
+def _gcode_storage_state_lock_path(state_path):
+  if (
+    not isinstance(state_path, str)
+    or not state_path
+    or "\x00" in state_path
+    or "\r" in state_path
+    or "\n" in state_path
+  ):
+    raise MotionInputError("G-code storage state lock path is invalid")
+  return f"{state_path}{GCODE_STORAGE_STATE_LOCK_SUFFIX}"
+
+
+def _windows_gcode_storage_handle_owned_by_current_user(handle):
+  import ctypes
+  from ctypes import wintypes
+
+  if os.name != "nt":
+    raise OSError("Windows storage ownership validation is unavailable")
+  kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+  advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+  kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+  kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+  kernel32.CloseHandle.restype = wintypes.BOOL
+  kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+  kernel32.LocalFree.restype = ctypes.c_void_p
+  advapi32.OpenProcessToken.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.HANDLE),
+  ]
+  advapi32.OpenProcessToken.restype = wintypes.BOOL
+  advapi32.GetTokenInformation.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_int,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+  ]
+  advapi32.GetTokenInformation.restype = wintypes.BOOL
+  advapi32.GetSecurityInfo.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_int,
+    wintypes.DWORD,
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.POINTER(ctypes.c_void_p),
+    ctypes.POINTER(ctypes.c_void_p),
+  ]
+  advapi32.GetSecurityInfo.restype = wintypes.DWORD
+  advapi32.IsValidSid.argtypes = [ctypes.c_void_p]
+  advapi32.IsValidSid.restype = wintypes.BOOL
+  advapi32.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+  advapi32.EqualSid.restype = wintypes.BOOL
+
+  token_handle = wintypes.HANDLE()
+  security_descriptor = ctypes.c_void_p()
+  owner_sid = ctypes.c_void_p()
+  try:
+    if not advapi32.OpenProcessToken(
+      kernel32.GetCurrentProcess(),
+      0x0008,
+      ctypes.byref(token_handle),
+    ):
+      raise ctypes.WinError(ctypes.get_last_error())
+    required_size = wintypes.DWORD()
+    if advapi32.GetTokenInformation(
+      token_handle,
+      1,
+      None,
+      0,
+      ctypes.byref(required_size),
+    ):
+      raise OSError("Windows token sizing unexpectedly succeeded")
+    token_error = ctypes.get_last_error()
+    if token_error != 122 or required_size.value <= 0:
+      raise ctypes.WinError(token_error)
+    token_buffer = ctypes.create_string_buffer(required_size.value)
+    if not advapi32.GetTokenInformation(
+      token_handle,
+      1,
+      token_buffer,
+      required_size,
+      ctypes.byref(required_size),
+    ):
+      raise ctypes.WinError(ctypes.get_last_error())
+    status = advapi32.GetSecurityInfo(
+      wintypes.HANDLE(handle),
+      1,
+      0x00000001,
+      ctypes.byref(owner_sid),
+      None,
+      None,
+      None,
+      ctypes.byref(security_descriptor),
+    )
+    if status != 0:
+      raise OSError(
+        status,
+        ctypes.FormatError(status),
+      )
+    token_sid = ctypes.cast(
+      token_buffer,
+      ctypes.POINTER(ctypes.c_void_p),
+    )[0]
+    if (
+      not token_sid
+      or not owner_sid.value
+      or not advapi32.IsValidSid(token_sid)
+      or not advapi32.IsValidSid(owner_sid)
+    ):
+      raise OSError("Windows storage owner SID is invalid")
+    return bool(advapi32.EqualSid(token_sid, owner_sid))
+  finally:
+    if security_descriptor.value:
+      kernel32.LocalFree(security_descriptor)
+    if token_handle.value:
+      kernel32.CloseHandle(token_handle)
+
+
+def _open_windows_gcode_storage_path(
+  path,
+  *,
+  expect_directory,
+  create,
+  write_access,
+):
+  import ctypes
+  from ctypes import wintypes
+
+  if os.name != "nt":
+    raise OSError("Windows storage path opening is unavailable")
+  if (
+    not isinstance(expect_directory, bool)
+    or not isinstance(create, bool)
+    or not isinstance(write_access, bool)
+  ):
+    raise TypeError("Windows storage path flags must be boolean")
+  if expect_directory and create:
+    raise ValueError("Windows storage directories must exist before opening")
+  if create and not write_access:
+    raise ValueError("Windows storage path creation requires write access")
+  kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+  class ByHandleFileInformation(ctypes.Structure):
+    _fields_ = [
+      ("file_attributes", wintypes.DWORD),
+      ("creation_time", wintypes.FILETIME),
+      ("last_access_time", wintypes.FILETIME),
+      ("last_write_time", wintypes.FILETIME),
+      ("volume_serial_number", wintypes.DWORD),
+      ("file_size_high", wintypes.DWORD),
+      ("file_size_low", wintypes.DWORD),
+      ("number_of_links", wintypes.DWORD),
+      ("file_index_high", wintypes.DWORD),
+      ("file_index_low", wintypes.DWORD),
+    ]
+
+  kernel32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HANDLE,
+  ]
+  kernel32.CreateFileW.restype = wintypes.HANDLE
+  kernel32.GetFileInformationByHandle.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(ByHandleFileInformation),
+  ]
+  kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+  kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+  kernel32.CloseHandle.restype = wintypes.BOOL
+
+  if expect_directory:
+    desired_access = 0x00020000
+  elif write_access:
+    desired_access = 0xC0000000
+  else:
+    desired_access = 0x80000000
+  creation_disposition = 4 if create else 3
+  flags = 0x00200000
+  if expect_directory:
+    flags |= 0x02000000
+  else:
+    flags |= 0x00000080
+  handle = kernel32.CreateFileW(
+    path,
+    desired_access,
+    0x00000001 | 0x00000002,
+    None,
+    creation_disposition,
+    flags,
+    None,
+  )
+  invalid_handle = ctypes.c_void_p(-1).value
+  if handle in (None, invalid_handle):
+    raise ctypes.WinError(ctypes.get_last_error())
+  try:
+    information = ByHandleFileInformation()
+    if not kernel32.GetFileInformationByHandle(
+      handle,
+      ctypes.byref(information),
+    ):
+      raise ctypes.WinError(ctypes.get_last_error())
+    is_directory = bool(information.file_attributes & 0x00000010)
+    is_reparse_point = bool(
+      information.file_attributes & 0x00000400
+    )
+    if is_directory != expect_directory or is_reparse_point:
+      raise OSError(
+        "G-code storage path is not a direct regular filesystem entry"
+      )
+    if not expect_directory and information.number_of_links != 1:
+      raise OSError(
+        "G-code storage file is not a single-link regular file"
+      )
+    if not _windows_gcode_storage_handle_owned_by_current_user(handle):
+      raise PermissionError(
+        "G-code storage path is not owned by the current user"
+      )
+    return handle
+  except Exception:
+    kernel32.CloseHandle(handle)
+    raise
+
+
+def _close_windows_gcode_storage_handle(handle):
+  import ctypes
+  from ctypes import wintypes
+
+  kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+  kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+  kernel32.CloseHandle.restype = wintypes.BOOL
+  if not kernel32.CloseHandle(wintypes.HANDLE(handle)):
+    raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _validate_gcode_storage_state_directory(state_path):
+  import stat as stat_module
+
+  state_directory = os.path.dirname(state_path)
+  if not state_directory:
+    raise OSError("G-code storage state directory is unavailable")
+  try:
+    directory_metadata = os.stat(
+      state_directory,
+      follow_symlinks=False,
+    )
+  except (OSError, TypeError) as exc:
+    raise OSError(
+      "G-code storage state directory is unavailable"
+    ) from exc
+  if not stat_module.S_ISDIR(directory_metadata.st_mode):
+    raise OSError("G-code storage state parent is not a directory")
+  if os.name == "posix":
+    if directory_metadata.st_uid != os.geteuid():
+      raise PermissionError(
+        "G-code storage state directory has a different owner"
+      )
+    if directory_metadata.st_mode & (
+      stat_module.S_IWGRP | stat_module.S_IWOTH
+    ):
+      raise PermissionError(
+        "G-code storage state directory is writable by another user"
+      )
+  elif os.name == "nt":
+    handle = _open_windows_gcode_storage_path(
+      state_directory,
+      expect_directory=True,
+      create=False,
+      write_access=False,
+    )
+    _close_windows_gcode_storage_handle(handle)
+  else:
+    raise OSError(
+      f"G-code storage state is unsupported on {os.name!r}"
+    )
+  return state_directory
+
+
+def _open_gcode_storage_lock_file(lock_path):
+  import stat as stat_module
+
+  if os.name == "nt":
+    import msvcrt
+
+    handle = _open_windows_gcode_storage_path(
+      lock_path,
+      expect_directory=False,
+      create=True,
+      write_access=True,
+    )
+    try:
+      descriptor = msvcrt.open_osfhandle(
+        handle,
+        os.O_RDWR | getattr(os, "O_BINARY", 0),
+      )
+    except Exception:
+      _close_windows_gcode_storage_handle(handle)
+      raise
+  elif os.name == "posix":
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if not isinstance(no_follow, int):
+      raise OSError(
+        "G-code storage lock requires no-follow file opening"
+      )
+    flags = os.O_RDWR | os.O_CREAT | no_follow
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+  else:
+    raise OSError(
+      f"G-code storage state locking is unsupported on {os.name!r}"
+    )
+
+  try:
+    metadata = os.fstat(descriptor)
+    if (
+      not stat_module.S_ISREG(metadata.st_mode)
+      or metadata.st_nlink != 1
+    ):
+      raise OSError(
+        "G-code storage lock is not a single-link regular file"
+      )
+    if os.name == "posix" and metadata.st_uid != os.geteuid():
+      raise PermissionError(
+        "G-code storage lock has a different owner"
+      )
+    path_metadata = os.stat(lock_path, follow_symlinks=False)
+    if (
+      path_metadata.st_dev != metadata.st_dev
+      or path_metadata.st_ino != metadata.st_ino
+    ):
+      raise OSError(
+        "G-code storage lock changed during secure opening"
+      )
+    return descriptor
+  except Exception:
+    os.close(descriptor)
+    raise
+
+
+def _open_gcode_storage_state_file(state_path):
+  import stat as stat_module
+
+  if os.name == "nt":
+    import msvcrt
+
+    handle = _open_windows_gcode_storage_path(
+      state_path,
+      expect_directory=False,
+      create=False,
+      write_access=False,
+    )
+    try:
+      descriptor = msvcrt.open_osfhandle(
+        handle,
+        os.O_RDONLY | getattr(os, "O_BINARY", 0),
+      )
+    except Exception:
+      _close_windows_gcode_storage_handle(handle)
+      raise
+  elif os.name == "posix":
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if not isinstance(no_follow, int) or not isinstance(nonblocking, int):
+      raise OSError(
+        "G-code storage state requires nonblocking no-follow file opening"
+      )
+    flags = os.O_RDONLY | no_follow | nonblocking
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(state_path, flags)
+  else:
+    raise OSError(
+      f"G-code storage state reading is unsupported on {os.name!r}"
+    )
+
+  try:
+    metadata = os.fstat(descriptor)
+    if (
+      not stat_module.S_ISREG(metadata.st_mode)
+      or metadata.st_nlink != 1
+    ):
+      raise OSError(
+        "G-code storage state is not a single-link regular file"
+      )
+    if os.name == "posix" and metadata.st_uid != os.geteuid():
+      raise PermissionError(
+        "G-code storage state has a different owner"
+      )
+    try:
+      path_metadata = os.stat(state_path, follow_symlinks=False)
+    except (OSError, TypeError) as exc:
+      raise OSError(
+        "G-code storage state changed during secure opening"
+      ) from exc
+    if (
+      path_metadata.st_dev != metadata.st_dev
+      or path_metadata.st_ino != metadata.st_ino
+    ):
+      raise OSError(
+        "G-code storage state changed during secure opening"
+      )
+    return descriptor
+  except Exception:
+    os.close(descriptor)
+    raise
+
+
+@contextmanager
+def _lock_gcode_storage_state_file(state_path):
+  _validate_gcode_storage_state_directory(state_path)
+  lock_path = _gcode_storage_state_lock_path(state_path)
+  try:
+    descriptor = _open_gcode_storage_lock_file(lock_path)
+  except GCodeStorageStateLockError:
+    raise
+  except OSError as exc:
+    raise GCodeStorageStateLockError(
+      "G-code storage reconciliation lock file is unavailable"
+    ) from exc
+  lock_module = None
+  try:
+    if os.fstat(descriptor).st_size == 0:
+      written = os.write(descriptor, b"\0")
+      if written != 1:
+        raise OSError("G-code storage state lock initialization failed")
+      os.fsync(descriptor)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+      import msvcrt
+      lock_module = msvcrt
+      try:
+        lock_module.locking(
+          descriptor,
+          lock_module.LK_NBLCK,
+          1,
+        )
+      except OSError as exc:
+        raise GCodeStorageStateLockError(
+          "G-code storage reconciliation state is locked by another "
+          "application process"
+        ) from exc
+    elif os.name == "posix":
+      import fcntl
+      lock_module = fcntl
+      try:
+        lock_module.flock(
+          descriptor,
+          lock_module.LOCK_EX | lock_module.LOCK_NB,
+        )
+      except (BlockingIOError, OSError) as exc:
+        raise GCodeStorageStateLockError(
+          "G-code storage reconciliation state is locked by another "
+          "application process"
+        ) from exc
+    else:
+      raise GCodeStorageStateLockError(
+        f"G-code storage state locking is unsupported on {os.name!r}"
+      )
+  except GCodeStorageStateLockError:
+    os.close(descriptor)
+    raise
+  except OSError as exc:
+    os.close(descriptor)
+    raise GCodeStorageStateLockError(
+      "G-code storage reconciliation state could not be locked"
+    ) from exc
+
+  try:
+    yield
+  finally:
+    release_error = None
+    try:
+      if os.name == "nt":
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        lock_module.locking(
+          descriptor,
+          lock_module.LK_UNLCK,
+          1,
+        )
+      else:
+        lock_module.flock(descriptor, lock_module.LOCK_UN)
+    except OSError as exc:
+      release_error = exc
+    try:
+      os.close(descriptor)
+    except OSError as exc:
+      if release_error is None:
+        release_error = exc
+    if release_error is not None:
+      raise GCodeStorageStateLockError(
+        "G-code storage reconciliation lock release failed"
+      ) from release_error
+
+
+def _gcode_storage_unique_json_object(pairs):
+  result = {}
+  for name, value in pairs:
+    if not isinstance(name, str) or name in result:
+      raise MotionInputError(
+        "G-code storage state contains a duplicated or invalid field"
+      )
+    result[name] = value
+  return result
+
+
+def _gcode_storage_state_document(pending):
+  if pending is not None and not isinstance(
+    pending,
+    GCodeDeleteReconciliation,
+  ):
+    raise TypeError("G-code storage pending state is invalid")
+  pending_document = None
+  if pending is not None:
+    pending_document = {
+      "request_id": pending.request_id,
+      "controller_hardware_id": pending.controller_hardware_id,
+      "media_id": pending.media_id,
+      "filename": pending.filename,
+    }
+  return {
+    "schema_version": GCODE_STORAGE_STATE_SCHEMA_VERSION,
+    "pending_delete": pending_document,
+  }
+
+
+def _decode_gcode_storage_state(document):
+  schema_version = (
+    document.get("schema_version")
+    if isinstance(document, dict)
+    else None
+  )
+  if (
+    not isinstance(document, dict)
+    or frozenset(document) != frozenset(
+      ("schema_version", "pending_delete")
+    )
+    or isinstance(schema_version, bool)
+    or not isinstance(schema_version, int)
+    or schema_version != GCODE_STORAGE_STATE_SCHEMA_VERSION
+  ):
+    raise MotionInputError(
+      "G-code storage state does not match the supported schema"
+    )
+  pending_document = document.get("pending_delete")
+  if pending_document is None:
+    return None
+  if (
+    not isinstance(pending_document, dict)
+    or frozenset(pending_document) != frozenset(
+      (
+        "request_id",
+        "controller_hardware_id",
+        "media_id",
+        "filename",
+      )
+    )
+  ):
+    raise MotionInputError(
+      "G-code storage pending-delete state is invalid"
+    )
+  return GCodeDeleteReconciliation(
+    pending_document.get("request_id"),
+    pending_document.get("controller_hardware_id"),
+    pending_document.get("media_id"),
+    pending_document.get("filename"),
+  )
+
+
+def _read_gcode_storage_state(state_path):
+  descriptor = None
+  try:
+    descriptor = _open_gcode_storage_state_file(state_path)
+  except FileNotFoundError:
+    return None
+  try:
+    with os.fdopen(descriptor, "rb") as state_file:
+      descriptor = None
+      encoded = state_file.read(GCODE_STORAGE_STATE_MAXIMUM_BYTES + 1)
+  finally:
+    if descriptor is not None:
+      os.close(descriptor)
+  if len(encoded) > GCODE_STORAGE_STATE_MAXIMUM_BYTES:
+    raise MotionInputError(
+      "G-code storage state exceeds the supported size"
+    )
+  if not encoded:
+    raise MotionInputError("G-code storage state is empty")
+  try:
+    serialized = encoded.decode("utf-8")
+  except UnicodeDecodeError as exc:
+    raise MotionInputError(
+      "G-code storage state is not valid UTF-8"
+    ) from exc
+  try:
+    document = json.loads(
+      serialized,
+      object_pairs_hook=_gcode_storage_unique_json_object,
+    )
+  except MotionInputError:
+    raise
+  except (TypeError, ValueError) as exc:
+    raise MotionInputError(
+      "G-code storage state is not valid JSON"
+    ) from exc
+  return _decode_gcode_storage_state(document)
+
+
+def _create_gcode_storage_state_temporary_file(state_directory):
+  import stat as stat_module
+
+  flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+  flags |= getattr(os, "O_BINARY", 0)
+  flags |= getattr(os, "O_CLOEXEC", 0)
+  for _ in range(GCODE_STORAGE_STATE_TEMPORARY_ATTEMPTS):
+    temporary_path = os.path.join(
+      state_directory,
+      f".gcode-storage-state-{secrets.token_hex(16)}.tmp",
+    )
+    try:
+      descriptor = os.open(temporary_path, flags, 0o600)
+    except FileExistsError:
+      continue
+    metadata = os.fstat(descriptor)
+    if (
+      not stat_module.S_ISREG(metadata.st_mode)
+      or metadata.st_nlink != 1
+      or (
+        os.name == "posix"
+        and metadata.st_uid != os.geteuid()
+      )
+    ):
+      os.close(descriptor)
+      try:
+        os.unlink(temporary_path)
+      except FileNotFoundError:
+        pass
+      raise OSError(
+        "G-code storage temporary state is not a private regular file"
+      )
+    return descriptor, temporary_path
+  raise FileExistsError(
+    "unable to allocate a unique G-code storage state temporary file"
+  )
+
+
+def _durably_replace_gcode_storage_state(
+  temporary_path,
+  state_path,
+):
+  temporary_directory = os.path.dirname(temporary_path)
+  state_directory = _validate_gcode_storage_state_directory(state_path)
+  if (
+    not temporary_directory
+    or os.path.abspath(temporary_directory)
+      != os.path.abspath(state_directory)
+  ):
+    raise OSError(
+      "G-code storage durable replacement requires one directory"
+    )
+
+  if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.MoveFileExW.argtypes = [
+      wintypes.LPCWSTR,
+      wintypes.LPCWSTR,
+      wintypes.DWORD,
+    ]
+    kernel32.MoveFileExW.restype = wintypes.BOOL
+    if not kernel32.MoveFileExW(
+      temporary_path,
+      state_path,
+      0x00000001 | 0x00000008,
+    ):
+      raise ctypes.WinError(ctypes.get_last_error())
+    return True
+
+  if os.name != "posix":
+    raise OSError(
+      f"durable G-code storage replacement is unsupported on {os.name!r}"
+    )
+  directory_only = getattr(os, "O_DIRECTORY", None)
+  if not isinstance(directory_only, int):
+    raise OSError(
+      "durable G-code storage replacement requires directory-only opening"
+    )
+  directory_flags = os.O_RDONLY | directory_only
+  directory_flags |= getattr(os, "O_CLOEXEC", 0)
+  no_follow = getattr(os, "O_NOFOLLOW", None)
+  if not isinstance(no_follow, int):
+    raise OSError(
+      "durable G-code storage replacement requires no-follow opening"
+    )
+  directory_flags |= no_follow
+  directory_descriptor = os.open(
+    state_directory,
+    directory_flags,
+  )
+  try:
+    os.replace(temporary_path, state_path)
+    os.fsync(directory_descriptor)
+  finally:
+    os.close(directory_descriptor)
+  return True
+
+
+def _write_gcode_storage_state(state_path, pending):
+  document = _gcode_storage_state_document(pending)
+  serialized = json.dumps(
+    document,
+    ensure_ascii=True,
+    allow_nan=False,
+    separators=(",", ":"),
+    sort_keys=True,
+  ) + "\n"
+  encoded = serialized.encode("utf-8")
+  if len(encoded) > GCODE_STORAGE_STATE_MAXIMUM_BYTES:
+    raise MotionInputError(
+      "G-code storage state exceeds the supported size"
+    )
+  state_directory = _validate_gcode_storage_state_directory(state_path)
+
+  descriptor = None
+  temporary_path = None
+  try:
+    descriptor, temporary_path = (
+      _create_gcode_storage_state_temporary_file(state_directory)
+    )
+    with os.fdopen(
+      descriptor,
+      "w",
+      encoding="utf-8",
+      newline="\n",
+    ) as state_file:
+      descriptor = None
+      written = state_file.write(serialized)
+      if written != len(serialized):
+        raise OSError("G-code storage state write was incomplete")
+      state_file.flush()
+      os.fsync(state_file.fileno())
+    _durably_replace_gcode_storage_state(
+      temporary_path,
+      state_path,
+    )
+    temporary_path = None
+  finally:
+    if descriptor is not None:
+      os.close(descriptor)
+    if temporary_path is not None:
+      try:
+        os.unlink(temporary_path)
+      except FileNotFoundError:
+        pass
+  return True
+
+
+def _gcode_storage_persistence_error(error):
+  detail = _gcode_storage_error_detail(
+    error,
+    "persistent state failed without details",
+  )
+  return f"{type(error).__name__}: {detail}"
+
+
+def _load_gcode_storage_state_locked(state_path):
+  global gcode_storage_pending_delete_reconciliation
+  global gcode_storage_persistent_state_loaded
+  global gcode_storage_persistent_state_error
+  global gcode_storage_next_request_id
+
+  try:
+    pending = _read_gcode_storage_state(state_path)
+  except Exception as exc:
+    gcode_storage_persistent_state_error = (
+      _gcode_storage_persistence_error(exc)
+    )
+    gcode_storage_pending_delete_reconciliation = None
+  else:
+    gcode_storage_pending_delete_reconciliation = pending
+    if pending is not None:
+      gcode_storage_next_request_id = max(
+        gcode_storage_next_request_id,
+        pending.request_id,
+      )
+    gcode_storage_persistent_state_error = None
+  gcode_storage_persistent_state_loaded = True
+  return gcode_storage_pending_delete_reconciliation
+
+
+def _require_gcode_storage_state_available_locked():
+  if gcode_storage_persistent_state_error is not None:
+    raise RuntimeError(
+      "G-code storage reconciliation state is unavailable: "
+      f"{gcode_storage_persistent_state_error}"
+    )
+  pending = gcode_storage_pending_delete_reconciliation
+  if pending is not None and not isinstance(
+    pending,
+    GCodeDeleteReconciliation,
+  ):
+    raise RuntimeError(
+      "pending G-code delete reconciliation state is invalid"
+    )
+  return pending
+
+
+def _record_gcode_storage_state_lock_error_locked(error):
+  global gcode_storage_pending_delete_reconciliation
+  global gcode_storage_persistent_state_loaded
+  global gcode_storage_persistent_state_error
+
+  gcode_storage_pending_delete_reconciliation = None
+  gcode_storage_persistent_state_loaded = True
+  gcode_storage_persistent_state_error = (
+    _gcode_storage_persistence_error(error)
+  )
+  return gcode_storage_persistent_state_error
+
+
+def _ensure_gcode_storage_state_loaded():
+  with gcode_storage_state_lock:
+    state_path = _gcode_storage_state_path()
+    try:
+      with _lock_gcode_storage_state_file(state_path):
+        _load_gcode_storage_state_locked(state_path)
+    except GCodeStorageStateLockError as exc:
+      _record_gcode_storage_state_lock_error_locked(exc)
+    return _require_gcode_storage_state_available_locked()
+
+
+def _persist_gcode_storage_state_locked(state_path, pending):
+  global gcode_storage_persistent_state_error
+
+  try:
+    _write_gcode_storage_state(
+      state_path,
+      pending,
+    )
+  except Exception as exc:
+    gcode_storage_persistent_state_error = (
+      _gcode_storage_persistence_error(exc)
+    )
+    raise RuntimeError(
+      "G-code storage reconciliation state could not be persisted: "
+      f"{gcode_storage_persistent_state_error}"
+    ) from exc
+  gcode_storage_persistent_state_error = None
+  return True
+
+
+def _current_gcode_delete_reconciliation():
+  return _ensure_gcode_storage_state_loaded()
+
+
+def _record_gcode_delete_reconciliation_locked(request, state_path):
+  global gcode_storage_pending_delete_reconciliation
+
+  if (
+    not isinstance(request, GCodeStorageRequest)
+    or request.operation != "delete"
+  ):
+    raise TypeError(
+      "G-code delete reconciliation requires a delete request"
+    )
+  pending = GCodeDeleteReconciliation(
+    request.request_id,
+    request.controller_hardware_id,
+    request.media_id,
+    request.filename,
+  )
+  with gcode_storage_state_lock:
+    _load_gcode_storage_state_locked(state_path)
+    current = _require_gcode_storage_state_available_locked()
+    if current is not None:
+      raise RuntimeError(
+        "another G-code delete already requires reconciliation"
+      )
+    _persist_gcode_storage_state_locked(state_path, pending)
+    gcode_storage_pending_delete_reconciliation = pending
+  return pending
+
+
+def _record_gcode_delete_reconciliation(request):
+  state_path = _gcode_storage_state_path()
+  try:
+    with _lock_gcode_storage_state_file(state_path):
+      return _record_gcode_delete_reconciliation_locked(
+        request,
+        state_path,
+      )
+  except GCodeStorageStateLockError as exc:
+    with gcode_storage_state_lock:
+      detail = _record_gcode_storage_state_lock_error_locked(exc)
+    raise RuntimeError(
+      "G-code storage reconciliation state is unavailable: "
+      f"{detail}"
+    ) from exc
+
+
+def _clear_gcode_delete_reconciliation_locked(
+  expected_pending,
+  state_path,
+):
+  global gcode_storage_pending_delete_reconciliation
+
+  if not isinstance(expected_pending, GCodeDeleteReconciliation):
+    raise TypeError(
+      "G-code delete reconciliation clear requires pending state"
+    )
+  with gcode_storage_state_lock:
+    _load_gcode_storage_state_locked(state_path)
+    current = _require_gcode_storage_state_available_locked()
+    if current != expected_pending:
+      raise RuntimeError(
+        "G-code delete reconciliation state changed before clearing"
+      )
+    _persist_gcode_storage_state_locked(state_path, None)
+    gcode_storage_pending_delete_reconciliation = None
+  return True
+
+
+def _clear_gcode_delete_reconciliation(expected_pending):
+  state_path = _gcode_storage_state_path()
+  try:
+    with _lock_gcode_storage_state_file(state_path):
+      return _clear_gcode_delete_reconciliation_locked(
+        expected_pending,
+        state_path,
+      )
+  except GCodeStorageStateLockError as exc:
+    with gcode_storage_state_lock:
+      detail = _record_gcode_storage_state_lock_error_locked(exc)
+    raise RuntimeError(
+      "G-code storage reconciliation state is unavailable: "
+      f"{detail}"
+    ) from exc
+
+
+def _reconcile_gcode_storage_delete_locked(
+  controller_hardware_id,
+  media_id,
+  filenames,
+  state_path,
+):
+  global gcode_storage_pending_delete_reconciliation
+
+  controller_hardware_id = validate_controller_hardware_id(
+    controller_hardware_id
+  )
+  media_id = validate_controller_media_id(media_id)
+  if not isinstance(filenames, tuple):
+    raise TypeError("G-code delete reconciliation requires a filename tuple")
+  normalized_names = []
+  for filename in filenames:
+    _gcode_storage_selection_name(filename)
+    normalized_names.append(filename.casefold())
+  normalized_names = tuple(normalized_names)
+  with gcode_storage_state_lock:
+    _load_gcode_storage_state_locked(state_path)
+    pending = _require_gcode_storage_state_available_locked()
+    if pending is None:
+      return None
+    if (
+      pending.controller_hardware_id != controller_hardware_id
+      or pending.media_id != media_id
+    ):
+      return pending, None
+    deletion_confirmed = pending.filename.casefold() not in normalized_names
+    _persist_gcode_storage_state_locked(state_path, None)
+    gcode_storage_pending_delete_reconciliation = None
+    return pending, deletion_confirmed
+
+
+def _reconcile_gcode_storage_delete(
+  controller_hardware_id,
+  media_id,
+  filenames,
+):
+  state_path = _gcode_storage_state_path()
+  try:
+    with _lock_gcode_storage_state_file(state_path):
+      return _reconcile_gcode_storage_delete_locked(
+        controller_hardware_id,
+        media_id,
+        filenames,
+        state_path,
+      )
+  except GCodeStorageStateLockError as exc:
+    with gcode_storage_state_lock:
+      detail = _record_gcode_storage_state_lock_error_locked(exc)
+    raise RuntimeError(
+      "G-code storage reconciliation state is unavailable: "
+      f"{detail}"
+    ) from exc
+
+
+def _run_gcode_storage_request(request):
+  write_started = threading.Event()
+  pending_delete = None
+
+  def failed_result(exc, state_path=None):
+    nonlocal pending_delete
+
+    logger.exception("G-code storage command failed")
+    request_id = getattr(request, "request_id", None)
+    if (
+      isinstance(request_id, bool)
+      or not isinstance(request_id, int)
+      or request_id <= 0
+    ):
+      logger.error("G-code storage worker could not publish an invalid request")
+      return None
+    detail = _gcode_storage_error_detail(
+      exc,
+      "G-code storage command failed without details",
+    )
+    committed = write_started.is_set()
+    if (
+      request.operation == "delete"
+      and pending_delete is not None
+      and not committed
+    ):
+      try:
+        if state_path is None:
+          _clear_gcode_delete_reconciliation(pending_delete)
+        else:
+          _clear_gcode_delete_reconciliation_locked(
+            pending_delete,
+            state_path,
+          )
+        pending_delete = None
+      except Exception as clear_exc:
+        clear_detail = _gcode_storage_error_detail(
+          clear_exc,
+          "pre-write reconciliation cleanup failed without details",
+        )
+        detail = _gcode_storage_error_detail(
+          RuntimeError(f"{detail}; {clear_detail}"),
+          detail,
+        )
+    if committed and not serial_transport_quarantined(request.serial_port):
+      try:
+        quarantine_serial_transport(
+          request.serial_port,
+          "G-code storage command failed after serial commitment: "
+          f"{detail}",
+        )
+      except Exception as quarantine_exc:
+        quarantine_detail = _gcode_storage_error_detail(
+          quarantine_exc,
+          "transport quarantine failed without details",
+        )
+        detail = _gcode_storage_error_detail(
+          RuntimeError(
+            f"{detail}; transport quarantine failed: {quarantine_detail}"
+          ),
+          detail,
+        )
+    outcome = (
+      "indeterminate"
+      if request.operation == "delete" and committed
+      else "failed"
+    )
+    return GCodeStorageResult(
+      request_id,
+      outcome,
+      detail,
+      (),
+      committed,
+      pending_delete=pending_delete,
+    )
+
+  result = None
+  state_path = None
+  try:
+    if not isinstance(request, GCodeStorageRequest):
+      raise TypeError("G-code storage worker request is invalid")
+    state_path = _gcode_storage_state_path()
+    with _lock_gcode_storage_state_file(state_path):
+      try:
+        if RUN.get('ser') is not request.serial_port:
+          raise ConnectionError(
+            "controller connection changed before G-code storage dispatch"
+          )
+        controller_binding = _current_main_controller_identity(
+          request.serial_port
+        )
+        if (
+          controller_binding is None
+          or controller_binding.identity.controller_hardware_id
+            != request.controller_hardware_id
+        ):
+          raise ConnectionError(
+            "controller identity changed before G-code storage dispatch"
+          )
+        if request.operation == "delete":
+          media_binding = _current_gcode_storage_media(
+            request.serial_port
+          )
+          if (
+            media_binding is None
+            or media_binding.controller_hardware_id
+              != request.controller_hardware_id
+            or media_binding.media_id != request.media_id
+          ):
+            raise ConnectionError(
+              "G-code storage media identity changed before delete dispatch"
+            )
+          pending_delete = _record_gcode_delete_reconciliation_locked(
+            request,
+            state_path,
+          )
+        write_options = {
+          "write_lock": serial_write_lock,
+          "reset_input": True,
+          "write_started_event": write_started,
+        }
+        if request.cancellation_event is not None:
+          write_options.update({
+            "cancellation_event": request.cancellation_event,
+            "write_boundary_lock": request.cancellation_lock,
+          })
+        write_serial_control(
+          request.serial_port,
+          request.command,
+          **write_options,
+        )
+        response = read_serial_line_response(
+          request.serial_port,
+          SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+          allow_empty_terminal_response=False,
+        )
+        media_id, filenames = _validate_gcode_storage_response(
+          request,
+          response,
+        )
+        reconciliation = None
+        if request.operation == "delete":
+          completed_result = GCodeStorageResult(
+            request.request_id,
+            "completed",
+            response,
+            filenames,
+            write_started.is_set(),
+            media_id,
+          )
+          _clear_gcode_delete_reconciliation_locked(
+            pending_delete,
+            state_path,
+          )
+          pending_delete = None
+          result = completed_result
+        else:
+          if media_id is not None:
+            reconciliation = _reconcile_gcode_storage_delete_locked(
+              request.controller_hardware_id,
+              media_id,
+              filenames,
+              state_path,
+            )
+          result = GCodeStorageResult(
+            request.request_id,
+            "completed",
+            response,
+            filenames,
+            write_started.is_set(),
+            media_id,
+            reconciliation=reconciliation,
+          )
+      except Exception as exc:
+        result = failed_result(exc, state_path)
+  except GCodeStorageStateLockError as exc:
+    if result is None:
+      result = failed_result(exc)
+    else:
+      with gcode_storage_state_lock:
+        _record_gcode_storage_state_lock_error_locked(exc)
+      logger.exception(
+        "G-code storage operation settled but state-lock release failed"
+      )
+  except Exception as exc:
+    result = failed_result(exc)
+  gcode_storage_event_queue.put(result)
+
+
+def _start_gcode_storage_request(
+  operation,
+  *,
+  filename=None,
+  announce_listing=False,
+  completion_callback=None,
+  cancellation_event=None,
+  cancellation_lock=None,
+):
+  global gcode_storage_active_request
+  global gcode_storage_next_request_id
+
+  if (
+    not isinstance(operation, str)
+    or operation not in GCODE_STORAGE_OPERATIONS
+  ):
+    raise MotionInputError("G-code storage operation is invalid")
+  if not isinstance(announce_listing, bool):
+    raise MotionInputError(
+      "G-code storage listing announcement flag must be boolean"
+    )
+  if completion_callback is not None and not callable(completion_callback):
+    raise MotionInputError(
+      "G-code storage completion callback must be callable"
+    )
+  cancellation_enabled = (
+    cancellation_event is not None
+    or cancellation_lock is not None
+  )
+  if cancellation_enabled and not (
+    callable(getattr(cancellation_event, "is_set", None))
+    and callable(getattr(cancellation_lock, "acquire", None))
+    and callable(getattr(cancellation_lock, "release", None))
+  ):
+    raise MotionInputError(
+      "G-code storage cancellation boundary is invalid"
+    )
+  if operation == "list":
+    if (
+      filename is not None
+      or completion_callback is not None
+      or cancellation_enabled
+    ):
+      raise MotionInputError(
+        "G-code storage list request contract is invalid"
+      )
+  else:
+    filename = _validate_gcode_storage_filename(
+      filename,
+      "G-code storage filename",
+    )
+    if announce_listing:
+      raise MotionInputError(
+        "G-code storage delete request cannot announce a listing"
+      )
+    if cancellation_enabled != (completion_callback is not None):
+      raise MotionInputError(
+        "conversion delete requires a matched cancellation boundary"
+      )
+
+  if RUN['offlineMode']:
+    return _render_gcode_storage_rejection(
+      "G-CODE STORAGE REQUIRES AN ONLINE CONTROLLER"
+    )
+  conversion_request = completion_callback is not None
+  try:
+    pending_delete = _current_gcode_delete_reconciliation()
+  except Exception as exc:
+    detail = _gcode_storage_error_detail(
+      exc,
+      "persistent reconciliation state is unavailable",
+    )
+    return _render_gcode_storage_rejection(
+      f"G-CODE STORAGE REJECTED; {detail}"
+    )
+  if operation == "delete" and pending_delete is not None:
+    return _render_gcode_storage_rejection(
+      "G-CODE DELETE REJECTED; REFRESH THE DIRECTORY TO RECONCILE "
+      "THE PREVIOUS DELETE"
+    )
+
+  storage_admission = _begin_gcode_storage_program_admission(
+    conversion_request
+  )
+  if storage_admission == "program-active":
+    return _render_gcode_storage_rejection(
+      "G-CODE STORAGE REJECTED DURING PROGRAM EXECUTION"
+    )
+  if storage_admission == "conversion-active":
+    return _render_gcode_storage_rejection(
+      "G-CODE STORAGE REJECTED DURING G-CODE CONVERSION"
+    )
+  if storage_admission == "storage-active":
+    return _render_gcode_storage_rejection(
+      "G-CODE STORAGE REJECTED WHILE ANOTHER STORAGE REQUEST IS ACTIVE"
+    )
+  if storage_admission == "conversion-inactive":
+    raise MotionInputError(
+      "G-code conversion storage request lacks conversion ownership"
+    )
+  if storage_admission != "admitted":
+    raise RuntimeError(
+      "G-code storage program admission returned an invalid result"
+    )
+
+  request_lease = None
+  serial_lock_owned = False
+  activity_lease = None
+  storage_admission_owned = True
+  startup_rejection = None
+  try:
+    request_lease = _acquire_motion_request(
+      f"G-code storage {operation}",
+      requires_kinematics=False,
+      allow_gcode_conversion=conversion_request,
+    )
+    if request_lease is None:
+      startup_rejection = _motion_request_rejection_message(
+        "G-code storage request rejected while another request is active"
+      )
+      raise SerialActivityRejected(startup_rejection)
+    if not serial_lock.acquire(blocking=False):
+      startup_rejection = (
+        "G-CODE STORAGE REJECTED WHILE CONTROLLER TRANSPORT IS BUSY"
+      )
+      raise SerialActivityRejected(startup_rejection)
+    serial_lock_owned = True
+    activity_lease = serial_activity_registry.lease("ser")
+    serial_port = RUN.get('ser')
+    if serial_port is None or not getattr(serial_port, "is_open", False):
+      raise ConnectionError(
+        "G-code storage requires an open controller connection"
+      )
+    if serial_transport_quarantined(serial_port):
+      raise ConnectionError(
+        "G-code storage requires a reconnected controller transport"
+      )
+    controller_binding = _current_main_controller_identity(serial_port)
+    if controller_binding is None:
+      raise ConnectionError(
+        "G-code storage requires a successfully identified controller"
+      )
+    controller_hardware_id = (
+      controller_binding.identity.controller_hardware_id
+    )
+    media_id = None
+    if operation == "list":
+      command = "RG\n"
+    else:
+      media_binding = _current_gcode_storage_media(serial_port)
+      if media_binding is None:
+        raise ConnectionError(
+          "G-code delete requires a directory refresh for the active SD card"
+        )
+      if (
+        media_binding.controller_hardware_id
+        != controller_hardware_id
+      ):
+        raise ConnectionError(
+          "G-code storage controller identity changed after directory refresh"
+        )
+      media_id = media_binding.media_id
+      command = _gcode_storage_delete_command(media_id, filename)
+    with gcode_storage_state_lock:
+      if gcode_storage_active_request is not None:
+        if not isinstance(
+          gcode_storage_active_request,
+          GCodeStorageRequest,
+        ):
+          raise RuntimeError("active G-code storage request is invalid")
+        raise RuntimeError("G-code storage request ownership is already active")
+      request_id = gcode_storage_next_request_id + 1
+      request = GCodeStorageRequest(
+        request_id,
+        operation,
+        serial_port,
+        command,
+        filename,
+        announce_listing,
+        _current_gcode_view_generation(),
+        activity_lease,
+        request_lease,
+        controller_hardware_id,
+        media_id,
+        completion_callback,
+        cancellation_event,
+        cancellation_lock,
+      )
+      thread = threading.Thread(
+        target=_run_gcode_storage_request,
+        args=(request,),
+        daemon=True,
+      )
+      gcode_storage_next_request_id = request_id
+      gcode_storage_active_request = request
+      try:
+        thread.start()
+      except Exception:
+        gcode_storage_active_request = None
+        raise
+    storage_admission_owned = False
+  except Exception as exc:
+    cleanup_errors = []
+    cleanup_retained = False
+
+    settlement_callback = None
+    if completion_callback is not None:
+      def settle_failed_storage_start():
+        return completion_callback(False)
+
+      settlement_callback = settle_failed_storage_start
+    try:
+      if not storage_admission_owned:
+        raise RuntimeError(
+          "G-code storage startup failure lost admission ownership"
+        )
+      cleanup = _new_gcode_storage_cleanup(
+        activity_lease,
+        serial_lock_owned,
+        request_lease,
+        settlement_callback=settlement_callback,
+      )
+      _release_or_retain_gcode_storage_cleanup(cleanup)
+      storage_admission_owned = False
+    except GCodeStorageCleanupRetainedError as cleanup_exc:
+      cleanup_retained = True
+      storage_admission_owned = False
+      cleanup_errors.append(
+        "complete ownership retained for cleanup retry: "
+        f"{cleanup_exc}"
+      )
+    except Exception as cleanup_exc:
+      cleanup_errors.append(
+        _gcode_storage_error_detail(
+          cleanup_exc,
+          "ownership cleanup failed",
+        )
+      )
+    if startup_rejection is not None and not cleanup_errors:
+      return _render_gcode_storage_rejection(startup_rejection)
+    detail = _gcode_storage_error_detail(
+      exc,
+      "G-code storage startup failed without details",
+    )
+    if cleanup_errors:
+      detail = f"{detail}; {'; '.join(cleanup_errors)}"
+    message = f"G-code storage request not started: {detail}"
+    logger.exception(message)
+    rendered = _render_gcode_storage_rejection(message)
+    if cleanup_retained and conversion_request:
+      return True
+    return rendered
+
+  cmdSentEntryField.delete(0, 'end')
+  cmdSentEntryField.insert(0, command)
+  if operation == "delete" or announce_listing:
+    GCalmStatusLab.config(
+      text="G-CODE STORAGE REQUEST IN PROGRESS",
+      style="Warn.TLabel",
+    )
+  return True
+
+
+def _release_gcode_storage_request(request, settlement_callback=None):
+  if not isinstance(request, GCodeStorageRequest):
+    raise TypeError("G-code storage cleanup requires a valid request")
+  if settlement_callback is not None and not callable(
+    settlement_callback
+  ):
+    raise TypeError(
+      "G-code storage cleanup settlement callback is invalid"
+    )
+  with gcode_storage_state_lock:
+    if gcode_storage_active_request is not request:
+      raise RuntimeError("G-code storage cleanup ownership is invalid")
+  cleanup = _new_gcode_storage_cleanup(
+    request.activity_lease,
+    True,
+    request.motion_lease,
+    active_request=request,
+    settlement_callback=settlement_callback,
+  )
+  return _release_or_retain_gcode_storage_cleanup(cleanup)
+
+
+def _set_gcode_program_path(value, *, final_state=None):
+  if (
+    not isinstance(value, str)
+    or "\x00" in value
+    or "\r" in value
+    or "\n" in value
+  ):
+    raise MotionInputError("G-code program path is invalid")
+  original_state = GcodeProgEntryField.cget("state")
+  if original_state not in ("normal", "readonly", "disabled"):
+    raise RuntimeError("G-code program path field state is invalid")
+  if final_state is None:
+    final_state = original_state
+  elif final_state not in ("normal", "readonly", "disabled"):
+    raise MotionInputError("G-code program path final state is invalid")
+
+  mutation_error = None
+  try:
+    if original_state != "normal":
+      GcodeProgEntryField.config(state="normal")
+    GcodeProgEntryField.delete(0, 'end')
+    if value:
+      GcodeProgEntryField.insert(0, value)
+    if GcodeProgEntryField.get() != value:
+      raise RuntimeError("G-code program path field rejected an update")
+  except Exception as exc:
+    mutation_error = exc
+
+  state_error = None
+  if final_state != "normal":
+    try:
+      GcodeProgEntryField.config(state=final_state)
+    except Exception as exc:
+      state_error = exc
+
+  if mutation_error is not None:
+    if state_error is not None:
+      raise RuntimeError(
+        "G-code program path update failed and field state restoration "
+        f"also failed: {state_error}"
+      ) from mutation_error
+    raise mutation_error
+  if state_error is not None:
+    raise state_error
+  return True
+
+
+def _set_gcode_current_row(value):
+  if (
+    not isinstance(value, str)
+    or "\x00" in value
+    or "\r" in value
+    or "\n" in value
+  ):
+    raise MotionInputError("G-code current-row display is invalid")
+  GcodCurRowEntryField.delete(0, 'end')
+  GcodCurRowEntryField.insert(0, value)
+  if GcodCurRowEntryField.get() != value:
+    raise RuntimeError("G-code current-row display rejected an update")
+  return True
+
+
+def _gcode_view_index(value, field_name, row_count):
+  if (
+    isinstance(row_count, bool)
+    or not isinstance(row_count, int)
+    or row_count < 0
+  ):
+    raise TypeError("G-code view row count is invalid")
+  if row_count == 0:
+    return None
+  if isinstance(value, bool):
+    raise MotionInputError(f"G-code view {field_name} is invalid")
+  try:
+    index = int(value)
+  except (TypeError, ValueError, OverflowError) as exc:
+    raise MotionInputError(
+      f"G-code view {field_name} is invalid"
+    ) from exc
+  if not 0 <= index < row_count:
+    raise MotionInputError(f"G-code view {field_name} is out of range")
+  return index
+
+
+def _gcode_view_fractions(values, field_name):
+  if isinstance(values, (str, bytes)):
+    raise MotionInputError(f"G-code view {field_name} is invalid")
+  try:
+    values = tuple(values)
+  except TypeError as exc:
+    raise MotionInputError(
+      f"G-code view {field_name} is invalid"
+    ) from exc
+  if len(values) != 2 or any(isinstance(value, bool) for value in values):
+    raise MotionInputError(f"G-code view {field_name} is invalid")
+  try:
+    fractions = tuple(float(value) for value in values)
+  except (TypeError, ValueError, OverflowError) as exc:
+    raise MotionInputError(
+      f"G-code view {field_name} is invalid"
+    ) from exc
+  return fractions
+
+
+def _capture_gcode_program_view():
+  rows = tab7.gcodeView.get(0, END)
+  if not isinstance(rows, tuple):
+    raise MotionInputError("G-code view returned invalid rows")
+  row_count = len(rows)
+  row_styles = tuple(
+    tuple(
+      tab7.gcodeView.itemcget(index, option)
+      for option in GCODE_LISTBOX_STYLE_OPTIONS
+    )
+    for index in range(row_count)
+  )
+  selection = tab7.gcodeView.curselection()
+  if not isinstance(selection, tuple):
+    raise MotionInputError("G-code view returned an invalid selection")
+  selected_rows = tuple(
+    _gcode_view_index(index, "selected row", row_count)
+    for index in selection
+  )
+  if any(index is None for index in selected_rows):
+    raise MotionInputError("empty G-code view returned selected rows")
+  active_row = None
+  anchor_row = None
+  if row_count:
+    active_row = _gcode_view_index(
+      tab7.gcodeView.index(ACTIVE),
+      "active row",
+      row_count,
+    )
+    anchor_row = _gcode_view_index(
+      tab7.gcodeView.index(ANCHOR),
+      "selection anchor",
+      row_count,
+    )
+  return GCodeProgramViewSnapshot(
+    rows,
+    row_styles,
+    selected_rows,
+    active_row,
+    anchor_row,
+    _gcode_view_fractions(tab7.gcodeView.xview(), "xview"),
+    _gcode_view_fractions(tab7.gcodeView.yview(), "yview"),
+    GcodeProgEntryField.get(),
+    GcodeProgEntryField.cget("state"),
+    GcodCurRowEntryField.get(),
+  )
+
+
+def _restore_gcode_program_view(snapshot):
+  if not isinstance(snapshot, GCodeProgramViewSnapshot):
+    raise TypeError("G-code view restoration requires a valid snapshot")
+  errors = []
+  try:
+    tab7.gcodeView.delete(0, END)
+    for row in snapshot.rows:
+      tab7.gcodeView.insert(END, row)
+    for index, style in enumerate(snapshot.row_styles):
+      tab7.gcodeView.itemconfig(
+        index,
+        dict(zip(GCODE_LISTBOX_STYLE_OPTIONS, style)),
+      )
+  except Exception as exc:
+    errors.append(
+      _gcode_storage_error_detail(
+        exc,
+        "G-code rows and styles could not be restored",
+      )
+    )
+  try:
+    tab7.gcodeView.selection_clear(0, END)
+    for index in snapshot.selected_rows:
+      tab7.gcodeView.selection_set(index)
+    if snapshot.anchor_row is not None:
+      tab7.gcodeView.selection_anchor(snapshot.anchor_row)
+    if snapshot.active_row is not None:
+      tab7.gcodeView.activate(snapshot.active_row)
+  except Exception as exc:
+    errors.append(
+      _gcode_storage_error_detail(
+        exc,
+        "G-code selection could not be restored",
+      )
+    )
+  try:
+    tab7.gcodeView.xview_moveto(snapshot.xview[0])
+    tab7.gcodeView.yview_moveto(snapshot.yview[0])
+  except Exception as exc:
+    errors.append(
+      _gcode_storage_error_detail(
+        exc,
+        "G-code scroll position could not be restored",
+      )
+    )
+  try:
+    _set_gcode_program_path(
+      snapshot.program_path,
+      final_state=snapshot.program_path_state,
+    )
+  except Exception as exc:
+    errors.append(
+      _gcode_storage_error_detail(
+        exc,
+        "G-code program path could not be restored",
+      )
+    )
+  try:
+    _set_gcode_current_row(snapshot.current_row)
+  except Exception as exc:
+    errors.append(
+      _gcode_storage_error_detail(
+        exc,
+        "G-code current row could not be restored",
+      )
+    )
+  if errors:
+    raise RuntimeError(
+      "G-code view rollback was incomplete: "
+      f"{'; '.join(errors)}"
+    )
+  return True
+
+
+def _replace_gcode_program_view(program_path, rows):
+  if (
+    not isinstance(program_path, str)
+    or "\x00" in program_path
+    or "\r" in program_path
+    or "\n" in program_path
+  ):
+    raise MotionInputError("G-code program path is invalid")
+  if not isinstance(rows, tuple) or any(
+    not isinstance(row, (str, bytes))
+    for row in rows
+  ):
+    raise MotionInputError("G-code replacement rows are invalid")
+
+  snapshot = _capture_gcode_program_view()
+  try:
+    tab7.gcodeView.delete(0, END)
+    for row in rows:
+      tab7.gcodeView.insert(END, row)
+    _set_gcode_program_path(program_path)
+    _set_gcode_current_row("---")
+    _advance_gcode_view_generation()
+  except Exception as exc:
+    try:
+      _restore_gcode_program_view(snapshot)
+    except Exception as rollback_exc:
+      raise RuntimeError(
+        "G-code view replacement failed and rollback was incomplete: "
+        f"{rollback_exc}"
+      ) from exc
+    raise
+  return True
+
+
+def _replace_gcode_storage_listing(filenames):
+  if not isinstance(filenames, tuple):
+    raise TypeError("G-code storage listing replacement requires a tuple")
+  for filename in filenames:
+    _gcode_storage_selection_name(filename)
+  return _replace_gcode_program_view("", filenames)
+
+
+def _apply_gcode_storage_result(result):
+  if not isinstance(result, GCodeStorageResult):
+    raise RuntimeError("G-code storage worker emitted an invalid result")
+  with gcode_storage_state_lock:
+    request = gcode_storage_active_request
+    if (
+      not isinstance(request, GCodeStorageRequest)
+      or request.request_id != result.request_id
+    ):
+      raise RuntimeError("G-code storage worker result ownership is invalid")
+  refresh_listing = False
+  completion_succeeded = False
+  application_error = None
+  try:
+    expected_pending = None
+    if request.operation == "delete":
+      expected_pending = GCodeDeleteReconciliation(
+        request.request_id,
+        request.controller_hardware_id,
+        request.media_id,
+        request.filename,
+      )
+      if (
+        result.pending_delete is not None
+        and result.pending_delete != expected_pending
+      ):
+        raise RuntimeError(
+          "G-code storage result retained the wrong delete reconciliation"
+        )
+      if result.reconciliation is not None:
+        raise RuntimeError(
+          "G-code delete result cannot contain directory reconciliation"
+        )
+    elif result.pending_delete is not None:
+      raise RuntimeError(
+        "G-code directory result cannot retain delete reconciliation"
+      )
+
+    if result.outcome == "failed":
+      if result.filenames:
+        raise RuntimeError(
+          "failed G-code storage result contains filenames"
+        )
+      if request.operation == "delete" and result.write_started:
+        raise RuntimeError(
+          "committed G-code delete failure was not marked indeterminate"
+        )
+      message = f"G-code storage command failed: {result.value}"
+      if result.pending_delete is not None:
+        message = (
+          f"{message}; refresh the directory before another delete"
+        )
+      logger.error(message)
+      GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+    elif result.outcome == "indeterminate":
+      if (
+        request.operation != "delete"
+        or not result.write_started
+        or result.filenames
+      ):
+        raise RuntimeError(
+          "G-code storage indeterminate result contract is invalid"
+        )
+      if result.pending_delete != expected_pending:
+        raise RuntimeError(
+          "indeterminate G-code delete lacks durable reconciliation state"
+        )
+      message = (
+        f"{request.filename} DELETE OUTCOME IS UNKNOWN; RECONNECT AND "
+        "REFRESH THE DIRECTORY BEFORE ANOTHER DELETE"
+      )
+      logger.error("%s: %s", message, result.value)
+      GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+    else:
+      if not result.write_started:
+        raise RuntimeError(
+          "completed G-code storage result lacks a committed write"
+        )
+      media_id, filenames = _validate_gcode_storage_response(
+        request,
+        result.value,
+      )
+      if (
+        filenames != result.filenames
+        or media_id != result.media_id
+      ):
+        raise RuntimeError(
+          "G-code storage result does not match the controller response"
+        )
+      estop_position = _gcode_storage_estop_position(result.value)
+      controller_error = _is_gcode_storage_controller_error(
+        request,
+        result.value
+      )
+      if estop_position is not None:
+        raise RuntimeError(
+          "G-code storage E-stop response escaped worker quarantine"
+        )
+      if request.operation == "delete":
+        if result.pending_delete is not None:
+          raise RuntimeError(
+            "completed G-code delete retained reconciliation state"
+          )
+      if controller_error:
+        _render_gcode_storage_controller_error(request, result.value)
+      elif request.operation == "delete":
+        completion_succeeded = result.value in ("P", "F")
+        if result.value == "P":
+          if request.completion_callback is None:
+            GCalmStatusLab.config(
+              text=f"{request.filename} has been deleted",
+              style="OK.TLabel",
+            )
+            refresh_listing = (
+              request.view_generation == _current_gcode_view_generation()
+            )
+            if not refresh_listing:
+              logger.warning(
+                "Skipped post-delete G-code listing refresh because "
+                "the local program view changed"
+              )
+        else:
+          if request.completion_callback is None:
+            GCalmStatusLab.config(
+              text=f"{request.filename} was not found",
+              style="Alarm.TLabel",
+            )
+      else:
+        if media_id is None:
+          raise RuntimeError(
+            "G-code storage listing lacks a media identity"
+          )
+        _bind_gcode_storage_media(
+          request.serial_port,
+          request.controller_hardware_id,
+          media_id,
+        )
+        reconciliation = result.reconciliation
+        stale_view = (
+          request.view_generation != _current_gcode_view_generation()
+        )
+        if stale_view:
+          logger.warning(
+            "Ignored stale G-code storage listing because "
+            "the local program view changed"
+          )
+        else:
+          _replace_gcode_storage_listing(filenames)
+
+        if reconciliation is not None:
+          pending, deletion_confirmed = reconciliation
+          if deletion_confirmed is None:
+            message = (
+              f"{pending.filename} DELETE RECONCILIATION REQUIRES "
+              "THE ORIGINAL CONTROLLER AND SD CARD"
+            )
+            style = "Alarm.TLabel"
+          elif deletion_confirmed:
+            message = (
+              f"{pending.filename} DELETION CONFIRMED BY DIRECTORY REFRESH"
+            )
+            style = "OK.TLabel"
+          else:
+            message = (
+              f"{pending.filename} DELETION DID NOT COMPLETE; "
+              "THE FILE REMAINS ON THE CONTROLLER"
+            )
+            style = "Alarm.TLabel"
+          if stale_view:
+            message = (
+              f"{message}; DIRECTORY LIST NOT APPLIED BECAUSE "
+              "THE LOCAL PROGRAM VIEW CHANGED"
+            )
+          GCalmStatusLab.config(text=message, style=style)
+        elif stale_view:
+          if request.announce_listing:
+            GCalmStatusLab.config(
+              text=(
+                "G-CODE STORAGE LIST NOT APPLIED; "
+                "LOCAL PROGRAM VIEW CHANGED"
+              ),
+              style="Warn.TLabel",
+            )
+        elif request.announce_listing:
+          status = (
+            "G-CODE .TXT PROGRAMS FOUND ON SD CARD:"
+            if filenames
+            else "NO G-CODE .TXT PROGRAMS FOUND ON SD CARD"
+          )
+          GCalmStatusLab.config(text=status, style="OK.TLabel")
+  except Exception as exc:
+    application_error = exc
+
+  if (
+    RUN.get('ser') is request.serial_port
+    and not getattr(request.serial_port, "is_open", False)
+  ):
+    RUN['ser'] = None
+    try:
+      _require_main_controller_identity_cleanup(
+        request.serial_port,
+        "G-code storage result cleanup",
+      )
+    except Exception as exc:
+      if application_error is None:
+        application_error = exc
+      else:
+        logger.error(
+          "G-code storage result application also failed identity cleanup: %s",
+          exc,
+        )
+
+  settlement_callback = None
+  if request.completion_callback is not None or (
+    refresh_listing and application_error is None
+  ):
+    def settle_gcode_storage_result():
+      if request.completion_callback is not None:
+        request.completion_callback(
+          application_error is None and completion_succeeded
+        )
+      if (
+        refresh_listing
+        and application_error is None
+        and not application_closing.is_set()
+      ):
+        GCread("no")
+      return True
+
+    settlement_callback = settle_gcode_storage_result
+
+  cleanup_error = None
+  cleanup_deferred = False
+  try:
+    _release_gcode_storage_request(
+      request,
+      settlement_callback=settlement_callback,
+    )
+  except GCodeStorageCleanupRetainedError as exc:
+    cleanup_error = exc
+    cleanup_deferred = True
+  except Exception as exc:
+    cleanup_error = exc
+
+  callback_error = None
+  if cleanup_error is None and settlement_callback is not None:
+    try:
+      settlement_callback()
+    except Exception as exc:
+      callback_error = exc
+
+  if cleanup_deferred:
+    cleanup_message = (
+      "G-CODE STORAGE CLEANUP PENDING; "
+      f"{cleanup_error}"
+    )
+    logger.error(cleanup_message)
+    try:
+      GCalmStatusLab.config(
+        text=cleanup_message,
+        style="Alarm.TLabel",
+      )
+    except Exception:
+      logger.exception(
+        "Unable to render pending G-code storage cleanup"
+      )
+
+  if application_error is not None:
+    if cleanup_error is not None:
+      logger.error(
+        "G-code storage result application also failed cleanup: %s",
+        cleanup_error,
+      )
+    application_detail = _gcode_storage_error_detail(
+      application_error,
+      "result application failed without details",
+    )
+    application_message = (
+      f"G-code storage result application failed: {application_detail}"
+    )
+    logger.error(application_message)
+    try:
+      GCalmStatusLab.config(
+        text=application_message,
+        style="Alarm.TLabel",
+      )
+    except Exception:
+      logger.exception(
+        "Unable to render the G-code storage application failure"
+      )
+    raise application_error
+  if cleanup_error is not None and not cleanup_deferred:
+    raise cleanup_error
+  if callback_error is not None:
+    raise callback_error
+  return True
 
 
 def _gcode_playback_command(filename):
@@ -9816,6 +13333,10 @@ def _exchange_serial_line(
       and not getattr(serial_port, "is_open", False)
     ):
       RUN['ser'] = None
+      _require_main_controller_identity_cleanup(
+        serial_port,
+        "controller exchange cleanup",
+      )
 
 
 def _exchange_auxiliary_line(command):
@@ -10763,6 +14284,26 @@ def _poll_manual_auxiliary_events():
         logger.exception(
           "Unable to dispatch a queued manual auxiliary command"
         )
+
+
+def _poll_gcode_storage_events():
+  try:
+    _ensure_gcode_storage_cleanup()
+    while True:
+      try:
+        result = gcode_storage_event_queue.get_nowait()
+      except Empty:
+        break
+      if isinstance(result, GCodeStorageCleanupResult):
+        _apply_gcode_storage_cleanup_result(result)
+      else:
+        _apply_gcode_storage_result(result)
+  except Exception:
+    logger.exception(
+      "Unable to apply a G-code storage result on the Tk event thread"
+    )
+  finally:
+    _reschedule_event_poll("gcode-storage")
 
 
 def _poll_xbox_auxiliary_events():
@@ -16004,6 +19545,10 @@ def _exchange_controller_calibration_acknowledgement(
       and not getattr(serial_port, "is_open", False)
     ):
       RUN['ser'] = None
+      _require_main_controller_identity_cleanup(
+        serial_port,
+        "controller calibration exchange cleanup",
+      )
 
 
 def _transmit_update_parameters(command, write_started_event=None):
@@ -16449,6 +19994,10 @@ def _exchange_position_acknowledgement(command):
       and not getattr(serial_port, "is_open", False)
     ):
       RUN['ser'] = None
+      _require_main_controller_identity_cleanup(
+        serial_port,
+        "controller position exchange cleanup",
+      )
 
 
 @_synchronous_motion_request("Set controller position")
@@ -17413,6 +20962,15 @@ def _invalidate_uncertain_controller_calibration(reason):
         and not getattr(serial_port, "is_open", False)
       ):
         RUN['ser'] = None
+        try:
+          _require_main_controller_identity_cleanup(
+            serial_port,
+            "uncertain controller calibration cleanup",
+          )
+        except RuntimeError:
+          logger.exception(
+            "Controller calibration cleanup encountered an identity invariant"
+          )
   try:
     _invalidate_joint_motion_state(reason)
   except Exception:
@@ -18561,26 +22119,135 @@ def gcodeViewselect(e):
   GcodCurRowEntryField.insert(0,gcodeRow)  
 
 
+def _parse_local_gcode_program(gcode_program):
+  readline = getattr(gcode_program, "readline", None)
+  if not callable(readline):
+    raise MotionInputError(
+      "G-code program source must provide bounded binary rows"
+    )
+  rows = []
+  source_bytes = 0
+  source_rows = 0
+  while True:
+    raw_row = readline(MAX_LOCAL_GCODE_SOURCE_LINE_BYTES + 1)
+    if not isinstance(raw_row, bytes):
+      raise MotionInputError("G-code program rows must be binary data")
+    if not raw_row:
+      break
+    source_bytes += len(raw_row)
+    if source_bytes > MAX_LOCAL_GCODE_PROGRAM_BYTES:
+      raise MotionInputError(
+        "G-code program exceeds the supported file size"
+      )
+    source_rows += 1
+    if source_rows > MAX_LOCAL_GCODE_PROGRAM_ROWS:
+      raise MotionInputError(
+        "G-code program exceeds the supported row count"
+      )
+    if len(raw_row) > MAX_LOCAL_GCODE_SOURCE_LINE_BYTES:
+      raise MotionInputError(
+        "G-code program row exceeds the supported source length"
+      )
+    if not raw_row.isascii():
+      raise MotionInputError(
+        "G-code program rows must contain ASCII data"
+      )
+    row = raw_row
+    if row.endswith(b"\n"):
+      row = row[:-1]
+      if row.endswith(b"\r"):
+        row = row[:-1]
+    if b"\r" in row or b"\n" in row or any(
+      value != 9 and not 32 <= value <= 126
+      for value in row
+    ):
+      raise MotionInputError(
+        "G-code program row contains an unsupported control character"
+      )
+    comment_index = row.find(b";")
+    if comment_index >= 0:
+      row = row[:comment_index]
+    row = b" ".join(row.split())
+    if not row:
+      continue
+    if len(row) + 1 > MAX_COMMAND_LENGTH:
+      raise MotionInputError(
+        "G-code program row exceeds the controller command length"
+      )
+    row += b" "
+    rows.append(row)
+  if not rows:
+    raise MotionInputError(
+      "G-code program must contain at least one row"
+    )
+  return tuple(rows)
+
+
+def _open_local_gcode_program(filename):
+  import stat as stat_module
+
+  if (
+    not isinstance(filename, str)
+    or not filename
+    or "\x00" in filename
+    or "\r" in filename
+    or "\n" in filename
+  ):
+    raise MotionInputError("G-code program path is invalid")
+  flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+  if os.name == "posix":
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if not isinstance(nonblocking, int):
+      raise OSError(
+        "G-code program loading requires nonblocking file opening"
+      )
+    flags |= nonblocking | getattr(os, "O_CLOEXEC", 0)
+  elif os.name == "nt":
+    flags |= getattr(os, "O_NOINHERIT", 0)
+  else:
+    raise OSError(
+      f"G-code program loading is unsupported on {os.name!r}"
+    )
+
+  descriptor = os.open(filename, flags)
+  try:
+    metadata = os.fstat(descriptor)
+    if not stat_module.S_ISREG(metadata.st_mode):
+      raise MotionInputError(
+        "G-code program source must be a regular file"
+      )
+    if metadata.st_size > MAX_LOCAL_GCODE_PROGRAM_BYTES:
+      raise MotionInputError(
+        "G-code program exceeds the supported file size"
+      )
+    gcode_program = os.fdopen(descriptor, "rb")
+  except Exception:
+    os.close(descriptor)
+    raise
+  return gcode_program
+
+
 def loadGcodeProg():
   filetypes = (('gcode files', '*.gcode *.nc *.ngc *.cnc *.tap'),('text files', '*.txt'))
+  if gcode_conversion_active.is_set():
+    GCalmStatusLab.config(
+      text="G-CODE LOAD REJECTED DURING G-CODE CONVERSION",
+      style="Warn.TLabel",
+    )
+    return False
   filename = fd.askopenfilename(title='Open files',initialdir='/',filetypes=filetypes)
-  GcodeProgEntryField.delete(0, 'end')
-  GcodeProgEntryField.insert(0,filename)
-  gcodeProg = open(GcodeProgEntryField.get(),"rb")
-  tab7.gcodeView.delete(0,END)
-  previtem = ""
-  for item in gcodeProg:
-    try:
-      commentIndex=item.find(b";")
-      item = item[:commentIndex]
-    except:
-      pass
-    item=item + b" " 
-    if(item != previtem ):
-      tab7.gcodeView.insert(END,item)
-    previtem = item 
-  tab7.gcodeView.pack()
-  gcodescrollbar.config(command=tab7.gcodeView.yview)
+  if not filename:
+    return False
+  try:
+    with _open_local_gcode_program(filename) as gcode_program:
+      rows = _parse_local_gcode_program(gcode_program)
+    _replace_gcode_program_view(filename, rows)
+  except Exception as exc:
+    message = f"Unable to load G-code program: {exc}"
+    logger.exception(message)
+    GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+    return False
+  return True
 
 def SetGcodeStartPos():
   GC_ST_E1_EntryField.delete(0, 'end')
@@ -18656,7 +22323,6 @@ def GCstepFwd():
       GcodCurRowEntryField.insert(0,"---")
     return True
 
-@_tracked_serial_operation("ser")
 def GCdelete():
   if(GcodeFilenameField.get() != ""):
     try:
@@ -18666,43 +22332,23 @@ def GCdelete():
       logger.error(message)
       GCalmStatusLab.config(text=message, style="Alarm.TLabel")
       return False
-    command = "DG"+"Fn"+Filename+"\n"
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0,command)
-    response = _exchange_legacy_main_command(command)
-    if (response[:1] == 'E'):
-      ErrorHandler(response)   
-    else:
-      if(response == "P"):
-        text = Filename + " has been deleted"
-        GCalmStatusLab.config(text= text,  style="OK.TLabel")
-        status = "no"
-        GCread(status)
-      elif(response == "F"):
-        text = Filename + " was not found"
-        GCalmStatusLab.config(text= text,  style="Alarm.TLabel")
-    return True
+    return _start_gcode_storage_request(
+      "delete",
+      filename=Filename,
+    )
   else:
     messagebox.showwarning("warning","Please Enter a Filename")
     return False
 
-@_tracked_serial_operation("ser")
 def GCread(status):
-  command = "RG"+"\n"
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,command)
-  response = _exchange_legacy_main_command(command)
-  if (response[:1] == 'E'):
-    ErrorHandler(response)   
-  else:
-    if(status == "yes"):
-      GCalmStatusLab.config(text= "FILES FOUND ON SD CARD:",  style="OK.TLabel")
-    GcodeProgEntryField.delete(0, 'end')
-    tab7.gcodeView.delete(0,END)
-    for value in response.split(","):
-      tab7.gcodeView.insert(END,value)
-    tab7.gcodeView.pack()
-    gcodescrollbar.config(command=tab7.gcodeView.yview)
+  if status not in ("yes", "no"):
+    return _render_gcode_storage_rejection(
+      "G-CODE STORAGE LIST REQUEST HAS AN INVALID STATUS"
+    )
+  return _start_gcode_storage_request(
+    "list",
+    announce_listing=status == "yes",
+  )
 
 
 def GCplay():
@@ -18784,12 +22430,19 @@ def GCplayProg(Filename, completion_callback=None):
   return True
 
 
-@_tracked_serial_operation("ser")
 def GCconvertProg():
+  if gcode_conversion_active.is_set():
+    GCalmStatusLab.config(
+      text="G-CODE CONVERSION IS ALREADY ACTIVE",
+      style="Warn.TLabel",
+    )
+    return False
   if(GcodeProgEntryField.get() == ""):
     messagebox.showwarning("warning","Please Load a Gcode Program") 
+    return False
   elif (GcodeFilenameField.get() == ""):  
     messagebox.showwarning("warning","Please Enter a Filename") 
+    return False
   else:
     try:
       Filename = _gcode_storage_filename(GcodeFilenameField.get())
@@ -18798,14 +22451,60 @@ def GCconvertProg():
       logger.error(message)
       GCalmStatusLab.config(text=message, style="Alarm.TLabel")
       return False
-    command = "DG"+"Fn"+Filename+"\n"
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0,command)
-    response = _exchange_legacy_main_command(command)
-    last = tab7.gcodeView.index('end')
-    for row in range (0,last):
-      tab7.gcodeView.itemconfig(row, {'fg': "#000000"})
-    def GCthreadProg():
+    media_binding = _current_gcode_storage_media()
+    if media_binding is None:
+      message = (
+        "G-code conversion requires a directory refresh "
+        "for the active SD card"
+      )
+      logger.error(message)
+      GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+      return False
+    if not kinematics_configuration_ready.is_set():
+      message = (
+        "G-code conversion requires configured native kinematics"
+      )
+      logger.error(message)
+      GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+      return False
+    ConversionMediaId = media_binding.media_id
+    ConversionMotionLease = None
+    ConversionAdmissionOwned = False
+    ConversionFinished = False
+
+    def finish_gcode_conversion():
+      nonlocal ConversionMotionLease
+      nonlocal ConversionAdmissionOwned
+      nonlocal ConversionFinished
+
+      acquired = gcode_conversion_cancel_lock.acquire()
+      if acquired is False:
+        raise RuntimeError(
+          "G-code conversion cancellation lock acquisition failed"
+      )
+      try:
+        if ConversionFinished:
+          logger.warning(
+            "Ignored duplicate G-code conversion ownership settlement"
+          )
+          return False
+        tab7.GCrunTrue = 0
+        if ConversionMotionLease is not None:
+          if not motion_request_registry.owns(ConversionMotionLease):
+            raise RuntimeError(
+              "G-code conversion lost motion request ownership"
+            )
+          _finish_motion_request(ConversionMotionLease)
+          ConversionMotionLease = None
+        if ConversionAdmissionOwned:
+          _finish_gcode_conversion_admission()
+          ConversionAdmissionOwned = False
+        ConversionFinished = True
+      finally:
+        gcode_conversion_cancel_lock.release()
+      return True
+
+    def run_gcode_conversion():
       # global RUN['GCrowinproc']
       # global RUN['prevxVal']
       # global RUN['prevyVal']
@@ -18813,15 +22512,13 @@ def GCconvertProg():
       RUN['prevxVal'] = 0
       RUN['prevyVal'] = 0
       RUN['prevzVal'] = 0
-      try:
-        GCselRow = tab7.gcodeView.curselection()[0]
-        if (GCselRow == 0):
-          GCselRow=1
-      except:
-        GCselRow=1
+      selected_rows = tab7.gcodeView.curselection()
+      if selected_rows:
+        GCselRow = selected_rows[0]
+      else:
+        GCselRow = 0
         tab7.gcodeView.selection_clear(0, END)
         tab7.gcodeView.select_set(GCselRow)
-      tab7.GCrunTrue = 1
       while tab7.GCrunTrue == 1:
         if (tab7.GCrunTrue == 0):
           GCalmStatusLab.config(text="GCODE CONVERSION STOPPED",  style="Alarm.TLabel")
@@ -18835,7 +22532,11 @@ def GCconvertProg():
           if tab7.GCrunTrue == 0:
             RUN['GCrowinproc'] = 0
             return
-          execution_state = GCexecuteRow()
+          execution_state = GCexecuteRow(
+            Filename,
+            ConversionMediaId,
+            conversion_motion_lease=ConversionMotionLease,
+          )
           if execution_state == ROW_EXECUTION_COMPLETE:
             break
           if execution_state == ROW_EXECUTION_REJECTED:
@@ -18875,8 +22576,187 @@ def GCconvertProg():
           GcodCurRowEntryField.insert(0,"---") 
           tab7.GCrunTrue = 0
           GCalmStatusLab.config(text="GCODE CONVERSION STOPPED",  style="Alarm.TLabel")
-    GCt = threading.Thread(target=GCthreadProg)
-    GCt.start()    
+    def GCthreadProg():
+      try:
+        acquired = gcode_conversion_cancel_lock.acquire()
+        if acquired is False:
+          raise RuntimeError(
+            "G-code conversion cancellation lock acquisition failed"
+          )
+        try:
+          if (
+            gcode_conversion_cancel_requested.is_set()
+            or tab7.GCrunTrue != 1
+            or application_closing.is_set()
+          ):
+            return
+          if (
+            not gcode_conversion_active.is_set()
+            or ConversionMotionLease is None
+            or not motion_request_registry.owns(ConversionMotionLease)
+          ):
+            raise RuntimeError(
+              "G-code conversion worker entry ownership is invalid"
+            )
+        finally:
+          gcode_conversion_cancel_lock.release()
+        run_gcode_conversion()
+      finally:
+        finish_gcode_conversion()
+
+    def begin_gcode_conversion(storage_ready):
+      nonlocal ConversionMotionLease
+
+      if not isinstance(storage_ready, bool):
+        finish_gcode_conversion()
+        raise TypeError(
+          "G-code conversion storage result must be boolean"
+        )
+      if (
+        not storage_ready
+        or tab7.GCrunTrue != 1
+        or application_closing.is_set()
+      ):
+        finish_gcode_conversion()
+        return False
+      active_media = _current_gcode_storage_media()
+      if (
+        active_media is None
+        or active_media.media_id != ConversionMediaId
+      ):
+        finish_gcode_conversion()
+        GCalmStatusLab.config(
+          text="G-CODE CONVERSION SD CARD IDENTITY CHANGED",
+          style="Alarm.TLabel",
+        )
+        return False
+      try:
+        last = tab7.gcodeView.index('end')
+        for row in range (0,last):
+          tab7.gcodeView.itemconfig(row, {'fg': "#000000"})
+        GCt = threading.Thread(target=GCthreadProg)
+        acquired = gcode_conversion_cancel_lock.acquire()
+        if acquired is False:
+          raise RuntimeError(
+            "G-code conversion cancellation lock acquisition failed"
+        )
+        try:
+          if (
+            gcode_conversion_cancel_requested.is_set()
+            or tab7.GCrunTrue != 1
+            or application_closing.is_set()
+          ):
+            start_worker = False
+            motion_rejection = None
+          elif not gcode_conversion_active.is_set():
+            raise RuntimeError(
+              "G-code conversion admission ended before worker transfer"
+            )
+          else:
+            ConversionMotionLease = _acquire_motion_request(
+              "G-code conversion",
+              allow_gcode_conversion=True,
+            )
+            start_worker = ConversionMotionLease is not None
+            motion_rejection = (
+              None
+              if start_worker
+              else _motion_request_rejection_message(
+                "G-code conversion worker admission failed"
+              )
+            )
+        finally:
+          gcode_conversion_cancel_lock.release()
+        if not start_worker:
+          finish_gcode_conversion()
+          if motion_rejection is not None:
+            logger.error(motion_rejection)
+            GCalmStatusLab.config(
+              text=motion_rejection,
+              style="Alarm.TLabel",
+            )
+          return False
+        if not motion_request_registry.owns(ConversionMotionLease):
+          raise RuntimeError(
+            "G-code conversion worker transfer lost motion ownership"
+          )
+        GCt.start()
+      except Exception as exc:
+        cleanup_error = None
+        try:
+          finish_gcode_conversion()
+        except Exception as cleanup_exc:
+          cleanup_error = cleanup_exc
+        message = f"Unable to start G-code conversion: {exc}"
+        if cleanup_error is not None:
+          message = (
+            f"{message}; ownership cleanup also failed: {cleanup_error}"
+          )
+        logger.exception(message)
+        try:
+          GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+        except Exception:
+          logger.exception(
+            "Unable to render the G-code conversion startup failure"
+          )
+        return False
+      return True
+
+    admission_result = None
+    try:
+      acquired = gcode_conversion_cancel_lock.acquire()
+      if acquired is False:
+        raise RuntimeError(
+          "G-code conversion cancellation lock acquisition failed"
+      )
+      try:
+        admission_result = _begin_gcode_conversion_admission()
+        if admission_result == "admitted":
+          gcode_conversion_cancel_requested.clear()
+          ConversionAdmissionOwned = True
+          tab7.GCrunTrue = 1
+      finally:
+        gcode_conversion_cancel_lock.release()
+      if admission_result != "admitted":
+        if admission_result == "program-active":
+          message = (
+            "G-CODE CONVERSION REJECTED DURING PROGRAM EXECUTION"
+          )
+        elif admission_result == "conversion-active":
+          message = "G-CODE CONVERSION IS ALREADY ACTIVE"
+        elif admission_result == "storage-active":
+          message = "G-CODE CONVERSION REJECTED DURING G-CODE STORAGE"
+        else:
+          raise RuntimeError(
+            "G-code conversion admission returned an invalid result"
+          )
+        GCalmStatusLab.config(text=message, style="Warn.TLabel")
+        return False
+      started = _start_gcode_storage_request(
+        "delete",
+        filename=Filename,
+        completion_callback=begin_gcode_conversion,
+        cancellation_event=gcode_conversion_cancel_requested,
+        cancellation_lock=gcode_conversion_cancel_lock,
+      )
+    except Exception as exc:
+      cleanup_error = None
+      try:
+        finish_gcode_conversion()
+      except Exception as cleanup_exc:
+        cleanup_error = cleanup_exc
+      message = f"Unable to start G-code conversion: {exc}"
+      if cleanup_error is not None:
+        message = (
+          f"{message}; ownership cleanup also failed: {cleanup_error}"
+        )
+      logger.exception(message)
+      GCalmStatusLab.config(text=message, style="Alarm.TLabel")
+      return False
+    if not started:
+      finish_gcode_conversion()
+      return False
+    return True
 
      
 
@@ -18889,20 +22769,45 @@ def _exchange_gcode_row(command):
     command = _canonicalize_main_serial_command(command)
     response_timeout = _controller_response_timeout(command)
     serial_port = RUN.get('ser')
+
+    class GCodeRowCancellationBoundary:
+      @staticmethod
+      def is_set():
+        conversion_cancelled = (
+          gcode_conversion_active.is_set()
+          and gcode_conversion_cancel_requested.is_set()
+        )
+        closing = application_closing.is_set()
+        run_state = tab7.GCrunTrue
+        if not isinstance(conversion_cancelled, bool):
+          raise MotionInputError(
+            "G-code conversion cancellation state must be boolean"
+          )
+        if not isinstance(closing, bool):
+          raise MotionInputError(
+            "G-code shutdown cancellation state must be boolean"
+          )
+        if (
+          isinstance(run_state, bool)
+          or not isinstance(run_state, int)
+          or run_state not in (0, 1)
+        ):
+          raise MotionInputError("G-code run state is invalid")
+        return conversion_cancelled or closing or run_state != 1
+
     try:
-      acquired = serial_write_lock.acquire()
-      if acquired is False:
-        raise RuntimeError("G-code serial write lock acquisition failed")
       try:
-        if tab7.GCrunTrue != 1:
-          return None
         write_serial_control(
           serial_port,
           command,
+          write_lock=serial_write_lock,
           reset_input=True,
+          write_started_event=threading.Event(),
+          cancellation_event=GCodeRowCancellationBoundary(),
+          write_boundary_lock=gcode_conversion_cancel_lock,
         )
-      finally:
-        serial_write_lock.release()
+      except SerialActivityRejected:
+        return None
       return read_serial_line_response(serial_port, response_timeout)
     finally:
       if (
@@ -18910,24 +22815,65 @@ def _exchange_gcode_row(command):
         and not getattr(serial_port, "is_open", False)
       ):
         RUN['ser'] = None
+        _require_main_controller_identity_cleanup(
+          serial_port,
+          "G-code row exchange cleanup",
+        )
 
 
 def GCstopProg():
-    tab7.GCrunTrue = 0
+    acquired = gcode_conversion_cancel_lock.acquire()
+    if acquired is False:
+      raise RuntimeError(
+        "G-code conversion cancellation lock acquisition failed"
+      )
+    try:
+      if gcode_conversion_active.is_set():
+        gcode_conversion_cancel_requested.set()
+      tab7.GCrunTrue = 0
+    finally:
+      gcode_conversion_cancel_lock.release()
     message = "GCODE SCHEDULING HALTED; ACTIVE CONTROLLER MOTION IS NOT PREEMPTED"
     GCalmStatusLab.config(text=message, style="Alarm.TLabel")
     return True
 
 
+def _reject_gcode_storage_write_response(response):
+    if not isinstance(response, str) or not response.startswith("E"):
+      raise ProtocolResponseError(
+        "G-code storage write rejection must be an error response"
+      )
+    detailed_error = _is_gcode_storage_detailed_error(response)
+    if not detailed_error:
+      ErrorHandler(response)
+    GCstopProg()
+    tab7.GCrunTrue = 0
+    RUN['GCrowinproc'] = 0
+    if detailed_error:
+      _render_gcode_storage_detailed_error(response)
+    else:
+      GCalmStatusLab.config(
+        text="UNABLE TO WRITE TO SD CARD",
+        style="Alarm.TLabel",
+      )
+    return ROW_EXECUTION_REJECTED
+
+
 @_synchronous_motion_request(
   "G-code conversion row",
   rejection_result=ROW_EXECUTION_PENDING,
+  inherited_lease_keyword="conversion_motion_lease",
 )
 @_tracked_serial_operation(
   "ser",
   rejection_result=ROW_EXECUTION_PENDING,
 )
-def GCexecuteRow():
+def GCexecuteRow(
+  conversion_filename=None,
+  conversion_media_id=None,
+  *,
+  conversion_motion_lease=None,
+):
   # global RUN['GCrowinproc']
   # global RUN['LineDist']
   # global RUN['Xv']
@@ -18942,6 +22888,30 @@ def GCexecuteRow():
   # global RUN['xVal']
   # global RUN['yVal']
   # global RUN['zVal']
+  if (conversion_filename is None) != (conversion_media_id is None):
+    raise MotionInputError(
+      "G-code conversion filename and media identity must be paired"
+    )
+  conversion_target = conversion_filename is not None
+  if (conversion_motion_lease is not None) != conversion_target:
+    raise MotionInputError(
+      "G-code conversion row requires matching motion ownership"
+    )
+  if conversion_target and (
+    not gcode_conversion_active.is_set()
+    or not motion_request_registry.owns(conversion_motion_lease)
+  ):
+    raise RuntimeError(
+      "G-code conversion row motion ownership is invalid"
+    )
+  if conversion_filename is not None:
+    conversion_filename = _validate_gcode_storage_filename(
+      conversion_filename,
+      "G-code conversion filename",
+    )
+    conversion_media_id = validate_controller_media_id(
+      conversion_media_id
+    )
   if tab7.GCrunTrue != 1:
     RUN['GCrowinproc'] = 0
     return ROW_EXECUTION_REJECTED
@@ -18992,8 +22962,14 @@ def GCexecuteRow():
       ACCramp = "100"
       RUN['WC'] = GC_ST_WC_EntryField.get()
       LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-      Filename = _gcode_storage_filename(GcodeFilenameField.get())
-      command = "WC"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"Fn"+Filename+"\n"
+      Filename = conversion_filename
+      if Filename is None:
+        Filename = _gcode_storage_filename(GcodeFilenameField.get())
+      StorageTarget = _gcode_storage_write_target(
+        Filename,
+        conversion_media_id,
+      )
+      command = "WC"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+StorageTarget+"\n"
       cmdSentEntryField.delete(0, 'end') 
       
       print(str(command))
@@ -19016,12 +22992,7 @@ def GCexecuteRow():
         return ROW_EXECUTION_REJECTED
       print(str(response))
       if (response[:1] == 'E'):
-        ErrorHandler(response)
-        GCstopProg()
-        tab7.GCrunTrue = 0
-        RUN['GCrowinproc'] = 0
-        GCalmStatusLab.config(text="UNABLE TO WRITE TO SD CARD",  style="Alarm.TLabel")
-        return ROW_EXECUTION_REJECTED
+        return _reject_gcode_storage_write_response(response)
       else:
         if _apply_valid_position_response(response) is None:
           tab7.GCrunTrue = 0
@@ -19183,9 +23154,15 @@ def GCexecuteRow():
       #LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
       LoopMode ="111111"
       #DisWrist = str(CAL['DisableWristRotVal'].get())
-      Filename = _gcode_storage_filename(GcodeFilenameField.get())
+      Filename = conversion_filename
+      if Filename is None:
+        Filename = _gcode_storage_filename(GcodeFilenameField.get())
+      StorageTarget = _gcode_storage_write_target(
+        Filename,
+        conversion_media_id,
+      )
 
-      command = "WC"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"Fn"+Filename+"\n"
+      command = "WC"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+StorageTarget+"\n"
       RUN['prevxVal'] = RUN['xVal']
       RUN['prevyVal'] = RUN['yVal']
       RUN['prevzVal'] = RUN['zVal']
@@ -19212,11 +23189,7 @@ def GCexecuteRow():
         RUN['GCrowinproc'] = 0
         return ROW_EXECUTION_REJECTED
       if (response[:1] == 'E'):
-        tab7.GCrunTrue = 0
-        RUN['GCrowinproc'] = 0
-        GCalmStatusLab.config(text="UNABLE TO WRITE TO SD CARD",  style="Alarm.TLabel")
-        ErrorHandler(response)
-        return ROW_EXECUTION_REJECTED
+        return _reject_gcode_storage_write_response(response)
       else:
         if _apply_valid_position_response(response) is None:
           tab7.GCrunTrue = 0
@@ -23195,7 +27168,12 @@ VisY2RobLab.place(x=1010, y=225)
 ####################################################################################################################################################
 ####TAB 7
 
-GcodeProgEntryField = Entry(tab7,width=60,justify="center")
+GcodeProgEntryField = Entry(
+  tab7,
+  width=60,
+  justify="center",
+  state="readonly",
+)
 GcodeProgEntryField.place(x=20, y=55)
 
 GcodCurRowEntryField = Entry(tab7,width=10,justify="center")
@@ -23254,25 +27232,34 @@ gcodeframe.place(x=400,y=53)
 gcodescrollbar = Scrollbar(gcodeframe) 
 gcodescrollbar.pack(side=RIGHT, fill=Y)
 tab7.gcodeView = Listbox(gcodeframe,exportselection=0,width=105,height=43, yscrollcommand=gcodescrollbar.set)
-tab7.gcodeView.bind('<<ListboxSelect>>', gcodeViewselect)
 tab7.gcodeView.pack()
 gcodescrollbar.config(command=tab7.gcodeView.yview)
 
 def GCcallback(event):
-    selection = event.widget.curselection()
     try:
-      if selection:
-          index = selection[0]
-          data = event.widget.get(index)
-          data = data.replace('.txt','')
-          GcodeFilenameField.delete(0, 'end')
-          GcodeFilenameField.insert(0,data)
-          PlayGCEntryField.delete(0, 'end')
-          PlayGCEntryField.insert(0,data)    
-      else:
-          GcodeFilenameField.insert(0,"")  
-    except:
-      logger.error("not an SD file")
+      selection = event.widget.curselection()
+      if not selection:
+        _set_gcode_current_row("---")
+        return False
+      index = selection[0]
+      _set_gcode_current_row(str(index))
+    except Exception as exc:
+      logger.error("Unable to select G-code row: %s", exc)
+      return False
+    try:
+      filename = _gcode_storage_selection_name(
+        event.widget.get(index)
+      )
+    except MotionInputError:
+      return True
+    except Exception as exc:
+      logger.error("Unable to select G-code storage file: %s", exc)
+      return False
+    GcodeFilenameField.delete(0, 'end')
+    GcodeFilenameField.insert(0, filename)
+    PlayGCEntryField.delete(0, 'end')
+    PlayGCEntryField.insert(0, filename)
+    return True
       
 tab7.gcodeView.bind("<<ListboxSelect>>", GCcallback)
 
@@ -23833,6 +27820,7 @@ _schedule_event_poll("serial")
 _schedule_event_poll("calibration")
 _schedule_event_poll("auxiliary-serial")
 _schedule_event_poll("manual-auxiliary")
+_schedule_event_poll("gcode-storage")
 _schedule_event_poll("xbox-auxiliary")
 _schedule_event_poll("virtual-motion")
 tab1.after(100, setCom)

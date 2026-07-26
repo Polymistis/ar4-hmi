@@ -19,6 +19,9 @@ dist/
 /ARbot.cal
 /curImage.jpg
 /temp.jpg
+/gcode-storage-state.json
+/gcode-storage-state.json.lock
+/.gcode-storage-state-*.tmp
 
 # Editor and operating-system state
 .idea/

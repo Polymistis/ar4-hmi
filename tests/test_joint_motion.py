@@ -12,7 +12,11 @@ from ARrobots.HMI.joint_motion import (
     AUXILIARY_BOARD_NANO,
     AUXILIARY_BOARD_NONE,
     AUXILIARY_BOARD_OUTPUT_PINS,
+    CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
+    CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
+    CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+    CONTROLLER_DIRECTORY_SEPARATOR,
     CONTROLLER_MAXIMUM_RAMP_PERCENT,
     CoalescingJointDispatcher,
     CommandTiming,
@@ -20,6 +24,7 @@ from ARrobots.HMI.joint_motion import (
     ControllerJointCalibration,
     DeferredLiveMotionArbiter,
     LiveMotionScheduleResult,
+    MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES,
     MAX_RESPONSE_FRAME_LENGTH,
     MAX_RESPONSE_PAYLOAD_LENGTH,
     MAX_CONTROLLER_FILENAME_BYTES,
@@ -69,6 +74,8 @@ from ARrobots.HMI.joint_motion import (
     validate_auxiliary_servo_command,
     write_serial_control,
 )
+
+TEST_CONTROLLER_MEDIA_ID = "00112233445566778899AABBCCDDEEFF"
 
 
 def position_response(joints, external=(0, 0, 0), speed_violation=0, debug="", flag=""):
@@ -632,6 +639,34 @@ class SerialActivityRegistryTests(unittest.TestCase):
         self.assertTrue(registry.idle())
         self.assertFalse(lease.close())
 
+    def test_activity_lease_close_retries_after_registry_release_failure(self):
+        class FailOnceRegistry(SerialActivityRegistry):
+            def __init__(self):
+                super().__init__(("ser",))
+                self.release_attempts = 0
+
+            def end(self, serial_name, control_injectable=False):
+                self.release_attempts += 1
+                if self.release_attempts == 1:
+                    raise RuntimeError("injected registry release failure")
+                return super().end(
+                    serial_name,
+                    control_injectable=control_injectable,
+                )
+
+        registry = FailOnceRegistry()
+        lease = registry.lease("ser")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "injected registry release failure",
+        ):
+            lease.close()
+        self.assertTrue(registry.active("ser"))
+        self.assertTrue(lease.close())
+        self.assertTrue(registry.idle())
+        self.assertFalse(lease.close())
+
 
 class DeferredLiveMotionArbiterTests(unittest.TestCase):
     def test_admission_retries_without_committing_rejected_input(self):
@@ -870,6 +905,102 @@ class SerialLineExchangeTests(unittest.TestCase):
             with self.subTest(response=response):
                 with self.assertRaises(ProtocolResponseError):
                     decode_serial_response_line(response)
+
+    def test_empty_framed_response_requires_explicit_protocol_admission(self):
+        for framed in (b"\n", b"\r\n"):
+            with self.subTest(framed=framed):
+                with self.assertRaisesRegex(
+                    ProtocolResponseError,
+                    "blank response line",
+                ):
+                    decode_serial_response_line(framed)
+                self.assertEqual(
+                    decode_serial_response_line(framed, allow_empty=True),
+                    "",
+                )
+
+                for serial_type in (FakeSerial, BoundedFakeSerial):
+                    with self.subTest(
+                        framed=framed,
+                        serial_type=serial_type.__name__,
+                    ):
+                        serial_port = serial_type(response=framed)
+                        self.assertEqual(
+                            read_serial_line_response(
+                                serial_port,
+                                20,
+                                allow_empty_terminal_response=True,
+                            ),
+                            "",
+                        )
+                        self.assertEqual(serial_port.timeout, 7.5)
+                        self.assertTrue(serial_port.is_open)
+
+        default_port = BoundedFakeSerial(response=b"\n")
+        with self.assertRaisesRegex(
+            SerialTransportQuarantinedError,
+            "blank response line",
+        ):
+            read_serial_line_response(default_port, 20)
+        self.assertFalse(default_port.is_open)
+        self.assertTrue(serial_transport_quarantined(default_port))
+
+        trailing_port = BoundedFakeSerial(response=b"\nUnexpected\n")
+        with self.assertRaisesRegex(
+            SerialTransportQuarantinedError,
+            "queued trailing data",
+        ):
+            read_serial_line_response(
+                trailing_port,
+                20,
+                allow_empty_terminal_response=True,
+            )
+        self.assertFalse(trailing_port.is_open)
+        self.assertTrue(serial_transport_quarantined(trailing_port))
+
+        invalid_flag_port = FakeSerial(response=b"\n")
+        with self.assertRaisesRegex(MotionInputError, "allow_empty"):
+            read_serial_line_response(
+                invalid_flag_port,
+                20,
+                allow_empty_terminal_response="yes",
+            )
+        self.assertTrue(invalid_flag_port.is_open)
+        self.assertFalse(serial_transport_quarantined(invalid_flag_port))
+
+        incompatible_contract_port = FakeSerial(response=b"\n")
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "cannot be combined",
+        ):
+            read_serial_line_response(
+                incompatible_contract_port,
+                20,
+                accepted_responses=("Done",),
+                allow_empty_terminal_response=True,
+            )
+        self.assertTrue(incompatible_contract_port.is_open)
+        self.assertFalse(
+            serial_transport_quarantined(incompatible_contract_port)
+        )
+
+    def test_gcode_storage_estop_followup_is_not_a_terminal_frame(self):
+        estop_response = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag="EB",
+        )
+        serial_port = BoundedFakeSerial(
+            response=f"{estop_response}\nprogram.txt,\n".encode("ascii")
+        )
+
+        with self.assertRaisesRegex(
+            SerialTransportQuarantinedError,
+            "queued trailing data",
+        ):
+            read_serial_line_response(serial_port, 20)
+
+        self.assertFalse(serial_port.is_open)
+        self.assertTrue(serial_transport_quarantined(serial_port))
 
     def test_strict_line_decoder_accepts_maximum_lf_and_crlf_payloads(self):
         payload = b"x" * MAX_RESPONSE_PAYLOAD_LENGTH
@@ -1568,6 +1699,101 @@ class SerialLineExchangeTests(unittest.TestCase):
     def test_control_write_rejects_non_boolean_reset_flag(self):
         with self.assertRaisesRegex(MotionInputError, "reset_input must be boolean"):
             write_serial_control(FakeSerial(), "STOP\n", reset_input=1)
+
+    def test_control_write_rechecks_cancellation_at_write_boundary(self):
+        serial_port = FakeSerial()
+        cancellation = threading.Event()
+        write_started = threading.Event()
+
+        class CancelOnAcquire:
+            def __init__(self):
+                self.locked = False
+
+            def acquire(self):
+                self.locked = True
+                cancellation.set()
+                return True
+
+            def release(self):
+                self.locked = False
+
+        boundary_lock = CancelOnAcquire()
+        with self.assertRaisesRegex(
+            SerialActivityRejected,
+            "cancelled before transmission",
+        ):
+            write_serial_control(
+                serial_port,
+                "STOP\n",
+                write_lock=threading.Lock(),
+                reset_input=True,
+                write_started_event=write_started,
+                cancellation_event=cancellation,
+                write_boundary_lock=boundary_lock,
+            )
+
+        self.assertFalse(boundary_lock.locked)
+        self.assertEqual(serial_port.commands, [])
+        self.assertEqual(serial_port.reset_count, 1)
+        self.assertFalse(write_started.is_set())
+        self.assertTrue(serial_port.is_open)
+        self.assertFalse(serial_transport_quarantined(serial_port))
+
+    def test_control_write_requires_complete_cancellation_boundary(self):
+        serial_port = FakeSerial()
+        cancellation = threading.Event()
+
+        for kwargs in (
+            {"cancellation_event": cancellation},
+            {
+                "cancellation_event": cancellation,
+                "write_started_event": threading.Event(),
+            },
+            {"write_boundary_lock": threading.Lock()},
+        ):
+            with self.subTest(kwargs=tuple(kwargs)):
+                with self.assertRaises(MotionInputError):
+                    write_serial_control(
+                        serial_port,
+                        "STOP\n",
+                        **kwargs,
+                    )
+
+        self.assertEqual(serial_port.commands, [])
+
+    def test_control_write_retains_commitment_after_late_cancellation(self):
+        cancellation = threading.Event()
+        write_started = threading.Event()
+
+        class CancellingSerial(FakeSerial):
+            def write(self, command):
+                self.assert_write_started()
+                cancellation.set()
+                return super().write(command)
+
+            @staticmethod
+            def assert_write_started():
+                if not write_started.is_set():
+                    raise AssertionError(
+                        "serial write began before commitment"
+                    )
+
+        serial_port = CancellingSerial()
+        write_serial_control(
+            serial_port,
+            "STOP\n",
+            write_lock=threading.Lock(),
+            reset_input=True,
+            write_started_event=write_started,
+            cancellation_event=cancellation,
+            write_boundary_lock=threading.Lock(),
+        )
+
+        self.assertTrue(cancellation.is_set())
+        self.assertTrue(write_started.is_set())
+        self.assertEqual(serial_port.commands, [b"STOP\n"])
+        self.assertTrue(serial_port.is_open)
+        self.assertFalse(serial_transport_quarantined(serial_port))
 
     def test_performs_one_framed_exchange(self):
         serial_port = FakeSerial(response=b"A response\r\n")
@@ -2370,7 +2596,8 @@ class CommandResponseTimeoutTests(unittest.TestCase):
         playback = "PGFnSampleGcode.txt\n"
         write_command = (
             "WCX1Y2Z3Rz4Ry5Rx6J70J80J90"
-            "Sp50Ac10Dc20Rm25WNLm000000FnSampleGcode.txt\n"
+            "Sp50Ac10Dc20Rm25WNLm000000"
+            f"Mi{TEST_CONTROLLER_MEDIA_ID}FnSampleGcode.txt\n"
         )
 
         self.assertIsNone(parse_command_timing(playback))
@@ -2389,8 +2616,14 @@ class CommandResponseTimeoutTests(unittest.TestCase):
             f"MG{cartesian}{timing}WNLm000000\n",
             f"ML{cartesian}{timing}Rnd0WNLm000000Q0\n",
             f"MV{cartesian}{timing}WNVr0Lm000000\n",
-            f"WC{cartesian}{timing}WNLm000000Fndemo.txt\n",
-            f"WG{cartesian}{timing}WNLm000000Fndemo.txt\n",
+            (
+                f"WC{cartesian}{timing}WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fndemo.txt\n"
+            ),
+            (
+                f"WG{cartesian}{timing}WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fndemo.txt\n"
+            ),
             (
                 "MAX1Y2Z3Rz4Ry5Rx6Ex7Ey8Ez9Tr0"
                 f"{timing}WNLm000000\n"
@@ -2407,6 +2640,32 @@ class CommandResponseTimeoutTests(unittest.TestCase):
         for command in commands:
             with self.subTest(command=command[:2]):
                 self.assertEqual(parse_command_timing(command), expected)
+
+    def test_storage_write_commands_require_canonical_media_identity(self):
+        timing = "Sp50Ac10Dc20Rm25"
+        cartesian = "X1Y2Z3Rz4Ry5Rx6J70J80J90"
+        calibration = controller_calibration()
+        invalid_targets = (
+            "Fndemo.txt",
+            f"Mi{TEST_CONTROLLER_MEDIA_ID.lower()}Fndemo.txt",
+            f"Mi{TEST_CONTROLLER_MEDIA_ID[:-1]}Fndemo.txt",
+        )
+
+        for opcode in ("WC", "WG"):
+            for target in invalid_targets:
+                with self.subTest(opcode=opcode, target=target):
+                    command = (
+                        f"{opcode}{cartesian}{timing}"
+                        f"WNLm000000{target}\n"
+                    )
+                    with self.assertRaisesRegex(
+                        MotionInputError,
+                        "invalid fields after timing",
+                    ):
+                        canonicalize_serial_command(
+                            command,
+                            calibration,
+                        )
 
     def test_live_jog_domains_match_firmware(self):
         timing = "Sp50Ac10Dc20Rm25"
@@ -2447,8 +2706,14 @@ class CommandResponseTimeoutTests(unittest.TestCase):
             f"MJ{cartesian}{timing}Rnd1WNLm000000\n",
             f"ML{cartesian}{timing}Rnd0WNLm000000Q1\n",
             f"MV{cartesian}{timing}Rnd1WNVr0Lm000000\n",
-            f"WC{cartesian}{timing}Rnd1WNLm000000Fndemo.txt\n",
-            f"WG{cartesian}{timing}Rnd1WNLm000000Fndemo.txt\n",
+            (
+                f"WC{cartesian}{timing}Rnd1WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fndemo.txt\n"
+            ),
+            (
+                f"WG{cartesian}{timing}Rnd1WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fndemo.txt\n"
+            ),
             f"LJV10{timing}WNLm000000\n",
             f"LJV10{timing}WFLm000000\n",
         )
@@ -2524,13 +2789,16 @@ class CommandResponseTimeoutTests(unittest.TestCase):
         with self.assertRaisesRegex(MotionInputError, "J7 position"):
             canonicalize_serial_command(invalid_external, calibration)
 
-    def test_controller_filenames_reject_fat_reserved_characters(self):
+    def test_controller_filenames_reject_reserved_characters(self):
         timing = "Sp50Ac10Dc20Rm25"
         cartesian = "X1Y2Z3Rz4Ry5Rx6J70J80J90"
         calibration = controller_calibration()
-        for reserved in '"*/:<>?\\|':
+        for reserved in f'"*/:<>?\\|{CONTROLLER_DIRECTORY_SEPARATOR}':
             with self.subTest(reserved=reserved):
-                with self.assertRaisesRegex(MotionInputError, "FAT-reserved"):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "controller-reserved",
+                ):
                     validate_controller_filename(
                         f"demo{reserved}file.txt",
                         "test filename",
@@ -2538,20 +2806,53 @@ class CommandResponseTimeoutTests(unittest.TestCase):
         commands = (
             "PGFn../demo.txt\n",
             "PGFnC:demo.txt\n",
-            f"WC{cartesian}{timing}WNLm000000Fnfolder/demo.txt\n",
-            f"WC{cartesian}{timing}WNLm000000Fnfolder/evilFndemo.txt\n",
-            f"WG{cartesian}{timing}WNLm000000Fnfolder\\demo.txt\n",
+            (
+                f"WC{cartesian}{timing}WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fnfolder/demo.txt\n"
+            ),
+            (
+                f"WC{cartesian}{timing}WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fnfolder/evilFndemo.txt\n"
+            ),
+            (
+                f"WG{cartesian}{timing}WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fnfolder\\demo.txt\n"
+            ),
+            "PGFndemo,evil.txt\n",
+            (
+                f"WC{cartesian}{timing}WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fndemo,evil.txt\n"
+            ),
+            (
+                f"WG{cartesian}{timing}WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fndemo,evil.txt\n"
+            ),
         )
 
         for command in commands:
             with self.subTest(opcode=command[:2]):
                 with self.assertRaisesRegex(
                     MotionInputError,
-                    "FAT-reserved",
+                    "controller-reserved",
                 ):
                     canonicalize_serial_command(command, calibration)
+        for filename in (" demo.txt", "demo.txt "):
+            with self.subTest(filename=filename):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "controller-reserved",
+                ):
+                    validate_controller_filename(filename, "test filename")
+        self.assertEqual(
+            validate_controller_filename("demo .txt", "test filename"),
+            "demo .txt",
+        )
 
     def test_controller_filename_byte_limit_matches_storage_commands(self):
+        self.assertEqual(
+            MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES,
+            MAX_RESPONSE_PAYLOAD_LENGTH,
+        )
         timing = "Sp50Ac10Dc20Rm25"
         cartesian = "X1Y2Z3Rz4Ry5Rx6J70J80J90"
         calibration = controller_calibration()
@@ -2564,8 +2865,14 @@ class CommandResponseTimeoutTests(unittest.TestCase):
         )
         for command in (
             f"PGFn{maximum}\n",
-            f"WC{cartesian}{timing}WNLm000000Fn{maximum}\n",
-            f"WG{cartesian}{timing}WNLm000000Fn{maximum}\n",
+            (
+                f"WC{cartesian}{timing}WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fn{maximum}\n"
+            ),
+            (
+                f"WG{cartesian}{timing}WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fn{maximum}\n"
+            ),
         ):
             with self.subTest(accepted=command[:2]):
                 self.assertEqual(
@@ -2575,8 +2882,14 @@ class CommandResponseTimeoutTests(unittest.TestCase):
 
         for command in (
             f"PGFn{oversized}\n",
-            f"WC{cartesian}{timing}WNLm000000Fn{oversized}\n",
-            f"WG{cartesian}{timing}WNLm000000Fn{oversized}\n",
+            (
+                f"WC{cartesian}{timing}WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fn{oversized}\n"
+            ),
+            (
+                f"WG{cartesian}{timing}WNLm000000"
+                f"Mi{TEST_CONTROLLER_MEDIA_ID}Fn{oversized}\n"
+            ),
         ):
             with self.subTest(rejected=command[:2]):
                 with self.assertRaisesRegex(MotionInputError, "encoded bytes"):
@@ -3110,13 +3423,19 @@ class JointMotionProtocolTests(unittest.TestCase):
     def test_parses_controller_identity_and_capabilities(self):
         response = json.dumps(
             {
+                "ControllerHardwareId": "12ABEF",
                 "DriverModel": "Teensy 4.1",
-                "FirmwareVersion": "6.7.1-ar4hmi.1",
+                "FirmwareVersion": "6.7.1-ar4hmi.2",
                 "RobotModel": 'AR4\\"Model',
                 "RobotVersion": "MK3",
                 "SerialNumber": "SN\\42",
                 "AssetTag": "Unset",
-                "ProtocolCapabilities": ["JT_WRIST_CONFIG_V1"],
+                "ProtocolCapabilities": [
+                    "JT_WRIST_CONFIG_V1",
+                    "GCODE_DIRECTORY_FRAMING_V1",
+                    "GCODE_DELETE_IDENTITY_V1",
+                    "GCODE_WRITE_IDENTITY_V1",
+                ],
             },
             separators=(",", ":"),
         )
@@ -3124,18 +3443,32 @@ class JointMotionProtocolTests(unittest.TestCase):
         identity = parse_controller_identity_response(response)
 
         self.assertIsInstance(identity, ControllerIdentity)
-        self.assertEqual(identity.firmware_version, "6.7.1-ar4hmi.1")
+        self.assertEqual(identity.controller_hardware_id, "12ABEF")
+        self.assertEqual(identity.firmware_version, "6.7.1-ar4hmi.2")
         self.assertEqual(identity.robot_model, 'AR4\\"Model')
         self.assertEqual(identity.serial_number, "SN\\42")
         self.assertIn(
             CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
             identity.protocol_capabilities,
         )
+        self.assertIn(
+            CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
+            identity.protocol_capabilities,
+        )
+        self.assertIn(
+            CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
+            identity.protocol_capabilities,
+        )
+        self.assertIn(
+            CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+            identity.protocol_capabilities,
+        )
 
     def test_controller_identity_fields_match_firmware_storage_contract(self):
         payload = {
+            "ControllerHardwareId": "12ABEF",
             "DriverModel": "Teensy 4.1",
-            "FirmwareVersion": "6.7.1-ar4hmi.1",
+            "FirmwareVersion": "6.7.1-ar4hmi.2",
             "RobotModel": "A" * 31,
             "RobotVersion": "MK3",
             "SerialNumber": "Unset",
@@ -3179,7 +3512,8 @@ class JointMotionProtocolTests(unittest.TestCase):
 
     def test_rejects_malformed_controller_identity_capabilities(self):
         base = (
-            '{"DriverModel":"Teensy 4.1","FirmwareVersion":"version",'
+            '{"ControllerHardwareId":"12ABEF",'
+            '"DriverModel":"Teensy 4.1","FirmwareVersion":"version",'
             '"RobotModel":"AR4","RobotVersion":"MK3",'
             '"SerialNumber":"Unset","AssetTag":"Unset",'
             '"ProtocolCapabilities":%s}'
@@ -3199,7 +3533,8 @@ class JointMotionProtocolTests(unittest.TestCase):
 
     def test_controller_identity_requires_an_exact_unique_schema(self):
         valid = (
-            '{"DriverModel":"Teensy 4.1","FirmwareVersion":"version",'
+            '{"ControllerHardwareId":"12ABEF",'
+            '"DriverModel":"Teensy 4.1","FirmwareVersion":"version",'
             '"RobotModel":"AR4","RobotVersion":"MK3",'
             '"SerialNumber":"Unset","AssetTag":"Unset",'
             '"ProtocolCapabilities":["JT_WRIST_CONFIG_V1"]}'
@@ -3217,6 +3552,13 @@ class JointMotionProtocolTests(unittest.TestCase):
             with self.subTest(response=response):
                 with self.assertRaises(ProtocolResponseError):
                     parse_controller_identity_response(response)
+
+        for hardware_id in ("12abef", "12AB", "12ABEG", " 12ABE"):
+            with self.subTest(hardware_id=hardware_id):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_controller_identity_response(
+                        valid.replace("12ABEF", hardware_id)
+                    )
 
     def test_rejects_non_firmware_debug_and_fault_payloads(self):
         raw = position_response((1, 2, 3, 4, 5, 6))

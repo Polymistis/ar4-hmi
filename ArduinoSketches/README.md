@@ -2,7 +2,41 @@
 
 Firmware compilation is hardware-free. Do not add `--upload` without the explicit operator authorization, emergency-stop check, cleared work envelope, firmware identity, configuration profile, and procedure required by `AGENTS.md`.
 
-The tracked line-oriented Teensy compatibility source identifies version `6.7.1-ar4hmi.1`, advertises the required `JT_WRIST_CONFIG_V1` host capability, and compiles with Arduino CLI, PJRC Teensy core 1.62.0, and ModbusMaster 2.0.1. Compilation establishes source and toolchain compatibility only; hardware-free fixtures cover selected protocol behavior, while correlated JSON parsing, Cartesian-bound, and emergency-event work remains a later integration unit.
+The tracked line-oriented Teensy compatibility source identifies version
+`6.7.1-ar4hmi.2`, advertises the required `JT_WRIST_CONFIG_V1`,
+`GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, and
+`GCODE_WRITE_IDENTITY_V1` host capabilities, and compiles with Arduino CLI,
+PJRC Teensy core 1.62.0, bundled SdFat 2.1.2, and ModbusMaster 2.0.1. `HO`
+includes the fixed-width controller hardware identity used to bind storage
+requests to the connected Teensy. Compilation
+establishes source and toolchain compatibility only; hardware-free fixtures
+cover selected protocol behavior, while correlated JSON parsing,
+Cartesian-bound, and emergency-event work remains a later integration unit.
+
+`GCODE_DIRECTORY_FRAMING_V1` reserves comma as the directory separator,
+requires every `.txt` entry to have a reversible controller-command stem, and
+caps the complete directory payload at 4096 bytes. Incompatible entries,
+directory-buffer allocation failure, directory read failure, and aggregate
+overflow return an `EG:` response before any partial listing. Clean
+end-of-directory is distinct from an iteration error.
+Directory-entry extraction treats the SdFat `getName` result only as a
+zero/nonzero read status and derives the filename length from the bounded
+terminated buffer, preserving compatibility across boolean and length return
+contracts.
+`GCODE_DELETE_IDENTITY_V1` prefixes every successful `RG` payload with
+`MID:<32-uppercase-hex-CID>|` and requires
+`DGMi<same-CID>Fn<filename>`. Directory and delete-lookup traversal revalidate
+the CID before a successful payload or absence response, and deletion checks
+the CID immediately before and after removal. Delete lookup distinguishes
+confirmed absence from directory lookup failure. `RG` terminates with the
+identity-prefixed directory payload or a printable `EG:` detail. `DG` returns
+definitive `P`, `F`, or `ER` responses; a printable `EG:` detail leaves
+host-side deletion reconciliation pending.
+
+`GCODE_WRITE_IDENTITY_V1` requires `WC` and `WG` targets in
+`Mi<same-CID>Fn<filename>` form. Every write checks the CID before opening the
+file and after closing the flushed file. A media mismatch returns `EG:` without
+a position-success frame.
 
 ```text
 arduino-cli core install teensy:avr@1.62.0 --additional-urls https://www.pjrc.com/teensy/package_teensy_index.json
@@ -17,5 +51,20 @@ arduino-cli compile --fqbn teensy:avr:teensy41 --clean --build-path <temporary-b
 ```
 
 Keep build output outside the tracked source tree.
+
+Python test fixtures use an external temporary parent. Set
+`AR4_TEST_TEMP_DIRECTORY` when the operating-system default temporary directory
+is unavailable; the configured directory must already exist outside the source
+tree.
+
+`tests/test_teensy_firmware_compile.py` runs the same no-upload compilation
+when `AR4_ARDUINO_CLI`, `AR4_TEENSY_BUILD_DIRECTORY`, and
+`AR4_TEENSY_SPI_LIBRARY` identify the selected executable, an external
+temporary build parent, and the Teensy 1.62.0 platform SPI library. The test
+also parses verbose compiler dependency reporting, requires the selected SPI
+and SdFat folders under the Teensy 1.62.0 platform, and verifies PJRC Teensy
+core 1.62.0 and ModbusMaster 2.0.1. A kill-on-close Windows Job Object or POSIX
+process group owns the compiler tree, and the timeout path waits for verified
+tree settlement before temporary build cleanup.
 
 The dated hardware-free build result is recorded in [`docs/hardware-free-verification-2026-07-19.md`](../docs/hardware-free-verification-2026-07-19.md).

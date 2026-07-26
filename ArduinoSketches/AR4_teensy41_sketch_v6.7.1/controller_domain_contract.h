@@ -11,6 +11,17 @@ namespace ar4_protocol {
 
 constexpr size_t kControllerAxisCount = 9;
 constexpr size_t kControllerFilenameMaxLength = 255;
+constexpr size_t kControllerDirectoryPayloadMaxLength = 4096;
+constexpr size_t kControllerMediaIdByteLength = 16;
+constexpr size_t kControllerMediaIdLength =
+  kControllerMediaIdByteLength * 2;
+constexpr size_t kControllerMediaIdCapacity = kControllerMediaIdLength + 1;
+constexpr char kControllerDirectoryIdentityPrefix[] = "MID:";
+constexpr char kControllerDirectoryIdentitySeparator = '|';
+constexpr size_t kControllerDirectoryIdentityPrefixLength =
+  sizeof(kControllerDirectoryIdentityPrefix) - 1
+  + kControllerMediaIdLength
+  + 1;
 constexpr int kMainFirmwareWaitMaxSeconds = 2147483;
 constexpr int kModbusMinimumSlaveId = 1;
 constexpr int kModbusMaximumSlaveId = 247;
@@ -26,6 +37,12 @@ enum class ModbusOperation {
   kReadInputRegisters,
   kWriteCoil,
   kWriteRegister,
+};
+
+enum class SDFileLookupStatus {
+  kPresent,
+  kAbsent,
+  kError,
 };
 
 struct ExternalAxisCalibration {
@@ -381,6 +398,63 @@ inline bool fat_reserved_filename_character(unsigned char value) {
   }
 }
 
+constexpr char kControllerDirectorySeparator = ',';
+
+inline bool uppercase_hex_character(unsigned char value) {
+  return (
+    (value >= static_cast<unsigned char>('0')
+      && value <= static_cast<unsigned char>('9'))
+    || (value >= static_cast<unsigned char>('A')
+      && value <= static_cast<unsigned char>('F'))
+  );
+}
+
+template <typename Text>
+inline bool valid_controller_media_id(
+  const Text &text,
+  int begin,
+  int end
+) {
+  if (
+    begin < 0
+    || end - begin != static_cast<int>(kControllerMediaIdLength)
+    || end > static_cast<int>(text.length())
+  ) {
+    return false;
+  }
+  for (int index = begin; index < end; ++index) {
+    if (!uppercase_hex_character(
+        static_cast<unsigned char>(text.charAt(index))
+    )) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool format_controller_media_id(
+  const uint8_t *cid_bytes,
+  size_t cid_length,
+  char *output,
+  size_t output_capacity
+) {
+  if (
+    cid_bytes == nullptr
+    || cid_length != kControllerMediaIdByteLength
+    || output == nullptr
+    || output_capacity < kControllerMediaIdCapacity
+  ) {
+    return false;
+  }
+  static const char kHexDigits[] = "0123456789ABCDEF";
+  for (size_t index = 0; index < cid_length; ++index) {
+    output[index * 2] = kHexDigits[(cid_bytes[index] >> 4) & 0x0F];
+    output[index * 2 + 1] = kHexDigits[cid_bytes[index] & 0x0F];
+  }
+  output[kControllerMediaIdLength] = '\0';
+  return true;
+}
+
 template <typename Text>
 inline bool valid_controller_filename(
   const Text &text,
@@ -412,11 +486,154 @@ inline bool valid_controller_filename(
       value < 32
       || value > 126
       || fat_reserved_filename_character(value)
+      || value == static_cast<unsigned char>(kControllerDirectorySeparator)
+      || (value == ' ' && (index == begin || index == end - 1))
     ) {
       return false;
     }
   }
   return true;
+}
+
+template <typename Text>
+inline bool parse_gcode_media_filename_suffix(
+  const Text &text,
+  int &filename_begin
+) {
+  constexpr int kMediaBegin = 2;
+  constexpr int kMediaEnd =
+    kMediaBegin + static_cast<int>(kControllerMediaIdLength);
+  constexpr int kFilenameMarkerEnd = kMediaEnd + 2;
+  if (
+    static_cast<int>(text.length()) <= kFilenameMarkerEnd
+    || text.charAt(0) != 'M'
+    || text.charAt(1) != 'i'
+    || !valid_controller_media_id(text, kMediaBegin, kMediaEnd)
+    || text.charAt(kMediaEnd) != 'F'
+    || text.charAt(kMediaEnd + 1) != 'n'
+    || !valid_controller_filename(
+      text,
+      kFilenameMarkerEnd,
+      static_cast<int>(text.length())
+    )
+  ) {
+    return false;
+  }
+  filename_begin = kFilenameMarkerEnd;
+  return true;
+}
+
+inline bool ascii_case_matches(char value, char lowercase) {
+  return value == lowercase || value == static_cast<char>(lowercase - 'a' + 'A');
+}
+
+inline unsigned char ascii_fold_lowercase(unsigned char value) {
+  return value >= static_cast<unsigned char>('A')
+      && value <= static_cast<unsigned char>('Z')
+    ? static_cast<unsigned char>(value - 'A' + 'a')
+    : value;
+}
+
+inline bool controller_filenames_equal_ignore_case(
+  const char *left,
+  const char *right
+) {
+  if (left == nullptr || right == nullptr) return false;
+  size_t index = 0;
+  while (left[index] != '\0' && right[index] != '\0') {
+    if (
+      ascii_fold_lowercase(static_cast<unsigned char>(left[index]))
+      != ascii_fold_lowercase(static_cast<unsigned char>(right[index]))
+    ) {
+      return false;
+    }
+    ++index;
+  }
+  return left[index] == '\0' && right[index] == '\0';
+}
+
+template <typename DirectoryEntry>
+inline bool read_controller_directory_entry_name(
+  DirectoryEntry &entry,
+  char *name,
+  size_t capacity,
+  size_t &name_length
+) {
+  if (name == nullptr || capacity < 2) return false;
+  for (size_t index = 0; index < capacity; ++index) {
+    name[index] = static_cast<char>(0x7F);
+  }
+  // Supported SdFat releases expose either a success flag or copied length.
+  // Zero/nonzero is shared; the terminated output defines the wire length.
+  if (!entry.getName(name, capacity)) {
+    name[0] = '\0';
+    return false;
+  }
+
+  size_t staged_length = 0;
+  while (staged_length < capacity && name[staged_length] != '\0') {
+    ++staged_length;
+  }
+  if (staged_length == 0 || staged_length >= capacity) {
+    name[0] = '\0';
+    return false;
+  }
+  name_length = staged_length;
+  return true;
+}
+
+template <typename Text>
+inline bool controller_filename_has_txt_suffix(
+  const Text &text,
+  int begin,
+  int end
+) {
+  return (
+    begin >= 0
+    && end - begin >= 4
+    && end <= static_cast<int>(text.length())
+    && text.charAt(end - 4) == '.'
+    && ascii_case_matches(text.charAt(end - 3), 't')
+    && ascii_case_matches(text.charAt(end - 2), 'x')
+    && ascii_case_matches(text.charAt(end - 1), 't')
+  );
+}
+
+template <typename Text>
+inline bool valid_controller_directory_entry_filename(
+  const Text &text,
+  int begin,
+  int end
+) {
+  if (!valid_controller_filename(text, begin, end)) return false;
+  if (!controller_filename_has_txt_suffix(text, begin, end)) return true;
+
+  const int stem_end = end - 4;
+  const int stem_length = stem_end - begin;
+  return (
+    stem_length > 0
+    && !(
+      stem_length == 1
+      && text.charAt(begin) == '.'
+    )
+    && !(
+      stem_length == 2
+      && text.charAt(begin) == '.'
+      && text.charAt(begin + 1) == '.'
+    )
+  );
+}
+
+inline bool controller_directory_entry_fits_payload(
+  size_t current_length,
+  size_t filename_length
+) {
+  return (
+    filename_length > 0
+    && current_length < kControllerDirectoryPayloadMaxLength
+    && filename_length
+      < kControllerDirectoryPayloadMaxLength - current_length
+  );
 }
 
 inline bool stored_step_target(

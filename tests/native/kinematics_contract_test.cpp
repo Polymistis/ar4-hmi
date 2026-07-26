@@ -35,6 +35,102 @@ void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+template <typename Result>
+class DirectoryEntryNameStub {
+public:
+    DirectoryEntryNameStub(
+        std::string value,
+        bool succeeds = true,
+        bool terminates = true
+    )
+        : value_(std::move(value)),
+          succeeds_(succeeds),
+          terminates_(terminates) {}
+
+    Result getName(char* name, std::size_t capacity) {
+        if (!succeeds_ || name == nullptr || capacity == 0) {
+            return static_cast<Result>(0);
+        }
+        const std::size_t copy_capacity =
+            terminates_ ? capacity - 1 : capacity;
+        const std::size_t copied = std::min(value_.size(), copy_capacity);
+        std::memcpy(name, value_.data(), copied);
+        if (terminates_ && copied < capacity) name[copied] = '\0';
+        return static_cast<Result>(value_.size());
+    }
+
+private:
+    std::string value_;
+    bool succeeds_;
+    bool terminates_;
+};
+
+void test_directory_entry_name_contract() {
+    char name[ar4_protocol::kControllerFilenameMaxLength + 1] = {};
+    std::size_t name_length = 17;
+    DirectoryEntryNameStub<bool> flag_result("program.txt");
+    require(
+        ar4_protocol::read_controller_directory_entry_name(
+            flag_result,
+            name,
+            sizeof(name),
+            name_length
+        )
+            && name_length == std::strlen("program.txt")
+            && std::strcmp(name, "program.txt") == 0,
+        "boolean directory-name result was treated as a filename length"
+    );
+
+    const std::string maximum_name(
+        ar4_protocol::kControllerFilenameMaxLength,
+        'a'
+    );
+    DirectoryEntryNameStub<std::size_t> length_result(maximum_name);
+    require(
+        ar4_protocol::read_controller_directory_entry_name(
+            length_result,
+            name,
+            sizeof(name),
+            name_length
+        )
+            && name_length == maximum_name.length()
+            && std::string(name) == maximum_name,
+        "length-returning directory-name result was rejected"
+    );
+
+    name_length = 17;
+    DirectoryEntryNameStub<std::size_t> failed_result("program.txt", false);
+    require(
+        !ar4_protocol::read_controller_directory_entry_name(
+            failed_result,
+            name,
+            sizeof(name),
+            name_length
+        )
+            && name_length == 17
+            && name[0] == '\0',
+        "failed directory-name read mutated length or retained data"
+    );
+
+    name_length = 17;
+    DirectoryEntryNameStub<bool> unterminated_result(
+        std::string(sizeof(name), 'a'),
+        true,
+        false
+    );
+    require(
+        !ar4_protocol::read_controller_directory_entry_name(
+            unterminated_result,
+            name,
+            sizeof(name),
+            name_length
+        )
+            && name_length == 17
+            && name[0] == '\0',
+        "unterminated directory name crossed the controller boundary"
+    );
+}
+
 void test_rejected_motion_mode_transaction_atomicity() {
     std::string active_wrist = "N";
     int active_loop_modes[6] = {0, 0, 0, 0, 0, 0};
@@ -1342,6 +1438,174 @@ void test_controller_domain_contract() {
                 + reserved
         );
     }
+    const std::string separator_filename =
+        std::string("program")
+        + ar4_protocol::kControllerDirectorySeparator
+        + ".ar4";
+    require(
+        !ar4_protocol::valid_controller_filename(
+            FirmwareCommandText(separator_filename),
+            0,
+            static_cast<int>(separator_filename.length())
+        ),
+        "controller directory separator was accepted in a filename"
+    );
+    for (const char* filename : {" program.txt", "program.txt "}) {
+        require(
+            !ar4_protocol::valid_controller_filename(
+                FirmwareCommandText(filename),
+                0,
+                static_cast<int>(std::string(filename).length())
+            ),
+            "outer-space controller filename was accepted"
+        );
+    }
+    require(
+        ar4_protocol::valid_controller_filename(
+            FirmwareCommandText("program .txt"),
+            0,
+            12
+        ),
+        "pre-extension space could not round-trip through storage"
+    );
+    require(
+        ar4_protocol::controller_filenames_equal_ignore_case(
+            "Program.TXT",
+            "program.txt"
+        )
+            && ar4_protocol::controller_filenames_equal_ignore_case(
+                "A1 -_.txt",
+                "a1 -_.TXT"
+            )
+            && !ar4_protocol::controller_filenames_equal_ignore_case(
+                "program.txt",
+                "program2.txt"
+            )
+            && !ar4_protocol::controller_filenames_equal_ignore_case(
+                "program.txt",
+                "program.txt.bak"
+            )
+            && !ar4_protocol::controller_filenames_equal_ignore_case(
+                nullptr,
+                "program.txt"
+            ),
+        "controller filename identity comparison changed"
+    );
+    for (const char* filename : {"program.txt", "program .txt", "second.nc"}) {
+        const FirmwareCommandText entry(filename);
+        require(
+            ar4_protocol::valid_controller_directory_entry_filename(
+                entry,
+                0,
+                static_cast<int>(entry.length())
+            ),
+            "valid controller directory entry was rejected"
+        );
+    }
+    for (const char* filename : {".txt", "..txt", "...txt"}) {
+        const FirmwareCommandText entry(filename);
+        require(
+            !ar4_protocol::valid_controller_directory_entry_filename(
+                entry,
+                0,
+                static_cast<int>(entry.length())
+            ),
+            "non-reversible G-code directory entry was accepted"
+        );
+    }
+    require(
+        ar4_protocol::kControllerDirectoryPayloadMaxLength == 4096
+            && ar4_protocol::kControllerDirectoryIdentityPrefixLength == 37
+            && ar4_protocol::controller_directory_entry_fits_payload(
+                3840,
+                255
+            )
+            && !ar4_protocol::controller_directory_entry_fits_payload(
+                3841,
+                255
+            )
+            && !ar4_protocol::controller_directory_entry_fits_payload(0, 0)
+            && !ar4_protocol::controller_directory_entry_fits_payload(
+                ar4_protocol::kControllerDirectoryPayloadMaxLength,
+                1
+            ),
+        "controller directory payload boundary changed"
+    );
+    std::string maximum_directory_payload;
+    for (int index = 0; index < 16; ++index) {
+        const std::string prefix = std::to_string(1000 + index);
+        const std::string filename = prefix + std::string(251, 'a');
+        require(
+            ar4_protocol::controller_directory_entry_fits_payload(
+                maximum_directory_payload.length(),
+                filename.length()
+            ),
+            "maximum controller directory payload rejected a valid entry"
+        );
+        maximum_directory_payload += filename;
+        maximum_directory_payload +=
+            ar4_protocol::kControllerDirectorySeparator;
+    }
+    require(
+        maximum_directory_payload.length()
+                == ar4_protocol::kControllerDirectoryPayloadMaxLength
+            && !ar4_protocol::controller_directory_entry_fits_payload(
+                maximum_directory_payload.length(),
+                1
+            ),
+        "controller directory payload overflow was accepted"
+    );
+
+    const std::array<std::uint8_t, 16> cid_bytes = {{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0xFF,
+    }};
+    char media_id[ar4_protocol::kControllerMediaIdCapacity] = {0};
+    require(
+        ar4_protocol::format_controller_media_id(
+            cid_bytes.data(),
+            cid_bytes.size(),
+            media_id,
+            sizeof(media_id)
+        )
+            && std::string(media_id)
+                == "000102030405060708090A0B0C0D0EFF"
+            && ar4_protocol::valid_controller_media_id(
+                FirmwareCommandText(media_id),
+                0,
+                static_cast<int>(ar4_protocol::kControllerMediaIdLength)
+            ),
+        "SD CID media identity was not encoded canonically"
+    );
+    int storage_filename_begin = 17;
+    const FirmwareCommandText storage_target(
+        std::string("Mi") + media_id + "Fndemo.txt"
+    );
+    require(
+        ar4_protocol::parse_gcode_media_filename_suffix(
+            storage_target,
+            storage_filename_begin
+        )
+            && storage_filename_begin == 36,
+        "media-bound G-code filename suffix was rejected"
+    );
+    storage_filename_begin = 17;
+    require(
+        !ar4_protocol::parse_gcode_media_filename_suffix(
+            FirmwareCommandText(
+                "Mi000102030405060708090a0B0C0D0EFFFndemo.txt"
+            ),
+            storage_filename_begin
+        )
+            && storage_filename_begin == 17
+            && !ar4_protocol::format_controller_media_id(
+                cid_bytes.data(),
+                cid_bytes.size() - 1,
+                media_id,
+                sizeof(media_id)
+            ),
+        "invalid G-code storage identity was accepted or mutated output"
+    );
 
     future_step = 17;
     require(
@@ -1907,6 +2171,23 @@ void test_firmware_identity_contract() {
         !ar4_protocol::identity_field_valid("12345678901234567890123456789012"),
         "overlength identity was accepted"
     );
+    char hardware_id[ar4_protocol::kControllerHardwareIdCapacity] = {0};
+    require(
+        ar4_protocol::format_controller_hardware_id(
+            0x12ABEFu,
+            hardware_id,
+            sizeof(hardware_id)
+        )
+            && std::string(hardware_id) == "12ABEF"
+            && ar4_protocol::controller_hardware_id_valid(hardware_id)
+            && !ar4_protocol::format_controller_hardware_id(
+                0x1000000u,
+                hardware_id,
+                sizeof(hardware_id)
+            )
+            && !ar4_protocol::controller_hardware_id_valid("12abef"),
+        "controller hardware identity encoding changed"
+    );
 
     ar4_protocol::IdentitySetCommandFields identity_command = {};
     require(
@@ -1961,16 +2242,24 @@ void test_firmware_identity_contract() {
         );
     }
 
+    const char* const protocol_capabilities[] = {
+        "JT_WRIST_CONFIG_V1",
+        "GCODE_DIRECTORY_FRAMING_V1",
+        "GCODE_DELETE_IDENTITY_V1",
+        "GCODE_WRITE_IDENTITY_V1",
+    };
     char response[ar4_protocol::kIdentityJsonCapacity] = {0};
     require(
         ar4_protocol::build_identity_json(
+            "12ABEF",
             "Teensy 4.1",
-            "6.7.1-ar4hmi.1",
+            "6.7.1-ar4hmi.2",
             "AR4\\\"Model",
             "MK3",
             "SN\\42",
             "Asset-1",
-            "JT_WRIST_CONFIG_V1",
+            protocol_capabilities,
+            4,
             response,
             sizeof(response)
         ),
@@ -1978,41 +2267,104 @@ void test_firmware_identity_contract() {
     );
     require(
         std::string(response) ==
-            "{\"DriverModel\":\"Teensy 4.1\",\"FirmwareVersion\":\"6.7.1-ar4hmi.1\","
+            "{\"ControllerHardwareId\":\"12ABEF\",\"DriverModel\":\"Teensy 4.1\","
+            "\"FirmwareVersion\":\"6.7.1-ar4hmi.2\","
             "\"RobotModel\":\"AR4\\\\\\\"Model\",\"RobotVersion\":\"MK3\","
             "\"SerialNumber\":\"SN\\\\42\",\"AssetTag\":\"Asset-1\","
-            "\"ProtocolCapabilities\":[\"JT_WRIST_CONFIG_V1\"]}",
+            "\"ProtocolCapabilities\":[\"JT_WRIST_CONFIG_V1\","
+            "\"GCODE_DIRECTORY_FRAMING_V1\","
+            "\"GCODE_DELETE_IDENTITY_V1\","
+            "\"GCODE_WRITE_IDENTITY_V1\"]}",
         "firmware identity frame did not escape JSON"
     );
     char short_response[32] = {0};
     require(
         !ar4_protocol::build_identity_json(
+            "12ABEF",
             "Teensy 4.1",
-            "6.7.1-ar4hmi.1",
+            "6.7.1-ar4hmi.2",
             "AR4",
             "MK3",
             "SN",
             "Asset",
-            "JT_WRIST_CONFIG_V1",
+            protocol_capabilities,
+            4,
             short_response,
             sizeof(short_response)
         ),
         "undersized identity frame buffer was accepted"
+    );
+    const char* const duplicate_capabilities[] = {
+        "JT_WRIST_CONFIG_V1",
+        "JT_WRIST_CONFIG_V1",
+    };
+    require(
+        !ar4_protocol::build_identity_json(
+            "12ABEF",
+            "Teensy 4.1",
+            "6.7.1-ar4hmi.2",
+            "AR4",
+            "MK3",
+            "SN",
+            "Asset",
+            duplicate_capabilities,
+            2,
+            response,
+            sizeof(response)
+        ),
+        "duplicated firmware capabilities were serialized"
+    );
+    const char* const malformed_capabilities[] = {
+        "lowercase",
+    };
+    require(
+        !ar4_protocol::build_identity_json(
+            "12ABEF",
+            "Teensy 4.1",
+            "6.7.1-ar4hmi.2",
+            "AR4",
+            "MK3",
+            "SN",
+            "Asset",
+            malformed_capabilities,
+            1,
+            response,
+            sizeof(response)
+        ),
+        "malformed firmware capability was serialized"
     );
 
     const std::string maximum_escaped_identity(
         ar4_protocol::kIdentityFieldMaximumLength,
         '\\'
     );
+    std::array<
+        std::string,
+        ar4_protocol::kProtocolCapabilityMaximumCount
+    > maximum_capability_values;
+    std::array<
+        const char*,
+        ar4_protocol::kProtocolCapabilityMaximumCount
+    > maximum_capabilities;
+    for (size_t index = 0; index < maximum_capability_values.size(); ++index) {
+        maximum_capability_values[index] = std::string(
+            ar4_protocol::kProtocolCapabilityMaximumLength - 1,
+            'A'
+        ) + static_cast<char>('A' + index);
+        maximum_capabilities[index] =
+            maximum_capability_values[index].c_str();
+    }
     require(
         ar4_protocol::build_identity_json(
+            "12ABEF",
             maximum_escaped_identity.c_str(),
             maximum_escaped_identity.c_str(),
             maximum_escaped_identity.c_str(),
             maximum_escaped_identity.c_str(),
             maximum_escaped_identity.c_str(),
             maximum_escaped_identity.c_str(),
-            maximum_escaped_identity.c_str(),
+            maximum_capabilities.data(),
+            maximum_capabilities.size(),
             response,
             sizeof(response)
         ),
@@ -3300,6 +3652,7 @@ int main(int argc, char** argv) {
     try {
         test_rejected_motion_mode_transaction_atomicity();
         test_bounded_serial_frame_accumulator();
+        test_directory_entry_name_contract();
         test_singularity_continuity();
         test_boundary_validation();
         test_cartesian_pose_order_contract();

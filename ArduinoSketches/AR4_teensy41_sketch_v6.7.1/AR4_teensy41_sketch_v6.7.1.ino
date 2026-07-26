@@ -66,8 +66,11 @@
 // 6.6 - 2/22/26 - update kinematic solver to reduce J4/6 wrap | reimplement wrist N/F config
 // 6.7 - 3/11/26 MB holding reg bug fix
 // 6.7.1 - 3/11/26 bug fix calibration debounce
-const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.1";
+const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.2";
 const char *JT_WRIST_CONFIG_CAPABILITY = "JT_WRIST_CONFIG_V1";
+const char *GCODE_DIRECTORY_CAPABILITY = "GCODE_DIRECTORY_FRAMING_V1";
+const char *GCODE_DELETE_IDENTITY_CAPABILITY = "GCODE_DELETE_IDENTITY_V1";
+const char *GCODE_WRITE_IDENTITY_CAPABILITY = "GCODE_WRITE_IDENTITY_V1";
 
 //////////////////////////////////////////////////////////////////////////////
 //DEBUGGING
@@ -98,6 +101,14 @@ const char *JT_WRIST_CONFIG_CAPABILITY = "JT_WRIST_CONFIG_V1";
 #include "spline_response_contract.h"
 #include "tool_jog_contract.h"
 #include "wrist_selection_contract.h"
+const char *const PROTOCOL_CAPABILITIES[] = {
+  JT_WRIST_CONFIG_CAPABILITY,
+  GCODE_DIRECTORY_CAPABILITY,
+  GCODE_DELETE_IDENTITY_CAPABILITY,
+  GCODE_WRITE_IDENTITY_CAPABILITY,
+};
+constexpr size_t PROTOCOL_CAPABILITY_COUNT =
+  sizeof(PROTOCOL_CAPABILITIES) / sizeof(PROTOCOL_CAPABILITIES[0]);
 #pragma GCC diagnostic ignored "-Warray-bounds"
 #pragma GCC diagnostic ignored "-Wunused-variable"
 #pragma GCC diagnostic ignored "-Wsequence-point"
@@ -1050,14 +1061,27 @@ void handle_hello_command() {
     return;
   }
   char response[ar4_protocol::kIdentityJsonCapacity] = { 0 };
+  char controller_hardware_id[
+    ar4_protocol::kControllerHardwareIdCapacity
+  ] = { 0 };
+  if (!ar4_protocol::format_controller_hardware_id(
+      HW_OCOTP_MAC0 & 0xFFFFFFu,
+      controller_hardware_id,
+      sizeof(controller_hardware_id)
+  )) {
+    Serial.println("ER");
+    return;
+  }
   if (!ar4_protocol::build_identity_json(
+      controller_hardware_id,
       driver_board.c_str(),
       FIRMWARE_VERSION,
       robot_model.c_str(),
       robot_version.c_str(),
       serial_number.c_str(),
       asset_tag.c_str(),
-      JT_WRIST_CONFIG_CAPABILITY,
+      PROTOCOL_CAPABILITIES,
+      PROTOCOL_CAPABILITY_COUNT,
       response,
       sizeof(response)
   )) {
@@ -1826,6 +1850,9 @@ void correctRobotPos() {
 
 
 static bool sd_ok = false;
+static char mounted_sd_media_id[
+  ar4_protocol::kControllerMediaIdCapacity
+] = { 0 };
 
 const char *sdCodeMeaning(uint8_t code) {
   switch (code) {
@@ -1851,18 +1878,137 @@ String egSD(const char *stage) {
   return s;
 }
 
+bool readSDMediaId(
+  char (&output)[ar4_protocol::kControllerMediaIdCapacity],
+  bool report_error
+) {
+  cid_t cid = {};
+  if (SD.sdfs.card() == nullptr || !SD.sdfs.card()->readCID(&cid)) {
+    sd_ok = false;
+    if (report_error) Serial.println(egSD("read CID fail"));
+    return false;
+  }
+  if (!ar4_protocol::format_controller_media_id(
+      reinterpret_cast<const uint8_t *>(&cid),
+      sizeof(cid),
+      output,
+      sizeof(output)
+  )) {
+    sd_ok = false;
+    if (report_error) {
+      Serial.println("EG: G-code media identity encoding failed");
+    }
+    return false;
+  }
+  return true;
+}
+
+bool readSDMediaId(
+  char (&output)[ar4_protocol::kControllerMediaIdCapacity]
+) {
+  return readSDMediaId(output, true);
+}
+
+bool sameSDMediaId(
+  const char (&left)[ar4_protocol::kControllerMediaIdCapacity],
+  const char (&right)[ar4_protocol::kControllerMediaIdCapacity]
+) {
+  for (
+    size_t index = 0;
+    index < ar4_protocol::kControllerMediaIdCapacity;
+    ++index
+  ) {
+    if (left[index] != right[index]) return false;
+  }
+  return true;
+}
+
+bool copyMountedSDMediaId(
+  char (&output)[ar4_protocol::kControllerMediaIdCapacity]
+) {
+  if (!sd_ok) return false;
+  for (
+    size_t index = 0;
+    index < ar4_protocol::kControllerMediaIdCapacity;
+    ++index
+  ) {
+    output[index] = mounted_sd_media_id[index];
+  }
+  return true;
+}
+
 bool initSD() {
-  if (sd_ok) return true;
+  char current_media_id[
+    ar4_protocol::kControllerMediaIdCapacity
+  ] = { 0 };
+  if (
+    sd_ok
+    && readSDMediaId(current_media_id, false)
+    && sameSDMediaId(current_media_id, mounted_sd_media_id)
+  ) {
+    return true;
+  }
+
+  sd_ok = false;
   if (!SD.begin(BUILTIN_SDCARD)) {
     Serial.println(egSD("begin fail"));
     return false;
+  }
+
+  char remounted_media_id[
+    ar4_protocol::kControllerMediaIdCapacity
+  ] = { 0 };
+  if (!readSDMediaId(remounted_media_id)) return false;
+  for (
+    size_t index = 0;
+    index < ar4_protocol::kControllerMediaIdCapacity;
+    ++index
+  ) {
+    mounted_sd_media_id[index] = remounted_media_id[index];
   }
   sd_ok = true;
   return true;
 }
 
-bool writeSD(const String &filename, const String &info) {
+bool verifyExpectedSDMediaId(const String &expected_media_id) {
+  if (
+    !ar4_protocol::valid_controller_media_id(
+      expected_media_id,
+      0,
+      static_cast<int>(expected_media_id.length())
+    )
+  ) {
+    Serial.println("EG: G-code storage media identity is invalid");
+    return false;
+  }
+  char current_media_id[
+    ar4_protocol::kControllerMediaIdCapacity
+  ] = { 0 };
+  char mounted_media_id[
+    ar4_protocol::kControllerMediaIdCapacity
+  ] = { 0 };
+  if (
+    !copyMountedSDMediaId(mounted_media_id)
+    || expected_media_id != mounted_media_id
+  ) {
+    Serial.println("EG: G-code storage media changed");
+    return false;
+  }
+  if (!readSDMediaId(current_media_id)) return false;
+  if (expected_media_id != current_media_id) {
+    Serial.println("EG: G-code storage media changed");
+    return false;
+  }
+  return true;
+}
+
+bool writeSD(
+  const String &filename,
+  const String &info,
+  const String &expected_media_id
+) {
   if (!initSD()) return false;
+  if (!verifyExpectedSDMediaId(expected_media_id)) return false;
 
   File f = SD.open(filename.c_str(), FILE_WRITE);
   if (!f) {
@@ -1878,18 +2024,80 @@ bool writeSD(const String &filename, const String &info) {
   if (!succeeded) {
     sd_ok = false;
     Serial.println(egSD("write fail"));
+    return false;
   }
-  return succeeded;
+  return verifyExpectedSDMediaId(expected_media_id);
 }
 
-bool deleteSD(const String &filename) {
+bool deleteSD(
+  const String &filename,
+  const String &expected_media_id
+) {
   if (!initSD()) return false;
+  if (!verifyExpectedSDMediaId(expected_media_id)) return false;
   if (!SD.remove(filename.c_str())) {
     sd_ok = false;
     Serial.println(egSD("remove fail"));
     return false;
   }
-  return true;
+  return verifyExpectedSDMediaId(expected_media_id);
+}
+
+ar4_protocol::SDFileLookupStatus findSDFile(const String &filename) {
+  FsFile root = SD.sdfs.open("/");
+  if (!root) {
+    sd_ok = false;
+    Serial.println(egSD("open root fail"));
+    return ar4_protocol::SDFileLookupStatus::kError;
+  }
+
+  while (true) {
+    FsFile entry = root.openNextFile();
+    if (!entry) {
+      const bool read_failed = root.getError() != 0;
+      root.close();
+      if (read_failed) {
+        sd_ok = false;
+        Serial.println(egSD("directory lookup fail"));
+        return ar4_protocol::SDFileLookupStatus::kError;
+      }
+      return ar4_protocol::SDFileLookupStatus::kAbsent;
+    }
+
+    char entry_name[
+      ar4_protocol::kControllerFilenameMaxLength + 1
+    ] = { 0 };
+    size_t entry_name_length = 0;
+    const bool entry_name_read =
+      ar4_protocol::read_controller_directory_entry_name(
+        entry,
+        entry_name,
+        sizeof(entry_name),
+        entry_name_length
+      );
+    const bool is_directory = entry.isDirectory();
+    entry.close();
+    if (
+      !entry_name_read
+      || entry_name_length
+        > ar4_protocol::kControllerFilenameMaxLength
+    ) {
+      root.close();
+      sd_ok = false;
+      Serial.println("EG: G-code directory filename read failed");
+      return ar4_protocol::SDFileLookupStatus::kError;
+    }
+    if (
+      !is_directory
+      && ar4_protocol::controller_filenames_equal_ignore_case(
+        entry_name,
+        filename.c_str()
+      )
+    ) {
+      root.close();
+      return ar4_protocol::SDFileLookupStatus::kPresent;
+    }
+  }
 }
 
 ar4_protocol::StoredRowReadStatus read_stored_command_row(
@@ -1907,19 +2115,95 @@ ar4_protocol::StoredRowReadStatus read_stored_command_row(
   return ar4_protocol::finish_stored_row(row);
 }
 
-void printDirectory(File dir, int numTabs) {
+bool printDirectory(FsFile &dir, const char *media_id) {
   String filesSD;
+  if (
+    !filesSD.reserve(
+      ar4_protocol::kControllerDirectoryPayloadMaxLength
+    )
+  ) {
+    Serial.println("EG: G-code directory buffer unavailable");
+    return false;
+  }
+  filesSD += ar4_protocol::kControllerDirectoryIdentityPrefix;
+  filesSD += media_id;
+  filesSD += ar4_protocol::kControllerDirectoryIdentitySeparator;
+  if (
+    filesSD.length()
+    != ar4_protocol::kControllerDirectoryIdentityPrefixLength
+  ) {
+    Serial.println("EG: G-code directory identity framing failed");
+    return false;
+  }
   while (true) {
 
-    File entry = dir.openNextFile();
+    FsFile entry = dir.openNextFile();
     if (!entry) {
-      // no more files
+      if (dir.getError() != 0) {
+        sd_ok = false;
+        Serial.println(egSD("directory read fail"));
+        return false;
+      }
+      if (!verifyExpectedSDMediaId(String(media_id))) return false;
       Serial.println(filesSD);
-      break;
+      return true;
     }
-    if (entry.name() != "System Volume Information") {
-      filesSD += entry.name();
-      filesSD += ",";
+    char entry_name[
+      ar4_protocol::kControllerFilenameMaxLength + 1
+    ] = { 0 };
+    size_t entry_name_length = 0;
+    const bool entry_name_read =
+      ar4_protocol::read_controller_directory_entry_name(
+        entry,
+        entry_name,
+        sizeof(entry_name),
+        entry_name_length
+      );
+    if (
+      !entry_name_read
+      || entry_name_length
+        > ar4_protocol::kControllerFilenameMaxLength
+    ) {
+      entry.close();
+      sd_ok = false;
+      Serial.println("EG: G-code directory filename read failed");
+      return false;
+    }
+    String entryName(entry_name);
+    if (entryName.length() != entry_name_length) {
+      entry.close();
+      Serial.println("EG: G-code directory buffer unavailable");
+      return false;
+    }
+    if (
+      !entry.isDirectory()
+      && entryName != "System Volume Information"
+    ) {
+      if (
+        !ar4_protocol::valid_controller_directory_entry_filename(
+          entryName,
+          0,
+          static_cast<int>(entryName.length())
+        )
+      ) {
+        entry.close();
+        Serial.println("EG: rename incompatible filename on SD card");
+        return false;
+      }
+      if (
+        !ar4_protocol::controller_directory_entry_fits_payload(
+          filesSD.length(),
+          entryName.length()
+        )
+      ) {
+        entry.close();
+        Serial.println(
+          "EG: G-code directory listing exceeds protocol payload limit"
+        );
+        return false;
+      }
+      filesSD += entryName;
+      filesSD += ar4_protocol::kControllerDirectorySeparator;
     }
     entry.close();
   }
@@ -6609,15 +6893,11 @@ void loop() {
     //----- DELETE PROG FROM SD CARD ---------------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "DG") {
-      int fileStart = inData.indexOf("Fn");
-      if (
-        fileStart != 0
-        || !ar4_protocol::valid_controller_filename(
+      int filenameStart = -1;
+      if (!ar4_protocol::parse_gcode_media_filename_suffix(
           inData,
-          fileStart + 2,
-          static_cast<int>(inData.length())
-        )
-      ) {
+          filenameStart
+      )) {
         Serial.println("ER");
         consume_current_command();
         return;
@@ -6626,11 +6906,29 @@ void loop() {
         consume_current_command();
         return;
       }
-      String filename = inData.substring(fileStart + 2);
-      const char *fn = filename.c_str();
-      if (SD.exists(fn)) {
-        if (deleteSD(filename)) Serial.println("P");
-      } else {
+      const String expected_media_id = inData.substring(
+        2,
+        2 + ar4_protocol::kControllerMediaIdLength
+      );
+      if (!verifyExpectedSDMediaId(expected_media_id)) {
+        consume_current_command();
+        return;
+      }
+      String filename = inData.substring(filenameStart);
+      const ar4_protocol::SDFileLookupStatus file_status =
+        findSDFile(filename);
+      if (
+        file_status != ar4_protocol::SDFileLookupStatus::kError
+        && !verifyExpectedSDMediaId(expected_media_id)
+      ) {
+        consume_current_command();
+        return;
+      }
+      if (file_status == ar4_protocol::SDFileLookupStatus::kPresent) {
+        if (deleteSD(filename, expected_media_id)) Serial.println("P");
+      } else if (
+        file_status == ar4_protocol::SDFileLookupStatus::kAbsent
+      ) {
         Serial.println("F");
       }
     }
@@ -6638,18 +6936,25 @@ void loop() {
     //----- READ FILES FROM SD CARD ---------------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "RG") {
-      File root;
       if (!initSD()) {
         consume_current_command();
         return;
       }
-      root = SD.open("/");
+      char media_id[ar4_protocol::kControllerMediaIdCapacity] = { 0 };
+      if (!copyMountedSDMediaId(media_id)) {
+        sd_ok = false;
+        Serial.println("EG: G-code storage mount identity is unavailable");
+        consume_current_command();
+        return;
+      }
+      FsFile root = SD.sdfs.open("/");
       if (!root) {
+        sd_ok = false;
         Serial.println(egSD("open root fail"));
         consume_current_command();
         return;
       }
-      printDirectory(root, 0);
+      printDirectory(root, media_id);
       root.close();
     }
 
@@ -6657,21 +6962,28 @@ void loop() {
     //----- WRITE COMMAND TO SD CARD ---------------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "WC") {
-      int fileStart = inData.indexOf("Fn");
+      const int mediaStart = inData.indexOf("Mi");
+      int targetFilenameStart = -1;
+      const String storageTarget = mediaStart > 0
+        ? inData.substring(mediaStart)
+        : String();
       if (
-        fileStart <= 0
-        || !ar4_protocol::valid_controller_filename(
-          inData,
-          fileStart + 2,
-          static_cast<int>(inData.length())
+        mediaStart <= 0
+        || !ar4_protocol::parse_gcode_media_filename_suffix(
+          storageTarget,
+          targetFilenameStart
         )
       ) {
         Serial.println("ER");
         consume_current_command();
         return;
       }
-      String filename = inData.substring(fileStart + 2);
-      String info = inData.substring(0, fileStart);
+      const String expected_media_id = storageTarget.substring(
+        2,
+        2 + ar4_protocol::kControllerMediaIdLength
+      );
+      String filename = storageTarget.substring(targetFilenameStart);
+      String info = inData.substring(0, mediaStart);
       ar4_protocol::CartesianMoveCommandFields stored_fields = {};
       int stored_external_steps[3] = {};
       if (
@@ -6687,7 +6999,7 @@ void loop() {
         consume_current_command();
         return;
       }
-      if (writeSD(filename, info)) sendRobotPos();
+      if (writeSD(filename, info, expected_media_id)) sendRobotPos();
     }
 
     //----- PLAY FILE ON SD CARD ---------------------------------------------------
@@ -6964,20 +7276,27 @@ void loop() {
 
       String info;
 
-      int fileStart = inData.indexOf("Fn");
+      const int mediaStart = inData.indexOf("Mi");
+      int targetFilenameStart = -1;
+      const String storageTarget = mediaStart > 0
+        ? inData.substring(mediaStart)
+        : String();
       if (
-        fileStart <= 0
-        || !ar4_protocol::valid_controller_filename(
-          inData,
-          fileStart + 2,
-          static_cast<int>(inData.length())
+        mediaStart <= 0
+        || !ar4_protocol::parse_gcode_media_filename_suffix(
+          storageTarget,
+          targetFilenameStart
         )
       ) {
         Serial.println("ER");
         consume_current_command();
         return;
       }
-      String motionInfo = inData.substring(0, fileStart);
+      const String expected_media_id = storageTarget.substring(
+        2,
+        2 + ar4_protocol::kControllerMediaIdLength
+      );
+      String motionInfo = inData.substring(0, mediaStart);
       ar4_protocol::CartesianMoveCommandFields commandFields = {};
       if (!ar4_protocol::parse_cartesian_move_command(
           motionInfo,
@@ -6987,7 +7306,7 @@ void loop() {
         consume_current_command();
         return;
       }
-      String filename = inData.substring(fileStart + 2);
+      String filename = storageTarget.substring(targetFilenameStart);
       for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
         xyzuvw_In[axis] = commandFields.pose[axis];
       }
@@ -7090,7 +7409,7 @@ void loop() {
 
       if (TotalAxisFault == 0 && KinematicError == 0) {
         info = String(abs(J1stepDif)) + "," + String(abs(J2stepDif)) + "," + String(abs(J3stepDif)) + "," + String(abs(J4stepDif)) + "," + String(abs(J5stepDif)) + "," + String(abs(J6stepDif)) + "," + String(abs(J7stepDif)) + "," + String(abs(J8stepDif)) + "," + String(abs(J9stepDif)) + "," + String(J1dir) + "," + String(J2dir) + "," + String(J3dir) + "," + String(J4dir) + "," + String(J5dir) + "," + String(J6dir) + "," + String(J7dir) + "," + String(J8dir) + "," + String(J9dir) + "," + String(SpeedType) + "," + String(SpeedVal) + "," + String(ACCspd) + "," + String(DCCspd) + "," + String(ACCramp);
-        if (writeSD(filename, info)) {
+        if (writeSD(filename, info, expected_media_id)) {
           J1StepM = J1futStepM;
           J2StepM = J2futStepM;
           J3StepM = J3futStepM;
@@ -7978,15 +8297,6 @@ void loop() {
       //loop through waypoints
       ////////////////////////////////////
 
-
-      ////debug values to sd card//////////////
-      //SD.begin(BUILTIN_SDCARD);
-      //String filename = "arc_debug";
-      //const char *fn = filename.c_str();
-      //if (SD.exists(fn)) {
-      //  deleteSD(filename);
-      //}
-
       resetEncoders();
 
       for (int i = 1; i <= waypoint_count; i++) {
@@ -8118,17 +8428,6 @@ void loop() {
 
         //increment angle
         cur_deg += theta_Deg;
-
-
-
-        ///////////debug values to sd card
-        //updatePos();
-        //String cart_val = "Cartesian Value = " + String(xyzuvw_Out[0]) + " - " + String(xyzuvw_Out[1]) + " - " + String(xyzuvw_Out[2]) + " - " + String(xyzuvw_Out[3]) + " - " + String(xyzuvw_Out[4]) + " - " + String(xyzuvw_Out[5]);
-        //String joint_val = "Joint Value = " + String(JangleIn[0]) + " - " + String(JangleIn[1]) + " - " + String(JangleIn[2]) + " - " + String(JangleIn[3]) + " - " + String(JangleIn[4]) + " - " + String(JangleIn[5]);
-        //SD.begin(BUILTIN_SDCARD);
-        //const char *fn = filename.c_str();
-        //writeSD(fn, cart_val);
-        //writeSD(fn, joint_val);
       }
       if (KinematicError == 1) {
         Alarm = "ER";

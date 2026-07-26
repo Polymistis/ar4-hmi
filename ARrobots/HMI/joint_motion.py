@@ -45,10 +45,23 @@ CONTROLLER_MAXIMUM_RAMP_PERCENT = 100.0
 CONTROLLER_FLOAT_MAX = 3.4028234663852886e38
 CONTROLLER_SIGNED_INT_MAX = 2147483647
 CONTROLLER_RADIANS_PER_DEGREE = math.pi / 180.0
+CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1 = (
+    "GCODE_DIRECTORY_FRAMING_V1"
+)
+CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1 = (
+    "GCODE_DELETE_IDENTITY_V1"
+)
+CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1 = (
+    "GCODE_WRITE_IDENTITY_V1"
+)
 CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1 = "JT_WRIST_CONFIG_V1"
+CONTROLLER_DIRECTORY_SEPARATOR = ","
+MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES = MAX_RESPONSE_PAYLOAD_LENGTH
 MAX_CONTROLLER_IDENTITY_FIELD_LENGTH = 31
 MAX_CONTROLLER_CAPABILITY_COUNT = 32
 MAX_CONTROLLER_FILENAME_BYTES = 255
+CONTROLLER_HARDWARE_ID_LENGTH = 6
+CONTROLLER_MEDIA_ID_LENGTH = 32
 _FAT_RESERVED_FILENAME_CHARACTERS = frozenset('"*/:<>?\\|')
 _CONTROLLER_IDENTITY_FIELD_NAMES = (
     ("DriverModel", "driver_model"),
@@ -60,7 +73,7 @@ _CONTROLLER_IDENTITY_FIELD_NAMES = (
 )
 _CONTROLLER_IDENTITY_WIRE_FIELDS = frozenset(
     wire_name for wire_name, _ in _CONTROLLER_IDENTITY_FIELD_NAMES
-) | {"ProtocolCapabilities"}
+) | {"ControllerHardwareId", "ProtocolCapabilities"}
 _SERIAL_QUARANTINE_ATTRIBUTE = "_ar4_transport_quarantine_reason"
 _SERIAL_QUARANTINE_LOCK = threading.Lock()
 _SERIAL_QUARANTINED_PORTS = {}
@@ -180,11 +193,11 @@ class _SerialActivityLease:
         with self._lock:
             if self._closed:
                 return False
+            self._registry.end(
+                self._serial_name,
+                control_injectable=self._control_injectable,
+            )
             self._closed = True
-        self._registry.end(
-            self._serial_name,
-            control_injectable=self._control_injectable,
-        )
         return True
 
 
@@ -420,6 +433,7 @@ def parse_controller_modbus_response(command, response):
 class ControllerIdentity:
     """Validated identity and protocol capabilities reported by a controller."""
 
+    controller_hardware_id: str
     driver_model: str
     firmware_version: str
     robot_model: str
@@ -427,6 +441,36 @@ class ControllerIdentity:
     serial_number: str
     asset_tag: str
     protocol_capabilities: tuple
+
+
+def validate_controller_hardware_id(value):
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(
+            rf"[0-9A-F]{{{CONTROLLER_HARDWARE_ID_LENGTH}}}",
+            value,
+        )
+        is None
+    ):
+        raise MotionInputError(
+            "controller hardware ID must be fixed-width uppercase hexadecimal"
+        )
+    return value
+
+
+def validate_controller_media_id(value):
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(
+            rf"[0-9A-F]{{{CONTROLLER_MEDIA_ID_LENGTH}}}",
+            value,
+        )
+        is None
+    ):
+        raise MotionInputError(
+            "controller media ID must be fixed-width uppercase hexadecimal"
+        )
+    return value
 
 
 def _unique_json_object(pairs):
@@ -479,6 +523,15 @@ def parse_controller_identity_response(response):
             )
         fields[field_name] = value
 
+    try:
+        controller_hardware_id = validate_controller_hardware_id(
+            payload.get("ControllerHardwareId")
+        )
+    except MotionInputError as exc:
+        raise ProtocolResponseError(
+            "controller hardware identity is invalid"
+        ) from exc
+
     capabilities = payload.get("ProtocolCapabilities")
     if (
         not isinstance(capabilities, list)
@@ -500,6 +553,7 @@ def parse_controller_identity_response(response):
         normalized_capabilities.append(capability)
 
     return ControllerIdentity(
+        controller_hardware_id=controller_hardware_id,
         **fields,
         protocol_capabilities=tuple(normalized_capabilities),
     )
@@ -1111,8 +1165,15 @@ def write_serial_control(
     write_lock=None,
     reset_input=False,
     write_started_event=None,
+    cancellation_event=None,
+    write_boundary_lock=None,
 ):
-    """Write a serialized command without consuming the pending response."""
+    """Write a serialized command without consuming the pending response.
+
+    The optional cancellation lock orders the final admission check against
+    write commitment. Cancellation after commitment remains the caller's
+    response-ownership responsibility.
+    """
     command_bytes = _serial_command_bytes(command)
     _require_open_serial_port(serial_port)
     _validate_write_lock(write_lock)
@@ -1125,14 +1186,51 @@ def write_serial_control(
             reset = getattr(serial_port, "flushInput", None)
         if not callable(reset):
             raise TypeError("serial connection does not support input-buffer reset")
+    if cancellation_event is None:
+        if write_boundary_lock is not None:
+            raise MotionInputError(
+                "write_boundary_lock requires a cancellation_event"
+            )
+        write_admission_check = None
+    else:
+        if not callable(getattr(cancellation_event, "is_set", None)):
+            raise MotionInputError(
+                "cancellation_event must satisfy the event contract"
+            )
+        if write_started_event is None or write_boundary_lock is None:
+            raise MotionInputError(
+                "cancellation_event requires write_started_event and "
+                "write_boundary_lock"
+            )
+
+        def write_admission_check():
+            try:
+                cancelled = cancellation_event.is_set()
+            except Exception as exc:
+                raise MotionInputError(
+                    "cancellation_event could not be read before transmission"
+                ) from exc
+            if not isinstance(cancelled, bool):
+                raise MotionInputError(
+                    "cancellation_event.is_set() must return a boolean"
+                )
+            if cancelled:
+                raise SerialActivityRejected(
+                    "serial control write cancelled before transmission"
+                )
+
     try:
         _write_serial_bytes(
             serial_port,
             command_bytes,
             write_lock,
             reset_input=reset,
+            write_admission_check=write_admission_check,
             write_started_event=write_started_event,
+            write_boundary_lock=write_boundary_lock,
         )
+    except SerialActivityRejected:
+        raise
     except Exception as exc:
         _raise_quarantined_transport(
             serial_port,
@@ -1233,6 +1331,7 @@ def _read_serial_framed_line(
     deadline,
     timeout,
     initial_bytes=b"",
+    allow_empty_terminal_response=False,
 ):
     response_buffer = bytearray(initial_bytes)
     while True:
@@ -1244,7 +1343,10 @@ def _read_serial_framed_line(
                 raise ProtocolResponseError(
                     "controller returned trailing framed data"
                 )
-            return decode_serial_response_line(response_buffer)
+            return decode_serial_response_line(
+                response_buffer,
+                allow_empty=allow_empty_terminal_response,
+            )
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1269,11 +1371,26 @@ def read_serial_line_response(
     timeout,
     accepted_responses=None,
     response_deadline=None,
+    allow_empty_terminal_response=False,
 ):
     """Read one bounded response line without taking command-write ownership.
 
     An absolute monotonic deadline can shorten but cannot extend the timeout.
+    An explicitly admitted blank payload must be the command's terminal
+    response before the required quiet boundary; non-terminal acknowledgements
+    require a continuing response owner. Dynamic terminal responses must be
+    validated by the caller before higher-level transport ownership is released.
+    Empty terminal admission cannot be combined with accepted_responses.
     """
+    if not isinstance(allow_empty_terminal_response, bool):
+        raise MotionInputError(
+            "allow_empty_terminal_response must be boolean"
+        )
+    if allow_empty_terminal_response and accepted_responses is not None:
+        raise MotionInputError(
+            "allow_empty_terminal_response cannot be combined with "
+            "accepted_responses"
+        )
     timeout = finite_number(timeout, "serial response timeout")
     if timeout <= 0:
         raise MotionInputError("serial response timeout must be positive")
@@ -1307,6 +1424,7 @@ def read_serial_line_response(
             read_until,
             deadline,
             timeout,
+            allow_empty_terminal_response=allow_empty_terminal_response,
         )
         if accepted is not None and response not in accepted:
             raise ProtocolResponseError(
@@ -2676,7 +2794,11 @@ _STANDARD_TIMING_SUFFIXES = {
         for opcode in ("LC", "LT")
     },
     **{
-        opcode: re.compile(rf"W[NFA]Lm[01]{{6}}Fn[ -~]+\n\Z")
+        opcode: re.compile(
+            rf"W[NFA]Lm[01]{{6}}"
+            rf"Mi[0-9A-F]{{{CONTROLLER_MEDIA_ID_LENGTH}}}"
+            rf"Fn[ -~]+\n\Z"
+        )
         for opcode in ("WC", "WG")
     },
 }
@@ -2876,6 +2998,19 @@ def _parse_command_contract(command, virtual):
         filename_index = normalized.find("Fn")
         if filename_index < 0:
             raise MotionInputError(f"serial {opcode} filename marker is missing")
+        media_marker_index = (
+            filename_index - CONTROLLER_MEDIA_ID_LENGTH - 2
+        )
+        if (
+            media_marker_index < 0
+            or normalized[media_marker_index:media_marker_index + 2] != "Mi"
+        ):
+            raise MotionInputError(
+                f"serial {opcode} media identity marker is missing"
+            )
+        validate_controller_media_id(
+            normalized[media_marker_index + 2:filename_index]
+        )
         validate_controller_filename(
             normalized[filename_index + 2:-1],
             f"{opcode} filename",
@@ -2892,10 +3027,13 @@ def validate_controller_filename(filename, field_name):
             character in _FAT_RESERVED_FILENAME_CHARACTERS
             for character in filename
         )
+        or CONTROLLER_DIRECTORY_SEPARATOR in filename
+        or filename[0] == " "
+        or filename[-1] == " "
         or any(ord(character) < 32 or ord(character) > 126 for character in filename)
     ):
         raise MotionInputError(
-            f"{field_name} contains a FAT-reserved or control character"
+            f"{field_name} contains a controller-reserved or control character"
         )
     if len(filename.encode("ascii")) > MAX_CONTROLLER_FILENAME_BYTES:
         raise MotionInputError(

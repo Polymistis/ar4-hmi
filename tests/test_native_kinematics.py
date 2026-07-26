@@ -6,10 +6,13 @@ import platform
 import shutil
 import subprocess
 import sys
-import tempfile
 import textwrap
 import unittest
 
+if __package__:
+    from .bounded_temp import BoundedTemporaryDirectory
+else:
+    from bounded_temp import BoundedTemporaryDirectory
 from ARrobots.HMI.joint_motion import (
     MotionInputError,
     parse_command_timing,
@@ -63,7 +66,7 @@ class NativeKinematicsContractTests(unittest.TestCase):
         if compiler is None:
             self.skipTest("g++ is unavailable")
 
-        with tempfile.TemporaryDirectory() as directory:
+        with BoundedTemporaryDirectory() as directory:
             executable = Path(directory) / "kinematics_contract_test"
             compile_result = subprocess.run(
                 [
@@ -217,7 +220,7 @@ class NativeKinematicsContractTests(unittest.TestCase):
         self.assertIsNotNone(bash, "bash is required for the Linux native build")
         self.assertIsNotNone(cmake, "CMake is required for the Linux native build")
 
-        with tempfile.TemporaryDirectory() as directory:
+        with BoundedTemporaryDirectory() as directory:
             environment = os.environ.copy()
             environment["PYTHON"] = sys.executable
             environment["AR4_KINEMATICS_BUILD_DIR"] = directory

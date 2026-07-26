@@ -3,6 +3,7 @@ import copy
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
+import importlib
 import io
 import json
 import math
@@ -10,6 +11,9 @@ import os
 from pathlib import Path
 from queue import Empty, Queue
 import re
+import secrets
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -19,17 +23,25 @@ import unittest
 
 import numpy as np
 
+if __package__:
+    from .bounded_temp import BoundedTemporaryDirectory
+else:
+    from bounded_temp import BoundedTemporaryDirectory
 from ARrobots.HMI.joint_motion import (
     AUXILIARY_BOARD_MEGA,
     AUXILIARY_BOARD_NANO,
     AUXILIARY_BOARD_NONE,
     AUXILIARY_BOARD_OUTPUT_PINS,
+    CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
+    CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
+    CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
     ControllerIdentity,
     ControllerJointCalibration,
     MotionInputError,
     LiveMotionScheduleResult,
     MAX_COMMAND_LENGTH,
+    MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES,
     MAX_CONTROLLER_FILENAME_BYTES,
     MAX_RESPONSE_FRAME_LENGTH,
     MAX_RESPONSE_PAYLOAD_LENGTH,
@@ -42,6 +54,7 @@ from ARrobots.HMI.joint_motion import (
     ProtocolResponseError,
     SerialActivityRegistry,
     SerialActivityRejected,
+    SerialTransportQuarantinedError,
     SerialTransportTimeout,
     VirtualMotionOperation,
     auxiliary_pneumatic_output_pin,
@@ -75,6 +88,8 @@ from ARrobots.HMI.joint_motion import (
     validate_auxiliary_output_command,
     validate_auxiliary_servo_command,
     validate_controller_filename,
+    validate_controller_hardware_id,
+    validate_controller_media_id,
     write_serial_control,
 )
 
@@ -136,14 +151,18 @@ VALID_CONTROLLER_POSITION = parse_position_response(
 )
 VALID_CONTROLLER_IDENTITY_RESPONSE = json.dumps(
     {
+        "ControllerHardwareId": "12ABEF",
         "DriverModel": "Teensy 4.1",
-        "FirmwareVersion": "6.7.1-ar4hmi.1",
+        "FirmwareVersion": "6.7.1-ar4hmi.2",
         "RobotModel": "AR4",
         "RobotVersion": "MK3",
         "SerialNumber": "Unset",
         "AssetTag": "Unset",
         "ProtocolCapabilities": [
             CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+            CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
+            CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
+            CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
         ],
     },
     separators=(",", ":"),
@@ -226,8 +245,40 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIsNotNone(assignment, name)
         return ast.literal_eval(assignment.value)
 
+    def compile_assignment(self, name, namespace):
+        assignment = self.module_assignments.get(name)
+        self.assertIsNotNone(assignment, name)
+        module = ast.Module(
+            body=[copy.deepcopy(assignment)],
+            type_ignores=[],
+        )
+        compiled = compile(
+            ast.fix_missing_locations(module),
+            str(AR4_SOURCE),
+            "exec",
+        )
+        exec(compiled, namespace)
+        return namespace[name]
+
     def compile_function(self, name, namespace, *, preserve_decorators=False):
         self.add_motion_request_dependencies(namespace)
+        main_identity_cleanup_callers = (
+            "_apply_gcode_storage_result",
+            "_close_failed_controller_startup",
+            "_close_serial_port",
+            "_exchange_controller_calibration_acknowledgement",
+            "_exchange_gcode_row",
+            "_exchange_legacy_main_command",
+            "_exchange_position_acknowledgement",
+            "_exchange_serial_line",
+            "_invalidate_uncertain_controller_calibration",
+            "_set_com_admitted",
+        )
+        if name in main_identity_cleanup_callers:
+            namespace.setdefault(
+                "_clear_main_controller_identity",
+                lambda serial_port=None: True,
+            )
         namespace.setdefault(
             "EVENT_POLL_INTERVAL_MS",
             self.module_literal("EVENT_POLL_INTERVAL_MS"),
@@ -358,12 +409,37 @@ class HmiSourceContractTests(unittest.TestCase):
             "validate_controller_filename",
             validate_controller_filename,
         )
+        namespace.setdefault(
+            "validate_controller_hardware_id",
+            validate_controller_hardware_id,
+        )
+        namespace.setdefault(
+            "validate_controller_media_id",
+            validate_controller_media_id,
+        )
         namespace.setdefault("LIVE_TOOL_JOG_INCREMENT", 0.25)
         namespace.setdefault("ControllerIdentity", ControllerIdentity)
+        namespace.setdefault(
+            "CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1",
+            CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
+        )
+        namespace.setdefault(
+            "CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1",
+            CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
+        )
+        namespace.setdefault(
+            "CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1",
+            CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+        )
         namespace.setdefault(
             "CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1",
             CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
         )
+        if "CONTROLLER_STARTUP_REQUIRED_CAPABILITIES" not in namespace:
+            self.compile_assignment(
+                "CONTROLLER_STARTUP_REQUIRED_CAPABILITIES",
+                namespace,
+            )
         namespace.setdefault(
             "parse_controller_identity_response",
             parse_controller_identity_response,
@@ -429,6 +505,10 @@ class HmiSourceContractTests(unittest.TestCase):
                 namespace,
             )
         dependencies = {
+            **{
+                function_name: ("_require_main_controller_identity_cleanup",)
+                for function_name in main_identity_cleanup_callers
+            },
             **{
                 function_name: ("_manual_auxiliary_error_detail",)
                 for function_name in (
@@ -527,6 +607,36 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_rotation_error_degrees",
             ),
             "_acquire_motion_request": ("_reject_motion_request",),
+            "GCconvertProg": (
+                "_reject_motion_request",
+                "_acquire_motion_request",
+                "_finish_motion_request",
+                "_begin_gcode_conversion_admission",
+                "_finish_gcode_conversion_admission",
+            ),
+            "_start_gcode_storage_request": (
+                "_begin_gcode_storage_program_admission",
+                "_finish_gcode_storage_program_admission",
+                "_new_gcode_storage_cleanup",
+                "_release_or_retain_gcode_storage_cleanup",
+            ),
+            "_release_gcode_storage_request": (
+                "_new_gcode_storage_cleanup",
+                "_release_or_retain_gcode_storage_cleanup",
+            ),
+            "_release_or_retain_gcode_storage_cleanup": (
+                "_retain_gcode_storage_cleanup",
+            ),
+            "_retain_gcode_storage_cleanup": (
+                "_ensure_gcode_storage_cleanup",
+            ),
+            "_ensure_gcode_storage_cleanup": (
+                "_run_gcode_storage_cleanup",
+            ),
+            "_poll_gcode_storage_events": (
+                "_ensure_gcode_storage_cleanup",
+                "_apply_gcode_storage_cleanup_result",
+            ),
             "parse_mj_command": ("_external_cartesian_pose_to_native",),
             "mj_command": ("_solve_inverse_kinematics",),
             "mt_command": (
@@ -551,6 +661,13 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_prepare_forced_position_request",
             ),
             "_gcode_playback_command": ("_gcode_storage_filename",),
+            "_gcode_storage_filename": (
+                "_validate_gcode_storage_filename",
+            ),
+            "_gcode_storage_selection_name": (
+                "_validate_gcode_storage_filename",
+                "_gcode_storage_filename",
+            ),
             "displayPosition": (
                 "_clear_acknowledged_forced_position_target",
                 "_calibration_pose_widget_groups",
@@ -588,7 +705,7 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
         }
         for dependency in dependencies.get(name, ()):
-            if dependency not in namespace:
+            if dependency not in namespace or name == "GCconvertProg":
                 self.compile_function(
                     dependency,
                     namespace,
@@ -613,6 +730,24 @@ class HmiSourceContractTests(unittest.TestCase):
             MotionRequestRegistry(),
         )
         namespace.setdefault("MotionRequestLease", MotionRequestLease)
+        namespace.setdefault("gcode_conversion_active", threading.Event())
+        namespace.setdefault(
+            "program_execution_state_lock",
+            threading.Lock(),
+        )
+        namespace.setdefault("program_execution_active_request", None)
+        namespace.setdefault(
+            "gcode_storage_program_admission_active",
+            False,
+        )
+        namespace.setdefault(
+            "gcode_storage_cleanup_lock",
+            threading.Lock(),
+        )
+        namespace.setdefault("gcode_storage_cleanup_pending", {})
+        namespace.setdefault("gcode_storage_cleanup_completed", {})
+        namespace.setdefault("gcode_storage_cleanup_worker", None)
+        namespace.setdefault("gcode_storage_cleanup_next_id", 0)
         namespace.setdefault(
             "application_closing",
             SimpleNamespace(is_set=lambda: False),
@@ -648,7 +783,15 @@ class HmiSourceContractTests(unittest.TestCase):
             name,
             allow_position_recovery=False,
             requires_kinematics=True,
+            allow_gcode_conversion=False,
         ):
+            conversion_active = namespace[
+                "gcode_conversion_active"
+            ].is_set()
+            if conversion_active and not allow_gcode_conversion:
+                return None
+            if allow_gcode_conversion and not conversion_active:
+                return None
             readiness = namespace.get("kinematics_configuration_ready")
             if (
                 requires_kinematics
@@ -722,6 +865,7 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault("_calibration_shutdown_pending", lambda: False)
         namespace.setdefault("_poll_calibration_events", lambda: None)
         namespace.setdefault("_poll_manual_auxiliary_events", lambda: None)
+        namespace.setdefault("_poll_gcode_storage_events", lambda: None)
         namespace.setdefault("_poll_virtual_motion_events", lambda: None)
         namespace.setdefault("_poll_xbox_auxiliary_events", lambda: None)
         namespace.setdefault("startup_controller_cleanup_lock", threading.Lock())
@@ -1710,6 +1854,27 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIsInstance(lease, MotionRequestLease)
         lease.close()
 
+        namespace["gcode_conversion_active"].set()
+        self.assertIsNone(acquire("Controller connection change"))
+        self.assertEqual(
+            namespace["_motion_request_rejection_message"]("fallback"),
+            "Controller connection change not started; "
+            "G-code conversion owns motion admission",
+        )
+        conversion_lease = acquire(
+            "G-code conversion",
+            allow_gcode_conversion=True,
+        )
+        self.assertIsInstance(conversion_lease, MotionRequestLease)
+        conversion_lease.close()
+        namespace["gcode_conversion_active"].clear()
+        self.assertIsNone(
+            acquire(
+                "Stale G-code conversion",
+                allow_gcode_conversion=True,
+            )
+        )
+
     def test_synchronous_configuration_repair_bypasses_only_kinematics_gate(self):
         ready = threading.Event()
         namespace = {
@@ -1735,6 +1900,27 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(repair())
         self.assertFalse(motion())
         self.assertEqual(calls, ["repair"])
+
+        borrowed = decorator(
+            "Borrowed motion",
+            inherited_lease_keyword="request_lease",
+        )(
+            lambda *, request_lease=None: (
+                calls.append("borrowed")
+                or namespace["motion_request_registry"].owns(request_lease)
+            )
+        )
+        borrowed_lease = namespace["motion_request_registry"].acquire(
+            "G-code conversion"
+        )
+        self.assertTrue(borrowed(request_lease=borrowed_lease))
+        self.assertTrue(
+            namespace["motion_request_registry"].owns(borrowed_lease)
+        )
+        self.assertTrue(borrowed_lease.close())
+        with self.assertRaisesRegex(RuntimeError, "inherited"):
+            borrowed(request_lease=borrowed_lease)
+        self.assertEqual(calls, ["repair", "borrowed"])
 
     def test_generic_program_exchange_bypasses_only_kinematics_gate(self):
         ready = threading.Event()
@@ -3265,9 +3451,13 @@ class HmiSourceContractTests(unittest.TestCase):
 
         dispatcher = Dispatcher()
         statuses = []
+        identity_clears = []
         namespace = {
             "RUN": {"ser": port},
             "quarantine_serial_transport": quarantine_serial_transport,
+            "_clear_main_controller_identity": (
+                lambda serial_port: identity_clears.append(serial_port) or True
+            ),
             "joint_motion_dispatcher": dispatcher,
             "deferred_joint_adjustments": SimpleNamespace(pending=False),
             "_clear_deferred_joint_adjustments": lambda: None,
@@ -3299,6 +3489,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(invalidate("controller calibration acknowledgement lost"))
         self.assertIsNone(namespace["RUN"]["ser"])
         self.assertEqual(port.close_count, 1)
+        self.assertEqual(identity_clears, [port])
         self.assertTrue(serial_transport_quarantined(port))
         self.assertEqual(
             dispatcher.invalidations,
@@ -3549,6 +3740,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "auxiliaryBoard": "old",
         }
         startup_serial = SimpleNamespace(timeout=2.0)
+        controller_identity = parse_controller_identity_response(
+            VALID_CONTROLLER_IDENTITY_RESPONSE
+        )
 
         class StartupCalibration:
             @staticmethod
@@ -3601,6 +3795,11 @@ class HmiSourceContractTests(unittest.TestCase):
             "_invalidate_joint_motion_state": (
                 lambda reason: calls.append(("invalidate", reason))
             ),
+            "_bind_main_controller_identity": (
+                lambda serial_port, identity: calls.append(
+                    ("bind", serial_port, identity)
+                )
+            ),
             "logger": SimpleNamespace(exception=lambda *args: None),
         }
         apply_startup_result = self.compile_function(
@@ -3614,7 +3813,11 @@ class HmiSourceContractTests(unittest.TestCase):
                     auxiliary_port="COM2",
                     auxiliary_board=AUXILIARY_BOARD_NANO,
                 ),
-                SimpleNamespace(position=position, visual_options=("arm.jpg",)),
+                SimpleNamespace(
+                    position=position,
+                    visual_options=("arm.jpg",),
+                    controller_identity=controller_identity,
+                ),
                 {"update": 1},
                 {"external": 2},
                 startup_serial,
@@ -3631,6 +3834,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(calibration["external"], 2)
         self.assertIsNone(startup_serial.timeout)
         self.assertFalse(any(call[0] == "invalidate" for call in calls))
+        self.assertIn(
+            ("bind", startup_serial, controller_identity),
+            calls,
+        )
         self.assertLess(
             next(index for index, call in enumerate(calls) if call[0] == "validate"),
             next(index for index, call in enumerate(calls) if call[0] == "apply"),
@@ -3934,6 +4141,9 @@ class HmiSourceContractTests(unittest.TestCase):
         live_pending = Flag(True)
         live_stop = Flag()
         offline_stop = Flag()
+        conversion_active = Flag(True)
+        conversion_cancel_requested = Flag()
+        conversion_tab = SimpleNamespace(GCrunTrue=1)
         dispatcher = Dispatcher()
         first_label = Label()
         second_label = Label()
@@ -3947,6 +4157,12 @@ class HmiSourceContractTests(unittest.TestCase):
             "live_jog_stop_requested": live_stop,
             "offline_live_jog_state_lock": threading.Lock(),
             "offline_live_jog_stop_event": offline_stop,
+            "gcode_conversion_active": conversion_active,
+            "gcode_conversion_cancel_requested": (
+                conversion_cancel_requested
+            ),
+            "gcode_conversion_cancel_lock": threading.Lock(),
+            "tab7": conversion_tab,
             "joint_motion_dispatcher": dispatcher,
             "_poll_application_close": lambda: poll_calls.append(True),
             "almStatusLab": first_label,
@@ -3959,6 +4175,8 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(closing.is_set())
         self.assertTrue(live_stop.is_set())
         self.assertTrue(offline_stop.is_set())
+        self.assertTrue(conversion_cancel_requested.is_set())
+        self.assertEqual(conversion_tab.GCrunTrue, 0)
         self.assertTrue(dispatcher.closed)
         with self.assertRaises(SerialActivityRejected):
             activity.begin("ser")
@@ -4081,9 +4299,11 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.destroy_count += 1
 
         root = Root()
+        storage_pending = {1: object()}
         auxiliary_pending = {1: object()}
         offline_operation = completed_virtual_operation()
         virtual_active = {"value": False}
+        conversion_active = threading.Event()
         ensures = []
         flushes = []
         closes = []
@@ -4091,6 +4311,11 @@ class HmiSourceContractTests(unittest.TestCase):
             "serial_lock": threading.Lock(),
             "auxiliary_serial_lock": threading.Lock(),
             "serial_activity_registry": SimpleNamespace(idle=lambda: True),
+            "gcode_storage_cleanup_lock": threading.Lock(),
+            "gcode_storage_cleanup_pending": storage_pending,
+            "_ensure_gcode_storage_cleanup": (
+                lambda: ensures.append("storage") or True
+            ),
             "startup_controller_cleanup_lock": threading.Lock(),
             "startup_controller_cleanup_pending": {},
             "_ensure_startup_controller_cleanup": lambda: True,
@@ -4102,6 +4327,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "offline_live_jog_state_lock": threading.Lock(),
             "offline_live_jog_operation": offline_operation,
             "_virtual_motion_active": lambda: virtual_active["value"],
+            "gcode_conversion_active": conversion_active,
             "SERIAL_SHUTDOWN_POLL_MS": 25,
             "SERIAL_SHUTDOWN_RETRY_MS": 1000,
             "root": root,
@@ -4120,7 +4346,12 @@ class HmiSourceContractTests(unittest.TestCase):
         poll_close = self.compile_function("_poll_application_close", namespace)
 
         self.assertFalse(poll_close())
-        self.assertEqual(ensures, ["auxiliary"])
+        self.assertEqual(ensures, ["storage"])
+        self.assertEqual(flushes, [])
+        storage_pending.clear()
+
+        self.assertFalse(root.jobs.pop(0)[1]())
+        self.assertEqual(ensures, ["storage", "auxiliary"])
         self.assertEqual(flushes, [])
         auxiliary_pending.clear()
 
@@ -4132,6 +4363,11 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(root.jobs.pop(0)[1]())
         self.assertEqual(flushes, [])
         virtual_active["value"] = False
+
+        conversion_active.set()
+        self.assertFalse(root.jobs.pop(0)[1]())
+        self.assertEqual(flushes, [])
+        conversion_active.clear()
 
         self.assertTrue(root.jobs.pop(0)[1]())
         self.assertEqual(flushes, [True])
@@ -4338,8 +4574,12 @@ class HmiSourceContractTests(unittest.TestCase):
         logical_motion_active = {"value": True}
         serial_port = Port(activity, logical_motion_active)
         root = Root()
+        identity_clears = []
         namespace = {
             "RUN": {"ser": serial_port, "ser2": None},
+            "_clear_main_controller_identity": (
+                lambda serial_port: identity_clears.append(serial_port) or True
+            ),
             "serial_lock": threading.Lock(),
             "auxiliary_serial_lock": threading.Lock(),
             "serial_activity_registry": activity,
@@ -4387,6 +4627,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(serial_port.close_count, 1)
         self.assertFalse(activity.active("ser"))
         self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertEqual(identity_clears, [serial_port])
         self.assertEqual(root.destroy_count, 1)
 
     def test_shutdown_close_helper_retains_a_port_that_did_not_close(self):
@@ -4415,11 +4656,19 @@ class HmiSourceContractTests(unittest.TestCase):
 
         logger = Logger()
         successful = Port()
-        namespace = {"RUN": {"ser": successful}, "logger": logger}
+        identity_clears = []
+        namespace = {
+            "RUN": {"ser": successful},
+            "_clear_main_controller_identity": (
+                lambda serial_port: identity_clears.append(serial_port) or True
+            ),
+            "logger": logger,
+        }
         close_port = self.compile_function("_close_serial_port", namespace)
 
         self.assertTrue(close_port("ser"))
         self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertEqual(identity_clears, [successful])
 
         stuck = Port(closes=False)
         namespace["RUN"]["ser"] = stuck
@@ -4600,8 +4849,12 @@ class HmiSourceContractTests(unittest.TestCase):
         activity_lease = activity.lease("ser")
         motion_registry = MotionRequestRegistry()
         request_lease = motion_registry.acquire("Controller connection change")
+        identity_clears = []
         namespace = {
             "RUN": {"ser": serial_port},
+            "_clear_main_controller_identity": (
+                lambda serial_port: identity_clears.append(serial_port) or True
+            ),
             "motion_request_registry": motion_registry,
             "logger": SimpleNamespace(
                 error=lambda *args: None,
@@ -4651,6 +4904,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(activity.idle())
         self.assertFalse(motion_registry.active)
         self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertEqual(identity_clears, [serial_port])
 
     def test_shutdown_retries_final_position_persistence_before_serial_close(self):
         class Lock:
@@ -6648,20 +6902,22 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace["application_closing"].clear()
 
         class BrokenManualQueue:
+            def __init__(self):
+                self.clear_calls = 0
+
             def __len__(self):
                 raise RuntimeError("manual queue unavailable")
 
             def clear(self):
-                raise AssertionError(
-                    "queue clear must not follow a failed length read"
-                )
+                self.clear_calls += 1
 
         original_queue = namespace["manual_auxiliary_request_queue"]
         original_logger = namespace["logger"]
         original_reschedule = namespace["_reschedule_event_poll"]
         closing_logs = []
         closing_reschedules = []
-        namespace["manual_auxiliary_request_queue"] = BrokenManualQueue()
+        broken_queue = BrokenManualQueue()
+        namespace["manual_auxiliary_request_queue"] = broken_queue
         namespace["logger"] = SimpleNamespace(
             error=lambda *args: None,
             warning=lambda *args: None,
@@ -6680,6 +6936,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
             ],
         )
+        self.assertEqual(broken_queue.clear_calls, 0)
         namespace["application_closing"].clear()
         namespace["manual_auxiliary_request_queue"] = original_queue
         namespace["logger"] = original_logger
@@ -7506,7 +7763,7 @@ class HmiSourceContractTests(unittest.TestCase):
         save_file = persistence_namespace["save_calibration"]
         load_file = persistence_namespace["load_calibration"]
 
-        with tempfile.TemporaryDirectory() as directory:
+        with BoundedTemporaryDirectory() as directory:
             calibration_file = Path(directory) / "ARconfig.json"
             outcomes = [False, True]
             root = Root()
@@ -7659,6 +7916,7 @@ class HmiSourceContractTests(unittest.TestCase):
         activity = SerialActivityRegistry(("ser",))
         logger = Logger()
         runtime = {"ser": None}
+        identity_clears = []
         namespace = {
             "application_closing": threading.Event(),
             "serial_lock": transport_lock,
@@ -7669,6 +7927,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "almStatusLab2": Label(),
             "CAL": {},
             "RUN": runtime,
+            "_clear_main_controller_identity": (
+                lambda serial_port: identity_clears.append(serial_port) or True
+            ),
             "com1SelectedValue": SimpleNamespace(get=lambda: "COM1"),
             "serial": SimpleNamespace(Serial=lambda **kwargs: serial_port),
             "SERIAL_WRITE_TIMEOUT_SECONDS": 5,
@@ -7708,6 +7969,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(serial_port.output_reset_count, 1)
         self.assertEqual(serial_port.close_count, 1)
         self.assertIsNone(runtime["ser"])
+        self.assertEqual(identity_clears, [serial_port])
         self.assertFalse(transport_lock.locked())
         self.assertTrue(activity.idle())
         self.assertTrue(logger.exceptions)
@@ -7849,6 +8111,11 @@ class HmiSourceContractTests(unittest.TestCase):
             # transport I/O; callers own or delegate the associated operation.
             "_bind_auxiliary_board_profile": {"ser2"},
             "_connected_auxiliary_board_profile": {"ser2"},
+            # Controller identity helpers only bind or inspect the active handle;
+            # callers retain transport ownership for any associated exchange.
+            "_bind_main_controller_identity": {"ser"},
+            "_current_main_controller_identity": {"ser"},
+            "_current_gcode_storage_media": {"ser"},
             # The failed-start activity lease and serial lock remain reserved
             # until close and cleanup release both ownership layers.
             "_close_failed_controller_startup": {"ser"},
@@ -7874,6 +8141,12 @@ class HmiSourceContractTests(unittest.TestCase):
             "_start_xbox_auxiliary_request": {"ser2"},
             "_try_dispatch_controller_correction": {"ser"},
             "send_xbox_auxiliary": {"ser2"},
+            # G-code storage captures the main handle under a request-scoped
+            # activity lease. The worker and Tk result applier retain that
+            # transferred owner through response validation and cleanup.
+            "_start_gcode_storage_request": {"ser"},
+            "_run_gcode_storage_request": {"ser"},
+            "_apply_gcode_storage_result": {"ser"},
             # Calibration commands run only inside the tracked public
             # calibration operation that owns the main transport.
             "_execute_calibration_command": {"ser"},
@@ -8017,6 +8290,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(len(lease_calls("_set_com_admitted")), 1)
         self.assertEqual(len(lease_calls("start_send_serial_thread")), 1)
         self.assertEqual(len(lease_calls("_start_calibration_sequence")), 1)
+        self.assertEqual(len(lease_calls("_start_gcode_storage_request")), 1)
 
         calibration_start = self.module_functions["_start_calibration_sequence"]
         lock_lines = [
@@ -8343,6 +8617,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "program_execution_state_lock": threading.Lock(),
             "program_execution_next_request_id": 0,
             "program_execution_active_request": None,
+            "gcode_storage_program_admission_active": False,
         }
         exec(
             compile(
@@ -8378,15 +8653,68 @@ class HmiSourceContractTests(unittest.TestCase):
             "_program_execution_busy_message",
             namespace,
         )
+        begin_conversion = self.compile_function(
+            "_begin_gcode_conversion_admission",
+            namespace,
+        )
+        finish_conversion = self.compile_function(
+            "_finish_gcode_conversion_admission",
+            namespace,
+        )
+        begin_storage = self.compile_function(
+            "_begin_gcode_storage_program_admission",
+            namespace,
+        )
+        finish_storage = self.compile_function(
+            "_finish_gcode_storage_program_admission",
+            namespace,
+        )
 
         with self.assertRaises(MotionInputError):
             namespace["ProgramExecutionRequest"](0, "run")
         with self.assertRaises(MotionInputError):
             begin_execution("invalid")
+        with self.assertRaises(MotionInputError):
+            begin_storage(1)
+
+        next_request_id = namespace["program_execution_next_request_id"]
+        self.assertEqual(begin_storage(False), "admitted")
+        for mode in ("run", "step-forward", "step-reverse"):
+            with self.subTest(storage_blocked_mode=mode):
+                self.assertIsNone(begin_execution(mode))
+                self.assertIsNone(
+                    namespace["program_execution_active_request"]
+                )
+                self.assertEqual(
+                    namespace["program_execution_next_request_id"],
+                    next_request_id,
+                )
+                self.assertEqual(
+                    namespace["_program_execution_busy_message"](),
+                    "PROGRAM EXECUTION REJECTED DURING G-CODE STORAGE",
+                )
+        self.assertEqual(begin_conversion(), "storage-active")
+        self.assertFalse(namespace["gcode_conversion_active"].is_set())
+        self.assertTrue(finish_storage())
+
+        self.assertEqual(begin_conversion(), "admitted")
+        self.assertIsNone(begin_execution("run"))
+        self.assertEqual(
+            namespace["_program_execution_busy_message"](),
+            "PROGRAM EXECUTION REJECTED DURING G-CODE CONVERSION",
+        )
+        self.assertEqual(begin_storage(False), "conversion-active")
+        self.assertEqual(begin_storage(True), "admitted")
+        self.assertEqual(begin_storage(True), "storage-active")
+        self.assertTrue(finish_storage())
+        self.assertTrue(finish_conversion())
 
         first_request = begin_execution("run")
         self.assertTrue(execution_active())
         self.assertTrue(request_active(first_request))
+        self.assertEqual(begin_conversion(), "program-active")
+        self.assertEqual(begin_storage(False), "program-active")
+        self.assertFalse(namespace["gcode_conversion_active"].is_set())
         self.assertIsNone(begin_execution("step-forward"))
         stale_request = namespace["ProgramExecutionRequest"](99, "run")
         self.assertFalse(finish_execution(stale_request))
@@ -8627,6 +8955,49 @@ class HmiSourceContractTests(unittest.TestCase):
                 and args[0] == "PROGRAM STEP REVERSE FAILED"
                 for level, args in logged
             )
+        )
+
+        self.assertEqual(begin_storage(False), "admitted")
+        runtime_before_storage_rejections = dict(runtime)
+        run_state_before_storage_rejections = tab.runTrue
+        callback_state_before_storage_rejections = (
+            len(callbacks),
+            len(completions),
+            len(selections),
+        )
+        next_request_id = namespace["program_execution_next_request_id"]
+        try:
+            for callback in (run_program, step_forward, step_reverse):
+                with self.subTest(
+                    storage_blocked_callback=callback.__name__
+                ):
+                    self.assertFalse(callback())
+                    self.assertFalse(execution_active())
+                    self.assertIsNone(
+                        namespace["program_execution_active_request"]
+                    )
+                    self.assertEqual(
+                        namespace["program_execution_next_request_id"],
+                        next_request_id,
+                    )
+                    self.assertEqual(runtime, runtime_before_storage_rejections)
+                    self.assertEqual(
+                        tab.runTrue,
+                        run_state_before_storage_rejections,
+                    )
+                    self.assertEqual(
+                        (
+                            len(callbacks),
+                            len(completions),
+                            len(selections),
+                        ),
+                        callback_state_before_storage_rejections,
+                    )
+        finally:
+            self.assertTrue(finish_storage())
+        self.assertEqual(
+            first_label.configurations[-1]["text"],
+            "PROGRAM EXECUTION REJECTED DURING G-CODE STORAGE",
         )
 
         busy_request = begin_execution("run")
@@ -9203,7 +9574,7 @@ class HmiSourceContractTests(unittest.TestCase):
         control_event = object()
         namespace = {
             "exchange_serial_line": exchange,
-            "RUN": {"ser": object()},
+            "RUN": {"ser": SimpleNamespace(is_open=True)},
             "_controller_response_timeout": lambda command: 250000,
             "serial_write_lock": object(),
             "SERIAL_LIVE_ACK_TIMEOUT_SECONDS": 5,
@@ -10382,6 +10753,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "application_closing": threading.Event(),
             "serial_write_lock": threading.Lock(),
             "quarantine_serial_transport": quarantine_serial_transport,
+            "_clear_main_controller_identity": lambda serial_port: True,
             "_invalidate_joint_motion_state": invalidations.append,
             "setStepMonitorsVR": lambda: None,
             "_current_controller_joint_calibration": (
@@ -14246,7 +14618,9 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace,
         )
 
-        self.assertEqual(storage_filename(" demo "), "demo.txt")
+        self.assertEqual(storage_filename("demo "), "demo .txt")
+        with self.assertRaises(MotionInputError):
+            storage_filename(" demo")
         maximum_base = "a" * (MAX_CONTROLLER_FILENAME_BYTES - len(".txt"))
         self.assertEqual(
             storage_filename(maximum_base),
@@ -14267,6 +14641,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "bad?name",
             "bad|name",
             "bad\\name",
+            "bad,name",
             "bad\x7fname",
         ):
             with self.subTest(invalid=invalid):
@@ -14295,6 +14670,2777 @@ class HmiSourceContractTests(unittest.TestCase):
             if isinstance(node, ast.Name)
         }
         self.assertFalse({"xVal", "yVal", "zVal"} & execute_names)
+
+    def test_gcode_storage_listing_parser_enforces_firmware_framing(self):
+        media_id = "00112233445566778899AABBCCDDEEFF"
+        prefix = f"MID:{media_id}|"
+        namespace = {
+            "MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES": (
+                MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES
+            ),
+            "MotionInputError": MotionInputError,
+            "ProtocolResponseError": ProtocolResponseError,
+            "CONTROLLER_MEDIA_ID_LENGTH": 32,
+            "GCODE_STORAGE_DIRECTORY_IDENTITY_PREFIX": "MID:",
+            "GCODE_STORAGE_DIRECTORY_IDENTITY_SEPARATOR": "|",
+            "validate_controller_filename": validate_controller_filename,
+            "validate_controller_media_id": validate_controller_media_id,
+        }
+        namespace["_validate_gcode_storage_filename"] = self.compile_function(
+            "_validate_gcode_storage_filename",
+            namespace,
+        )
+        namespace["_gcode_storage_filename"] = self.compile_function(
+            "_gcode_storage_filename",
+            namespace,
+        )
+        namespace["_gcode_storage_selection_name"] = self.compile_function(
+            "_gcode_storage_selection_name",
+            namespace,
+        )
+        parse_listing = self.compile_function(
+            "_parse_gcode_storage_listing",
+            namespace,
+        )
+        selection_name = namespace["_gcode_storage_selection_name"]
+
+        self.assertEqual(parse_listing(prefix), (media_id, ()))
+        self.assertEqual(
+            parse_listing(f"{prefix}Example.txt,second.nc,"),
+            (media_id, ("Example.txt",)),
+        )
+        self.assertEqual(
+            selection_name("archive.txt.backup.txt"),
+            "archive.txt.backup",
+        )
+        self.assertEqual(selection_name("program .txt"), "program ")
+        with self.assertRaisesRegex(MotionInputError, r"\.txt program"):
+            selection_name("second.nc")
+        for non_reversible in (".txt", "..txt", "...txt"):
+            with self.subTest(non_reversible=non_reversible):
+                with self.assertRaisesRegex(MotionInputError, "reversible"):
+                    selection_name(non_reversible)
+                with self.assertRaisesRegex(
+                    ProtocolResponseError,
+                    "non-actionable",
+                ):
+                    parse_listing(f"{prefix}{non_reversible},")
+
+        maximum_names = tuple(
+            f"{index:04d}" + "a" * 251
+            for index in range(15)
+        ) + ("z" * 218,)
+        maximum_listing = prefix + "".join(
+            f"{filename},"
+            for filename in maximum_names
+        )
+        self.assertEqual(
+            len(maximum_listing),
+            MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES,
+        )
+        self.assertEqual(parse_listing(maximum_listing), (media_id, ()))
+        with self.assertRaisesRegex(ProtocolResponseError, "payload limit"):
+            parse_listing(f"{maximum_listing}x")
+        for invalid in (
+            "",
+            media_id,
+            f"MID:{media_id}",
+            f"MID:{media_id.lower()}|",
+            "first.txt",
+            ",",
+            "first.txt,,",
+            "first.txt,FIRST.TXT,",
+            "bad/name.txt,",
+            " first.txt,",
+            "first.txt, ",
+            "bad\x7fname,",
+            "caf\u00e9.txt,",
+        ):
+            with self.subTest(invalid_listing=invalid):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_listing(
+                        invalid
+                        if invalid.startswith("MID:")
+                        or invalid == ""
+                        or invalid == media_id
+                        else f"{prefix}{invalid}"
+                    )
+        with self.assertRaises(ProtocolResponseError):
+            parse_listing(f"{prefix}first.txt,".encode("ascii"))
+
+        firmware_source = TEENSY_SOURCE.read_text(encoding="utf-8")
+        init_start = firmware_source.index("bool initSD()")
+        init_end = firmware_source.index(
+            "\nbool verifyExpectedSDMediaId(",
+            init_start,
+        )
+        init_source = firmware_source[init_start:init_end]
+        self.assertNotIn("if (sd_ok) return true;", init_source)
+        for remount_contract in (
+            "readSDMediaId(current_media_id, false)",
+            "sameSDMediaId(current_media_id, mounted_sd_media_id)",
+            "SD.begin(BUILTIN_SDCARD)",
+            "readSDMediaId(remounted_media_id)",
+            "mounted_sd_media_id[index] = remounted_media_id[index]",
+        ):
+            self.assertIn(remount_contract, init_source)
+        self.assertLess(
+            init_source.index("sameSDMediaId("),
+            init_source.index("SD.begin(BUILTIN_SDCARD)"),
+        )
+        self.assertLess(
+            init_source.index("SD.begin(BUILTIN_SDCARD)"),
+            init_source.index("readSDMediaId(remounted_media_id)"),
+        )
+
+        verify_start = firmware_source.index(
+            "bool verifyExpectedSDMediaId("
+        )
+        verify_end = firmware_source.index(
+            "\nbool writeSD(",
+            verify_start,
+        )
+        verify_source = firmware_source[verify_start:verify_end]
+        self.assertLess(
+            verify_source.index("copyMountedSDMediaId(mounted_media_id)"),
+            verify_source.index("readSDMediaId(current_media_id)"),
+        )
+
+        directory_start = firmware_source.index("bool printDirectory(")
+        directory_end = firmware_source.index(
+            "\nvoid driveLimit(",
+            directory_start,
+        )
+        directory_source = firmware_source[directory_start:directory_end]
+        self.assertIn("String filesSD;", directory_source)
+        self.assertIn(
+            "ar4_protocol::kControllerDirectoryPayloadMaxLength",
+            directory_source,
+        )
+        self.assertIn("!filesSD.reserve(", directory_source)
+        self.assertIn(
+            "EG: G-code directory buffer unavailable",
+            directory_source,
+        )
+        self.assertIn("FsFile entry = dir.openNextFile();", directory_source)
+        self.assertIn(
+            "ar4_protocol::read_controller_directory_entry_name(",
+            directory_source,
+        )
+        self.assertNotIn("entry.getName(", directory_source)
+        self.assertIn("dir.getError() != 0", directory_source)
+        self.assertIn('egSD("directory read fail")', directory_source)
+        self.assertIn(
+            "verifyExpectedSDMediaId(String(media_id))",
+            directory_source,
+        )
+        self.assertIn("Serial.println(filesSD);", directory_source)
+        self.assertIn(
+            "ar4_protocol::kControllerDirectoryIdentityPrefix",
+            directory_source,
+        )
+        self.assertIn(
+            "!entry.isDirectory()",
+            directory_source,
+        )
+        self.assertIn(
+            "ar4_protocol::valid_controller_directory_entry_filename(",
+            directory_source,
+        )
+        self.assertIn(
+            'Serial.println("EG: rename incompatible filename on SD card");',
+            directory_source,
+        )
+        self.assertIn(
+            "filesSD += ar4_protocol::kControllerDirectorySeparator;",
+            directory_source,
+        )
+        self.assertIn(
+            "ar4_protocol::controller_directory_entry_fits_payload(",
+            directory_source,
+        )
+        self.assertIn(
+            "EG: G-code directory listing exceeds protocol payload limit",
+            directory_source,
+        )
+        self.assertLess(
+            directory_source.index(
+                "ar4_protocol::valid_controller_directory_entry_filename("
+            ),
+            directory_source.index("filesSD += entryName;"),
+        )
+        self.assertLess(
+            directory_source.index(
+                "ar4_protocol::controller_directory_entry_fits_payload("
+            ),
+            directory_source.index("filesSD += entryName;"),
+        )
+        self.assertLess(
+            directory_source.index("dir.getError() != 0"),
+            directory_source.index("Serial.println(filesSD);"),
+        )
+        self.assertLess(
+            directory_source.index(
+                "verifyExpectedSDMediaId(String(media_id))"
+            ),
+            directory_source.index("Serial.println(filesSD);"),
+        )
+
+        lookup_start = firmware_source.index(
+            "ar4_protocol::SDFileLookupStatus findSDFile("
+        )
+        lookup_end = firmware_source.index(
+            "\nar4_protocol::StoredRowReadStatus read_stored_command_row(",
+            lookup_start,
+        )
+        lookup_source = firmware_source[lookup_start:lookup_end]
+        self.assertIn(
+            "ar4_protocol::read_controller_directory_entry_name(",
+            lookup_source,
+        )
+        self.assertNotIn("entry.getName(", lookup_source)
+
+        delete_start = firmware_source.index('if (function == "DG")')
+        delete_end = firmware_source.index(
+            '//----- READ FILES FROM SD CARD',
+            delete_start,
+        )
+        delete_source = firmware_source[delete_start:delete_end]
+        self.assertNotIn("SD.exists(", delete_source)
+        self.assertIn("findSDFile(filename)", delete_source)
+        self.assertIn(
+            "file_status == ar4_protocol::SDFileLookupStatus::kPresent",
+            delete_source,
+        )
+        self.assertIn(
+            "file_status == ar4_protocol::SDFileLookupStatus::kAbsent",
+            delete_source,
+        )
+        self.assertEqual(
+            delete_source.count(
+                "verifyExpectedSDMediaId(expected_media_id)"
+            ),
+            2,
+        )
+        self.assertLess(
+            delete_source.index("findSDFile(filename)"),
+            delete_source.rindex(
+                "verifyExpectedSDMediaId(expected_media_id)"
+            ),
+        )
+        self.assertIn(
+            "deleteSD(filename, expected_media_id)",
+            delete_source,
+        )
+
+        read_start = firmware_source.index('if (function == "RG")')
+        read_end = firmware_source.index(
+            "//----- WRITE COMMAND TO SD CARD",
+            read_start,
+        )
+        read_source = firmware_source[read_start:read_end]
+        self.assertIn("copyMountedSDMediaId(media_id)", read_source)
+        self.assertNotIn("readSDMediaId(media_id)", read_source)
+
+        write_function_start = firmware_source.index("bool writeSD(")
+        write_function_end = firmware_source.index(
+            "\nbool deleteSD(",
+            write_function_start,
+        )
+        write_function = firmware_source[
+            write_function_start:write_function_end
+        ]
+        self.assertEqual(
+            write_function.count(
+                "verifyExpectedSDMediaId(expected_media_id)"
+            ),
+            2,
+        )
+        self.assertLess(
+            write_function.index(
+                "verifyExpectedSDMediaId(expected_media_id)"
+            ),
+            write_function.index("SD.open("),
+        )
+        self.assertLess(
+            write_function.index("f.close();"),
+            write_function.rindex(
+                "verifyExpectedSDMediaId(expected_media_id)"
+            ),
+        )
+
+        remove_function_start = firmware_source.index("bool deleteSD(")
+        remove_function_end = firmware_source.index(
+            "\nar4_protocol::SDFileLookupStatus findSDFile(",
+            remove_function_start,
+        )
+        remove_function = firmware_source[
+            remove_function_start:remove_function_end
+        ]
+        self.assertEqual(
+            remove_function.count(
+                "verifyExpectedSDMediaId(expected_media_id)"
+            ),
+            2,
+        )
+        self.assertLess(
+            remove_function.index(
+                "verifyExpectedSDMediaId(expected_media_id)"
+            ),
+            remove_function.index("SD.remove("),
+        )
+        self.assertLess(
+            remove_function.index("SD.remove("),
+            remove_function.rindex(
+                "verifyExpectedSDMediaId(expected_media_id)"
+            ),
+        )
+
+    def test_gcode_storage_write_target_binds_the_active_media(self):
+        media_id = "00112233445566778899AABBCCDDEEFF"
+        binding = {"value": SimpleNamespace(media_id=media_id)}
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "RUN": {"ser": object()},
+            "validate_controller_filename": validate_controller_filename,
+            "validate_controller_media_id": validate_controller_media_id,
+            "_current_gcode_storage_media": lambda: binding["value"],
+        }
+        for assignment_name in (
+            "GCODE_STORAGE_MEDIA_MARKER",
+            "GCODE_STORAGE_FILENAME_MARKER",
+        ):
+            self.compile_assignment(assignment_name, namespace)
+        namespace["_validate_gcode_storage_filename"] = (
+            self.compile_function(
+                "_validate_gcode_storage_filename",
+                namespace,
+            )
+        )
+        write_target = self.compile_function(
+            "_gcode_storage_write_target",
+            namespace,
+        )
+
+        expected = f"Mi{media_id}Fndemo.txt"
+        self.assertEqual(write_target("demo.txt"), expected)
+        self.assertEqual(
+            write_target("demo.txt", media_id),
+            expected,
+        )
+        binding["value"] = None
+        with self.assertRaisesRegex(MotionInputError, "directory refresh"):
+            write_target("demo.txt")
+        with self.assertRaisesRegex(MotionInputError, "uppercase hexadecimal"):
+            write_target("demo.txt", media_id.lower())
+
+    def test_gcode_storage_state_temporary_file_creation_is_bounded(self):
+        attempts = []
+
+        def deny_open(*args):
+            attempts.append(args)
+            raise PermissionError("state directory is not writable")
+
+        fake_os = SimpleNamespace(
+            O_BINARY=getattr(os, "O_BINARY", 0),
+            O_CREAT=os.O_CREAT,
+            O_EXCL=os.O_EXCL,
+            O_WRONLY=os.O_WRONLY,
+            open=deny_open,
+            path=os.path,
+        )
+        namespace = {
+            "GCodeDeleteReconciliation": object,
+            "MotionInputError": MotionInputError,
+            "json": json,
+            "os": fake_os,
+            "secrets": secrets,
+        }
+        for assignment_name in (
+            "GCODE_STORAGE_STATE_SCHEMA_VERSION",
+            "GCODE_STORAGE_STATE_MAXIMUM_BYTES",
+            "GCODE_STORAGE_STATE_TEMPORARY_ATTEMPTS",
+        ):
+            self.compile_assignment(assignment_name, namespace)
+        create_temporary = self.compile_function(
+            "_create_gcode_storage_state_temporary_file",
+            namespace,
+        )
+        namespace["_create_gcode_storage_state_temporary_file"] = (
+            create_temporary
+        )
+        namespace["_validate_gcode_storage_state_directory"] = (
+            lambda state_path: os.path.dirname(state_path)
+        )
+        namespace["_gcode_storage_state_document"] = self.compile_function(
+            "_gcode_storage_state_document",
+            namespace,
+        )
+        write_state = self.compile_function(
+            "_write_gcode_storage_state",
+            namespace,
+        )
+
+        state_path = PROJECT_ROOT / "gcode-storage-state.json"
+        with self.assertRaisesRegex(PermissionError, "not writable"):
+            write_state(str(state_path), None)
+        self.assertEqual(len(attempts), 1)
+
+        attempts.clear()
+
+        def collide_open(*args):
+            attempts.append(args)
+            raise FileExistsError("temporary path collision")
+
+        fake_os.open = collide_open
+        with self.assertRaisesRegex(FileExistsError, "unique"):
+            create_temporary(str(PROJECT_ROOT))
+        self.assertEqual(
+            len(attempts),
+            namespace["GCODE_STORAGE_STATE_TEMPORARY_ATTEMPTS"],
+        )
+
+    def test_gcode_storage_state_reader_rejects_indirect_and_nonregular_entries(
+        self,
+    ):
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "json": json,
+            "os": os,
+        }
+        for assignment_name in (
+            "GCODE_STORAGE_STATE_SCHEMA_VERSION",
+            "GCODE_STORAGE_STATE_MAXIMUM_BYTES",
+        ):
+            self.compile_assignment(assignment_name, namespace)
+        for function_name in (
+            "_windows_gcode_storage_handle_owned_by_current_user",
+            "_open_windows_gcode_storage_path",
+            "_close_windows_gcode_storage_handle",
+            "_open_gcode_storage_state_file",
+            "_gcode_storage_unique_json_object",
+            "_decode_gcode_storage_state",
+            "_read_gcode_storage_state",
+        ):
+            namespace[function_name] = self.compile_function(
+                function_name,
+                namespace,
+            )
+
+        state_directory = BoundedTemporaryDirectory(
+            dir="/tmp" if os.name == "posix" else None
+        )
+        self.addCleanup(state_directory.cleanup)
+        state_path = Path(state_directory.name) / "gcode-storage-state.json"
+        valid_document = json.dumps({
+            "schema_version": namespace[
+                "GCODE_STORAGE_STATE_SCHEMA_VERSION"
+            ],
+            "pending_delete": None,
+        }).encode("utf-8")
+        state_path.write_bytes(valid_document)
+        self.assertIsNone(
+            namespace["_read_gcode_storage_state"](str(state_path))
+        )
+
+        state_path.write_bytes(
+            b"x" * (
+                namespace["GCODE_STORAGE_STATE_MAXIMUM_BYTES"] + 1
+            )
+        )
+        with self.assertRaisesRegex(MotionInputError, "supported size"):
+            namespace["_read_gcode_storage_state"](str(state_path))
+
+        state_path.write_bytes(b"\xff")
+        with self.assertRaisesRegex(MotionInputError, "valid UTF-8"):
+            namespace["_read_gcode_storage_state"](str(state_path))
+
+        state_path.unlink()
+        victim_path = Path(state_directory.name) / "state-victim.json"
+        victim_path.write_bytes(valid_document)
+        os.link(victim_path, state_path)
+        with self.assertRaisesRegex(OSError, "single-link"):
+            namespace["_read_gcode_storage_state"](str(state_path))
+        state_path.unlink()
+
+        try:
+            os.symlink(victim_path, state_path)
+        except OSError:
+            pass
+        else:
+            with self.assertRaises(OSError):
+                namespace["_read_gcode_storage_state"](str(state_path))
+            state_path.unlink()
+
+        if os.name == "posix" and hasattr(os, "mkfifo"):
+            fifo_path = Path(state_directory.name) / "state-fifo"
+            os.mkfifo(fifo_path, 0o600)
+            opener_source = ast.unparse(
+                copy.deepcopy(
+                    self.module_functions[
+                        "_open_gcode_storage_state_file"
+                    ]
+                )
+            )
+            child_source = "\n".join((
+                "import os",
+                "import sys",
+                "",
+                opener_source,
+                "",
+                "try:",
+                "    descriptor = _open_gcode_storage_state_file(sys.argv[1])",
+                "except OSError:",
+                "    raise SystemExit(0)",
+                "else:",
+                "    os.close(descriptor)",
+                "    raise SystemExit(2)",
+            ))
+            try:
+                result = subprocess.run(
+                    (sys.executable, "-c", child_source, str(fifo_path)),
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                self.fail(
+                    "G-code storage FIFO admission blocked beyond the "
+                    f"bounded test deadline: {exc}"
+                )
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stdout + result.stderr,
+            )
+
+    def test_gcode_storage_posix_replace_syncs_parent_directory(self):
+        events = []
+
+        class FakeOS:
+            name = "posix"
+            O_RDONLY = os.O_RDONLY
+            O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+            O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+            O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0x20000)
+            path = os.path
+
+            @staticmethod
+            def replace(source, destination):
+                events.append(("replace", source, destination))
+
+            @staticmethod
+            def open(path, flags):
+                events.append(("open", path, flags))
+                return 41
+
+            @staticmethod
+            def fsync(descriptor):
+                events.append(("fsync", descriptor))
+
+            @staticmethod
+            def close(descriptor):
+                events.append(("close", descriptor))
+
+        namespace = {
+            "os": FakeOS,
+            "_validate_gcode_storage_state_directory": (
+                lambda state_path: "/secure"
+            ),
+        }
+        durable_replace = self.compile_function(
+            "_durably_replace_gcode_storage_state",
+            namespace,
+        )
+
+        self.assertTrue(
+            durable_replace(
+                "/secure/.gcode-storage-state-token.tmp",
+                "/secure/gcode-storage-state.json",
+            )
+        )
+        self.assertEqual(events[0][0], "open")
+        self.assertEqual(events[1][0], "replace")
+        self.assertEqual(events[2], ("fsync", 41))
+        self.assertEqual(events[3], ("close", 41))
+
+    def test_test_temporary_directory_allocation_is_bounded(self):
+        helper_module = importlib.import_module(
+            BoundedTemporaryDirectory.__module__
+        )
+        helper_os = helper_module.os
+        original_mkdir = helper_os.mkdir
+        attempts = []
+        temporary_parent = os.environ.get(
+            "AR4_TEST_TEMP_DIRECTORY"
+        ) or tempfile.gettempdir()
+
+        with self.assertRaisesRegex(ValueError, "outside the source tree"):
+            BoundedTemporaryDirectory(dir=PROJECT_ROOT)
+
+        def deny_mkdir(*args):
+            attempts.append(args)
+            raise PermissionError("test directory is not writable")
+
+        try:
+            helper_os.mkdir = deny_mkdir
+            with self.assertRaisesRegex(PermissionError, "not writable"):
+                BoundedTemporaryDirectory(dir=temporary_parent)
+            self.assertEqual(len(attempts), 1)
+
+            attempts.clear()
+
+            def collide_mkdir(*args):
+                attempts.append(args)
+                raise FileExistsError("test directory path collision")
+
+            helper_os.mkdir = collide_mkdir
+            with self.assertRaisesRegex(FileExistsError, "unique"):
+                BoundedTemporaryDirectory(dir=temporary_parent)
+            self.assertEqual(
+                len(attempts),
+                BoundedTemporaryDirectory._MAXIMUM_ATTEMPTS,
+            )
+        finally:
+            helper_os.mkdir = original_mkdir
+
+    def test_test_temporary_directory_default_parent_is_external(self):
+        expected_parent = Path(
+            os.environ.get("AR4_TEST_TEMP_DIRECTORY")
+            or tempfile.gettempdir()
+        ).resolve(strict=True)
+
+        with BoundedTemporaryDirectory(
+            prefix="ar4hmi-default-parent-",
+        ) as directory:
+            allocated_parent = Path(directory).resolve(strict=True).parent
+            self.assertEqual(allocated_parent, expected_parent)
+            self.assertNotEqual(allocated_parent, PROJECT_ROOT)
+            self.assertNotIn(PROJECT_ROOT, allocated_parent.parents)
+
+    def test_local_gcode_parser_enforces_source_bounds_and_ascii(self):
+        namespace = {
+            "MAX_COMMAND_LENGTH": MAX_COMMAND_LENGTH,
+            "MotionInputError": MotionInputError,
+        }
+        for assignment_name in (
+            "MAX_LOCAL_GCODE_PROGRAM_BYTES",
+            "MAX_LOCAL_GCODE_PROGRAM_ROWS",
+            "MAX_LOCAL_GCODE_SOURCE_LINE_BYTES",
+        ):
+            self.compile_assignment(assignment_name, namespace)
+        parse_program = self.compile_function(
+            "_parse_local_gcode_program",
+            namespace,
+        )
+
+        class RepeatingProgram:
+            def __init__(self, row, count):
+                self.row = row
+                self.remaining = count
+                self.requested_sizes = []
+
+            def readline(self, size):
+                self.requested_sizes.append(size)
+                if self.remaining <= 0:
+                    return b""
+                self.remaining -= 1
+                return self.row
+
+        oversized_line = RepeatingProgram(
+            b"G" * (namespace["MAX_LOCAL_GCODE_SOURCE_LINE_BYTES"] + 1),
+            1,
+        )
+        with self.assertRaisesRegex(MotionInputError, "source length"):
+            parse_program(oversized_line)
+        self.assertEqual(
+            set(oversized_line.requested_sizes),
+            {namespace["MAX_LOCAL_GCODE_SOURCE_LINE_BYTES"] + 1},
+        )
+
+        excessive_rows = RepeatingProgram(
+            b"; ignored\n",
+            namespace["MAX_LOCAL_GCODE_PROGRAM_ROWS"] + 1,
+        )
+        with self.assertRaisesRegex(MotionInputError, "row count"):
+            parse_program(excessive_rows)
+
+        maximum_source_row = (
+            b";"
+            + b"x" * (
+                namespace["MAX_LOCAL_GCODE_SOURCE_LINE_BYTES"] - 2
+            )
+            + b"\n"
+        )
+        rows_before_file_limit = (
+            namespace["MAX_LOCAL_GCODE_PROGRAM_BYTES"]
+            // len(maximum_source_row)
+        )
+        excessive_file = RepeatingProgram(
+            maximum_source_row,
+            rows_before_file_limit + 1,
+        )
+        with self.assertRaisesRegex(MotionInputError, "file size"):
+            parse_program(excessive_file)
+
+        non_ascii = RepeatingProgram(b"G1 X1 \xff\n", 1)
+        with self.assertRaisesRegex(MotionInputError, "ASCII"):
+            parse_program(non_ascii)
+
+        for control_character in (b"\x00", b"\x1f", b"\x7f"):
+            with self.subTest(control_character=control_character):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "unsupported control",
+                ):
+                    parse_program(
+                        io.BytesIO(b"G1 X1" + control_character + b"\n")
+                    )
+
+        normalized_whitespace = io.BytesIO(
+            b"\tG1\tX1\tY2 \n  G1   X2\t\n"
+        )
+        self.assertEqual(
+            parse_program(normalized_whitespace),
+            (b"G1 X1 Y2 ", b"G1 X2 "),
+        )
+        repeated_rows = io.BytesIO(
+            b"G1 X1\nG1 X1\n;\n;\n"
+        )
+        self.assertEqual(
+            parse_program(repeated_rows),
+            (b"G1 X1 ", b"G1 X1 "),
+        )
+        for non_actionable_program in (
+            b"",
+            b"\n\t  \n",
+            b"; comment\n \t ; second comment\n",
+        ):
+            with self.subTest(
+                non_actionable_program=non_actionable_program
+            ):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "at least one row",
+                ):
+                    parse_program(io.BytesIO(non_actionable_program))
+
+    def test_local_gcode_open_rejects_special_files_without_blocking(self):
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "os": os,
+        }
+        self.compile_assignment(
+            "MAX_LOCAL_GCODE_PROGRAM_BYTES",
+            namespace,
+        )
+        open_program = self.compile_function(
+            "_open_local_gcode_program",
+            namespace,
+        )
+
+        state_directory = BoundedTemporaryDirectory(
+            dir="/tmp" if os.name == "posix" else None
+        )
+        self.addCleanup(state_directory.cleanup)
+        source_path = Path(state_directory.name) / "program.ngc"
+        source_path.write_bytes(b"G1 X1\n")
+        with open_program(str(source_path)) as source:
+            self.assertEqual(source.read(), b"G1 X1\n")
+
+        for invalid_path in ("", "bad\x00path", "bad\npath"):
+            with self.subTest(invalid_path=invalid_path):
+                with self.assertRaisesRegex(MotionInputError, "path"):
+                    open_program(invalid_path)
+
+        oversized_path = Path(state_directory.name) / "oversized.ngc"
+        with open(oversized_path, "wb") as oversized:
+            oversized.truncate(
+                namespace["MAX_LOCAL_GCODE_PROGRAM_BYTES"] + 1
+            )
+        with self.assertRaisesRegex(MotionInputError, "file size"):
+            open_program(str(oversized_path))
+
+        directory_path = Path(state_directory.name) / "directory.ngc"
+        directory_path.mkdir()
+        with self.assertRaises((MotionInputError, OSError)):
+            open_program(str(directory_path))
+
+        linked_path = Path(state_directory.name) / "linked.ngc"
+        try:
+            os.symlink(source_path, linked_path)
+        except OSError:
+            pass
+        else:
+            with open_program(str(linked_path)) as linked_source:
+                self.assertEqual(linked_source.read(), b"G1 X1\n")
+
+        if os.name == "posix" and hasattr(os, "mkfifo"):
+            fifo_path = Path(state_directory.name) / "program-fifo"
+            os.mkfifo(fifo_path, 0o600)
+            opener_source = ast.unparse(
+                copy.deepcopy(
+                    self.module_functions["_open_local_gcode_program"]
+                )
+            )
+            child_source = "\n".join((
+                "import os",
+                "import sys",
+                "",
+                "class MotionInputError(ValueError):",
+                "    pass",
+                "",
+                "MAX_LOCAL_GCODE_PROGRAM_BYTES = "
+                + str(namespace["MAX_LOCAL_GCODE_PROGRAM_BYTES"]),
+                "",
+                opener_source,
+                "",
+                "try:",
+                "    source = _open_local_gcode_program(sys.argv[1])",
+                "except (MotionInputError, OSError):",
+                "    raise SystemExit(0)",
+                "else:",
+                "    source.close()",
+                "    raise SystemExit(2)",
+            ))
+            try:
+                result = subprocess.run(
+                    (sys.executable, "-c", child_source, str(fifo_path)),
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                self.fail(
+                    "local G-code FIFO admission blocked beyond the "
+                    f"bounded test deadline: {exc}"
+                )
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stdout + result.stderr,
+            )
+
+    def test_gcode_storage_state_lock_excludes_competing_process(self):
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "os": os,
+        }
+        namespace["GCODE_STORAGE_STATE_LOCK_SUFFIX"] = self.module_literal(
+            "GCODE_STORAGE_STATE_LOCK_SUFFIX"
+        )
+        namespace["GCodeStorageStateLockError"] = self.compile_class(
+            "GCodeStorageStateLockError",
+            namespace,
+        )
+        namespace["_gcode_storage_state_lock_path"] = self.compile_function(
+            "_gcode_storage_state_lock_path",
+            namespace,
+        )
+        for function_name in (
+            "_windows_gcode_storage_handle_owned_by_current_user",
+            "_open_windows_gcode_storage_path",
+            "_close_windows_gcode_storage_handle",
+            "_validate_gcode_storage_state_directory",
+            "_open_gcode_storage_lock_file",
+        ):
+            namespace[function_name] = self.compile_function(
+                function_name,
+                namespace,
+            )
+        namespace["_lock_gcode_storage_state_file"] = self.compile_function(
+            "_lock_gcode_storage_state_file",
+            namespace,
+            preserve_decorators=True,
+        )
+
+        state_directory = BoundedTemporaryDirectory(
+            dir="/tmp" if os.name == "posix" else None
+        )
+        self.addCleanup(state_directory.cleanup)
+        state_path = Path(state_directory.name) / "gcode-storage-state.json"
+        lock_path = namespace["_gcode_storage_state_lock_path"](
+            str(state_path)
+        )
+        ready_path = Path(state_directory.name) / "child-lock-ready"
+        child_source = "\n".join((
+            "import os",
+            "import sys",
+            "",
+            "lock_path = sys.argv[1]",
+            "ready_path = sys.argv[2]",
+            "flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0)",
+            "descriptor = os.open(lock_path, flags, 0o600)",
+            "lock_module = None",
+            "locked = False",
+            "try:",
+            "    if os.fstat(descriptor).st_size == 0:",
+            "        if os.write(descriptor, b'\\0') != 1:",
+            "            raise OSError('lock initialization failed')",
+            "        os.fsync(descriptor)",
+            "    os.lseek(descriptor, 0, os.SEEK_SET)",
+            "    if os.name == 'nt':",
+            "        import msvcrt",
+            "        lock_module = msvcrt",
+            "        lock_module.locking(descriptor, msvcrt.LK_NBLCK, 1)",
+            "    elif os.name == 'posix':",
+            "        import fcntl",
+            "        lock_module = fcntl",
+            "        lock_module.flock(",
+            "            descriptor,",
+            "            fcntl.LOCK_EX | fcntl.LOCK_NB,",
+            "        )",
+            "    else:",
+            "        raise RuntimeError(f'unsupported platform: {os.name}')",
+            "    locked = True",
+            "    with open(ready_path, 'x', encoding='ascii') as ready:",
+            "        ready.write('locked')",
+            "    if sys.stdin.readline() != 'release\\n':",
+            "        raise RuntimeError('lock release signal missing')",
+            "finally:",
+            "    if locked:",
+            "        if os.name == 'nt':",
+            "            os.lseek(descriptor, 0, os.SEEK_SET)",
+            "            lock_module.locking(",
+            "                descriptor,",
+            "                lock_module.LK_UNLCK,",
+            "                1,",
+            "            )",
+            "        else:",
+            "            lock_module.flock(",
+            "                descriptor,",
+            "                lock_module.LOCK_UN,",
+            "            )",
+            "    os.close(descriptor)",
+        ))
+        child = subprocess.Popen(
+            (
+                sys.executable,
+                "-c",
+                child_source,
+                lock_path,
+                str(ready_path),
+            ),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            ready_deadline = time.monotonic() + 5.0
+            while not ready_path.exists():
+                if child.poll() is not None:
+                    stdout, stderr = child.communicate(timeout=1)
+                    self.fail(
+                        "competing lock process exited before readiness: "
+                        f"{stdout}{stderr}"
+                    )
+                if time.monotonic() >= ready_deadline:
+                    self.fail("competing lock process did not become ready")
+                time.sleep(0.01)
+
+            with self.assertRaisesRegex(
+                namespace["GCodeStorageStateLockError"],
+                "locked by another application process",
+            ):
+                with namespace["_lock_gcode_storage_state_file"](
+                    str(state_path)
+                ):
+                    self.fail("a competing process lock was admitted")
+
+            stdout, stderr = child.communicate(
+                input="release\n",
+                timeout=5,
+            )
+            self.assertEqual(child.returncode, 0, stdout + stderr)
+            with namespace["_lock_gcode_storage_state_file"](
+                str(state_path)
+            ):
+                pass
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate(timeout=5)
+
+        class CloseReportingFailureOS:
+            name = os.name
+            path = os.path
+
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+            @staticmethod
+            def close(descriptor):
+                os.close(descriptor)
+                raise OSError("injected close reporting failure")
+
+        namespace["os"] = CloseReportingFailureOS()
+        try:
+            with self.assertRaisesRegex(
+                namespace["GCodeStorageStateLockError"],
+                "lock release failed",
+            ):
+                with namespace["_lock_gcode_storage_state_file"](
+                    str(state_path)
+                ):
+                    pass
+        finally:
+            namespace["os"] = os
+        with namespace["_lock_gcode_storage_state_file"](str(state_path)):
+            pass
+
+        os.unlink(lock_path)
+        victim_path = Path(state_directory.name) / "lock-victim.txt"
+        victim_path.write_bytes(b"protected")
+        os.link(victim_path, lock_path)
+        with self.assertRaisesRegex(
+            namespace["GCodeStorageStateLockError"],
+            "lock file is unavailable",
+        ):
+            with namespace["_lock_gcode_storage_state_file"](
+                str(state_path)
+            ):
+                self.fail("a hard-linked storage lock was admitted")
+        self.assertEqual(victim_path.read_bytes(), b"protected")
+        os.unlink(lock_path)
+
+        try:
+            os.symlink(victim_path, lock_path)
+        except OSError:
+            pass
+        else:
+            with self.assertRaisesRegex(
+                namespace["GCodeStorageStateLockError"],
+                "lock file is unavailable",
+            ):
+                with namespace["_lock_gcode_storage_state_file"](
+                    str(state_path)
+                ):
+                    self.fail("a symbolic-link storage lock was admitted")
+            self.assertEqual(victim_path.read_bytes(), b"protected")
+
+    def test_gcode_storage_callbacks_use_nonblocking_owned_handoff(self):
+        class Port:
+            def __init__(self):
+                self.is_open = True
+
+        class Entry:
+            def __init__(self, value="", state="normal"):
+                self.value = value
+                self.state = state
+                self.fail_next_state = None
+
+            def get(self):
+                return self.value
+
+            def delete(self, *args):
+                if self.state == "normal":
+                    self.value = ""
+
+            def insert(self, index, value):
+                if self.state == "normal":
+                    self.value = value
+
+            def cget(self, option):
+                if option != "state":
+                    raise RuntimeError("unsupported Entry option")
+                return self.state
+
+            def config(self, **kwargs):
+                if set(kwargs) != {"state"}:
+                    raise RuntimeError("unsupported Entry configuration")
+                if kwargs["state"] not in ("normal", "readonly", "disabled"):
+                    raise RuntimeError("invalid Entry state")
+                if kwargs["state"] == self.fail_next_state:
+                    self.fail_next_state = None
+                    raise RuntimeError("Entry state update failed")
+                self.state = kwargs["state"]
+
+            def user_replace(self, value):
+                previous = self.value
+                self.delete(0, "end")
+                self.insert(0, value)
+                return self.value != previous
+
+        class Label:
+            def __init__(self):
+                self.text = None
+                self.style = None
+
+            def config(self, **kwargs):
+                self.text = kwargs.get("text")
+                self.style = kwargs.get("style")
+
+        class Listbox:
+            def __init__(self):
+                self.values = []
+                self.fail_delete_after_clear = False
+                self.styles = []
+                self.selection = ()
+                self.active = 0
+                self.anchor = 0
+                self.xview_state = (0.0, 1.0)
+                self.yview_state = (0.0, 1.0)
+
+            def get(self, first, last=None):
+                if last is None:
+                    return self.values[first]
+                return tuple(self.values)
+
+            def delete(self, *args):
+                self.values.clear()
+                self.styles.clear()
+                self.selection = ()
+                self.active = 0
+                self.anchor = 0
+                self.xview_state = (0.0, 1.0)
+                self.yview_state = (0.0, 1.0)
+                if self.fail_delete_after_clear:
+                    self.fail_delete_after_clear = False
+                    raise RuntimeError("listbox update failed")
+
+            def insert(self, index, value):
+                self.values.append(value)
+                self.styles.append({
+                    "background": "",
+                    "foreground": "",
+                    "selectbackground": "",
+                    "selectforeground": "",
+                })
+
+            def itemcget(self, index, option):
+                return self.styles[index][option]
+
+            def itemconfig(self, index, values):
+                self.styles[index].update(values)
+
+            def curselection(self):
+                return self.selection
+
+            def index(self, index):
+                if index == "end":
+                    return len(self.values)
+                if index == "active":
+                    return self.active
+                if index == "anchor":
+                    return self.anchor
+                return int(index)
+
+            def selection_clear(self, first, last):
+                self.selection = ()
+
+            def selection_set(self, index):
+                self.selection = tuple(sorted((*self.selection, index)))
+
+            def selection_anchor(self, index):
+                self.anchor = index
+
+            def activate(self, index):
+                self.active = index
+
+            def pack(self):
+                return None
+
+            def yview(self, *args):
+                return self.yview_state
+
+            def xview(self, *args):
+                return self.xview_state
+
+            def yview_moveto(self, fraction):
+                self.yview_state = (fraction, min(1.0, fraction + 0.25))
+
+            def xview_moveto(self, fraction):
+                self.xview_state = (fraction, min(1.0, fraction + 0.25))
+
+        deferred_threads = []
+
+        class DeferredThread:
+            def __init__(
+                self,
+                target,
+                args=(),
+                daemon=False,
+                name=None,
+            ):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+                self.name = name
+                self.started = False
+                self.finished = False
+                deferred_threads.append(self)
+
+            def start(self):
+                self.started = True
+
+            def is_alive(self):
+                return self.started and not self.finished
+
+            def run(self):
+                try:
+                    self.target(*self.args)
+                finally:
+                    self.finished = True
+
+        port = Port()
+        controller_identity = parse_controller_identity_response(
+            VALID_CONTROLLER_IDENTITY_RESPONSE
+        )
+        different_controller_identity = ControllerIdentity(
+            controller_hardware_id="654321",
+            driver_model=controller_identity.driver_model,
+            firmware_version=controller_identity.firmware_version,
+            robot_model=controller_identity.robot_model,
+            robot_version=controller_identity.robot_version,
+            serial_number=controller_identity.serial_number,
+            asset_tag=controller_identity.asset_tag,
+            protocol_capabilities=controller_identity.protocol_capabilities,
+        )
+        media_id = "00112233445566778899AABBCCDDEEFF"
+        other_media_id = "FFEEDDCCBBAA99887766554433221100"
+
+        def directory_response(entries="", selected_media_id=media_id):
+            return f"MID:{selected_media_id}|{entries}"
+
+        state_directory = BoundedTemporaryDirectory(
+            dir="/tmp" if os.name == "posix" else None
+        )
+        self.addCleanup(state_directory.cleanup)
+        state_path = Path(state_directory.name) / "gcode-storage-state.json"
+        sent = Entry()
+        received = Entry()
+        program = Entry("loaded.ngc", state="readonly")
+        current_row = Entry("---")
+        filename = Entry("demo")
+        status = Label()
+        listing = Listbox()
+        responses = []
+        writes = []
+        reads = []
+        quarantines = []
+        quarantined_port_ids = set()
+        logs = []
+        schedules = []
+        applied_positions = []
+        operation_lease_phases = []
+        serial_lock = threading.Lock()
+        serial_registry = SerialActivityRegistry(("ser",))
+        motion_registry = MotionRequestRegistry()
+
+        def quarantine_storage_transport(serial_port, reason):
+            quarantines.append((serial_port, reason))
+            quarantined_port_ids.add(id(serial_port))
+            serial_port.is_open = False
+            raise SerialTransportQuarantinedError(
+                f"{reason}; serial connection closed; reconnect required"
+            )
+
+        def assert_operation_lease(phase):
+            if phase in operation_lease_phases:
+                return
+            child_source = "\n".join((
+                "import os",
+                "import sys",
+                "",
+                "lock_path = sys.argv[1]",
+                "flags = os.O_RDWR | os.O_CREAT",
+                "flags |= getattr(os, 'O_BINARY', 0)",
+                "descriptor = os.open(lock_path, flags, 0o600)",
+                "exit_code = 2",
+                "lock_module = None",
+                "try:",
+                "    if os.fstat(descriptor).st_size == 0:",
+                "        if os.write(descriptor, b'\\0') != 1:",
+                "            raise OSError('lock initialization failed')",
+                "        os.fsync(descriptor)",
+                "    os.lseek(descriptor, 0, os.SEEK_SET)",
+                "    try:",
+                "        if os.name == 'nt':",
+                "            import msvcrt",
+                "            lock_module = msvcrt",
+                "            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)",
+                "        elif os.name == 'posix':",
+                "            import fcntl",
+                "            lock_module = fcntl",
+                "            fcntl.flock(",
+                "                descriptor,",
+                "                fcntl.LOCK_EX | fcntl.LOCK_NB,",
+                "            )",
+                "        else:",
+                "            raise RuntimeError(os.name)",
+                "    except (BlockingIOError, OSError):",
+                "        exit_code = 0",
+                "    else:",
+                "        if os.name == 'nt':",
+                "            os.lseek(descriptor, 0, os.SEEK_SET)",
+                "            lock_module.locking(",
+                "                descriptor,",
+                "                lock_module.LK_UNLCK,",
+                "                1,",
+                "            )",
+                "        else:",
+                "            lock_module.flock(",
+                "                descriptor,",
+                "                lock_module.LOCK_UN,",
+                "            )",
+                "finally:",
+                "    os.close(descriptor)",
+                "raise SystemExit(exit_code)",
+            ))
+            result = subprocess.run(
+                (
+                    sys.executable,
+                    "-c",
+                    child_source,
+                    namespace["_gcode_storage_state_lock_path"](
+                        str(state_path)
+                    ),
+                ),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"{phase}: {result.stdout}{result.stderr}",
+            )
+            operation_lease_phases.append(phase)
+
+        def write_storage_control(serial_port, command, **kwargs):
+            assert_operation_lease("write")
+            write_started = kwargs.get("write_started_event")
+            cancellation_event = kwargs.get("cancellation_event")
+            cancellation_lock = kwargs.get("write_boundary_lock")
+            if cancellation_event is not None:
+                acquired = cancellation_lock.acquire()
+                if acquired is False:
+                    raise RuntimeError(
+                        "test cancellation lock acquisition failed"
+                    )
+                try:
+                    if cancellation_event.is_set():
+                        raise SerialActivityRejected(
+                            "serial control write cancelled before transmission"
+                        )
+                    write_started.set()
+                finally:
+                    cancellation_lock.release()
+            elif write_started is not None:
+                write_started.set()
+            writes.append((serial_port, command, kwargs))
+
+        def read_storage_line(serial_port, timeout, **kwargs):
+            assert_operation_lease("read")
+            reads.append((serial_port, timeout, kwargs))
+            response = responses.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return response
+
+        namespace = {
+            "Optional": Optional,
+            "dataclass": dataclass,
+            "json": json,
+            "math": math,
+            "os": os,
+            "secrets": secrets,
+            "sys": SimpleNamespace(frozen=False),
+            "MAX_COMMAND_LENGTH": MAX_COMMAND_LENGTH,
+            "MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES": (
+                MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES
+            ),
+            "CONTROLLER_MEDIA_ID_LENGTH": 32,
+            "ControllerIdentity": ControllerIdentity,
+            "MotionInputError": MotionInputError,
+            "MotionRequestLease": MotionRequestLease,
+            "MAX_RESPONSE_PAYLOAD_LENGTH": MAX_RESPONSE_PAYLOAD_LENGTH,
+            "SERIAL_SHUTDOWN_RETRY_MS": 1,
+            "ProtocolResponseError": ProtocolResponseError,
+            "PositionResponse": PositionResponse,
+            "SerialActivityRejected": SerialActivityRejected,
+            "SerialTransportQuarantinedError": (
+                SerialTransportQuarantinedError
+            ),
+            "parse_position_response": parse_position_response,
+            "validate_controller_filename": validate_controller_filename,
+            "validate_controller_hardware_id": validate_controller_hardware_id,
+            "validate_controller_media_id": validate_controller_media_id,
+            "quarantine_serial_transport": quarantine_storage_transport,
+            "serial_transport_quarantined": (
+                lambda serial_port: id(serial_port) in quarantined_port_ids
+            ),
+            "write_serial_control": write_storage_control,
+            "read_serial_line_response": read_storage_line,
+            "SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS": 120,
+            "serial_write_lock": threading.Lock(),
+            "serial_lock": serial_lock,
+            "serial_activity_registry": serial_registry,
+            "motion_request_registry": motion_registry,
+            "gcode_storage_event_queue": Queue(),
+            "gcode_storage_state_lock": threading.Lock(),
+            "gcode_storage_active_request": None,
+            "gcode_storage_next_request_id": 0,
+            "gcode_storage_pending_delete_reconciliation": None,
+            "gcode_storage_persistent_state_loaded": False,
+            "gcode_storage_persistent_state_error": None,
+            "gcode_storage_state_path_override": str(state_path),
+            "main_controller_identity_binding": None,
+            "gcode_storage_media_binding": None,
+            "gcode_view_generation": 0,
+            "gcode_conversion_active": threading.Event(),
+            "program_execution_state_lock": threading.Lock(),
+            "program_execution_next_request_id": 0,
+            "program_execution_active_request": None,
+            "gcode_storage_program_admission_active": False,
+            "application_closing": threading.Event(),
+            "threading": SimpleNamespace(
+                Thread=DeferredThread,
+                Event=threading.Event,
+                Lock=threading.Lock,
+            ),
+            "RUN": {"offlineMode": False, "ser": port},
+            "cmdSentEntryField": sent,
+            "cmdRecEntryField": received,
+            "GcodeProgEntryField": program,
+            "GcodCurRowEntryField": current_row,
+            "GcodeFilenameField": filename,
+            "GCalmStatusLab": status,
+            "tab7": SimpleNamespace(gcodeView=listing),
+            "END": "end",
+            "ACTIVE": "active",
+            "ANCHOR": "anchor",
+            "gcodescrollbar": SimpleNamespace(config=lambda **kwargs: None),
+            "messagebox": SimpleNamespace(
+                showwarning=lambda *args: (_ for _ in ()).throw(
+                    AssertionError("valid filename must not show a warning")
+                )
+            ),
+            "displayPosition": lambda response, parsed=None: (
+                applied_positions.append((response, parsed))
+                or parsed
+            ),
+            "logger": SimpleNamespace(
+                error=lambda *args: logs.append(("error", args)),
+                warning=lambda *args: logs.append(("warning", args)),
+                exception=lambda *args: logs.append(("exception", args)),
+            ),
+            "Empty": Empty,
+            "root": SimpleNamespace(
+                after=lambda *args: schedules.append(args) or len(schedules)
+            ),
+        }
+        for assignment_name in (
+            "GCODE_STORAGE_OPERATIONS",
+            "GCODE_STORAGE_DELETE_TERMINAL_RESPONSES",
+            "GCODE_STORAGE_DETAILED_ERROR_PREFIX",
+            "GCODE_STORAGE_DIRECTORY_IDENTITY_PREFIX",
+            "GCODE_STORAGE_DIRECTORY_IDENTITY_SEPARATOR",
+            "GCODE_STORAGE_MEDIA_MARKER",
+            "GCODE_STORAGE_FILENAME_MARKER",
+            "GCODE_STORAGE_STATE_SCHEMA_VERSION",
+            "GCODE_STORAGE_STATE_DIRECTORY_NAME",
+            "GCODE_STORAGE_STATE_FILENAME",
+            "GCODE_STORAGE_STATE_LOCK_SUFFIX",
+            "GCODE_STORAGE_STATE_MAXIMUM_BYTES",
+            "GCODE_STORAGE_STATE_TEMPORARY_ATTEMPTS",
+            "MAX_LOCAL_GCODE_PROGRAM_BYTES",
+            "MAX_LOCAL_GCODE_PROGRAM_ROWS",
+            "MAX_LOCAL_GCODE_SOURCE_LINE_BYTES",
+            "GCODE_LISTBOX_STYLE_OPTIONS",
+            "PROGRAM_EXECUTION_MODES",
+        ):
+            self.compile_assignment(assignment_name, namespace)
+        namespace["ProgramExecutionRequest"] = self.compile_class(
+            "ProgramExecutionRequest",
+            namespace,
+        )
+        namespace["MainControllerIdentityBinding"] = self.compile_class(
+            "MainControllerIdentityBinding",
+            namespace,
+        )
+        namespace["GCodeStorageMediaBinding"] = self.compile_class(
+            "GCodeStorageMediaBinding",
+            namespace,
+        )
+        namespace["GCodeStorageRequest"] = self.compile_class(
+            "GCodeStorageRequest",
+            namespace,
+        )
+        namespace["GCodeStorageCleanupRetainedError"] = self.compile_class(
+            "GCodeStorageCleanupRetainedError",
+            namespace,
+        )
+        namespace["GCodeStorageCleanupResult"] = self.compile_class(
+            "GCodeStorageCleanupResult",
+            namespace,
+        )
+        namespace["GCodeStorageCleanup"] = self.compile_class(
+            "GCodeStorageCleanup",
+            namespace,
+        )
+        namespace["GCodeStorageResult"] = self.compile_class(
+            "GCodeStorageResult",
+            namespace,
+        )
+        namespace["GCodeDeleteReconciliation"] = self.compile_class(
+            "GCodeDeleteReconciliation",
+            namespace,
+        )
+        namespace["GCodeStorageStateLockError"] = self.compile_class(
+            "GCodeStorageStateLockError",
+            namespace,
+        )
+        namespace["GCodeProgramViewSnapshot"] = self.compile_class(
+            "GCodeProgramViewSnapshot",
+            namespace,
+        )
+        for function_name in (
+            "_begin_program_execution",
+            "_finish_program_execution",
+            "_program_execution_busy_message",
+            "_begin_gcode_conversion_admission",
+            "_finish_gcode_conversion_admission",
+            "_begin_gcode_storage_program_admission",
+            "_finish_gcode_storage_program_admission",
+            "_new_gcode_storage_cleanup",
+            "_run_gcode_storage_cleanup",
+            "_ensure_gcode_storage_cleanup",
+            "_retain_gcode_storage_cleanup",
+            "_release_or_retain_gcode_storage_cleanup",
+            "_apply_gcode_storage_cleanup_result",
+            "_bind_main_controller_identity",
+            "_clear_main_controller_identity",
+            "_require_main_controller_identity_cleanup",
+            "_current_main_controller_identity",
+            "_bind_gcode_storage_media",
+            "_current_gcode_storage_media",
+            "_current_gcode_view_generation",
+            "_advance_gcode_view_generation",
+            "_validate_gcode_storage_filename",
+            "_gcode_storage_filename",
+            "_gcode_storage_delete_command",
+            "_gcode_storage_selection_name",
+            "_parse_gcode_storage_listing",
+            "_gcode_storage_error_detail",
+            "_is_gcode_storage_detailed_error",
+            "_gcode_storage_detailed_error_message",
+            "_is_gcode_storage_controller_error",
+            "_gcode_storage_estop_position",
+            "_gcode_storage_controller_error_message",
+            "_render_gcode_storage_controller_error",
+            "_render_gcode_storage_detailed_error",
+            "_validate_gcode_storage_response",
+            "_render_gcode_storage_rejection",
+            "_gcode_storage_default_state_directory",
+            "_gcode_storage_state_path",
+            "_gcode_storage_state_lock_path",
+            "_windows_gcode_storage_handle_owned_by_current_user",
+            "_open_windows_gcode_storage_path",
+            "_close_windows_gcode_storage_handle",
+            "_validate_gcode_storage_state_directory",
+            "_open_gcode_storage_lock_file",
+            "_open_gcode_storage_state_file",
+            "_lock_gcode_storage_state_file",
+            "_gcode_storage_unique_json_object",
+            "_gcode_storage_state_document",
+            "_decode_gcode_storage_state",
+            "_read_gcode_storage_state",
+            "_create_gcode_storage_state_temporary_file",
+            "_durably_replace_gcode_storage_state",
+            "_write_gcode_storage_state",
+            "_gcode_storage_persistence_error",
+            "_load_gcode_storage_state_locked",
+            "_require_gcode_storage_state_available_locked",
+            "_record_gcode_storage_state_lock_error_locked",
+            "_ensure_gcode_storage_state_loaded",
+            "_persist_gcode_storage_state_locked",
+            "_current_gcode_delete_reconciliation",
+            "_record_gcode_delete_reconciliation_locked",
+            "_record_gcode_delete_reconciliation",
+            "_clear_gcode_delete_reconciliation_locked",
+            "_clear_gcode_delete_reconciliation",
+            "_reconcile_gcode_storage_delete_locked",
+            "_reconcile_gcode_storage_delete",
+            "_run_gcode_storage_request",
+            "_release_async_main_serial_transport",
+            "_release_gcode_storage_request",
+            "_set_gcode_program_path",
+            "_set_gcode_current_row",
+            "_gcode_view_index",
+            "_gcode_view_fractions",
+            "_capture_gcode_program_view",
+            "_restore_gcode_program_view",
+            "_replace_gcode_program_view",
+            "_replace_gcode_storage_listing",
+            "_start_gcode_storage_request",
+            "GCread",
+            "GCdelete",
+            "_apply_gcode_storage_result",
+            "_poll_gcode_storage_events",
+            "_parse_local_gcode_program",
+            "_open_local_gcode_program",
+            "loadGcodeProg",
+        ):
+            namespace[function_name] = self.compile_function(
+                function_name,
+                namespace,
+                preserve_decorators=(
+                    function_name == "_lock_gcode_storage_state_file"
+                ),
+            )
+        namespace["_bind_main_controller_identity"](
+            port,
+            controller_identity,
+        )
+        mismatched_port = Port()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "identity cleanup invariant failed during mismatch test",
+        ):
+            namespace["_require_main_controller_identity_cleanup"](
+                mismatched_port,
+                "mismatch test",
+            )
+        retained_binding = namespace["_current_main_controller_identity"](port)
+        self.assertIsNotNone(retained_binding)
+        self.assertIs(retained_binding.serial_port, port)
+        self.assertIn(
+            (
+                "error",
+                (
+                    "Main-controller identity cleanup rejected because the "
+                    "bound controller changed",
+                ),
+            ),
+            logs,
+        )
+
+        read_files = namespace["GCread"]
+        delete_file = namespace["GCdelete"]
+        poll_results = namespace["_poll_gcode_storage_events"]
+        load_program = namespace["loadGcodeProg"]
+
+        def assert_storage_blocks_program_modes():
+            self.assertTrue(
+                namespace["gcode_storage_program_admission_active"]
+            )
+            next_request_id = namespace[
+                "program_execution_next_request_id"
+            ]
+            for mode in ("run", "step-forward", "step-reverse"):
+                with self.subTest(active_storage_blocked_mode=mode):
+                    self.assertIsNone(
+                        namespace["_begin_program_execution"](mode)
+                    )
+                    self.assertIsNone(
+                        namespace["program_execution_active_request"]
+                    )
+                    self.assertEqual(
+                        namespace["program_execution_next_request_id"],
+                        next_request_id,
+                    )
+
+        with self.assertRaisesRegex(MotionInputError, "operation"):
+            namespace["_start_gcode_storage_request"]([])
+        with self.assertRaisesRegex(MotionInputError, "outcome"):
+            namespace["GCodeStorageResult"](1, [], "Done", (), False)
+        with self.assertRaisesRegex(MotionInputError, "value"):
+            namespace["GCodeStorageResult"](
+                1,
+                "completed",
+                "x" * (MAX_RESPONSE_PAYLOAD_LENGTH + 1),
+                (),
+                True,
+            )
+        with self.assertRaisesRegex(MotionInputError, "non-actionable"):
+            namespace["GCodeStorageResult"](
+                1,
+                "completed",
+                ".txt,",
+                (".txt",),
+                True,
+            )
+        with self.assertRaisesRegex(MotionInputError, "committed write"):
+            namespace["GCodeStorageResult"](
+                1,
+                "indeterminate",
+                "response lost",
+                (),
+                False,
+            )
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "pending reconciliation",
+        ):
+            namespace["GCodeStorageResult"](
+                1,
+                "indeterminate",
+                "response lost",
+                (),
+                True,
+            )
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "cancellation boundary",
+        ):
+            namespace["_start_gcode_storage_request"](
+                "delete",
+                filename="demo.txt",
+                completion_callback=lambda succeeded: None,
+                cancellation_event=threading.Event(),
+            )
+        for invalid_schema_version in (True, 1.0, "1"):
+            with self.subTest(
+                invalid_schema_version=invalid_schema_version
+            ):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "supported schema",
+                ):
+                    namespace["_decode_gcode_storage_state"]({
+                        "schema_version": invalid_schema_version,
+                        "pending_delete": None,
+                    })
+
+        with namespace["_lock_gcode_storage_state_file"](str(state_path)):
+            with self.assertRaisesRegex(
+                namespace["GCodeStorageStateLockError"],
+                "locked by another application process",
+            ):
+                with namespace["_lock_gcode_storage_state_file"](
+                    str(state_path)
+                ):
+                    self.fail("a second state-file lock was admitted")
+
+        externally_recorded = namespace["GCodeDeleteReconciliation"](
+            1,
+            controller_identity.controller_hardware_id,
+            media_id,
+            "external.txt",
+        )
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "reconciliation is invalid",
+        ):
+            namespace["GCodeStorageResult"](
+                1,
+                "completed",
+                directory_response(),
+                (),
+                True,
+                media_id,
+                reconciliation=(externally_recorded, 1),
+            )
+        namespace["_write_gcode_storage_state"](
+            str(state_path),
+            externally_recorded,
+        )
+        namespace["gcode_storage_pending_delete_reconciliation"] = None
+        namespace["gcode_storage_persistent_state_loaded"] = True
+        self.assertEqual(
+            namespace["_current_gcode_delete_reconciliation"](),
+            externally_recorded,
+        )
+        namespace["_write_gcode_storage_state"](str(state_path), None)
+
+        generation_before_user_edit = namespace["gcode_view_generation"]
+        self.assertFalse(program.user_replace("typed-path.ngc"))
+        self.assertEqual(program.value, "loaded.ngc")
+        self.assertEqual(
+            namespace["gcode_view_generation"],
+            generation_before_user_edit,
+        )
+
+        active_program_request = namespace["_begin_program_execution"](
+            "run"
+        )
+        self.assertIsNotNone(active_program_request)
+        self.assertFalse(read_files("yes"))
+        self.assertEqual(
+            status.text,
+            "G-CODE STORAGE REJECTED DURING PROGRAM EXECUTION",
+        )
+        self.assertEqual(writes, [])
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+        self.assertTrue(
+            namespace["_finish_program_execution"](
+                active_program_request
+            )
+        )
+
+        namespace["gcode_conversion_active"].set()
+        self.assertFalse(read_files("yes"))
+        self.assertEqual(
+            status.text,
+            "G-CODE STORAGE REJECTED DURING G-CODE CONVERSION",
+        )
+        self.assertFalse(load_program())
+        self.assertEqual(
+            status.text,
+            "G-CODE LOAD REJECTED DURING G-CODE CONVERSION",
+        )
+        namespace["gcode_conversion_active"].clear()
+
+        responses.append(directory_response("Example.txt,second.nc,"))
+        self.assertTrue(
+            read_files("yes"),
+            (status.text, logs[-3:]),
+        )
+        self.assertEqual(writes, [])
+        self.assertEqual(sent.value, "RG\n")
+        self.assertTrue(serial_lock.locked())
+        self.assertTrue(serial_registry.active("ser"))
+        self.assertTrue(motion_registry.active)
+        self.assertEqual(len(deferred_threads), 1)
+        self.assertTrue(deferred_threads[0].started)
+        assert_storage_blocks_program_modes()
+        pending_thread_count = len(deferred_threads)
+        self.assertFalse(read_files("yes"))
+        self.assertEqual(
+            status.text,
+            "G-CODE STORAGE REJECTED WHILE ANOTHER STORAGE REQUEST IS ACTIVE",
+        )
+        self.assertEqual(len(deferred_threads), pending_thread_count)
+        self.assertTrue(serial_lock.locked())
+        self.assertTrue(serial_registry.active("ser"))
+        self.assertTrue(motion_registry.active)
+        self.assertEqual(
+            namespace["_begin_gcode_conversion_admission"](),
+            "storage-active",
+        )
+        self.assertFalse(namespace["gcode_conversion_active"].is_set())
+
+        deferred_threads.pop(0).run()
+        self.assertTrue(serial_lock.locked())
+        self.assertEqual(listing.values, [])
+        poll_results()
+
+        self.assertEqual(listing.values, ["Example.txt"])
+        self.assertEqual(program.value, "")
+        self.assertEqual(
+            status.text,
+            "G-CODE .TXT PROGRAMS FOUND ON SD CARD:",
+        )
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+        self.assertFalse(
+            namespace["gcode_storage_program_admission_active"]
+        )
+        self.assertEqual(operation_lease_phases, ["write", "read"])
+        self.assertEqual(
+            reads[0][2],
+            {"allow_empty_terminal_response": False},
+        )
+
+        cancelled_conversion = []
+        cancellation_event = threading.Event()
+        cancellation_event.set()
+        cancellation_lock = threading.Lock()
+        namespace["gcode_conversion_active"].set()
+        write_count_before_cancellation = len(writes)
+
+        def record_cancelled_conversion(succeeded):
+            cancelled_conversion.append(succeeded)
+            namespace["gcode_conversion_active"].clear()
+
+        self.assertTrue(
+            namespace["_start_gcode_storage_request"](
+                "delete",
+                filename="demo.txt",
+                completion_callback=record_cancelled_conversion,
+                cancellation_event=cancellation_event,
+                cancellation_lock=cancellation_lock,
+            )
+        )
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertEqual(cancelled_conversion, [False])
+        self.assertEqual(len(writes), write_count_before_cancellation)
+        self.assertIsNone(
+            namespace["_current_gcode_delete_reconciliation"]()
+        )
+        self.assertTrue(port.is_open)
+
+        responses.append("P")
+        self.assertTrue(delete_file())
+        assert_storage_blocks_program_modes()
+        self.assertEqual(writes[-1][1], "RG\n")
+        deferred_threads.pop(0).run()
+        poll_results()
+
+        self.assertEqual(status.text, "demo.txt has been deleted")
+        self.assertTrue(serial_lock.locked())
+        self.assertTrue(serial_registry.active("ser"))
+        self.assertTrue(motion_registry.active)
+        self.assertEqual(len(deferred_threads), 1)
+        self.assertEqual(sent.value, "RG\n")
+        self.assertEqual(
+            reads[-1][2],
+            {"allow_empty_terminal_response": False},
+        )
+
+        responses.append(directory_response("second.nc,"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertEqual(listing.values, [])
+        self.assertEqual(status.text, "demo.txt has been deleted")
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+        self.assertFalse(
+            namespace["gcode_storage_program_admission_active"]
+        )
+        self.assertEqual(
+            [command for _, command, _ in writes],
+            [
+                "RG\n",
+                f"DGMi{media_id}Fndemo.txt\n",
+                "RG\n",
+            ],
+        )
+        self.assertEqual(
+            [
+                read_options["allow_empty_terminal_response"]
+                for _, _, read_options in reads
+            ],
+            [False, False, False],
+        )
+        self.assertEqual(quarantines, [])
+
+        release_failure_completion = []
+        release_failure_cancel = threading.Event()
+        release_failure_cancel_lock = threading.Lock()
+        namespace["gcode_conversion_active"].set()
+
+        def record_release_failure_completion(succeeded):
+            release_failure_completion.append(succeeded)
+            namespace["gcode_conversion_active"].clear()
+
+        responses.append("P")
+        self.assertTrue(
+            namespace["_start_gcode_storage_request"](
+                "delete",
+                filename="demo.txt",
+                completion_callback=record_release_failure_completion,
+                cancellation_event=release_failure_cancel,
+                cancellation_lock=release_failure_cancel_lock,
+            )
+        )
+        original_storage_lock = namespace[
+            "_lock_gcode_storage_state_file"
+        ]
+
+        @contextmanager
+        def release_failing_storage_lock(state_path_value):
+            with original_storage_lock(state_path_value):
+                yield
+            raise namespace["GCodeStorageStateLockError"](
+                "injected post-settlement release failure"
+            )
+
+        namespace["_lock_gcode_storage_state_file"] = (
+            release_failing_storage_lock
+        )
+        try:
+            deferred_threads.pop(0).run()
+        finally:
+            namespace["_lock_gcode_storage_state_file"] = (
+                original_storage_lock
+            )
+        self.assertIsNotNone(
+            namespace["gcode_storage_persistent_state_error"]
+        )
+        self.assertIsNone(
+            namespace["_read_gcode_storage_state"](str(state_path))
+        )
+        poll_results()
+        self.assertEqual(release_failure_completion, [True])
+        self.assertFalse(namespace["gcode_conversion_active"].is_set())
+        self.assertIsNone(
+            namespace["_current_gcode_delete_reconciliation"]()
+        )
+        self.assertIsNone(
+            namespace["gcode_storage_persistent_state_error"]
+        )
+        self.assertTrue(
+            any(
+                entry[0] == "exception"
+                and "settled but state-lock release failed"
+                in entry[1][0]
+                for entry in logs
+            )
+        )
+
+        responses.append(directory_response("second.nc,"))
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertEqual(listing.values, [])
+        self.assertEqual(
+            status.text,
+            "NO G-CODE .TXT PROGRAMS FOUND ON SD CARD",
+        )
+
+        responses.append(directory_response())
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertEqual(listing.values, [])
+        self.assertEqual(
+            status.text,
+            "NO G-CODE .TXT PROGRAMS FOUND ON SD CARD",
+        )
+
+        responses.append(directory_response("stale.txt,"))
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        with BoundedTemporaryDirectory() as directory:
+            local_program = Path(directory) / "new-local-program.ngc"
+            local_program.write_bytes(b"G1 X1\n")
+            namespace["fd"] = SimpleNamespace(
+                askopenfilename=lambda **kwargs: str(local_program)
+            )
+            self.assertTrue(load_program())
+        poll_results()
+        self.assertEqual(program.value, str(local_program))
+        self.assertEqual(listing.values, [b"G1 X1 "])
+        self.assertEqual(
+            status.text,
+            "G-CODE STORAGE LIST NOT APPLIED; LOCAL PROGRAM VIEW CHANGED",
+        )
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+
+        responses.append("P")
+        self.assertTrue(delete_file())
+        deferred_threads.pop(0).run()
+        with BoundedTemporaryDirectory() as directory:
+            newer_local_program = Path(directory) / "newer-local-program.ngc"
+            newer_local_program.write_bytes(b"G1 X2\n")
+            namespace["fd"] = SimpleNamespace(
+                askopenfilename=lambda **kwargs: str(newer_local_program)
+            )
+            self.assertTrue(load_program())
+        pending_thread_count = len(deferred_threads)
+        poll_results()
+        self.assertEqual(program.value, str(newer_local_program))
+        self.assertEqual(listing.values, [b"G1 X2 "])
+        self.assertEqual(status.text, "demo.txt has been deleted")
+        self.assertEqual(len(deferred_threads), pending_thread_count)
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+
+        responses.append("EG: begin fail code 1 data 2")
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertTrue(port.is_open)
+        self.assertEqual(quarantines, [])
+        self.assertEqual(
+            status.text,
+            "G-CODE STORAGE CONTROLLER ERROR: begin fail code 1 data 2",
+        )
+        self.assertEqual(received.value, "EG: begin fail code 1 data 2")
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+
+        estop_response = VALID_CONTROLLER_POSITION.raw.replace(
+            "NOP",
+            "NOEBP",
+        )
+        quarantine_count = len(quarantines)
+        responses.append(estop_response)
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertEqual(applied_positions, [])
+        self.assertFalse(port.is_open)
+        self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertEqual(len(quarantines), quarantine_count + 1)
+        self.assertIn("physical E-stop", quarantines[-1][1])
+        self.assertIn("additional controller output", status.text)
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+
+        malformed_port = Port()
+        namespace["RUN"]["ser"] = malformed_port
+        namespace["_bind_main_controller_identity"](
+            malformed_port,
+            controller_identity,
+        )
+        responses.append("Example.txt")
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        self.assertTrue(serial_lock.locked())
+        poll_results()
+        self.assertEqual(len(quarantines), quarantine_count + 2)
+        self.assertIs(quarantines[-1][0], malformed_port)
+        self.assertFalse(malformed_port.is_open)
+        self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertIn("G-code storage command failed:", status.text)
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+
+        replacement_port = Port()
+        namespace["RUN"]["ser"] = replacement_port
+        namespace["_bind_main_controller_identity"](
+            replacement_port,
+            controller_identity,
+        )
+        responses.append(directory_response("safe.txt,"))
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        listing.styles[0]["foreground"] = "#0057A6"
+        listing.selection = (0,)
+        listing.active = 0
+        listing.anchor = 0
+        listing.xview_state = (0.2, 0.7)
+        listing.yview_state = (0.3, 0.8)
+        current_row.value = "0"
+        preserved_program = program.value
+        preserved_listing = list(listing.values)
+        preserved_styles = [dict(style) for style in listing.styles]
+        listing.fail_delete_after_clear = True
+        poll_results()
+        self.assertEqual(program.value, preserved_program)
+        self.assertEqual(listing.values, preserved_listing)
+        self.assertEqual(listing.styles, preserved_styles)
+        self.assertEqual(listing.selection, (0,))
+        self.assertEqual(listing.active, 0)
+        self.assertEqual(listing.anchor, 0)
+        self.assertEqual(listing.xview_state[0], 0.2)
+        self.assertEqual(listing.yview_state[0], 0.3)
+        self.assertEqual(current_row.value, "0")
+        self.assertIn("result application failed", status.text)
+        self.assertNotEqual(
+            status.text,
+            "G-CODE .TXT PROGRAMS FOUND ON SD CARD:",
+        )
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+        self.assertTrue(
+            any(
+                entry[0] == "exception"
+                and "Unable to apply a G-code storage result"
+                in entry[1][0]
+                for entry in logs
+            )
+        )
+
+        responses.append(directory_response("rollback.txt,"))
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        preserved_program = program.value
+        preserved_listing = list(listing.values)
+        preserved_styles = [dict(style) for style in listing.styles]
+        program.fail_next_state = "readonly"
+        poll_results()
+        self.assertEqual(program.value, preserved_program)
+        self.assertEqual(program.state, "readonly")
+        self.assertEqual(listing.values, preserved_listing)
+        self.assertEqual(listing.styles, preserved_styles)
+        self.assertIn("result application failed", status.text)
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+
+        responses.append("ER")
+        self.assertTrue(delete_file())
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertTrue(replacement_port.is_open)
+        self.assertEqual(
+            status.text,
+            "G-CODE STORAGE COMMAND REJECTED BY CONTROLLER",
+        )
+
+        responses.append("EG: remove fail code 1 data 2")
+        self.assertTrue(delete_file())
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertFalse(replacement_port.is_open)
+        self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertIsInstance(
+            namespace["gcode_storage_pending_delete_reconciliation"],
+            namespace["GCodeDeleteReconciliation"],
+        )
+        self.assertIn("DELETE OUTCOME IS UNKNOWN", status.text)
+
+        post_error_port = Port()
+        namespace["RUN"]["ser"] = post_error_port
+        namespace["_bind_main_controller_identity"](
+            post_error_port,
+            controller_identity,
+        )
+        responses.append(directory_response("demo.txt,"))
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertIsNone(
+            namespace["gcode_storage_pending_delete_reconciliation"]
+        )
+        self.assertEqual(
+            status.text,
+            "demo.txt DELETION DID NOT COMPLETE; "
+            "THE FILE REMAINS ON THE CONTROLLER",
+        )
+
+        responses.append("ER")
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertFalse(post_error_port.is_open)
+        self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertIn("G-code storage command failed:", status.text)
+
+        bare_error_port = Port()
+        namespace["RUN"]["ser"] = bare_error_port
+        namespace["_bind_main_controller_identity"](
+            bare_error_port,
+            controller_identity,
+        )
+        responses.append("EG")
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertFalse(bare_error_port.is_open)
+        self.assertIsNone(namespace["RUN"]["ser"])
+
+        uncertain_delete_port = Port()
+        namespace["RUN"]["ser"] = uncertain_delete_port
+        namespace["_bind_main_controller_identity"](
+            uncertain_delete_port,
+            controller_identity,
+        )
+        responses.append(directory_response("demo.txt,"))
+        self.assertTrue(read_files("no"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        responses.append(TimeoutError("delete response was lost"))
+        self.assertTrue(delete_file())
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertFalse(uncertain_delete_port.is_open)
+        self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertIsInstance(
+            namespace["gcode_storage_pending_delete_reconciliation"],
+            namespace["GCodeDeleteReconciliation"],
+        )
+        self.assertIn("DELETE OUTCOME IS UNKNOWN", status.text)
+
+        reconciliation_port = Port()
+        namespace["RUN"]["ser"] = reconciliation_port
+        namespace["_bind_main_controller_identity"](
+            reconciliation_port,
+            controller_identity,
+        )
+        pending_thread_count = len(deferred_threads)
+        self.assertFalse(delete_file())
+        self.assertEqual(len(deferred_threads), pending_thread_count)
+        self.assertIn("REFRESH THE DIRECTORY", status.text)
+
+        responses.append(directory_response("demo.txt,"))
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertIsNone(
+            namespace["gcode_storage_pending_delete_reconciliation"]
+        )
+        self.assertEqual(
+            status.text,
+            "demo.txt DELETION DID NOT COMPLETE; "
+            "THE FILE REMAINS ON THE CONTROLLER",
+        )
+        self.assertTrue(reconciliation_port.is_open)
+
+        responses.append(TimeoutError("delete acknowledgement was lost"))
+        self.assertTrue(delete_file())
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertIsNotNone(
+            namespace["gcode_storage_pending_delete_reconciliation"]
+        )
+        persisted_pending = (
+            namespace["gcode_storage_pending_delete_reconciliation"]
+        )
+        self.assertTrue(state_path.is_file())
+        namespace["gcode_storage_pending_delete_reconciliation"] = None
+        namespace["gcode_storage_persistent_state_loaded"] = True
+        namespace["gcode_storage_persistent_state_error"] = None
+        self.assertEqual(
+            namespace["_current_gcode_delete_reconciliation"](),
+            persisted_pending,
+        )
+
+        different_controller_port = Port()
+        namespace["RUN"]["ser"] = different_controller_port
+        namespace["_bind_main_controller_identity"](
+            different_controller_port,
+            different_controller_identity,
+        )
+        responses.append(directory_response("other.txt,"))
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertEqual(
+            namespace["gcode_storage_pending_delete_reconciliation"],
+            persisted_pending,
+        )
+        self.assertIn("ORIGINAL CONTROLLER AND SD CARD", status.text)
+
+        different_media_port = Port()
+        namespace["RUN"]["ser"] = different_media_port
+        namespace["_bind_main_controller_identity"](
+            different_media_port,
+            controller_identity,
+        )
+        responses.append(
+            directory_response(
+                "other.txt,",
+                selected_media_id=other_media_id,
+            )
+        )
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertEqual(
+            namespace["gcode_storage_pending_delete_reconciliation"],
+            persisted_pending,
+        )
+        self.assertIn("ORIGINAL CONTROLLER AND SD CARD", status.text)
+
+        confirmation_port = Port()
+        namespace["RUN"]["ser"] = confirmation_port
+        namespace["_bind_main_controller_identity"](
+            confirmation_port,
+            controller_identity,
+        )
+        responses.append(directory_response("other.txt,"))
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertIsNone(
+            namespace["gcode_storage_pending_delete_reconciliation"]
+        )
+        self.assertEqual(
+            status.text,
+            "demo.txt DELETION CONFIRMED BY DIRECTORY REFRESH",
+        )
+        self.assertTrue(confirmation_port.is_open)
+
+        prewrite_port = Port()
+        namespace["RUN"]["ser"] = prewrite_port
+        namespace["_bind_main_controller_identity"](
+            prewrite_port,
+            controller_identity,
+        )
+        responses.append(directory_response("demo.txt,"))
+        self.assertTrue(read_files("no"))
+        deferred_threads.pop(0).run()
+        poll_results()
+        namespace["write_serial_control"] = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                ConnectionError("delete rejected before write")
+            )
+        )
+        self.assertTrue(delete_file())
+        deferred_threads.pop(0).run()
+        poll_results()
+        self.assertIsNone(
+            namespace["gcode_storage_pending_delete_reconciliation"]
+        )
+        self.assertIn("G-code storage command failed:", status.text)
+        namespace["write_serial_control"] = write_storage_control
+
+        state_path.write_text("{", encoding="utf-8")
+        namespace["gcode_storage_pending_delete_reconciliation"] = None
+        namespace["gcode_storage_persistent_state_loaded"] = False
+        namespace["gcode_storage_persistent_state_error"] = None
+        pending_thread_count = len(deferred_threads)
+        self.assertFalse(delete_file())
+        self.assertEqual(len(deferred_threads), pending_thread_count)
+        self.assertIn("reconciliation state is unavailable", status.text)
+        namespace["_write_gcode_storage_state"](str(state_path), None)
+        namespace["gcode_storage_persistent_state_loaded"] = False
+        namespace["gcode_storage_persistent_state_error"] = None
+        namespace["_current_gcode_delete_reconciliation"]()
+
+        with BoundedTemporaryDirectory() as directory:
+            local_program = Path(directory) / "local.ngc"
+            local_program.write_bytes(
+                b"\tG1\tX3 ;comment\n  G1   X4\t"
+            )
+            namespace["fd"] = SimpleNamespace(
+                askopenfilename=lambda **kwargs: str(local_program)
+            )
+            generation_before_load = namespace["gcode_view_generation"]
+            self.assertTrue(
+                load_program(),
+                (status.text, logs[-3:]),
+            )
+        self.assertEqual(
+            namespace["gcode_view_generation"],
+            generation_before_load + 1,
+        )
+        self.assertEqual(program.value, str(local_program))
+        self.assertEqual(listing.values, [b"G1 X3 ", b"G1 X4 "])
+
+        loaded_program = program.value
+        loaded_rows = list(listing.values)
+        generation_before_non_actionable_load = namespace[
+            "gcode_view_generation"
+        ]
+        with BoundedTemporaryDirectory() as directory:
+            for source_name, source_bytes in (
+                ("empty.ngc", b""),
+                (
+                    "comments.ngc",
+                    b"; comment\n \t ; second comment\n",
+                ),
+            ):
+                with self.subTest(source_name=source_name):
+                    source_path = Path(directory) / source_name
+                    source_path.write_bytes(source_bytes)
+                    namespace["fd"] = SimpleNamespace(
+                        askopenfilename=lambda **kwargs: str(source_path)
+                    )
+                    self.assertFalse(load_program())
+                    self.assertEqual(program.value, loaded_program)
+                    self.assertEqual(listing.values, loaded_rows)
+                    self.assertEqual(
+                        namespace["gcode_view_generation"],
+                        generation_before_non_actionable_load,
+                    )
+                    self.assertIn("at least one row", status.text)
+        self.assertEqual(program.value, loaded_program)
+        self.assertEqual(listing.values, loaded_rows)
+        self.assertEqual(
+            namespace["gcode_view_generation"],
+            generation_before_non_actionable_load,
+        )
+        self.assertIn("at least one row", status.text)
+
+        cleanup_port = Port()
+        namespace["RUN"]["ser"] = cleanup_port
+        namespace["_bind_main_controller_identity"](
+            cleanup_port,
+            controller_identity,
+        )
+        namespace["_bind_gcode_storage_media"](
+            cleanup_port,
+            controller_identity.controller_hardware_id,
+            media_id,
+        )
+
+        class FailOnceActivityLease:
+            def __init__(self, delegate):
+                self.delegate = delegate
+                self.close_attempts = 0
+
+            def close(self):
+                self.close_attempts += 1
+                if self.close_attempts == 1:
+                    raise RuntimeError(
+                        "injected activity lease cleanup failure"
+                    )
+                return self.delegate.close()
+
+        class FailOnceActivityRegistry:
+            def __init__(self, delegate):
+                self.delegate = delegate
+                self.lease_wrapper = None
+
+            def lease(self, serial_name):
+                self.lease_wrapper = FailOnceActivityLease(
+                    self.delegate.lease(serial_name)
+                )
+                return self.lease_wrapper
+
+        class ConstructionFailingThread:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("worker construction failed")
+
+        failing_activity_registry = FailOnceActivityRegistry(
+            serial_registry
+        )
+        namespace["serial_activity_registry"] = failing_activity_registry
+        namespace["threading"] = SimpleNamespace(
+            Thread=DeferredThread,
+            Event=threading.Event,
+            Lock=threading.Lock,
+        )
+        namespace["gcode_conversion_active"].set()
+        retained_result_cleanup = []
+
+        def settle_retained_result(succeeded):
+            retained_result_cleanup.append(succeeded)
+            return namespace["_finish_gcode_conversion_admission"]()
+
+        responses.append("P")
+        self.assertTrue(
+            namespace["_start_gcode_storage_request"](
+                "delete",
+                filename="demo.txt",
+                completion_callback=settle_retained_result,
+                cancellation_event=threading.Event(),
+                cancellation_lock=threading.Lock(),
+            )
+        )
+        deferred_threads.pop(0).run()
+        poll_results()
+
+        self.assertIsNotNone(namespace["gcode_storage_active_request"])
+        self.assertTrue(serial_lock.locked())
+        self.assertTrue(serial_registry.active("ser"))
+        self.assertTrue(motion_registry.active)
+        self.assertTrue(
+            namespace["gcode_storage_program_admission_active"]
+        )
+        self.assertTrue(namespace["gcode_conversion_active"].is_set())
+        self.assertEqual(
+            len(namespace["gcode_storage_cleanup_pending"]),
+            1,
+        )
+        self.assertEqual(retained_result_cleanup, [])
+        assert_storage_blocks_program_modes()
+
+        result_cleanup_thread = deferred_threads.pop(0)
+        self.assertEqual(
+            result_cleanup_thread.name,
+            "ar4-gcode-storage-cleanup",
+        )
+        result_cleanup_thread.run()
+        self.assertIsNone(namespace["gcode_storage_active_request"])
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+        self.assertFalse(
+            namespace["gcode_storage_program_admission_active"]
+        )
+        self.assertEqual(
+            namespace["gcode_storage_cleanup_pending"],
+            {},
+        )
+        self.assertEqual(retained_result_cleanup, [])
+
+        poll_results()
+        self.assertEqual(retained_result_cleanup, [True])
+        self.assertFalse(namespace["gcode_conversion_active"].is_set())
+        self.assertEqual(
+            namespace["gcode_storage_cleanup_completed"],
+            {},
+        )
+
+        namespace["threading"] = SimpleNamespace(
+            Thread=ConstructionFailingThread,
+            Event=threading.Event,
+            Lock=threading.Lock,
+        )
+        namespace["gcode_conversion_active"].set()
+        retained_cleanup_results = []
+        retained_cancel = threading.Event()
+        retained_cancel_lock = threading.Lock()
+
+        def settle_retained_conversion(succeeded):
+            retained_cleanup_results.append(succeeded)
+            return namespace["_finish_gcode_conversion_admission"]()
+
+        self.assertTrue(
+            namespace["_start_gcode_storage_request"](
+                "delete",
+                filename="demo.txt",
+                completion_callback=settle_retained_conversion,
+                cancellation_event=retained_cancel,
+                cancellation_lock=retained_cancel_lock,
+            )
+        )
+        self.assertIsNone(namespace["gcode_storage_active_request"])
+        self.assertTrue(serial_lock.locked())
+        self.assertTrue(serial_registry.active("ser"))
+        self.assertTrue(motion_registry.active)
+        self.assertTrue(
+            namespace["gcode_storage_program_admission_active"]
+        )
+        self.assertTrue(namespace["gcode_conversion_active"].is_set())
+        self.assertEqual(
+            len(namespace["gcode_storage_cleanup_pending"]),
+            1,
+        )
+        self.assertEqual(retained_cleanup_results, [])
+        assert_storage_blocks_program_modes()
+
+        namespace["threading"] = SimpleNamespace(
+            Thread=DeferredThread,
+            Event=threading.Event,
+            Lock=threading.Lock,
+        )
+        cleanup_thread_count = len(deferred_threads)
+        self.assertTrue(namespace["_ensure_gcode_storage_cleanup"]())
+        self.assertEqual(
+            len(deferred_threads),
+            cleanup_thread_count + 1,
+        )
+        cleanup_thread = deferred_threads.pop()
+        self.assertEqual(
+            cleanup_thread.name,
+            "ar4-gcode-storage-cleanup",
+        )
+        cleanup_thread.run()
+
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+        self.assertFalse(
+            namespace["gcode_storage_program_admission_active"]
+        )
+        self.assertEqual(
+            namespace["gcode_storage_cleanup_pending"],
+            {},
+        )
+        self.assertTrue(namespace["gcode_conversion_active"].is_set())
+        self.assertEqual(retained_cleanup_results, [])
+
+        poll_results()
+        self.assertEqual(retained_cleanup_results, [False])
+        self.assertFalse(namespace["gcode_conversion_active"].is_set())
+        self.assertEqual(
+            namespace["gcode_storage_cleanup_completed"],
+            {},
+        )
+        namespace["serial_activity_registry"] = serial_registry
+
+        class FailingThread:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("worker construction failed")
+
+        namespace["threading"] = SimpleNamespace(
+            Thread=FailingThread,
+            Event=threading.Event,
+            Lock=threading.Lock,
+        )
+        self.assertFalse(read_files("yes"))
+        self.assertIsNone(namespace["gcode_storage_active_request"])
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+        self.assertFalse(
+            namespace["gcode_storage_program_admission_active"]
+        )
+
+        for function_name in ("GCread", "GCdelete"):
+            function = self.module_functions[function_name]
+            self.assertEqual(function.decorator_list, [])
+            synchronous_calls = [
+                node
+                for node in ast.walk(function)
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "_exchange_legacy_main_command"
+                )
+            ]
+            self.assertEqual(synchronous_calls, [], function_name)
+
+        program_path_assignment = self.module_assignments[
+            "GcodeProgEntryField"
+        ]
+        program_path_state = {
+            keyword.arg: ast.literal_eval(keyword.value)
+            for keyword in program_path_assignment.value.keywords
+        }
+        self.assertEqual(program_path_state.get("state"), "readonly")
+
+        worker_widget_names = {
+            node.id
+            for node in ast.walk(
+                self.module_functions["_run_gcode_storage_request"]
+            )
+            if isinstance(node, ast.Name)
+        }
+        self.assertFalse(
+            {
+                "GCalmStatusLab",
+                "GcodeProgEntryField",
+                "GcodeFilenameField",
+                "cmdSentEntryField",
+                "tab7",
+            }
+            & worker_widget_names
+        )
+
+        selection_callback = self.module_functions["GCcallback"]
+        selection_helpers = [
+            node
+            for node in ast.walk(selection_callback)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_gcode_storage_selection_name"
+            )
+        ]
+        self.assertEqual(len(selection_helpers), 1)
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "replace"
+                for node in ast.walk(selection_callback)
+            )
+        )
+
+        clear_identity_callers = {
+            name
+            for name, function in self.module_functions.items()
+            if any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_clear_main_controller_identity"
+                for node in ast.walk(function)
+            )
+        }
+        self.assertEqual(
+            clear_identity_callers,
+            {"_require_main_controller_identity_cleanup"},
+        )
+        required_cleanup_callers = {
+            name
+            for name, function in self.module_functions.items()
+            if any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_require_main_controller_identity_cleanup"
+                for node in ast.walk(function)
+            )
+        }
+        self.assertEqual(
+            required_cleanup_callers,
+            {
+                "_apply_gcode_storage_result",
+                "_close_failed_controller_startup",
+                "_close_serial_port",
+                "_exchange_controller_calibration_acknowledgement",
+                "_exchange_gcode_row",
+                "_exchange_legacy_main_command",
+                "_exchange_position_acknowledgement",
+                "_exchange_serial_line",
+                "_invalidate_uncertain_controller_calibration",
+                "_set_com_admitted",
+            },
+        )
 
     def test_gcode_start_position_uses_manual_owner_and_stays_virtual_offline(self):
         class Entry:
@@ -14601,10 +17747,14 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertNotIn("fall back to unfiltered best", solver)
 
         self.assertIn(
-            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.1";',
+            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.2";',
             firmware,
         )
         self.assertIn('"JT_WRIST_CONFIG_V1"', firmware)
+        self.assertIn('"GCODE_DIRECTORY_FRAMING_V1"', firmware)
+        self.assertIn('"GCODE_DELETE_IDENTITY_V1"', firmware)
+        self.assertIn('"GCODE_WRITE_IDENTITY_V1"', firmware)
+        self.assertIn("PROTOCOL_CAPABILITIES", firmware)
 
         host = AR4_SOURCE.read_text(encoding="utf-8")
         self.assertNotIn('+"I"+ACCramp+"Lm"+LoopMode', host)
@@ -15333,9 +18483,15 @@ class HmiSourceContractTests(unittest.TestCase):
         write_start = firmware.index('if (function == "WG")')
         write_end = firmware.index('if (function == "MC")', write_start)
         write_branch = firmware[write_start:write_end]
-        self.assertIn("valid_controller_filename(", write_branch)
+        self.assertIn(
+            "parse_gcode_media_filename_suffix(",
+            write_branch,
+        )
         self.assertIn("inverse_solution_to_future_steps(", write_branch)
-        self.assertIn("if (writeSD(filename, info))", write_branch)
+        self.assertIn(
+            "if (writeSD(filename, info, expected_media_id))",
+            write_branch,
+        )
 
     def test_tool_jog_directions_match_the_firmware_contract(self):
         discrete_commands = {
@@ -15669,14 +18825,20 @@ class HmiSourceContractTests(unittest.TestCase):
             def config(self, **kwargs):
                 self.text = kwargs.get("text")
 
+        cancellation_requested = threading.Event()
         namespace = {
             "tab7": SimpleNamespace(GCrunTrue=1),
             "GCalmStatusLab": Label(),
+            "gcode_conversion_active": threading.Event(),
+            "gcode_conversion_cancel_requested": cancellation_requested,
+            "gcode_conversion_cancel_lock": threading.Lock(),
         }
+        namespace["gcode_conversion_active"].set()
         stop_gcode = self.compile_function("GCstopProg", namespace)
 
         self.assertTrue(stop_gcode())
         self.assertEqual(namespace["tab7"].GCrunTrue, 0)
+        self.assertTrue(cancellation_requested.is_set())
         self.assertIn("SCHEDULING HALTED", namespace["GCalmStatusLab"].text)
         self.assertIn("NOT PREEMPTED", namespace["GCalmStatusLab"].text)
 
@@ -15784,8 +18946,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.value = value
 
         class ProgramView:
-            def __init__(self):
-                self.selection = 1
+            def __init__(self, selection=1):
+                self.selection = selection
                 self.selection_mutations = []
 
             @staticmethod
@@ -15797,6 +18959,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 pass
 
             def curselection(self):
+                if self.selection is None:
+                    return ()
                 return (self.selection,)
 
             def selection_clear(self, *args):
@@ -15831,6 +18995,17 @@ class HmiSourceContractTests(unittest.TestCase):
 
         program_view = ProgramView()
         serial_port = SerialPort()
+        storage_requests = []
+        conversion_cancel_requested = threading.Event()
+        conversion_cancel_lock = threading.Lock()
+        conversion_status = []
+        media_id = "00112233445566778899AABBCCDDEEFF"
+        media_binding = SimpleNamespace(media_id=media_id)
+
+        def start_storage_request(operation, **kwargs):
+            storage_requests.append((operation, kwargs))
+            return kwargs["completion_callback"](True)
+
         tab = SimpleNamespace(gcodeView=program_view, GCrunTrue=0)
         runtime = {"ser": serial_port, "GCrowinproc": 0}
         namespace = {
@@ -15841,10 +19016,19 @@ class HmiSourceContractTests(unittest.TestCase):
             "tab7": tab,
             "END": "end",
             "messagebox": SimpleNamespace(showwarning=lambda *args: None),
-            "GCalmStatusLab": SimpleNamespace(config=lambda **kwargs: None),
+            "GCalmStatusLab": SimpleNamespace(
+                config=lambda **kwargs: conversion_status.append(kwargs)
+            ),
             "GcodCurRowEntryField": Entry(),
             "serial_lock": threading.Lock(),
-            "GCexecuteRow": lambda: "rejected",
+            "gcode_conversion_active": threading.Event(),
+            "gcode_conversion_cancel_requested": (
+                conversion_cancel_requested
+            ),
+            "gcode_conversion_cancel_lock": conversion_cancel_lock,
+            "GCexecuteRow": (
+                lambda filename, selected_media_id, **kwargs: "rejected"
+            ),
             "ROW_EXECUTION_PENDING": "pending",
             "ROW_EXECUTION_COMPLETE": "complete",
             "ROW_EXECUTION_REJECTED": "rejected",
@@ -15852,9 +19036,12 @@ class HmiSourceContractTests(unittest.TestCase):
             "time": SimpleNamespace(sleep=lambda seconds: None),
             "MotionInputError": MotionInputError,
             "MAX_COMMAND_LENGTH": 4096,
-            "logger": SimpleNamespace(error=lambda *args: None),
-            "_exchange_legacy_main_command": (
-                lambda command: serial_port.commands.append(command.encode()) or "Done"
+            "_start_gcode_storage_request": start_storage_request,
+            "_current_gcode_storage_media": lambda: media_binding,
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                warning=lambda *args: None,
+                exception=lambda *args: None,
             ),
         }
         namespace["_gcode_storage_filename"] = self.compile_function(
@@ -15863,19 +19050,218 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         convert = self.compile_function("GCconvertProg", namespace)
 
-        convert()
+        begin_storage = self.compile_function(
+            "_begin_gcode_storage_program_admission",
+            namespace,
+        )
+        finish_storage = self.compile_function(
+            "_finish_gcode_storage_program_admission",
+            namespace,
+        )
+        self.assertEqual(begin_storage(False), "admitted")
+        self.assertFalse(convert())
+        self.assertEqual(
+            conversion_status[-1],
+            {
+                "text": "G-CODE CONVERSION REJECTED DURING G-CODE STORAGE",
+                "style": "Warn.TLabel",
+            },
+        )
+        self.assertEqual(storage_requests, [])
+        self.assertEqual(program_view.selection_mutations, [])
+        self.assertFalse(namespace["gcode_conversion_active"].is_set())
+        self.assertTrue(finish_storage())
 
-        self.assertEqual(serial_port.commands, [b"DGFnoutput.txt\n"])
+        self.assertTrue(convert())
+
+        self.assertEqual(serial_port.commands, [])
+        self.assertEqual(len(storage_requests), 1)
+        self.assertEqual(storage_requests[0][0], "delete")
+        self.assertEqual(storage_requests[0][1]["filename"], "output.txt")
+        self.assertTrue(
+            callable(storage_requests[0][1]["completion_callback"])
+        )
+        self.assertIs(
+            storage_requests[0][1]["cancellation_event"],
+            conversion_cancel_requested,
+        )
+        self.assertIs(
+            storage_requests[0][1]["cancellation_lock"],
+            conversion_cancel_lock,
+        )
         self.assertEqual(program_view.selection, 1)
         self.assertEqual(program_view.selection_mutations, [])
         self.assertEqual(tab.GCrunTrue, 0)
         self.assertEqual(runtime["GCrowinproc"], 0)
+        self.assertFalse(namespace["gcode_conversion_active"].is_set())
+
+        def assert_worker_handoff_cancellation(cancel_kind):
+            delayed_targets = []
+            row_calls = []
+
+            class DelayedThread:
+                def __init__(self, target):
+                    self.target = target
+
+                def start(self):
+                    delayed_targets.append(self.target)
+
+            delayed_view = ProgramView()
+            delayed_tab = SimpleNamespace(
+                gcodeView=delayed_view,
+                GCrunTrue=0,
+            )
+            delayed_cancel = threading.Event()
+            delayed_cancel_lock = threading.Lock()
+            delayed_closing = threading.Event()
+            delayed_conversion_active = threading.Event()
+            delayed_motion_registry = MotionRequestRegistry()
+
+            def start_delayed_storage(operation, **kwargs):
+                return kwargs["completion_callback"](True)
+
+            delayed_namespace = dict(namespace)
+            delayed_namespace.update({
+                "RUN": {"ser": SerialPort(), "GCrowinproc": 0},
+                "tab7": delayed_tab,
+                "GcodCurRowEntryField": Entry(),
+                "cmdSentEntryField": Entry(),
+                "serial_lock": threading.Lock(),
+                "gcode_conversion_active": delayed_conversion_active,
+                "gcode_conversion_cancel_requested": delayed_cancel,
+                "gcode_conversion_cancel_lock": delayed_cancel_lock,
+                "gcode_storage_program_admission_active": False,
+                "program_execution_state_lock": threading.Lock(),
+                "program_execution_active_request": None,
+                "application_closing": delayed_closing,
+                "motion_request_registry": delayed_motion_registry,
+                "threading": SimpleNamespace(Thread=DelayedThread),
+                "_start_gcode_storage_request": start_delayed_storage,
+                "GCexecuteRow": (
+                    lambda *args, **kwargs: (
+                        row_calls.append((args, kwargs)) or "rejected"
+                    )
+                ),
+            })
+            delayed_convert = self.compile_function(
+                "GCconvertProg",
+                delayed_namespace,
+            )
+
+            self.assertTrue(delayed_convert())
+            self.assertEqual(len(delayed_targets), 1)
+            self.assertTrue(delayed_conversion_active.is_set())
+            self.assertTrue(delayed_motion_registry.active)
+
+            if cancel_kind == "stop":
+                delayed_stop = self.compile_function(
+                    "GCstopProg",
+                    delayed_namespace,
+                )
+                self.assertTrue(delayed_stop())
+            else:
+                acquired = delayed_cancel_lock.acquire()
+                self.assertTrue(acquired)
+                try:
+                    delayed_closing.set()
+                    delayed_cancel.set()
+                    delayed_tab.GCrunTrue = 0
+                finally:
+                    delayed_cancel_lock.release()
+
+            delayed_targets[0]()
+            self.assertEqual(row_calls, [])
+            self.assertEqual(delayed_view.selection_mutations, [])
+            self.assertEqual(delayed_tab.GCrunTrue, 0)
+            self.assertFalse(delayed_conversion_active.is_set())
+            self.assertFalse(delayed_motion_registry.active)
+
+        for cancel_kind in ("stop", "shutdown"):
+            with self.subTest(worker_handoff_cancel=cancel_kind):
+                assert_worker_handoff_cancellation(cancel_kind)
+
+        storage_request_count = len(storage_requests)
+        namespace["kinematics_configuration_ready"].clear()
+        self.assertFalse(convert())
+        self.assertEqual(len(storage_requests), storage_request_count)
+        self.assertFalse(namespace["gcode_conversion_active"].is_set())
+        namespace["kinematics_configuration_ready"].set()
+
+        unselected_view = ProgramView(selection=None)
+        unselected_tab = SimpleNamespace(
+            gcodeView=unselected_view,
+            GCrunTrue=0,
+        )
+        unselected_runtime = {
+            "ser": SerialPort(),
+            "GCrowinproc": 0,
+        }
+        unselected_rows = []
+
+        def reject_unselected_row(
+            filename,
+            selected_media_id,
+            **kwargs,
+        ):
+            unselected_rows.append(unselected_view.selection)
+            return "rejected"
+
+        unselected_namespace = dict(namespace)
+        unselected_namespace.update({
+            "RUN": unselected_runtime,
+            "tab7": unselected_tab,
+            "GCexecuteRow": reject_unselected_row,
+            "GcodCurRowEntryField": Entry(),
+            "cmdSentEntryField": Entry(),
+            "gcode_conversion_active": threading.Event(),
+        })
+        unselected_convert = self.compile_function(
+            "GCconvertProg",
+            unselected_namespace,
+        )
+
+        self.assertTrue(unselected_convert())
+        self.assertEqual(unselected_rows, [0])
+        self.assertEqual(
+            unselected_view.selection_mutations,
+            ["clear", ("select", 0)],
+        )
+        self.assertEqual(unselected_runtime["GCrowinproc"], 0)
+        self.assertFalse(
+            unselected_namespace["gcode_conversion_active"].is_set()
+        )
+
+        closing = threading.Event()
+        closing.set()
+        closing_active = threading.Event()
+        closing_tab = SimpleNamespace(
+            gcodeView=ProgramView(),
+            GCrunTrue=0,
+        )
+        closing_namespace = dict(namespace)
+        closing_namespace.update({
+            "application_closing": closing,
+            "gcode_conversion_active": closing_active,
+            "tab7": closing_tab,
+        })
+        closing_convert = self.compile_function(
+            "GCconvertProg",
+            closing_namespace,
+        )
+
+        self.assertFalse(closing_convert())
+        self.assertEqual(closing_tab.GCrunTrue, 0)
+        self.assertFalse(closing_active.is_set())
 
         stopped_view = ProgramView()
         stopped_tab = SimpleNamespace(gcodeView=stopped_view, GCrunTrue=0)
         stopped_runtime = {"ser": SerialPort(), "GCrowinproc": 0}
 
-        def stop_during_pending_row():
+        def stop_during_pending_row(
+            filename,
+            selected_media_id,
+            **kwargs,
+        ):
             stopped_tab.GCrunTrue = 0
             return "pending"
 
@@ -15894,11 +19280,14 @@ class HmiSourceContractTests(unittest.TestCase):
             stopped_namespace,
         )
 
-        stopped_convert()
+        self.assertTrue(stopped_convert())
 
         self.assertEqual(stopped_view.selection, 1)
         self.assertEqual(stopped_view.selection_mutations, [])
         self.assertEqual(stopped_runtime["GCrowinproc"], 0)
+        self.assertFalse(
+            stopped_namespace["gcode_conversion_active"].is_set()
+        )
 
         lock_stopped_view = ProgramView()
         lock_stopped_tab = SimpleNamespace(
@@ -15919,7 +19308,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 "RUN": lock_stopped_runtime,
                 "tab7": lock_stopped_tab,
                 "serial_lock": StopOnLockCheck(),
-                "GCexecuteRow": lambda: (_ for _ in ()).throw(
+                "GCexecuteRow": lambda *args: (_ for _ in ()).throw(
                     AssertionError("stopped conversion must not execute a row")
                 ),
                 "GcodCurRowEntryField": Entry(),
@@ -15931,11 +19320,575 @@ class HmiSourceContractTests(unittest.TestCase):
             lock_stopped_namespace,
         )
 
-        lock_stopped_convert()
+        self.assertTrue(lock_stopped_convert())
 
         self.assertEqual(lock_stopped_view.selection, 1)
         self.assertEqual(lock_stopped_view.selection_mutations, [])
         self.assertEqual(lock_stopped_runtime["GCrowinproc"], 0)
+        self.assertFalse(
+            lock_stopped_namespace["gcode_conversion_active"].is_set()
+        )
+
+        class FailingStyleProgramView(ProgramView):
+            @staticmethod
+            def itemconfig(row, values):
+                raise RuntimeError("conversion style update failed")
+
+        style_failure_active = threading.Event()
+        style_failure_namespace = dict(namespace)
+        style_failure_namespace.update({
+            "RUN": {"ser": SerialPort(), "GCrowinproc": 0},
+            "tab7": SimpleNamespace(
+                gcodeView=FailingStyleProgramView(),
+                GCrunTrue=0,
+            ),
+            "gcode_conversion_active": style_failure_active,
+        })
+        style_failure_convert = self.compile_function(
+            "GCconvertProg",
+            style_failure_namespace,
+        )
+
+        self.assertFalse(style_failure_convert())
+        self.assertFalse(style_failure_active.is_set())
+        self.assertEqual(style_failure_namespace["tab7"].GCrunTrue, 0)
+
+        class FailingThread:
+            def __init__(self, target):
+                raise RuntimeError("conversion worker construction failed")
+
+        failed_namespace = dict(namespace)
+        failed_namespace.update({
+            "RUN": {"ser": SerialPort(), "GCrowinproc": 0},
+            "tab7": SimpleNamespace(
+                gcodeView=ProgramView(),
+                GCrunTrue=0,
+            ),
+            "threading": SimpleNamespace(Thread=FailingThread),
+            "gcode_conversion_active": threading.Event(),
+        })
+        failed_convert = self.compile_function(
+            "GCconvertProg",
+            failed_namespace,
+        )
+
+        self.assertFalse(failed_convert())
+        self.assertFalse(
+            failed_namespace["gcode_conversion_active"].is_set()
+        )
+
+    def test_gcode_conversion_keeps_admitted_filename_after_field_edit(self):
+        class Entry:
+            def __init__(self, value=""):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+        class ProgramView:
+            selection = 1
+
+            @staticmethod
+            def index(value):
+                return 2
+
+            @staticmethod
+            def itemconfig(row, values):
+                pass
+
+            @staticmethod
+            def see(row):
+                pass
+
+            def curselection(self):
+                return (self.selection,)
+
+            @staticmethod
+            def get(row):
+                return b"G90 "
+
+            @staticmethod
+            def selection_clear(*args):
+                pass
+
+            def select_set(self, row):
+                self.selection = row
+
+        class CapturedThread:
+            target_callback = None
+
+            def __init__(self, target):
+                self.target = target
+
+            def start(self):
+                type(self).target_callback = self.target
+
+        execute_function = self.module_functions["GCexecuteRow"]
+        self.assertEqual(
+            [argument.arg for argument in execute_function.args.args[-2:]],
+            ["conversion_filename", "conversion_media_id"],
+        )
+        self.assertEqual(
+            [
+                ast.literal_eval(default)
+                for default in execute_function.args.defaults[-2:]
+            ],
+            [None, None],
+        )
+        self.assertEqual(
+            [
+                argument.arg
+                for argument in execute_function.args.kwonlyargs
+            ],
+            ["conversion_motion_lease"],
+        )
+        self.assertEqual(
+            [
+                ast.literal_eval(default)
+                for default in execute_function.args.kw_defaults
+            ],
+            [None],
+        )
+        conversion_calls = [
+            node
+            for node in ast.walk(self.module_functions["GCconvertProg"])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "GCexecuteRow"
+        ]
+        self.assertEqual(len(conversion_calls), 1)
+        self.assertEqual(len(conversion_calls[0].args), 2)
+        self.assertEqual(len(conversion_calls[0].keywords), 1)
+        self.assertEqual(
+            conversion_calls[0].keywords[0].arg,
+            "conversion_motion_lease",
+        )
+        self.assertIsInstance(
+            conversion_calls[0].keywords[0].value,
+            ast.Name,
+        )
+        self.assertEqual(
+            conversion_calls[0].keywords[0].value.id,
+            "ConversionMotionLease",
+        )
+        self.assertIsInstance(conversion_calls[0].args[0], ast.Name)
+        self.assertEqual(conversion_calls[0].args[0].id, "Filename")
+        self.assertIsInstance(conversion_calls[0].args[1], ast.Name)
+        self.assertEqual(
+            conversion_calls[0].args[1].id,
+            "ConversionMediaId",
+        )
+        filename_fallbacks = [
+            node
+            for node in ast.walk(execute_function)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "Filename"
+            and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.Is)
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value is None
+        ]
+        self.assertEqual(len(filename_fallbacks), 2)
+        for fallback in filename_fallbacks:
+            fallback_calls = [
+                node
+                for node in ast.walk(fallback)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_gcode_storage_filename"
+            ]
+            self.assertEqual(len(fallback_calls), 1)
+
+        filename_field = Entry("original")
+        program_view = ProgramView()
+        tab = SimpleNamespace(gcodeView=program_view, GCrunTrue=0)
+        runtime = {"GCrowinproc": 0}
+        commands = []
+        storage_requests = []
+        executed_filenames = []
+        startup_errors = []
+        conversion_active = threading.Event()
+        conversion_cancel_requested = threading.Event()
+        conversion_cancel_lock = threading.Lock()
+        media_id = "00112233445566778899AABBCCDDEEFF"
+        media_binding = SimpleNamespace(media_id=media_id)
+
+        def start_storage_request(operation, **kwargs):
+            storage_requests.append((operation, kwargs))
+            return True
+
+        calibration = {
+            "J7PosCur": 0,
+            "J8PosCur": 0,
+            "J9PosCur": 0,
+        }
+        for joint in range(1, 7):
+            calibration[f"J{joint}OpenLoopVal"] = Entry(1)
+
+        namespace = {
+            "GcodeProgEntryField": Entry("loaded"),
+            "GcodeFilenameField": filename_field,
+            "GC_ST_E1_EntryField": Entry("1"),
+            "GC_ST_E2_EntryField": Entry("2"),
+            "GC_ST_E3_EntryField": Entry("3"),
+            "GC_ST_E4_EntryField": Entry("4"),
+            "GC_ST_E5_EntryField": Entry("5"),
+            "GC_ST_E6_EntryField": Entry("6"),
+            "GC_SToff_E1_EntryField": Entry("0"),
+            "GC_SToff_E2_EntryField": Entry("0"),
+            "GC_SToff_E3_EntryField": Entry("0"),
+            "GC_SToff_E4_EntryField": Entry("0"),
+            "GC_SToff_E5_EntryField": Entry("0"),
+            "GC_SToff_E6_EntryField": Entry("0"),
+            "GC_ST_WC_EntryField": Entry("N"),
+            "GcodCurRowEntryField": Entry(),
+            "cmdSentEntryField": Entry(),
+            "RUN": runtime,
+            "CAL": calibration,
+            "tab7": tab,
+            "END": "end",
+            "ROW_EXECUTION_PENDING": "pending",
+            "ROW_EXECUTION_COMPLETE": "complete",
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "MotionInputError": MotionInputError,
+            "validate_controller_media_id": validate_controller_media_id,
+            "messagebox": SimpleNamespace(showwarning=lambda *args: None),
+            "GCalmStatusLab": SimpleNamespace(config=lambda **kwargs: None),
+            "serial_lock": threading.Lock(),
+            "gcode_conversion_active": conversion_active,
+            "gcode_conversion_cancel_requested": (
+                conversion_cancel_requested
+            ),
+            "gcode_conversion_cancel_lock": conversion_cancel_lock,
+            "application_closing": threading.Event(),
+            "_start_gcode_storage_request": start_storage_request,
+            "_current_gcode_storage_media": lambda: media_binding,
+            "_exchange_gcode_row": (
+                lambda command: commands.append(command) or "position"
+            ),
+            "_apply_valid_position_response": lambda response: object(),
+            "ErrorHandler": lambda response: None,
+            "GCstopProg": lambda: None,
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                warning=lambda *args: None,
+                exception=lambda message, *args: startup_errors.append(
+                    message
+                ),
+            ),
+            "print": lambda *args: None,
+        }
+        namespace["_validate_gcode_storage_filename"] = (
+            self.compile_function(
+                "_validate_gcode_storage_filename",
+                namespace,
+            )
+        )
+        namespace["_gcode_storage_filename"] = self.compile_function(
+            "_gcode_storage_filename",
+            namespace,
+        )
+        for assignment_name in (
+            "GCODE_STORAGE_MEDIA_MARKER",
+            "GCODE_STORAGE_FILENAME_MARKER",
+        ):
+            self.compile_assignment(assignment_name, namespace)
+        namespace["_gcode_storage_write_target"] = self.compile_function(
+            "_gcode_storage_write_target",
+            namespace,
+        )
+        execute_row = self.compile_function("GCexecuteRow", namespace)
+
+        def execute_once(
+            filename,
+            selected_media_id,
+            *,
+            conversion_motion_lease=None,
+        ):
+            executed_filenames.append((filename, selected_media_id))
+            result = execute_row(
+                filename,
+                selected_media_id,
+                conversion_motion_lease=conversion_motion_lease,
+            )
+            tab.GCrunTrue = 0
+            return result
+
+        namespace["GCexecuteRow"] = execute_once
+        namespace["threading"] = SimpleNamespace(Thread=CapturedThread)
+        convert = self.compile_function("GCconvertProg", namespace)
+
+        self.assertTrue(convert())
+        self.assertTrue(conversion_active.is_set())
+        self.assertFalse(namespace["motion_request_registry"].active)
+        self.assertIsNone(
+            namespace["_acquire_motion_request"]("Manual motion")
+        )
+        self.assertEqual(commands, [])
+        self.assertEqual(len(storage_requests), 1)
+        self.assertEqual(storage_requests[0][0], "delete")
+        self.assertEqual(
+            storage_requests[0][1]["filename"],
+            "original.txt",
+        )
+
+        filename_field.value = "replacement"
+        callback = storage_requests[0][1]["completion_callback"]
+        self.assertTrue(callback(True), startup_errors)
+
+        self.assertTrue(conversion_active.is_set())
+        self.assertEqual(
+            namespace["motion_request_registry"].active_name,
+            "G-code conversion",
+        )
+        self.assertIsNone(
+            namespace["_acquire_motion_request"](
+                "Controller connection change",
+                allow_position_recovery=True,
+                requires_kinematics=False,
+            )
+        )
+        self.assertEqual(executed_filenames, [])
+        self.assertIsNotNone(CapturedThread.target_callback)
+        CapturedThread.target_callback()
+
+        self.assertEqual(
+            executed_filenames,
+            [("original.txt", media_id)],
+        )
+        self.assertEqual(len(commands), 1)
+        self.assertIn(f"Mi{media_id}", commands[0])
+        self.assertIn("Fnoriginal.txt\n", commands[0])
+        self.assertNotIn("replacement", commands[0])
+        self.assertEqual(filename_field.get(), "replacement")
+        self.assertEqual(runtime["GCrowinproc"], 0)
+        self.assertEqual(tab.GCrunTrue, 0)
+        self.assertFalse(conversion_active.is_set())
+
+    def test_gcode_write_identity_errors_preserve_details_in_both_wc_paths(
+        self,
+    ):
+        class Entry:
+            def __init__(self, value=""):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+        class Label:
+            def __init__(self):
+                self.text = ""
+                self.style = ""
+
+            def config(self, **kwargs):
+                self.text = kwargs.get("text", self.text)
+                self.style = kwargs.get("style", self.style)
+
+        class ProgramView:
+            def __init__(self):
+                self.row = b"G90 "
+
+            @staticmethod
+            def curselection():
+                return (0,)
+
+            @staticmethod
+            def see(row):
+                pass
+
+            def get(self, row):
+                return self.row
+
+        media_id = "00112233445566778899AABBCCDDEEFF"
+        responses = []
+        commands = []
+        legacy_errors = []
+        conversion_stops = []
+        logged_errors = []
+        program_view = ProgramView()
+        tab = SimpleNamespace(gcodeView=program_view, GCrunTrue=1)
+        status = Label()
+        received = Entry()
+        runtime = {
+            "GCrowinproc": 1,
+            "inchTrue": False,
+            "prevxVal": 0,
+            "prevyVal": 0,
+            "prevzVal": 0,
+            "gcodeSpeed": "1",
+        }
+        calibration = {
+            "XcurPos": 0,
+            "YcurPos": 0,
+            "ZcurPos": 0,
+            "RzcurPos": 0,
+            "RycurPos": 0,
+            "RxcurPos": 0,
+            "J7PosCur": 0,
+            "J8PosCur": 0,
+            "J9PosCur": 0,
+        }
+        for joint in range(1, 7):
+            calibration[f"J{joint}OpenLoopVal"] = Entry(1)
+
+        def exchange_row(command):
+            commands.append(command)
+            return responses.pop(0)
+
+        def stop_conversion():
+            conversion_stops.append(True)
+            tab.GCrunTrue = 0
+            return True
+
+        namespace = {
+            "CAL": calibration,
+            "GCalmStatusLab": status,
+            "GC_ST_E1_EntryField": Entry("1"),
+            "GC_ST_E2_EntryField": Entry("2"),
+            "GC_ST_E3_EntryField": Entry("3"),
+            "GC_ST_E4_EntryField": Entry("4"),
+            "GC_ST_E5_EntryField": Entry("5"),
+            "GC_ST_E6_EntryField": Entry("6"),
+            "GC_ST_WC_EntryField": Entry("N"),
+            "GC_SToff_E1_EntryField": Entry("0"),
+            "GC_SToff_E2_EntryField": Entry("0"),
+            "GC_SToff_E3_EntryField": Entry("0"),
+            "GC_SToff_E4_EntryField": Entry("0"),
+            "GC_SToff_E5_EntryField": Entry("0"),
+            "GC_SToff_E6_EntryField": Entry("0"),
+            "GCstopProg": stop_conversion,
+            "GcodeFilenameField": Entry("unused"),
+            "MotionInputError": MotionInputError,
+            "ProtocolResponseError": ProtocolResponseError,
+            "ROW_EXECUTION_COMPLETE": "complete",
+            "ROW_EXECUTION_PENDING": "pending",
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "RUN": runtime,
+            "_apply_valid_position_response": (
+                lambda response: (_ for _ in ()).throw(
+                    AssertionError(
+                        "a storage error must not reach position parsing"
+                    )
+                )
+            ),
+            "_exchange_gcode_row": exchange_row,
+            "_gcode_feed_rate_mm_per_second": (
+                lambda value, inch_mode: "1"
+            ),
+            "cmdRecEntryField": received,
+            "cmdSentEntryField": Entry(),
+            "ErrorHandler": legacy_errors.append,
+            "logger": SimpleNamespace(
+                error=lambda *args: logged_errors.append(args),
+                exception=lambda *args: None,
+            ),
+            "print": lambda *args: None,
+            "tab7": tab,
+            "validate_controller_filename": validate_controller_filename,
+            "validate_controller_media_id": validate_controller_media_id,
+        }
+        namespace["_validate_gcode_storage_filename"] = (
+            self.compile_function(
+                "_validate_gcode_storage_filename",
+                namespace,
+            )
+        )
+        namespace["_gcode_storage_filename"] = self.compile_function(
+            "_gcode_storage_filename",
+            namespace,
+        )
+        for assignment_name in (
+            "GCODE_STORAGE_DETAILED_ERROR_PREFIX",
+            "GCODE_STORAGE_MEDIA_MARKER",
+            "GCODE_STORAGE_FILENAME_MARKER",
+        ):
+            self.compile_assignment(assignment_name, namespace)
+        namespace["_gcode_storage_write_target"] = self.compile_function(
+            "_gcode_storage_write_target",
+            namespace,
+        )
+        for function_name in (
+            "_is_gcode_storage_detailed_error",
+            "_gcode_storage_detailed_error_message",
+            "_render_gcode_storage_detailed_error",
+            "_reject_gcode_storage_write_response",
+        ):
+            namespace[function_name] = self.compile_function(
+                function_name,
+                namespace,
+            )
+        execute_row = self.compile_function("GCexecuteRow", namespace)
+        detailed_error_prefix = namespace[
+            "GCODE_STORAGE_DETAILED_ERROR_PREFIX"
+        ]
+
+        rejection_calls = [
+            node
+            for node in ast.walk(self.module_functions["GCexecuteRow"])
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id
+                    == "_reject_gcode_storage_write_response"
+            )
+        ]
+        self.assertEqual(len(rejection_calls), 2)
+
+        cases = (
+            (b"G90 ", "EG: G-code storage media identity is invalid"),
+            (b"G1 X1 Y2 Z3 F60 ", "EG: G-code storage media changed"),
+        )
+        namespace["gcode_conversion_active"].set()
+        conversion_lease = namespace[
+            "motion_request_registry"
+        ].acquire("G-code conversion")
+        self.assertIsNotNone(conversion_lease)
+        for program_row, response in cases:
+            with self.subTest(program_row=program_row):
+                program_view.row = program_row
+                tab.GCrunTrue = 1
+                runtime["GCrowinproc"] = 1
+                responses.append(response)
+
+                self.assertEqual(
+                    execute_row(
+                        "demo.txt",
+                        media_id,
+                        conversion_motion_lease=conversion_lease,
+                    ),
+                    "rejected",
+                )
+                self.assertEqual(received.value, response)
+                self.assertEqual(
+                    status.text,
+                    "G-CODE STORAGE CONTROLLER ERROR: "
+                    + response[len(detailed_error_prefix):],
+                )
+                self.assertEqual(status.style, "Alarm.TLabel")
+                self.assertEqual(runtime["GCrowinproc"], 0)
+                self.assertEqual(tab.GCrunTrue, 0)
+                self.assertIn(f"Mi{media_id}Fndemo.txt\n", commands[-1])
+        self.assertTrue(conversion_lease.close())
+        namespace["gcode_conversion_active"].clear()
+
+        self.assertEqual(legacy_errors, [])
+        self.assertEqual(len(conversion_stops), len(cases))
+        self.assertEqual(len(logged_errors), len(cases))
 
     def test_gcode_step_rejection_does_not_advance_selection(self):
         program_view = SimpleNamespace(
@@ -15960,20 +19913,59 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(step())
 
     def test_gcode_row_exchange_rechecks_local_stop_under_the_write_lock(self):
-        serial_port = SimpleNamespace(is_open=True)
+        class SerialPort:
+            def __init__(self):
+                self.is_open = True
+                self.stop_on_reset = False
+                self.writes = []
+                self.flushes = 0
+
+            def reset_input_buffer(self):
+                if not self.stop_on_reset:
+                    return
+                acquired = cancellation_lock.acquire()
+                self.assert_lock_acquired(acquired)
+                try:
+                    tab.GCrunTrue = 0
+                finally:
+                    cancellation_lock.release()
+
+            @staticmethod
+            def assert_lock_acquired(acquired):
+                if acquired is False:
+                    raise AssertionError(
+                        "cancellation lock acquisition failed"
+                    )
+
+            def write(self, payload):
+                self.writes.append(payload)
+                return len(payload)
+
+            def flush(self):
+                self.flushes += 1
+
+        serial_port = SerialPort()
         runtime = {"ser": serial_port}
         tab = SimpleNamespace(GCrunTrue=0)
         write_lock = threading.Lock()
-        commands = []
+        cancellation_lock = threading.Lock()
+        conversion_active = threading.Event()
+        conversion_cancelled = threading.Event()
+        application_closing = threading.Event()
         reads = []
         namespace = {
             "_controller_response_timeout": lambda command: 12.0,
             "RUN": runtime,
             "serial_write_lock": write_lock,
+            "gcode_conversion_active": conversion_active,
+            "gcode_conversion_cancel_requested": conversion_cancelled,
+            "gcode_conversion_cancel_lock": cancellation_lock,
+            "application_closing": application_closing,
             "tab7": tab,
-            "write_serial_control": (
-                lambda port, command, **kwargs: commands.append(command)
-            ),
+            "threading": threading,
+            "MotionInputError": MotionInputError,
+            "SerialActivityRejected": SerialActivityRejected,
+            "write_serial_control": write_serial_control,
             "read_serial_line_response": (
                 lambda port, timeout: reads.append(timeout) or "position"
             ),
@@ -15982,19 +19974,33 @@ class HmiSourceContractTests(unittest.TestCase):
         exchange = self.compile_function("_exchange_gcode_row", namespace)
         command = (
             "WCX1Y2Z3Rz4Ry5Rx6J70J80J90"
-            "Sp50Ac10Dc20Rm25WNLm000000Fndemo.txt\n"
+            "Sp50Ac10Dc20Rm25WNLm000000"
+            "Mi00112233445566778899AABBCCDDEEFFFndemo.txt\n"
         )
 
         self.assertIsNone(exchange(command))
-        self.assertEqual(commands, [])
+        self.assertEqual(serial_port.writes, [])
         self.assertEqual(reads, [])
         self.assertFalse(write_lock.locked())
+        self.assertFalse(cancellation_lock.locked())
 
         tab.GCrunTrue = 1
         self.assertEqual(exchange(command), "position")
-        self.assertEqual(commands, [command])
+        self.assertEqual(serial_port.writes, [command.encode("ascii")])
         self.assertEqual(reads, [12.0])
+        self.assertEqual(serial_port.flushes, 1)
         self.assertFalse(write_lock.locked())
+        self.assertFalse(cancellation_lock.locked())
+
+        serial_port.stop_on_reset = True
+        tab.GCrunTrue = 1
+        self.assertIsNone(exchange(command))
+        self.assertEqual(tab.GCrunTrue, 0)
+        self.assertEqual(serial_port.writes, [command.encode("ascii")])
+        self.assertEqual(reads, [12.0])
+        self.assertEqual(serial_port.flushes, 1)
+        self.assertFalse(write_lock.locked())
+        self.assertFalse(cancellation_lock.locked())
 
     def test_reverse_step_supplies_an_async_motion_completion(self):
         reverse_step = self.module_functions["stepRev"]
@@ -19058,6 +23064,16 @@ class HmiSourceContractTests(unittest.TestCase):
 
         cleanup_calls = []
         cleanup_logs = []
+        original_cleanup_functions = {
+            name: namespace[name]
+            for name in (
+                "_apply_program_stop_status_events",
+                "_try_dispatch_controller_correction",
+                "_try_dispatch_auxiliary_stop",
+                "_ensure_startup_auxiliary_cleanup",
+                "logger",
+            )
+        }
 
         def failed_cleanup(name):
             def cleanup():
@@ -19115,6 +23131,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 ),
             ],
         )
+        namespace.update(original_cleanup_functions)
 
     def test_startup_timeout_is_async_and_waits_for_worker_termination(self):
         class Request:
@@ -19190,8 +23207,12 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(worker.is_alive())
         self.assertEqual(finished, [])
 
-        time.sleep(0.03)
-        root.jobs.pop(0)[1]()
+        timeout_deadline = time.monotonic() + 2
+        while not timeouts and time.monotonic() < timeout_deadline:
+            self.assertTrue(root.jobs)
+            root.jobs.pop(0)[1]()
+            if not timeouts:
+                time.sleep(0.005)
         self.assertEqual(timeouts, [True])
         self.assertEqual(finished, [])
         self.assertEqual(spinner.destroy_count, 1)
@@ -19433,11 +23454,13 @@ class HmiSourceContractTests(unittest.TestCase):
                 position,
                 visual_options,
                 auxiliary_serial,
+                controller_identity,
                 auxiliary_error=None,
             ):
                 self.position = position
                 self.visual_options = visual_options
                 self.auxiliary_serial = auxiliary_serial
+                self.controller_identity = controller_identity
                 self.auxiliary_error = auxiliary_error
 
         request = Request()
@@ -19490,6 +23513,12 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].position.raw, raw_position)
         self.assertEqual(results[0].visual_options, ("part.jpg",))
+        self.assertEqual(
+            results[0].controller_identity,
+            parse_controller_identity_response(
+                VALID_CONTROLLER_IDENTITY_RESPONSE
+            ),
+        )
         self.assertIsNone(results[0].auxiliary_error)
         self.assertEqual(closed, [])
         self.assertEqual(
@@ -19570,11 +23599,13 @@ class HmiSourceContractTests(unittest.TestCase):
                 position,
                 visual_options,
                 auxiliary_serial,
+                controller_identity,
                 auxiliary_error=None,
             ):
                 self.position = position
                 self.visual_options = visual_options
                 self.auxiliary_serial = auxiliary_serial
+                self.controller_identity = controller_identity
                 self.auxiliary_error = auxiliary_error
 
         raw_position = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
@@ -19639,6 +23670,12 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
 
                 self.assertIsNone(result.auxiliary_serial)
+                self.assertEqual(
+                    result.controller_identity,
+                    parse_controller_identity_response(
+                        VALID_CONTROLLER_IDENTITY_RESPONSE
+                    ),
+                )
                 self.assertEqual(result.auxiliary_error, expected_error)
                 self.assertEqual(
                     exchanges,
@@ -19666,11 +23703,13 @@ class HmiSourceContractTests(unittest.TestCase):
                 position,
                 visual_options,
                 auxiliary_serial,
+                controller_identity,
                 auxiliary_error=None,
             ):
                 self.position = position
                 self.visual_options = visual_options
                 self.auxiliary_serial = auxiliary_serial
+                self.controller_identity = controller_identity
                 self.auxiliary_error = auxiliary_error
 
         raw_position = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
@@ -19755,6 +23794,12 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
 
                 self.assertIsNone(result.auxiliary_serial)
+                self.assertEqual(
+                    result.controller_identity,
+                    parse_controller_identity_response(
+                        VALID_CONTROLLER_IDENTITY_RESPONSE
+                    ),
+                )
                 self.assertEqual(result.auxiliary_error, expected_error)
                 self.assertFalse(old_serial.is_open)
                 self.assertIsNone(runtime["ser2BoardProfile"])
@@ -19843,6 +23888,7 @@ class HmiSourceContractTests(unittest.TestCase):
             {
                 "dataclass": dataclass,
                 "Optional": Optional,
+                "ControllerIdentity": ControllerIdentity,
                 "PositionResponse": PositionResponse,
                 "ProtocolResponseError": ProtocolResponseError,
                 "os": os,
@@ -19851,15 +23897,30 @@ class HmiSourceContractTests(unittest.TestCase):
         position = parse_position_response(
             "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
         )
+        controller_identity = parse_controller_identity_response(
+            VALID_CONTROLLER_IDENTITY_RESPONSE
+        )
 
-        result = result_type(position, (), None, "  auxiliary offline  ")
+        result = result_type(
+            position,
+            (),
+            None,
+            controller_identity,
+            "  auxiliary offline  ",
+        )
 
         self.assertEqual(result.auxiliary_error, "auxiliary offline")
         with self.assertRaisesRegex(
             ProtocolResponseError,
             "cannot contain both",
         ):
-            result_type(position, (), object(), "auxiliary offline")
+            result_type(
+                position,
+                (),
+                object(),
+                controller_identity,
+                "auxiliary offline",
+            )
 
     def test_startup_exchange_consumes_exact_and_line_firmware_responses(self):
         class SerialPort:
@@ -20082,7 +24143,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(exchanges, ["HO\n", "UPA1\n"])
         self.assertEqual(closed, [auxiliary_serial])
 
-    def test_startup_rejects_missing_wrist_capability_before_side_effects(self):
+    def test_startup_rejects_missing_required_capability_before_side_effects(self):
         class Request:
             auxiliary_port = "COM2"
             auxiliary_board = AUXILIARY_BOARD_NANO
@@ -20090,43 +24151,59 @@ class HmiSourceContractTests(unittest.TestCase):
             external_axis_command = "CEA1\n"
             position_command = "SPA1\n"
 
-        unsupported_identity = json.loads(VALID_CONTROLLER_IDENTITY_RESPONSE)
-        unsupported_identity["ProtocolCapabilities"] = []
-        exchanges = []
-        connections = []
-        cleanup_calls = []
-
-        def exchange(command, *args, **kwargs):
-            exchanges.append(command)
-            if command != "HO\n":
-                raise AssertionError("unsupported firmware must receive no writes")
-            return json.dumps(unsupported_identity, separators=(",", ":"))
-
-        namespace = {
-            "ControllerStartupRequest": Request,
-            "ControllerStartupResult": object,
-            "MotionInputError": MotionInputError,
-            "ProtocolResponseError": ProtocolResponseError,
-            "threading": threading,
-            "_connect_startup_auxiliary": (
-                lambda *args: connections.append(args)
-            ),
-            "_startup_exchange_response": exchange,
-            "parse_position_response": parse_position_response,
-            "_startup_visual_options": lambda: (),
-            "_request_startup_auxiliary_cleanup": cleanup_calls.append,
-        }
-        startup = self.compile_function("startup", namespace)
-
-        with self.assertRaisesRegex(
-            ProtocolResponseError,
-            "lacks command-local JT wrist configuration",
+        for missing_capability in (
+            CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+            CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
+            CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
+            CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
         ):
-            startup(Request(), threading.Event())
+            with self.subTest(missing_capability=missing_capability):
+                unsupported_identity = json.loads(
+                    VALID_CONTROLLER_IDENTITY_RESPONSE
+                )
+                unsupported_identity["ProtocolCapabilities"].remove(
+                    missing_capability
+                )
+                exchanges = []
+                connections = []
+                cleanup_calls = []
 
-        self.assertEqual(exchanges, ["HO\n"])
-        self.assertEqual(connections, [])
-        self.assertEqual(cleanup_calls, [])
+                def exchange(command, *args, **kwargs):
+                    exchanges.append(command)
+                    if command != "HO\n":
+                        raise AssertionError(
+                            "unsupported firmware must receive no writes"
+                        )
+                    return json.dumps(
+                        unsupported_identity,
+                        separators=(",", ":"),
+                    )
+
+                namespace = {
+                    "ControllerStartupRequest": Request,
+                    "ControllerStartupResult": object,
+                    "MotionInputError": MotionInputError,
+                    "ProtocolResponseError": ProtocolResponseError,
+                    "threading": threading,
+                    "_connect_startup_auxiliary": (
+                        lambda *args: connections.append(args)
+                    ),
+                    "_startup_exchange_response": exchange,
+                    "parse_position_response": parse_position_response,
+                    "_startup_visual_options": lambda: (),
+                    "_request_startup_auxiliary_cleanup": cleanup_calls.append,
+                }
+                startup = self.compile_function("startup", namespace)
+
+                with self.assertRaisesRegex(
+                    ProtocolResponseError,
+                    re.escape(missing_capability),
+                ):
+                    startup(Request(), threading.Event())
+
+                self.assertEqual(exchanges, ["HO\n"])
+                self.assertEqual(connections, [])
+                self.assertEqual(cleanup_calls, [])
 
     def test_failed_startup_auxiliary_close_is_retained_and_retried(self):
         class SerialPort:
