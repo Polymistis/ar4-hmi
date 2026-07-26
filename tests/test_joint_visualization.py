@@ -265,7 +265,7 @@ class SliderMarkerGeometryTests(unittest.TestCase):
 
 
 class GhostSliderMarkerTests(unittest.TestCase):
-    def test_real_tk_marker_geometry_and_global_release(self):
+    def test_real_tk_marker_geometry_and_pointer_routing(self):
         try:
             root = tk.Tk()
         except tk.TclError as exc:
@@ -322,6 +322,13 @@ class GhostSliderMarkerTests(unittest.TestCase):
                 add="+",
             )
             slider.bind(
+                "<B1-Motion>",
+                lambda event: forwarded_events.append(
+                    ("motion", event.x, event.y)
+                ),
+                add="+",
+            )
+            slider.bind(
                 "<ButtonRelease-1>",
                 lambda event: forwarded_events.append(
                     ("release", event.x, event.y)
@@ -353,6 +360,35 @@ class GhostSliderMarkerTests(unittest.TestCase):
             self.assertTrue(
                 getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
             )
+            motion_x = 2
+            motion_y = 2
+            expected_motion_x = (
+                marker._marker.winfo_rootx()
+                + motion_x
+                - slider.winfo_rootx()
+            )
+            expected_motion_y = (
+                marker._marker.winfo_rooty()
+                + motion_y
+                - slider.winfo_rooty()
+            )
+            marker._marker.event_generate(
+                "<B1-Motion>",
+                x=motion_x,
+                y=motion_y,
+            )
+            root.update()
+            self.assertEqual(
+                forwarded_events,
+                [
+                    ("press", expected_x, expected_y),
+                    (
+                        "motion",
+                        expected_motion_x,
+                        expected_motion_y,
+                    ),
+                ],
+            )
             marker._marker.event_generate(
                 "<ButtonRelease-1>",
                 x=event_x,
@@ -363,6 +399,11 @@ class GhostSliderMarkerTests(unittest.TestCase):
                 forwarded_events,
                 [
                     ("press", expected_x, expected_y),
+                    (
+                        "motion",
+                        expected_motion_x,
+                        expected_motion_y,
+                    ),
                     ("release", expected_x, expected_y),
                 ],
             )
