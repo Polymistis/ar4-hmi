@@ -286,14 +286,28 @@ class GhostSliderMarkerTests(unittest.TestCase):
                 orient=tk.HORIZONTAL,
             )
             slider.grid(row=0, column=0)
+            sibling = tk.Button(parent, text="sibling")
+            sibling.grid(row=1, column=0)
             marker = GhostSliderMarker(parent, slider)
-            root.update_idletasks()
+            root.geometry("+100000+100000")
+            root.deiconify()
+            root.update()
 
             self.assertTrue(marker.show(25))
             root.update_idletasks()
 
             self.assertEqual(slider.winfo_manager(), "grid")
             self.assertEqual(marker._marker.winfo_manager(), "place")
+            slider.event_generate(
+                "<ButtonPress-1>",
+                x=slider.winfo_width() // 2,
+                y=slider.winfo_height() // 2,
+            )
+            root.update()
+            self.assertTrue(slider._ar4_joint_slider_drag_active)
+            sibling.event_generate("<ButtonRelease-1>", x=1, y=1)
+            root.update()
+            self.assertFalse(slider._ar4_joint_slider_drag_active)
             self.assertTrue(marker.hide())
             root.update_idletasks()
             self.assertEqual(marker._marker.winfo_manager(), "")
