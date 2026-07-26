@@ -289,7 +289,7 @@ class GhostSliderMarkerTests(unittest.TestCase):
             slider.grid(row=0, column=0)
             sibling = tk.Button(parent, text="sibling")
             sibling.grid(row=1, column=0)
-            binding_before = root.bind_all("<ButtonRelease-1>")
+            self.assertFalse(root.bind_all("<ButtonRelease-1>"))
             marker = GhostSliderMarker(parent, slider)
             # Tk drops synthetic pointer events for withdrawn widgets; a
             # one-pixel override-redirect root keeps a mapped event surface
@@ -304,34 +304,68 @@ class GhostSliderMarkerTests(unittest.TestCase):
 
             self.assertEqual(slider.winfo_manager(), "grid")
             self.assertEqual(marker._marker.winfo_manager(), "place")
-            self.assertNotEqual(
-                root.bind_all("<ButtonRelease-1>"),
-                binding_before,
-            )
-            marker._marker.event_generate("<ButtonPress-1>", x=0, y=0)
-            root.update()
-            self.assertTrue(
-                getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
-            )
-            marker._marker.event_generate(
-                "<ButtonRelease-1>",
-                x=0,
-                y=0,
-            )
-            root.update()
-            self.assertFalse(
-                getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
-            )
+            self.assertTrue(root.bind_all("<ButtonRelease-1>"))
             setattr(slider, _SLIDER_DRAG_ATTRIBUTE, True)
             sibling.event_generate("<ButtonRelease-1>", x=0, y=0)
             root.update()
             self.assertFalse(
                 getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
             )
+
             root.unbind_all("<ButtonRelease-1>")
-            setattr(slider, _SLIDER_DRAG_ATTRIBUTE, True)
-            slider.event_generate("<ButtonRelease-1>", x=0, y=0)
+            forwarded_events = []
+            slider.bind(
+                "<ButtonPress-1>",
+                lambda event: forwarded_events.append(
+                    ("press", event.x, event.y)
+                ),
+                add="+",
+            )
+            slider.bind(
+                "<ButtonRelease-1>",
+                lambda event: forwarded_events.append(
+                    ("release", event.x, event.y)
+                ),
+                add="+",
+            )
+            event_x = 1
+            event_y = 1
+            expected_x = (
+                marker._marker.winfo_rootx()
+                + event_x
+                - slider.winfo_rootx()
+            )
+            expected_y = (
+                marker._marker.winfo_rooty()
+                + event_y
+                - slider.winfo_rooty()
+            )
+            marker._marker.event_generate(
+                "<ButtonPress-1>",
+                x=event_x,
+                y=event_y,
+            )
             root.update()
+            self.assertEqual(
+                forwarded_events,
+                [("press", expected_x, expected_y)],
+            )
+            self.assertTrue(
+                getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
+            )
+            marker._marker.event_generate(
+                "<ButtonRelease-1>",
+                x=event_x,
+                y=event_y,
+            )
+            root.update()
+            self.assertEqual(
+                forwarded_events,
+                [
+                    ("press", expected_x, expected_y),
+                    ("release", expected_x, expected_y),
+                ],
+            )
             self.assertFalse(
                 getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
             )
