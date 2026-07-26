@@ -264,7 +264,7 @@ class SliderMarkerGeometryTests(unittest.TestCase):
 
 
 class GhostSliderMarkerTests(unittest.TestCase):
-    def test_real_tk_marker_geometry_and_global_release_binding(self):
+    def test_real_tk_marker_geometry_and_global_release(self):
         try:
             root = tk.Tk()
         except tk.TclError as exc:
@@ -288,20 +288,31 @@ class GhostSliderMarkerTests(unittest.TestCase):
             slider.grid(row=0, column=0)
             sibling = tk.Button(parent, text="sibling")
             sibling.grid(row=1, column=0)
-            binding_before = root.bind_all("<ButtonRelease-1>")
             marker = GhostSliderMarker(parent, slider)
-            root.update_idletasks()
+            # Synthetic Tk pointer events require mapped widgets; an invisible
+            # override-redirect root avoids desktop focus or visible test UI.
+            root.overrideredirect(True)
+            root.attributes("-alpha", 0.0)
+            root.deiconify()
+            root.update()
 
             self.assertTrue(marker.show(25))
-            root.update_idletasks()
+            root.update()
 
             self.assertEqual(slider.winfo_manager(), "grid")
             self.assertEqual(marker._marker.winfo_manager(), "place")
-            self.assertNotEqual(
-                root.bind_all("<ButtonRelease-1>"),
-                binding_before,
+            marker._marker.event_generate(
+                "<ButtonPress-1>",
+                x=1,
+                y=1,
             )
-            self.assertIn("all", sibling.bindtags())
+            root.update()
+            self.assertTrue(slider._ar4_joint_slider_drag_active)
+            sibling.event_generate("<ButtonRelease-1>", x=1, y=1)
+            root.update()
+            self.assertFalse(slider._ar4_joint_slider_drag_active)
+            slider.event_generate("<ButtonRelease-1>", x=1, y=1)
+            root.update()
             self.assertTrue(marker.hide())
             root.update_idletasks()
             self.assertEqual(marker._marker.winfo_manager(), "")
