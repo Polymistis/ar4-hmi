@@ -179,6 +179,7 @@ class GhostSliderMarker:
             "winfo_x",
             "winfo_y",
             "bind",
+            "bind_all",
         )
         if any(
             not callable(getattr(slider, method_name, None))
@@ -229,6 +230,15 @@ class GhostSliderMarker:
             ),
             add="+",
         )
+        self._slider.bind_all(
+            "<ButtonRelease-1>",
+            lambda _event: setattr(
+                self._slider,
+                _SLIDER_DRAG_ATTRIBUTE,
+                False,
+            ),
+            add="+",
+        )
 
     def _forward_pointer(self, sequence, event):
         x = int(event.x_root - self._slider.winfo_rootx())
@@ -237,6 +247,8 @@ class GhostSliderMarker:
         return "break"
 
     def show(self, value):
+        """Show or move the marker and report whether placement changed."""
+
         width = self._slider.winfo_width()
         height = self._slider.winfo_height()
         if width <= 1:
@@ -273,6 +285,8 @@ class GhostSliderMarker:
         return True
 
     def hide(self):
+        """Hide the marker and report whether visibility changed."""
+
         if not self._visible:
             return False
         self._marker.place_forget()

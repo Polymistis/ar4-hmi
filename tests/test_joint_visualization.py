@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import tkinter as tk
 import unittest
 from unittest.mock import patch
 
@@ -76,6 +77,7 @@ class OverlaySlider(FakeSlider):
     def __init__(self, value=0):
         super().__init__(value)
         self.bindings = {}
+        self.global_bindings = {}
         self.generated_events = []
 
     def bind(self, sequence, callback, add=None):
@@ -84,10 +86,18 @@ class OverlaySlider(FakeSlider):
         else:
             self.bindings[sequence] = [callback]
 
+    def bind_all(self, sequence, callback, add=None):
+        if add == "+":
+            self.global_bindings.setdefault(sequence, []).append(callback)
+        else:
+            self.global_bindings[sequence] = [callback]
+
     def event_generate(self, sequence, **coordinates):
         self.generated_events.append((sequence, coordinates))
         event = SimpleNamespace(**coordinates)
         for callback in self.bindings.get(sequence, ()):
+            callback(event)
+        for callback in self.global_bindings.get(sequence, ()):
             callback(event)
 
     @staticmethod
@@ -254,6 +264,42 @@ class SliderMarkerGeometryTests(unittest.TestCase):
 
 
 class GhostSliderMarkerTests(unittest.TestCase):
+    def test_real_tk_marker_coexists_with_grid_managed_slider(self):
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:
+            message = str(exc).lower()
+            if (
+                "no display name" in message
+                or "couldn't connect to display" in message
+            ):
+                self.skipTest("Tk display is unavailable")
+            raise
+        try:
+            root.withdraw()
+            parent = tk.Frame(root)
+            parent.pack()
+            slider = tk.Scale(
+                parent,
+                from_=-100,
+                to=100,
+                orient=tk.HORIZONTAL,
+            )
+            slider.grid(row=0, column=0)
+            marker = GhostSliderMarker(parent, slider)
+            root.update_idletasks()
+
+            self.assertTrue(marker.show(25))
+            root.update_idletasks()
+
+            self.assertEqual(slider.winfo_manager(), "grid")
+            self.assertEqual(marker._marker.winfo_manager(), "place")
+            self.assertTrue(marker.hide())
+            root.update_idletasks()
+            self.assertEqual(marker._marker.winfo_manager(), "")
+        finally:
+            root.destroy()
+
     def test_overlay_forwards_pointer_and_skips_unchanged_placement(self):
         slider = OverlaySlider()
         with patch(
@@ -323,6 +369,42 @@ class GhostSliderMarkerTests(unittest.TestCase):
             tuple(item.value for item in sliders),
             (20.0,) * 9,
         )
+
+    def test_global_release_clears_a_stale_drag(self):
+        slider = OverlaySlider()
+        with patch(
+            "ARrobots.HMI.joint_visualization.tk.Frame",
+            FakeMarkerFrame,
+        ):
+            marker = GhostSliderMarker(object(), slider)
+        pointer = SimpleNamespace(x_root=130, y_root=235)
+        marker._marker.bindings["<ButtonPress-1>"](pointer)
+        self.assertTrue(slider._ar4_joint_slider_drag_active)
+
+        for callback in slider.global_bindings["<ButtonRelease-1>"]:
+            callback(SimpleNamespace())
+
+        self.assertFalse(slider._ar4_joint_slider_drag_active)
+
+    def test_drag_placeholder_keeps_rollback_indices_aligned(self):
+        sliders = [FakeSlider(axis) for axis in range(9)]
+        sliders[1]._ar4_joint_slider_drag_active = True
+        sliders[3] = FailingSlider(3)
+
+        with self.assertRaisesRegex(RuntimeError, "joint slider"):
+            set_joint_slider_positions(sliders, (10,) * 9)
+
+        self.assertEqual(
+            tuple(slider.value for slider in sliders),
+            tuple(range(9)),
+        )
+
+    def test_non_boolean_drag_state_is_rejected(self):
+        sliders = [FakeSlider() for _ in range(9)]
+        sliders[4]._ar4_joint_slider_drag_active = "active"
+
+        with self.assertRaisesRegex(MotionInputError, "must be boolean"):
+            set_joint_slider_positions(sliders, (10,) * 9)
 
 
 class JointMotionVisualizationTests(unittest.TestCase):

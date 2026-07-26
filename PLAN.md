@@ -521,9 +521,10 @@ Display contract:
 - Existing line-oriented firmware reports joint position only in the terminal
   response, so the moving marker is labeled estimated and never advances
   confirmed calibration state.
-- Terminal position feedback remains authoritative and reconciles the normal
-  sliders. Faults or unavailable estimates hide the marker rather than
-  fabricating live position.
+- Terminal position feedback remains authoritative for confirmed state and
+  reconciles every idle normal slider. An actively dragged slider retains
+  operator input until pointer release. Faults or unavailable estimates hide
+  the marker rather than fabricating live position.
 - Cartesian, tool, program, calibration, homing, and indefinite live-jog
   operations remain outside the estimate until a validated trajectory or
   correlated live-telemetry contract supplies meaningful progress.
@@ -538,7 +539,7 @@ Acceptance criteria:
   sleeps, or worker waits.
 - Deterministic hardware-free tests cover step-derived duration, synchronized
   multi-axis interpolation, terminal clamping, toggle behavior, desired-target
-  preservation, and marker geometry.
+  preservation, active-drag preservation, and marker geometry.
 - Live-arm comparison is recorded separately and does not convert an estimate
   into actual telemetry.
 
@@ -555,7 +556,9 @@ Implemented evidence:
 - The complete Windows and Ubuntu hardware-free suites pass. Tracked marker
   tests exercise placement, pointer forwarding, drag preservation, redraw
   suppression, and cleanup without opening the application entry point or a
-  serial transport.
+  serial transport. A hidden real-Tk integration test verifies that the
+  place-managed marker can overlay and clear from a grid-managed scale on
+  display-capable test hosts and skips explicitly when no Tk display exists.
 
 ### M4B - Repeatability and dynamic interception pass
 
