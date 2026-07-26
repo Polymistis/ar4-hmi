@@ -12,6 +12,7 @@ from ARrobots.HMI.joint_motion import (
 from ARrobots.HMI.joint_visualization import (
     GhostSliderMarker,
     JointMotionVisualization,
+    _SLIDER_DRAG_ATTRIBUTE,
     set_joint_slider_positions,
     slider_marker_geometry,
 )
@@ -288,10 +289,12 @@ class GhostSliderMarkerTests(unittest.TestCase):
             slider.grid(row=0, column=0)
             sibling = tk.Button(parent, text="sibling")
             sibling.grid(row=1, column=0)
+            binding_before = root.bind_all("<ButtonRelease-1>")
             marker = GhostSliderMarker(parent, slider)
-            # Synthetic Tk pointer events require mapped widgets; an invisible
-            # override-redirect root avoids desktop focus or visible test UI.
+            # Tk drops synthetic pointer events for withdrawn widgets; a
+            # one-pixel override-redirect root bounds the mapped test surface.
             root.overrideredirect(True)
+            root.geometry("1x1+0+0")
             root.attributes("-alpha", 0.0)
             root.deiconify()
             root.update()
@@ -301,18 +304,22 @@ class GhostSliderMarkerTests(unittest.TestCase):
 
             self.assertEqual(slider.winfo_manager(), "grid")
             self.assertEqual(marker._marker.winfo_manager(), "place")
-            marker._marker.event_generate(
-                "<ButtonPress-1>",
-                x=1,
-                y=1,
+            self.assertNotEqual(
+                root.bind_all("<ButtonRelease-1>"),
+                binding_before,
             )
+            setattr(slider, _SLIDER_DRAG_ATTRIBUTE, True)
+            sibling.event_generate("<ButtonRelease-1>", x=0, y=0)
             root.update()
-            self.assertTrue(slider._ar4_joint_slider_drag_active)
-            sibling.event_generate("<ButtonRelease-1>", x=1, y=1)
+            self.assertFalse(
+                getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
+            )
+            setattr(slider, _SLIDER_DRAG_ATTRIBUTE, True)
+            slider.event_generate("<ButtonRelease-1>", x=0, y=0)
             root.update()
-            self.assertFalse(slider._ar4_joint_slider_drag_active)
-            slider.event_generate("<ButtonRelease-1>", x=1, y=1)
-            root.update()
+            self.assertFalse(
+                getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
+            )
             self.assertTrue(marker.hide())
             root.update_idletasks()
             self.assertEqual(marker._marker.winfo_manager(), "")
