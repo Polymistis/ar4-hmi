@@ -41,9 +41,11 @@ CONTROL_POLL_INTERVAL_SECONDS = 0.05
 RESPONSE_TIMEOUT_SAFETY_SCALE = 1.25
 FIRMWARE_MINIMUM_RAMP_PERCENT = 10.0
 FIRMWARE_LEGACY_RAMP_NUMERATOR = 200.0
+FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS = 30.0
 CONTROLLER_MAXIMUM_RAMP_PERCENT = 100.0
 CONTROLLER_FLOAT_MAX = 3.4028234663852886e38
 CONTROLLER_SIGNED_INT_MAX = 2147483647
+CONTROLLER_MAXIMUM_PULSE_DELAY_MICROSECONDS = 4294967295.0
 CONTROLLER_RADIANS_PER_DEGREE = math.pi / 180.0
 CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1 = (
     "GCODE_DIRECTORY_FRAMING_V1"
@@ -2425,6 +2427,35 @@ def _finite_tuple(values, expected_length, field_name):
     return tuple(normalized)
 
 
+def _nonnegative_integer_tuple(values, expected_length, field_name):
+    if isinstance(values, (str, bytes)):
+        raise MotionInputError(f"{field_name} must be an integer sequence")
+    try:
+        iterator = iter(values)
+    except TypeError as exc:
+        raise MotionInputError(
+            f"{field_name} must be an integer sequence"
+        ) from exc
+
+    normalized = []
+    for index in range(expected_length + 1):
+        try:
+            value = next(iterator)
+        except StopIteration:
+            break
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise MotionInputError(
+                f"{field_name}[{index}] must be a non-negative integer"
+            )
+        normalized.append(value)
+    if len(normalized) != expected_length:
+        raise MotionInputError(
+            f"{field_name} must contain {expected_length} values; "
+            f"got {len(normalized)}"
+        )
+    return tuple(normalized)
+
+
 def _protocol_number(value):
     return controller_protocol_decimal(value, "protocol value")
 
@@ -2657,6 +2688,515 @@ class JointMove:
             self.profile,
             self.calibration,
         )
+
+
+@dataclass(frozen=True)
+class CommandedJointTrajectory:
+    """Display-only RJ estimate for firmware that reports terminal position."""
+
+    start_positions: Tuple[float, ...]
+    target_positions: Tuple[float, ...]
+    estimated_terminal_positions: Tuple[float, ...]
+    step_deltas: Tuple[int, ...]
+    high_steps: int
+    acceleration_steps: float
+    cruise_steps: float
+    deceleration_steps: float
+    average_distribution_delay_microseconds: float
+    cruise_delay_microseconds: float
+    start_delay_microseconds: float
+    end_delay_microseconds: float
+    acceleration_duration_seconds: float
+    cruise_duration_seconds: float
+    deceleration_duration_seconds: float
+    duration_seconds: float
+
+    def __post_init__(self):
+        start_positions = _finite_tuple(
+            self.start_positions,
+            JOINT_COUNT,
+            "trajectory start positions",
+        )
+        target_positions = _finite_tuple(
+            self.target_positions,
+            JOINT_COUNT,
+            "trajectory target positions",
+        )
+        estimated_terminal_positions = _finite_tuple(
+            self.estimated_terminal_positions,
+            JOINT_COUNT,
+            "trajectory estimated terminal positions",
+        )
+        step_deltas = _nonnegative_integer_tuple(
+            self.step_deltas,
+            JOINT_COUNT,
+            "trajectory step deltas",
+        )
+        if (
+            isinstance(self.high_steps, bool)
+            or not isinstance(self.high_steps, int)
+            or self.high_steps < 0
+            or self.high_steps != max(step_deltas)
+        ):
+            raise MotionInputError(
+                "trajectory coordinated step count is invalid"
+            )
+
+        numeric_fields = (
+            "acceleration_steps",
+            "cruise_steps",
+            "deceleration_steps",
+            "average_distribution_delay_microseconds",
+            "cruise_delay_microseconds",
+            "start_delay_microseconds",
+            "end_delay_microseconds",
+            "acceleration_duration_seconds",
+            "cruise_duration_seconds",
+            "deceleration_duration_seconds",
+            "duration_seconds",
+        )
+        numeric_values = {}
+        for field_name in numeric_fields:
+            value = finite_number(
+                getattr(self, field_name),
+                f"trajectory {field_name}",
+            )
+            if value < 0:
+                raise MotionInputError(
+                    f"trajectory {field_name} must be non-negative"
+                )
+            numeric_values[field_name] = value
+
+        phase_steps = (
+            numeric_values["acceleration_steps"]
+            + numeric_values["cruise_steps"]
+            + numeric_values["deceleration_steps"]
+        )
+        step_tolerance = max(0.001, self.high_steps * 1e-6)
+        if not math.isclose(
+            phase_steps,
+            self.high_steps,
+            rel_tol=0.0,
+            abs_tol=step_tolerance,
+        ):
+            raise MotionInputError(
+                "trajectory timing regions do not span the coordinated move"
+            )
+
+        phase_duration = (
+            numeric_values["acceleration_duration_seconds"]
+            + numeric_values["cruise_duration_seconds"]
+            + numeric_values["deceleration_duration_seconds"]
+        )
+        if not math.isclose(
+            phase_duration,
+            numeric_values["duration_seconds"],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        ):
+            raise MotionInputError(
+                "trajectory phase durations do not match the total duration"
+            )
+        if self.high_steps == 0:
+            if any(numeric_values.values()):
+                raise MotionInputError(
+                    "zero-step trajectory must have zero timing values"
+                )
+        elif (
+            numeric_values["cruise_delay_microseconds"] <= 0
+            or numeric_values["start_delay_microseconds"] <= 0
+            or numeric_values["end_delay_microseconds"] <= 0
+            or numeric_values["duration_seconds"] <= 0
+        ):
+            raise MotionInputError(
+                "moving trajectory requires positive timing values"
+            )
+
+        object.__setattr__(self, "start_positions", start_positions)
+        object.__setattr__(self, "target_positions", target_positions)
+        object.__setattr__(
+            self,
+            "estimated_terminal_positions",
+            estimated_terminal_positions,
+        )
+        object.__setattr__(self, "step_deltas", step_deltas)
+        for field_name, value in numeric_values.items():
+            object.__setattr__(self, field_name, value)
+
+    def progress_at(self, elapsed_seconds):
+        elapsed = finite_number(elapsed_seconds, "trajectory elapsed time")
+        if elapsed < 0:
+            raise MotionInputError(
+                "trajectory elapsed time must be non-negative"
+            )
+        if self.high_steps == 0:
+            return 0.0
+        if elapsed >= self.duration_seconds:
+            return 1.0
+
+        elapsed_microseconds = elapsed * 1_000_000.0
+        acceleration_duration = (
+            self.acceleration_duration_seconds * 1_000_000.0
+        )
+        cruise_duration = self.cruise_duration_seconds * 1_000_000.0
+
+        if elapsed_microseconds < acceleration_duration:
+            phase_steps = _linear_delay_phase_steps(
+                elapsed_microseconds,
+                self.acceleration_steps,
+                self.start_delay_microseconds,
+                self.cruise_delay_microseconds,
+            )
+            completed_steps = phase_steps
+        elif elapsed_microseconds < acceleration_duration + cruise_duration:
+            cruise_elapsed = elapsed_microseconds - acceleration_duration
+            completed_steps = self.acceleration_steps + (
+                cruise_elapsed / self.cruise_delay_microseconds
+            )
+        else:
+            deceleration_elapsed = (
+                elapsed_microseconds
+                - acceleration_duration
+                - cruise_duration
+            )
+            phase_steps = _linear_delay_phase_steps(
+                deceleration_elapsed,
+                self.deceleration_steps,
+                self.cruise_delay_microseconds,
+                self.end_delay_microseconds,
+            )
+            completed_steps = (
+                self.acceleration_steps
+                + self.cruise_steps
+                + phase_steps
+            )
+
+        return min(1.0, max(0.0, completed_steps / self.high_steps))
+
+    def positions_at(self, elapsed_seconds):
+        progress = self.progress_at(elapsed_seconds)
+        return tuple(
+            start + (target - start) * progress
+            for start, target in zip(
+                self.start_positions,
+                self.estimated_terminal_positions,
+            )
+        )
+
+
+def _linear_delay_phase_steps(
+    elapsed_microseconds,
+    phase_steps,
+    initial_delay_microseconds,
+    final_delay_microseconds,
+):
+    if phase_steps <= 0 or elapsed_microseconds <= 0:
+        return 0.0
+    phase_duration = (
+        phase_steps
+        * (initial_delay_microseconds + final_delay_microseconds)
+        * 0.5
+    )
+    if elapsed_microseconds >= phase_duration:
+        return phase_steps
+
+    delay_change = final_delay_microseconds - initial_delay_microseconds
+    if delay_change == 0:
+        return min(
+            phase_steps,
+            elapsed_microseconds / initial_delay_microseconds,
+        )
+
+    quadratic = delay_change / (2.0 * phase_steps)
+    discriminant = (
+        initial_delay_microseconds * initial_delay_microseconds
+        + 4.0 * quadratic * elapsed_microseconds
+    )
+    if discriminant < 0:
+        raise MotionInputError("trajectory phase timing is not invertible")
+    denominator = initial_delay_microseconds + math.sqrt(discriminant)
+    if denominator <= 0:
+        raise MotionInputError("trajectory phase timing is not invertible")
+    return min(
+        phase_steps,
+        max(0.0, 2.0 * elapsed_microseconds / denominator),
+    )
+
+
+def _controller_calibrated_step(position, calibration, axis):
+    position_float = _controller_float(position, f"J{axis} position")
+    negative_float = _controller_float(
+        calibration.negative_limits[axis - 1],
+        f"J{axis} negative limit",
+    )
+    scale_float = _controller_float(
+        calibration.steps_per_unit[axis - 1],
+        f"J{axis} steps per unit",
+    )
+    shifted_position = _controller_float(
+        position_float + negative_float,
+        f"J{axis} shifted position",
+    )
+    future_step = _controller_float_product(
+        shifted_position,
+        scale_float,
+        f"J{axis} future step position",
+    )
+    if future_step < 0 or future_step > CONTROLLER_SIGNED_INT_MAX:
+        raise MotionInputError(
+            f"J{axis} position exceeds the controller step range"
+        )
+    return int(future_step)
+
+
+def _controller_position_from_step(step, calibration, axis):
+    scale_float = _controller_float(
+        calibration.steps_per_unit[axis - 1],
+        f"J{axis} steps per unit",
+    )
+    negative_float = _controller_float(
+        calibration.negative_limits[axis - 1],
+        f"J{axis} negative limit",
+    )
+    zero_step_value = _controller_float_product(
+        negative_float,
+        scale_float,
+        f"J{axis} zero step position",
+    )
+    if zero_step_value < 0 or zero_step_value > CONTROLLER_SIGNED_INT_MAX:
+        raise MotionInputError(
+            f"J{axis} zero step exceeds the controller range"
+        )
+    zero_step = int(zero_step_value)
+    relative_step = step - zero_step
+    return _controller_float(
+        _controller_float(
+            relative_step,
+            f"J{axis} relative step position",
+        )
+        / scale_float,
+        f"J{axis} estimated terminal position",
+    )
+
+
+def estimate_commanded_joint_trajectory(
+    start_positions,
+    move,
+    minimum_step_delay_microseconds,
+):
+    """Estimate the coordinated RJ timing envelope without claiming telemetry."""
+
+    if not isinstance(move, JointMove):
+        raise MotionInputError("move must be a JointMove")
+    start = move.calibration.validate_positions(start_positions)
+    target = move.calibration.validate_positions(move.positions)
+    minimum_delay = _controller_float(
+        minimum_step_delay_microseconds,
+        "controller minimum step delay",
+    )
+    if minimum_delay <= 0:
+        raise MotionInputError(
+            "controller minimum step delay must be positive"
+        )
+
+    start_steps = tuple(
+        _controller_calibrated_step(position, move.calibration, axis)
+        for axis, position in enumerate(start, start=1)
+    )
+    target_steps = tuple(
+        _controller_calibrated_step(position, move.calibration, axis)
+        for axis, position in enumerate(target, start=1)
+    )
+    step_deltas = tuple(
+        abs(target_step - start_step)
+        for start_step, target_step in zip(start_steps, target_steps)
+    )
+    high_steps = max(step_deltas)
+    if high_steps == 0:
+        return CommandedJointTrajectory(
+            start_positions=start,
+            target_positions=target,
+            estimated_terminal_positions=start,
+            step_deltas=step_deltas,
+            high_steps=0,
+            acceleration_steps=0.0,
+            cruise_steps=0.0,
+            deceleration_steps=0.0,
+            average_distribution_delay_microseconds=0.0,
+            cruise_delay_microseconds=0.0,
+            start_delay_microseconds=0.0,
+            end_delay_microseconds=0.0,
+            acceleration_duration_seconds=0.0,
+            cruise_duration_seconds=0.0,
+            deceleration_duration_seconds=0.0,
+            duration_seconds=0.0,
+        )
+
+    estimated_terminal_positions = tuple(
+        (
+            _controller_position_from_step(
+                target_step,
+                move.calibration,
+                axis,
+            )
+            if step_delta > 0
+            else start_position
+        )
+        for axis, (
+            start_position,
+            target_step,
+            step_delta,
+        ) in enumerate(
+            zip(start, target_steps, step_deltas),
+            start=1,
+        )
+    )
+
+    high_steps_float = _controller_float(high_steps, "coordinated step count")
+    acceleration_ratio = _controller_float(
+        move.profile.acceleration / 100.0,
+        "acceleration ratio",
+    )
+    deceleration_ratio = _controller_float(
+        move.profile.deceleration / 100.0,
+        "deceleration ratio",
+    )
+    acceleration_steps = _controller_float_product(
+        high_steps_float,
+        acceleration_ratio,
+        "acceleration step count",
+    )
+    deceleration_steps = _controller_float_product(
+        high_steps_float,
+        deceleration_ratio,
+        "deceleration step count",
+    )
+    cruise_steps = _controller_float(
+        _controller_float(
+            high_steps_float - acceleration_steps,
+            "pre-deceleration step count",
+        )
+        - deceleration_steps,
+        "cruise step count",
+    )
+    if cruise_steps < 0:
+        raise MotionInputError(
+            "controller timing regions overlap after float encoding"
+        )
+
+    ramp = max(move.profile.ramp, FIRMWARE_MINIMUM_RAMP_PERCENT)
+    ramp_factor = _controller_float(
+        ramp / FIRMWARE_MINIMUM_RAMP_PERCENT,
+        "motion ramp factor",
+    )
+    acceleration_weight = _controller_float_product(
+        acceleration_steps,
+        _controller_float(1.0 + ramp_factor, "acceleration timing factor"),
+        "acceleration timing weight",
+    )
+    deceleration_weight = _controller_float_product(
+        deceleration_steps,
+        _controller_float(1.0 + ramp_factor, "deceleration timing factor"),
+        "deceleration timing weight",
+    )
+    ramp_weight = _controller_float(
+        acceleration_weight + deceleration_weight,
+        "ramp timing weight",
+    )
+    denominator = cruise_steps + ramp_weight * 0.5
+
+    if move.profile.speed_prefix == "Ss":
+        target_duration_microseconds = move.profile.speed * 1_000_000.0
+        if denominator <= 0:
+            cruise_delay = _controller_float(
+                target_duration_microseconds / high_steps,
+                "seconds-mode cruise delay",
+            )
+        else:
+            cruise_delay = _controller_float(
+                target_duration_microseconds / denominator,
+                "seconds-mode cruise delay",
+            )
+        cruise_delay = max(cruise_delay, minimum_delay)
+    else:
+        speed_ratio = _controller_float(
+            move.profile.speed / 100.0,
+            "percent speed ratio",
+        )
+        cruise_delay = _controller_float(
+            minimum_delay / speed_ratio,
+            "percent-mode cruise delay",
+        )
+
+    start_delay = _controller_float_product(
+        cruise_delay,
+        ramp_factor,
+        "motion start delay",
+    )
+    end_delay = _controller_float_product(
+        cruise_delay,
+        ramp_factor,
+        "motion end delay",
+    )
+    average_distribution_delay = (
+        FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS
+        * sum(step_deltas)
+        / high_steps
+    )
+    effective_delay_floor = minimum_delay + average_distribution_delay
+    cruise_delay = max(cruise_delay, effective_delay_floor)
+    start_delay = max(start_delay, effective_delay_floor)
+    end_delay = max(end_delay, effective_delay_floor)
+    for label, delay in (
+        ("cruise", cruise_delay),
+        ("start", start_delay),
+        ("end", end_delay),
+    ):
+        if (
+            delay <= 0
+            or delay > CONTROLLER_MAXIMUM_PULSE_DELAY_MICROSECONDS
+        ):
+            raise MotionInputError(
+                f"controller {label} delay is outside the firmware range"
+            )
+
+    acceleration_duration = (
+        acceleration_steps * (start_delay + cruise_delay) * 0.5
+    ) / 1_000_000.0
+    cruise_duration = (
+        cruise_steps * cruise_delay
+    ) / 1_000_000.0
+    deceleration_duration = (
+        deceleration_steps * (cruise_delay + end_delay) * 0.5
+    ) / 1_000_000.0
+    duration = (
+        acceleration_duration
+        + cruise_duration
+        + deceleration_duration
+    )
+    if not math.isfinite(duration) or duration <= 0:
+        raise MotionInputError("estimated joint trajectory duration is invalid")
+
+    return CommandedJointTrajectory(
+        start_positions=start,
+        target_positions=target,
+        estimated_terminal_positions=estimated_terminal_positions,
+        step_deltas=step_deltas,
+        high_steps=high_steps,
+        acceleration_steps=acceleration_steps,
+        cruise_steps=cruise_steps,
+        deceleration_steps=deceleration_steps,
+        average_distribution_delay_microseconds=(
+            average_distribution_delay
+        ),
+        cruise_delay_microseconds=cruise_delay,
+        start_delay_microseconds=start_delay,
+        end_delay_microseconds=end_delay,
+        acceleration_duration_seconds=acceleration_duration,
+        cruise_duration_seconds=cruise_duration,
+        deceleration_duration_seconds=deceleration_duration,
+        duration_seconds=duration,
+    )
 
 
 _NUMBER = r"-?(?:\d+(?:\.\d*)?|\.\d+)"
@@ -3309,6 +3849,7 @@ class MotionSubmission:
 class MotionEvent:
     kind: str
     move: JointMove
+    started_at_seconds: Optional[float] = None
     response: Optional[str] = None
     position: Optional[PositionResponse] = None
     error: Optional[str] = None
@@ -3754,7 +4295,14 @@ class CoalescingJointDispatcher:
             if move is None:
                 return
 
-            self._events.put(MotionEvent(kind="started", move=move))
+            started_at_seconds = time.monotonic()
+            self._events.put(
+                MotionEvent(
+                    kind="started",
+                    move=move,
+                    started_at_seconds=started_at_seconds,
+                )
+            )
             response = None
             position = None
             try:

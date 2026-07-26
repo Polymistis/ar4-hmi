@@ -36,6 +36,7 @@ from ARrobots.HMI.joint_motion import (
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+    FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS,
     ControllerIdentity,
     ControllerJointCalibration,
     MotionInputError,
@@ -305,6 +306,22 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault(
             "_reschedule_event_poll",
             reschedule_event_poll,
+        )
+        namespace.setdefault(
+            "_set_joint_motion_target_display",
+            lambda target_positions: tuple(target_positions),
+        )
+        namespace.setdefault(
+            "_start_joint_motion_visualization",
+            lambda move, started_at_seconds: True,
+        )
+        namespace.setdefault(
+            "_refresh_joint_motion_visualization",
+            lambda: None,
+        )
+        namespace.setdefault(
+            "_finish_joint_motion_visualization",
+            lambda: True,
         )
         namespace.setdefault("dataclass", dataclass)
         namespace.setdefault("threading", threading)
@@ -12801,6 +12818,109 @@ class HmiSourceContractTests(unittest.TestCase):
             self.assertIsInstance(target_calls[0].args[0], ast.Constant, name)
             self.assertEqual(target_calls[0].args[0].value, axis, name)
 
+    def test_joint_motion_estimate_is_toggleable_and_wired_to_tk_polling(self):
+        toggle_assignments = [
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Subscript)
+            and isinstance(node.targets[0].value, ast.Name)
+            and node.targets[0].value.id == "RUN"
+            and isinstance(node.targets[0].slice, ast.Constant)
+            and node.targets[0].slice.value == "showEstimatedMotion"
+        ]
+        self.assertEqual(len(toggle_assignments), 1)
+        toggle_constructor = toggle_assignments[0].value
+        self.assertIsInstance(toggle_constructor, ast.Call)
+        self.assertIsInstance(toggle_constructor.func, ast.Name)
+        self.assertEqual(toggle_constructor.func.id, "IntVar")
+        self.assertEqual(
+            {
+                keyword.arg: ast.literal_eval(keyword.value)
+                for keyword in toggle_constructor.keywords
+            },
+            {"value": 1},
+        )
+
+        visualization_assignment = self.module_assignments[
+            "joint_motion_visualization"
+        ]
+        constructor = visualization_assignment.value
+        self.assertIsInstance(constructor, ast.Call)
+        self.assertIsInstance(constructor.func, ast.Name)
+        self.assertEqual(constructor.func.id, "JointMotionVisualization")
+        keywords = {
+            keyword.arg: keyword.value
+            for keyword in constructor.keywords
+        }
+        slider_names = tuple(
+            element.id
+            for element in keywords["sliders"].elts
+        )
+        self.assertEqual(
+            slider_names,
+            tuple(f"J{axis}jogslide" for axis in range(1, 10)),
+        )
+        marker_calls = keywords["markers"].elts
+        self.assertEqual(len(marker_calls), 9)
+        for axis, marker_call in enumerate(marker_calls, start=1):
+            self.assertIsInstance(marker_call, ast.Call)
+            self.assertIsInstance(marker_call.func, ast.Name)
+            self.assertEqual(marker_call.func.id, "GhostSliderMarker")
+            self.assertEqual(
+                tuple(argument.id for argument in marker_call.args),
+                (f"J{axis}jogFrame", f"J{axis}jogslide"),
+            )
+
+        poll_calls = [
+            node.func.id
+            for node in ast.walk(
+                self.module_functions["_poll_joint_motion_events"]
+            )
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+        ]
+        self.assertIn("_start_joint_motion_visualization", poll_calls)
+        self.assertIn("_refresh_joint_motion_visualization", poll_calls)
+        self.assertIn("_finish_joint_motion_visualization", poll_calls)
+
+        start_calls = [
+            node
+            for node in ast.walk(
+                self.module_functions["_poll_joint_motion_events"]
+            )
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_start_joint_motion_visualization"
+        ]
+        self.assertEqual(len(start_calls), 1)
+        self.assertEqual(
+            tuple(
+                (argument.value.id, argument.attr)
+                for argument in start_calls[0].args
+                if isinstance(argument, ast.Attribute)
+                and isinstance(argument.value, ast.Name)
+            ),
+            (
+                ("event", "move"),
+                ("event", "started_at_seconds"),
+            ),
+        )
+
+        for function_name in (
+            "_queue_joint_motion",
+            "_try_dispatch_deferred_joint_adjustments",
+        ):
+            target_calls = [
+                node
+                for node in ast.walk(self.module_functions[function_name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_set_joint_motion_target_display"
+            ]
+            self.assertEqual(len(target_calls), 1, function_name)
+
     def test_primary_joint_entry_factory_binds_typed_absolute_targets(self):
         function = self.module_functions["create_joint_jog_frame"]
         bind_calls = [
@@ -18493,6 +18613,43 @@ class HmiSourceContractTests(unittest.TestCase):
             write_branch,
         )
 
+    def test_joint_estimator_timing_constants_match_active_firmware(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        driver_start = firmware.index("bool driveMotorsJ(")
+        driver_end = firmware.index("//DRIVE MOTORS G", driver_start)
+        driver = firmware[driver_start:driver_end]
+        distribution_match = re.search(
+            r"\bfloat\s+distDelay\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*;",
+            driver,
+        )
+        minimum_match = re.search(
+            r"\bfloat\s+minSpeedDelay\s*=\s*"
+            r"([0-9]+(?:\.[0-9]+)?)\s*;",
+            firmware,
+        )
+        runtime_assignment = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Subscript)
+            and isinstance(node.targets[0].value, ast.Name)
+            and node.targets[0].value.id == "RUN"
+            and isinstance(node.targets[0].slice, ast.Constant)
+            and node.targets[0].slice.value == "minSpeedDelay"
+        )
+
+        self.assertIsNotNone(distribution_match)
+        self.assertIsNotNone(minimum_match)
+        self.assertEqual(
+            float(distribution_match.group(1)),
+            FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS,
+        )
+        self.assertEqual(
+            float(minimum_match.group(1)),
+            float(ast.literal_eval(runtime_assignment.value)),
+        )
+
     def test_tool_jog_directions_match_the_firmware_contract(self):
         discrete_commands = {
             "TXjogNeg": "JTX1",
@@ -20738,6 +20895,7 @@ class HmiSourceContractTests(unittest.TestCase):
         class Dispatcher:
             def __init__(self):
                 self.pending = False
+                self.desired_target = (0.0,) * 9
                 self.events = []
 
             def drain_events(self):

@@ -20,6 +20,7 @@ from ARrobots.HMI.joint_motion import (
     CONTROLLER_MAXIMUM_RAMP_PERCENT,
     CoalescingJointDispatcher,
     CommandTiming,
+    CommandedJointTrajectory,
     ControllerIdentity,
     ControllerJointCalibration,
     DeferredLiveMotionArbiter,
@@ -29,6 +30,7 @@ from ARrobots.HMI.joint_motion import (
     MAX_RESPONSE_PAYLOAD_LENGTH,
     MAX_CONTROLLER_FILENAME_BYTES,
     DeferredJointAdjustments,
+    JointMove,
     MotionInputError,
     MotionProfile,
     MotionQueueFault,
@@ -52,6 +54,7 @@ from ARrobots.HMI.joint_motion import (
     decode_serial_response_line,
     exchange_serial_line,
     exchange_serial_line_until_cancelled,
+    estimate_commanded_joint_trajectory,
     finite_number,
     motion_timing_response_timeout,
     normalize_auxiliary_board_profile,
@@ -3598,6 +3601,207 @@ class JointMotionProtocolTests(unittest.TestCase):
             MotionProfile("Sp", 50, 10, 10, 25, "N", None)
 
 
+class CommandedJointTrajectoryTests(unittest.TestCase):
+    def setUp(self):
+        self.calibration = controller_calibration()
+        self.start = (0,) * 9
+
+    def move(self, target, profile):
+        return JointMove(target, profile, self.calibration)
+
+    def test_percent_profile_models_synchronized_firmware_envelope(self):
+        profile = MotionProfile(
+            "Sp",
+            50,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move((10, -5, 0, 0, 0, 0, 0, 0, 0), profile),
+            200,
+        )
+
+        self.assertIsInstance(trajectory, CommandedJointTrajectory)
+        self.assertEqual(
+            trajectory.step_deltas,
+            (1000, 500, 0, 0, 0, 0, 0, 0, 0),
+        )
+        self.assertEqual(trajectory.high_steps, 1000)
+        self.assertAlmostEqual(trajectory.duration_seconds, 0.48)
+        self.assertEqual(trajectory.positions_at(0), (0.0,) * 9)
+        self.assertEqual(
+            trajectory.positions_at(trajectory.duration_seconds / 2)[:2],
+            (5.0, -2.5),
+        )
+        self.assertEqual(
+            trajectory.positions_at(trajectory.duration_seconds + 1),
+            (10.0, -5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        )
+
+    def test_seconds_profile_uses_requested_duration_when_not_clamped(self):
+        profile = MotionProfile(
+            "Ss",
+            2,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move((10, 0, 0, 0, 0, 0, 0, 0, 0), profile),
+            200,
+        )
+
+        self.assertAlmostEqual(trajectory.duration_seconds, 2.0, places=6)
+        self.assertAlmostEqual(trajectory.positions_at(1.0)[0], 5.0, places=5)
+
+    def test_fast_profile_includes_synchronized_pulse_distribution_cost(self):
+        profile = MotionProfile(
+            "Sp",
+            100,
+            20,
+            20,
+            10,
+            "N",
+            "000000",
+        )
+        single_axis = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move((10, 0, 0, 0, 0, 0, 0, 0, 0), profile),
+            200,
+        )
+        all_axes = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move((10,) * 9, profile),
+            200,
+        )
+
+        self.assertEqual(
+            single_axis.average_distribution_delay_microseconds,
+            30,
+        )
+        self.assertEqual(
+            all_axes.average_distribution_delay_microseconds,
+            270,
+        )
+        self.assertAlmostEqual(single_axis.duration_seconds, 0.23)
+        self.assertAlmostEqual(all_axes.duration_seconds, 0.47)
+
+    def test_zero_step_delta_holds_confirmed_start_until_terminal_feedback(self):
+        profile = MotionProfile(
+            "Sp",
+            50,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move((0.009, 0, 0, 0, 0, 0, 0, 0, 0), profile),
+            200,
+        )
+
+        self.assertEqual(trajectory.high_steps, 0)
+        self.assertEqual(trajectory.duration_seconds, 0)
+        self.assertEqual(trajectory.positions_at(60), (0.0,) * 9)
+
+    def test_substep_axis_remains_at_confirmed_position_during_other_motion(self):
+        profile = MotionProfile(
+            "Sp",
+            50,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move((10, 0.009, 0, 0, 0, 0, 0, 0, 0), profile),
+            200,
+        )
+
+        self.assertEqual(trajectory.target_positions[1], 0.009)
+        self.assertEqual(trajectory.step_deltas[1], 0)
+        self.assertEqual(trajectory.positions_at(trajectory.duration_seconds)[1], 0)
+
+    def test_terminal_estimate_uses_controller_integer_zero_step(self):
+        calibration = controller_calibration(
+            negative_limits=(170,) * 9,
+            positive_limits=(170,) * 9,
+            steps_per_unit=(6400 / 360,) * 9,
+        )
+        profile = MotionProfile(
+            "Sp",
+            50,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        target = 10.2
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            JointMove(
+                (target, 0, 0, 0, 0, 0, 0, 0, 0),
+                profile,
+                calibration,
+            ),
+            200,
+        )
+        float32 = lambda value: struct.unpack(
+            ">f",
+            struct.pack(">f", value),
+        )[0]
+        negative = float32(170)
+        scale = float32(6400 / 360)
+        zero_step = int(float32(negative * scale))
+        target_step = int(
+            float32(float32(float32(target) + negative) * scale)
+        )
+        expected = float32(float32(target_step - zero_step) / scale)
+
+        self.assertEqual(trajectory.estimated_terminal_positions[0], expected)
+
+    def test_estimator_rejects_invalid_timing_boundaries(self):
+        profile = MotionProfile(
+            "Sp",
+            50,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        move = self.move((10, 0, 0, 0, 0, 0, 0, 0, 0), profile)
+
+        for invalid_delay in (0, -1, float("nan"), True):
+            with self.subTest(invalid_delay=invalid_delay):
+                with self.assertRaises(MotionInputError):
+                    estimate_commanded_joint_trajectory(
+                        self.start,
+                        move,
+                        invalid_delay,
+                    )
+
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            move,
+            200,
+        )
+        with self.assertRaisesRegex(MotionInputError, "non-negative"):
+            trajectory.positions_at(-0.1)
+
+
 class CoalescingJointDispatcherTests(unittest.TestCase):
     def setUp(self):
         self.profile = MotionProfile("Sp", 50, 10, 10, 25, "N", "000000")
@@ -3651,6 +3855,20 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         self.assertEqual(
             [event.kind for event in events],
             ["started", "completed", "started", "completed"],
+        )
+        started_events = [
+            event for event in events if event.kind == "started"
+        ]
+        self.assertTrue(
+            all(
+                isinstance(event.started_at_seconds, float)
+                and math.isfinite(event.started_at_seconds)
+                for event in started_events
+            )
+        )
+        self.assertLessEqual(
+            started_events[0].started_at_seconds,
+            started_events[1].started_at_seconds,
         )
 
     def test_repeated_absolute_targets_replace_instead_of_accumulating(self):

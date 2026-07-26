@@ -1,0 +1,304 @@
+import unittest
+
+from ARrobots.HMI.joint_motion import (
+    ControllerJointCalibration,
+    JointMove,
+    MotionInputError,
+    MotionProfile,
+)
+from ARrobots.HMI.joint_visualization import (
+    JointMotionVisualization,
+    slider_marker_geometry,
+)
+
+
+class FakeSlider:
+    def __init__(self, value=0):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+class FailingSlider(FakeSlider):
+    def set(self, value):
+        raise RuntimeError("slider write failed")
+
+
+class FakeMarker:
+    def __init__(self, fail_show=False):
+        self.fail_show = fail_show
+        self.visible = False
+        self.value = None
+        self.hide_count = 0
+
+    def show(self, value):
+        if self.fail_show:
+            raise RuntimeError("marker draw failed")
+        self.visible = True
+        self.value = value
+
+    def hide(self):
+        self.visible = False
+        self.hide_count += 1
+
+
+def joint_move():
+    calibration = ControllerJointCalibration(
+        negative_limits=(100,) * 9,
+        positive_limits=(100,) * 9,
+        steps_per_unit=(100,) * 9,
+    )
+    profile = MotionProfile(
+        "Sp",
+        50,
+        20,
+        20,
+        20,
+        "N",
+        "000000",
+    )
+    return JointMove(
+        (10, -5, 0, 0, 0, 0, 0, 0, 0),
+        profile,
+        calibration,
+    )
+
+
+class SliderMarkerGeometryTests(unittest.TestCase):
+    def test_geometry_tracks_ascending_and_descending_ranges(self):
+        lower = slider_marker_geometry(
+            -100,
+            -100,
+            100,
+            10,
+            20,
+            200,
+            20,
+        )
+        middle = slider_marker_geometry(
+            0,
+            -100,
+            100,
+            10,
+            20,
+            200,
+            20,
+        )
+        upper = slider_marker_geometry(
+            100,
+            -100,
+            100,
+            10,
+            20,
+            200,
+            20,
+        )
+        descending_lower = slider_marker_geometry(
+            100,
+            100,
+            -100,
+            10,
+            20,
+            200,
+            20,
+        )
+        descending_upper = slider_marker_geometry(
+            -100,
+            100,
+            -100,
+            10,
+            20,
+            200,
+            20,
+        )
+
+        self.assertEqual(lower, (20.0, 30.0, 18))
+        self.assertEqual(middle, (110.0, 30.0, 18))
+        self.assertEqual(upper, (200.0, 30.0, 18))
+        self.assertEqual(descending_lower, lower)
+        self.assertEqual(descending_upper, upper)
+
+    def test_geometry_clamps_values_and_centers_degenerate_ranges(self):
+        below = slider_marker_geometry(
+            -200,
+            -100,
+            100,
+            10,
+            20,
+            200,
+            20,
+        )
+        above = slider_marker_geometry(
+            200,
+            -100,
+            100,
+            10,
+            20,
+            200,
+            20,
+        )
+        degenerate = slider_marker_geometry(
+            7,
+            0,
+            0,
+            10,
+            20,
+            200,
+            20,
+        )
+
+        self.assertEqual(below[0], 20.0)
+        self.assertEqual(above[0], 200.0)
+        self.assertEqual(degenerate[0], 110.0)
+
+        for width, height in ((0, 20), (200, 0), (-1, 20)):
+            with self.subTest(width=width, height=height):
+                with self.assertRaisesRegex(MotionInputError, "positive"):
+                    slider_marker_geometry(
+                        0,
+                        -100,
+                        100,
+                        10,
+                        20,
+                        width,
+                        height,
+                    )
+
+
+class JointMotionVisualizationTests(unittest.TestCase):
+    def setUp(self):
+        self.sliders = [FakeSlider() for _ in range(9)]
+        self.markers = [FakeMarker() for _ in range(9)]
+        self.enabled = {"value": 1}
+        self.clock = {"value": 10.0}
+        self.visualization = JointMotionVisualization(
+            self.sliders,
+            self.markers,
+            lambda: self.enabled["value"],
+            clock=lambda: self.clock["value"],
+        )
+
+    def test_start_preserves_newer_desired_target_and_updates_estimate(self):
+        queued_target = (20, 4, 3, 2, 1, 0, 6, 7, 8)
+        self.visualization.set_desired(queued_target)
+        trajectory = self.visualization.start(
+            (0,) * 9,
+            joint_move(),
+            200,
+        )
+
+        self.assertTrue(self.visualization.active)
+        self.assertEqual(
+            tuple(slider.value for slider in self.sliders),
+            tuple(float(value) for value in queued_target),
+        )
+        self.assertEqual(
+            tuple(marker.value for marker in self.markers),
+            (0.0,) * 9,
+        )
+
+        self.clock["value"] += trajectory.duration_seconds / 2
+        positions = self.visualization.refresh()
+
+        self.assertAlmostEqual(positions[0], 5.0)
+        self.assertAlmostEqual(positions[1], -2.5)
+        self.assertEqual(
+            tuple(slider.value for slider in self.sliders),
+            tuple(float(value) for value in queued_target),
+        )
+
+    def test_worker_timestamp_accounts_for_tk_poll_delay(self):
+        trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
+        self.visualization.finish()
+        started_at = self.clock["value"] - trajectory.duration_seconds / 2
+
+        self.visualization.start(
+            (0,) * 9,
+            joint_move(),
+            200,
+            started_at_seconds=started_at,
+        )
+
+        self.assertAlmostEqual(self.markers[0].value, 5.0)
+        self.assertAlmostEqual(self.markers[1].value, -2.5)
+
+    def test_toggle_hides_without_discarding_active_estimate(self):
+        trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
+        self.enabled["value"] = 0
+
+        self.assertIsNone(self.visualization.refresh())
+        self.assertTrue(self.visualization.active)
+        self.assertFalse(any(marker.visible for marker in self.markers))
+        hide_counts = tuple(marker.hide_count for marker in self.markers)
+        self.assertIsNone(self.visualization.refresh())
+        self.assertEqual(
+            tuple(marker.hide_count for marker in self.markers),
+            hide_counts,
+        )
+
+        self.clock["value"] += trajectory.duration_seconds
+        self.enabled["value"] = 1
+        positions = self.visualization.refresh()
+
+        self.assertEqual(positions, trajectory.target_positions)
+        self.assertTrue(all(marker.visible for marker in self.markers))
+
+    def test_finish_hides_markers_without_changing_queued_target(self):
+        queued_target = (20, 4, 3, 2, 1, 0, 6, 7, 8)
+        self.visualization.set_desired(queued_target)
+        self.visualization.start((0,) * 9, joint_move(), 200)
+
+        self.assertTrue(self.visualization.finish())
+
+        self.assertFalse(self.visualization.active)
+        self.assertFalse(any(marker.visible for marker in self.markers))
+        self.assertEqual(
+            tuple(slider.value for slider in self.sliders),
+            tuple(float(value) for value in queued_target),
+        )
+
+    def test_desired_slider_failure_rolls_back_completed_writes(self):
+        sliders = [FakeSlider(axis) for axis in range(9)]
+        sliders[2] = FailingSlider(2)
+        visualization = JointMotionVisualization(
+            sliders,
+            [FakeMarker() for _ in range(9)],
+            lambda: 1,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "desired joint slider"):
+            visualization.set_desired((10,) * 9)
+
+        self.assertEqual(sliders[0].value, 0)
+        self.assertEqual(sliders[1].value, 1)
+        self.assertEqual(sliders[3].value, 3)
+
+    def test_marker_failure_hides_every_partial_overlay(self):
+        self.markers[2] = FakeMarker(fail_show=True)
+        visualization = JointMotionVisualization(
+            self.sliders,
+            self.markers,
+            lambda: 1,
+            clock=lambda: self.clock["value"],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "marker draw failed"):
+            visualization.start((0,) * 9, joint_move(), 200)
+
+        self.assertFalse(visualization.active)
+        self.assertFalse(any(marker.visible for marker in self.markers))
+
+    def test_invalid_toggle_value_hides_markers_and_disables_estimate(self):
+        trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
+        self.enabled["value"] = "enabled"
+
+        with self.assertRaisesRegex(MotionInputError, "zero or one"):
+            self.visualization.refresh()
+
+        self.assertFalse(self.visualization.active)
+        self.assertFalse(any(marker.visible for marker in self.markers))
+        self.assertEqual(trajectory.target_positions[0], 10.0)

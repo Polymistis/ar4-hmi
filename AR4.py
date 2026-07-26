@@ -244,6 +244,10 @@ from ARrobots.HMI.joint_motion import (
   validate_controller_media_id,
   write_serial_control,
 )
+from ARrobots.HMI.joint_visualization import (
+  GhostSliderMarker,
+  JointMotionVisualization,
+)
 
 #####################################################################################
 # Cross-Compat Patch
@@ -3139,6 +3143,7 @@ RUN['J9CalStat2'] = IntVar()
 '''
 
 RUN['IncJogStat'] = IntVar()
+RUN['showEstimatedMotion'] = IntVar(value=1)
 RUN['fullRot'] = IntVar()
 RUN['pick180'] = IntVar()
 RUN['pickClosest'] = IntVar()
@@ -14531,6 +14536,43 @@ confirmed_position_generation = 0
 deferred_joint_adjustments = DeferredJointAdjustments()
 
 
+def _set_joint_motion_target_display(target_positions):
+  try:
+    return joint_motion_visualization.set_desired(target_positions)
+  except Exception:
+    logger.exception("Unable to update desired joint slider positions")
+    return False
+
+
+def _start_joint_motion_visualization(move, started_at_seconds):
+  try:
+    return joint_motion_visualization.start(
+      _current_joint_positions(),
+      move,
+      _runtime_number('minSpeedDelay'),
+      started_at_seconds,
+    )
+  except Exception:
+    logger.exception("Unable to start estimated joint-position display")
+    return False
+
+
+def _refresh_joint_motion_visualization():
+  try:
+    return joint_motion_visualization.refresh()
+  except Exception:
+    logger.exception("Unable to refresh estimated joint-position display")
+    return False
+
+
+def _finish_joint_motion_visualization():
+  try:
+    return joint_motion_visualization.finish()
+  except Exception:
+    logger.exception("Unable to finish estimated joint-position display")
+    return False
+
+
 def _reserve_joint_motion_request():
   global joint_motion_request_lease
 
@@ -14659,6 +14701,7 @@ def _try_dispatch_deferred_joint_adjustments(allow_current_generation=False):
   almStatusLab.config(text=status, style="OK.TLabel")
   almStatusLab2.config(text=status, style="OK.TLabel")
   _try_set_virtual_joint_target(submission.target)
+  _set_joint_motion_target_display(submission.target)
   return True
 
 
@@ -14780,6 +14823,10 @@ def _poll_joint_motion_events():
             cmdSentEntryField.insert(0, event.move.command)
             almStatusLab.config(text="JOINT MOVE IN PROGRESS", style="OK.TLabel")
             almStatusLab2.config(text="JOINT MOVE IN PROGRESS", style="OK.TLabel")
+            _start_joint_motion_visualization(
+              event.move,
+              event.started_at_seconds,
+            )
             continue
 
           if event.kind == "completed":
@@ -14822,6 +14869,12 @@ def _poll_joint_motion_events():
               )
               almStatusLab.config(text=status, style="OK.TLabel")
               almStatusLab2.config(text=status, style="OK.TLabel")
+              desired_target = joint_motion_dispatcher.desired_target
+              if (
+                joint_motion_dispatcher.pending
+                and desired_target is not None
+              ):
+                _set_joint_motion_target_display(desired_target)
             continue
 
           if event.position is not None:
@@ -14861,10 +14914,13 @@ def _poll_joint_motion_events():
           almStatusLab.config(text=message, style="Alarm.TLabel")
           almStatusLab2.config(text=message, style="Alarm.TLabel")
       finally:
+        if event.kind != "started":
+          _finish_joint_motion_visualization()
         event.acknowledge()
 
     if not _finish_joint_motion_request_if_idle():
       _try_dispatch_deferred_joint_adjustments()
+    _refresh_joint_motion_visualization()
   finally:
     _reschedule_event_poll("joint-motion")
 
@@ -14984,6 +15040,7 @@ def _queue_joint_motion(axis, value, absolute):
       almStatusLab2.config(text=status, style="OK.TLabel")
       if submission is not None:
         _try_set_virtual_joint_target(submission.target)
+        _set_joint_motion_target_display(submission.target)
     return True
   except (KeyError, TypeError, ValueError, MotionInputError, MotionQueueFault) as exc:
     message = f"Joint motion rejected: {exc}"
@@ -23829,6 +23886,21 @@ def J6sliderExecute(foo):
 J6jogslide.config(command=J6sliderUpdate)
 J6jogslide.bind("<ButtonRelease-1>", J6sliderExecute)
 
+estimatedMotionCbut = Checkbutton(
+  jointFrame,
+  text="Show estimated motion (cyan marker)",
+  variable=RUN['showEstimatedMotion'],
+  command=_refresh_joint_motion_visualization,
+)
+estimatedMotionCbut.grid(
+  row=3,
+  column=0,
+  columnspan=2,
+  sticky="w",
+  padx=4,
+  pady=(2, 0),
+)
+
 # Cartesian jog controls
 CartjogFrame = LabelFrame(rightPanel, text="Cartesian Control (X Y Z Rz Ry Rx)", padding=5)
 CartjogFrame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
@@ -24328,6 +24400,26 @@ def J9sliderExecute(foo):
   _queue_joint_target(8, J9jogslide.get())
 J9jogslide.config(command=J9sliderUpdate)
 J9jogslide.bind("<ButtonRelease-1>", J9sliderExecute)
+
+joint_motion_visualization = JointMotionVisualization(
+  sliders=(
+    J1jogslide, J2jogslide, J3jogslide,
+    J4jogslide, J5jogslide, J6jogslide,
+    J7jogslide, J8jogslide, J9jogslide,
+  ),
+  markers=(
+    GhostSliderMarker(J1jogFrame, J1jogslide),
+    GhostSliderMarker(J2jogFrame, J2jogslide),
+    GhostSliderMarker(J3jogFrame, J3jogslide),
+    GhostSliderMarker(J4jogFrame, J4jogslide),
+    GhostSliderMarker(J5jogFrame, J5jogslide),
+    GhostSliderMarker(J6jogFrame, J6jogslide),
+    GhostSliderMarker(J7jogFrame, J7jogslide),
+    GhostSliderMarker(J8jogFrame, J8jogslide),
+    GhostSliderMarker(J9jogFrame, J9jogslide),
+  ),
+  enabled_provider=RUN['showEstimatedMotion'].get,
+)
 
 # Command builders (IF, SET, WAIT - reordered and aligned)
 cmdFrame = LabelFrame(rightPanel, text="Command Builders", padding=5)

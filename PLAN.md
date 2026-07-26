@@ -505,6 +505,56 @@ Implemented portions of the active integration unit:
   and length result contracts; full SD-library traversal remains
   hardware-free source and compile coverage.
 
+### M4A5 - Desired-versus-estimated joint display
+
+Status: `Tested`
+
+Display contract:
+
+- The normal J1-J9 slider thumb represents the latest accepted desired target.
+- A toggleable cyan marker represents the commanded in-flight position estimate
+  for coordinated `RJ` moves.
+- The estimate follows the controller's calibrated step conversion,
+  synchronized high-step progression, and acceleration, cruise, and
+  deceleration timing envelope.
+- Existing line-oriented firmware reports joint position only in the terminal
+  response, so the moving marker is labeled estimated and never advances
+  confirmed calibration state.
+- Terminal position feedback remains authoritative and reconciles the normal
+  sliders. Faults or unavailable estimates hide the marker rather than
+  fabricating live position.
+- Cartesian, tool, program, calibration, homing, and indefinite live-jog
+  operations remain outside the estimate until a validated trajectory or
+  correlated live-telemetry contract supplies meaningful progress.
+
+Acceptance criteria:
+
+- Estimated markers can be enabled or disabled without affecting motion
+  admission, serial ownership, or controller state.
+- J1-J9 desired targets remain interactive while an accepted coordinated move
+  owns the serial interface.
+- Marker updates run only on the Tk event thread and perform no serial I/O,
+  sleeps, or worker waits.
+- Deterministic hardware-free tests cover step-derived duration, synchronized
+  multi-axis interpolation, terminal clamping, toggle behavior, desired-target
+  preservation, and marker geometry.
+- Live-arm comparison is recorded separately and does not convert an estimate
+  into actual telemetry.
+
+Implemented evidence:
+
+- A validated command-trajectory estimator models controller binary32
+  calibration conversion, coordinated step timing, and average
+  pulse-distribution overhead without reading or mutating Tk state.
+- A Tk-thread visualization owner updates the J1-J9 overlay markers from the
+  existing joint-motion poll, preserves coalesced desired targets in the normal
+  sliders across delayed worker events, uses the worker's monotonic dispatch
+  timestamp, and disables only the display estimate after presentation failure.
+- The complete Windows and Ubuntu hardware-free suites pass, and an isolated
+  hidden Tk probe verifies that a place-managed marker can overlay and clear
+  from each grid-managed scale. No application entry point or serial transport
+  was opened.
+
 ### M4B - Repeatability and dynamic interception pass
 
 Status: `Proposed`
