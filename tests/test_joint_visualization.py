@@ -1,4 +1,6 @@
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from ARrobots.HMI.joint_motion import (
     ControllerJointCalibration,
@@ -7,7 +9,9 @@ from ARrobots.HMI.joint_motion import (
     MotionProfile,
 )
 from ARrobots.HMI.joint_visualization import (
+    GhostSliderMarker,
     JointMotionVisualization,
+    set_joint_slider_positions,
     slider_marker_geometry,
 )
 
@@ -44,6 +48,86 @@ class FakeMarker:
     def hide(self):
         self.visible = False
         self.hide_count += 1
+
+
+class FakeMarkerFrame:
+    def __init__(self, parent, **options):
+        self.parent = parent
+        self.options = options
+        self.bindings = {}
+        self.placements = []
+        self.lift_count = 0
+        self.hide_count = 0
+
+    def bind(self, sequence, callback):
+        self.bindings[sequence] = callback
+
+    def place(self, **geometry):
+        self.placements.append(geometry)
+
+    def lift(self):
+        self.lift_count += 1
+
+    def place_forget(self):
+        self.hide_count += 1
+
+
+class OverlaySlider(FakeSlider):
+    def __init__(self, value=0):
+        super().__init__(value)
+        self.bindings = {}
+        self.generated_events = []
+
+    def bind(self, sequence, callback, add=None):
+        if add == "+":
+            self.bindings.setdefault(sequence, []).append(callback)
+        else:
+            self.bindings[sequence] = [callback]
+
+    def event_generate(self, sequence, **coordinates):
+        self.generated_events.append((sequence, coordinates))
+        event = SimpleNamespace(**coordinates)
+        for callback in self.bindings.get(sequence, ()):
+            callback(event)
+
+    @staticmethod
+    def cget(option):
+        return {
+            "from": "-100.0",
+            "to": "100.0",
+        }[option]
+
+    @staticmethod
+    def winfo_height():
+        return 20
+
+    @staticmethod
+    def winfo_reqheight():
+        return 20
+
+    @staticmethod
+    def winfo_reqwidth():
+        return 200
+
+    @staticmethod
+    def winfo_rootx():
+        return 110
+
+    @staticmethod
+    def winfo_rooty():
+        return 220
+
+    @staticmethod
+    def winfo_width():
+        return 200
+
+    @staticmethod
+    def winfo_x():
+        return 10
+
+    @staticmethod
+    def winfo_y():
+        return 20
 
 
 def joint_move():
@@ -169,6 +253,78 @@ class SliderMarkerGeometryTests(unittest.TestCase):
                     )
 
 
+class GhostSliderMarkerTests(unittest.TestCase):
+    def test_overlay_forwards_pointer_and_skips_unchanged_placement(self):
+        slider = OverlaySlider()
+        with patch(
+            "ARrobots.HMI.joint_visualization.tk.Frame",
+            FakeMarkerFrame,
+        ):
+            marker = GhostSliderMarker(object(), slider)
+
+        self.assertTrue(marker.show(0))
+        self.assertFalse(marker.show(0))
+        self.assertEqual(
+            marker._marker.placements,
+            [{
+                "x": 110,
+                "y": 30,
+                "anchor": "center",
+                "width": 3,
+                "height": 18,
+            }],
+        )
+        self.assertEqual(marker._marker.lift_count, 1)
+
+        event = SimpleNamespace(x_root=130, y_root=235)
+        result = marker._marker.bindings["<ButtonPress-1>"](event)
+
+        self.assertEqual(result, "break")
+        self.assertEqual(
+            slider.generated_events[-1],
+            ("<ButtonPress-1>", {"x": 20, "y": 15}),
+        )
+        self.assertTrue(marker.hide())
+        self.assertFalse(marker.hide())
+        self.assertEqual(marker._marker.hide_count, 1)
+
+    def test_slider_updates_preserve_an_active_operator_drag(self):
+        slider = OverlaySlider(5)
+        release_states = []
+        slider.bind(
+            "<ButtonRelease-1>",
+            lambda _event: release_states.append(
+                slider._ar4_joint_slider_drag_active
+            ),
+            add="+",
+        )
+        with patch(
+            "ARrobots.HMI.joint_visualization.tk.Frame",
+            FakeMarkerFrame,
+        ):
+            marker = GhostSliderMarker(object(), slider)
+        sliders = [slider] + [FakeSlider() for _ in range(8)]
+        pointer = SimpleNamespace(x_root=130, y_root=235)
+        marker._marker.bindings["<ButtonPress-1>"](pointer)
+
+        set_joint_slider_positions(sliders, (10,) * 9)
+
+        self.assertEqual(slider.value, 5)
+        self.assertEqual(
+            tuple(item.value for item in sliders[1:]),
+            (10.0,) * 8,
+        )
+
+        marker._marker.bindings["<ButtonRelease-1>"](pointer)
+        self.assertEqual(release_states, [True])
+        set_joint_slider_positions(sliders, (20,) * 9)
+
+        self.assertEqual(
+            tuple(item.value for item in sliders),
+            (20.0,) * 9,
+        )
+
+
 class JointMotionVisualizationTests(unittest.TestCase):
     def setUp(self):
         self.sliders = [FakeSlider() for _ in range(9)]
@@ -270,7 +426,7 @@ class JointMotionVisualizationTests(unittest.TestCase):
             lambda: 1,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "desired joint slider"):
+        with self.assertRaisesRegex(RuntimeError, "joint slider"):
             visualization.set_desired((10,) * 9)
 
         self.assertEqual(sliders[0].value, 0)

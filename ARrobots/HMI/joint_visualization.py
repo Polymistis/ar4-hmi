@@ -15,6 +15,7 @@ GHOST_MARKER_COLOR = "#00A6D6"
 GHOST_MARKER_WIDTH = 3
 GHOST_MARKER_MINIMUM_HEIGHT = 8
 GHOST_MARKER_MAXIMUM_HEIGHT = 18
+_SLIDER_DRAG_ATTRIBUTE = "_ar4_joint_slider_drag_active"
 
 
 def _fixed_items(values, expected_length, field_name):
@@ -44,6 +45,82 @@ def _joint_positions(values, field_name):
         finite_number(value, f"{field_name}[{axis}]")
         for axis, value in enumerate(items, start=1)
     )
+
+
+def _slider_drag_active(slider):
+    active = getattr(slider, _SLIDER_DRAG_ATTRIBUTE, False)
+    if not isinstance(active, bool):
+        raise MotionInputError(
+            "joint slider drag state must be boolean"
+        )
+    return active
+
+
+def set_joint_slider_positions(sliders, positions):
+    """Preserve active operator drags while updating every idle slider.
+
+    The normalized requested target is returned even when an active slider
+    retains the operator-controlled value.
+    """
+
+    slider_items = _fixed_items(
+        sliders,
+        JOINT_COUNT,
+        "joint position sliders",
+    )
+    if any(
+        not callable(getattr(slider, "get", None))
+        or not callable(getattr(slider, "set", None))
+        for slider in slider_items
+    ):
+        raise TypeError("joint position slider contract is invalid")
+    target = _joint_positions(positions, "joint slider positions")
+    active = tuple(
+        _slider_drag_active(slider)
+        for slider in slider_items
+    )
+    previous = []
+    for axis, (slider, drag_active) in enumerate(
+        zip(slider_items, active),
+        start=1,
+    ):
+        if drag_active:
+            previous.append(None)
+            continue
+        try:
+            previous.append(slider.get())
+        except Exception as exc:
+            raise RuntimeError(
+                f"unable to snapshot J{axis} slider: {exc}"
+            ) from exc
+
+    changed = []
+    try:
+        for axis, (slider, value, drag_active) in enumerate(
+            zip(slider_items, target, active),
+        ):
+            if drag_active:
+                continue
+            slider.set(value)
+            changed.append(axis)
+    except Exception as exc:
+        rollback_failures = []
+        for axis in changed:
+            try:
+                slider_items[axis].set(previous[axis])
+            except Exception as rollback_exc:
+                rollback_failures.append(
+                    f"J{axis + 1}: {rollback_exc}"
+                )
+        detail = (
+            "; rollback failed for " + ", ".join(rollback_failures)
+            if rollback_failures
+            else ""
+        )
+        raise RuntimeError(
+            f"unable to update joint slider{detail}"
+        ) from exc
+    return target
 
 
 def slider_marker_geometry(
@@ -101,6 +178,7 @@ class GhostSliderMarker:
             "winfo_width",
             "winfo_x",
             "winfo_y",
+            "bind",
         )
         if any(
             not callable(getattr(slider, method_name, None))
@@ -111,6 +189,9 @@ class GhostSliderMarker:
             raise TypeError("ghost marker color must be non-empty text")
 
         self._slider = slider
+        setattr(self._slider, _SLIDER_DRAG_ATTRIBUTE, False)
+        self._placement = None
+        self._visible = False
         self._marker = tk.Frame(
             parent,
             background=color,
@@ -130,6 +211,24 @@ class GhostSliderMarker:
                     event,
                 ),
             )
+        self._slider.bind(
+            "<ButtonPress-1>",
+            lambda _event: setattr(
+                self._slider,
+                _SLIDER_DRAG_ATTRIBUTE,
+                True,
+            ),
+            add="+",
+        )
+        self._slider.bind(
+            "<ButtonRelease-1>",
+            lambda _event: setattr(
+                self._slider,
+                _SLIDER_DRAG_ATTRIBUTE,
+                False,
+            ),
+            add="+",
+        )
 
     def _forward_pointer(self, sequence, event):
         x = int(event.x_root - self._slider.winfo_rootx())
@@ -153,18 +252,31 @@ class GhostSliderMarker:
             width,
             height,
         )
+        placement = (
+            round(marker_x),
+            round(marker_y),
+            GHOST_MARKER_WIDTH,
+            round(marker_height),
+        )
+        if self._visible and placement == self._placement:
+            return False
         self._marker.place(
-            x=round(marker_x),
-            y=round(marker_y),
+            x=placement[0],
+            y=placement[1],
             anchor="center",
-            width=GHOST_MARKER_WIDTH,
-            height=round(marker_height),
+            width=placement[2],
+            height=placement[3],
         )
         self._marker.lift()
+        self._placement = placement
+        self._visible = True
         return True
 
     def hide(self):
+        if not self._visible:
+            return False
         self._marker.place_forget()
+        self._visible = False
         return True
 
 
@@ -242,44 +354,8 @@ class JointMotionVisualization:
         self._markers_visible = False
         return True
 
-    def hide(self):
-        return self._hide_markers()
-
     def set_desired(self, positions):
-        target = _joint_positions(positions, "desired joint positions")
-        previous = []
-        for axis, slider in enumerate(self._sliders, start=1):
-            try:
-                previous.append(slider.get())
-            except Exception as exc:
-                raise RuntimeError(
-                    f"unable to snapshot J{axis} desired slider: {exc}"
-                ) from exc
-
-        changed = 0
-        try:
-            for slider, value in zip(self._sliders, target):
-                slider.set(value)
-                changed += 1
-        except Exception as exc:
-            rollback_failures = []
-            for axis, (slider, value) in enumerate(
-                zip(self._sliders[:changed], previous[:changed]),
-                start=1,
-            ):
-                try:
-                    slider.set(value)
-                except Exception as rollback_exc:
-                    rollback_failures.append(f"J{axis}: {rollback_exc}")
-            detail = (
-                "; rollback failed for " + ", ".join(rollback_failures)
-                if rollback_failures
-                else ""
-            )
-            raise RuntimeError(
-                f"unable to update desired joint slider{detail}"
-            ) from exc
-        return target
+        return set_joint_slider_positions(self._sliders, positions)
 
     def start(
         self,

@@ -247,6 +247,7 @@ from ARrobots.HMI.joint_motion import (
 from ARrobots.HMI.joint_visualization import (
   GhostSliderMarker,
   JointMotionVisualization,
+  set_joint_slider_positions,
 )
 
 #####################################################################################
@@ -20246,11 +20247,10 @@ def displayPosition(response, parsed=None, synchronize_dispatcher=True):
   for entry_field, value in zip(entry_fields, position_values):
     _write_joint_position_entry(entry_field, value)
 
-  for jog_slider, value in zip(
+  set_joint_slider_positions(
     jog_sliders,
     parsed.joint_text + parsed.external_text,
-  ):
-    jog_slider.set(value)
+  )
 
   manEntryField.delete(0, 'end')
   manEntryField.insert(0, parsed.debug)

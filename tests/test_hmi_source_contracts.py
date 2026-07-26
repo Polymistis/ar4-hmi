@@ -36,6 +36,7 @@ from ARrobots.HMI.joint_motion import (
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+    CONTROLLER_MAXIMUM_PULSE_DELAY_MICROSECONDS,
     FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS,
     ControllerIdentity,
     ControllerJointCalibration,
@@ -93,6 +94,7 @@ from ARrobots.HMI.joint_motion import (
     validate_controller_media_id,
     write_serial_control,
 )
+from ARrobots.HMI.joint_visualization import set_joint_slider_positions
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -322,6 +324,10 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault(
             "_finish_joint_motion_visualization",
             lambda: True,
+        )
+        namespace.setdefault(
+            "set_joint_slider_positions",
+            set_joint_slider_positions,
         )
         namespace.setdefault("dataclass", dataclass)
         namespace.setdefault("threading", threading)
@@ -9681,6 +9687,9 @@ class HmiSourceContractTests(unittest.TestCase):
             def set(self, value):
                 self.value = value
 
+            def get(self):
+                return self.value
+
             def config(self, **kwargs):
                 self.value = kwargs
 
@@ -9721,6 +9730,9 @@ class HmiSourceContractTests(unittest.TestCase):
             name: Widget()
             for name in entry_names + slider_names
         }
+        dragged_slider = widgets["J2jogslide"]
+        dragged_slider.value = -9.5
+        dragged_slider._ar4_joint_slider_drag_active = True
         edited_entry_name = "J3curAngEntryField"
         widgets[edited_entry_name].value = "-4.25"
         widgets[edited_entry_name]._joint_target_editing = True
@@ -9798,8 +9810,9 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(
             tuple(widgets[name].value for name in slider_names),
-            ("1", "2", "3", "4", "5", "6", "13", "14", "15"),
+            (1.0, -9.5, 3.0, 4.0, 5.0, 6.0, 13.0, 14.0, 15.0),
         )
+        dragged_slider._ar4_joint_slider_drag_active = False
 
         for malformed_response in (
             response.replace("N42.5O", "NdebugO"),
@@ -18627,6 +18640,14 @@ class HmiSourceContractTests(unittest.TestCase):
             r"([0-9]+(?:\.[0-9]+)?)\s*;",
             firmware,
         )
+        maximum_match = re.search(
+            r"\bconstexpr\s+double\s+"
+            r"kMaximumPulseDelayMicroseconds\s*=\s*"
+            r"([0-9]+(?:\.[0-9]+)?)\s*;",
+            TEENSY_CONTROLLER_DOMAIN_CONTRACT.read_text(
+                encoding="utf-8"
+            ),
+        )
         runtime_assignment = next(
             node
             for node in self.tree.body
@@ -18641,6 +18662,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertIsNotNone(distribution_match)
         self.assertIsNotNone(minimum_match)
+        self.assertIsNotNone(maximum_match)
         self.assertEqual(
             float(distribution_match.group(1)),
             FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS,
@@ -18648,6 +18670,21 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(
             float(minimum_match.group(1)),
             float(ast.literal_eval(runtime_assignment.value)),
+        )
+        self.assertEqual(
+            float(maximum_match.group(1)),
+            CONTROLLER_MAXIMUM_PULSE_DELAY_MICROSECONDS,
+        )
+        self.assertIn("if (highStepCur < ACCStep)", driver)
+        self.assertIn(
+            "else if (highStepCur >= (HighStep - DCCStep))",
+            driver,
+        )
+        self.assertIn("curDelay - calcACCstepInc", driver)
+        self.assertIn("curDelay + calcDCCstepInc", driver)
+        self.assertIn(
+            "pulse_delay_microseconds(",
+            driver,
         )
 
     def test_tool_jog_directions_match_the_firmware_contract(self):
@@ -20919,12 +20956,20 @@ class HmiSourceContractTests(unittest.TestCase):
         first_label = Label()
         second_label = Label()
         display_calls = []
+        target_display_calls = []
+        finish_calls = []
         namespace = {
             "joint_motion_dispatcher": dispatcher,
             "displayPosition": lambda *args, **kwargs: display_calls.append(
                 (args, kwargs)
             ) or VALID_CONTROLLER_POSITION,
             "_set_virtual_from_joint_result": lambda position: True,
+            "_set_joint_motion_target_display": (
+                lambda target: target_display_calls.append(target)
+            ),
+            "_finish_joint_motion_visualization": (
+                lambda: finish_calls.append(True)
+            ),
             "_try_dispatch_deferred_joint_adjustments": lambda: False,
             "application_closing": Closing(),
             "almStatusLab": first_label,
@@ -20942,6 +20987,8 @@ class HmiSourceContractTests(unittest.TestCase):
             display_calls[-1][1]["synchronize_dispatcher"],
             False,
         )
+        self.assertEqual(target_display_calls, [])
+        self.assertEqual(finish_calls, [True])
 
         queued_event = Event()
         dispatcher.pending = True
@@ -20949,6 +20996,84 @@ class HmiSourceContractTests(unittest.TestCase):
         poll()
         self.assertTrue(queued_event.acknowledged)
         self.assertEqual(first_label.text, "JOINT TARGET QUEUED")
+        self.assertEqual(
+            target_display_calls,
+            [dispatcher.desired_target],
+        )
+        self.assertEqual(finish_calls, [True, True])
+
+    def test_joint_started_event_uses_dispatch_time_without_terminal_finish(self):
+        move = SimpleNamespace(command="RJ-command")
+        start_calls = []
+        finish_calls = []
+
+        class Event:
+            kind = "started"
+            started_at_seconds = 12.5
+
+            def __init__(self):
+                self.move = move
+                self.acknowledged = False
+
+            def acknowledge(self):
+                self.acknowledged = True
+
+        class Dispatcher:
+            pending = False
+            desired_target = None
+
+            def __init__(self, event):
+                self.active = True
+                self.events = [event]
+
+            def drain_events(self):
+                events = self.events
+                self.events = []
+                return events
+
+        class Widget:
+            def __init__(self):
+                self.value = None
+
+            def delete(self, *_args):
+                self.value = None
+
+            def insert(self, _index, value):
+                self.value = value
+
+            def config(self, **kwargs):
+                self.value = kwargs.get("text")
+
+        class Closing:
+            @staticmethod
+            def is_set():
+                return True
+
+        event = Event()
+        dispatcher = Dispatcher(event)
+        sent_entry = Widget()
+        namespace = {
+            "joint_motion_dispatcher": dispatcher,
+            "cmdSentEntryField": sent_entry,
+            "almStatusLab": Widget(),
+            "almStatusLab2": Widget(),
+            "_start_joint_motion_visualization": (
+                lambda *args: start_calls.append(args)
+            ),
+            "_finish_joint_motion_visualization": (
+                lambda: finish_calls.append(True)
+            ),
+            "_try_dispatch_deferred_joint_adjustments": lambda: False,
+            "application_closing": Closing(),
+        }
+        poll = self.compile_function("_poll_joint_motion_events", namespace)
+
+        poll()
+
+        self.assertTrue(event.acknowledged)
+        self.assertEqual(sent_entry.value, move.command)
+        self.assertEqual(start_calls, [(move, event.started_at_seconds)])
+        self.assertEqual(finish_calls, [])
 
     def test_joint_completion_invalidates_before_failed_virtual_sync_ack(self):
         sequence = []

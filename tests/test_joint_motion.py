@@ -108,6 +108,142 @@ def controller_calibration(
     )
 
 
+def discrete_firmware_joint_duration(
+    step_counts,
+    profile,
+    minimum_delay_microseconds=200.0,
+    distribution_delay_microseconds=30.0,
+):
+    """Independent timing oracle for the active Teensy joint drive loop."""
+
+    steps = tuple(step_counts)
+    high_steps = max(steps)
+    if high_steps == 0:
+        return 0.0
+
+    acceleration_steps = high_steps * (profile.acceleration / 100.0)
+    deceleration_steps = high_steps * (profile.deceleration / 100.0)
+    cruise_steps = (
+        high_steps - acceleration_steps - deceleration_steps
+    )
+    ramp_factor = max(profile.ramp, 10.0) / 10.0
+    denominator = cruise_steps + (
+        acceleration_steps * (1.0 + ramp_factor)
+        + deceleration_steps * (1.0 + ramp_factor)
+    ) * 0.5
+    if profile.speed_prefix == "Ss":
+        cruise_delay = (
+            profile.speed * 1_000_000.0
+            / (denominator if denominator > 0 else high_steps)
+        )
+        cruise_delay = max(
+            cruise_delay,
+            minimum_delay_microseconds,
+        )
+    else:
+        cruise_delay = minimum_delay_microseconds / (
+            profile.speed / 100.0
+        )
+
+    start_delay = cruise_delay * ramp_factor
+    end_delay = cruise_delay * ramp_factor
+    acceleration_increment = (
+        (start_delay - cruise_delay) / acceleration_steps
+        if acceleration_steps > 0
+        else 0.0
+    )
+    deceleration_increment = (
+        (end_delay - cruise_delay) / deceleration_steps
+        if deceleration_steps > 0
+        else 0.0
+    )
+    current_delay = start_delay
+    current = [0] * 9
+    primary_error = [0] * 9
+    secondary_error_1 = [0] * 9
+    secondary_error_2 = [0] * 9
+    elapsed_microseconds = 0.0
+    high_step_current = 0
+
+    while any(
+        current[axis] < steps[axis]
+        for axis in range(9)
+    ):
+        if high_step_current < acceleration_steps:
+            current_delay = max(
+                cruise_delay,
+                current_delay - acceleration_increment,
+            )
+        elif high_step_current >= high_steps - deceleration_steps:
+            current_delay = min(
+                end_delay,
+                current_delay + deceleration_increment,
+            )
+        else:
+            current_delay = cruise_delay
+
+        emitted_steps = 0
+        for axis, step_count in enumerate(steps):
+            if current[axis] >= step_count:
+                continue
+            primary_period = high_steps // step_count
+            leftover_1 = high_steps - step_count * primary_period
+            secondary_period_1 = (
+                high_steps // leftover_1
+                if leftover_1 > 0
+                else 0
+            )
+            leftover_2 = (
+                high_steps
+                - (
+                    step_count * primary_period
+                    + (
+                        step_count * primary_period
+                    ) // secondary_period_1
+                )
+                if secondary_period_1 > 0
+                else 0
+            )
+            secondary_period_2 = (
+                high_steps // leftover_2
+                if leftover_2 > 0
+                else 0
+            )
+            if secondary_period_2 == 0:
+                secondary_error_2[axis] = 1
+            if secondary_error_2[axis] == secondary_period_2:
+                secondary_error_2[axis] = 0
+                continue
+            secondary_error_2[axis] += 1
+            if secondary_period_1 == 0:
+                secondary_error_1[axis] = 1
+            if secondary_error_1[axis] == secondary_period_1:
+                secondary_error_1[axis] = 0
+                continue
+            secondary_error_1[axis] += 1
+            primary_error[axis] += 1
+            if primary_error[axis] == primary_period:
+                current[axis] += 1
+                primary_error[axis] = 0
+                emitted_steps += 1
+
+        distribution_delay = (
+            emitted_steps * distribution_delay_microseconds
+        )
+        pulse_delay = math.ceil(max(
+            minimum_delay_microseconds,
+            current_delay - distribution_delay,
+        ))
+        elapsed_microseconds += distribution_delay + pulse_delay
+        high_step_current += 1
+        if high_step_current > high_steps * 2:
+            raise AssertionError(
+                "firmware timing oracle exceeded the coordinated step bound"
+            )
+
+    return elapsed_microseconds / 1_000_000.0
+
+
 def wait_until(predicate, timeout=2.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -3631,7 +3767,13 @@ class CommandedJointTrajectoryTests(unittest.TestCase):
             (1000, 500, 0, 0, 0, 0, 0, 0, 0),
         )
         self.assertEqual(trajectory.high_steps, 1000)
-        self.assertAlmostEqual(trajectory.duration_seconds, 0.48)
+        self.assertAlmostEqual(
+            trajectory.duration_seconds,
+            discrete_firmware_joint_duration(
+                trajectory.step_deltas,
+                profile,
+            ),
+        )
         self.assertEqual(trajectory.positions_at(0), (0.0,) * 9)
         self.assertEqual(
             trajectory.positions_at(trajectory.duration_seconds / 2)[:2],
@@ -3690,8 +3832,48 @@ class CommandedJointTrajectoryTests(unittest.TestCase):
             all_axes.average_distribution_delay_microseconds,
             270,
         )
-        self.assertAlmostEqual(single_axis.duration_seconds, 0.23)
-        self.assertAlmostEqual(all_axes.duration_seconds, 0.47)
+        self.assertAlmostEqual(
+            single_axis.duration_seconds,
+            discrete_firmware_joint_duration(
+                single_axis.step_deltas,
+                profile,
+            ),
+        )
+        self.assertAlmostEqual(
+            all_axes.duration_seconds,
+            discrete_firmware_joint_duration(
+                all_axes.step_deltas,
+                profile,
+            ),
+        )
+
+    def test_average_distribution_model_tracks_discrete_firmware_loop(self):
+        profile = MotionProfile(
+            "Ss",
+            0.25,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move(
+                (10, 3.33, 1.11, 0.37, 0.12, 0.04, 0.01, 0, 0),
+                profile,
+            ),
+            200,
+        )
+        firmware_duration = discrete_firmware_joint_duration(
+            trajectory.step_deltas,
+            profile,
+        )
+        relative_error = abs(
+            trajectory.duration_seconds - firmware_duration
+        ) / firmware_duration
+
+        self.assertLessEqual(relative_error, 0.03)
 
     def test_zero_step_delta_holds_confirmed_start_until_terminal_feedback(self):
         profile = MotionProfile(

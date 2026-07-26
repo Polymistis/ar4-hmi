@@ -511,7 +511,8 @@ Status: `Tested`
 
 Display contract:
 
-- The normal J1-J9 slider thumb represents the latest accepted desired target.
+- The normal J1-J9 slider thumb represents the active operator input or the
+  latest accepted desired target.
 - A toggleable cyan marker represents the commanded in-flight position estimate
   for coordinated `RJ` moves.
 - The estimate follows the controller's calibrated step conversion,
@@ -547,13 +548,14 @@ Implemented evidence:
   calibration conversion, coordinated step timing, and average
   pulse-distribution overhead without reading or mutating Tk state.
 - A Tk-thread visualization owner updates the J1-J9 overlay markers from the
-  existing joint-motion poll, preserves coalesced desired targets in the normal
-  sliders across delayed worker events, uses the worker's monotonic dispatch
-  timestamp, and disables only the display estimate after presentation failure.
-- The complete Windows and Ubuntu hardware-free suites pass, and an isolated
-  hidden Tk probe verifies that a place-managed marker can overlay and clear
-  from each grid-managed scale. No application entry point or serial transport
-  was opened.
+  existing joint-motion poll, preserves active pointer drags and coalesced
+  desired targets across delayed worker events, uses the worker's monotonic
+  dispatch timestamp, and disables only the display estimate after presentation
+  failure.
+- The complete Windows and Ubuntu hardware-free suites pass. Tracked marker
+  tests exercise placement, pointer forwarding, drag preservation, redraw
+  suppression, and cleanup without opening the application entry point or a
+  serial transport.
 
 ### M4B - Repeatability and dynamic interception pass
 
