@@ -40,13 +40,23 @@ def save_calibration(calibration_data: dict, calibration_file: str="ARconfig.jso
         logger.error(f"Error saving calibration: {e}")
         return False
     
-def load_calibration(calibration_file: str='ARconfig.json', defaults_file='defaults.json') -> dict | None:
+def load_calibration(
+    calibration_file: str='ARconfig.json',
+    defaults_file='defaults.json',
+    allow_fallback: bool=True,
+) -> dict | None:
     ''' Load calibration data from JSON or convert from old pickle format '''
+    if not isinstance(allow_fallback, bool):
+        raise TypeError("calibration fallback flag must be boolean")
+    calibration_data = None
     try:
         if os.path.exists(calibration_file):
             logger.debug("JSON config file found, loading")
             with open(calibration_file, 'r') as f:
                 calibration_data = json.load(f)
+        elif not allow_fallback:
+            logger.error(f"Calibration file not found: {calibration_file}")
+            return None
         elif os.path.exists('ARbot.cal'):
             logger.debug("No JSON config file found, attempting to load ARbot.cal")
             calibration_data = convert_calibration()
@@ -57,14 +67,15 @@ def load_calibration(calibration_file: str='ARconfig.json', defaults_file='defau
                 with open(defaults_file, 'r') as f:
                     calibration_data = json.load(f)
                 save_calibration(calibration_data)
-        if calibration_data != None:
-            return calibration_data
-        else:
-            logger.error("Error loading calibration data")
+            else:
+                logger.error(f"Default calibration file not found: {defaults_file}")
+        if not isinstance(calibration_data, dict):
+            logger.error("Calibration data must be a JSON object")
             return None
+        return calibration_data
     except Exception as e:
-        logger.error(f"Unrecoverable error reading config file.  Maae sure it isn't corrupted.\n{e}")
-        exit()
+        logger.error(f"Unable to read calibration data: {e}")
+        return None
     
 def convert_calibration()-> dict | None:
     ''' Convert old ARbot.cal pickle file to new dictionary format and save as ARconfig.json '''

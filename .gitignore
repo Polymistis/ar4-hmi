@@ -9,6 +9,7 @@ venv/
 CMakeFiles/
 cmake-build-*/
 build/
+build-windows-*/
 dist/
 
 # AR4 runtime and machine-specific state
@@ -18,9 +19,15 @@ dist/
 /ARbot.cal
 /curImage.jpg
 /temp.jpg
+/gcode-storage-state.json
+/gcode-storage-state.json.lock
+/.gcode-storage-state-*.tmp
 
 # Editor and operating-system state
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local development artifacts
+logs/
