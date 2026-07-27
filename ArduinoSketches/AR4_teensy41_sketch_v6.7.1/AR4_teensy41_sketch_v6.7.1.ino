@@ -4465,13 +4465,9 @@ void loop() {
       }
       ar4_protocol::PrimaryHomeReferenceState invalidatedHomeReference =
         primaryHomeReference;
-      if (!ar4_protocol::invalidate_primary_home_reference(
-          invalidatedHomeReference
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
+      ar4_protocol::invalidate_primary_home_reference(
+        invalidatedHomeReference
+      );
       Robot_Kin_Tool[0] = stagedTool[0];
       Robot_Kin_Tool[1] = stagedTool[1];
       Robot_Kin_Tool[2] = stagedTool[2];
@@ -4944,13 +4940,9 @@ void loop() {
       }
       ar4_protocol::PrimaryHomeReferenceState invalidatedHomeReference =
         primaryHomeReference;
-      if (!ar4_protocol::invalidate_primary_home_reference(
-          invalidatedHomeReference
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
+      ar4_protocol::invalidate_primary_home_reference(
+        invalidatedHomeReference
+      );
       J1StepM = stagedStepMonitors[0];
       J2StepM = stagedStepMonitors[1];
       J3StepM = stagedStepMonitors[2];
@@ -5201,7 +5193,11 @@ void loop() {
       }
       ar4_protocol::PrimaryHomeReferenceState invalidatedHomeReference =
         primaryHomeReference;
-      for (size_t axis = 0; axis < 2; ++axis) {
+      for (
+        size_t axis = 0;
+        axis < ar4_protocol::kPrimaryHomeReferenceAxisCount;
+        ++axis
+      ) {
         if (Jreq[axis] == 1) {
           if (!ar4_protocol::invalidate_primary_home_reference_axis(
             invalidatedHomeReference,
@@ -5340,7 +5336,11 @@ void loop() {
       }
       ar4_protocol::PrimaryHomeReferenceState committedHomeReference =
         primaryHomeReference;
-      for (size_t axis = 0; axis < 2; ++axis) {
+      for (
+        size_t axis = 0;
+        axis < ar4_protocol::kPrimaryHomeReferenceAxisCount;
+        ++axis
+      ) {
         if (Jreq[axis] == 1) {
           if (!ar4_protocol::set_primary_home_reference(
             committedHomeReference,

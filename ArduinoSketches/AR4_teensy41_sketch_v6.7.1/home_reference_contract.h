@@ -26,13 +26,13 @@ inline bool invalidate_primary_home_reference_axis(
   return true;
 }
 
-inline bool invalidate_primary_home_reference(
+inline void invalidate_primary_home_reference(
   PrimaryHomeReferenceState &state
 ) {
   for (size_t axis = 0; axis < kPrimaryHomeReferenceAxisCount; ++axis) {
-    if (!invalidate_primary_home_reference_axis(state, axis)) return false;
+    state.valid[axis] = false;
+    state.millidegrees[axis] = 0;
   }
-  return true;
 }
 
 inline bool primary_home_reference_millidegrees(

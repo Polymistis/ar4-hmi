@@ -13752,7 +13752,7 @@ class HmiSourceContractTests(unittest.TestCase):
             4,
         )
         reference_invalidation = calibration_handler.index(
-            "invalidate_primary_home_reference_axis"
+            "primaryHomeReference = invalidatedHomeReference;"
         )
         backoff = calibration_handler.index("if (!backOff(")
         step_monitor_commit = calibration_handler.index(
@@ -13800,7 +13800,7 @@ class HmiSourceContractTests(unittest.TestCase):
             final_drive,
         )
         reference_commit = calibration_handler.index(
-            "set_primary_home_reference"
+            "primaryHomeReference = committedHomeReference;"
         )
         terminal_response = calibration_handler.index(
             "sendRobotPos();",
@@ -13833,7 +13833,9 @@ class HmiSourceContractTests(unittest.TestCase):
             update_handler_start:update_handler_end
         ]
         self.assertLess(
-            update_handler.index("invalidate_primary_home_reference"),
+            update_handler.index(
+                "primaryHomeReference = invalidatedHomeReference;"
+            ),
             update_handler.index("if (!robot_set_AR())"),
         )
 

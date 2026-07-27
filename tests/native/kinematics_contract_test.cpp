@@ -2282,10 +2282,7 @@ void test_primary_home_reference_contract() {
         "axis-local home-reference invalidation changed another axis"
     );
 
-    require(
-        ar4_protocol::invalidate_primary_home_reference(state),
-        "complete primary home-reference invalidation was rejected"
-    );
+    ar4_protocol::invalidate_primary_home_reference(state);
     require(
         !state.valid[0]
             && !state.valid[1]
