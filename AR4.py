@@ -183,6 +183,7 @@ from ARrobots.HMI.joint_motion import (
   CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
   CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
   CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+  CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
   CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
   CONTROLLER_HARDWARE_ID_LENGTH,
   CONTROLLER_MEDIA_ID_LENGTH,
@@ -225,6 +226,7 @@ from ARrobots.HMI.joint_motion import (
   exchange_serial_line,
   exchange_serial_line_until_cancelled,
   finite_number,
+  joint_telemetry_response_budget,
   motion_timing_response_timeout,
   normalize_auxiliary_board_profile,
   parse_auxiliary_output_command,
@@ -232,6 +234,7 @@ from ARrobots.HMI.joint_motion import (
   parse_command_timing,
   parse_controller_identity_response,
   parse_controller_modbus_response,
+  parse_joint_motion_exchange_response,
   parse_motion_wrist_config,
   parse_position_response,
   parse_primary_home_reference_response,
@@ -241,6 +244,7 @@ from ARrobots.HMI.joint_motion import (
   read_serial_exact_response,
   read_serial_line_response,
   read_serial_line_response_with_optional_followup,
+  request_joint_telemetry,
   serial_transport_quarantined,
   validate_auxiliary_output_command,
   validate_auxiliary_servo_command,
@@ -13437,6 +13441,8 @@ def _exchange_serial_line(
   command,
   control_event=None,
   write_started_event=None,
+  interim_response_handler=None,
+  interim_response_limit=None,
 ):
   command = _canonicalize_main_serial_command(command)
   serial_port = RUN.get('ser')
@@ -13445,6 +13451,13 @@ def _exchange_serial_line(
       if control_event is not None:
         raise MotionInputError(
           "G-code playback does not support live-jog control injection"
+        )
+      if (
+        interim_response_handler is not None
+        or interim_response_limit is not None
+      ):
+        raise MotionInputError(
+          "G-code playback does not support interim response handling"
         )
       parse_command_timing(command)
       return exchange_serial_line_until_cancelled(
@@ -13473,6 +13486,8 @@ def _exchange_serial_line(
         else None
       ),
       write_started_event=write_started_event,
+      interim_response_handler=interim_response_handler,
+      interim_response_limit=interim_response_limit,
     )
   finally:
     if (
@@ -14665,7 +14680,28 @@ def _current_joint_motion_profile():
 
 
 def _exchange_joint_motion(command):
-  return _exchange_serial_line(command)
+  binding = _current_main_controller_identity()
+  if (
+    binding is None
+    or CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1
+      not in binding.identity.protocol_capabilities
+  ):
+    return _exchange_serial_line(command)
+
+  def consume_joint_telemetry(response):
+    telemetry = parse_joint_motion_exchange_response(response)
+    if telemetry is None:
+      return False
+    joint_motion_dispatcher.publish_telemetry(telemetry)
+    return True
+
+  return _exchange_serial_line(
+    request_joint_telemetry(command),
+    interim_response_handler=consume_joint_telemetry,
+    interim_response_limit=joint_telemetry_response_budget(
+      _controller_response_timeout(command)
+    ),
+  )
 
 
 joint_motion_dispatcher = CoalescingJointDispatcher(
@@ -14704,6 +14740,14 @@ def _refresh_joint_motion_visualization():
     return joint_motion_visualization.refresh()
   except Exception:
     logger.exception("Unable to refresh estimated joint-position display")
+    return False
+
+
+def _observe_joint_motion_telemetry(telemetry):
+  try:
+    return joint_motion_visualization.observe_actual(telemetry.joints)
+  except Exception:
+    logger.exception("Unable to update actual joint-position display")
     return False
 
 
@@ -14971,6 +15015,14 @@ def _poll_joint_motion_events():
             )
             continue
 
+          if event.kind == "telemetry":
+            if event.telemetry is None:
+              raise RuntimeError(
+                "joint telemetry event omitted validated positions"
+              )
+            _observe_joint_motion_telemetry(event.telemetry)
+            continue
+
           if event.kind == "completed":
             applied_position = displayPosition(
               event.response,
@@ -15056,7 +15108,7 @@ def _poll_joint_motion_events():
           almStatusLab.config(text=message, style="Alarm.TLabel")
           almStatusLab2.config(text=message, style="Alarm.TLabel")
       finally:
-        if event.kind != "started":
+        if event.kind not in ("started", "telemetry"):
           _finish_joint_motion_visualization()
         event.acknowledge()
 
@@ -24385,7 +24437,7 @@ J6jogslide.bind("<ButtonRelease-1>", J6sliderExecute)
 
 estimatedMotionCbut = Checkbutton(
   jointFrame,
-  text="Show estimated motion (cyan marker)",
+  text="Show motion tracking (cyan marker)",
   variable=RUN['showEstimatedMotion'],
   command=_refresh_joint_motion_visualization,
 )
@@ -25678,7 +25730,7 @@ cmdFrame.grid(row=2, column=0, columnspan=5, sticky="ew", padx=5, pady=5)
 
 cmdFrame.grid_columnconfigure(0, weight=1)
 
-cmdSentLab = Label(cmdFrame, text="Last Command Sent to Controller")
+cmdSentLab = Label(cmdFrame, text="Last Requested Command")
 cmdSentLab.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 2))
 
 cmdSentEntryField = Entry(cmdFrame, width=120, justify="center")

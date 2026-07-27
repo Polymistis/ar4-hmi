@@ -15,6 +15,7 @@ from ARrobots.HMI.joint_motion import (
     CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+    CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
     CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
     CONTROLLER_DIRECTORY_SEPARATOR,
     CONTROLLER_MAXIMUM_RAMP_PERCENT,
@@ -31,6 +32,7 @@ from ARrobots.HMI.joint_motion import (
     MAX_CONTROLLER_FILENAME_BYTES,
     DeferredJointAdjustments,
     JointMove,
+    JointTelemetry,
     MotionInputError,
     MotionProfile,
     MotionQueueFault,
@@ -58,6 +60,7 @@ from ARrobots.HMI.joint_motion import (
     exchange_serial_line_until_cancelled,
     estimate_commanded_joint_trajectory,
     finite_number,
+    joint_telemetry_response_budget,
     motion_timing_response_timeout,
     normalize_auxiliary_board_profile,
     parse_auxiliary_output_command,
@@ -66,6 +69,8 @@ from ARrobots.HMI.joint_motion import (
     parse_command_timing,
     parse_controller_identity_response,
     parse_controller_modbus_response,
+    parse_joint_motion_exchange_response,
+    parse_joint_telemetry_response,
     parse_motion_wrist_config,
     parse_position_response,
     parse_primary_home_reference_response,
@@ -75,6 +80,7 @@ from ARrobots.HMI.joint_motion import (
     read_serial_exact_response,
     read_serial_line_response,
     read_serial_line_response_with_optional_followup,
+    request_joint_telemetry,
     serial_transport_quarantined,
     validate_controller_filename,
     validate_auxiliary_output_command,
@@ -1949,6 +1955,219 @@ class SerialLineExchangeTests(unittest.TestCase):
         self.assertEqual(serial_port.flush_count, 1)
         self.assertEqual(serial_port.timeout, 7.5)
 
+    def test_exchange_demultiplexes_interim_telemetry_before_terminal_data(self):
+        terminal = position_response((1, 2, 3, 4, 5, 6))
+        serial_port = SequenceFakeSerial(
+            (
+                b"TMA1000B2000C3000D4000E5000F6000\n",
+                f"{terminal}\n".encode("ascii"),
+            )
+        )
+        observed = []
+
+        def consume_interim(response):
+            if not response.startswith("TM"):
+                return False
+            observed.append(parse_joint_telemetry_response(response))
+            return True
+
+        response = exchange_serial_line(
+            serial_port,
+            "RP\n",
+            120,
+            interim_response_handler=consume_interim,
+            interim_response_limit=10,
+        )
+
+        self.assertEqual(response, terminal)
+        self.assertEqual(
+            observed,
+            [
+                JointTelemetry(
+                    raw="TMA1000B2000C3000D4000E5000F6000",
+                    joints=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+                )
+            ],
+        )
+        self.assertTrue(serial_port.is_open)
+        self.assertFalse(serial_transport_quarantined(serial_port))
+
+    def test_invalid_interim_telemetry_quarantines_the_owned_exchange(self):
+        serial_port = SequenceFakeSerial((b"TMA1B2\n",))
+
+        with self.assertRaisesRegex(
+            SerialTransportQuarantinedError,
+            "invalid markers or values",
+        ):
+            exchange_serial_line(
+                serial_port,
+                "RP\n",
+                120,
+                interim_response_handler=lambda response: (
+                    parse_joint_motion_exchange_response(response) is not None
+                ),
+                interim_response_limit=10,
+            )
+
+        self.assertFalse(serial_port.is_open)
+        self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_interim_handler_exceptions_quarantine_the_owned_exchange(self):
+        terminal = position_response((1, 2, 3, 4, 5, 6))
+        exception_types = (
+            SerialTransportQuarantinedError,
+            SerialTransportTimeout,
+            MotionInputError,
+            SerialActivityRejected,
+        )
+
+        for exception_type in exception_types:
+            with self.subTest(exception_type=exception_type.__name__):
+                serial_port = SequenceFakeSerial(
+                    (
+                        b"TMA1B2C3D4E5F6\n",
+                        f"{terminal}\n".encode("ascii"),
+                    )
+                )
+
+                def fail_handler(_response, error_type=exception_type):
+                    raise error_type("callback failure")
+
+                with self.assertRaisesRegex(
+                    SerialTransportQuarantinedError,
+                    "interim response handler failed after transmission",
+                ):
+                    exchange_serial_line(
+                        serial_port,
+                        "RP\n",
+                        120,
+                        interim_response_handler=fail_handler,
+                        interim_response_limit=10,
+                    )
+
+                self.assertEqual(serial_port.commands, [b"RP\n"])
+                self.assertFalse(serial_port.is_open)
+                self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_unknown_interim_line_quarantines_before_terminal_data(self):
+        terminal = position_response((1, 2, 3, 4, 5, 6))
+        serial_port = SequenceFakeSerial(
+            (
+                b"unexpected\n",
+                f"{terminal}\n".encode("ascii"),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            SerialTransportQuarantinedError,
+            "invalid frame",
+        ):
+            exchange_serial_line(
+                serial_port,
+                "RP\n",
+                120,
+                interim_response_handler=lambda response: (
+                    parse_joint_motion_exchange_response(response) is not None
+                ),
+                interim_response_limit=10,
+            )
+
+        self.assertEqual(serial_port.commands, [b"RP\n"])
+        self.assertFalse(serial_port.is_open)
+        self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_interim_response_limit_quarantines_a_flooded_exchange(self):
+        terminal = position_response((1, 2, 3, 4, 5, 6))
+        telemetry = b"TMA1B2C3D4E5F6\n"
+        serial_port = SequenceFakeSerial(
+            (
+                telemetry,
+                telemetry,
+                telemetry,
+                f"{terminal}\n".encode("ascii"),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            SerialTransportQuarantinedError,
+            "exceeded the interim response limit",
+        ):
+            exchange_serial_line(
+                serial_port,
+                "RP\n",
+                120,
+                interim_response_handler=lambda response: (
+                    parse_joint_motion_exchange_response(response) is not None
+                ),
+                interim_response_limit=2,
+            )
+
+        self.assertFalse(serial_port.is_open)
+        self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_interim_response_handler_contract_is_validated(self):
+        serial_port = FakeSerial()
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "interim_response_handler",
+        ):
+            exchange_serial_line(
+                serial_port,
+                "RP\n",
+                120,
+                interim_response_handler="invalid",
+            )
+        self.assertEqual(serial_port.commands, [])
+        self.assertTrue(serial_port.is_open)
+
+        missing_limit_port = FakeSerial()
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "interim_response_limit must be a positive integer",
+        ):
+            exchange_serial_line(
+                missing_limit_port,
+                "RP\n",
+                120,
+                interim_response_handler=lambda _response: False,
+            )
+        self.assertEqual(missing_limit_port.commands, [])
+        self.assertTrue(missing_limit_port.is_open)
+
+        live_port = FakeSerial()
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "unsupported during live control",
+        ):
+            exchange_serial_line(
+                live_port,
+                "RP\n",
+                120,
+                control_event=threading.Event(),
+                control_command="S\n",
+                control_ack_timeout_seconds=1,
+                control_response_timeout_seconds=1,
+                interim_response_handler=lambda _response: False,
+                interim_response_limit=10,
+            )
+        self.assertEqual(live_port.commands, [])
+        self.assertTrue(live_port.is_open)
+
+        transmitted_port = FakeSerial(response=b"unexpected\n")
+        with self.assertRaisesRegex(
+            SerialTransportQuarantinedError,
+            "must return a boolean",
+        ):
+            exchange_serial_line(
+                transmitted_port,
+                "RP\n",
+                120,
+                interim_response_handler=lambda _response: None,
+                interim_response_limit=10,
+            )
+        self.assertFalse(transmitted_port.is_open)
+        self.assertTrue(serial_transport_quarantined(transmitted_port))
+
     def test_nonresetting_exchange_preserves_input_boundary(self):
         serial_port = FakeSerial(response=b"queued frame\n")
 
@@ -3353,6 +3572,107 @@ class NamedJointPositionTests(unittest.TestCase):
                     parse_primary_home_reference_response(response)
 
 
+class JointTelemetryProtocolTests(unittest.TestCase):
+    def test_parser_accepts_canonical_encoder_millidegrees(self):
+        telemetry = parse_joint_telemetry_response(
+            "TMA-170000B90000C-88992D0E45000F180000"
+        )
+
+        self.assertEqual(
+            telemetry,
+            JointTelemetry(
+                raw="TMA-170000B90000C-88992D0E45000F180000",
+                joints=(-170.0, 90.0, -88.992, 0.0, 45.0, 180.0),
+            ),
+        )
+
+    def test_parser_rejects_malformed_or_out_of_range_frames(self):
+        for response in (
+            "TMA0B0C0D0E0",
+            "TMA00B0C0D0E0F0",
+            "TMA-0B0C0D0E0F0",
+            "TMA2147483648B0C0D0E0F0",
+            "TMA0B0C0D0E0F0\n",
+            "TMÃ0B0C0D0E0F0",
+        ):
+            with self.subTest(response=response):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_joint_telemetry_response(response)
+
+    def test_exchange_classifier_accepts_only_owned_response_families(self):
+        telemetry = parse_joint_motion_exchange_response(
+            "TMA1B2C3D4E5F6"
+        )
+
+        self.assertEqual(
+            telemetry,
+            JointTelemetry(
+                raw="TMA1B2C3D4E5F6",
+                joints=(0.001, 0.002, 0.003, 0.004, 0.005, 0.006),
+            ),
+        )
+        for response in (
+            position_response((1, 2, 3, 4, 5, 6)),
+            "ER",
+            "EL010101010",
+        ):
+            with self.subTest(response=response):
+                self.assertIsNone(
+                    parse_joint_motion_exchange_response(response)
+                )
+
+        for response in (
+            "unexpected",
+            "E",
+            "EL01010101",
+            "EL010101012",
+            "TMA1B2",
+        ):
+            with self.subTest(response=response):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_joint_motion_exchange_response(response)
+
+    def test_response_budget_is_deadline_bounded(self):
+        self.assertEqual(joint_telemetry_response_budget(0.1), 3)
+        self.assertEqual(joint_telemetry_response_budget(120), 1202)
+        for timeout in (0, -1, True, float("nan")):
+            with self.subTest(timeout=timeout):
+                with self.assertRaises(MotionInputError):
+                    joint_telemetry_response_budget(timeout)
+
+    def test_request_marker_is_rj_scoped_and_idempotent(self):
+        command = (
+            "RJA1B2C3D4E5F6J70J80J90"
+            "Sp50Ac10Dc20Rm25WNLm000000\n"
+        )
+        requested = request_joint_telemetry(command)
+
+        self.assertEqual(
+            requested,
+            command[:-1] + "T1\n",
+        )
+        self.assertEqual(request_joint_telemetry(requested), requested)
+        self.assertEqual(
+            canonicalize_serial_command(
+                requested,
+                controller_calibration(),
+            ),
+            requested,
+        )
+        with self.assertRaises(MotionInputError):
+            canonicalize_virtual_command(requested)
+        self.assertEqual(
+            CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
+            "JOINT_TELEMETRY_V1",
+        )
+
+        with self.assertRaisesRegex(MotionInputError, "only for RJ"):
+            request_joint_telemetry(
+                "MJX1Y2Z3Rz4Ry5Rx6J70J80J90"
+                "Sp50Ac10Dc20Rm25WNLm000000\n"
+            )
+
+
 class DeferredJointAdjustmentsTests(unittest.TestCase):
     def setUp(self):
         self.profile = MotionProfile("Sp", 50, 10, 10, 25, "N", "000000")
@@ -4114,6 +4434,86 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
             lambda: self.calibration,
             **kwargs,
         )
+
+    def test_telemetry_events_preserve_exchange_order(self):
+        dispatcher = None
+        telemetry = parse_joint_telemetry_response(
+            "TMA100B200C300D400E500F600"
+        )
+
+        def exchange(_command):
+            self.assertTrue(dispatcher.publish_telemetry(telemetry))
+            return position_response((1, 2, 3, 4, 5, 6))
+
+        dispatcher = self.make_dispatcher(exchange)
+        dispatcher.submit_positions(
+            (1, 2, 3, 4, 5, 6, 0, 0, 0),
+            self.actual,
+            self.profile,
+        )
+        events = collect_events_until_idle(dispatcher)
+
+        self.assertEqual(
+            [event.kind for event in events],
+            ["started", "telemetry", "completed"],
+        )
+        self.assertEqual(events[1].telemetry, telemetry)
+        self.assertIs(events[1].move, events[0].move)
+
+    def test_telemetry_events_coalesce_without_delaying_completion(self):
+        dispatcher = None
+        final_telemetry = None
+        publication_finished = threading.Event()
+
+        def exchange(_command):
+            nonlocal final_telemetry
+            for sample in range(10000):
+                final_telemetry = parse_joint_telemetry_response(
+                    f"TMA{sample}B2C3D4E5F6"
+                )
+                self.assertTrue(
+                    dispatcher.publish_telemetry(final_telemetry)
+                )
+            publication_finished.set()
+            return position_response((1, 2, 3, 4, 5, 6))
+
+        dispatcher = self.make_dispatcher(exchange)
+        dispatcher.submit_positions(
+            (1, 2, 3, 4, 5, 6, 0, 0, 0),
+            self.actual,
+            self.profile,
+        )
+        self.assertTrue(publication_finished.wait(2))
+        events = collect_events_until_idle(dispatcher)
+
+        self.assertEqual(
+            [event.kind for event in events],
+            ["started", "telemetry", "completed"],
+        )
+        self.assertEqual(events[1].telemetry, final_telemetry)
+
+    def test_telemetry_publication_requires_an_active_validated_exchange(self):
+        dispatcher = self.make_dispatcher(
+            lambda _command: position_response((0, 0, 0, 0, 0, 0))
+        )
+        telemetry = parse_joint_telemetry_response(
+            "TMA0B0C0D0E0F0"
+        )
+
+        with self.assertRaisesRegex(MotionQueueFault, "in-flight"):
+            dispatcher.publish_telemetry(telemetry)
+        with self.assertRaisesRegex(MotionInputError, "validated telemetry"):
+            dispatcher.publish_telemetry((0,) * 6)
+        with self.assertRaisesRegex(MotionInputError, "validated wire frame"):
+            dispatcher.publish_telemetry(
+                JointTelemetry(
+                    raw="TMA0B0C0D0E0F0",
+                    joints=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+                )
+            )
+
+        dispatcher.close()
+        self.assertFalse(dispatcher.publish_telemetry(telemetry))
 
     def test_many_adjustments_become_one_latest_pending_target(self):
         first_started = threading.Event()

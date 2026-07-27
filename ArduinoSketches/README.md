@@ -3,16 +3,30 @@
 Firmware compilation is hardware-free. Do not add `--upload` without the explicit operator authorization, emergency-stop check, cleared work envelope, firmware identity, configuration profile, and procedure required by `AGENTS.md`.
 
 The tracked line-oriented Teensy compatibility source identifies version
-`6.7.1-ar4hmi.3`, advertises the required `JT_WRIST_CONFIG_V1`,
+`6.7.1-ar4hmi.4`, advertises the required `JT_WRIST_CONFIG_V1`,
 `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, and
 `GCODE_WRITE_IDENTITY_V1` host capabilities plus the optional
-`HOME_REFERENCE_V1` parking-reference contract, and compiles with Arduino CLI,
+`HOME_REFERENCE_V1` parking-reference and `JOINT_TELEMETRY_V1` request-scoped
+J1-J6 encoder telemetry contracts, and compiles with Arduino CLI,
 PJRC Teensy core 1.62.0, bundled SdFat 2.1.2, and ModbusMaster 2.0.1. `HO`
 includes the fixed-width controller hardware identity used to bind storage
 requests to the connected Teensy. Compilation
 establishes source and toolchain compatibility only; hardware-free fixtures
 cover selected protocol behavior, while correlated JSON parsing,
 Cartesian-bound, and emergency-event work remains a later integration unit.
+
+`JOINT_TELEMETRY_V1` accepts the optional `T1` suffix only on `RJ` commands.
+The controller targets ten samples per second, formats signed millidegrees in a
+fixed ASCII frame, and drops a sample unless USB capacity remains for both the
+telemetry frame and a reserved terminal response. J7-J9 remain host estimates
+because the tracked controller has no matching encoder sources. A
+telemetry-enabled `RJ` retains main-loop response ownership across the drive;
+an E-stop latches immediately, then terminal framing follows committed step
+progress and encoder reconciliation. A stop deferred after terminal selection
+becomes an admission block during atomic ownership commit. The next queued
+command receives an `EB` position response before parsing or output activation,
+then the reported block clears. No-upload compilation does not establish encoder
+accuracy or pulse-timing behavior.
 
 `GCODE_DIRECTORY_FRAMING_V1` reserves comma as the directory separator,
 requires every `.txt` entry to have a reversible controller-command stem, and

@@ -7,11 +7,11 @@ event thread.
 
 from dataclasses import dataclass
 from contextlib import contextmanager
+from collections import deque
 from collections.abc import Mapping
 from enum import Enum
 import json
 import math
-from queue import Empty, Queue
 import re
 import struct
 import threading
@@ -59,6 +59,12 @@ CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1 = (
 )
 CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1 = "JT_WRIST_CONFIG_V1"
 CONTROLLER_CAPABILITY_HOME_REFERENCE_V1 = "HOME_REFERENCE_V1"
+CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1 = "JOINT_TELEMETRY_V1"
+JOINT_TELEMETRY_AXIS_COUNT = 6
+JOINT_TELEMETRY_PREFIX = "TMA"
+JOINT_TELEMETRY_FAMILY_PREFIX = JOINT_TELEMETRY_PREFIX[:2]
+JOINT_TELEMETRY_PERIOD_SECONDS = 0.1
+JOINT_TELEMETRY_RESPONSE_BUDGET_MARGIN = 2
 CONTROLLER_DIRECTORY_SEPARATOR = ","
 MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES = MAX_RESPONSE_PAYLOAD_LENGTH
 MAX_CONTROLLER_IDENTITY_FIELD_LENGTH = 31
@@ -2018,6 +2024,8 @@ def exchange_serial_line(
     control_response_timeout_seconds=None,
     write_started_event=None,
     reset_input=True,
+    interim_response_handler=None,
+    interim_response_limit=None,
 ):
     """Perform a validated newline-delimited exchange on a serial-like object.
 
@@ -2029,6 +2037,25 @@ def exchange_serial_line(
         raise MotionInputError("response_timeout_seconds must be positive")
     if not isinstance(reset_input, bool):
         raise MotionInputError("reset_input must be boolean")
+    if interim_response_handler is not None and not callable(
+        interim_response_handler
+    ):
+        raise MotionInputError(
+            "interim_response_handler must be callable or None"
+        )
+    if interim_response_handler is None:
+        if interim_response_limit is not None:
+            raise MotionInputError(
+                "interim_response_limit requires an interim_response_handler"
+            )
+    elif (
+        isinstance(interim_response_limit, bool)
+        or not isinstance(interim_response_limit, int)
+        or interim_response_limit <= 0
+    ):
+        raise MotionInputError(
+            "interim_response_limit must be a positive integer"
+        )
     command_bytes = _serial_command_bytes(command)
     _require_open_serial_port(serial_port)
     _validate_write_lock(write_lock)
@@ -2046,6 +2073,10 @@ def exchange_serial_line(
         control_ack_timeout = None
         control_response_timeout = None
     else:
+        if interim_response_handler is not None:
+            raise MotionInputError(
+                "interim responses are unsupported during live control"
+            )
         if not callable(getattr(control_event, "is_set", None)):
             raise MotionInputError("control_event must satisfy the event contract")
         if control_command is None:
@@ -2094,6 +2125,8 @@ def exchange_serial_line(
             control_response_timeout,
             write_started_event,
             reset_input,
+            interim_response_handler,
+            interim_response_limit,
         )
     except (SerialTransportQuarantinedError, SerialTransportTimeout) as exc:
         operation_error = exc
@@ -2133,6 +2166,8 @@ def _exchange_serial_line_with_timeout(
     control_response_timeout,
     write_started_event,
     reset_input,
+    interim_response_handler,
+    interim_response_limit,
 ):
     _set_serial_timeout(serial_port, timeout)
 
@@ -2157,6 +2192,7 @@ def _exchange_serial_line_with_timeout(
         raise TypeError("serial connection does not satisfy the line-exchange contract")
 
     response_buffer = bytearray()
+    interim_response_count = 0
     control_sent = False
     control_attempted = False
     live_acknowledged = False
@@ -2307,6 +2343,25 @@ def _exchange_serial_line_with_timeout(
             )
             response_buffer.clear()
             if response:
+                if interim_response_handler is not None:
+                    try:
+                        consumed = interim_response_handler(response)
+                    except Exception as exc:
+                        raise ProtocolResponseError(
+                            "interim response handler failed after "
+                            f"transmission: {exc}"
+                        ) from exc
+                    if not isinstance(consumed, bool):
+                        raise ProtocolResponseError(
+                            "interim response handler must return a boolean"
+                        )
+                    if consumed:
+                        interim_response_count += 1
+                        if interim_response_count > interim_response_limit:
+                            raise ProtocolResponseError(
+                                "controller exceeded the interim response limit"
+                            )
+                        continue
                 controller_estop = _is_physical_estop_position_response(response)
                 if control_bytes is not None and not controller_estop:
                     if not live_acknowledged:
@@ -3449,6 +3504,10 @@ _STANDARD_TIMING_SUFFIXES = {
         for opcode in ("WC", "WG")
     },
 }
+_SERIAL_TIMING_SUFFIXES = {
+    **_STANDARD_TIMING_SUFFIXES,
+    "RJ": re.compile(r"W[NFA]Lm[01]{6}(?:T1)?\n\Z"),
+}
 _LIVE_JOG_MAXIMUM_AXES = {
     "LC": 6,
     "LJ": JOINT_COUNT,
@@ -3472,6 +3531,16 @@ _PRIMARY_HOME_REFERENCE_RESPONSE = re.compile(
     r"C(?P<j2_valid>[01])"
     r"D(?P<j2_millidegrees>(?:0|-?[1-9][0-9]*))$"
 )
+_JOINT_TELEMETRY_RESPONSE = re.compile(
+    rf"^{re.escape(JOINT_TELEMETRY_PREFIX)}"
+    r"(?P<j1_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"B(?P<j2_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"C(?P<j3_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"D(?P<j4_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"E(?P<j5_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"F(?P<j6_millidegrees>(?:0|-?[1-9][0-9]*))$"
+)
+_JOINT_MOTION_ERROR_RESPONSE = re.compile(r"^(?:ER|EL[01]{9})$")
 
 
 @dataclass(frozen=True)
@@ -3630,7 +3699,11 @@ def _parse_command_contract(command, virtual):
     )
     envelope = envelopes.get(opcode)
     timing_pattern = _STANDARD_TIMING_PROFILE
-    suffix_pattern = _STANDARD_TIMING_SUFFIXES.get(opcode)
+    suffix_pattern = (
+        _STANDARD_TIMING_SUFFIXES.get(opcode)
+        if virtual
+        else _SERIAL_TIMING_SUFFIXES.get(opcode)
+    )
     if envelope is None:
         envelope = _LEGACY_TIMING_ENVELOPES.get(opcode)
         timing_pattern = _LEGACY_JOG_TIMING_PROFILE
@@ -3730,6 +3803,29 @@ def canonicalize_serial_command(command, calibration=None):
             )
         calibration.validate_axis_positions(axis_targets)
     return normalized
+
+
+def request_joint_telemetry(command):
+    normalized = _parse_command_contract(command, virtual=False)[1]
+    if normalized[:2] != "RJ":
+        raise MotionInputError("joint telemetry is available only for RJ commands")
+    if normalized.endswith("T1\n"):
+        return normalized
+    requested = normalized[:-1] + "T1\n"
+    return _parse_command_contract(requested, virtual=False)[1]
+
+
+def joint_telemetry_response_budget(response_timeout_seconds):
+    timeout = finite_number(
+        response_timeout_seconds,
+        "response_timeout_seconds",
+    )
+    if timeout <= 0:
+        raise MotionInputError("response_timeout_seconds must be positive")
+    return (
+        math.ceil(timeout / JOINT_TELEMETRY_PERIOD_SECONDS)
+        + JOINT_TELEMETRY_RESPONSE_BUDGET_MARGIN
+    )
 
 
 def canonicalize_virtual_command(command):
@@ -3892,6 +3988,72 @@ class PositionResponse:
     flag: str
 
 
+@dataclass(frozen=True)
+class JointTelemetry:
+    """Actual encoder positions sampled during one requested RJ exchange."""
+
+    raw: str
+    joints: Tuple[float, ...]
+
+
+def parse_joint_telemetry_response(response):
+    if (
+        not isinstance(response, str)
+        or not response
+        or response != response.strip()
+        or len(response) > MAX_RESPONSE_PAYLOAD_LENGTH
+    ):
+        raise ProtocolResponseError(
+            "controller joint telemetry response is invalid"
+        )
+    try:
+        response.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ProtocolResponseError(
+            "controller joint telemetry response must contain ASCII only"
+        ) from exc
+    match = _JOINT_TELEMETRY_RESPONSE.fullmatch(response)
+    if match is None:
+        raise ProtocolResponseError(
+            "controller joint telemetry response has invalid markers or values"
+        )
+    millidegrees = tuple(
+        int(match.group(f"j{axis}_millidegrees"))
+        for axis in range(1, JOINT_TELEMETRY_AXIS_COUNT + 1)
+    )
+    if any(
+        value < -CONTROLLER_SIGNED_INT_MAX - 1
+        or value > CONTROLLER_SIGNED_INT_MAX
+        for value in millidegrees
+    ):
+        raise ProtocolResponseError(
+            "controller joint telemetry response exceeds the signed range"
+        )
+    return JointTelemetry(
+        raw=response,
+        joints=tuple(value / 1000.0 for value in millidegrees),
+    )
+
+
+def parse_joint_motion_exchange_response(response):
+    if (
+        isinstance(response, str)
+        and response.startswith(JOINT_TELEMETRY_FAMILY_PREFIX)
+    ):
+        return parse_joint_telemetry_response(response)
+    try:
+        parse_position_response(response)
+    except ProtocolResponseError as exc:
+        if (
+            not isinstance(response, str)
+            or _JOINT_MOTION_ERROR_RESPONSE.fullmatch(response) is None
+        ):
+            raise ProtocolResponseError(
+                "controller joint-motion exchange returned an invalid frame"
+            ) from exc
+    return None
+
+
 def parse_primary_home_reference_response(response):
     if (
         not isinstance(response, str)
@@ -4012,6 +4174,7 @@ class MotionEvent:
     started_at_seconds: Optional[float] = None
     response: Optional[str] = None
     position: Optional[PositionResponse] = None
+    telemetry: Optional[JointTelemetry] = None
     error: Optional[str] = None
     pending_discarded: bool = False
     _acknowledgement: Optional[threading.Event] = None
@@ -4212,7 +4375,9 @@ class CoalescingJointDispatcher:
         self._transport_lock = transport_lock
         self._activity_factory = activity_factory
         self._lock = threading.Lock()
-        self._events = Queue()
+        self._events = deque()
+        self._latest_telemetry_event = None
+        self._next_event_sequence = 0
         self._worker = None
         self._inflight = None
         self._pending = None
@@ -4454,6 +4619,7 @@ class CoalescingJointDispatcher:
             self._closed = True
             self._pending = None
             self._desired = None
+            self._latest_telemetry_event = None
             acknowledgement = self._result_acknowledgement
             if self._worker is None and self._transport_reserved:
                 self._release_transport_locked()
@@ -4464,12 +4630,66 @@ class CoalescingJointDispatcher:
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
             raise MotionInputError("event limit must be a non-negative integer or None")
         events = []
-        while limit is None or len(events) < limit:
-            try:
-                events.append(self._events.get_nowait())
-            except Empty:
-                break
+        with self._lock:
+            while limit is None or len(events) < limit:
+                queued_event = self._events[0] if self._events else None
+                telemetry_event = self._latest_telemetry_event
+                if queued_event is None and telemetry_event is None:
+                    break
+                if (
+                    telemetry_event is not None
+                    and (
+                        queued_event is None
+                        or telemetry_event[0] < queued_event[0]
+                    )
+                ):
+                    self._latest_telemetry_event = None
+                    events.append(telemetry_event[1])
+                else:
+                    events.append(self._events.popleft()[1])
         return events
+
+    def _next_event_record_locked(self, event):
+        self._next_event_sequence += 1
+        return self._next_event_sequence, event
+
+    def _publish_event(self, event):
+        with self._lock:
+            self._events.append(
+                self._next_event_record_locked(event)
+            )
+
+    def publish_telemetry(self, telemetry):
+        if not isinstance(telemetry, JointTelemetry):
+            raise MotionInputError(
+                "joint telemetry event must contain validated telemetry"
+            )
+        try:
+            validated = parse_joint_telemetry_response(telemetry.raw)
+        except ProtocolResponseError as exc:
+            raise MotionInputError(
+                "joint telemetry event must contain validated telemetry"
+            ) from exc
+        if telemetry != validated:
+            raise MotionInputError(
+                "joint telemetry event must match its validated wire frame"
+            )
+        with self._lock:
+            if self._closed:
+                return False
+            move = self._inflight
+            if move is None:
+                raise MotionQueueFault(
+                    "joint telemetry arrived without an in-flight move"
+                )
+            self._latest_telemetry_event = self._next_event_record_locked(
+                MotionEvent(
+                    kind="telemetry",
+                    move=move,
+                    telemetry=validated,
+                )
+            )
+        return True
 
     def _run(self):
         while True:
@@ -4483,11 +4703,12 @@ class CoalescingJointDispatcher:
                     move = self._pending
                     self._pending = None
                     self._inflight = move
+                    self._latest_telemetry_event = None
             if move is None:
                 return
 
             started_at_seconds = time.monotonic()
-            self._events.put(
+            self._publish_event(
                 MotionEvent(
                     kind="started",
                     move=move,
@@ -4523,7 +4744,7 @@ class CoalescingJointDispatcher:
                         self._result_acknowledgement = acknowledgement
                     else:
                         acknowledgement.set()
-                self._events.put(
+                self._publish_event(
                     MotionEvent(
                         kind="failed",
                         move=move,
@@ -4552,7 +4773,7 @@ class CoalescingJointDispatcher:
                 else:
                     acknowledgement.set()
 
-            self._events.put(
+            self._publish_event(
                 MotionEvent(
                     kind="completed",
                     move=move,

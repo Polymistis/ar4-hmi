@@ -21,7 +21,7 @@ This file defines project scope, status, acceptance criteria, and architectural 
 
 - Commit `63c886f` preserves the imported AR4 control-software baseline.
 - Commit `627990a` installs cross-review-gate and the per-clone pre-commit dispatcher.
-- `AR4.py` identifies host source version 6.7. The imported Teensy baseline identifies version 6.7.1; the active tracked derivative identifies version `6.7.1-ar4hmi.3` and advertises `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, and `HOME_REFERENCE_V1`.
+- `AR4.py` identifies host source version 6.7. The imported Teensy baseline identifies version 6.7.1; the active tracked derivative identifies version `6.7.1-ar4hmi.4` and advertises `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, `HOME_REFERENCE_V1`, and `JOINT_TELEMETRY_V1`.
 - Runtime calibration and machine state remain untracked; `defaults.json` remains the tracked default profile.
 - No live-arm command, firmware flash, calibration cycle, or movement was performed during repository setup.
 
@@ -158,7 +158,7 @@ Implemented HMI work:
 - Deferred joint resolution, dispatcher admission, and consumed-state clearing share synchronized locking. Concurrent input is included in the admitted snapshot or remains pending for the next confirmed generation, and dispatcher worker startup completes or rolls back before another submission can receive acceptance.
 - Controller errors, malformed responses, timeouts, and embedded motion faults discard pending motion and require position resynchronization. Automatic calibration requires a terminal controller disposition after a committed write because the line-oriented `LL` protocol has no host abort command. Shutdown and calibration write admission share an atomic boundary: shutdown before write commitment rejects transmission, while a committed write latches calibration transport and motion ownership through an applied terminal response or explicit post-write quarantine and verified-close handling. Any post-write framing failure, extra frame, non-position response, controller fault, or result-application failure blocks later calibration stages. Result-application rejection restores the captured pre-command pose and generation, cancels changed debounced persistence, schedules the restored state or retains dirty state after scheduler failure, then quarantines the transport before releasing ownership.
 - Owned line exchanges classify controller opcodes before parsing fields. Motion opcodes require complete opcode-specific envelopes, so timing-like payload text cannot replace or duplicate motion timing. Controller-bound `RJ` and `MJ` envelopes require J7-J9, while simulator-bound `RJ` and `MJ` use separate exact J1-J6 and Cartesian envelopes and legacy `JT` retains an explicit simulator contract. Bounded commands validate encoded speed, acceleration, deceleration, and ramp fields, reject acceleration and deceleration regions whose combined share exceeds the move, then derive finite response deadlines from validated timing and configured full-travel bounds. `PG` playback has no duration contract in the current firmware and therefore retains response ownership without a fixed terminal deadline; application shutdown cancels the host exchange and quarantines the transport, without claiming physical-motion preemption. Live-jog start acknowledgement uses `SERIAL_LIVE_ACK_TIMEOUT_SECONDS`; completion after the stop token reuses the command-specific full-travel deadline, while the deadline remains suspended during an acknowledged hold. Live-jog and playback cancellation admission is rechecked under the serial write lock after stale-input reset, so cancellation before transmission writes neither the motion command nor a fail-safe stop token. Any premature terminal data, framing failure, or timeout-state failure after transmission writes the fail-safe stop token where possible, quarantines the main serial transport before ownership release, attempts a verified close, and requires explicit reconnection. A failed close retains the poisoned handle for later cleanup instead of dropping application ownership. Temporary exchange-timeout restoration is attempted across exit paths, and restoration failure triggers the same quarantine.
-- Owned framed responses remove only a required LF and an optional preceding CR. Response validation separates the 4096-byte payload limit from the 4098-byte CRLF-capable frame limit, so a maximum-length payload remains valid with either supported delimiter. Payload padding, additional delimiters, non-ASCII data, and queued data outside an operation-specific follow-up contract are protocol failures; terminal readers require a complete bounded quiet interval before releasing ownership and quarantine the transport when the response deadline cannot provide that interval. Host response parsing accepts a validated controller-initiated `EB` position as a physical-E-stop terminal frame. The active Teensy `6.7.1-ar4hmi.3` derivative retains baseline serial response work from `EstopProg` and speculative spline acknowledgements from `processSerial`, so an interrupt race can produce multiple terminal frames. No E-stop firmware rewrite is included in M4A. Safe response ownership requires a controller-protocol redesign followed by compilation, simulation, and authorized live-arm verification.
+- Owned framed responses remove only a required LF and an optional preceding CR. Response validation separates the 4096-byte payload limit from the 4098-byte CRLF-capable frame limit, so a maximum-length payload remains valid with either supported delimiter. Payload padding, additional delimiters, non-ASCII data, and queued data outside an operation-specific follow-up contract are protocol failures; terminal readers require a complete bounded quiet interval before releasing ownership and quarantine the transport when the response deadline cannot provide that interval. Host response parsing accepts a validated controller-initiated `EB` position as a physical-E-stop terminal frame. The active Teensy `6.7.1-ar4hmi.4` derivative gives a telemetry-enabled `RJ` request main-loop response ownership from before the coordinated drive through terminal framing. Matching interrupts latch the stop without writing serial data; the drive commits local step progress, reconciles encoders, and emits the selected terminal response from the owner. A stop deferred after terminal selection becomes an admission block during the atomic ownership commit. The next queued command is rejected with an `EB` position response before parsing or output activation, then the reported block clears. Interrupt-side serial responses outside that request-local contract and speculative spline acknowledgements from `processSerial` remain. Those remaining paths can still produce multiple terminal frames. No comprehensive E-stop protocol rewrite is included in M4A; safe response ownership requires a controller-protocol redesign followed by compilation, simulation, and authorized live-arm verification.
 - Serial worker terminal results reach Tk through event queues. The matching transport and shutdown-activity lease remain reserved until Tk applies the operation-local result and releases transport admission. The matching callback then settles any request-scoped motion owner before deferred input is retried. Joint-dispatch and startup leases likewise span worker execution through terminal acknowledgement or connection cleanup. Parsed M1 speed-violation metadata survives serial, manual, startup, calibration, and joint completion; ready or queued status cannot overwrite the warning. Joint M1 completion discards queued and deferred targets, rebases desired state on the confirmed controller position, and leaves later input admissible from that position.
 - Controller fault rendering queues recovery instead of performing controller I/O on Tk. Collision correction waits for main-transport release before dispatching `CP\n`. Auxiliary program stop uses request-correlated pending, dispatched, completed, and failed states. Only the firmware's interruptible `WI` wait permits write-only `STOP\n` injection while the wait worker retains sole response ownership. `Nano Stopped` acknowledges interruption directly. Immediately after successful `STOP\n` transmission, one absolute monotonic deadline based on `SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS` replaces the original `WI` deadline. Wait-owner handoff, optional owner-side follow-up, serial-lock acquisition, stop-worker follow-up read, and the required quiet boundary all consume that same deadline. When racing natural `Done` or `Timeout` and `Nano Inactive Stopped` frames are already queued, the wait owner validates both before release and publishes the inactive acknowledgement; when the second frame arrives later, the stop worker consumes the bounded follow-up after ownership release. Missing, unexpected, or additional follow-up data quarantines the auxiliary transport. Program halt status explicitly reports that active main motion is not preempted. Other auxiliary operations retain a pending stop request until an exclusive exchange returns the expected inactive-stop acknowledgement. `WI` timeouts are constrained to the firmware integer range, receive an encoded-timeout-plus-margin read deadline, and accept only documented terminal responses. Servo and output rows consume bounded unframed acknowledgements, require a quiet read boundary after the expected bytes, and quarantine empty, partial, unexpected, or trailing data. Legacy auxiliary commands reset stale input before transmission and share the stop-token write lock, preventing byte interleaving or post-write response erasure. Windows and Linux Xbox gripper paths share the bounded validated exchange owner. Every program, manual, and Xbox `SV`/`ON`/`OF` command requires an explicit Nano or Mega profile bound to the active auxiliary serial handle; an unselected or stale profile blocks transmission. Servo commands enforce channels 0-6 and positions 0-180. Nano accepts outputs 8-13, Mega accepts outputs 28-53, and each profile rejects the complete opposing range. Windows pneumatic toggles use profile-valid output 8 for Nano and 28 for Mega. Closing or replacing the handle clears the binding, and existing configurations default to no selected board until the operator chooses a profile. Windows toggle state remains pending until the expected acknowledgement returns through the Tk event queue; transport rejection preserves the last acknowledged state, while an invalid exchange marks state unknown and attempts a verified auxiliary close. Linux performs the same exchange synchronously in the controller worker and changes local grip state only after acknowledgement.
 - Live joint, Cartesian, and tool jog callbacks use an interruptible worker-owned request. Button release sets a stop event without sleeping or reading serial data on Tk; the worker writes the firmware stop token and remains the sole response reader. Live modes normalize Seconds and millimetres-per-second selections to Percent because firmware accepts stop input only between segments. Offline live workers validate the complete command through the shared host parser and forward the encoded speed, acceleration, deceleration, and ramp profile to the virtual drive. Offline live workers reserve a shared request slot before launch, synchronize stop against segment admission, and wait for each request-scoped virtual result. The request-scoped operation remains authoritative until matching Tk settlement, so rejected or invalid later input cannot clear active state and button release still signals the active owner even if the display flag is stale. Tk performs the final virtual-state snapshot only after terminal ownership settlement, so a later press cannot reactivate released work or overlap an unfinished segment. Virtual live-jog errors return through a Tk event queue.
@@ -276,7 +276,7 @@ Implemented HMI work:
   Feed values convert from active units per minute to millimetres per second,
   and imperial coordinates convert from the parsed axis value before start
   offsets are applied. `Tool Set` rows reject without transmission because the
-  tracked Teensy `6.7.1-ar4hmi.3` protocol has no `TF` handler.
+  tracked Teensy `6.7.1-ar4hmi.4` protocol has no `TF` handler.
 - Virtual program completion preserves the original deadline when Tk scheduling falls back to a background owner. Timeout remains a failed result while ownership waits for the matching request-scoped operation to settle; failure to start the fallback worker retains the same settlement synchronously instead of publishing an early terminal row result.
 
 - `controller_degree_to_native_radians` defines shared binary32 degree-to-radian and round-trip representability for motion envelopes, `UP` construction, custom-profile validation, startup native preflight, and Teensy conversion. Values rejected by the native public-degree boundary are rejected before controller writes or profile persistence.
@@ -484,7 +484,7 @@ Implemented portions of the active integration unit:
 - Rounded `ML` execution carries the originating command-local wrist selector and loop modes into the derived `MA` frame. Live `LC`, `LJ`, and `LT` control readers accept only exact `S` lines with LF or CRLF termination; overlength or other complete control frames receive one error from the live terminal-response owner, while ordinary command-ingress callers own their separate overflow responses. Host and firmware filename validation rejects the complete FAT-reserved character set, the comma-delimited controller-directory separator, outer spaces, and control or non-ASCII input. Controller-directory framing additionally rejects `.txt` entries without a reversible stem and caps the aggregate payload at 4096 bytes before emission. Controller Modbus polling waits require a positive timeout so every accepted wait performs at least one polling interval.
 - SD-card identity is revalidated after directory and delete-lookup traversal before any successful listing or absence response. Deletion revalidates the admitted CID immediately before and after removal. `WC` and `WG` carry the admitted `Mi<CID>Fn<filename>` target, and firmware revalidates that CID before and after each write. A changed or unreadable card produces a detailed storage error without a success response.
 - Multi-register Modbus reads reject any contiguous span ending beyond address `0xFFFF`. Live `LC` and `LT` handlers validate the complete start command before emitting the blank start acknowledgement. Finite `ML`, `MC`, and `MA` trajectory loops stop at the first joint-limit fault and emit at most one terminal fault frame. SD playback accumulates each stored row under the shared command-size boundary before parsing and stops after any non-completed Cartesian row without duplicating a terminal fault response. Encoder collision sends one `EC`-bearing position frame before returning terminal-fault status, so stored playback stops before reading another row. Emergency-stop state read by motion loops is declared volatile because the interrupt handler writes that state asynchronously.
-- The paired line-oriented Teensy `6.7.1-ar4hmi.3` compatibility unit advertises `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, and `HOME_REFERENCE_V1` and compiles for `teensy:avr:teensy41` with PJRC core 1.62.0, bundled SdFat 2.1.2, and ModbusMaster 2.0.1. The compile regression parses the verbose dependency report and requires the active SPI and SdFat folders under the selected Teensy platform; `docs/hardware-free-verification-2026-07-19.md` records the earlier no-upload compatibility result and establishes no live-arm behavior or correlated JSON readiness.
+- The paired line-oriented Teensy `6.7.1-ar4hmi.4` compatibility unit advertises `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, `HOME_REFERENCE_V1`, and `JOINT_TELEMETRY_V1` and compiles for `teensy:avr:teensy41` with PJRC core 1.62.0, bundled SdFat 2.1.2, and ModbusMaster 2.0.1. The compile regression parses the verbose dependency report and requires the active SPI and SdFat folders under the selected Teensy platform; `docs/hardware-free-verification-2026-07-19.md` records the earlier no-upload compatibility result and establishes no live-arm behavior or correlated JSON readiness.
 - Firmware identity fields share a bounded printable-ASCII storage and response contract with the host, use the same tested JSON producer as the sketch, and load from explicitly terminated EEPROM buffers. The `SR` transport reserves `[M]`, `[V]`, `[B]`, `[S]`, and `[A]`; its shared parser rejects missing, reordered, duplicated, field-embedded, empty, control-byte, and overlength input before persistence, while stored and migrated legacy identity values retain the complete printable range. Erased identity storage, an in-progress transaction, a current committed record, a legacy committed record, and corrupt storage have distinct marker states. Startup migrates valid legacy identity and binary debug data through verified current-schema records, substitutes `Unset` only for erased legacy identity fields, and blocks `HO` after failed migration. The erased debug byte left by the legacy `SR` path migrates to the disabled safe default; every other legacy debug byte outside the binary domain aborts migration before any current-schema write. Interrupted current-schema identity writes reload as corrupt and also block `HO`. `HO` emits one protocol frame regardless of persistent debug or spline state. Debug commands validate the complete grammar before transactional persistence and live-state mutation; complete-buffer EEPROM verification failure suppresses success. Every early `loop()` exit consumes the active command through a tested queue-rotation primitive, so invalid `DB`, `SR`, `JT`, and missing-file `PG` commands cannot wedge later work.
 - Native boundary, binary32 underflow, degree-to-radian underflow, strict firmware numeric parsing through the complete shared `JT`, `MJ`, and `MV` handler grammar, serial and SD frame extraction into the shared parser, exact live-control classification and terminal-response selection, strict `SR` identity extraction, paired host/firmware ramp and FAT-reserved filename limits, positive Modbus polling timeouts, rounded `ML` wrist preservation, ordered minor- and major-arc execution geometry, branch, singularity, near-singularity, shared native/firmware wrist generation, cross-seam branch parity, nearest in-range multi-turn normalization, joint-limit, unreachable-target, tool-frame representability, tool-rotation geometry, vision-Rx restoration, immediate firmware kinematic-cache refresh, parallel-determinism, sanitizer, host-routing, command-specific Modbus response classification, generic program admission, Windows loaded-binding, Linux source-build/import, firmware identity, old-`SR` EEPROM migration with erased debug storage, binary legacy debug migration, marker-valid identity corruption, interrupted identity transaction reload, partial-byte EEPROM failure, command-queue, control-query spline isolation, large-finite wrist normalization, transactional debug-command, Cartesian display/wire-to-native ordering, Cartesian direction, firmware wrist-selection rejection, and paired tool-jog signed-TCP-displacement contracts have hardware-free regression coverage.
 - G-code directory contract coverage includes exact and overflowing aggregate
@@ -516,25 +516,27 @@ Display contract:
 
 - The normal J1-J9 slider thumb represents the active operator input or the
   latest accepted desired target.
-- A toggleable cyan marker represents the commanded in-flight position estimate
-  for coordinated `RJ` moves.
+- A toggleable cyan marker represents coordinated `RJ` motion. The marker uses
+  the commanded estimate until negotiated encoder telemetry arrives, then uses
+  actual J1-J6 samples while retaining the estimator for J7-J9.
 - The estimate follows the controller's calibrated step conversion,
   synchronized high-step progression, and acceleration, cruise, and
   deceleration timing envelope.
-- Existing line-oriented firmware reports joint position only in the terminal
-  response, so the moving marker is labeled estimated and never advances
-  confirmed calibration state.
+- Controllers without `JOINT_TELEMETRY_V1` report joint position only in the
+  terminal response and retain the estimate-only behavior. Telemetry-capable
+  controllers emit request-scoped interim samples that never advance confirmed
+  calibration state.
 - Terminal position feedback remains authoritative for confirmed state and
   reconciles every idle normal slider. An actively dragged slider retains
   operator input until pointer release. Faults or unavailable estimates hide
   the marker rather than fabricating live position.
 - Cartesian, tool, program, calibration, homing, and indefinite live-jog
-  operations remain outside the estimate until a validated trajectory or
+  operations remain outside motion tracking until a validated trajectory or
   correlated live-telemetry contract supplies meaningful progress.
 
 Acceptance criteria:
 
-- Estimated markers can be enabled or disabled without affecting motion
+- Motion-tracking markers can be enabled or disabled without affecting motion
   admission, serial ownership, or controller state.
 - J1-J9 desired targets remain interactive while an accepted coordinated move
   owns the serial interface.
@@ -543,8 +545,8 @@ Acceptance criteria:
 - Deterministic hardware-free tests cover step-derived duration, synchronized
   multi-axis interpolation, terminal clamping, toggle behavior, desired-target
   preservation, active-drag preservation, and marker geometry.
-- Live-arm comparison is recorded separately and does not convert an estimate
-  into actual telemetry.
+- Live-arm comparison is recorded separately; hardware-free telemetry fixtures
+  do not establish physical encoder accuracy, cadence, or motion-timing impact.
 
 Implemented evidence:
 
@@ -554,8 +556,8 @@ Implemented evidence:
 - A Tk-thread visualization owner updates the J1-J9 overlay markers from the
   existing joint-motion poll, preserves active pointer drags and coalesced
   desired targets across delayed worker events, uses the worker's monotonic
-  dispatch timestamp, and disables only the display estimate after presentation
-  failure.
+  dispatch timestamp, replaces only J1-J6 estimates with validated encoder
+  samples, and disables only the display after presentation failure.
 - The complete Windows and Ubuntu hardware-free suites pass. Tracked marker
   tests exercise placement, pointer forwarding, drag preservation, redraw
   suppression, and cleanup without opening the application entry point or a
@@ -581,7 +583,7 @@ Control contract:
 - Tool Frame controls use matching vertical relative-jog rows. Absolute sliders
   remain unavailable because tool-frame jog represents signed displacement
   along the moving tool axes rather than an absolute tool-frame position.
-- The estimated joint marker uses a wider bright-cyan body and contrasting
+- The joint motion marker uses a wider bright-cyan body and contrasting
   outline while retaining pointer forwarding and desired-slider interaction.
 - `Start Position` submits the canonical post-calibration J1-J6 target
   `(0, 0, 0, 0, 45, 0)`.
@@ -631,6 +633,73 @@ Acceptance criteria:
   hardware-free coverage.
 - Live-arm verification remains a separate M5 procedure and is not inferred
   from HMI rendering or mocked transport results.
+
+### M4A7 - Low-priority joint encoder telemetry
+
+Status: `In progress`
+
+Protocol contract:
+
+- `JOINT_TELEMETRY_V1` is optional. A connected controller must advertise the
+  capability before the host appends `T1` to a coordinated `RJ` command.
+  Controllers without the capability retain the estimator-only path.
+- `T1` is request-scoped. No telemetry persists after the owning `RJ` exchange,
+  and no other motion opcode can enable the stream.
+- The Teensy samples the encoder-backed primary joints at a ten-hertz target
+  cadence and emits one bounded ASCII frame containing signed J1-J6
+  millidegrees. J7-J9 have no matching encoder source and remain command
+  estimates.
+- Telemetry formatting uses fixed stack buffers and integer fields. A frame is
+  attempted only when the USB transport reports capacity for both the frame and
+  a reserved terminal response; unavailable capacity drops the sample without
+  retrying or delaying terminal and fault ownership.
+- A telemetry-enabled `RJ` claims main-loop response ownership before encoder
+  reset and coordinated drive, retaining ownership through terminal framing.
+  An E-stop interrupt still latches motion stop immediately but defers serial
+  output while that owner is active. The drive commits local step progress,
+  reconciles the encoders, and emits the selected terminal response from the
+  owning path. A stop already reported before ownership prevents motion and is
+  not duplicated. A stop deferred after terminal selection is atomically
+  retained as an admission block during ownership commit. The next queued
+  command receives an `EB` position response before parsing or output
+  activation, then the reported block clears. Legacy non-telemetry E-stop and
+  spline ownership hazards remain outside this contract.
+- Telemetry work occupies the existing high-pulse wait and the measured work
+  duration is deducted from the remaining wait. No telemetry write flushes or
+  resets serial state. Hardware verification must still measure the worst-case
+  pulse interval because a task exceeding the available wait would extend one
+  scheduler interval.
+- The host serial owner classifies every received line as telemetry or an
+  allowed coordinated-move terminal while preserving the original command
+  deadline. Any malformed or unknown frame quarantines the transport before
+  ownership release. A response budget derived from that deadline and the
+  negotiated cadence quarantines a controller that exceeds the allowed interim
+  volume. The existing terminal position frame remains authoritative for
+  confirmed pose, collision status, speed-violation state, and queue rebasing.
+- Telemetry callbacks use a bounded latest-sample slot, separate from
+  ordered lifecycle and terminal events. Tk applies only the latest observed
+  sample to the display and performs no serial work.
+
+Acceptance criteria:
+
+- Host parsing, request-marker admission, interim-line demultiplexing,
+  malformed-frame quarantine, response-budget enforcement,
+  serial-versus-virtual suffix separation, bounded latest-sample coalescing,
+  dispatcher ordering, actual-versus-estimated overlay selection, and
+  stale-sample cleanup have deterministic tests.
+- Native sanitized checks cover encoder conversion, atomic validation,
+  millidegree rounding, frame bounds, framing, wrap-safe cadence, and
+  response-owner state transitions.
+- Source-contract checks cover capability negotiation, RJ-only enablement,
+  USB backpressure checks before encoder reads and before transmission,
+  terminal-capacity reservation, fixed-buffer formatting, pulse-wait
+  accounting, monitor commitment before encoder reconciliation, and
+  telemetry/E-stop response-owner handoff.
+- The tracked Teensy source compiles without upload for Teensy 4.1 with the
+  pinned toolchain.
+- Hardware verification remains pending for observed cadence, encoder accuracy,
+  USB load, terminal priority, and pulse-timing behavior across representative
+  speeds and simultaneous-axis moves.
 
 ### M4B - Repeatability and dynamic interception pass
 
@@ -722,9 +791,14 @@ Known M5 deviations:
   sliders. Active text edits survive controller and virtual position refreshes;
   accepted submissions resume confirmed-position display updates, and
   cancelled or abandoned edits restore the latest confirmed position.
+- Negotiated `JOINT_TELEMETRY_V1` coordinated-joint exchanges demultiplex
+  request-scoped J1-J6 encoder samples into the Tk motion overlay. Samples are
+  dropped under firmware USB backpressure, never update confirmed host state,
+  and leave J7-J9 on the existing command estimator. Hardware timing and
+  encoder accuracy remain unverified.
 - Simple program movement routes now share request-scoped controller ownership, raw target validation, and offline physical-write rejection. The broader typed program state machine, non-motion row migration, Cartesian and tool-frame coalescing, complete main-controller response ownership, application lifecycle separation, and dynamic controller work remain incomplete.
-- Tracked Teensy `6.7.1-ar4hmi.3` `MA` and `MC` parsing stages `Tr` in a command-local value instead of writing beyond the six-element Cartesian array and accepts only the supported zero value. `ML` accepts only `Q0` because wrist-suppression semantics remain unimplemented. The corrected source passes the Teensy toolchain compile. Host arc and circle program transmission remains disabled until deterministic trajectory simulation and an authorized hardware-validation plan cover the broader algorithms. Spline program transmission also remains disabled until one terminal response-owner contract replaces speculative acknowledgements.
-- Teensy coordinated pulse scheduling and E-stop response ownership were inspected but not changed. The `6.7.1-ar4hmi.3` E-stop protocol can race speculative spline responses and remains unsafe for claimed single-frame ownership. Drive routines also report completion after an E-stop terminates a pulse loop; changing only the return value would cause current callers to emit a competing `ER` after the interrupt-side `EB` position frame. Remediation requires a separate single-owner protocol design and hardware-validation plan. The missing-file behavior has a source-contract assertion, and the current line-oriented compatibility source passes a Teensy 4.1 syntax/toolchain compile. That compile does not satisfy the later correlated JSON safety prerequisite; simulation and live-arm verification remain pending.
+- Tracked Teensy `6.7.1-ar4hmi.4` `MA` and `MC` parsing stages `Tr` in a command-local value instead of writing beyond the Cartesian pose array and accepts only the supported zero value. `ML` accepts only `Q0` because wrist-suppression semantics remain unimplemented. The corrected source passes the Teensy toolchain compile. Host arc and circle program transmission remains disabled until deterministic trajectory simulation and an authorized hardware-validation plan cover the broader algorithms. Spline program transmission also remains disabled until one terminal response-owner contract replaces speculative acknowledgements.
+- Teensy coordinated joint pulse scheduling now deducts bounded telemetry work from the existing pulse wait. A telemetry-enabled `RJ` also owns response framing across the coordinated drive, so an interrupt latches the stop while the drive commits local progress, reconciles encoders, and emits the selected terminal response without reentrant USB transmission. A stop deferred after terminal selection becomes an admission block during atomic ownership commit; the next queued command receives an `EB` position response before parsing or motor output. Broader E-stop ownership remains unchanged: the `6.7.1-ar4hmi.4` protocol can race speculative spline responses and remains unsafe for claimed single-frame ownership, and non-telemetry drive routines still report completion after an E-stop terminates a pulse loop. Broader remediation requires a separate single-owner protocol design and hardware-validation plan. The missing-file behavior has a source-contract assertion, and the current line-oriented compatibility source passes a Teensy 4.1 syntax/toolchain compile. That compile does not satisfy the later correlated JSON safety prerequisite; simulation and live-arm verification remain pending.
 - M4A3 found that delivered 7.0 retains busy-input loss, blocking Tk paths, incomplete response ownership, firmware array-bound defects, and emergency-event races. Selective integration is approved because delivered inverse-kinematics, MK5 calibration-switch, JSON auxiliary-controller, and optional CAD/EOAT changes can be isolated without replacing the hardened HMI baseline.
 - Authorized controller flashing, drive-off communication, HMI startup, and
   exploratory powered single-joint calibration, jog checks, and simultaneous

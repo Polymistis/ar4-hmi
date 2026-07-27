@@ -5,6 +5,7 @@ import time
 
 from ARrobots.HMI.joint_motion import (
     JOINT_COUNT,
+    JOINT_TELEMETRY_AXIS_COUNT,
     MotionInputError,
     estimate_commanded_joint_trajectory,
     finite_number,
@@ -297,7 +298,7 @@ class GhostSliderMarker:
 
 
 class JointMotionVisualization:
-    """Coordinate target thumbs and a command-derived in-flight marker."""
+    """Coordinate target thumbs with actual or estimated in-flight markers."""
 
     def __init__(
         self,
@@ -337,6 +338,7 @@ class JointMotionVisualization:
         self._clock = clock
         self._trajectory = None
         self._started_at = None
+        self._actual_joint_positions = None
         self._markers_visible = False
 
     @property
@@ -373,6 +375,21 @@ class JointMotionVisualization:
     def set_desired(self, positions):
         return set_joint_slider_positions(self._sliders, positions)
 
+    def observe_actual(self, positions):
+        values = _fixed_items(
+            positions,
+            JOINT_TELEMETRY_AXIS_COUNT,
+            "actual joint positions",
+        )
+        normalized = tuple(
+            finite_number(value, f"actual joint positions[{axis}]")
+            for axis, value in enumerate(values, start=1)
+        )
+        if self._trajectory is None:
+            return False
+        self._actual_joint_positions = normalized
+        return True
+
     def start(
         self,
         start_positions,
@@ -395,11 +412,13 @@ class JointMotionVisualization:
         )
         self._trajectory = trajectory
         self._started_at = started_at
+        self._actual_joint_positions = None
         try:
             self.refresh()
         except Exception as exc:
             self._trajectory = None
             self._started_at = None
+            self._actual_joint_positions = None
             try:
                 self._hide_markers()
             except Exception as cleanup_exc:
@@ -422,12 +441,18 @@ class JointMotionVisualization:
             now = finite_number(self._clock(), "joint visualization clock")
             elapsed = max(0.0, now - self._started_at)
             positions = self._trajectory.positions_at(elapsed)
+            if self._actual_joint_positions is not None:
+                positions = (
+                    self._actual_joint_positions
+                    + positions[JOINT_TELEMETRY_AXIS_COUNT:]
+                )
             self._markers_visible = True
             for marker, position in zip(self._markers, positions):
                 marker.show(position)
         except Exception as exc:
             self._trajectory = None
             self._started_at = None
+            self._actual_joint_positions = None
             try:
                 self._hide_markers()
             except Exception as cleanup_exc:
@@ -440,4 +465,5 @@ class JointMotionVisualization:
     def finish(self):
         self._trajectory = None
         self._started_at = None
+        self._actual_joint_positions = None
         return self._hide_markers()

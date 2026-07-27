@@ -36,9 +36,11 @@ from ARrobots.HMI.joint_motion import (
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+    CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
     CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
     CONTROLLER_MAXIMUM_PULSE_DELAY_MICROSECONDS,
     FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS,
+    JOINT_TELEMETRY_PERIOD_SECONDS,
     ControllerIdentity,
     ControllerJointCalibration,
     MotionInputError,
@@ -75,6 +77,7 @@ from ARrobots.HMI.joint_motion import (
     exchange_serial_line,
     exchange_serial_line_until_cancelled,
     finite_number,
+    joint_telemetry_response_budget,
     motion_timing_response_timeout,
     normalize_auxiliary_board_profile,
     parse_auxiliary_output_command,
@@ -82,6 +85,8 @@ from ARrobots.HMI.joint_motion import (
     parse_command_timing,
     parse_controller_identity_response,
     parse_controller_modbus_response,
+    parse_joint_motion_exchange_response,
+    parse_joint_telemetry_response,
     parse_motion_wrist_config,
     parse_position_response,
     parse_primary_home_reference_response,
@@ -91,6 +96,7 @@ from ARrobots.HMI.joint_motion import (
     read_serial_exact_response,
     read_serial_line_response,
     read_serial_line_response_with_optional_followup,
+    request_joint_telemetry,
     serial_transport_quarantined,
     validate_auxiliary_output_command,
     validate_auxiliary_servo_command,
@@ -126,6 +132,9 @@ TEENSY_CONTROLLER_DOMAIN_CONTRACT = TEENSY_SOURCE.with_name(
     "controller_domain_contract.h"
 )
 TEENSY_IDENTITY_CONTRACT = TEENSY_SOURCE.with_name("identity_contract.h")
+TEENSY_JOINT_TELEMETRY_CONTRACT = TEENSY_SOURCE.with_name(
+    "joint_telemetry_contract.h"
+)
 TEENSY_NUMERIC_PARSE_CONTRACT = TEENSY_SOURCE.with_name(
     "numeric_parse_contract.h"
 )
@@ -1197,7 +1206,7 @@ class HmiSourceContractTests(unittest.TestCase):
         identity = ControllerIdentity(
             controller_hardware_id=base_identity.controller_hardware_id,
             driver_model=base_identity.driver_model,
-            firmware_version="6.7.1-ar4hmi.3",
+            firmware_version="6.7.1-ar4hmi.4",
             robot_model=base_identity.robot_model,
             robot_version=base_identity.robot_version,
             serial_number=base_identity.serial_number,
@@ -13498,7 +13507,7 @@ class HmiSourceContractTests(unittest.TestCase):
         capability_identity = ControllerIdentity(
             controller_hardware_id=base_identity.controller_hardware_id,
             driver_model=base_identity.driver_model,
-            firmware_version="6.7.1-ar4hmi.3",
+            firmware_version="6.7.1-ar4hmi.4",
             robot_model=base_identity.robot_model,
             robot_version=base_identity.robot_version,
             serial_number=base_identity.serial_number,
@@ -19298,7 +19307,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertNotIn("fall back to unfiltered best", solver)
 
         self.assertIn(
-            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.3";',
+            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.4";',
             firmware,
         )
         self.assertIn('"JT_WRIST_CONFIG_V1"', firmware)
@@ -20104,6 +20113,321 @@ class HmiSourceContractTests(unittest.TestCase):
             "pulse_delay_microseconds(",
             driver,
         )
+
+    def test_joint_telemetry_is_request_scoped_and_backpressure_dropped(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        telemetry_contract = TEENSY_JOINT_TELEMETRY_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+        motion_contract = TEENSY_MOTION_COMMAND_PARSE_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+        host = AR4_SOURCE.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
+            "JOINT_TELEMETRY_V1",
+        )
+        self.assertIn('"JOINT_TELEMETRY_V1"', firmware)
+        capabilities_start = firmware.index(
+            "const char *const PROTOCOL_CAPABILITIES[]"
+        )
+        capabilities_end = firmware.index("};", capabilities_start)
+        advertised_capabilities = firmware[
+            capabilities_start:capabilities_end
+        ]
+        self.assertIn(
+            "JOINT_TELEMETRY_CAPABILITY",
+            advertised_capabilities,
+        )
+        self.assertIn('#include "joint_telemetry_contract.h"', firmware)
+        telemetry_period_match = re.search(
+            r"kJointTelemetryPeriodMicroseconds\s*=\s*([0-9]+)",
+            telemetry_contract,
+        )
+        self.assertIsNotNone(telemetry_period_match)
+        self.assertEqual(
+            int(telemetry_period_match.group(1)) / 1_000_000.0,
+            JOINT_TELEMETRY_PERIOD_SECONDS,
+        )
+        self.assertIn(
+            "kJointTelemetryTerminalReserveBytes = 2048",
+            telemetry_contract,
+        )
+        self.assertIn(
+            "static_cast<uint32_t>(",
+            telemetry_contract,
+        )
+        self.assertIn(
+            "encoder_counts_to_joint_millidegrees(",
+            telemetry_contract,
+        )
+        self.assertIn(
+            '"TMA%ldB%ldC%ldD%ldE%ldF%ld\\n"',
+            telemetry_contract,
+        )
+
+        emitter_start = firmware.index("bool emit_joint_telemetry()")
+        emitter_end = firmware.index("bool driveMotorsJ(", emitter_start)
+        emitter = firmware[emitter_start:emitter_end]
+        first_capacity_check = emitter.index("Serial.availableForWrite()")
+        first_encoder_read = emitter.index("J1encPos.read()")
+        response_owner_check = emitter.index(
+            "!telemetryResponseOwnership.active"
+        )
+        serial_write = emitter.index("Serial.write(")
+        self.assertLess(response_owner_check, first_capacity_check)
+        self.assertLess(first_capacity_check, first_encoder_read)
+        self.assertLess(first_encoder_read, serial_write)
+        self.assertGreaterEqual(
+            emitter.count("Serial.availableForWrite()"),
+            2,
+        )
+        self.assertNotIn("String", emitter)
+        self.assertNotIn("delay", emitter)
+
+        driver_start = firmware.index("bool driveMotorsJ(")
+        driver_end = firmware.index("//DRIVE MOTORS G", driver_start)
+        driver = firmware[driver_start:driver_end]
+        self.assertIn("bool telemetryRequested", driver)
+        self.assertIn("joint_telemetry_due(", driver)
+        self.assertIn("emit_joint_telemetry();", driver)
+        self.assertIn(
+            "pulseDelay - telemetryWorkMicroseconds",
+            driver,
+        )
+        committed_monitors = driver.rindex(
+            "store_step_monitors(stepMonitors);"
+        )
+        successful_return = driver.rindex("return true;")
+        self.assertLess(committed_monitors, successful_return)
+        self.assertNotIn("Serial.flush", driver)
+
+        rj_start = firmware.index('if (function == "RJ")')
+        rj_end = firmware.index("//----- MOVE L", rj_start)
+        rj_branch = firmware[rj_start:rj_end]
+        self.assertIn(
+            "commandFields.telemetry_requested",
+            rj_branch,
+        )
+        self.assertIn(
+            "begin_telemetry_response_ownership(",
+            rj_branch,
+        )
+        self.assertEqual(
+            rj_branch.count("complete_telemetry_joint_response("),
+            2,
+        )
+        ownership_start = rj_branch.index(
+            "begin_telemetry_response_ownership("
+        )
+        reset_encoders = rj_branch.index(
+            "resetEncoders();",
+            ownership_start,
+        )
+        drive_start = rj_branch.index(
+            "driveMotorsJ(",
+            reset_encoders,
+        )
+        completion_start = rj_branch.index(
+            "complete_telemetry_joint_response(",
+            drive_start,
+        )
+        self.assertLess(ownership_start, reset_encoders)
+        self.assertLess(reset_encoders, drive_start)
+        self.assertLess(drive_start, completion_start)
+        self.assertIn("bool telemetry_requested;", motion_contract)
+        self.assertIn("command.charAt(loop_modes_end) == 'T'", motion_contract)
+        self.assertIn("command.charAt(loop_modes_end + 1) == '1'", motion_contract)
+
+        exchange_start = host.index("def _exchange_joint_motion(command):")
+        exchange_end = host.index(
+            "joint_motion_dispatcher =",
+            exchange_start,
+        )
+        exchange = host[exchange_start:exchange_end]
+        self.assertIn(
+            "CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1",
+            exchange,
+        )
+        self.assertIn("request_joint_telemetry(command)", exchange)
+        self.assertIn(
+            "parse_joint_motion_exchange_response(response)",
+            exchange,
+        )
+        self.assertIn("publish_telemetry(telemetry)", exchange)
+        self.assertIn("joint_telemetry_response_budget(", exchange)
+
+        completion_start = firmware.index(
+            "bool complete_telemetry_joint_response("
+        )
+        completion_end = firmware.index(
+            "bool driveMotorsJ(",
+            completion_start,
+        )
+        completion = firmware[completion_start:completion_end]
+        reconcile_position = completion.index("checkEncoders();")
+        terminal_decision = completion.index(
+            "decide_joint_telemetry_terminal("
+        )
+        position_response = completion.index("sendRobotPos();")
+        ownership_commit = completion.index(
+            "commit_joint_telemetry_terminal("
+        )
+        self.assertLess(reconcile_position, terminal_decision)
+        self.assertLess(terminal_decision, position_response)
+        self.assertLess(position_response, ownership_commit)
+        self.assertIn(
+            "telemetryResponseOwnership",
+            completion[ownership_commit:],
+        )
+
+        estop_start = firmware.index("void EstopProg()")
+        estop_end = firmware.index(
+            "////////////////////////////////////////////////////////////////",
+            estop_start,
+        )
+        estop_handler = firmware[estop_start:estop_end]
+        active_guard = estop_handler.index("if (estopActive) return;")
+        active_latch = estop_handler.index("estopActive = true;")
+        response_defer = estop_handler.index(
+            "defer_joint_telemetry_estop_response("
+        )
+        deferred_return = estop_handler.index(
+            "return;",
+            response_defer,
+        )
+        terminal_response = estop_handler.index("sendRobotPos();")
+        self.assertLess(active_guard, active_latch)
+        self.assertLess(active_latch, response_defer)
+        self.assertLess(response_defer, deferred_return)
+        self.assertLess(deferred_return, terminal_response)
+
+        command_start = firmware.index('if (cmdBuffer1 != "")')
+        command_extract = firmware.index(
+            "extract_serial_command_payload(",
+            command_start,
+        )
+        deferred_guard = firmware.index(
+            "joint_telemetry_estop_admission_blocked(",
+            command_start,
+            command_extract,
+        )
+        deferred_response = firmware.index(
+            'flag = "EB";',
+            deferred_guard,
+            command_extract,
+        )
+        deferred_terminal = firmware.index(
+            "sendRobotPos();",
+            deferred_response,
+            command_extract,
+        )
+        deferred_clear = firmware.index(
+            "clear_joint_telemetry_estop_admission_block(",
+            deferred_terminal,
+            command_extract,
+        )
+        deferred_consume = firmware.index(
+            "consume_current_command();",
+            deferred_clear,
+            command_extract,
+        )
+        legacy_estop_clear = firmware.index(
+            "estopActive = false;",
+            deferred_consume,
+            command_extract,
+        )
+        self.assertLess(deferred_guard, deferred_response)
+        self.assertLess(deferred_response, deferred_terminal)
+        self.assertLess(deferred_terminal, deferred_clear)
+        self.assertLess(deferred_clear, deferred_consume)
+        self.assertLess(deferred_consume, legacy_estop_clear)
+
+        self.assertEqual(
+            request_joint_telemetry(
+                "RJA1B2C3D4E5F6J70J80J90"
+                "Sp50Ac10Dc20Rm25WNLm000000\n"
+            )[-3:],
+            "T1\n",
+        )
+        self.assertEqual(
+            parse_joint_telemetry_response(
+                "TMA1B2C3D4E5F6"
+            ).joints,
+            (0.001, 0.002, 0.003, 0.004, 0.005, 0.006),
+        )
+
+    def test_joint_telemetry_exchange_uses_the_production_classifier(self):
+        command = (
+            "RJA1B2C3D4E5F6J70J80J90"
+            "Sp50Ac10Dc20Rm25WNLm000000\n"
+        )
+        binding = {"value": None}
+        exchanges = []
+        published = []
+
+        def exchange(candidate, **options):
+            exchanges.append((candidate, options))
+            return "terminal"
+
+        namespace = {
+            "_current_main_controller_identity": (
+                lambda: binding["value"]
+            ),
+            "CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1": (
+                CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1
+            ),
+            "_exchange_serial_line": exchange,
+            "request_joint_telemetry": request_joint_telemetry,
+            "parse_joint_motion_exchange_response": (
+                parse_joint_motion_exchange_response
+            ),
+            "joint_telemetry_response_budget": (
+                joint_telemetry_response_budget
+            ),
+            "_controller_response_timeout": lambda _command: 12.0,
+            "joint_motion_dispatcher": SimpleNamespace(
+                publish_telemetry=published.append
+            ),
+        }
+        exchange_joint_motion = self.compile_function(
+            "_exchange_joint_motion",
+            namespace,
+        )
+
+        self.assertEqual(exchange_joint_motion(command), "terminal")
+        self.assertEqual(exchanges.pop(), (command, {}))
+
+        binding["value"] = SimpleNamespace(
+            identity=SimpleNamespace(
+                protocol_capabilities=(
+                    CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
+                )
+            )
+        )
+        self.assertEqual(exchange_joint_motion(command), "terminal")
+        requested, options = exchanges.pop()
+        self.assertEqual(requested, command[:-1] + "T1\n")
+        self.assertEqual(
+            options["interim_response_limit"],
+            joint_telemetry_response_budget(12.0),
+        )
+        handler = options["interim_response_handler"]
+        self.assertTrue(handler("TMA1B2C3D4E5F6"))
+        self.assertEqual(
+            published,
+            [
+                parse_joint_telemetry_response(
+                    "TMA1B2C3D4E5F6"
+                )
+            ],
+        )
+        self.assertFalse(
+            handler("A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9")
+        )
+        with self.assertRaises(ProtocolResponseError):
+            handler("unexpected")
 
     def test_tool_jog_directions_match_the_firmware_contract(self):
         discrete_commands = {
@@ -22492,6 +22816,58 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(sent_entry.value, move.command)
         self.assertEqual(start_calls, [(move, event.started_at_seconds)])
         self.assertEqual(finish_calls, [])
+
+    def test_joint_telemetry_event_observes_and_refreshes_without_finish(self):
+        telemetry = parse_joint_telemetry_response(
+            "TMA1000B2000C3000D4000E5000F6000"
+        )
+        observed = []
+        refreshed = []
+        finished = []
+
+        class Event:
+            kind = "telemetry"
+
+            def __init__(self):
+                self.telemetry = telemetry
+                self.acknowledged = False
+
+            def acknowledge(self):
+                self.acknowledged = True
+
+        class Dispatcher:
+            pending = False
+            desired_target = None
+
+            def __init__(self, event):
+                self.events = [event]
+
+            def drain_events(self):
+                events = self.events
+                self.events = []
+                return events
+
+        event = Event()
+        namespace = {
+            "joint_motion_dispatcher": Dispatcher(event),
+            "_observe_joint_motion_telemetry": observed.append,
+            "_finish_joint_motion_request_if_idle": lambda: True,
+            "_refresh_joint_motion_visualization": (
+                lambda: refreshed.append(True)
+            ),
+            "_finish_joint_motion_visualization": (
+                lambda: finished.append(True)
+            ),
+            "application_closing": SimpleNamespace(is_set=lambda: True),
+        }
+        poll = self.compile_function("_poll_joint_motion_events", namespace)
+
+        poll()
+
+        self.assertEqual(observed, [telemetry])
+        self.assertTrue(event.acknowledged)
+        self.assertEqual(refreshed, [True])
+        self.assertEqual(finished, [])
 
     def test_joint_completion_invalidates_before_failed_virtual_sync_ack(self):
         sequence = []
@@ -25671,7 +26047,7 @@ class HmiSourceContractTests(unittest.TestCase):
         capability_identity = ControllerIdentity(
             controller_hardware_id=controller_identity.controller_hardware_id,
             driver_model=controller_identity.driver_model,
-            firmware_version="6.7.1-ar4hmi.3",
+            firmware_version="6.7.1-ar4hmi.4",
             robot_model=controller_identity.robot_model,
             robot_version=controller_identity.robot_version,
             serial_number=controller_identity.serial_number,

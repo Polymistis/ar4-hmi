@@ -592,6 +592,51 @@ class JointMotionVisualizationTests(unittest.TestCase):
         self.assertAlmostEqual(self.markers[0].value, 5.0)
         self.assertAlmostEqual(self.markers[1].value, -2.5)
 
+    def test_actual_telemetry_replaces_only_encoder_backed_estimates(self):
+        trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
+        self.clock["value"] += trajectory.duration_seconds / 2
+        estimated = trajectory.positions_at(trajectory.duration_seconds / 2)
+
+        self.assertTrue(
+            self.visualization.observe_actual((1, 2, 3, 4, 5, 6))
+        )
+        positions = self.visualization.refresh()
+
+        self.assertEqual(positions[:6], (1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
+        self.assertEqual(positions[6:], estimated[6:])
+        self.assertEqual(
+            tuple(marker.value for marker in self.markers[:6]),
+            positions[:6],
+        )
+
+    def test_actual_telemetry_requires_an_active_six_axis_sample(self):
+        self.assertFalse(
+            self.visualization.observe_actual((1, 2, 3, 4, 5, 6))
+        )
+        for positions in (
+            (1, 2, 3, 4, 5),
+            (1, 2, 3, 4, 5, float("nan")),
+        ):
+            with self.subTest(positions=positions):
+                with self.assertRaises(MotionInputError):
+                    self.visualization.observe_actual(positions)
+
+    def test_new_motion_discards_prior_actual_sample(self):
+        trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
+        self.assertTrue(
+            self.visualization.observe_actual((1, 2, 3, 4, 5, 6))
+        )
+        self.visualization.finish()
+        self.clock["value"] += 1
+
+        second = self.visualization.start((0,) * 9, joint_move(), 200)
+        self.clock["value"] += second.duration_seconds / 2
+        positions = self.visualization.refresh()
+
+        self.assertAlmostEqual(positions[0], 5.0)
+        self.assertAlmostEqual(positions[1], -2.5)
+        self.assertNotEqual(trajectory.duration_seconds, 0)
+
     def test_toggle_hides_without_discarding_active_estimate(self):
         trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
         self.enabled["value"] = 0
