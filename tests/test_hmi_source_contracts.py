@@ -13766,6 +13766,23 @@ class HmiSourceContractTests(unittest.TestCase):
                 r"ar4_protocol::kPrimaryHomeReferenceAxisCount"
             ),
         )
+        primary_reference_loop = (
+            r"for\s*\(\s*size_t\s+axis\s*=\s*0\s*;\s*"
+            r"axis\s*<\s*"
+            r"ar4_protocol::kPrimaryHomeReferenceAxisCount\s*;\s*"
+            r"\+\+axis\s*\)\s*\{\s*"
+            r"if\s*\(\s*Jreq\[axis\]\s*==\s*1\s*\)\s*\{\s*"
+        )
+        self.assertRegex(
+            calibration_handler,
+            primary_reference_loop
+            + r"ar4_protocol::invalidate_primary_home_reference_axis\s*\(",
+        )
+        self.assertRegex(
+            calibration_handler,
+            primary_reference_loop
+            + r"ar4_protocol::set_primary_home_reference\s*\(",
+        )
         reference_invalidation_helper = calibration_handler.index(
             "invalidate_primary_home_reference_axis"
         )
