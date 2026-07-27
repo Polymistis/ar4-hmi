@@ -20170,19 +20170,32 @@ class HmiSourceContractTests(unittest.TestCase):
         emitter_start = firmware.index("bool emit_joint_telemetry()")
         emitter_end = firmware.index("bool driveMotorsJ(", emitter_start)
         emitter = firmware[emitter_start:emitter_end]
-        first_capacity_check = emitter.index("Serial.availableForWrite()")
+        minimum_capacity_gate = re.search(
+            r"Serial\.availableForWrite\(\)\s*"
+            r"<\s*ar4_protocol::kJointTelemetryMinimumWriteCapacity",
+            emitter,
+        )
+        terminal_reserve_gate = re.search(
+            r"Serial\.availableForWrite\(\)\s*"
+            r"<\s*static_cast<int>\(\s*"
+            r"frameLength\s*\+\s*"
+            r"ar4_protocol::kJointTelemetryTerminalReserveBytes\s*\)",
+            emitter,
+        )
+        self.assertIsNotNone(minimum_capacity_gate)
+        self.assertIsNotNone(terminal_reserve_gate)
         first_encoder_read = emitter.index("J1encPos.read()")
         response_owner_check = emitter.index(
             "!telemetryResponseOwnership.active"
         )
+        frame_build = emitter.index("build_joint_telemetry_frame(")
         serial_write = emitter.index("Serial.write(")
-        self.assertLess(response_owner_check, first_capacity_check)
-        self.assertLess(first_capacity_check, first_encoder_read)
-        self.assertLess(first_encoder_read, serial_write)
-        self.assertGreaterEqual(
-            emitter.count("Serial.availableForWrite()"),
-            2,
-        )
+        self.assertLess(response_owner_check, minimum_capacity_gate.start())
+        self.assertLess(minimum_capacity_gate.end(), first_encoder_read)
+        self.assertLess(first_encoder_read, frame_build)
+        self.assertLess(frame_build, terminal_reserve_gate.start())
+        self.assertLess(terminal_reserve_gate.end(), serial_write)
+        self.assertEqual(emitter.count("Serial.availableForWrite()"), 2)
         self.assertNotIn("String", emitter)
         self.assertNotIn("delay", emitter)
 
@@ -20195,6 +20208,27 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIn(
             "pulseDelay - telemetryWorkMicroseconds",
             driver,
+        )
+        telemetry_work = driver.index(
+            "const uint32_t telemetryWorkMicroseconds"
+        )
+        guarded_wait = driver.index(
+            "if (telemetryWorkMicroseconds < pulseDelay)",
+            telemetry_work,
+        )
+        guarded_delay = driver.index(
+            "delayMicroseconds(pulseDelay - telemetryWorkMicroseconds);",
+            guarded_wait,
+        )
+        guarded_wait_end = driver.index("}", guarded_delay)
+        self.assertLess(telemetry_work, guarded_wait)
+        self.assertLess(guarded_wait, guarded_delay)
+        self.assertLess(guarded_delay, guarded_wait_end)
+        self.assertEqual(
+            driver.count(
+                "delayMicroseconds(pulseDelay - telemetryWorkMicroseconds);"
+            ),
+            1,
         )
         committed_monitors = driver.rindex(
             "store_step_monitors(stepMonitors);"
@@ -20214,10 +20248,6 @@ class HmiSourceContractTests(unittest.TestCase):
             "begin_telemetry_response_ownership(",
             rj_branch,
         )
-        self.assertEqual(
-            rj_branch.count("complete_telemetry_joint_response("),
-            2,
-        )
         ownership_start = rj_branch.index(
             "begin_telemetry_response_ownership("
         )
@@ -20232,6 +20262,48 @@ class HmiSourceContractTests(unittest.TestCase):
         completion_start = rj_branch.index(
             "complete_telemetry_joint_response(",
             drive_start,
+        )
+        success_completion_start = rj_branch.index(
+            "complete_telemetry_joint_response(",
+            completion_start + 1,
+        )
+        success_completion_end = rj_branch.index(
+            "} else if (KinematicError",
+            success_completion_start,
+        )
+        failed_drive_start = rj_branch.index(
+            "if (!driveSucceeded)",
+            drive_start,
+        )
+        failed_drive_branch = rj_branch[
+            failed_drive_start:success_completion_start
+        ]
+        successful_drive_branch = rj_branch[
+            success_completion_start:success_completion_end
+        ]
+        self.assertEqual(
+            failed_drive_branch.count(
+                "complete_telemetry_joint_response("
+            ),
+            1,
+        )
+        self.assertRegex(
+            failed_drive_branch,
+            r"complete_telemetry_joint_response\(\s*"
+            r"commandFields\.telemetry_requested,\s*false\s*\)",
+        )
+        self.assertIn("consume_current_command();", failed_drive_branch)
+        self.assertIn("return;", failed_drive_branch)
+        self.assertEqual(
+            successful_drive_branch.count(
+                "complete_telemetry_joint_response("
+            ),
+            1,
+        )
+        self.assertRegex(
+            successful_drive_branch,
+            r"complete_telemetry_joint_response\(\s*"
+            r"commandFields\.telemetry_requested,\s*true\s*\)",
         )
         self.assertLess(ownership_start, reset_encoders)
         self.assertLess(reset_encoders, drive_start)

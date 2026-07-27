@@ -1992,6 +1992,72 @@ class SerialLineExchangeTests(unittest.TestCase):
         self.assertTrue(serial_port.is_open)
         self.assertFalse(serial_transport_quarantined(serial_port))
 
+    def test_interim_telemetry_does_not_extend_the_absolute_deadline(self):
+        class FakeClock:
+            def __init__(self):
+                self.now = 100.0
+
+            def monotonic(self):
+                return self.now
+
+        class TimedSequenceSerial(SequenceFakeSerial):
+            def __init__(self, responses, clock):
+                super().__init__(responses)
+                self.clock = clock
+
+            def readline(self):
+                response = super().readline()
+                self.clock.now += 0.06
+                return response
+
+        clock = FakeClock()
+        terminal = position_response((1, 2, 3, 4, 5, 6))
+        serial_port = TimedSequenceSerial(
+            (
+                b"TMA1B2C3D4E5F6\n",
+                b"TMA2B3C4D5E6F7\n",
+                f"{terminal}\n".encode("ascii"),
+            ),
+            clock,
+        )
+        observed = []
+
+        def consume_telemetry(response):
+            if not response.startswith("TM"):
+                return False
+            observed.append(response)
+            return True
+
+        with patch(
+            "ARrobots.HMI.joint_motion.time.monotonic",
+            side_effect=clock.monotonic,
+        ):
+            with self.assertRaisesRegex(
+                SerialTransportTimeout,
+                "within 0.1 seconds",
+            ):
+                exchange_serial_line(
+                    serial_port,
+                    "RP\n",
+                    0.1,
+                    interim_response_handler=consume_telemetry,
+                    interim_response_limit=10,
+                )
+
+        self.assertEqual(
+            observed,
+            [
+                "TMA1B2C3D4E5F6",
+                "TMA2B3C4D5E6F7",
+            ],
+        )
+        self.assertEqual(
+            serial_port.responses,
+            [f"{terminal}\n".encode("ascii")],
+        )
+        self.assertFalse(serial_port.is_open)
+        self.assertTrue(serial_transport_quarantined(serial_port))
+
     def test_invalid_interim_telemetry_quarantines_the_owned_exchange(self):
         serial_port = SequenceFakeSerial((b"TMA1B2\n",))
 
