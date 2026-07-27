@@ -13759,6 +13759,18 @@ class HmiSourceContractTests(unittest.TestCase):
                 r"\s*=\s*\{\s*\};"
             ),
         )
+        fail_closed_calibration_body = (
+            r"\s*\{\s*Serial\.println\(\"ER\"\);\s*"
+            r"consume_current_command\(\);\s*return;\s*\}"
+        )
+        self.assertRegex(
+            calibration_handler,
+            (
+                r"if\s*\(\s*!ar4_protocol::calibration_reference_steps"
+                r"\s*\([\s\S]*?stagedJointFiveSteps\[axis\]\s*\)\s*\)"
+            )
+            + fail_closed_calibration_body,
+        )
         self.assertRegex(
             calibration_handler,
             (
@@ -13772,7 +13784,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 r"static_cast<float>\(zeroSteps\[axis\]\)\s*\)"
                 r"\s*/\s*stepsPerUnit\[axis\]\s*,\s*"
                 r"stagedPrimaryHomeReference\[axis\]\s*\)\s*\)"
-            ),
+            )
+            + fail_closed_calibration_body,
         )
         primary_reference_loop = (
             r"for\s*\(\s*size_t\s+axis\s*=\s*0\s*;\s*"
@@ -13787,6 +13800,8 @@ class HmiSourceContractTests(unittest.TestCase):
             + (
                 r"ar4_protocol::invalidate_primary_home_reference_axis"
                 r"\s*\(\s*invalidatedHomeReference\s*,\s*axis\s*\)"
+                r"\s*;\s*\}\s*\}\s*"
+                r"primaryHomeReference\s*=\s*invalidatedHomeReference\s*;"
             ),
         )
         self.assertRegex(
@@ -13796,6 +13811,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 r"ar4_protocol::set_primary_home_reference\s*\(\s*"
                 r"committedHomeReference\s*,\s*axis\s*,\s*"
                 r"stagedPrimaryHomeReference\[axis\]\s*\)"
+                r"\s*;\s*\}\s*\}\s*"
+                r"primaryHomeReference\s*=\s*committedHomeReference\s*;"
             ),
         )
         reference_invalidation_helper = calibration_handler.index(
