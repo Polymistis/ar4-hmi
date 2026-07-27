@@ -195,6 +195,60 @@ TEST_CONTROLLER_CALIBRATION = ControllerJointCalibration(
 )
 
 
+def cpp_braced_statement(source, anchor, start=0):
+    if not isinstance(source, str) or not isinstance(anchor, str) or not anchor:
+        raise TypeError("C++ source and non-empty anchor text are required")
+    if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+        raise TypeError("C++ statement search start must be a non-negative integer")
+
+    anchor_index = source.index(anchor, start)
+    opening_brace = source.find("{", anchor_index + len(anchor))
+    if opening_brace < 0:
+        raise AssertionError(f"C++ statement has no opening brace: {anchor!r}")
+
+    depth = 0
+    state = "code"
+    index = opening_brace
+    while index < len(source):
+        character = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+
+        if state == "code":
+            if character == "/" and following == "/":
+                state = "line-comment"
+                index += 2
+                continue
+            if character == "/" and following == "*":
+                state = "block-comment"
+                index += 2
+                continue
+            if character in ('"', "'"):
+                state = character
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[anchor_index:index + 1]
+        elif state in ('"', "'"):
+            if character == "\\":
+                index += 2
+                continue
+            if character == state:
+                state = "code"
+        elif state == "line-comment":
+            if character == "\n":
+                state = "code"
+        elif state == "block-comment":
+            if character == "*" and following == "/":
+                state = "code"
+                index += 2
+                continue
+        index += 1
+
+    raise AssertionError(f"C++ statement has no closing brace: {anchor!r}")
+
+
 def canonicalize_main_test_command(command):
     calibration = (
         TEST_CONTROLLER_CALIBRATION
@@ -20170,31 +20224,41 @@ class HmiSourceContractTests(unittest.TestCase):
         emitter_start = firmware.index("bool emit_joint_telemetry()")
         emitter_end = firmware.index("bool driveMotorsJ(", emitter_start)
         emitter = firmware[emitter_start:emitter_end]
-        minimum_capacity_gate = re.search(
+        minimum_capacity_block = cpp_braced_statement(
+            emitter,
+            "if (\n    !telemetryResponseOwnership.active",
+        )
+        terminal_reserve_block = cpp_braced_statement(
+            emitter,
+            "if (\n    !ar4_protocol::build_joint_telemetry_frame(",
+        )
+        self.assertRegex(
+            minimum_capacity_block,
             r"Serial\.availableForWrite\(\)\s*"
             r"<\s*ar4_protocol::kJointTelemetryMinimumWriteCapacity",
-            emitter,
         )
-        terminal_reserve_gate = re.search(
+        self.assertRegex(
+            terminal_reserve_block,
             r"Serial\.availableForWrite\(\)\s*"
             r"<\s*static_cast<int>\(\s*"
             r"frameLength\s*\+\s*"
             r"ar4_protocol::kJointTelemetryTerminalReserveBytes\s*\)",
-            emitter,
         )
-        self.assertIsNotNone(minimum_capacity_gate)
-        self.assertIsNotNone(terminal_reserve_gate)
+        self.assertEqual(minimum_capacity_block.count("return false;"), 1)
+        self.assertEqual(terminal_reserve_block.count("return false;"), 1)
         first_encoder_read = emitter.index("J1encPos.read()")
-        response_owner_check = emitter.index(
-            "!telemetryResponseOwnership.active"
-        )
-        frame_build = emitter.index("build_joint_telemetry_frame(")
         serial_write = emitter.index("Serial.write(")
-        self.assertLess(response_owner_check, minimum_capacity_gate.start())
-        self.assertLess(minimum_capacity_gate.end(), first_encoder_read)
-        self.assertLess(first_encoder_read, frame_build)
-        self.assertLess(frame_build, terminal_reserve_gate.start())
-        self.assertLess(terminal_reserve_gate.end(), serial_write)
+        minimum_capacity_start = emitter.index(minimum_capacity_block)
+        terminal_reserve_start = emitter.index(terminal_reserve_block)
+        self.assertLess(
+            minimum_capacity_start + len(minimum_capacity_block),
+            first_encoder_read,
+        )
+        self.assertLess(first_encoder_read, terminal_reserve_start)
+        self.assertLess(
+            terminal_reserve_start + len(terminal_reserve_block),
+            serial_write,
+        )
         self.assertEqual(emitter.count("Serial.availableForWrite()"), 2)
         self.assertNotIn("String", emitter)
         self.assertNotIn("delay", emitter)
@@ -20203,27 +20267,34 @@ class HmiSourceContractTests(unittest.TestCase):
         driver_end = firmware.index("//DRIVE MOTORS G", driver_start)
         driver = firmware[driver_start:driver_end]
         self.assertIn("bool telemetryRequested", driver)
-        self.assertIn("joint_telemetry_due(", driver)
-        self.assertIn("emit_joint_telemetry();", driver)
-        self.assertIn(
-            "pulseDelay - telemetryWorkMicroseconds",
+        telemetry_request_block = cpp_braced_statement(
             driver,
+            "if (\n      telemetryRequested",
+        )
+        self.assertIn("joint_telemetry_due(", telemetry_request_block)
+        self.assertIn(
+            "lastTelemetryAttempt = pulseWaitStarted;",
+            telemetry_request_block,
+        )
+        self.assertEqual(
+            telemetry_request_block.count("emit_joint_telemetry();"),
+            1,
         )
         telemetry_work = driver.index(
             "const uint32_t telemetryWorkMicroseconds"
         )
-        guarded_wait = driver.index(
+        guarded_wait_block = cpp_braced_statement(
+            driver,
             "if (telemetryWorkMicroseconds < pulseDelay)",
-            telemetry_work,
+            start=telemetry_work,
         )
-        guarded_delay = driver.index(
-            "delayMicroseconds(pulseDelay - telemetryWorkMicroseconds);",
-            guarded_wait,
+        self.assertEqual(
+            guarded_wait_block.count(
+                "delayMicroseconds(pulseDelay - telemetryWorkMicroseconds);"
+            ),
+            1,
         )
-        guarded_wait_end = driver.index("}", guarded_delay)
-        self.assertLess(telemetry_work, guarded_wait)
-        self.assertLess(guarded_wait, guarded_delay)
-        self.assertLess(guarded_delay, guarded_wait_end)
+        self.assertEqual(driver.count("emit_joint_telemetry();"), 1)
         self.assertEqual(
             driver.count(
                 "delayMicroseconds(pulseDelay - telemetryWorkMicroseconds);"
@@ -20263,24 +20334,28 @@ class HmiSourceContractTests(unittest.TestCase):
             "complete_telemetry_joint_response(",
             drive_start,
         )
-        success_completion_start = rj_branch.index(
-            "complete_telemetry_joint_response(",
-            completion_start + 1,
-        )
-        success_completion_end = rj_branch.index(
-            "} else if (KinematicError",
-            success_completion_start,
-        )
         failed_drive_start = rj_branch.index(
             "if (!driveSucceeded)",
             drive_start,
         )
-        failed_drive_branch = rj_branch[
-            failed_drive_start:success_completion_start
-        ]
-        successful_drive_branch = rj_branch[
-            success_completion_start:success_completion_end
-        ]
+        failed_drive_branch = cpp_braced_statement(
+            rj_branch,
+            "if (!driveSucceeded)",
+            start=drive_start,
+        )
+        success_completion_start = rj_branch.index(
+            "if (!complete_telemetry_joint_response(",
+            failed_drive_start + len(failed_drive_branch),
+        )
+        successful_drive_branch = cpp_braced_statement(
+            rj_branch,
+            "if (!complete_telemetry_joint_response(",
+            start=success_completion_start,
+        )
+        self.assertEqual(
+            rj_branch.count("complete_telemetry_joint_response("),
+            2,
+        )
         self.assertEqual(
             failed_drive_branch.count(
                 "complete_telemetry_joint_response("
@@ -20292,8 +20367,11 @@ class HmiSourceContractTests(unittest.TestCase):
             r"complete_telemetry_joint_response\(\s*"
             r"commandFields\.telemetry_requested,\s*false\s*\)",
         )
-        self.assertIn("consume_current_command();", failed_drive_branch)
-        self.assertIn("return;", failed_drive_branch)
+        failed_consume = failed_drive_branch.index(
+            "consume_current_command();"
+        )
+        failed_return = failed_drive_branch.index("return;", failed_consume)
+        self.assertLess(failed_consume, failed_return)
         self.assertEqual(
             successful_drive_branch.count(
                 "complete_telemetry_joint_response("
@@ -20360,61 +20438,84 @@ class HmiSourceContractTests(unittest.TestCase):
             estop_start,
         )
         estop_handler = firmware[estop_start:estop_end]
+        deferred_estop_block = cpp_braced_statement(
+            estop_handler,
+            "if (ar4_protocol::defer_joint_telemetry_estop_response(",
+        )
         active_guard = estop_handler.index("if (estopActive) return;")
         active_latch = estop_handler.index("estopActive = true;")
-        response_defer = estop_handler.index(
-            "defer_joint_telemetry_estop_response("
+        deferred_estop_start = estop_handler.index(deferred_estop_block)
+        terminal_response = estop_handler.index(
+            "sendRobotPos();",
+            deferred_estop_start + len(deferred_estop_block),
         )
-        deferred_return = estop_handler.index(
-            "return;",
-            response_defer,
+        self.assertEqual(
+            deferred_estop_block.count(
+                "defer_joint_telemetry_estop_response("
+            ),
+            1,
         )
-        terminal_response = estop_handler.index("sendRobotPos();")
+        self.assertEqual(deferred_estop_block.count("return;"), 1)
+        self.assertNotIn("sendRobotPos();", deferred_estop_block)
         self.assertLess(active_guard, active_latch)
-        self.assertLess(active_latch, response_defer)
-        self.assertLess(response_defer, deferred_return)
-        self.assertLess(deferred_return, terminal_response)
+        self.assertLess(active_latch, deferred_estop_start)
+        self.assertLess(
+            deferred_estop_start + len(deferred_estop_block),
+            terminal_response,
+        )
 
         command_start = firmware.index('if (cmdBuffer1 != "")')
-        command_extract = firmware.index(
-            "extract_serial_command_payload(",
-            command_start,
+        command_block = cpp_braced_statement(
+            firmware,
+            'if (cmdBuffer1 != "")',
+            start=command_start,
         )
-        deferred_guard = firmware.index(
+        deferred_admission_block = cpp_braced_statement(
+            command_block,
+            "if (deferredTelemetryEstop)",
+        )
+        deferred_guard = command_block.index(
             "joint_telemetry_estop_admission_blocked(",
-            command_start,
-            command_extract,
         )
-        deferred_response = firmware.index(
+        deferred_branch = command_block.index(deferred_admission_block)
+        deferred_response = deferred_admission_block.index(
             'flag = "EB";',
-            deferred_guard,
-            command_extract,
         )
-        deferred_terminal = firmware.index(
+        deferred_terminal = deferred_admission_block.index(
             "sendRobotPos();",
             deferred_response,
-            command_extract,
         )
-        deferred_clear = firmware.index(
+        deferred_clear = deferred_admission_block.index(
             "clear_joint_telemetry_estop_admission_block(",
             deferred_terminal,
-            command_extract,
         )
-        deferred_consume = firmware.index(
+        deferred_consume = deferred_admission_block.index(
             "consume_current_command();",
             deferred_clear,
-            command_extract,
         )
-        legacy_estop_clear = firmware.index(
-            "estopActive = false;",
+        deferred_return = deferred_admission_block.index(
+            "return;",
             deferred_consume,
-            command_extract,
         )
-        self.assertLess(deferred_guard, deferred_response)
+        legacy_estop_clear = command_block.index(
+            "estopActive = false;",
+            deferred_branch + len(deferred_admission_block),
+        )
+        command_extract = command_block.index(
+            "extract_serial_command_payload(",
+            legacy_estop_clear,
+        )
+        self.assertLess(deferred_guard, deferred_branch)
         self.assertLess(deferred_response, deferred_terminal)
         self.assertLess(deferred_terminal, deferred_clear)
         self.assertLess(deferred_clear, deferred_consume)
-        self.assertLess(deferred_consume, legacy_estop_clear)
+        self.assertLess(deferred_consume, deferred_return)
+        self.assertEqual(deferred_admission_block.count("return;"), 1)
+        self.assertLess(
+            deferred_branch + len(deferred_admission_block),
+            legacy_estop_clear,
+        )
+        self.assertLess(legacy_estop_clear, command_extract)
 
         self.assertEqual(
             request_joint_telemetry(
