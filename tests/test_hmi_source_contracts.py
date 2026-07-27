@@ -195,16 +195,26 @@ TEST_CONTROLLER_CALIBRATION = ControllerJointCalibration(
 )
 
 
-def cpp_braced_statement(source, anchor, start=0):
-    if not isinstance(source, str) or not isinstance(anchor, str) or not anchor:
-        raise TypeError("C++ source and non-empty anchor text are required")
+def cpp_braced_statement(source, pattern, start=0):
+    if not isinstance(source, str) or not isinstance(pattern, str) or not pattern:
+        raise TypeError("C++ source and non-empty statement pattern are required")
     if isinstance(start, bool) or not isinstance(start, int) or start < 0:
         raise TypeError("C++ statement search start must be a non-negative integer")
 
-    anchor_index = source.index(anchor, start)
-    opening_brace = source.find("{", anchor_index + len(anchor))
-    if opening_brace < 0:
-        raise AssertionError(f"C++ statement has no opening brace: {anchor!r}")
+    match = re.search(pattern, source[start:])
+    if match is None:
+        raise AssertionError(f"C++ statement pattern did not match: {pattern!r}")
+    anchor_index = start + match.start()
+    matched_statement = match.group(0)
+    relative_brace = matched_statement.rfind("{")
+    if (
+        relative_brace < 0
+        or matched_statement[relative_brace + 1:].strip()
+    ):
+        raise AssertionError(
+            f"C++ statement pattern must end at an opening brace: {pattern!r}"
+        )
+    opening_brace = anchor_index + relative_brace
 
     depth = 0
     state = "code"
@@ -246,7 +256,7 @@ def cpp_braced_statement(source, anchor, start=0):
                 continue
         index += 1
 
-    raise AssertionError(f"C++ statement has no closing brace: {anchor!r}")
+    raise AssertionError(f"C++ statement has no closing brace: {pattern!r}")
 
 
 def canonicalize_main_test_command(command):
@@ -20226,11 +20236,20 @@ class HmiSourceContractTests(unittest.TestCase):
         emitter = firmware[emitter_start:emitter_end]
         minimum_capacity_block = cpp_braced_statement(
             emitter,
-            "if (\n    !telemetryResponseOwnership.active",
+            r"if\s*\(\s*!telemetryResponseOwnership\.active\s*"
+            r"\|\|\s*Serial\.availableForWrite\(\)\s*"
+            r"<\s*ar4_protocol::kJointTelemetryMinimumWriteCapacity\s*"
+            r"\)\s*\{",
         )
         terminal_reserve_block = cpp_braced_statement(
             emitter,
-            "if (\n    !ar4_protocol::build_joint_telemetry_frame(",
+            r"if\s*\(\s*!ar4_protocol::build_joint_telemetry_frame\(\s*"
+            r"millidegrees,\s*frame,\s*sizeof\(frame\),\s*frameLength\s*"
+            r"\)\s*\|\|\s*estopActive\s*"
+            r"\|\|\s*Serial\.availableForWrite\(\)\s*"
+            r"<\s*static_cast<int>\(\s*frameLength\s*\+\s*"
+            r"ar4_protocol::kJointTelemetryTerminalReserveBytes\s*\)"
+            r"\s*\)\s*\{",
         )
         self.assertRegex(
             minimum_capacity_block,
@@ -20269,7 +20288,9 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIn("bool telemetryRequested", driver)
         telemetry_request_block = cpp_braced_statement(
             driver,
-            "if (\n      telemetryRequested",
+            r"if\s*\(\s*telemetryRequested\s*"
+            r"&&\s*ar4_protocol::joint_telemetry_due\(\s*"
+            r"pulseWaitStarted,\s*lastTelemetryAttempt\s*\)\s*\)\s*\{",
         )
         self.assertIn("joint_telemetry_due(", telemetry_request_block)
         self.assertIn(
@@ -20285,7 +20306,8 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         guarded_wait_block = cpp_braced_statement(
             driver,
-            "if (telemetryWorkMicroseconds < pulseDelay)",
+            r"if\s*\(\s*telemetryWorkMicroseconds\s*"
+            r"<\s*pulseDelay\s*\)\s*\{",
             start=telemetry_work,
         )
         self.assertEqual(
@@ -20319,41 +20341,53 @@ class HmiSourceContractTests(unittest.TestCase):
             "begin_telemetry_response_ownership(",
             rj_branch,
         )
-        ownership_start = rj_branch.index(
+        successful_motion_arm = cpp_braced_statement(
+            rj_branch,
+            r"if\s*\(\s*TotalAxisFault\s*==\s*0\s*"
+            r"&&\s*KinematicError\s*==\s*0\s*\)\s*\{",
+        )
+        ownership_start = successful_motion_arm.index(
             "begin_telemetry_response_ownership("
         )
-        reset_encoders = rj_branch.index(
+        reset_encoders = successful_motion_arm.index(
             "resetEncoders();",
             ownership_start,
         )
-        drive_start = rj_branch.index(
+        drive_start = successful_motion_arm.index(
             "driveMotorsJ(",
             reset_encoders,
         )
-        completion_start = rj_branch.index(
+        completion_start = successful_motion_arm.index(
             "complete_telemetry_joint_response(",
             drive_start,
         )
-        failed_drive_start = rj_branch.index(
+        failed_drive_start = successful_motion_arm.index(
             "if (!driveSucceeded)",
             drive_start,
         )
         failed_drive_branch = cpp_braced_statement(
-            rj_branch,
-            "if (!driveSucceeded)",
+            successful_motion_arm,
+            r"if\s*\(\s*!driveSucceeded\s*\)\s*\{",
             start=drive_start,
         )
-        success_completion_start = rj_branch.index(
+        success_completion_start = successful_motion_arm.index(
             "if (!complete_telemetry_joint_response(",
             failed_drive_start + len(failed_drive_branch),
         )
         successful_drive_branch = cpp_braced_statement(
-            rj_branch,
-            "if (!complete_telemetry_joint_response(",
+            successful_motion_arm,
+            r"if\s*\(\s*!complete_telemetry_joint_response\(\s*"
+            r"commandFields\.telemetry_requested,\s*true\s*\)\s*\)\s*\{",
             start=success_completion_start,
         )
         self.assertEqual(
             rj_branch.count("complete_telemetry_joint_response("),
+            2,
+        )
+        self.assertEqual(
+            successful_motion_arm.count(
+                "complete_telemetry_joint_response("
+            ),
             2,
         )
         self.assertEqual(
@@ -20440,7 +20474,9 @@ class HmiSourceContractTests(unittest.TestCase):
         estop_handler = firmware[estop_start:estop_end]
         deferred_estop_block = cpp_braced_statement(
             estop_handler,
-            "if (ar4_protocol::defer_joint_telemetry_estop_response(",
+            r"if\s*\(\s*"
+            r"ar4_protocol::defer_joint_telemetry_estop_response\(\s*"
+            r"telemetryResponseOwnership\s*\)\s*\)\s*\{",
         )
         active_guard = estop_handler.index("if (estopActive) return;")
         active_latch = estop_handler.index("estopActive = true;")
@@ -20467,12 +20503,12 @@ class HmiSourceContractTests(unittest.TestCase):
         command_start = firmware.index('if (cmdBuffer1 != "")')
         command_block = cpp_braced_statement(
             firmware,
-            'if (cmdBuffer1 != "")',
+            r'if\s*\(\s*cmdBuffer1\s*!=\s*""\s*\)\s*\{',
             start=command_start,
         )
         deferred_admission_block = cpp_braced_statement(
             command_block,
-            "if (deferredTelemetryEstop)",
+            r"if\s*\(\s*deferredTelemetryEstop\s*\)\s*\{",
         )
         deferred_guard = command_block.index(
             "joint_telemetry_estop_admission_blocked(",
