@@ -13751,12 +13751,34 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             4,
         )
+        self.assertRegex(
+            calibration_handler,
+            (
+                r"int32_t\s+stagedPrimaryHomeReference\s*\[\s*"
+                r"ar4_protocol::kPrimaryHomeReferenceAxisCount\s*\]"
+                r"\s*=\s*\{\s*\};"
+            ),
+        )
+        self.assertRegex(
+            calibration_handler,
+            (
+                r"static_cast<size_t>\(axis\)\s*<\s*"
+                r"ar4_protocol::kPrimaryHomeReferenceAxisCount"
+            ),
+        )
+        reference_invalidation_helper = calibration_handler.index(
+            "invalidate_primary_home_reference_axis"
+        )
         reference_invalidation = calibration_handler.index(
             "primaryHomeReference = invalidatedHomeReference;"
         )
         backoff = calibration_handler.index("if (!backOff(")
         step_monitor_commit = calibration_handler.index(
             "int *stepMonitors[9]"
+        )
+        self.assertLess(
+            reference_invalidation_helper,
+            reference_invalidation,
         )
         self.assertLess(reference_invalidation, guarded_limit_searches[0])
         self.assertLess(guarded_limit_searches[0], backoff)
@@ -13799,6 +13821,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "if (estopActive) {",
             final_drive,
         )
+        reference_commit_helper = calibration_handler.index(
+            "set_primary_home_reference"
+        )
         reference_commit = calibration_handler.index(
             "primaryHomeReference = committedHomeReference;"
         )
@@ -13807,7 +13832,8 @@ class HmiSourceContractTests(unittest.TestCase):
             reference_commit,
         )
         self.assertLess(final_drive, post_drive_estop_guard)
-        self.assertLess(post_drive_estop_guard, reference_commit)
+        self.assertLess(post_drive_estop_guard, reference_commit_helper)
+        self.assertLess(reference_commit_helper, reference_commit)
         self.assertLess(reference_commit, terminal_response)
 
         for command in ("UP", "SP"):

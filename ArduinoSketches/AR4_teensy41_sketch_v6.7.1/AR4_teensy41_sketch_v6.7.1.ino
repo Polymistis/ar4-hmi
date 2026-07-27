@@ -5149,7 +5149,9 @@ void loop() {
       int stagedMasterSteps[9];
       int stagedCenterSteps[9];
       int stagedJointFiveSteps[9];
-      int32_t stagedPrimaryHomeReference[2] = { 0, 0 };
+      int32_t stagedPrimaryHomeReference[
+        ar4_protocol::kPrimaryHomeReferenceAxisCount
+      ] = {};
       for (int axis = 0; axis < 9; ++axis) {
         if (!ar4_protocol::calibration_reference_steps(
             Jreq[axis],
@@ -5170,7 +5172,8 @@ void loop() {
           return;
         }
         if (
-          axis < 2
+          static_cast<size_t>(axis)
+            < ar4_protocol::kPrimaryHomeReferenceAxisCount
           && Jreq[axis] == 1
           && !ar4_protocol::primary_home_reference_millidegrees(
             (
@@ -5199,14 +5202,10 @@ void loop() {
         ++axis
       ) {
         if (Jreq[axis] == 1) {
-          if (!ar4_protocol::invalidate_primary_home_reference_axis(
+          ar4_protocol::invalidate_primary_home_reference_axis(
             invalidatedHomeReference,
             axis
-          )) {
-            Serial.println("ER");
-            consume_current_command();
-            return;
-          }
+          );
         }
       }
       primaryHomeReference = invalidatedHomeReference;
@@ -5342,15 +5341,11 @@ void loop() {
         ++axis
       ) {
         if (Jreq[axis] == 1) {
-          if (!ar4_protocol::set_primary_home_reference(
+          ar4_protocol::set_primary_home_reference(
             committedHomeReference,
             axis,
             stagedPrimaryHomeReference[axis]
-          )) {
-            Serial.println("ER");
-            consume_current_command();
-            return;
-          }
+          );
         }
       }
       primaryHomeReference = committedHomeReference;

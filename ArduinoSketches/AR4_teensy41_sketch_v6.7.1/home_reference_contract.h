@@ -30,8 +30,7 @@ inline void invalidate_primary_home_reference(
   PrimaryHomeReferenceState &state
 ) {
   for (size_t axis = 0; axis < kPrimaryHomeReferenceAxisCount; ++axis) {
-    state.valid[axis] = false;
-    state.millidegrees[axis] = 0;
+    invalidate_primary_home_reference_axis(state, axis);
   }
 }
 
