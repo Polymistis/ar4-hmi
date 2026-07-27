@@ -13762,8 +13762,16 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertRegex(
             calibration_handler,
             (
-                r"static_cast<size_t>\(axis\)\s*<\s*"
-                r"ar4_protocol::kPrimaryHomeReferenceAxisCount"
+                r"if\s*\(\s*static_cast<size_t>\(axis\)\s*<\s*"
+                r"ar4_protocol::kPrimaryHomeReferenceAxisCount\s*"
+                r"&&\s*Jreq\[axis\]\s*==\s*1\s*"
+                r"&&\s*!ar4_protocol::"
+                r"primary_home_reference_millidegrees\s*\(\s*"
+                r"\(\s*static_cast<float>"
+                r"\(stagedMasterSteps\[axis\]\)\s*-\s*"
+                r"static_cast<float>\(zeroSteps\[axis\]\)\s*\)"
+                r"\s*/\s*stepsPerUnit\[axis\]\s*,\s*"
+                r"stagedPrimaryHomeReference\[axis\]\s*\)\s*\)"
             ),
         )
         primary_reference_loop = (
@@ -13776,12 +13784,19 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertRegex(
             calibration_handler,
             primary_reference_loop
-            + r"ar4_protocol::invalidate_primary_home_reference_axis\s*\(",
+            + (
+                r"ar4_protocol::invalidate_primary_home_reference_axis"
+                r"\s*\(\s*invalidatedHomeReference\s*,\s*axis\s*\)"
+            ),
         )
         self.assertRegex(
             calibration_handler,
             primary_reference_loop
-            + r"ar4_protocol::set_primary_home_reference\s*\(",
+            + (
+                r"ar4_protocol::set_primary_home_reference\s*\(\s*"
+                r"committedHomeReference\s*,\s*axis\s*,\s*"
+                r"stagedPrimaryHomeReference\[axis\]\s*\)"
+            ),
         )
         reference_invalidation_helper = calibration_handler.index(
             "invalidate_primary_home_reference_axis"
