@@ -3,9 +3,10 @@
 Firmware compilation is hardware-free. Do not add `--upload` without the explicit operator authorization, emergency-stop check, cleared work envelope, firmware identity, configuration profile, and procedure required by `AGENTS.md`.
 
 The tracked line-oriented Teensy compatibility source identifies version
-`6.7.1-ar4hmi.2`, advertises the required `JT_WRIST_CONFIG_V1`,
+`6.7.1-ar4hmi.3`, advertises the required `JT_WRIST_CONFIG_V1`,
 `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, and
-`GCODE_WRITE_IDENTITY_V1` host capabilities, and compiles with Arduino CLI,
+`GCODE_WRITE_IDENTITY_V1` host capabilities plus the optional
+`HOME_REFERENCE_V1` parking-reference contract, and compiles with Arduino CLI,
 PJRC Teensy core 1.62.0, bundled SdFat 2.1.2, and ModbusMaster 2.0.1. `HO`
 includes the fixed-width controller hardware identity used to bind storage
 requests to the connected Teensy. Compilation

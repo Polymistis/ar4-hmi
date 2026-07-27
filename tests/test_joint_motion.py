@@ -37,8 +37,8 @@ from ARrobots.HMI.joint_motion import (
     MotionRequestLease,
     MotionRequestRegistry,
     MotionTransportBusy,
-    PRIMARY_CALIBRATION_BASE_OFFSETS,
     PRIMARY_START_POSITION,
+    PrimaryHomeReference,
     ProtocolResponseError,
     SerialActivityRegistry,
     SerialActivityRejected,
@@ -68,6 +68,7 @@ from ARrobots.HMI.joint_motion import (
     parse_controller_modbus_response,
     parse_motion_wrist_config,
     parse_position_response,
+    parse_primary_home_reference_response,
     parse_virtual_command_timing,
     primary_shutdown_position,
     quarantine_serial_transport,
@@ -3278,62 +3279,55 @@ class CommandResponseTimeoutTests(unittest.TestCase):
 
 
 class NamedJointPositionTests(unittest.TestCase):
-    @staticmethod
-    def calibration(**overrides):
-        values = {
-            "J1CalDir": 1,
-            "J1NegLim": 170,
-            "J1PosLim": 170,
-            "J1calOff": 0,
-            "J2CalDir": 0,
-            "J2NegLim": 42,
-            "J2PosLim": 90,
-            "J2calOff": 0,
-        }
-        values.update(overrides)
-        return values
-
     def test_start_position_matches_post_calibration_pose(self):
         self.assertEqual(
             PRIMARY_START_POSITION,
             (0.0, 0.0, 0.0, 0.0, 45.0, 0.0),
         )
 
-    def test_shutdown_position_uses_calibrated_switch_references(self):
-        target = primary_shutdown_position(self.calibration())
+    def test_shutdown_position_uses_controller_switch_references(self):
+        reference = PrimaryHomeReference(
+            (True, True),
+            (163.8, -38.2),
+        )
+        target = primary_shutdown_position(reference)
 
-        self.assertAlmostEqual(
-            target[0],
-            170 + PRIMARY_CALIBRATION_BASE_OFFSETS[0],
-        )
-        self.assertAlmostEqual(
-            target[1],
-            -42 + PRIMARY_CALIBRATION_BASE_OFFSETS[1],
-        )
+        self.assertAlmostEqual(target[0], 163.8)
+        self.assertAlmostEqual(target[1], -38.2)
         self.assertEqual(target[2:], PRIMARY_START_POSITION[2:])
 
-    def test_shutdown_position_honors_direction_and_software_offset(self):
-        target = primary_shutdown_position(
-            self.calibration(
-                J1CalDir=0,
-                J1calOff=10,
-                J2CalDir=1,
-                J2calOff=-5,
+    def test_shutdown_position_requires_both_active_home_references(self):
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "requires homing J2",
+        ):
+            primary_shutdown_position(
+                PrimaryHomeReference((True, False), (163.8, 0.0))
             )
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "requires a controller home reference",
+        ):
+            primary_shutdown_position(None)
+
+    def test_home_reference_parser_accepts_controller_millidegrees(self):
+        reference = parse_primary_home_reference_response(
+            "A1B163800C1D-38200"
         )
 
-        self.assertAlmostEqual(target[0], -166.2)
-        self.assertAlmostEqual(target[1], 88.8)
+        self.assertEqual(reference.valid, (True, True))
+        self.assertEqual(reference.positions, (163.8, -38.2))
 
-    def test_shutdown_position_rejects_untrusted_calibration(self):
-        with self.assertRaisesRegex(MotionInputError, "must be a mapping"):
-            primary_shutdown_position(None)
-        with self.assertRaisesRegex(MotionInputError, "direction must be binary"):
-            primary_shutdown_position(self.calibration(J1CalDir=2))
-        with self.assertRaisesRegex(MotionInputError, "outside calibrated limits"):
-            primary_shutdown_position(self.calibration(J1calOff=-400))
-        with self.assertRaisesRegex(MotionInputError, "must be numeric"):
-            primary_shutdown_position(self.calibration(J2calOff=None))
+    def test_home_reference_parser_rejects_invalid_or_stale_frames(self):
+        for response in (
+            "A0B1C0D0",
+            "A1B01C1D0",
+            "A1B2147483648C1D0",
+            "A1B0C1D0\n",
+        ):
+            with self.subTest(response=response):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_primary_home_reference_response(response)
 
 
 class DeferredJointAdjustmentsTests(unittest.TestCase):

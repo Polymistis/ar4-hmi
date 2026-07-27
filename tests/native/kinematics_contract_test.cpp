@@ -17,6 +17,7 @@
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/command_queue_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/controller_domain_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/debug_contract.h"
+#include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/home_reference_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/identity_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/motion_command_parse_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/motion_mode_transaction.h"
@@ -1110,6 +1111,61 @@ void test_firmware_numeric_parse_contract() {
 }
 
 void test_controller_domain_contract() {
+    int release_step_limit = 17;
+    require(
+        ar4_protocol::calibration_release_step_limit(
+            88.888f,
+            10.0f,
+            3000,
+            release_step_limit
+        )
+            && release_step_limit == 889,
+        "valid calibration switch-release travel was rejected"
+    );
+    release_step_limit = 17;
+    require(
+        ar4_protocol::calibration_release_step_limit(
+            100.0f,
+            10.0f,
+            500,
+            release_step_limit
+        )
+            && release_step_limit == 500,
+        "calibration switch-release travel exceeded full axis travel"
+    );
+    release_step_limit = 17;
+    require(
+        !ar4_protocol::calibration_release_step_limit(
+            0.0f,
+            10.0f,
+            3000,
+            release_step_limit
+        )
+            && release_step_limit == 17
+            && !ar4_protocol::calibration_release_step_limit(
+                100.0f,
+                0.0f,
+                3000,
+                release_step_limit
+            )
+            && release_step_limit == 17
+            && !ar4_protocol::calibration_release_step_limit(
+                100.0f,
+                10.0f,
+                0,
+                release_step_limit
+            )
+            && release_step_limit == 17
+            && !ar4_protocol::calibration_release_step_limit(
+                std::numeric_limits<float>::max(),
+                std::numeric_limits<float>::max(),
+                INT_MAX,
+                release_step_limit
+            )
+            && release_step_limit == 17,
+        "invalid calibration switch-release travel was accepted"
+    );
+
     int step_limit = 17;
     int zero_step = 19;
     require(
@@ -1253,6 +1309,23 @@ void test_controller_domain_contract() {
             && center_step == 19
             && joint_five_step == 23,
         "invalid calibration reference was accepted or mutated output"
+    );
+    require(
+        !ar4_protocol::calibration_reference_steps(
+            1,
+            0,
+            0.0f,
+            0.0f,
+            100.0f,
+            0,
+            0.0f,
+            0.0f,
+            false,
+            master_step,
+            center_step,
+            joint_five_step
+        ),
+        "requested zero-travel calibration reference was accepted"
     );
 
     std::uint32_t milliseconds = 17;
@@ -2146,6 +2219,78 @@ void test_tool_jog_signed_tcp_displacement() {
         && frame_index == 0
         && frame_offset == -tiny_rotation,
         "native-unit tool translation was rejected as an angular underflow"
+    );
+}
+
+void test_primary_home_reference_contract() {
+    ar4_protocol::PrimaryHomeReferenceState state = {
+        {false, false},
+        {123, -456},
+    };
+    char response[
+        ar4_protocol::kPrimaryHomeReferenceResponseCapacity
+    ] = {};
+    require(
+        ar4_protocol::build_primary_home_reference_response(
+            state,
+            response,
+            sizeof(response)
+        )
+            && std::strcmp(response, "A0B0C0D0") == 0,
+        "invalid primary home references leaked stale coordinates"
+    );
+
+    int32_t first = 0;
+    int32_t second = 0;
+    require(
+        ar4_protocol::primary_home_reference_millidegrees(
+            163.8004f,
+            first
+        )
+            && first == 163800
+            && ar4_protocol::primary_home_reference_millidegrees(
+                -38.1996f,
+                second
+            )
+            && second == -38200,
+        "primary home-reference conversion changed millidegree rounding"
+    );
+    ar4_protocol::set_primary_home_reference(state, 0, first);
+    ar4_protocol::set_primary_home_reference(state, 1, second);
+    require(
+        ar4_protocol::build_primary_home_reference_response(
+            state,
+            response,
+            sizeof(response)
+        )
+            && std::strcmp(response, "A1B163800C1D-38200") == 0,
+        "primary home-reference response changed wire framing"
+    );
+
+    ar4_protocol::invalidate_primary_home_reference_axis(state, 0);
+    require(
+        !state.valid[0]
+            && state.millidegrees[0] == 0
+            && state.valid[1]
+            && state.millidegrees[1] == second,
+        "axis-local home-reference invalidation changed another axis"
+    );
+
+    ar4_protocol::invalidate_primary_home_reference(state);
+    require(
+        !state.valid[0]
+            && !state.valid[1]
+            && state.millidegrees[0] == 0
+            && state.millidegrees[1] == 0,
+        "primary home-reference invalidation retained stale state"
+    );
+    require(
+        !ar4_protocol::primary_home_reference_millidegrees(
+            std::numeric_limits<float>::infinity(),
+            first
+        )
+            && first == 163800,
+        "non-finite primary home reference was accepted"
     );
 }
 
@@ -3660,6 +3805,7 @@ int main(int argc, char** argv) {
         test_controller_domain_contract();
         test_tool_frame_axis_order();
         test_tool_jog_signed_tcp_displacement();
+        test_primary_home_reference_contract();
         test_firmware_identity_contract();
         test_firmware_command_queue_consumption();
         test_firmware_spline_response_contract();

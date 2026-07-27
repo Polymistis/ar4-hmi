@@ -35,6 +35,7 @@ from ARrobots.HMI.joint_motion import (
     CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+    CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
     CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
     CONTROLLER_MAXIMUM_PULSE_DELAY_MICROSECONDS,
     FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS,
@@ -52,8 +53,8 @@ from ARrobots.HMI.joint_motion import (
     MotionRequestLease,
     MotionRequestRegistry,
     MotionTransportBusy,
-    PRIMARY_CALIBRATION_BASE_OFFSETS,
     PRIMARY_START_POSITION,
+    PrimaryHomeReference,
     PositionResponse,
     ProtocolResponseError,
     SerialActivityRegistry,
@@ -83,6 +84,7 @@ from ARrobots.HMI.joint_motion import (
     parse_controller_modbus_response,
     parse_motion_wrist_config,
     parse_position_response,
+    parse_primary_home_reference_response,
     parse_virtual_command_timing,
     primary_shutdown_position,
     quarantine_serial_transport,
@@ -358,6 +360,27 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         namespace.setdefault("PRIMARY_JOINT_COUNT", 6)
         namespace.setdefault("PRIMARY_START_POSITION", PRIMARY_START_POSITION)
+        namespace.setdefault(
+            "CONTROLLER_CAPABILITY_HOME_REFERENCE_V1",
+            CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+        )
+        namespace.setdefault(
+            "parse_primary_home_reference_response",
+            parse_primary_home_reference_response,
+        )
+        namespace.setdefault("PrimaryHomeReference", PrimaryHomeReference)
+        namespace.setdefault(
+            "_query_primary_home_reference",
+            lambda serial_port: None,
+        )
+        namespace.setdefault(
+            "_apply_calibration_home_reference",
+            lambda serial_port, home_reference, error: True,
+        )
+        namespace.setdefault(
+            "_invalidate_bound_primary_home_reference",
+            lambda serial_port: True,
+        )
         namespace.setdefault(
             "primary_shutdown_position",
             primary_shutdown_position,
@@ -940,6 +963,11 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
     def compile_class(self, name, namespace):
+        namespace.setdefault("PrimaryHomeReference", PrimaryHomeReference)
+        namespace.setdefault(
+            "CONTROLLER_CAPABILITY_HOME_REFERENCE_V1",
+            CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+        )
         class_node = copy.deepcopy(self.module_classes[name])
         module = ast.Module(body=[class_node], type_ignores=[])
         compiled = compile(ast.fix_missing_locations(module), str(AR4_SOURCE), "exec")
@@ -992,7 +1020,11 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.jobs.append((delay, callback))
 
         class Port:
-            is_open = True
+            def __init__(self):
+                self.is_open = True
+
+            def close(self):
+                self.is_open = False
 
         calibration = {}
         for axis in range(1, 10):
@@ -1150,6 +1182,98 @@ class HmiSourceContractTests(unittest.TestCase):
                 namespace,
             )
         return namespace, state
+
+    def install_calibration_home_reference_contract(
+        self,
+        namespace,
+        response,
+        *,
+        initial_reference=None,
+    ):
+        serial_port = namespace["RUN"]["ser"]
+        base_identity = parse_controller_identity_response(
+            VALID_CONTROLLER_IDENTITY_RESPONSE
+        )
+        identity = ControllerIdentity(
+            controller_hardware_id=base_identity.controller_hardware_id,
+            driver_model=base_identity.driver_model,
+            firmware_version="6.7.1-ar4hmi.3",
+            robot_model=base_identity.robot_model,
+            robot_version=base_identity.robot_version,
+            serial_number=base_identity.serial_number,
+            asset_tag=base_identity.asset_tag,
+            protocol_capabilities=(
+                base_identity.protocol_capabilities
+                + (CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,)
+            ),
+        )
+        if initial_reference is None:
+            initial_reference = PrimaryHomeReference(
+                (True, True),
+                (160.0, -40.0),
+            )
+        namespace.update({
+            "Optional": Optional,
+            "ControllerIdentity": ControllerIdentity,
+            "PrimaryHomeReference": PrimaryHomeReference,
+            "validate_controller_hardware_id": validate_controller_hardware_id,
+            "CONTROLLER_CAPABILITY_HOME_REFERENCE_V1": (
+                CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
+            ),
+            "gcode_storage_state_lock": threading.Lock(),
+            "gcode_storage_media_binding": None,
+        })
+        binding_type = self.compile_class(
+            "MainControllerIdentityBinding",
+            namespace,
+        )
+        namespace["main_controller_identity_binding"] = binding_type(
+            serial_port,
+            identity,
+            initial_reference,
+        )
+        for function_name in (
+            "_current_main_controller_identity",
+            "_bind_main_controller_home_reference",
+            "_current_primary_home_reference",
+            "_invalidate_bound_primary_home_reference",
+        ):
+            namespace[function_name] = self.compile_function(
+                function_name,
+                namespace,
+            )
+
+        query_calls = []
+
+        def exchange_home_reference(
+            candidate_port,
+            command,
+            timeout,
+            *,
+            write_lock,
+        ):
+            query_calls.append(
+                (candidate_port, command, timeout, write_lock)
+            )
+            return response() if callable(response) else response
+
+        namespace.update({
+            "exchange_serial_line": exchange_home_reference,
+            "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 1.0,
+            "parse_primary_home_reference_response": (
+                parse_primary_home_reference_response
+            ),
+            "ProtocolResponseError": ProtocolResponseError,
+        })
+        namespace["_query_primary_home_reference"] = self.compile_function(
+            "_query_primary_home_reference",
+            namespace,
+        )
+        namespace["_apply_calibration_home_reference"] = self.compile_function(
+            "_apply_calibration_home_reference",
+            namespace,
+        )
+        return serial_port, query_calls
 
     @staticmethod
     def _valid_update_parameter_values():
@@ -2409,6 +2533,60 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.assertEqual(calibration, {"sentinel": "unchanged"})
                 self.assertEqual(calls, [])
 
+    def test_update_parameter_write_invalidates_cached_home_reference(self):
+        port = SimpleNamespace(is_open=True)
+        for outcome in (True, RuntimeError("acknowledgement failed")):
+            with self.subTest(outcome=outcome):
+                invalidations = []
+
+                def write_control(
+                    serial_port,
+                    command,
+                    *,
+                    write_lock,
+                    reset_input,
+                    write_started_event,
+                ):
+                    self.assertIs(serial_port, port)
+                    self.assertEqual(command, "UPA1\n")
+                    self.assertTrue(reset_input)
+                    write_started_event.set()
+                    return True
+
+                def read_response(serial_port, expected, timeout):
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return "Done"
+
+                namespace = {
+                    "RUN": {"ser": port},
+                    "threading": threading,
+                    "serial_write_lock": threading.Lock(),
+                    "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 1.0,
+                    "write_serial_control": write_control,
+                    "read_serial_exact_response": read_response,
+                    "_invalidate_bound_primary_home_reference": (
+                        lambda serial_port: (
+                            invalidations.append(serial_port)
+                            or True
+                        )
+                    ),
+                }
+                exchange = self.compile_function(
+                    "_exchange_controller_calibration_acknowledgement",
+                    namespace,
+                )
+
+                if isinstance(outcome, Exception):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "acknowledgement failed",
+                    ):
+                        exchange("UPA1\n")
+                else:
+                    self.assertTrue(exchange("UPA1\n"))
+                self.assertEqual(invalidations, [port])
+
     def test_update_parameters_rejects_nonbinary_direction_flags(self):
         values = self._valid_update_parameter_values()
         namespace = {
@@ -2470,6 +2648,9 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(command.startswith("LLA1B0C0D0E0F0G0H0I0"))
         self.assertTrue(command.endswith("R0.89999997615814208984375\n"))
 
+        with self.assertRaisesRegex(MotionInputError, "at least one selected axis"):
+            prepare((0,) * 9)
+
         for invalid in (2, -1, float("nan"), True):
             with self.subTest(selection=invalid):
                 selections = [0] * 9
@@ -2479,7 +2660,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         calibration["J7calOff"] = float("inf")
         with self.assertRaisesRegex(MotionInputError, "J7 calibration offset"):
-            prepare((0,) * 9)
+            prepare((1, 0, 0, 0, 0, 0, 0, 0, 0))
 
     def test_calibration_field_collection_rejects_nonfinite_values(self):
         class Entry:
@@ -3130,27 +3311,35 @@ class HmiSourceContractTests(unittest.TestCase):
     def test_calibration_transmissions_require_exact_firmware_acknowledgement(self):
         port = SimpleNamespace(is_open=True)
         exchange_calls = []
+        home_reference_invalidations = []
         write_lock = object()
+
+        def write_control(
+            serial_port,
+            command,
+            write_lock=None,
+            reset_input=False,
+            write_started_event=None,
+        ):
+            exchange_calls.append(
+                (
+                    "write",
+                    serial_port,
+                    command,
+                    write_lock,
+                    reset_input,
+                    write_started_event,
+                )
+            )
+            if write_started_event is not None:
+                write_started_event.set()
+            return True
+
         helper_namespace = {
             "RUN": {"ser": port},
             "serial_write_lock": write_lock,
             "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 10,
-            "write_serial_control": (
-                lambda serial_port, command, write_lock=None, reset_input=False,
-                write_started_event=None: (
-                    exchange_calls.append(
-                        (
-                            "write",
-                            serial_port,
-                            command,
-                            write_lock,
-                            reset_input,
-                            write_started_event,
-                        )
-                    )
-                    or True
-                )
-            ),
+            "write_serial_control": write_control,
             "read_serial_exact_response": (
                 lambda serial_port, expected, timeout: (
                     exchange_calls.append(
@@ -3160,6 +3349,12 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
             ),
             "serial_transport_quarantined": lambda serial_port: False,
+            "_invalidate_bound_primary_home_reference": (
+                lambda serial_port: (
+                    home_reference_invalidations.append(serial_port)
+                    or True
+                )
+            ),
         }
         exchange_acknowledgement = self.compile_function(
             "_exchange_controller_calibration_acknowledgement",
@@ -3168,12 +3363,13 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertTrue(exchange_acknowledgement("UPA1\n"))
         self.assertEqual(
-            exchange_calls,
-            [
-                ("write", port, "UPA1\n", write_lock, True, None),
-                ("read", port, b"Done", 10),
-            ],
+            exchange_calls[0][:-1],
+            ("write", port, "UPA1\n", write_lock, True),
         )
+        self.assertTrue(exchange_calls[0][-1].is_set())
+        self.assertEqual(exchange_calls[1], ("read", port, b"Done", 10))
+        self.assertEqual(len(exchange_calls), 2)
+        self.assertEqual(home_reference_invalidations, [port])
 
         calls = []
 
@@ -3184,6 +3380,7 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace = {
             "_exchange_controller_calibration_acknowledgement": exchange,
         }
+        self.add_startup_command_dependencies(namespace)
         transmit_update = self.compile_function(
             "_transmit_update_parameters",
             namespace,
@@ -3195,6 +3392,15 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertTrue(transmit_update("UPA1\n"))
         self.assertTrue(transmit_external("CEA2\n"))
+        self.assertEqual(
+            calls,
+            [("UPA1\n", None), ("CEA2\n", None)],
+        )
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "must begin with 'CE'",
+        ):
+            transmit_external("UPA1\n")
         self.assertEqual(
             calls,
             [("UPA1\n", None), ("CEA2\n", None)],
@@ -3828,8 +4034,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 lambda reason: calls.append(("invalidate", reason))
             ),
             "_bind_main_controller_identity": (
-                lambda serial_port, identity: calls.append(
-                    ("bind", serial_port, identity)
+                lambda serial_port, identity, home_reference: calls.append(
+                    ("bind", serial_port, identity, home_reference)
                 )
             ),
             "logger": SimpleNamespace(exception=lambda *args: None),
@@ -3849,6 +4055,7 @@ class HmiSourceContractTests(unittest.TestCase):
                     position=position,
                     visual_options=("arm.jpg",),
                     controller_identity=controller_identity,
+                    home_reference=None,
                 ),
                 {"update": 1},
                 {"external": 2},
@@ -3867,7 +4074,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIsNone(startup_serial.timeout)
         self.assertFalse(any(call[0] == "invalidate" for call in calls))
         self.assertIn(
-            ("bind", startup_serial, controller_identity),
+            ("bind", startup_serial, controller_identity, None),
             calls,
         )
         self.assertLess(
@@ -8148,6 +8355,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_bind_main_controller_identity": {"ser"},
             "_current_main_controller_identity": {"ser"},
             "_current_gcode_storage_media": {"ser"},
+            "_invalidate_bound_primary_home_reference": {"ser"},
             # The failed-start activity lease and serial lock remain reserved
             # until close and cleanup release both ownership layers.
             "_close_failed_controller_startup": {"ser"},
@@ -8173,6 +8381,8 @@ class HmiSourceContractTests(unittest.TestCase):
             "_start_xbox_auxiliary_request": {"ser2"},
             "_try_dispatch_controller_correction": {"ser"},
             "send_xbox_auxiliary": {"ser2"},
+            "_bind_main_controller_home_reference": {"ser"},
+            "MoveToShutdownPosition": {"ser"},
             # G-code storage captures the main handle under a request-scoped
             # activity lease. The worker and Tk result applier retain that
             # transferred owner through response validation and cleanup.
@@ -10581,6 +10791,7 @@ class HmiSourceContractTests(unittest.TestCase):
         first_label = Label()
         second_label = Label()
         monitor_updates = []
+        invalidations = []
         applied_results = [None]
         response = (
             b"A1B2C3D4E5F6G7H8I9J10K11L12"
@@ -10628,6 +10839,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "_apply_valid_position_response": (
                 lambda response: applied_results.pop(0)
             ),
+            "_invalidate_uncertain_controller_calibration": (
+                invalidations.append
+            ),
         }
         self.add_startup_command_dependencies(namespace)
         namespace["_binary_controller_flag"] = self.compile_function(
@@ -10660,6 +10874,10 @@ class HmiSourceContractTests(unittest.TestCase):
             "Auto Calibration Stage 1 Failed - See Log",
         )
         self.assertEqual(second_label.text, first_label.text)
+        self.assertEqual(
+            invalidations,
+            ["calibration command position could not be applied"],
+        )
 
         namespace["RUN"]["ser"] = Port((response, response))
         applied_results.extend((VALID_CONTROLLER_POSITION, None))
@@ -10669,6 +10887,13 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(
             first_label.text,
             "Auto Calibration Stage 2 Failed - See Log",
+        )
+        self.assertEqual(
+            invalidations,
+            [
+                "calibration command position could not be applied",
+                "calibration command position could not be applied",
+            ],
         )
 
         for axis in range(1, 10):
@@ -11080,8 +11305,10 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace,
             preserve_decorators=True,
         )
+        commit_callbacks = []
         write_commitment = namespace["CalibrationWriteCommitment"](
-            namespace["calibration_serial_write_committed"]
+            namespace["calibration_serial_write_committed"],
+            lambda: commit_callbacks.append(True),
         )
         port = Port()
 
@@ -11104,6 +11331,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(write_commitment.is_set())
         self.assertFalse(namespace["calibration_serial_write_committed"].is_set())
         self.assertFalse(namespace["calibration_terminal_response_pending"].is_set())
+        self.assertEqual(commit_callbacks, [])
 
     def test_calibration_write_boundary_latches_terminal_response(self):
         class Port:
@@ -11161,8 +11389,10 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace,
             preserve_decorators=True,
         )
+        commit_callbacks = []
         write_commitment = namespace["CalibrationWriteCommitment"](
-            namespace["calibration_serial_write_committed"]
+            namespace["calibration_serial_write_committed"],
+            lambda: commit_callbacks.append(True),
         )
         port = Port()
 
@@ -11183,6 +11413,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(write_commitment.is_set())
         self.assertTrue(namespace["calibration_serial_write_committed"].is_set())
         self.assertFalse(namespace["calibration_terminal_response_pending"].is_set())
+        self.assertEqual(commit_callbacks, [True])
 
     def test_async_calibration_stages_settle_transport_and_motion_once(self):
         class Entry:
@@ -11423,6 +11654,268 @@ class HmiSourceContractTests(unittest.TestCase):
             state["first_label"].text,
             "Auto Calibration Stage 2 Successful",
         )
+
+    def test_async_calibration_commits_controller_home_reference(self):
+        response = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+
+        def successful_exchange(
+            serial_port,
+            command,
+            cancellation_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            write_started_event.set()
+            return response
+
+        namespace, state = self.compile_async_calibration_lifecycle(
+            successful_exchange
+        )
+        reference = PrimaryHomeReference(
+            (True, False),
+            (163.8, 0.0),
+        )
+        serial_port, query_calls = (
+            self.install_calibration_home_reference_contract(
+                namespace,
+                "A1B163800C0D0",
+            )
+        )
+
+        self.assertTrue(namespace["startCalRobotJ1"]())
+        event = state["event_queue"].get(timeout=2)
+        state["event_queue"].put(event)
+        namespace["_poll_calibration_events"]()
+
+        self.assertEqual(
+            query_calls,
+            [
+                (
+                    serial_port,
+                    "HR\n",
+                    1.0,
+                    namespace["serial_write_lock"],
+                )
+            ],
+        )
+        self.assertEqual(
+            namespace["_current_primary_home_reference"](serial_port),
+            reference,
+        )
+        self.assertFalse(state["motion_registry"].active)
+
+    def test_async_calibration_invalidates_home_reference_at_write_boundary(self):
+        response = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+        write_committed = threading.Event()
+        release_response = threading.Event()
+
+        def delayed_exchange(
+            serial_port,
+            command,
+            cancellation_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            write_started_event.set()
+            write_committed.set()
+            if not release_response.wait(timeout=2):
+                raise TimeoutError("test response release timed out")
+            return response
+
+        namespace, state = self.compile_async_calibration_lifecycle(
+            delayed_exchange
+        )
+        serial_port, query_calls = (
+            self.install_calibration_home_reference_contract(
+                namespace,
+                "A1B163800C1D-38200",
+            )
+        )
+
+        self.assertTrue(namespace["startCalRobotJ1"]())
+        self.assertTrue(write_committed.wait(timeout=2))
+        self.assertEqual(
+            namespace["_current_primary_home_reference"](serial_port),
+            PrimaryHomeReference((False, False), (0.0, 0.0)),
+        )
+
+        release_response.set()
+        event = state["event_queue"].get(timeout=2)
+        state["event_queue"].put(event)
+        namespace["_poll_calibration_events"]()
+
+        self.assertEqual(len(query_calls), 1)
+        self.assertEqual(
+            namespace["_current_primary_home_reference"](serial_port),
+            PrimaryHomeReference((True, True), (163.8, -38.2)),
+        )
+        self.assertFalse(state["motion_registry"].active)
+
+    def test_async_failed_calibration_refreshes_controller_home_reference(self):
+        response = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+
+        def successful_exchange(
+            serial_port,
+            command,
+            cancellation_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            write_started_event.set()
+            return response
+
+        namespace, state = self.compile_async_calibration_lifecycle(
+            successful_exchange
+        )
+        serial_port, query_calls = (
+            self.install_calibration_home_reference_contract(
+                namespace,
+                "A0B0C0D0",
+            )
+        )
+        namespace["displayPosition"] = lambda response, parsed=None: None
+
+        self.assertTrue(namespace["startCalRobotJ1"]())
+        event = state["event_queue"].get(timeout=2)
+        state["event_queue"].put(event)
+        namespace["_poll_calibration_events"]()
+
+        self.assertEqual(len(query_calls), 1)
+        self.assertEqual(
+            namespace["_current_primary_home_reference"](serial_port),
+            PrimaryHomeReference((False, False), (0.0, 0.0)),
+        )
+        self.assertEqual(
+            state["invalidations"],
+            ["calibration command position could not be applied"],
+        )
+        self.assertFalse(state["motion_registry"].active)
+        self.assertIsNone(namespace["calibration_operation"])
+
+    def test_synchronous_failed_calibration_refreshes_home_reference(self):
+        response = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+
+        def successful_exchange(
+            serial_port,
+            command,
+            cancellation_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            write_started_event.set()
+            return response
+
+        namespace, state = self.compile_async_calibration_lifecycle(
+            successful_exchange
+        )
+        serial_port, query_calls = (
+            self.install_calibration_home_reference_contract(
+                namespace,
+                "A0B0C0D0",
+            )
+        )
+        namespace["displayPosition"] = lambda response, parsed=None: None
+        execute = self.compile_function(
+            "_execute_calibration_command",
+            namespace,
+        )
+        command = namespace["_prepare_calibration_command"](
+            (1, 0, 0, 0, 0, 0, 0, 0, 0)
+        )
+
+        self.assertFalse(
+            execute(
+                command,
+                "Calibration Successful",
+                "Calibration Failed",
+            )
+        )
+
+        self.assertEqual(len(query_calls), 1)
+        self.assertEqual(
+            namespace["_current_primary_home_reference"](serial_port),
+            PrimaryHomeReference((False, False), (0.0, 0.0)),
+        )
+        self.assertEqual(
+            state["invalidations"],
+            ["calibration command position could not be applied"],
+        )
+
+    def test_async_home_reference_error_stops_calibration_sequence(self):
+        response = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+        exchanges = []
+
+        def successful_exchange(
+            serial_port,
+            command,
+            cancellation_event,
+            *,
+            write_lock,
+            write_boundary_lock,
+            write_started_event,
+        ):
+            exchanges.append(command)
+            write_started_event.set()
+            return response
+
+        namespace, state = self.compile_async_calibration_lifecycle(
+            successful_exchange
+        )
+        serial_port, query_calls = (
+            self.install_calibration_home_reference_contract(
+                namespace,
+                "invalid",
+            )
+        )
+        state["invalidations"].clear()
+        namespace.update({
+            "quarantine_serial_transport": quarantine_serial_transport,
+            "_invalidate_joint_motion_state": state["invalidations"].append,
+            "_require_main_controller_identity_cleanup": (
+                lambda candidate_port, context: True
+            ),
+        })
+        namespace["_invalidate_uncertain_controller_calibration"] = (
+            self.compile_function(
+                "_invalidate_uncertain_controller_calibration",
+                namespace,
+            )
+        )
+
+        self.assertTrue(namespace["startCalRobotAll"]())
+        event = state["event_queue"].get(timeout=2)
+        state["event_queue"].put(event)
+        namespace["_poll_calibration_events"]()
+
+        self.assertEqual(len(exchanges), 1)
+        self.assertEqual(len(query_calls), 1)
+        self.assertFalse(serial_port.is_open)
+        self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertEqual(
+            state["invalidations"],
+            [
+                "calibration home-reference synchronization failed: "
+                "controller home-reference response is invalid: "
+                "controller home-reference response has invalid markers "
+                "or values"
+            ],
+        )
+        self.assertEqual(
+            state["first_label"].text,
+            "Controller calibration state is uncertain; "
+            "controller quarantined and reconnection is required",
+        )
+        self.assertEqual(state["first_label"].style, "Alarm.TLabel")
+        self.assertFalse(state["motion_registry"].active)
+        self.assertIsNone(namespace["calibration_operation"])
 
     def test_completed_calibration_event_requires_write_commitment(self):
         exchanges = []
@@ -12095,6 +12588,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         def position_namespace(port):
             invalidations = []
+            home_reference_invalidations = []
             namespace = {
                 "RUN": {"ser": port},
                 "threading": threading,
@@ -12104,6 +12598,12 @@ class HmiSourceContractTests(unittest.TestCase):
                 "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 1.0,
                 "ProtocolResponseError": ProtocolResponseError,
                 "_invalidate_joint_motion_state": invalidations.append,
+                "_invalidate_bound_primary_home_reference": (
+                    lambda serial_port: (
+                        home_reference_invalidations.append(serial_port)
+                        or True
+                    )
+                ),
                 "logger": SimpleNamespace(exception=lambda *args: None),
             }
             self.add_startup_command_dependencies(namespace)
@@ -12113,10 +12613,14 @@ class HmiSourceContractTests(unittest.TestCase):
                     namespace,
                 )
             )
-            return namespace, invalidations
+            return namespace, invalidations, home_reference_invalidations
 
         port = FirmwarePort()
-        namespace, invalidations = position_namespace(port)
+        (
+            namespace,
+            invalidations,
+            home_reference_invalidations,
+        ) = position_namespace(port)
         namespace["_prepare_position_command"] = (
             lambda: "SPA1B2C3D4E5F6G7H8I9\n"
         )
@@ -12130,6 +12634,28 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(port.response, b"")
         self.assertEqual(port.discarded, [])
         self.assertEqual(invalidations, [])
+        self.assertEqual(home_reference_invalidations, [port])
+
+        class FailingFirmwarePort(FirmwarePort):
+            def write(self, value):
+                self.writes.append(value)
+                raise OSError("write failed")
+
+        failing_port = FailingFirmwarePort()
+        (
+            failing_namespace,
+            failing_invalidations,
+            failing_home_reference_invalidations,
+        ) = position_namespace(failing_port)
+        with self.assertRaises(SerialTransportQuarantinedError):
+            failing_namespace["_exchange_position_acknowledgement"](
+                "SPA1B2C3D4E5F6G7H8I9\n"
+            )
+        self.assertEqual(
+            failing_home_reference_invalidations,
+            [failing_port],
+        )
+        self.assertEqual(len(failing_invalidations), 1)
 
         expected_commands = {
             "CalZeroPos": b"SPA0B0C0D0E45F0G7H8I9\n",
@@ -12138,7 +12664,11 @@ class HmiSourceContractTests(unittest.TestCase):
         for function_name, expected_command in expected_commands.items():
             with self.subTest(function=function_name):
                 port = FirmwarePort()
-                namespace, invalidations = position_namespace(port)
+                (
+                    namespace,
+                    invalidations,
+                    home_reference_invalidations,
+                ) = position_namespace(port)
                 namespace.update(
                     {
                         "CAL": {
@@ -12251,6 +12781,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
                 self.assertEqual(port.response, b"")
                 self.assertEqual(port.discarded, [])
+                self.assertEqual(home_reference_invalidations, [port])
                 self.assertEqual(len(invalidations), 1)
                 self.assertIn("forced position", invalidations[0])
                 self.assertIsNone(
@@ -12952,7 +13483,188 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(len(submit_calls), 1)
         self.assertEqual(submit_calls[0].func.attr, "submit_targets")
 
-    def test_named_position_references_match_program_and_firmware(self):
+    def test_home_reference_binding_query_and_invalidation_contracts(self):
+        base_identity = parse_controller_identity_response(
+            VALID_CONTROLLER_IDENTITY_RESPONSE
+        )
+        capability_identity = ControllerIdentity(
+            controller_hardware_id=base_identity.controller_hardware_id,
+            driver_model=base_identity.driver_model,
+            firmware_version="6.7.1-ar4hmi.3",
+            robot_model=base_identity.robot_model,
+            robot_version=base_identity.robot_version,
+            serial_number=base_identity.serial_number,
+            asset_tag=base_identity.asset_tag,
+            protocol_capabilities=(
+                base_identity.protocol_capabilities
+                + (CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,)
+            ),
+        )
+        port = SimpleNamespace(is_open=True)
+        invalidation_warnings = []
+        namespace = {
+            "dataclass": dataclass,
+            "Optional": Optional,
+            "ControllerIdentity": ControllerIdentity,
+            "PrimaryHomeReference": PrimaryHomeReference,
+            "MotionInputError": MotionInputError,
+            "validate_controller_hardware_id": validate_controller_hardware_id,
+            "CONTROLLER_CAPABILITY_HOME_REFERENCE_V1": (
+                CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
+            ),
+            "RUN": {"ser": port},
+            "gcode_storage_state_lock": threading.Lock(),
+            "main_controller_identity_binding": None,
+            "gcode_storage_media_binding": None,
+            "logger": SimpleNamespace(
+                warning=lambda *values: invalidation_warnings.append(values)
+            ),
+        }
+        binding_type = self.compile_class(
+            "MainControllerIdentityBinding",
+            namespace,
+        )
+        valid_reference = PrimaryHomeReference(
+            (True, True),
+            (163.8, -38.2),
+        )
+
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "home-reference capability is inconsistent",
+        ):
+            binding_type(port, capability_identity)
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "home-reference capability is inconsistent",
+        ):
+            binding_type(port, base_identity, valid_reference)
+
+        namespace["main_controller_identity_binding"] = binding_type(
+            port,
+            capability_identity,
+            valid_reference,
+        )
+        namespace["_current_main_controller_identity"] = self.compile_function(
+            "_current_main_controller_identity",
+            namespace,
+        )
+        namespace["_bind_main_controller_home_reference"] = (
+            self.compile_function(
+                "_bind_main_controller_home_reference",
+                namespace,
+            )
+        )
+        namespace["_current_primary_home_reference"] = self.compile_function(
+            "_current_primary_home_reference",
+            namespace,
+        )
+        namespace["_invalidate_bound_primary_home_reference"] = (
+            self.compile_function(
+                "_invalidate_bound_primary_home_reference",
+                namespace,
+            )
+        )
+
+        self.assertEqual(
+            namespace["_current_primary_home_reference"](port),
+            valid_reference,
+        )
+        self.assertTrue(
+            namespace["_invalidate_bound_primary_home_reference"](port)
+        )
+        self.assertEqual(
+            namespace["_current_primary_home_reference"](port),
+            PrimaryHomeReference((False, False), (0.0, 0.0)),
+        )
+
+        responses = ["A1B163800C1D-38200"]
+
+        def exchange(
+            serial_port,
+            command,
+            timeout,
+            *,
+            write_lock,
+        ):
+            self.assertIs(serial_port, port)
+            self.assertEqual(command, "HR\n")
+            return responses.pop(0)
+
+        namespace.update({
+            "exchange_serial_line": exchange,
+            "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 1.0,
+            "serial_write_lock": threading.Lock(),
+            "parse_primary_home_reference_response": (
+                parse_primary_home_reference_response
+            ),
+            "ProtocolResponseError": ProtocolResponseError,
+        })
+        namespace["_query_primary_home_reference"] = self.compile_function(
+            "_query_primary_home_reference",
+            namespace,
+        )
+
+        queried_reference = namespace["_query_primary_home_reference"](port)
+        self.assertEqual(queried_reference, valid_reference)
+
+        responses.append("invalid")
+        with self.assertRaisesRegex(
+            ProtocolResponseError,
+            "home-reference response is invalid",
+        ):
+            namespace["_query_primary_home_reference"](port)
+
+        invalidations = []
+        namespace.update({
+            "_invalidate_uncertain_controller_calibration": (
+                lambda reason: invalidations.append(reason) or False
+            ),
+        })
+        namespace["_apply_calibration_home_reference"] = self.compile_function(
+            "_apply_calibration_home_reference",
+            namespace,
+        )
+        self.assertTrue(
+            namespace["_apply_calibration_home_reference"](
+                port,
+                valid_reference,
+                None,
+            )
+        )
+        self.assertEqual(
+            namespace["_current_primary_home_reference"](port),
+            valid_reference,
+        )
+        self.assertFalse(
+            namespace["_apply_calibration_home_reference"](
+                port,
+                None,
+                "query failed",
+            )
+        )
+        self.assertEqual(
+            namespace["_current_primary_home_reference"](port),
+            PrimaryHomeReference((False, False), (0.0, 0.0)),
+        )
+        self.assertEqual(
+            invalidations,
+            [
+                "calibration home-reference synchronization failed: "
+                "query failed"
+            ],
+        )
+        port.is_open = False
+        self.assertFalse(
+            namespace["_invalidate_bound_primary_home_reference"](port)
+        )
+        self.assertEqual(len(invalidation_warnings), 1)
+        self.assertEqual(
+            invalidation_warnings[0][1],
+            "the controller connection is closed",
+        )
+
+    def test_named_position_references_match_program_and_controller_contract(self):
         home_program = HOME_PROGRAM_SOURCE.read_text(encoding="utf-8")
         home_match = re.search(
             r"J1\s+([-0-9.]+)\s+J2\s+([-0-9.]+)\s+"
@@ -12967,16 +13679,136 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         firmware_source = TEENSY_SOURCE.read_text(encoding="utf-8")
-        for axis, expected_offset in enumerate(
-            PRIMARY_CALIBRATION_BASE_OFFSETS,
-            start=1,
-        ):
-            offset_match = re.search(
-                rf"float\s+J{axis}calBaseOff\s*=\s*([-0-9.]+)\s*;",
-                firmware_source,
+        self.assertIn(
+            'const char *HOME_REFERENCE_CAPABILITY = "HOME_REFERENCE_V1";',
+            firmware_source,
+        )
+        self.assertIn(
+            'if (function == "HR")',
+            firmware_source,
+        )
+        shutdown_function = self.module_functions[
+            "MoveToShutdownPosition"
+        ]
+        referenced_names = {
+            node.id
+            for node in ast.walk(shutdown_function)
+            if isinstance(node, ast.Name)
+        }
+        self.assertIn("_current_primary_home_reference", referenced_names)
+        self.assertNotIn("CAL", referenced_names)
+
+        calibration_start = firmware_source.index(
+            'if (function == "LL")'
+        )
+        calibration_end = firmware_source.index(
+            '//----- LIVE CARTESIAN JOG',
+            calibration_start,
+        )
+        calibration_handler = firmware_source[
+            calibration_start:calibration_end
+        ]
+        limit_search_start = firmware_source.index(
+            "bool driveLimit("
+        )
+        limit_search_end = firmware_source.index(
+            "\nbool backOff(",
+            limit_search_start,
+        )
+        limit_search = firmware_source[
+            limit_search_start:limit_search_end
+        ]
+        self.assertIn("limitConfirmed[i] = 1;", limit_search)
+        self.assertIn("&& limitSeen[i] == 0", limit_search)
+        self.assertIn(
+            "if (requested[i] == 1 && limitConfirmed[i] == 0) return false;",
+            limit_search,
+        )
+        guarded_limit_searches = [
+            match.start()
+            for match in re.finditer(
+                r"if \(!driveLimit\(JStep, Jreq, SpeedIn\)\)",
+                calibration_handler,
             )
-            self.assertIsNotNone(offset_match, f"J{axis}")
-            self.assertEqual(float(offset_match.group(1)), expected_offset)
+        ]
+        self.assertEqual(len(guarded_limit_searches), 2)
+        self.assertEqual(
+            calibration_handler.count(
+                'if (!estopActive) Serial.println("ER");'
+            ),
+            4,
+        )
+        reference_invalidation = calibration_handler.index(
+            "invalidate_primary_home_reference_axis"
+        )
+        backoff = calibration_handler.index("if (!backOff(")
+        step_monitor_commit = calibration_handler.index(
+            "int *stepMonitors[9]"
+        )
+        self.assertLess(reference_invalidation, guarded_limit_searches[0])
+        self.assertLess(guarded_limit_searches[0], backoff)
+        self.assertLess(backoff, guarded_limit_searches[1])
+        self.assertLess(guarded_limit_searches[1], step_monitor_commit)
+        backoff_start = firmware_source.index(
+            "bool backOff("
+        )
+        backoff_end = firmware_source.index(
+            "//CHECK ENCODERS",
+            backoff_start,
+        )
+        backoff_source = firmware_source[backoff_start:backoff_end]
+        self.assertIn(
+            "ar4_protocol::calibration_release_step_limit(",
+            backoff_source,
+        )
+        self.assertIn(
+            "digitalRead(calPins[axis]) == LOW",
+            backoff_source,
+        )
+        self.assertIn(
+            ">= CALIBRATION_RELEASE_STABLE_MICROSECONDS",
+            backoff_source,
+        )
+        self.assertIn(
+            "completedSteps[axis] >= maximumSteps[axis]",
+            backoff_source,
+        )
+        self.assertIn(
+            "configuredStepLimits[axis]",
+            backoff_source,
+        )
+        empty_selection_guard = calibration_handler.index(
+            "if (!hasRequestedAxis)"
+        )
+        self.assertLess(empty_selection_guard, guarded_limit_searches[0])
+        final_drive = calibration_handler.index("if (!driveMotorsJ")
+        post_drive_estop_guard = calibration_handler.index(
+            "if (estopActive) {",
+            final_drive,
+        )
+        reference_commit = calibration_handler.index(
+            "set_primary_home_reference"
+        )
+        terminal_response = calibration_handler.index(
+            "sendRobotPos();",
+            reference_commit,
+        )
+        self.assertLess(final_drive, post_drive_estop_guard)
+        self.assertLess(post_drive_estop_guard, reference_commit)
+        self.assertLess(reference_commit, terminal_response)
+
+        for command in ("UP", "SP"):
+            handler_start = firmware_source.index(
+                f'if (function == "{command}")'
+            )
+            next_handler = firmware_source.index(
+                "//-----COMMAND",
+                handler_start + 1,
+            )
+            self.assertIn(
+                "invalidate_primary_home_reference",
+                firmware_source[handler_start:next_handler],
+            )
 
     def test_named_position_online_route_preserves_external_axes(self):
         actual = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 7.0, 8.0, 9.0)
@@ -13054,6 +13886,195 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(
             virtual_targets,
             [PRIMARY_START_POSITION + actual[6:]],
+        )
+
+    def test_controller_reference_position_rejects_unrelated_deferral(self):
+        class Calibration:
+            @staticmethod
+            def validate_positions(positions):
+                return tuple(positions)
+
+        class Deferred:
+            pending = False
+
+            @staticmethod
+            def set_targets(*args):
+                raise AssertionError(
+                    "controller-reference target must not be retained"
+                )
+
+        namespace = {
+            "RUN": {"xboxUse": 1, "offlineMode": False},
+            "application_closing": threading.Event(),
+            "controller_correction_requested": threading.Event(),
+            "finite_number": finite_number,
+            "MotionInputError": MotionInputError,
+            "MotionQueueFault": MotionQueueFault,
+            "MotionTransportBusy": MotionTransportBusy,
+            "_current_joint_positions": lambda: (0.0,) * 9,
+            "_current_controller_joint_calibration": Calibration,
+            "_current_joint_motion_profile": lambda: object(),
+            "deferred_joint_adjustments": Deferred(),
+            "motion_request_registry": SimpleNamespace(active=True),
+            "joint_motion_dispatcher": SimpleNamespace(active=False),
+            "confirmed_position_generation": 3,
+            "almStatusLab": SimpleNamespace(config=lambda **values: None),
+            "almStatusLab2": SimpleNamespace(config=lambda **values: None),
+            "logger": SimpleNamespace(error=lambda message: None),
+        }
+        route = self.compile_function(
+            "_queue_primary_joint_position",
+            namespace,
+        )
+
+        self.assertFalse(
+            route(
+                PRIMARY_START_POSITION,
+                allow_unrelated_defer=False,
+            )
+        )
+
+    def test_controller_reference_position_abandons_busy_submission(self):
+        abandoned = []
+
+        class Calibration:
+            @staticmethod
+            def validate_positions(positions):
+                return tuple(positions)
+
+        class Dispatcher:
+            active = False
+
+            @staticmethod
+            def submit_targets(*args):
+                raise MotionTransportBusy("dispatcher became busy")
+
+        class Deferred:
+            pending = False
+
+            @staticmethod
+            def set_targets(*args):
+                raise AssertionError(
+                    "controller-reference target must not be retained"
+                )
+
+        lease = object()
+        namespace = {
+            "RUN": {"xboxUse": 1, "offlineMode": False},
+            "application_closing": threading.Event(),
+            "controller_correction_requested": threading.Event(),
+            "finite_number": finite_number,
+            "MotionInputError": MotionInputError,
+            "MotionQueueFault": MotionQueueFault,
+            "MotionTransportBusy": MotionTransportBusy,
+            "_current_joint_positions": lambda: (0.0,) * 9,
+            "_current_controller_joint_calibration": Calibration,
+            "_current_joint_motion_profile": lambda: object(),
+            "deferred_joint_adjustments": Deferred(),
+            "motion_request_registry": SimpleNamespace(active=False),
+            "joint_motion_dispatcher": Dispatcher(),
+            "_reserve_joint_motion_request": lambda: (lease, True),
+            "_abandon_joint_motion_request": abandoned.append,
+            "legacy_serial_result_pending": threading.Event(),
+            "live_serial_result_pending": threading.Event(),
+            "serial_lock": SimpleNamespace(locked=lambda: False),
+            "confirmed_position_generation": 3,
+            "almStatusLab": SimpleNamespace(config=lambda **values: None),
+            "almStatusLab2": SimpleNamespace(config=lambda **values: None),
+            "logger": SimpleNamespace(error=lambda message: None),
+        }
+        route = self.compile_function(
+            "_queue_primary_joint_position",
+            namespace,
+        )
+
+        self.assertFalse(
+            route(
+                PRIMARY_START_POSITION,
+                allow_unrelated_defer=False,
+            )
+        )
+        self.assertEqual(abandoned, [lease])
+
+    def test_shutdown_position_disables_unrelated_deferral(self):
+        serial_port = object()
+        reference = PrimaryHomeReference(
+            (True, True),
+            (163.8, -38.2),
+        )
+        queued = []
+
+        def queue_position(target, *, allow_unrelated_defer=True):
+            queued.append((target, allow_unrelated_defer))
+            return True
+
+        namespace = {
+            "RUN": {"offlineMode": False, "ser": serial_port},
+            "MotionInputError": MotionInputError,
+            "_current_primary_home_reference": (
+                lambda active_port: (
+                    reference
+                    if active_port is serial_port
+                    else None
+                )
+            ),
+            "primary_shutdown_position": primary_shutdown_position,
+            "_queue_primary_joint_position": queue_position,
+            "almStatusLab": SimpleNamespace(config=lambda **values: None),
+            "almStatusLab2": SimpleNamespace(config=lambda **values: None),
+            "logger": SimpleNamespace(error=lambda message: None),
+        }
+        move_to_shutdown = self.compile_function(
+            "MoveToShutdownPosition",
+            namespace,
+        )
+
+        self.assertTrue(move_to_shutdown())
+        self.assertEqual(
+            queued,
+            [
+                (
+                    (163.8, -38.2, 0.0, 0.0, 45.0, 0.0),
+                    False,
+                )
+            ],
+        )
+
+    def test_shutdown_position_rejects_offline_before_target_dispatch(self):
+        messages = []
+        queued = []
+        namespace = {
+            "RUN": {"offlineMode": True, "ser": object()},
+            "MotionInputError": MotionInputError,
+            "_current_primary_home_reference": (
+                lambda serial_port: (_ for _ in ()).throw(
+                    AssertionError("offline shutdown must not read a controller")
+                )
+            ),
+            "primary_shutdown_position": primary_shutdown_position,
+            "_queue_primary_joint_position": queued.append,
+            "almStatusLab": SimpleNamespace(
+                config=lambda **values: messages.append(values)
+            ),
+            "almStatusLab2": SimpleNamespace(config=lambda **values: None),
+            "logger": SimpleNamespace(error=lambda message: None),
+        }
+        move_to_shutdown = self.compile_function(
+            "MoveToShutdownPosition",
+            namespace,
+        )
+
+        self.assertFalse(move_to_shutdown())
+        self.assertEqual(queued, [])
+        self.assertEqual(
+            messages,
+            [{
+                "text": (
+                    "Shutdown position rejected: shutdown position "
+                    "requires online controller mode"
+                ),
+                "style": "Alarm.TLabel",
+            }],
         )
 
     def test_joint_motion_estimate_is_toggleable_and_wired_to_tk_polling(self):
@@ -13148,6 +14169,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         for function_name in (
             "_queue_joint_motion",
+            "_queue_primary_joint_position",
             "_try_dispatch_deferred_joint_adjustments",
         ):
             target_calls = [
@@ -15166,7 +16188,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         directory_start = firmware_source.index("bool printDirectory(")
         directory_end = firmware_source.index(
-            "\nvoid driveLimit(",
+            "\nbool driveLimit(",
             directory_start,
         )
         directory_source = firmware_source[directory_start:directory_end]
@@ -18105,7 +19127,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertNotIn("fall back to unfiltered best", solver)
 
         self.assertIn(
-            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.2";',
+            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.3";',
             firmware,
         )
         self.assertIn('"JT_WRIST_CONFIG_V1"', firmware)
@@ -23963,12 +24985,14 @@ class HmiSourceContractTests(unittest.TestCase):
                 visual_options,
                 auxiliary_serial,
                 controller_identity,
+                home_reference=None,
                 auxiliary_error=None,
             ):
                 self.position = position
                 self.visual_options = visual_options
                 self.auxiliary_serial = auxiliary_serial
                 self.controller_identity = controller_identity
+                self.home_reference = home_reference
                 self.auxiliary_error = auxiliary_error
 
         request = Request()
@@ -24056,6 +25080,63 @@ class HmiSourceContractTests(unittest.TestCase):
         }
         self.assertEqual(referenced_names & forbidden_names, set())
 
+    def test_startup_queries_advertised_controller_home_reference(self):
+        class Request:
+            auxiliary_port = None
+            auxiliary_board = None
+            update_parameters_command = "UPA1\n"
+            external_axis_command = "CEA1\n"
+            position_command = "SPA1\n"
+
+        class Result:
+            def __init__(self, **values):
+                self.__dict__.update(values)
+
+        identity_payload = json.loads(VALID_CONTROLLER_IDENTITY_RESPONSE)
+        identity_payload["ProtocolCapabilities"].append(
+            CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
+        )
+        identity_response = json.dumps(
+            identity_payload,
+            separators=(",", ":"),
+        )
+        raw_position = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
+        exchanges = []
+
+        def exchange(command, cancel_event, expected_response=None):
+            exchanges.append(command)
+            if command == "HO\n":
+                return identity_response
+            if command == "HR\n":
+                return "A0B0C0D0"
+            if command == "RP\n":
+                return raw_position
+            return expected_response.decode("ascii").strip()
+
+        namespace = {
+            "ControllerStartupRequest": Request,
+            "ControllerStartupResult": Result,
+            "MotionInputError": MotionInputError,
+            "ProtocolResponseError": ProtocolResponseError,
+            "_startup_exchange_response": exchange,
+            "_startup_visual_options": lambda: (),
+            "_clear_unavailable_startup_auxiliary": lambda: True,
+            "_request_startup_auxiliary_cleanup": lambda serial_port: True,
+            "parse_position_response": parse_position_response,
+        }
+        startup = self.compile_function("startup", namespace)
+
+        result = startup(Request(), threading.Event())
+
+        self.assertEqual(
+            result.home_reference,
+            PrimaryHomeReference((False, False), (0.0, 0.0)),
+        )
+        self.assertEqual(
+            exchanges,
+            ["HO\n", "UPA1\n", "CEA1\n", "SPA1\n", "HR\n", "RP\n"],
+        )
+
     def test_main_startup_proceeds_without_an_auxiliary_controller(self):
         request_namespace = {
             "dataclass": dataclass,
@@ -24108,12 +25189,14 @@ class HmiSourceContractTests(unittest.TestCase):
                 visual_options,
                 auxiliary_serial,
                 controller_identity,
+                home_reference=None,
                 auxiliary_error=None,
             ):
                 self.position = position
                 self.visual_options = visual_options
                 self.auxiliary_serial = auxiliary_serial
                 self.controller_identity = controller_identity
+                self.home_reference = home_reference
                 self.auxiliary_error = auxiliary_error
 
         raw_position = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
@@ -24212,12 +25295,14 @@ class HmiSourceContractTests(unittest.TestCase):
                 visual_options,
                 auxiliary_serial,
                 controller_identity,
+                home_reference=None,
                 auxiliary_error=None,
             ):
                 self.position = position
                 self.visual_options = visual_options
                 self.auxiliary_serial = auxiliary_serial
                 self.controller_identity = controller_identity
+                self.home_reference = home_reference
                 self.auxiliary_error = auxiliary_error
 
         raw_position = "A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9"
@@ -24398,6 +25483,10 @@ class HmiSourceContractTests(unittest.TestCase):
                 "Optional": Optional,
                 "ControllerIdentity": ControllerIdentity,
                 "PositionResponse": PositionResponse,
+                "PrimaryHomeReference": PrimaryHomeReference,
+                "CONTROLLER_CAPABILITY_HOME_REFERENCE_V1": (
+                    "HOME_REFERENCE_V1"
+                ),
                 "ProtocolResponseError": ProtocolResponseError,
                 "os": os,
             },
@@ -24408,13 +25497,26 @@ class HmiSourceContractTests(unittest.TestCase):
         controller_identity = parse_controller_identity_response(
             VALID_CONTROLLER_IDENTITY_RESPONSE
         )
+        capability_identity = ControllerIdentity(
+            controller_hardware_id=controller_identity.controller_hardware_id,
+            driver_model=controller_identity.driver_model,
+            firmware_version="6.7.1-ar4hmi.3",
+            robot_model=controller_identity.robot_model,
+            robot_version=controller_identity.robot_version,
+            serial_number=controller_identity.serial_number,
+            asset_tag=controller_identity.asset_tag,
+            protocol_capabilities=(
+                controller_identity.protocol_capabilities
+                + (CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,)
+            ),
+        )
 
         result = result_type(
             position,
             (),
             None,
             controller_identity,
-            "  auxiliary offline  ",
+            auxiliary_error="  auxiliary offline  ",
         )
 
         self.assertEqual(result.auxiliary_error, "auxiliary offline")
@@ -24427,8 +25529,51 @@ class HmiSourceContractTests(unittest.TestCase):
                 (),
                 object(),
                 controller_identity,
-                "auxiliary offline",
+                auxiliary_error="auxiliary offline",
             )
+        with self.assertRaisesRegex(
+            ProtocolResponseError,
+            "home-reference capability is inconsistent",
+        ):
+            result_type(
+                position,
+                (),
+                None,
+                capability_identity,
+            )
+        with self.assertRaisesRegex(
+            ProtocolResponseError,
+            "home-reference capability is inconsistent",
+        ):
+            result_type(
+                position,
+                (),
+                None,
+                controller_identity,
+                PrimaryHomeReference((False, False), (0.0, 0.0)),
+            )
+        with self.assertRaisesRegex(
+            ProtocolResponseError,
+            "home reference has an invalid type",
+        ):
+            result_type(
+                position,
+                (),
+                None,
+                controller_identity,
+                "invalid",
+            )
+        capability_result = result_type(
+            position,
+            (),
+            None,
+            capability_identity,
+            PrimaryHomeReference((False, False), (0.0, 0.0)),
+        )
+        self.assertEqual(
+            capability_result.home_reference,
+            PrimaryHomeReference((False, False), (0.0, 0.0)),
+        )
 
     def test_startup_exchange_consumes_exact_and_line_firmware_responses(self):
         class SerialPort:

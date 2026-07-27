@@ -66,11 +66,12 @@
 // 6.6 - 2/22/26 - update kinematic solver to reduce J4/6 wrap | reimplement wrist N/F config
 // 6.7 - 3/11/26 MB holding reg bug fix
 // 6.7.1 - 3/11/26 bug fix calibration debounce
-const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.2";
+const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.3";
 const char *JT_WRIST_CONFIG_CAPABILITY = "JT_WRIST_CONFIG_V1";
 const char *GCODE_DIRECTORY_CAPABILITY = "GCODE_DIRECTORY_FRAMING_V1";
 const char *GCODE_DELETE_IDENTITY_CAPABILITY = "GCODE_DELETE_IDENTITY_V1";
 const char *GCODE_WRITE_IDENTITY_CAPABILITY = "GCODE_WRITE_IDENTITY_V1";
+const char *HOME_REFERENCE_CAPABILITY = "HOME_REFERENCE_V1";
 
 //////////////////////////////////////////////////////////////////////////////
 //DEBUGGING
@@ -92,6 +93,7 @@ const char *GCODE_WRITE_IDENTITY_CAPABILITY = "GCODE_WRITE_IDENTITY_V1";
 #include "controller_domain_contract.h"
 #include "cartesian_pose_contract.h"
 #include "debug_contract.h"
+#include "home_reference_contract.h"
 #include "identity_contract.h"
 #include "motion_command_parse_contract.h"
 #include "motion_mode_transaction.h"
@@ -106,6 +108,7 @@ const char *const PROTOCOL_CAPABILITIES[] = {
   GCODE_DIRECTORY_CAPABILITY,
   GCODE_DELETE_IDENTITY_CAPABILITY,
   GCODE_WRITE_IDENTITY_CAPABILITY,
+  HOME_REFERENCE_CAPABILITY,
 };
 constexpr size_t PROTOCOL_CAPABILITY_COUNT =
   sizeof(PROTOCOL_CAPABILITIES) / sizeof(PROTOCOL_CAPABILITIES[0]);
@@ -305,6 +308,10 @@ float J6calBaseOff = .5;
 float J7calBaseOff = 0;
 float J8calBaseOff = 0;
 float J9calBaseOff = 0;
+ar4_protocol::PrimaryHomeReferenceState primaryHomeReference = {
+  { false, false },
+  { 0, 0 },
+};
 
 //reset collision indicators
 int J1collisionTrue = 0;
@@ -340,6 +347,8 @@ unsigned long J4DebounceTime = 0;
 unsigned long J5DebounceTime = 0;
 unsigned long J6DebounceTime = 0;
 unsigned long debounceDelay = 50;
+constexpr float CALIBRATION_RELEASE_MAXIMUM_TRAVEL_UNITS = 10.0f;
+constexpr unsigned long CALIBRATION_RELEASE_STABLE_MICROSECONDS = 3000UL;
 
 String Alarm = "0";
 String speedViolation = "0";
@@ -1082,6 +1091,21 @@ void handle_hello_command() {
       asset_tag.c_str(),
       PROTOCOL_CAPABILITIES,
       PROTOCOL_CAPABILITY_COUNT,
+      response,
+      sizeof(response)
+  )) {
+    Serial.println("ER");
+    return;
+  }
+  Serial.println(response);
+}
+
+void handle_home_reference_command() {
+  char response[
+    ar4_protocol::kPrimaryHomeReferenceResponseCapacity
+  ] = { 0 };
+  if (!ar4_protocol::build_primary_home_reference_response(
+      primaryHomeReference,
       response,
       sizeof(response)
   )) {
@@ -2216,7 +2240,11 @@ bool printDirectory(FsFile &dir, const char *media_id) {
 //DRIVE LIMIT
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void driveLimit(const int steps[], float SpeedVal) {
+bool driveLimit(
+  const int steps[],
+  const int requested[],
+  float SpeedVal
+) {
 
   const unsigned long DEBOUNCE_US = 3000;  // 3 ms
   unsigned long firstHighUs[numJoints] = { 0 };
@@ -2236,6 +2264,7 @@ void driveLimit(const int steps[], float SpeedVal) {
 
   int stepsDone[numJoints] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
   int complete[numJoints] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+  int limitConfirmed[numJoints] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
   // Once the sensor is first seen, stop that axis immediately.
   // Debounce confirms the sensor while the axis is stationary.
@@ -2253,8 +2282,9 @@ void driveLimit(const int steps[], float SpeedVal) {
   }
 
   for (int i = 0; i < numJoints; i++) {
-    // Set complete if joint was not sent a limit value
-    if (steps[i] == 0) {
+    if (requested[i] != 0 && requested[i] != 1) return false;
+    // Unrequested joints must not participate in completion or switch checks.
+    if (requested[i] == 0) {
       complete[i] = 1;
     }
   }
@@ -2282,6 +2312,7 @@ void driveLimit(const int steps[], float SpeedVal) {
 
         if ((micros() - firstHighUs[i]) >= DEBOUNCE_US) {
           complete[i] = 1;
+          limitConfirmed[i] = 1;
         }
 
       } else {
@@ -2299,7 +2330,11 @@ void driveLimit(const int steps[], float SpeedVal) {
 
         delayMicroseconds(calcStepGap);
 
-      } else if (stepsDone[i] >= steps[i] && complete[i] == 0) {
+      } else if (
+        stepsDone[i] >= steps[i]
+        && complete[i] == 0
+        && limitSeen[i] == 0
+      ) {
         // Steps exceeded, sensor never triggered
         complete[i] = 1;
       }
@@ -2321,15 +2356,30 @@ void driveLimit(const int steps[], float SpeedVal) {
 
     delayMicroseconds(100);
   }
+
+  if (estopActive) return false;
+  for (int i = 0; i < numJoints; ++i) {
+    if (requested[i] == 1 && limitConfirmed[i] == 0) return false;
+  }
+  return true;
 }
 
 
-void backOff(uint8_t J1req, uint8_t J2req, uint8_t J3req, uint8_t J4req, uint8_t J5req,
+bool backOff(uint8_t J1req, uint8_t J2req, uint8_t J3req, uint8_t J4req, uint8_t J5req,
              uint8_t J6req, uint8_t J7req, uint8_t J8req, uint8_t J9req,
              float SpeedVal,
-             int backoffSteps) {
+             float maximumBackoffTravel) {
 
+  if (
+    !isfinite(SpeedVal)
+    || !isfinite(minSpeedDelay)
+    || SpeedVal <= 0.0f
+    || minSpeedDelay <= 0.0f
+  ) {
+    return false;
+  }
   int calcStepGap = minSpeedDelay / (SpeedVal / 100);
+  if (calcStepGap <= 0) return false;
 
   // SET DIRECTIONS
   digitalWrite(J1dirPin, (J1CalDir == J1MotDir) ? LOW : HIGH);
@@ -2353,24 +2403,78 @@ void backOff(uint8_t J1req, uint8_t J2req, uint8_t J3req, uint8_t J4req, uint8_t
   digitalWrite(J8stepPin, LOW);
   digitalWrite(J9stepPin, LOW);
 
-  auto pulseStep = [](uint8_t pin) {
+  const uint8_t requested[numJoints] = {
+    J1req, J2req, J3req, J4req, J5req,
+    J6req, J7req, J8req, J9req,
+  };
+  const int calPins[numJoints] = {
+    J1calPin, J2calPin, J3calPin, J4calPin, J5calPin,
+    J6calPin, J7calPin, J8calPin, J9calPin,
+  };
+  const int stepPins[numJoints] = {
+    J1stepPin, J2stepPin, J3stepPin, J4stepPin, J5stepPin,
+    J6stepPin, J7stepPin, J8stepPin, J9stepPin,
+  };
+  const float stepsPerUnit[numJoints] = {
+    J1StepDeg, J2StepDeg, J3StepDeg, J4StepDeg, J5StepDeg,
+    J6StepDeg, J7StepDeg, J8StepDeg, J9StepDeg,
+  };
+  const int configuredStepLimits[numJoints] = {
+    J1StepLim, J2StepLim, J3StepLim, J4StepLim, J5StepLim,
+    J6StepLim, J7StepLim, J8StepLim, J9StepLim,
+  };
+  int maximumSteps[numJoints] = { 0 };
+  int completedSteps[numJoints] = { 0 };
+  bool releaseCandidate[numJoints] = { false };
+  bool releaseConfirmed[numJoints] = { false };
+  unsigned long releaseStarted[numJoints] = { 0 };
+
+  for (int axis = 0; axis < numJoints; ++axis) {
+    if (requested[axis] == 0) {
+      releaseConfirmed[axis] = true;
+      continue;
+    }
+    if (!ar4_protocol::calibration_release_step_limit(
+        stepsPerUnit[axis],
+        maximumBackoffTravel,
+        configuredStepLimits[axis],
+        maximumSteps[axis]
+    )) {
+      return false;
+    }
+  }
+
+  auto pulseStep = [](int pin) {
     digitalWrite(pin, HIGH);
     delayMicroseconds(5);
     digitalWrite(pin, LOW);
   };
 
-  for (int step = 0; step < backoffSteps && estopActive == false; step++) {
-
-    if (J1req == 1) pulseStep(J1stepPin);
-    if (J2req == 1) pulseStep(J2stepPin);
-    if (J3req == 1) pulseStep(J3stepPin);
-    if (J4req == 1) pulseStep(J4stepPin);
-    if (J5req == 1) pulseStep(J5stepPin);
-    if (J6req == 1) pulseStep(J6stepPin);
-    if (J7req == 1) pulseStep(J7stepPin);
-    if (J8req == 1) pulseStep(J8stepPin);
-    if (J9req == 1) pulseStep(J9stepPin);
-
+  while (true) {
+    if (estopActive) return false;
+    bool allReleased = true;
+    const unsigned long now = micros();
+    for (int axis = 0; axis < numJoints; ++axis) {
+      if (releaseConfirmed[axis]) continue;
+      allReleased = false;
+      if (digitalRead(calPins[axis]) == LOW) {
+        if (!releaseCandidate[axis]) {
+          releaseCandidate[axis] = true;
+          releaseStarted[axis] = now;
+        } else if (
+          (now - releaseStarted[axis])
+          >= CALIBRATION_RELEASE_STABLE_MICROSECONDS
+        ) {
+          releaseConfirmed[axis] = true;
+        }
+        continue;
+      }
+      releaseCandidate[axis] = false;
+      if (completedSteps[axis] >= maximumSteps[axis]) return false;
+      pulseStep(stepPins[axis]);
+      ++completedSteps[axis];
+    }
+    if (allReleased) return true;
     delayMicroseconds(calcStepGap);
   }
 }
@@ -3624,6 +3728,10 @@ void loop() {
       handle_hello_command();
     }
 
+    if (function == "HR") {
+      handle_home_reference_command();
+    }
+
     if (function == "RB") {
       Serial.println("System Restarting");
       reboot();
@@ -4434,6 +4542,9 @@ void loop() {
         consume_current_command();
         return;
       }
+      ar4_protocol::invalidate_primary_home_reference(
+        primaryHomeReference
+      );
       Serial.print("Done");
     }
 
@@ -4824,6 +4935,9 @@ void loop() {
       J7StepM = stagedStepMonitors[6];
       J8StepM = stagedStepMonitors[7];
       J9StepM = stagedStepMonitors[8];
+      ar4_protocol::invalidate_primary_home_reference(
+        primaryHomeReference
+      );
       delay(5);
       Serial.println("Done");
     }
@@ -4939,6 +5053,18 @@ void loop() {
         consume_current_command();
         return;
       }
+      bool hasRequestedAxis = false;
+      for (int axis = 0; axis < 9; ++axis) {
+        if (requested[axis] == 1) {
+          hasRequestedAxis = true;
+          break;
+        }
+      }
+      if (!hasRequestedAxis) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
       int J1req = requested[0];
       int J2req = requested[1];
       int J3req = requested[2];
@@ -5000,9 +5126,15 @@ void loop() {
         J4calBaseOff, J5calBaseOff, J6calBaseOff,
         J7calBaseOff, J8calBaseOff, J9calBaseOff,
       };
+      const int zeroSteps[9] = {
+        J1zeroStep, J2zeroStep, J3zeroStep,
+        J4zeroStep, J5zeroStep, J6zeroStep,
+        J7zeroStep, J8zeroStep, J9zeroStep,
+      };
       int stagedMasterSteps[9];
       int stagedCenterSteps[9];
       int stagedJointFiveSteps[9];
+      int32_t stagedPrimaryHomeReference[2] = { 0, 0 };
       for (int axis = 0; axis < 9; ++axis) {
         if (!ar4_protocol::calibration_reference_steps(
             Jreq[axis],
@@ -5022,6 +5154,21 @@ void loop() {
           consume_current_command();
           return;
         }
+        if (
+          axis < 2
+          && Jreq[axis] == 1
+          && !ar4_protocol::primary_home_reference_millidegrees(
+            (
+              static_cast<float>(stagedMasterSteps[axis])
+              - static_cast<float>(zeroSteps[axis])
+            ) / stepsPerUnit[axis],
+            stagedPrimaryHomeReference[axis]
+          )
+        ) {
+          Serial.println("ER");
+          consume_current_command();
+          return;
+        }
       }
 
       for (int i = 0; i < 9; i++) {
@@ -5029,20 +5176,42 @@ void loop() {
           JStep[i] = JStepLim[i];
         }
       }
+      for (size_t axis = 0; axis < 2; ++axis) {
+        if (Jreq[axis] == 1) {
+          ar4_protocol::invalidate_primary_home_reference_axis(
+            primaryHomeReference,
+            axis
+          );
+        }
+      }
 
       //DRIVE TO LIMITS FAST
       SpeedIn = 25;
-      driveLimit(JStep, SpeedIn);
+      if (!driveLimit(JStep, Jreq, SpeedIn)) {
+        if (!estopActive) Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
       //Backoff 
-      backOff(J1req, J2req, J3req, J4req, J5req,
-        J6req, J7req, J8req, J9req,
-        5,      // speed
-        700);   // steps
+      if (!backOff(
+          J1req, J2req, J3req, J4req, J5req,
+          J6req, J7req, J8req, J9req,
+          5,
+          CALIBRATION_RELEASE_MAXIMUM_TRAVEL_UNITS
+      )) {
+        if (!estopActive) Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
       //DRIVE TO LIMITS MED
       SpeedIn = 2;
-      driveLimit(JStep, SpeedIn);
+      if (!driveLimit(JStep, Jreq, SpeedIn)) {
+        if (!estopActive) Serial.println("ER");
+        consume_current_command();
+        return;
+      }
 
 
 
@@ -5131,9 +5300,22 @@ void loop() {
       float ACCramp = 50;
 
       if (!driveMotorsJ(J1stepCen, J2stepCen, J3stepCen, J4stepCen, J5step45, J6stepCen, J7stepCen, J8stepCen, J9stepCen, J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, nullptr)) {
-        Serial.println("ER");
+        if (!estopActive) Serial.println("ER");
         consume_current_command();
         return;
+      }
+      if (estopActive) {
+        consume_current_command();
+        return;
+      }
+      for (size_t axis = 0; axis < 2; ++axis) {
+        if (Jreq[axis] == 1) {
+          ar4_protocol::set_primary_home_reference(
+            primaryHomeReference,
+            axis,
+            stagedPrimaryHomeReference[axis]
+          );
+        }
       }
       sendRobotPos();
       inData = "";  // Clear recieved buffer

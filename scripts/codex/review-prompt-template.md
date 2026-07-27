@@ -60,9 +60,10 @@ success.
   tracked source. The supported packaged Windows native extension targets CPython
   3.12 x64. Python package requirements remain unpinned, so framework versions
   are unverified. Host source identifies version 6.7; active Teensy firmware
-  identifies version `6.7.1-ar4hmi.2` and advertises
+  identifies version `6.7.1-ar4hmi.3` and advertises
   `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`,
-  `GCODE_DELETE_IDENTITY_V1`, and `GCODE_WRITE_IDENTITY_V1`.
+  `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, and
+  `HOME_REFERENCE_V1`.
 - **Boundary direction**: `AR4.py` calls `ARrobots` Python modules and the
   `robot_kinematics` native extension. `ARrobots/src/bindings.cpp` exposes
   `ARrobots/src/kinematics.cpp`. Host serial commands are consumed by Teensy,
@@ -308,6 +309,20 @@ The output structure is:
 2. A blank line.
 3. The verdict line: `VERDICT: CLEAN`, `VERDICT: NON-BLOCKING`, or `VERDICT: BLOCKED`.
 4. If any findings exist, the per-severity entries in severity order (BLOCKER first, then QUALITY, then NOTE).
+
+Copy this complete category skeleton into every verdict and replace each
+`none` with a decimal count only when that category has findings:
+
+```
+PLAN-DRIFT: none
+SILENT-FAILURE: none
+TOMBSTONE-OR-SHIM: none
+CROSS-CRATE-CONTRACT: none
+LOADER-OR-ASSET-EDGE: none
+CONVENTION-ADHERENCE: none
+TEST-QUALITY: none
+DOC-VS-CODE-DRIFT: none
+```
 
 Per-severity entry format:
 

@@ -1,5 +1,5 @@
 # AR4 Control Software
-**Host source 6.7 — tracked Teensy derivative 6.7.1-ar4hmi.2**
+**Host source 6.7 — tracked Teensy derivative 6.7.1-ar4hmi.3**
 
 ![AR4 Logo](AR.png)
 
@@ -58,7 +58,8 @@ python AR4.py
 ```
 
 ## 🧠 Troubleshooting
-- **Serial connection issues** → Verify the correct COM port and a Teensy 4.1 firmware build identifying version `6.7.1-ar4hmi.2` and advertising `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, and `GCODE_WRITE_IDENTITY_V1`.
+- **Serial connection issues** → Verify the correct COM port and a Teensy 4.1 firmware build identifying version `6.7.1-ar4hmi.3` and advertising `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, and `GCODE_WRITE_IDENTITY_V1`.
+- **Shutdown Position unavailable** → `HOME_REFERENCE_V1` is optional for connection but required for the parking action; complete J1 and J2 homing after controller startup or parameter and forced-position updates.
 - **Display lag in visualization** → Disable real-time rendering under *Settings → Viewer Options*.
 
 ---

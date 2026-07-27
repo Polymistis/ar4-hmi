@@ -182,6 +182,7 @@ from ARrobots.HMI.joint_motion import (
   CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
   CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
   CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+  CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
   CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
   CONTROLLER_HARDWARE_ID_LENGTH,
   CONTROLLER_MEDIA_ID_LENGTH,
@@ -204,6 +205,7 @@ from ARrobots.HMI.joint_motion import (
   MotionTransportBusy,
   PRIMARY_START_POSITION,
   PositionResponse,
+  PrimaryHomeReference,
   ProtocolResponseError,
   SerialTransportQuarantinedError,
   SerialTransportTimeout,
@@ -232,6 +234,7 @@ from ARrobots.HMI.joint_motion import (
   parse_controller_modbus_response,
   parse_motion_wrist_config,
   parse_position_response,
+  parse_primary_home_reference_response,
   parse_virtual_command_timing,
   primary_shutdown_position,
   quarantine_serial_transport,
@@ -553,18 +556,23 @@ class CalibrationCancellationBoundary:
 
 
 class CalibrationWriteCommitment:
-  def __init__(self, shared_event):
+  def __init__(self, shared_event, on_commit=None):
     if not all(
       callable(getattr(shared_event, method_name, None))
       for method_name in ("set", "clear", "is_set")
     ):
       raise TypeError("calibration commitment event contract is invalid")
+    if on_commit is not None and not callable(on_commit):
+      raise TypeError("calibration commitment callback must be callable")
     self._shared_event = shared_event
     self._local_event = threading.Event()
+    self._on_commit = on_commit
 
   def set(self):
     self._shared_event.set()
     self._local_event.set()
+    if self._on_commit is not None:
+      self._on_commit()
 
   def is_set(self):
     committed = self._local_event.is_set()
@@ -778,6 +786,7 @@ class ManualAuxiliaryResult:
 class MainControllerIdentityBinding:
   serial_port: object
   identity: ControllerIdentity
+  home_reference: Optional[PrimaryHomeReference] = None
 
   def __post_init__(self):
     if self.serial_port is None or not getattr(self.serial_port, "is_open", False):
@@ -786,6 +795,21 @@ class MainControllerIdentityBinding:
       )
     if not isinstance(self.identity, ControllerIdentity):
       raise MotionInputError("main controller identity binding is invalid")
+    if (
+      self.home_reference is not None
+      and not isinstance(self.home_reference, PrimaryHomeReference)
+    ):
+      raise MotionInputError(
+        "main controller home-reference binding is invalid"
+      )
+    supports_home_reference = (
+      CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
+      in self.identity.protocol_capabilities
+    )
+    if supports_home_reference != (self.home_reference is not None):
+      raise MotionInputError(
+        "main controller home-reference capability is inconsistent"
+      )
     validate_controller_hardware_id(
       self.identity.controller_hardware_id
     )
@@ -2452,11 +2476,19 @@ def _request_manual_output(row, on_state, entry):
   )
 
 
-def _bind_main_controller_identity(serial_port, identity):
+def _bind_main_controller_identity(
+  serial_port,
+  identity,
+  home_reference=None,
+):
   global main_controller_identity_binding
   global gcode_storage_media_binding
 
-  binding = MainControllerIdentityBinding(serial_port, identity)
+  binding = MainControllerIdentityBinding(
+    serial_port,
+    identity,
+    home_reference,
+  )
   if RUN.get('ser') is not serial_port:
     raise ConnectionError(
       "main controller changed before identity binding"
@@ -2465,6 +2497,34 @@ def _bind_main_controller_identity(serial_port, identity):
     main_controller_identity_binding = binding
     gcode_storage_media_binding = None
   return binding
+
+
+def _bind_main_controller_home_reference(serial_port, home_reference):
+  global main_controller_identity_binding
+
+  if not isinstance(home_reference, PrimaryHomeReference):
+    raise MotionInputError(
+      "main controller home-reference update is invalid"
+    )
+  with gcode_storage_state_lock:
+    binding = main_controller_identity_binding
+    if (
+      not isinstance(binding, MainControllerIdentityBinding)
+      or binding.serial_port is not serial_port
+      or RUN.get('ser') is not serial_port
+      or not getattr(serial_port, "is_open", False)
+      or CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
+        not in binding.identity.protocol_capabilities
+    ):
+      raise ConnectionError(
+        "main controller changed before home-reference binding"
+      )
+    main_controller_identity_binding = MainControllerIdentityBinding(
+      serial_port,
+      binding.identity,
+      home_reference,
+    )
+    return main_controller_identity_binding
 
 
 def _clear_main_controller_identity(serial_port=None):
@@ -2514,6 +2574,59 @@ def _current_main_controller_identity(serial_port=None):
   ):
     return None
   return binding
+
+
+def _current_primary_home_reference(serial_port=None):
+  binding = _current_main_controller_identity(serial_port)
+  if binding is None:
+    return None
+  return binding.home_reference
+
+
+def _invalidate_bound_primary_home_reference(serial_port):
+  global main_controller_identity_binding
+
+  with gcode_storage_state_lock:
+    binding = main_controller_identity_binding
+    if not isinstance(binding, MainControllerIdentityBinding):
+      reason = "no main-controller identity is bound"
+    elif binding.serial_port is not serial_port:
+      reason = "the bound controller changed"
+    elif RUN.get('ser') is not serial_port:
+      reason = "the active controller changed"
+    elif not getattr(serial_port, "is_open", False):
+      reason = "the controller connection is closed"
+    elif (
+      CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
+      not in binding.identity.protocol_capabilities
+    ):
+      if binding.home_reference is None:
+        return True
+      reason = (
+        "a controller without home-reference capability retained a reference"
+      )
+    else:
+      reason = None
+    if reason is not None:
+      logger.warning(
+        "Primary home-reference invalidation skipped: %s",
+        reason,
+      )
+      return False
+    try:
+      replacement = MainControllerIdentityBinding(
+        serial_port,
+        binding.identity,
+        PrimaryHomeReference((False, False), (0.0, 0.0)),
+      )
+    except ConnectionError as exc:
+      logger.warning(
+        "Primary home-reference invalidation lost the controller: %s",
+        exc,
+      )
+      return False
+    main_controller_identity_binding = replacement
+    return True
 
 
 def _bind_gcode_storage_media(
@@ -5629,6 +5742,7 @@ class ControllerStartupResult:
     visual_options: tuple
     auxiliary_serial: object
     controller_identity: ControllerIdentity
+    home_reference: Optional[PrimaryHomeReference] = None
     auxiliary_error: Optional[str] = None
 
     def __post_init__(self):
@@ -5639,6 +5753,21 @@ class ControllerStartupResult:
         if not isinstance(self.controller_identity, ControllerIdentity):
             raise ProtocolResponseError(
                 "controller startup identity has an invalid type"
+            )
+        supports_home_reference = (
+            CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
+            in self.controller_identity.protocol_capabilities
+        )
+        if (
+            self.home_reference is not None
+            and not isinstance(self.home_reference, PrimaryHomeReference)
+        ):
+            raise ProtocolResponseError(
+                "controller startup home reference has an invalid type"
+            )
+        if supports_home_reference != (self.home_reference is not None):
+            raise ProtocolResponseError(
+                "controller startup home-reference capability is inconsistent"
             )
         if isinstance(self.visual_options, (str, bytes)):
             raise ProtocolResponseError("visual options must be a sequence")
@@ -6214,6 +6343,14 @@ def startup(startup_request, cancel_event=None):
       cancel_event,
       expected_response=b"Done\n",
     )
+    home_reference = None
+    if (
+      CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
+      in controller_identity.protocol_capabilities
+    ):
+      home_reference = parse_primary_home_reference_response(
+        _startup_exchange_response("HR\n", cancel_event)
+      )
     position_text = _startup_exchange_response("RP\n", cancel_event)
     position = parse_position_response(position_text)
     if position.flag:
@@ -6225,6 +6362,7 @@ def startup(startup_request, cancel_event=None):
       visual_options=_startup_visual_options(),
       auxiliary_serial=auxiliary_serial,
       controller_identity=controller_identity,
+      home_reference=home_reference,
       auxiliary_error=auxiliary_error,
     )
   except BaseException:
@@ -6303,6 +6441,7 @@ def _apply_controller_startup_result(
     _bind_main_controller_identity(
       startup_serial,
       result.controller_identity,
+      result.home_reference,
     )
   except Exception:
     if calibration_applied:
@@ -15061,8 +15200,16 @@ def _queue_joint_target(axis, target):
   return _queue_joint_motion(axis, target, absolute=True)
 
 
-def _queue_primary_joint_position(primary_positions):
+def _queue_primary_joint_position(
+  primary_positions,
+  *,
+  allow_unrelated_defer=True,
+):
   try:
+    if not isinstance(allow_unrelated_defer, bool):
+      raise TypeError(
+        "named-position unrelated-defer state must be boolean"
+      )
     if application_closing.is_set():
       raise MotionQueueFault(
         "joint motion is unavailable during application shutdown"
@@ -15118,6 +15265,11 @@ def _queue_primary_joint_position(primary_positions):
         and not joint_motion_dispatcher.active
       )
     ):
+      if not allow_unrelated_defer:
+        raise MotionQueueFault(
+          "controller-reference position cannot be deferred during "
+          "another motion request"
+        )
       deferred = True
       coalesced = deferred_joint_adjustments.set_targets(
         target_updates,
@@ -15142,6 +15294,11 @@ def _queue_primary_joint_position(primary_positions):
       except MotionTransportBusy:
         if lease_created and not joint_motion_dispatcher.active:
           _abandon_joint_motion_request(request_lease)
+        if not allow_unrelated_defer:
+          raise MotionQueueFault(
+            "controller-reference position cannot be deferred during "
+            "another motion request"
+          )
         if (
           not legacy_serial_result_pending.is_set()
           and not motion_request_registry.active
@@ -15204,14 +15361,23 @@ def MoveToStartPosition():
 
 def MoveToShutdownPosition():
   try:
-    target = primary_shutdown_position(CAL)
+    if RUN.get('offlineMode') is True:
+      raise MotionInputError(
+        "shutdown position requires online controller mode"
+      )
+    target = primary_shutdown_position(
+      _current_primary_home_reference(RUN.get('ser'))
+    )
   except (KeyError, TypeError, ValueError, MotionInputError) as exc:
     message = f"Shutdown position rejected: {exc}"
     logger.error(message)
     almStatusLab.config(text=message, style="Alarm.TLabel")
     almStatusLab2.config(text=message, style="Alarm.TLabel")
     return False
-  return _queue_primary_joint_position(target)
+  return _queue_primary_joint_position(
+    target,
+    allow_unrelated_defer=False,
+  )
 
 
 PRIMARY_JOINT_COUNT = 6
@@ -18271,6 +18437,60 @@ def _calibration_available():
   return False
 
 
+def _query_primary_home_reference(serial_port):
+  binding = _current_main_controller_identity(serial_port)
+  if binding is None:
+    raise ConnectionError(
+      "home-reference query requires the bound controller"
+    )
+  if (
+    CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
+    not in binding.identity.protocol_capabilities
+  ):
+    return None
+  response = exchange_serial_line(
+    serial_port,
+    "HR\n",
+    SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+    write_lock=serial_write_lock,
+  )
+  try:
+    return parse_primary_home_reference_response(response)
+  except ProtocolResponseError as exc:
+    reason = f"controller home-reference response is invalid: {exc}"
+    raise ProtocolResponseError(reason) from exc
+
+
+def _apply_calibration_home_reference(
+  serial_port,
+  home_reference,
+  error,
+):
+  if home_reference is None and error is None:
+    return True
+  if home_reference is not None:
+    if error is not None:
+      raise RuntimeError(
+        "calibration home-reference result contains data and an error"
+      )
+    _bind_main_controller_home_reference(serial_port, home_reference)
+    return True
+  if (
+    not isinstance(error, str)
+    or not error.strip()
+    or error != error.strip()
+  ):
+    raise RuntimeError(
+      "calibration home-reference failure is invalid"
+    )
+  _invalidate_bound_primary_home_reference(serial_port)
+  reason = (
+    "calibration home-reference synchronization failed: "
+    + error
+  )
+  return _invalidate_uncertain_controller_calibration(reason)
+
+
 def _binary_controller_flag(value, field_name):
   number = finite_number(value, field_name)
   if number not in (0, 1):
@@ -18293,6 +18513,8 @@ def _prepare_calibration_command(selections):
     _binary_controller_flag(value, f"J{axis} calibration selection")
     for axis, value in enumerate(selections, start=1)
   )
+  if not any(normalized_selections):
+    raise MotionInputError("calibration requires at least one selected axis")
   offsets = tuple(
     finite_number(CAL[f'J{axis}calOff'], f"J{axis} calibration offset")
     for axis in range(1, 10)
@@ -18353,6 +18575,14 @@ def _record_calibration_response(
       else None
     )
     succeeded = applied_position is not None
+    if (
+      parsed_position is not None
+      and applied_position is None
+      and controller_write_started
+    ):
+      _invalidate_uncertain_controller_calibration(
+        "calibration command position could not be applied"
+      )
   if parsed_position is None and controller_write_started:
     _invalidate_uncertain_controller_calibration(
       position_validation_reason
@@ -18431,6 +18661,8 @@ class CalibrationWorkerResult:
   response: object
   error: object
   write_started: object
+  home_reference: object = None
+  home_reference_error: object = None
 
 
 CALIBRATION_POSITION_KEYS = (
@@ -18849,8 +19081,12 @@ def _run_calibration_stage_safe(
   command,
 ):
   write_commitment = CalibrationWriteCommitment(
-    calibration_serial_write_committed
+    calibration_serial_write_committed,
+    lambda: _invalidate_bound_primary_home_reference(serial_port),
   )
+  response = None
+  home_reference = None
+  home_reference_error = None
   try:
     with _require_calibration_terminal_response(
       write_commitment
@@ -18863,6 +19099,13 @@ def _run_calibration_stage_safe(
         write_boundary_lock=application_lifecycle_lock,
         write_started_event=write_commitment,
       )
+      try:
+        home_reference = _query_primary_home_reference(serial_port)
+      except Exception as exc:
+        home_reference_error = (
+          " ".join(str(exc).split())
+          or exc.__class__.__name__
+        )
     event = CalibrationWorkerResult(
       worker_token,
       request_id,
@@ -18871,6 +19114,8 @@ def _run_calibration_stage_safe(
       response,
       None,
       write_commitment.is_set(),
+      home_reference,
+      home_reference_error,
     )
   except Exception as exc:
     message = str(exc).strip() or "calibration exchange failed without details"
@@ -18882,6 +19127,8 @@ def _run_calibration_stage_safe(
       None,
       message,
       write_commitment.is_set(),
+      None,
+      None,
     )
   calibration_serial_event_queue.put(event)
 
@@ -19033,6 +19280,8 @@ def _claim_calibration_worker_result(event):
   response = event.response
   error = event.error
   write_started = event.write_started
+  home_reference = event.home_reference
+  home_reference_error = event.home_reference_error
   if event_type not in ("completed", "failed"):
     raise RuntimeError("calibration worker emitted an unknown event type")
   if (
@@ -19056,6 +19305,25 @@ def _claim_calibration_worker_result(event):
       or error is not None
     ):
       raise RuntimeError("calibration worker emitted an invalid success result")
+    if home_reference is not None and not isinstance(
+      home_reference,
+      PrimaryHomeReference,
+    ):
+      raise RuntimeError(
+        "calibration worker emitted an invalid home reference"
+      )
+    if home_reference_error is not None and (
+      not isinstance(home_reference_error, str)
+      or not home_reference_error.strip()
+      or home_reference_error != home_reference_error.strip()
+    ):
+      raise RuntimeError(
+        "calibration worker emitted an invalid home-reference error"
+      )
+    if home_reference is not None and home_reference_error is not None:
+      raise RuntimeError(
+        "calibration worker emitted home-reference data and an error"
+      )
   elif (
     response is not None
     or not isinstance(error, str)
@@ -19063,6 +19331,10 @@ def _claim_calibration_worker_result(event):
     or error != error.strip()
   ):
     raise RuntimeError("calibration worker emitted an invalid failure result")
+  elif home_reference is not None or home_reference_error is not None:
+    raise RuntimeError(
+      "failed calibration worker emitted a home-reference result"
+    )
 
   with calibration_operation_lock:
     operation = calibration_operation
@@ -19088,6 +19360,8 @@ def _claim_calibration_worker_result(event):
     response,
     error,
     write_started,
+    home_reference,
+    home_reference_error,
   )
 
 
@@ -19129,12 +19403,21 @@ def _apply_calibration_worker_result(event):
     response,
     error,
     write_started,
+    home_reference,
+    home_reference_error,
   ) = _claim_calibration_worker_result(event)
   try:
     cmdRecEntryField.delete(0, 'end')
     cmdRecEntryField.insert(0, response if event_type == "completed" else error)
     if event_type == "failed":
       logger.error("Calibration controller exchange failed: %s", error)
+    reference_synchronized = True
+    if home_reference is not None:
+      reference_synchronized = _apply_calibration_home_reference(
+        operation.serial_port,
+        home_reference,
+        None,
+      )
     succeeded = _record_calibration_response(
       response,
       stage.success_message,
@@ -19147,7 +19430,13 @@ def _apply_calibration_worker_result(event):
         else None
       ),
     )
-    if not succeeded:
+    if home_reference is None:
+      reference_synchronized = _apply_calibration_home_reference(
+        operation.serial_port,
+        None,
+        home_reference_error,
+      )
+    if not succeeded or not reference_synchronized:
       return _finish_calibration_operation(operation, False)
 
     with calibration_operation_lock:
@@ -19212,17 +19501,21 @@ def _execute_calibration_command(
   *,
   update_virtual=True,
 ):
+  serial_port = RUN.get('ser')
   try:
     pose_snapshot = _capture_calibration_pose_snapshot()
   except Exception:
     logger.exception("Unable to capture the pre-command calibration pose")
     return False
   write_commitment = CalibrationWriteCommitment(
-    calibration_serial_write_committed
+    calibration_serial_write_committed,
+    lambda: _invalidate_bound_primary_home_reference(serial_port),
   )
   calibration_serial_write_committed.clear()
   response = None
   uncertainty_reason = None
+  home_reference = None
+  home_reference_error = None
   try:
     try:
       with _require_calibration_terminal_response(
@@ -19231,13 +19524,22 @@ def _execute_calibration_command(
         cmdSentEntryField.delete(0, 'end')
         cmdSentEntryField.insert(0, command)
         response = exchange_serial_line_until_cancelled(
-          RUN.get('ser'),
+          serial_port,
           command,
           response_requirement,
           write_lock=serial_write_lock,
           write_boundary_lock=application_lifecycle_lock,
           write_started_event=write_commitment,
         )
+        try:
+          home_reference = _query_primary_home_reference(
+            serial_port
+          )
+        except Exception as exc:
+          home_reference_error = (
+            " ".join(str(exc).split())
+            or exc.__class__.__name__
+          )
     except Exception:
       if write_commitment.is_set():
         uncertainty_reason = (
@@ -19248,7 +19550,14 @@ def _execute_calibration_command(
     try:
       cmdRecEntryField.delete(0, 'end')
       cmdRecEntryField.insert(0, "" if response is None else response)
-      return _record_calibration_response(
+      reference_synchronized = True
+      if home_reference is not None:
+        reference_synchronized = _apply_calibration_home_reference(
+          serial_port,
+          home_reference,
+          None,
+        )
+      succeeded = _record_calibration_response(
         response,
         success_message,
         failure_message,
@@ -19256,6 +19565,13 @@ def _execute_calibration_command(
         controller_write_started=write_commitment.is_set(),
         uncertainty_reason=uncertainty_reason,
       )
+      if home_reference is None:
+        reference_synchronized = _apply_calibration_home_reference(
+          serial_port,
+          None,
+          home_reference_error,
+        )
+      return succeeded and reference_synchronized
     except Exception as exc:
       if write_commitment.is_set():
         _handle_calibration_result_application_failure(
@@ -19738,6 +20054,12 @@ def _exchange_controller_calibration_acknowledgement(
   command,
   write_started_event=None,
 ):
+  invalidates_home_reference = (
+    isinstance(command, str)
+    and command.startswith("UP")
+  )
+  if invalidates_home_reference and write_started_event is None:
+    write_started_event = threading.Event()
   serial_port = RUN.get('ser')
   try:
     write_serial_control(
@@ -19753,18 +20075,26 @@ def _exchange_controller_calibration_acknowledgement(
       SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
     ) == "Done"
   finally:
-    if (
-      RUN.get('ser') is serial_port
-      and not getattr(serial_port, "is_open", False)
-    ):
-      RUN['ser'] = None
-      _require_main_controller_identity_cleanup(
-        serial_port,
-        "controller calibration exchange cleanup",
-      )
+    try:
+      if (
+        invalidates_home_reference
+        and write_started_event.is_set()
+      ):
+        _invalidate_bound_primary_home_reference(serial_port)
+    finally:
+      if (
+        RUN.get('ser') is serial_port
+        and not getattr(serial_port, "is_open", False)
+      ):
+        RUN['ser'] = None
+        _require_main_controller_identity_cleanup(
+          serial_port,
+          "controller calibration exchange cleanup",
+        )
 
 
 def _transmit_update_parameters(command, write_started_event=None):
+  command = _validated_startup_command(command, "UP")
   return _exchange_controller_calibration_acknowledgement(
     command,
     write_started_event,
@@ -19959,6 +20289,7 @@ def _apply_external_axis_values(values):
 
 
 def _transmit_external_axis_parameters(command, write_started_event=None):
+  command = _validated_startup_command(command, "CE")
   return _exchange_controller_calibration_acknowledgement(
     command,
     write_started_event,
@@ -20202,15 +20533,19 @@ def _exchange_position_acknowledgement(command):
         )
     raise
   finally:
-    if (
-      RUN.get('ser') is serial_port
-      and not getattr(serial_port, "is_open", False)
-    ):
-      RUN['ser'] = None
-      _require_main_controller_identity_cleanup(
-        serial_port,
-        "controller position exchange cleanup",
-      )
+    try:
+      if write_started.is_set():
+        _invalidate_bound_primary_home_reference(serial_port)
+    finally:
+      if (
+        RUN.get('ser') is serial_port
+        and not getattr(serial_port, "is_open", False)
+      ):
+        RUN['ser'] = None
+        _require_main_controller_identity_cleanup(
+          serial_port,
+          "controller position exchange cleanup",
+        )
 
 
 @_synchronous_motion_request("Set controller position")

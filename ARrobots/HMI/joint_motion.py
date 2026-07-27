@@ -21,7 +21,6 @@ from typing import Callable, Optional, Tuple
 
 JOINT_COUNT = 9
 PRIMARY_START_POSITION = (0.0, 0.0, 0.0, 0.0, 45.0, 0.0)
-PRIMARY_CALIBRATION_BASE_OFFSETS = (-6.2, 3.8, 1.4, -0.8, 5.6, 0.5)
 MAX_COMMAND_LENGTH = 4096
 MAX_RESPONSE_PAYLOAD_LENGTH = 4096
 MAX_RESPONSE_FRAME_LENGTH = MAX_RESPONSE_PAYLOAD_LENGTH + 2
@@ -59,6 +58,7 @@ CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1 = (
     "GCODE_WRITE_IDENTITY_V1"
 )
 CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1 = "JT_WRIST_CONFIG_V1"
+CONTROLLER_CAPABILITY_HOME_REFERENCE_V1 = "HOME_REFERENCE_V1"
 CONTROLLER_DIRECTORY_SEPARATOR = ","
 MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES = MAX_RESPONSE_PAYLOAD_LENGTH
 MAX_CONTROLLER_IDENTITY_FIELD_LENGTH = 31
@@ -445,6 +445,44 @@ class ControllerIdentity:
     serial_number: str
     asset_tag: str
     protocol_capabilities: tuple
+
+
+@dataclass(frozen=True)
+class PrimaryHomeReference:
+    """Controller-reported switch coordinates for the primary parking axes."""
+
+    valid: Tuple[bool, bool]
+    positions: Tuple[float, float]
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.valid, tuple)
+            or len(self.valid) != 2
+            or any(not isinstance(value, bool) for value in self.valid)
+        ):
+            raise MotionInputError(
+                "primary home-reference validity must contain two booleans"
+            )
+        if (
+            not isinstance(self.positions, tuple)
+            or len(self.positions) != 2
+        ):
+            raise MotionInputError(
+                "primary home-reference positions must contain two values"
+            )
+        normalized_positions = tuple(
+            finite_number(value, f"J{axis} home-reference position")
+            for axis, value in enumerate(self.positions, start=1)
+        )
+        for axis, (valid, position) in enumerate(
+            zip(self.valid, normalized_positions),
+            start=1,
+        ):
+            if not valid and position != 0.0:
+                raise MotionInputError(
+                    f"invalid J{axis} home reference must use a zero position"
+                )
+        object.__setattr__(self, "positions", normalized_positions)
 
 
 def validate_controller_hardware_id(value):
@@ -2407,49 +2445,24 @@ def controller_protocol_decimal(value, field_name):
     return format(encoded, ".46f").rstrip("0").rstrip(".")
 
 
-def primary_shutdown_position(calibration_values):
-    if not isinstance(calibration_values, Mapping):
-        raise MotionInputError("shutdown-position calibration must be a mapping")
-
+def primary_shutdown_position(home_reference):
+    if not isinstance(home_reference, PrimaryHomeReference):
+        raise MotionInputError(
+            "shutdown position requires a controller home reference"
+        )
+    missing_axes = tuple(
+        f"J{axis}"
+        for axis, valid in enumerate(home_reference.valid, start=1)
+        if not valid
+    )
+    if missing_axes:
+        raise MotionInputError(
+            "shutdown position requires homing "
+            + " and ".join(missing_axes)
+            + " under the active controller frame"
+        )
     target = list(PRIMARY_START_POSITION)
-    for axis in (1, 2):
-        direction = finite_number(
-            calibration_values.get(f"J{axis}CalDir"),
-            f"J{axis} calibration direction",
-        )
-        if direction not in (0.0, 1.0):
-            raise MotionInputError(
-                f"J{axis} calibration direction must be binary"
-            )
-        negative_limit = finite_number(
-            calibration_values.get(f"J{axis}NegLim"),
-            f"J{axis} negative limit",
-        )
-        positive_limit = finite_number(
-            calibration_values.get(f"J{axis}PosLim"),
-            f"J{axis} positive limit",
-        )
-        if negative_limit < 0 or positive_limit < 0:
-            raise MotionInputError(
-                f"J{axis} calibrated limits must be non-negative"
-            )
-        command_offset = finite_number(
-            calibration_values.get(f"J{axis}calOff"),
-            f"J{axis} calibration offset",
-        )
-        switch_position = (
-            positive_limit
-            if direction == 1.0
-            else -negative_limit
-        )
-        switch_position += (
-            PRIMARY_CALIBRATION_BASE_OFFSETS[axis - 1] + command_offset
-        )
-        if not -negative_limit <= switch_position <= positive_limit:
-            raise MotionInputError(
-                f"J{axis} home-switch position is outside calibrated limits"
-            )
-        target[axis - 1] = switch_position
+    target[:2] = home_reference.positions
     return tuple(target)
 
 
@@ -3440,6 +3453,12 @@ _POSITION_RESPONSE = re.compile(
     rf"O(?P<flag>(?:EB|EC[01]{{6}})?)"
     rf"P(?P<j7>{_NUMBER})Q(?P<j8>{_NUMBER})R(?P<j9>{_NUMBER})$"
 )
+_PRIMARY_HOME_REFERENCE_RESPONSE = re.compile(
+    r"^A(?P<j1_valid>[01])"
+    r"B(?P<j1_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"C(?P<j2_valid>[01])"
+    r"D(?P<j2_millidegrees>(?:0|-?[1-9][0-9]*))$"
+)
 
 
 @dataclass(frozen=True)
@@ -3858,6 +3877,53 @@ class PositionResponse:
     speed_violation: bool
     debug: str
     flag: str
+
+
+def parse_primary_home_reference_response(response):
+    if (
+        not isinstance(response, str)
+        or not response
+        or response != response.strip()
+        or len(response) > MAX_RESPONSE_PAYLOAD_LENGTH
+    ):
+        raise ProtocolResponseError(
+            "controller home-reference response is invalid"
+        )
+    try:
+        response.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ProtocolResponseError(
+            "controller home-reference response must contain ASCII only"
+        ) from exc
+    match = _PRIMARY_HOME_REFERENCE_RESPONSE.fullmatch(response)
+    if match is None:
+        raise ProtocolResponseError(
+            "controller home-reference response has invalid markers or values"
+        )
+    millidegrees = tuple(
+        int(match.group(name))
+        for name in ("j1_millidegrees", "j2_millidegrees")
+    )
+    if any(
+        value < -CONTROLLER_SIGNED_INT_MAX - 1
+        or value > CONTROLLER_SIGNED_INT_MAX
+        for value in millidegrees
+    ):
+        raise ProtocolResponseError(
+            "controller home-reference response exceeds the signed range"
+        )
+    try:
+        return PrimaryHomeReference(
+            valid=tuple(
+                match.group(name) == "1"
+                for name in ("j1_valid", "j2_valid")
+            ),
+            positions=tuple(value / 1000.0 for value in millidegrees),
+        )
+    except MotionInputError as exc:
+        raise ProtocolResponseError(
+            f"controller home-reference response is inconsistent: {exc}"
+        ) from exc
 
 
 def parse_position_response(response):
