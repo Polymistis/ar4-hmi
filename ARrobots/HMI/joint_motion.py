@@ -20,6 +20,8 @@ from typing import Callable, Optional, Tuple
 
 
 JOINT_COUNT = 9
+PRIMARY_START_POSITION = (0.0, 0.0, 0.0, 0.0, 45.0, 0.0)
+PRIMARY_CALIBRATION_BASE_OFFSETS = (-6.2, 3.8, 1.4, -0.8, 5.6, 0.5)
 MAX_COMMAND_LENGTH = 4096
 MAX_RESPONSE_PAYLOAD_LENGTH = 4096
 MAX_RESPONSE_FRAME_LENGTH = MAX_RESPONSE_PAYLOAD_LENGTH + 2
@@ -2405,6 +2407,52 @@ def controller_protocol_decimal(value, field_name):
     return format(encoded, ".46f").rstrip("0").rstrip(".")
 
 
+def primary_shutdown_position(calibration_values):
+    if not isinstance(calibration_values, Mapping):
+        raise MotionInputError("shutdown-position calibration must be a mapping")
+
+    target = list(PRIMARY_START_POSITION)
+    for axis in (1, 2):
+        direction = finite_number(
+            calibration_values.get(f"J{axis}CalDir"),
+            f"J{axis} calibration direction",
+        )
+        if direction not in (0.0, 1.0):
+            raise MotionInputError(
+                f"J{axis} calibration direction must be binary"
+            )
+        negative_limit = finite_number(
+            calibration_values.get(f"J{axis}NegLim"),
+            f"J{axis} negative limit",
+        )
+        positive_limit = finite_number(
+            calibration_values.get(f"J{axis}PosLim"),
+            f"J{axis} positive limit",
+        )
+        if negative_limit < 0 or positive_limit < 0:
+            raise MotionInputError(
+                f"J{axis} calibrated limits must be non-negative"
+            )
+        command_offset = finite_number(
+            calibration_values.get(f"J{axis}calOff"),
+            f"J{axis} calibration offset",
+        )
+        switch_position = (
+            positive_limit
+            if direction == 1.0
+            else -negative_limit
+        )
+        switch_position += (
+            PRIMARY_CALIBRATION_BASE_OFFSETS[axis - 1] + command_offset
+        )
+        if not -negative_limit <= switch_position <= positive_limit:
+            raise MotionInputError(
+                f"J{axis} home-switch position is outside calibrated limits"
+            )
+        target[axis - 1] = switch_position
+    return tuple(target)
+
+
 def _finite_tuple(values, expected_length, field_name):
     if isinstance(values, (str, bytes)):
         raise MotionInputError(f"{field_name} must be a numeric sequence")
@@ -2424,6 +2472,39 @@ def _finite_tuple(values, expected_length, field_name):
         raise MotionInputError(
             f"{field_name} must contain {expected_length} values; got {len(normalized)}"
         )
+    return tuple(normalized)
+
+
+def _optional_finite_tuple(values, expected_length, field_name):
+    if isinstance(values, (str, bytes)):
+        raise MotionInputError(
+            f"{field_name} must be a numeric-or-empty sequence"
+        )
+    try:
+        iterator = iter(values)
+    except TypeError as exc:
+        raise MotionInputError(
+            f"{field_name} must be a numeric-or-empty sequence"
+        ) from exc
+
+    normalized = []
+    for index in range(expected_length + 1):
+        try:
+            value = next(iterator)
+        except StopIteration:
+            break
+        normalized.append(
+            None
+            if value is None
+            else finite_number(value, f"{field_name}[{index}]")
+        )
+    if len(normalized) != expected_length:
+        raise MotionInputError(
+            f"{field_name} must contain {expected_length} values; "
+            f"got {len(normalized)}"
+        )
+    if not any(value is not None for value in normalized):
+        raise MotionInputError(f"{field_name} must contain at least one target")
     return tuple(normalized)
 
 
@@ -3908,7 +3989,20 @@ class DeferredJointAdjustments:
     def set_target(self, axis, target, profile, confirmed_position_generation):
         if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis < JOINT_COUNT:
             raise MotionInputError(f"axis must be an integer in [0, {JOINT_COUNT - 1}]")
-        normalized_target = finite_number(target, "target")
+        targets = [None] * JOINT_COUNT
+        targets[axis] = target
+        return self.set_targets(
+            targets,
+            profile,
+            confirmed_position_generation,
+        )
+
+    def set_targets(self, targets, profile, confirmed_position_generation):
+        normalized_targets = _optional_finite_tuple(
+            targets,
+            JOINT_COUNT,
+            "targets",
+        )
         if not isinstance(profile, MotionProfile):
             raise MotionInputError("profile must be a MotionProfile")
         self._validate_generation(confirmed_position_generation)
@@ -3917,11 +4011,14 @@ class DeferredJointAdjustments:
             if not self._pending_locked():
                 self._position_generation = confirmed_position_generation
             adjustments = list(self._adjustments)
-            targets = list(self._targets)
-            adjustments[axis] = 0.0
-            targets[axis] = normalized_target
+            merged_targets = list(self._targets)
+            for axis, target in enumerate(normalized_targets):
+                if target is None:
+                    continue
+                adjustments[axis] = 0.0
+                merged_targets[axis] = target
             self._adjustments = tuple(adjustments)
-            self._targets = tuple(targets)
+            self._targets = tuple(merged_targets)
             self._profile = profile
             return True
 
@@ -4100,14 +4197,29 @@ class CoalescingJointDispatcher:
     def submit_target(self, axis, target, actual_positions, profile):
         if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis < JOINT_COUNT:
             raise MotionInputError(f"axis must be an integer in [0, {JOINT_COUNT - 1}]")
-        normalized_target = finite_number(target, "target")
+        targets = [None] * JOINT_COUNT
+        targets[axis] = target
+        return self.submit_targets(
+            targets,
+            actual_positions,
+            profile,
+        )
+
+    def submit_targets(self, targets, actual_positions, profile):
+        normalized_targets = _optional_finite_tuple(
+            targets,
+            JOINT_COUNT,
+            "targets",
+        )
         actual = _finite_tuple(actual_positions, JOINT_COUNT, "actual_positions")
         if not isinstance(profile, MotionProfile):
             raise MotionInputError("profile must be a MotionProfile")
 
         def resolve_target(base):
             values = list(base)
-            values[axis] = normalized_target
+            for axis, target in enumerate(normalized_targets):
+                if target is not None:
+                    values[axis] = target
             return tuple(values)
 
         return self._submit_resolved_target(actual, profile, resolve_target)

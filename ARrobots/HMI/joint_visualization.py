@@ -11,10 +11,11 @@ from ARrobots.HMI.joint_motion import (
 )
 
 
-GHOST_MARKER_COLOR = "#00A6D6"
-GHOST_MARKER_WIDTH = 3
-GHOST_MARKER_MINIMUM_HEIGHT = 8
-GHOST_MARKER_MAXIMUM_HEIGHT = 18
+GHOST_MARKER_COLOR = "#00D7FF"
+GHOST_MARKER_OUTLINE_COLOR = "#003B49"
+GHOST_MARKER_WIDTH = 7
+GHOST_MARKER_MINIMUM_HEIGHT = 12
+GHOST_MARKER_MAXIMUM_HEIGHT = 24
 _SLIDER_DRAG_ATTRIBUTE = "_ar4_joint_slider_drag_active"
 
 
@@ -164,7 +165,7 @@ def slider_marker_geometry(
 
 
 class GhostSliderMarker:
-    """Thin overlay marker that leaves the normal slider thumb visible."""
+    """High-contrast overlay marker that leaves the slider thumb visible."""
 
     def __init__(self, parent, slider, color=GHOST_MARKER_COLOR):
         required_slider_methods = (
@@ -197,7 +198,8 @@ class GhostSliderMarker:
             parent,
             background=color,
             borderwidth=0,
-            highlightthickness=0,
+            highlightbackground=GHOST_MARKER_OUTLINE_COLOR,
+            highlightthickness=1,
             takefocus=0,
         )
         for sequence in (

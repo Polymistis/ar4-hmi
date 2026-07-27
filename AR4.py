@@ -202,6 +202,7 @@ from ARrobots.HMI.joint_motion import (
   MotionRequestLease,
   MotionRequestRegistry,
   MotionTransportBusy,
+  PRIMARY_START_POSITION,
   PositionResponse,
   ProtocolResponseError,
   SerialTransportQuarantinedError,
@@ -232,6 +233,7 @@ from ARrobots.HMI.joint_motion import (
   parse_motion_wrist_config,
   parse_position_response,
   parse_virtual_command_timing,
+  primary_shutdown_position,
   quarantine_serial_transport,
   read_serial_exact_response,
   read_serial_line_response,
@@ -15059,6 +15061,159 @@ def _queue_joint_target(axis, target):
   return _queue_joint_motion(axis, target, absolute=True)
 
 
+def _queue_primary_joint_position(primary_positions):
+  try:
+    if application_closing.is_set():
+      raise MotionQueueFault(
+        "joint motion is unavailable during application shutdown"
+      )
+    if controller_correction_requested.is_set():
+      raise MotionQueueFault(
+        "joint motion is unavailable during controller correction"
+      )
+    if isinstance(primary_positions, (str, bytes)):
+      raise MotionInputError(
+        "primary joint position must be a numeric sequence"
+      )
+    try:
+      primary_positions = tuple(primary_positions)
+    except TypeError as exc:
+      raise MotionInputError(
+        "primary joint position must be a numeric sequence"
+      ) from exc
+    if len(primary_positions) != 6:
+      raise MotionInputError(
+        "primary joint position must contain 6 values"
+      )
+    primary_positions = tuple(
+      finite_number(value, f"J{axis} named position")
+      for axis, value in enumerate(primary_positions, start=1)
+    )
+
+    current_positions = _current_joint_positions()
+    _current_controller_joint_calibration().validate_positions(
+      primary_positions + current_positions[6:]
+    )
+    profile = _current_joint_motion_profile()
+    target_updates = primary_positions + (None, None, None)
+    deferred = False
+    submission = None
+
+    if RUN['xboxUse'] != 1:
+      almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
+      almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+
+    if RUN['offlineMode']:
+      if not _start_offline_joint_motion(
+        build_virtual_joint_command(primary_positions, profile)
+      ):
+        raise MotionQueueFault(_motion_request_rejection_message(
+          "offline virtual joint motion did not start"
+        ))
+      coalesced = False
+    elif (
+      deferred_joint_adjustments.pending
+      or (
+        motion_request_registry.active
+        and not joint_motion_dispatcher.active
+      )
+    ):
+      deferred = True
+      coalesced = deferred_joint_adjustments.set_targets(
+        target_updates,
+        profile,
+        confirmed_position_generation,
+      )
+    else:
+      request_lease = None
+      lease_created = False
+      try:
+        request_lease, lease_created = _reserve_joint_motion_request()
+        if request_lease is None:
+          raise MotionTransportBusy(_motion_request_rejection_message(
+            "another motion request is active"
+          ))
+        submission = joint_motion_dispatcher.submit_targets(
+          target_updates,
+          current_positions,
+          profile,
+        )
+        coalesced = submission.coalesced
+      except MotionTransportBusy:
+        if lease_created and not joint_motion_dispatcher.active:
+          _abandon_joint_motion_request(request_lease)
+        if (
+          not legacy_serial_result_pending.is_set()
+          and not motion_request_registry.active
+        ):
+          raise MotionQueueFault(
+            "controller transport is busy outside the legacy motion queue"
+          )
+        deferred = True
+        coalesced = deferred_joint_adjustments.set_targets(
+          target_updates,
+          profile,
+          confirmed_position_generation,
+        )
+      except Exception:
+        if lease_created and not joint_motion_dispatcher.active:
+          _abandon_joint_motion_request(request_lease)
+        raise
+
+    if not RUN['offlineMode']:
+      if deferred and not coalesced:
+        if live_serial_result_pending.is_set():
+          status = "LIVE JOG IN PROGRESS"
+        elif (
+          legacy_serial_result_pending.is_set()
+          or serial_lock.locked()
+          or joint_motion_dispatcher.active
+        ):
+          status = "CONTROLLER MOVE IN PROGRESS"
+        else:
+          status = "SYSTEM READY"
+      else:
+        status = (
+          "JOINT TARGET QUEUED"
+          if coalesced
+          else "JOINT MOVE IN PROGRESS"
+        )
+      almStatusLab.config(text=status, style="OK.TLabel")
+      almStatusLab2.config(text=status, style="OK.TLabel")
+      if submission is not None:
+        _try_set_virtual_joint_target(submission.target)
+        _set_joint_motion_target_display(submission.target)
+    return True
+  except (
+    KeyError,
+    TypeError,
+    ValueError,
+    MotionInputError,
+    MotionQueueFault,
+  ) as exc:
+    message = f"Named joint position rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+
+
+def MoveToStartPosition():
+  return _queue_primary_joint_position(PRIMARY_START_POSITION)
+
+
+def MoveToShutdownPosition():
+  try:
+    target = primary_shutdown_position(CAL)
+  except (KeyError, TypeError, ValueError, MotionInputError) as exc:
+    message = f"Shutdown position rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+  return _queue_primary_joint_position(target)
+
+
 PRIMARY_JOINT_COUNT = 6
 
 
@@ -23650,34 +23805,41 @@ reloadBut.grid(row=1, column=4, sticky="ew", padx=2, pady=2)
 # Duplicate buttons removed - now in proper containers
 
 # ============================================================================
-# RIGHT PANEL - Joint and Cartesian Controls
+# RIGHT PANEL - Motion and Command Controls
 # ============================================================================
 rightPanel = Frame(tab1)
 rightPanel.grid(row=0, column=2, sticky="nsew", padx=2, pady=2)
 
 # Configure right panel grid
-rightPanel.grid_rowconfigure(0, weight=0)  # Joint controls - fixed height
-rightPanel.grid_rowconfigure(1, weight=0)  # Cartesian controls - fixed height
-rightPanel.grid_rowconfigure(2, weight=0)  # Tool controls - fixed height
-rightPanel.grid_rowconfigure(3, weight=0)  # Command builders - fixed height
-rightPanel.grid_rowconfigure(4, weight=0)  # Navigation - fixed height
-rightPanel.grid_rowconfigure(5, weight=0)  # Register commands - fixed height
-rightPanel.grid_rowconfigure(6, weight=0)  # Device commands - fixed height
-rightPanel.grid_rowconfigure(7, weight=1)  # Additional axes - compresses first when height reduced
-rightPanel.grid_rowconfigure(8, weight=2)  # Spacer - expands most
+rightPanel.grid_rowconfigure(0, weight=1)
+rightPanel.grid_rowconfigure(1, weight=0)
+rightPanel.grid_rowconfigure(2, weight=0)
+rightPanel.grid_rowconfigure(3, weight=0)
+rightPanel.grid_rowconfigure(4, weight=0)
+rightPanel.grid_rowconfigure(5, weight=0)
+rightPanel.grid_rowconfigure(6, weight=1)
 rightPanel.grid_columnconfigure(0, weight=1)
 rightPanel.grid_columnconfigure(1, weight=1)
 
-# Joint controls container (J1-J6)
-jointFrame = LabelFrame(
-    rightPanel,
-    text="Joint Control (J1-J6) - type target, press Enter",
-    padding=5,
+# Coordinate-space tabs keep unrelated jog modes out of the active workspace.
+motionControlNotebook = ttk_bootstrap.Notebook(rightPanel)
+motionControlNotebook.grid(
+  row=0,
+  column=0,
+  columnspan=2,
+  sticky="nsew",
+  padx=5,
+  pady=5,
 )
-jointFrame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+
+jointFrame = ttk_bootstrap.Frame(motionControlNotebook, padding=5)
+CartjogFrame = ttk_bootstrap.Frame(motionControlNotebook, padding=5)
+TooljogFrame = ttk_bootstrap.Frame(motionControlNotebook, padding=5)
+motionControlNotebook.add(jointFrame, text=" Joint ")
+motionControlNotebook.add(CartjogFrame, text=" Cartesian ")
+motionControlNotebook.add(TooljogFrame, text=" Tool Frame ")
 
 jointFrame.grid_columnconfigure(0, weight=1)
-jointFrame.grid_columnconfigure(1, weight=1)
 
 def create_joint_jog_frame(parent, row, col, joint_name, joint_num):
     frame = Frame(parent)
@@ -23716,7 +23878,6 @@ def create_joint_jog_frame(parent, row, col, joint_name, joint_num):
     
     return frame, entry, neg_but, pos_but, slider, slide_label, neg_lim_lab, pos_lim_lab
 
-# Create J1-J6 frames (2 columns x 3 rows)
 ##J1
 J1jogFrame, J1curAngEntryField, J1jogNegBut, J1jogPosBut, J1jogslide, J1slidelabel, J1negLimLab, J1posLimLab = create_joint_jog_frame(jointFrame, 0, 0, "J1", 1)
 
@@ -23803,7 +23964,7 @@ J3jogslide.config(command=J3sliderUpdate)
 J3jogslide.bind("<ButtonRelease-1>", J3sliderExecute)
 
 ##J4
-J4jogFrame, J4curAngEntryField, J4jogNegBut, J4jogPosBut, J4jogslide, J4slidelabel, J4negLimLab, J4posLimLab = create_joint_jog_frame(jointFrame, 0, 1, "J4", 4)
+J4jogFrame, J4curAngEntryField, J4jogNegBut, J4jogPosBut, J4jogslide, J4slidelabel, J4negLimLab, J4posLimLab = create_joint_jog_frame(jointFrame, 3, 0, "J4", 4)
 
 def SelJ4jogNeg(self):
   IncJogStatVal = int(RUN['IncJogStat'].get())
@@ -23831,7 +23992,7 @@ J4jogslide.config(command=J4sliderUpdate)
 J4jogslide.bind("<ButtonRelease-1>", J4sliderExecute)
 
 ##J5
-J5jogFrame, J5curAngEntryField, J5jogNegBut, J5jogPosBut, J5jogslide, J5slidelabel, J5negLimLab, J5posLimLab = create_joint_jog_frame(jointFrame, 1, 1, "J5", 5)
+J5jogFrame, J5curAngEntryField, J5jogNegBut, J5jogPosBut, J5jogslide, J5slidelabel, J5negLimLab, J5posLimLab = create_joint_jog_frame(jointFrame, 4, 0, "J5", 5)
 
 def SelJ5jogNeg(self):
   IncJogStatVal = int(RUN['IncJogStat'].get())
@@ -23859,7 +24020,7 @@ J5jogslide.config(command=J5sliderUpdate)
 J5jogslide.bind("<ButtonRelease-1>", J5sliderExecute)
 
 ##J6
-J6jogFrame, J6curAngEntryField, J6jogNegBut, J6jogPosBut, J6jogslide, J6slidelabel, J6negLimLab, J6posLimLab = create_joint_jog_frame(jointFrame, 2, 1, "J6", 6)
+J6jogFrame, J6curAngEntryField, J6jogNegBut, J6jogPosBut, J6jogslide, J6slidelabel, J6negLimLab, J6posLimLab = create_joint_jog_frame(jointFrame, 5, 0, "J6", 6)
 
 def SelJ6jogNeg(self):
   IncJogStatVal = int(RUN['IncJogStat'].get())
@@ -23893,51 +24054,74 @@ estimatedMotionCbut = Checkbutton(
   command=_refresh_joint_motion_visualization,
 )
 estimatedMotionCbut.grid(
-  row=3,
+  row=6,
   column=0,
-  columnspan=2,
   sticky="w",
   padx=4,
   pady=(2, 0),
 )
 
-# Cartesian jog controls
-CartjogFrame = LabelFrame(rightPanel, text="Cartesian Control (X Y Z Rz Ry Rx)", padding=5)
-CartjogFrame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+namedPositionFrame = Frame(jointFrame)
+namedPositionFrame.grid(
+  row=7,
+  column=0,
+  sticky="ew",
+  padx=2,
+  pady=(4, 2),
+)
+namedPositionFrame.grid_columnconfigure(0, weight=1)
+namedPositionFrame.grid_columnconfigure(1, weight=1)
+
+startPositionBut = Button(
+  namedPositionFrame,
+  text="Start Position",
+  command=MoveToStartPosition,
+)
+startPositionBut.grid(row=0, column=0, sticky="ew", padx=(0, 2))
+
+shutdownPositionBut = Button(
+  namedPositionFrame,
+  text="Shutdown Position",
+  command=MoveToShutdownPosition,
+)
+shutdownPositionBut.grid(row=0, column=1, sticky="ew", padx=(2, 0))
 
 CartjogFrame.grid_columnconfigure(0, weight=1)
-CartjogFrame.grid_columnconfigure(1, weight=1)
-CartjogFrame.grid_columnconfigure(2, weight=1)
-CartjogFrame.grid_columnconfigure(3, weight=1)
-CartjogFrame.grid_columnconfigure(4, weight=1)
-CartjogFrame.grid_columnconfigure(5, weight=1)
 
 
-def create_cart_control(parent, row, col, label_text):
-    Label(parent, font=("Arial", 14), text=label_text).grid(row=row, column=col, pady=2)
-    
-    entry = Entry(parent, width=6, justify="center")
-    entry.grid(row=row+1, column=col, pady=2)
-    
-    # Create frame for horizontal button layout
-    button_frame = Frame(parent)
-    button_frame.grid(row=row+2, column=col, pady=2)
-    
-    neg_but = Button(button_frame, text="-", width=3)
-    neg_but.grid(row=0, column=0, padx=1)
-    
-    pos_but = Button(button_frame, text="+", width=3)
-    pos_but.grid(row=0, column=1, padx=1)
-    
+def create_cart_control(parent, row, label_text):
+    frame = Frame(parent)
+    frame.grid(row=row, column=0, sticky="ew", padx=2, pady=3)
+    frame.grid_columnconfigure(0, weight=0)
+    frame.grid_columnconfigure(1, weight=0)
+    frame.grid_columnconfigure(2, weight=1)
+    frame.grid_columnconfigure(3, weight=0)
+
+    Label(frame, font=("Arial", 14), text=label_text, width=4).grid(
+      row=0,
+      column=0,
+      padx=2,
+    )
+    entry = Entry(frame, width=10, justify="center")
+    entry.grid(row=0, column=1, padx=2)
+    neg_but = Button(frame, text="-", width=5)
+    neg_but.grid(row=0, column=2, sticky="e", padx=2)
+    pos_but = Button(frame, text="+", width=5)
+    pos_but.grid(row=0, column=3, padx=2)
     return entry, neg_but, pos_but
 
 # Create cartesian controls
-XcurEntryField, XjogNegBut, XjogPosBut = create_cart_control(CartjogFrame, 0, 0, "X")
-YcurEntryField, YjogNegBut, YjogPosBut = create_cart_control(CartjogFrame, 0, 1, "Y")
-ZcurEntryField, ZjogNegBut, ZjogPosBut = create_cart_control(CartjogFrame, 0, 2, "Z")
-RzcurEntryField, RzjogNegBut, RzjogPosBut = create_cart_control(CartjogFrame, 0, 3, "Rz")
-RycurEntryField, RyjogNegBut, RyjogPosBut = create_cart_control(CartjogFrame, 0, 4, "Ry")
-RxcurEntryField, RxjogNegBut, RxjogPosBut = create_cart_control(CartjogFrame, 0, 5, "Rx")
+XcurEntryField, XjogNegBut, XjogPosBut = create_cart_control(CartjogFrame, 0, "X")
+YcurEntryField, YjogNegBut, YjogPosBut = create_cart_control(CartjogFrame, 1, "Y")
+ZcurEntryField, ZjogNegBut, ZjogPosBut = create_cart_control(CartjogFrame, 2, "Z")
+RzcurEntryField, RzjogNegBut, RzjogPosBut = create_cart_control(CartjogFrame, 3, "Rz")
+RycurEntryField, RyjogNegBut, RyjogPosBut = create_cart_control(CartjogFrame, 4, "Ry")
+RxcurEntryField, RxjogNegBut, RxjogPosBut = create_cart_control(CartjogFrame, 5, "Rx")
+
+Label(
+  CartjogFrame,
+  text="Cartesian travel is kinematics-limited; no fixed slider bounds.",
+).grid(row=6, column=0, sticky="w", padx=4, pady=(6, 2))
 
 # Bind cartesian button events
 def SelXjogNeg(self):
@@ -24048,30 +24232,29 @@ def SelRxjogPos(self):
 RxjogPosBut.bind("<ButtonPress>", SelRxjogPos)
 RxjogPosBut.bind("<ButtonRelease>", StopJog)
 
-# Tool frame controls
-TooljogFrame = LabelFrame(rightPanel, text="Tool Frame Control (Tx Ty Tz Trz Try Trx)", padding=5)
-TooljogFrame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
-
 TooljogFrame.grid_columnconfigure(0, weight=1)
-TooljogFrame.grid_columnconfigure(1, weight=1)
-TooljogFrame.grid_columnconfigure(2, weight=1)
-TooljogFrame.grid_columnconfigure(3, weight=1)
-TooljogFrame.grid_columnconfigure(4, weight=1)
-TooljogFrame.grid_columnconfigure(5, weight=1)
 
-def create_tool_control(parent, col, label_text):
-    Label(parent, font=("Arial", 14), text=label_text).grid(row=0, column=col, pady=2)
-    
-    # Create frame for horizontal button layout
-    button_frame = Frame(parent)
-    button_frame.grid(row=1, column=col, pady=2)
-    
-    neg_but = Button(button_frame, text="-", width=3)
-    neg_but.grid(row=0, column=0, padx=1)
-    
-    pos_but = Button(button_frame, text="+", width=3)
-    pos_but.grid(row=0, column=1, padx=1)
-    
+def create_tool_control(parent, row, label_text):
+    frame = Frame(parent)
+    frame.grid(row=row, column=0, sticky="ew", padx=2, pady=3)
+    frame.grid_columnconfigure(0, weight=0)
+    frame.grid_columnconfigure(1, weight=1)
+    frame.grid_columnconfigure(2, weight=0)
+    Label(frame, font=("Arial", 14), text=label_text, width=4).grid(
+      row=0,
+      column=0,
+      padx=2,
+    )
+    Label(frame, text="Relative jog").grid(
+      row=0,
+      column=1,
+      sticky="w",
+      padx=4,
+    )
+    neg_but = Button(frame, text="-", width=5)
+    neg_but.grid(row=0, column=2, padx=2)
+    pos_but = Button(frame, text="+", width=5)
+    pos_but.grid(row=0, column=3, padx=2)
     return neg_but, pos_but
 
 # Create tool frame controls (no entry fields)
@@ -24081,6 +24264,11 @@ TZjogNegBut, TZjogPosBut = create_tool_control(TooljogFrame, 2, "Tz")
 TRzjogNegBut, TRzjogPosBut = create_tool_control(TooljogFrame, 3, "Trz")
 TRyjogNegBut, TRyjogPosBut = create_tool_control(TooljogFrame, 4, "Try")
 TRxjogNegBut, TRxjogPosBut = create_tool_control(TooljogFrame, 5, "Trx")
+
+Label(
+  TooljogFrame,
+  text="Tool-frame motion is relative; no absolute slider position exists.",
+).grid(row=6, column=0, sticky="w", padx=4, pady=(6, 2))
 
 # Bind tool frame button events
 def SelTXjogNeg(self):
@@ -24194,7 +24382,7 @@ TRxjogPosBut.bind("<ButtonRelease>", StopJog)
 
 # Extra axes (J7, J8, J9)
 extraAxesFrame = LabelFrame(rightPanel, text="Additional Axes", padding=5)
-extraAxesFrame.grid(row=7, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+extraAxesFrame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
 
 extraAxesFrame.grid_columnconfigure(0, weight=1)
 extraAxesFrame.grid_columnconfigure(1, weight=1)
@@ -24423,7 +24611,7 @@ joint_motion_visualization = JointMotionVisualization(
 
 # Command builders (IF, SET, WAIT - reordered and aligned)
 cmdFrame = LabelFrame(rightPanel, text="Command Builders", padding=5)
-cmdFrame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=(5, 2))
+cmdFrame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=(5, 2))
 
 # Configure columns for proper alignment
 cmdFrame.grid_columnconfigure(0, weight=0, minsize=45)   # Label
@@ -24520,7 +24708,7 @@ insertWaitBut.grid(row=2, column=8, sticky="ew", padx=2, pady=2)
 
 # Navigation container (2x2 grid layout)
 navFrame = LabelFrame(rightPanel, text="Navigation", padding=5)
-navFrame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+navFrame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
 
 # Configure 4 columns for 2x2 grid (button, entry, button, entry)
 navFrame.grid_columnconfigure(0, weight=1, minsize=100)  # Button 1
@@ -24556,7 +24744,7 @@ PlayGCEntryField.grid(row=1, column=3, sticky="ew", padx=2, pady=2)
 
 # Register Commands container
 regFrame = LabelFrame(rightPanel, text="Register Commands", padding=5)
-regFrame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+regFrame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
 
 # Configure columns for side-by-side layout
 regFrame.grid_columnconfigure(0, weight=1, minsize=120)  # Register button
@@ -24602,7 +24790,7 @@ posRegEntryField = storPosNumEntryField
 
 # Device Commands container
 devFrame = LabelFrame(rightPanel, text="Device Commands", padding=5)
-devFrame.grid(row=6, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+devFrame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
 
 # Configure columns
 devFrame.grid_columnconfigure(0, weight=1, minsize=100)  # Servo button

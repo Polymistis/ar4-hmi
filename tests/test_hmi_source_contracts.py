@@ -52,6 +52,8 @@ from ARrobots.HMI.joint_motion import (
     MotionRequestLease,
     MotionRequestRegistry,
     MotionTransportBusy,
+    PRIMARY_CALIBRATION_BASE_OFFSETS,
+    PRIMARY_START_POSITION,
     PositionResponse,
     ProtocolResponseError,
     SerialActivityRegistry,
@@ -82,6 +84,7 @@ from ARrobots.HMI.joint_motion import (
     parse_motion_wrist_config,
     parse_position_response,
     parse_virtual_command_timing,
+    primary_shutdown_position,
     quarantine_serial_transport,
     read_serial_exact_response,
     read_serial_line_response,
@@ -99,6 +102,7 @@ from ARrobots.HMI.joint_visualization import set_joint_slider_positions
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 AR4_SOURCE = PROJECT_ROOT / "AR4.py"
+HOME_PROGRAM_SOURCE = PROJECT_ROOT / "Home.ar4"
 CALIBRATION_SOURCE = PROJECT_ROOT / "ARrobots" / "Calibration.py"
 NATIVE_KINEMATICS_SOURCE = PROJECT_ROOT / "ARrobots" / "src" / "kinematics.cpp"
 NATIVE_WINDOWS_BUILD_SOURCE = (
@@ -353,6 +357,11 @@ class HmiSourceContractTests(unittest.TestCase):
             threading.Event(),
         )
         namespace.setdefault("PRIMARY_JOINT_COUNT", 6)
+        namespace.setdefault("PRIMARY_START_POSITION", PRIMARY_START_POSITION)
+        namespace.setdefault(
+            "primary_shutdown_position",
+            primary_shutdown_position,
+        )
         namespace.setdefault(
             "CALIBRATION_POSITION_KEYS",
             (
@@ -12830,6 +12839,222 @@ class HmiSourceContractTests(unittest.TestCase):
             self.assertEqual(len(target_calls), 1, name)
             self.assertIsInstance(target_calls[0].args[0], ast.Constant, name)
             self.assertEqual(target_calls[0].args[0].value, axis, name)
+
+    def test_motion_controls_use_coordinate_space_tabs_and_vertical_rows(self):
+        notebook_add_calls = [
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and isinstance(node.value.func.value, ast.Name)
+            and node.value.func.value.id == "motionControlNotebook"
+            and node.value.func.attr == "add"
+        ]
+        self.assertEqual(len(notebook_add_calls), 3)
+        self.assertEqual(
+            [
+                (
+                    call.value.args[0].id,
+                    next(
+                        ast.literal_eval(keyword.value)
+                        for keyword in call.value.keywords
+                        if keyword.arg == "text"
+                    ).strip(),
+                )
+                for call in notebook_add_calls
+            ],
+            [
+                ("jointFrame", "Joint"),
+                ("CartjogFrame", "Cartesian"),
+                ("TooljogFrame", "Tool Frame"),
+            ],
+        )
+
+        joint_rows = []
+        cartesian_rows = []
+        tool_rows = []
+        for node in self.tree.body:
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                continue
+            call = node.value
+            if isinstance(call.func, ast.Name) and call.func.id == "create_joint_jog_frame":
+                joint_rows.append(
+                    (
+                        ast.literal_eval(call.args[1]),
+                        ast.literal_eval(call.args[2]),
+                        ast.literal_eval(call.args[3]),
+                    )
+                )
+            elif isinstance(call.func, ast.Name) and call.func.id == "create_cart_control":
+                cartesian_rows.append(
+                    (
+                        ast.literal_eval(call.args[1]),
+                        ast.literal_eval(call.args[2]),
+                    )
+                )
+            elif isinstance(call.func, ast.Name) and call.func.id == "create_tool_control":
+                tool_rows.append(
+                    (
+                        ast.literal_eval(call.args[1]),
+                        ast.literal_eval(call.args[2]),
+                    )
+                )
+
+        self.assertEqual(
+            joint_rows,
+            [(axis - 1, 0, f"J{axis}") for axis in range(1, 7)],
+        )
+        self.assertEqual(
+            cartesian_rows,
+            list(enumerate(("X", "Y", "Z", "Rz", "Ry", "Rx"))),
+        )
+        self.assertEqual(
+            tool_rows,
+            list(enumerate(("Tx", "Ty", "Tz", "Trz", "Try", "Trx"))),
+        )
+        for function_name in ("create_cart_control", "create_tool_control"):
+            scale_calls = [
+                node
+                for node in ast.walk(self.module_functions[function_name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "Scale"
+            ]
+            self.assertEqual(scale_calls, [], function_name)
+
+    def test_named_position_buttons_route_through_atomic_joint_submission(self):
+        button_commands = {}
+        for name in ("startPositionBut", "shutdownPositionBut"):
+            constructor = self.module_assignments[name].value
+            self.assertIsInstance(constructor, ast.Call)
+            button_commands[name] = next(
+                keyword.value.id
+                for keyword in constructor.keywords
+                if keyword.arg == "command"
+            )
+        self.assertEqual(
+            button_commands,
+            {
+                "startPositionBut": "MoveToStartPosition",
+                "shutdownPositionBut": "MoveToShutdownPosition",
+            },
+        )
+
+        queue_function = self.module_functions["_queue_primary_joint_position"]
+        submit_calls = [
+            node
+            for node in ast.walk(queue_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("submit_target", "submit_targets")
+        ]
+        self.assertEqual(len(submit_calls), 1)
+        self.assertEqual(submit_calls[0].func.attr, "submit_targets")
+
+    def test_named_position_references_match_program_and_firmware(self):
+        home_program = HOME_PROGRAM_SOURCE.read_text(encoding="utf-8")
+        home_match = re.search(
+            r"J1\s+([-0-9.]+)\s+J2\s+([-0-9.]+)\s+"
+            r"J3\s+([-0-9.]+)\s+J4\s+([-0-9.]+)\s+"
+            r"J5\s+([-0-9.]+)\s+J6\s+([-0-9.]+)",
+            home_program,
+        )
+        self.assertIsNotNone(home_match)
+        self.assertEqual(
+            tuple(float(value) for value in home_match.groups()),
+            PRIMARY_START_POSITION,
+        )
+
+        firmware_source = TEENSY_SOURCE.read_text(encoding="utf-8")
+        for axis, expected_offset in enumerate(
+            PRIMARY_CALIBRATION_BASE_OFFSETS,
+            start=1,
+        ):
+            offset_match = re.search(
+                rf"float\s+J{axis}calBaseOff\s*=\s*([-0-9.]+)\s*;",
+                firmware_source,
+            )
+            self.assertIsNotNone(offset_match, f"J{axis}")
+            self.assertEqual(float(offset_match.group(1)), expected_offset)
+
+    def test_named_position_online_route_preserves_external_axes(self):
+        actual = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 7.0, 8.0, 9.0)
+        profile = object()
+        validation_calls = []
+        submissions = []
+        virtual_targets = []
+
+        class Calibration:
+            def validate_positions(self, positions):
+                positions = tuple(positions)
+                validation_calls.append(positions)
+                return positions
+
+        class Dispatcher:
+            active = False
+
+            def submit_targets(self, targets, positions, move_profile):
+                targets = tuple(targets)
+                positions = tuple(positions)
+                submissions.append((targets, positions, move_profile))
+                resolved = tuple(
+                    position if target is None else float(target)
+                    for position, target in zip(positions, targets)
+                )
+                return SimpleNamespace(target=resolved, coalesced=False)
+
+        class Label:
+            def config(self, **kwargs):
+                pass
+
+        namespace = {
+            "RUN": {"xboxUse": 1, "offlineMode": False},
+            "application_closing": threading.Event(),
+            "controller_correction_requested": threading.Event(),
+            "finite_number": finite_number,
+            "MotionInputError": MotionInputError,
+            "MotionQueueFault": MotionQueueFault,
+            "MotionTransportBusy": MotionTransportBusy,
+            "_current_joint_positions": lambda: actual,
+            "_current_controller_joint_calibration": Calibration,
+            "_current_joint_motion_profile": lambda: profile,
+            "deferred_joint_adjustments": SimpleNamespace(pending=False),
+            "motion_request_registry": SimpleNamespace(active=False),
+            "joint_motion_dispatcher": Dispatcher(),
+            "_reserve_joint_motion_request": lambda: (object(), True),
+            "_abandon_joint_motion_request": lambda lease: True,
+            "legacy_serial_result_pending": threading.Event(),
+            "live_serial_result_pending": threading.Event(),
+            "serial_lock": SimpleNamespace(locked=lambda: False),
+            "_try_set_virtual_joint_target": virtual_targets.append,
+            "_set_joint_motion_target_display": lambda target: True,
+            "build_virtual_joint_command": lambda positions, move_profile: "",
+            "_start_offline_joint_motion": lambda command: True,
+            "confirmed_position_generation": 3,
+            "almStatusLab": Label(),
+            "almStatusLab2": Label(),
+            "logger": SimpleNamespace(error=lambda message: None),
+        }
+        route = self.compile_function(
+            "_queue_primary_joint_position",
+            namespace,
+        )
+
+        self.assertTrue(route(PRIMARY_START_POSITION))
+        expected_updates = PRIMARY_START_POSITION + (None, None, None)
+        self.assertEqual(
+            validation_calls,
+            [PRIMARY_START_POSITION + actual[6:]],
+        )
+        self.assertEqual(
+            submissions,
+            [(expected_updates, actual, profile)],
+        )
+        self.assertEqual(
+            virtual_targets,
+            [PRIMARY_START_POSITION + actual[6:]],
+        )
 
     def test_joint_motion_estimate_is_toggleable_and_wired_to_tk_polling(self):
         toggle_assignments = [

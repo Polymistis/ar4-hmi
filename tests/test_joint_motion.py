@@ -37,6 +37,8 @@ from ARrobots.HMI.joint_motion import (
     MotionRequestLease,
     MotionRequestRegistry,
     MotionTransportBusy,
+    PRIMARY_CALIBRATION_BASE_OFFSETS,
+    PRIMARY_START_POSITION,
     ProtocolResponseError,
     SerialActivityRegistry,
     SerialActivityRejected,
@@ -67,6 +69,7 @@ from ARrobots.HMI.joint_motion import (
     parse_motion_wrist_config,
     parse_position_response,
     parse_virtual_command_timing,
+    primary_shutdown_position,
     quarantine_serial_transport,
     read_serial_exact_response,
     read_serial_line_response,
@@ -3274,6 +3277,65 @@ class CommandResponseTimeoutTests(unittest.TestCase):
             motion_timing_response_timeout("invalid", 120, 100, 1000)
 
 
+class NamedJointPositionTests(unittest.TestCase):
+    @staticmethod
+    def calibration(**overrides):
+        values = {
+            "J1CalDir": 1,
+            "J1NegLim": 170,
+            "J1PosLim": 170,
+            "J1calOff": 0,
+            "J2CalDir": 0,
+            "J2NegLim": 42,
+            "J2PosLim": 90,
+            "J2calOff": 0,
+        }
+        values.update(overrides)
+        return values
+
+    def test_start_position_matches_post_calibration_pose(self):
+        self.assertEqual(
+            PRIMARY_START_POSITION,
+            (0.0, 0.0, 0.0, 0.0, 45.0, 0.0),
+        )
+
+    def test_shutdown_position_uses_calibrated_switch_references(self):
+        target = primary_shutdown_position(self.calibration())
+
+        self.assertAlmostEqual(
+            target[0],
+            170 + PRIMARY_CALIBRATION_BASE_OFFSETS[0],
+        )
+        self.assertAlmostEqual(
+            target[1],
+            -42 + PRIMARY_CALIBRATION_BASE_OFFSETS[1],
+        )
+        self.assertEqual(target[2:], PRIMARY_START_POSITION[2:])
+
+    def test_shutdown_position_honors_direction_and_software_offset(self):
+        target = primary_shutdown_position(
+            self.calibration(
+                J1CalDir=0,
+                J1calOff=10,
+                J2CalDir=1,
+                J2calOff=-5,
+            )
+        )
+
+        self.assertAlmostEqual(target[0], -166.2)
+        self.assertAlmostEqual(target[1], 88.8)
+
+    def test_shutdown_position_rejects_untrusted_calibration(self):
+        with self.assertRaisesRegex(MotionInputError, "must be a mapping"):
+            primary_shutdown_position(None)
+        with self.assertRaisesRegex(MotionInputError, "direction must be binary"):
+            primary_shutdown_position(self.calibration(J1CalDir=2))
+        with self.assertRaisesRegex(MotionInputError, "outside calibrated limits"):
+            primary_shutdown_position(self.calibration(J1calOff=-400))
+        with self.assertRaisesRegex(MotionInputError, "must be numeric"):
+            primary_shutdown_position(self.calibration(J2calOff=None))
+
+
 class DeferredJointAdjustmentsTests(unittest.TestCase):
     def setUp(self):
         self.profile = MotionProfile("Sp", 50, 10, 10, 25, "N", "000000")
@@ -3352,6 +3414,45 @@ class DeferredJointAdjustmentsTests(unittest.TestCase):
             3,
         )
         self.assertEqual(target, (20.0, 15.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0))
+
+    def test_multi_axis_target_is_atomic_and_preserves_other_intent(self):
+        deferred = DeferredJointAdjustments()
+        deferred.add(6, 2, self.profile, 2)
+
+        self.assertTrue(
+            deferred.set_targets(
+                (0, 0, 0, 0, 45, 0, None, None, None),
+                self.profile,
+                2,
+            )
+        )
+
+        target, profile = self.consume(
+            deferred,
+            (10, 20, 30, 40, 50, 60, 7, 8, 9),
+            3,
+        )
+        self.assertEqual(
+            target,
+            (0.0, 0.0, 0.0, 0.0, 45.0, 0.0, 9.0, 8.0, 9.0),
+        )
+        self.assertIs(profile, self.profile)
+
+    def test_multi_axis_target_rejects_empty_or_wrong_length_input(self):
+        deferred = DeferredJointAdjustments()
+
+        with self.assertRaisesRegex(MotionInputError, "at least one target"):
+            deferred.set_targets(
+                (None,) * 9,
+                self.profile,
+                2,
+            )
+        with self.assertRaisesRegex(MotionInputError, "contain 9 values"):
+            deferred.set_targets(
+                (0,) * 8,
+                self.profile,
+                2,
+            )
 
     def test_concurrent_producers_preserve_every_accepted_axis(self):
         deferred = DeferredJointAdjustments()
@@ -4126,6 +4227,34 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         self.assertEqual(submission.target, (1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
         self.assertEqual(len(commands), 1)
         self.assertTrue(commands[0].startswith("RJA1B2C3D0E0F0J70J80J90"))
+
+    def test_submits_partial_multi_axis_target_as_one_command(self):
+        commands = []
+
+        def exchange(command):
+            commands.append(command)
+            return position_response(
+                (0, 0, 0, 0, 45, 0),
+                external=(7, 8, 9),
+            )
+
+        dispatcher = self.make_dispatcher(exchange)
+        actual = (10, 20, 30, 40, 50, 60, 7, 8, 9)
+        submission = dispatcher.submit_targets(
+            (0, 0, 0, 0, 45, 0, None, None, None),
+            actual,
+            self.profile,
+        )
+        collect_events_until_idle(dispatcher)
+
+        self.assertEqual(
+            submission.target,
+            (0.0, 0.0, 0.0, 0.0, 45.0, 0.0, 7.0, 8.0, 9.0),
+        )
+        self.assertEqual(len(commands), 1)
+        self.assertTrue(
+            commands[0].startswith("RJA0B0C0D0E45F0J77J88J99")
+        )
 
     def test_uses_latest_confirmed_position_before_tk_consumes_event(self):
         commands = []

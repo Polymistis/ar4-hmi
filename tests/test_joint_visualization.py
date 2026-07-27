@@ -211,9 +211,9 @@ class SliderMarkerGeometryTests(unittest.TestCase):
             20,
         )
 
-        self.assertEqual(lower, (20.0, 30.0, 18))
-        self.assertEqual(middle, (110.0, 30.0, 18))
-        self.assertEqual(upper, (200.0, 30.0, 18))
+        self.assertEqual(lower, (20.0, 30.0, 20.0))
+        self.assertEqual(middle, (110.0, 30.0, 20.0))
+        self.assertEqual(upper, (200.0, 30.0, 20.0))
         self.assertEqual(descending_lower, lower)
         self.assertEqual(descending_upper, upper)
 
@@ -432,8 +432,8 @@ class GhostSliderMarkerTests(unittest.TestCase):
                 "x": 110,
                 "y": 30,
                 "anchor": "center",
-                "width": 3,
-                "height": 18,
+                "width": 7,
+                "height": 20,
             }],
         )
         self.assertEqual(marker._marker.lift_count, 1)

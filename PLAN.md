@@ -562,6 +562,51 @@ Implemented evidence:
   display-capable test hosts; the test skips explicitly when no Tk display
   exists.
 
+### M4A6 - Main-control workspace and named positions
+
+Status: `Tested`
+
+Control contract:
+
+- Joint, Cartesian, and Tool Frame controls occupy separate tabs in the main
+  control workspace. J1-J6 use one vertical stack so every joint receives the
+  full available slider width.
+- Cartesian controls use matching vertical current-position and jog rows.
+  Cartesian sliders remain unavailable because the reachable Cartesian set is
+  configuration-dependent and cannot be represented by independent fixed axis
+  bounds.
+- Tool Frame controls use matching vertical relative-jog rows. Absolute sliders
+  remain unavailable because tool-frame jog represents signed displacement
+  along the moving tool axes rather than an absolute tool-frame position.
+- The estimated joint marker uses a wider bright-cyan body and contrasting
+  outline while retaining pointer forwarding and desired-slider interaction.
+- `Start Position` submits the canonical post-calibration J1-J6 target
+  `(0, 0, 0, 0, 45, 0)`.
+- `Shutdown Position` keeps J3-J6 at the canonical start values and derives the
+  J1/J2 calibration-switch coordinates from each calibrated direction, joint
+  limits, software calibration offset, and the paired Teensy firmware base
+  offset. Invalid or out-of-range configuration rejects before motion
+  admission.
+- Both named positions enter the semantic joint dispatcher as one partial
+  multi-axis absolute target. J7-J9 remain unchanged, an active joint move
+  retains only the latest named target, and unrelated owned motion retains the
+  complete named target for later dispatch from confirmed controller state.
+
+Acceptance criteria:
+
+- Main-control coordinate tabs and vertical axis ordering have source-contract
+  coverage without importing the application entry point.
+- Start and shutdown targets are validated against active calibration before
+  online or offline admission.
+- Host calibration base offsets remain source-checked against the paired
+  Teensy firmware constants, and the start target remains checked against
+  `Home.ar4`.
+- Atomic partial-target submission, deferred-target replacement, external-axis
+  preservation, slider-marker geometry, and pointer routing have deterministic
+  hardware-free coverage.
+- Live-arm verification remains a separate M5 procedure and is not inferred
+  from HMI rendering or mocked transport results.
+
 ### M4B - Repeatability and dynamic interception pass
 
 Status: `Proposed`
