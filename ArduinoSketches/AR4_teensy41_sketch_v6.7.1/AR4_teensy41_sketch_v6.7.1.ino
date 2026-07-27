@@ -5146,9 +5146,9 @@ void loop() {
         J4zeroStep, J5zeroStep, J6zeroStep,
         J7zeroStep, J8zeroStep, J9zeroStep,
       };
-      int stagedMasterSteps[9];
-      int stagedCenterSteps[9];
-      int stagedJointFiveSteps[9];
+      int stagedMasterSteps[9] = {};
+      int stagedCenterSteps[9] = {};
+      int stagedJointFiveSteps[9] = {};
       int32_t stagedPrimaryHomeReference[
         ar4_protocol::kPrimaryHomeReferenceAxisCount
       ] = {};

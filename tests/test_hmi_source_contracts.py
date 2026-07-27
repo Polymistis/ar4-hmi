@@ -13766,8 +13766,54 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertRegex(
             calibration_handler,
             (
+                r"if\s*\(\s*"
+                r"!ar4_protocol::field_boundaries_cover_command\s*\(\s*"
+                r"inData\.length\(\)\s*,\s*positions\s*\)\s*"
+                r"\|\|\s*!parse_int_marker_fields\s*\(\s*"
+                r"inData\s*,\s*positions\s*,\s*requested\s*\)\s*"
+                r"\|\|\s*!ar4_protocol::values_are_binary\s*\(\s*"
+                r"requested\s*\)\s*"
+                r"\|\|\s*!parse_float_marker_fields\s*\(\s*"
+                r"inData\s*,\s*positions\s*\+\s*9\s*,\s*"
+                r"calibrationOffsets\s*\)\s*\)"
+            )
+            + fail_closed_calibration_body,
+        )
+        self.assertRegex(
+            calibration_handler,
+            r"if\s*\(\s*!hasRequestedAxis\s*\)"
+            + fail_closed_calibration_body,
+        )
+        for staged_steps in (
+            "stagedMasterSteps",
+            "stagedCenterSteps",
+            "stagedJointFiveSteps",
+        ):
+            self.assertRegex(
+                calibration_handler,
+                rf"int\s+{staged_steps}\s*\[\s*9\s*\]\s*=\s*\{{\s*\}};",
+            )
+        calibration_reference_loop = (
+            r"for\s*\(\s*int\s+axis\s*=\s*0\s*;\s*"
+            r"axis\s*<\s*9\s*;\s*\+\+axis\s*\)\s*\{\s*"
+        )
+        self.assertRegex(
+            calibration_handler,
+            calibration_reference_loop
+            + (
                 r"if\s*\(\s*!ar4_protocol::calibration_reference_steps"
-                r"\s*\([\s\S]*?stagedJointFiveSteps\[axis\]\s*\)\s*\)"
+                r"\s*\(\s*Jreq\[axis\]\s*,\s*"
+                r"calibrationDirections\[axis\]\s*,\s*"
+                r"positiveLimits\[axis\]\s*,\s*"
+                r"negativeLimits\[axis\]\s*,\s*"
+                r"stepsPerUnit\[axis\]\s*,\s*"
+                r"JStepLim\[axis\]\s*,\s*"
+                r"baseOffsets\[axis\]\s*,\s*"
+                r"calibrationOffsets\[axis\]\s*,\s*"
+                r"axis\s*==\s*4\s*,\s*"
+                r"stagedMasterSteps\[axis\]\s*,\s*"
+                r"stagedCenterSteps\[axis\]\s*,\s*"
+                r"stagedJointFiveSteps\[axis\]\s*\)\s*\)"
             )
             + fail_closed_calibration_body,
         )
@@ -13824,6 +13870,24 @@ class HmiSourceContractTests(unittest.TestCase):
         backoff = calibration_handler.index("if (!backOff(")
         step_monitor_commit = calibration_handler.index(
             "int *stepMonitors[9]"
+        )
+        parse_validation = calibration_handler.index(
+            "!ar4_protocol::field_boundaries_cover_command"
+        )
+        calibration_reference_validation = calibration_handler.index(
+            "!ar4_protocol::calibration_reference_steps"
+        )
+        home_reference_validation = calibration_handler.index(
+            "!ar4_protocol::primary_home_reference_millidegrees"
+        )
+        self.assertLess(parse_validation, guarded_limit_searches[0])
+        self.assertLess(
+            calibration_reference_validation,
+            guarded_limit_searches[0],
+        )
+        self.assertLess(
+            home_reference_validation,
+            guarded_limit_searches[0],
         )
         self.assertLess(
             reference_invalidation_helper,
@@ -13885,7 +13949,11 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertLess(reference_commit_helper, reference_commit)
         self.assertLess(reference_commit, terminal_response)
 
-        for command in ("UP", "SP"):
+        invalidation_terminals = {
+            "UP": "if (!robot_set_AR())",
+            "SP": 'Serial.println("Done");',
+        }
+        for command, terminal_marker in invalidation_terminals.items():
             handler_start = firmware_source.index(
                 f'if (function == "{command}")'
             )
@@ -13893,26 +13961,25 @@ class HmiSourceContractTests(unittest.TestCase):
                 "//-----COMMAND",
                 handler_start + 1,
             )
-            self.assertIn(
-                "invalidate_primary_home_reference",
-                firmware_source[handler_start:next_handler],
+            handler = firmware_source[handler_start:next_handler]
+            self.assertRegex(
+                handler,
+                (
+                    r"ar4_protocol::invalidate_primary_home_reference"
+                    r"\s*\(\s*invalidatedHomeReference\s*\)\s*;"
+                ),
             )
-        update_handler_start = firmware_source.index(
-            'if (function == "UP")'
-        )
-        update_handler_end = firmware_source.index(
-            '//-----COMMAND CALIBRATE EXTERNAL AXIS',
-            update_handler_start,
-        )
-        update_handler = firmware_source[
-            update_handler_start:update_handler_end
-        ]
-        self.assertLess(
-            update_handler.index(
+            invalidation = handler.index(
+                "ar4_protocol::invalidate_primary_home_reference("
+            )
+            write_back = handler.index(
                 "primaryHomeReference = invalidatedHomeReference;"
-            ),
-            update_handler.index("if (!robot_set_AR())"),
-        )
+            )
+            self.assertLess(
+                invalidation,
+                write_back,
+            )
+            self.assertLess(write_back, handler.index(terminal_marker))
 
     def test_named_position_online_route_preserves_external_axes(self):
         actual = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 7.0, 8.0, 9.0)
