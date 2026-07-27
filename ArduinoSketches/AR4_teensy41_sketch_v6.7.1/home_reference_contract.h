@@ -16,21 +16,23 @@ struct PrimaryHomeReferenceState {
   int32_t millidegrees[kPrimaryHomeReferenceAxisCount];
 };
 
-inline void invalidate_primary_home_reference_axis(
+inline bool invalidate_primary_home_reference_axis(
   PrimaryHomeReferenceState &state,
   size_t axis
 ) {
-  if (axis >= kPrimaryHomeReferenceAxisCount) return;
+  if (axis >= kPrimaryHomeReferenceAxisCount) return false;
   state.valid[axis] = false;
   state.millidegrees[axis] = 0;
+  return true;
 }
 
-inline void invalidate_primary_home_reference(
+inline bool invalidate_primary_home_reference(
   PrimaryHomeReferenceState &state
 ) {
   for (size_t axis = 0; axis < kPrimaryHomeReferenceAxisCount; ++axis) {
-    invalidate_primary_home_reference_axis(state, axis);
+    if (!invalidate_primary_home_reference_axis(state, axis)) return false;
   }
+  return true;
 }
 
 inline bool primary_home_reference_millidegrees(
@@ -56,14 +58,15 @@ inline bool primary_home_reference_millidegrees(
   return true;
 }
 
-inline void set_primary_home_reference(
+inline bool set_primary_home_reference(
   PrimaryHomeReferenceState &state,
   size_t axis,
   int32_t millidegrees
 ) {
-  if (axis >= kPrimaryHomeReferenceAxisCount) return;
+  if (axis >= kPrimaryHomeReferenceAxisCount) return false;
   state.valid[axis] = true;
   state.millidegrees[axis] = millidegrees;
+  return true;
 }
 
 inline bool build_primary_home_reference_response(

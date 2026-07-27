@@ -2246,10 +2246,19 @@ bool driveLimit(
   float SpeedVal
 ) {
 
+  if (
+    !isfinite(SpeedVal)
+    || !isfinite(minSpeedDelay)
+    || SpeedVal <= 0.0f
+    || minSpeedDelay <= 0.0f
+  ) {
+    return false;
+  }
   const unsigned long DEBOUNCE_US = 3000;  // 3 ms
   unsigned long firstHighUs[numJoints] = { 0 };
 
   int calcStepGap = minSpeedDelay / (SpeedVal / 100);
+  if (calcStepGap <= 0) return false;
 
   // Define arrays for calibration directions, motor directions, and direction pins
   const uint8_t limitSensor[numJoints] = { HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH };
@@ -4454,6 +4463,15 @@ void loop() {
           return;
         }
       }
+      ar4_protocol::PrimaryHomeReferenceState invalidatedHomeReference =
+        primaryHomeReference;
+      if (!ar4_protocol::invalidate_primary_home_reference(
+          invalidatedHomeReference
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
       Robot_Kin_Tool[0] = stagedTool[0];
       Robot_Kin_Tool[1] = stagedTool[1];
       Robot_Kin_Tool[2] = stagedTool[2];
@@ -4537,14 +4555,12 @@ void loop() {
       J5zeroStep = stagedZeroSteps[4];
       J6zeroStep = stagedZeroSteps[5];
 
+      primaryHomeReference = invalidatedHomeReference;
       if (!robot_set_AR()) {
         Serial.println("ER");
         consume_current_command();
         return;
       }
-      ar4_protocol::invalidate_primary_home_reference(
-        primaryHomeReference
-      );
       Serial.print("Done");
     }
 
@@ -4926,6 +4942,15 @@ void loop() {
         consume_current_command();
         return;
       }
+      ar4_protocol::PrimaryHomeReferenceState invalidatedHomeReference =
+        primaryHomeReference;
+      if (!ar4_protocol::invalidate_primary_home_reference(
+          invalidatedHomeReference
+      )) {
+        Serial.println("ER");
+        consume_current_command();
+        return;
+      }
       J1StepM = stagedStepMonitors[0];
       J2StepM = stagedStepMonitors[1];
       J3StepM = stagedStepMonitors[2];
@@ -4935,9 +4960,7 @@ void loop() {
       J7StepM = stagedStepMonitors[6];
       J8StepM = stagedStepMonitors[7];
       J9StepM = stagedStepMonitors[8];
-      ar4_protocol::invalidate_primary_home_reference(
-        primaryHomeReference
-      );
+      primaryHomeReference = invalidatedHomeReference;
       delay(5);
       Serial.println("Done");
     }
@@ -5176,14 +5199,21 @@ void loop() {
           JStep[i] = JStepLim[i];
         }
       }
+      ar4_protocol::PrimaryHomeReferenceState invalidatedHomeReference =
+        primaryHomeReference;
       for (size_t axis = 0; axis < 2; ++axis) {
         if (Jreq[axis] == 1) {
-          ar4_protocol::invalidate_primary_home_reference_axis(
-            primaryHomeReference,
+          if (!ar4_protocol::invalidate_primary_home_reference_axis(
+            invalidatedHomeReference,
             axis
-          );
+          )) {
+            Serial.println("ER");
+            consume_current_command();
+            return;
+          }
         }
       }
+      primaryHomeReference = invalidatedHomeReference;
 
       //DRIVE TO LIMITS FAST
       SpeedIn = 25;
@@ -5308,15 +5338,22 @@ void loop() {
         consume_current_command();
         return;
       }
+      ar4_protocol::PrimaryHomeReferenceState committedHomeReference =
+        primaryHomeReference;
       for (size_t axis = 0; axis < 2; ++axis) {
         if (Jreq[axis] == 1) {
-          ar4_protocol::set_primary_home_reference(
-            primaryHomeReference,
+          if (!ar4_protocol::set_primary_home_reference(
+            committedHomeReference,
             axis,
             stagedPrimaryHomeReference[axis]
-          );
+          )) {
+            Serial.println("ER");
+            consume_current_command();
+            return;
+          }
         }
       }
+      primaryHomeReference = committedHomeReference;
       sendRobotPos();
       inData = "";  // Clear recieved buffer
     }

@@ -2255,8 +2255,11 @@ void test_primary_home_reference_contract() {
             && second == -38200,
         "primary home-reference conversion changed millidegree rounding"
     );
-    ar4_protocol::set_primary_home_reference(state, 0, first);
-    ar4_protocol::set_primary_home_reference(state, 1, second);
+    require(
+        ar4_protocol::set_primary_home_reference(state, 0, first)
+            && ar4_protocol::set_primary_home_reference(state, 1, second),
+        "valid primary home-reference update was rejected"
+    );
     require(
         ar4_protocol::build_primary_home_reference_response(
             state,
@@ -2267,7 +2270,10 @@ void test_primary_home_reference_contract() {
         "primary home-reference response changed wire framing"
     );
 
-    ar4_protocol::invalidate_primary_home_reference_axis(state, 0);
+    require(
+        ar4_protocol::invalidate_primary_home_reference_axis(state, 0),
+        "valid primary home-reference invalidation was rejected"
+    );
     require(
         !state.valid[0]
             && state.millidegrees[0] == 0
@@ -2276,7 +2282,10 @@ void test_primary_home_reference_contract() {
         "axis-local home-reference invalidation changed another axis"
     );
 
-    ar4_protocol::invalidate_primary_home_reference(state);
+    require(
+        ar4_protocol::invalidate_primary_home_reference(state),
+        "complete primary home-reference invalidation was rejected"
+    );
     require(
         !state.valid[0]
             && !state.valid[1]
@@ -2291,6 +2300,19 @@ void test_primary_home_reference_contract() {
         )
             && first == 163800,
         "non-finite primary home reference was accepted"
+    );
+    const ar4_protocol::PrimaryHomeReferenceState preserved = state;
+    require(
+        !ar4_protocol::set_primary_home_reference(state, 2, 1)
+            && !ar4_protocol::invalidate_primary_home_reference_axis(
+                state,
+                2
+            )
+            && state.valid[0] == preserved.valid[0]
+            && state.valid[1] == preserved.valid[1]
+            && state.millidegrees[0] == preserved.millidegrees[0]
+            && state.millidegrees[1] == preserved.millidegrees[1],
+        "out-of-range primary home-reference mutation was accepted"
     );
 }
 

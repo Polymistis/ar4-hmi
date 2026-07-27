@@ -604,8 +604,11 @@ Control contract:
   calibration disposition refreshes the host reference after the host mirror
   invalidates at `LL` write commitment; a malformed reference response
   quarantines the controller, stops a multi-stage sequence, and requires
-  reconnection. Shutdown Position cannot enter the generic deferred queue while
-  an unrelated motion request can invalidate the captured controller reference.
+  reconnection. The post-calibration `HR` exchange preserves pending input so
+  an unexpected queued frame fails the owned protocol boundary instead of
+  being discarded. Shutdown Position cannot enter the generic deferred queue
+  while an unrelated motion request can invalidate the captured controller
+  reference.
 - Online named positions enter the semantic joint dispatcher as one partial
   multi-axis absolute target. J7-J9 remain unchanged, an active joint move
   retains only the latest named target, and unrelated owned motion retains the

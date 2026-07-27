@@ -1251,9 +1251,16 @@ class HmiSourceContractTests(unittest.TestCase):
             timeout,
             *,
             write_lock,
+            reset_input,
         ):
             query_calls.append(
-                (candidate_port, command, timeout, write_lock)
+                (
+                    candidate_port,
+                    command,
+                    timeout,
+                    write_lock,
+                    reset_input,
+                )
             )
             return response() if callable(response) else response
 
@@ -11697,6 +11704,7 @@ class HmiSourceContractTests(unittest.TestCase):
                     "HR\n",
                     1.0,
                     namespace["serial_write_lock"],
+                    False,
                 )
             ],
         )
@@ -13586,9 +13594,11 @@ class HmiSourceContractTests(unittest.TestCase):
             timeout,
             *,
             write_lock,
+            reset_input,
         ):
             self.assertIs(serial_port, port)
             self.assertEqual(command, "HR\n")
+            self.assertFalse(reset_input)
             return responses.pop(0)
 
         namespace.update({
@@ -13718,6 +13728,9 @@ class HmiSourceContractTests(unittest.TestCase):
         limit_search = firmware_source[
             limit_search_start:limit_search_end
         ]
+        self.assertIn("!isfinite(SpeedVal)", limit_search)
+        self.assertIn("!isfinite(minSpeedDelay)", limit_search)
+        self.assertIn("if (calcStepGap <= 0) return false;", limit_search)
         self.assertIn("limitConfirmed[i] = 1;", limit_search)
         self.assertIn("&& limitSeen[i] == 0", limit_search)
         self.assertIn(
@@ -13809,6 +13822,20 @@ class HmiSourceContractTests(unittest.TestCase):
                 "invalidate_primary_home_reference",
                 firmware_source[handler_start:next_handler],
             )
+        update_handler_start = firmware_source.index(
+            'if (function == "UP")'
+        )
+        update_handler_end = firmware_source.index(
+            '//-----COMMAND CALIBRATE EXTERNAL AXIS',
+            update_handler_start,
+        )
+        update_handler = firmware_source[
+            update_handler_start:update_handler_end
+        ]
+        self.assertLess(
+            update_handler.index("invalidate_primary_home_reference"),
+            update_handler.index("if (!robot_set_AR())"),
+        )
 
     def test_named_position_online_route_preserves_external_axes(self):
         actual = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 7.0, 8.0, 9.0)

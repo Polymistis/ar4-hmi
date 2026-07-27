@@ -449,7 +449,7 @@ class ControllerIdentity:
 
 @dataclass(frozen=True)
 class PrimaryHomeReference:
-    """Controller-reported switch coordinates for the primary parking axes."""
+    """Controller-reported J1/J2 parking-switch coordinates in degrees."""
 
     valid: Tuple[bool, bool]
     positions: Tuple[float, float]
@@ -2017,15 +2017,18 @@ def exchange_serial_line(
     control_ack_timeout_seconds=None,
     control_response_timeout_seconds=None,
     write_started_event=None,
+    reset_input=True,
 ):
     """Perform a validated newline-delimited exchange on a serial-like object.
 
-    A write-start event is set after admission and reset checks, immediately
-    before the initial serial write call.
+    A write-start event is set after admission and any requested input reset,
+    immediately before the initial serial write call.
     """
     timeout = finite_number(response_timeout_seconds, "response_timeout_seconds")
     if timeout <= 0:
         raise MotionInputError("response_timeout_seconds must be positive")
+    if not isinstance(reset_input, bool):
+        raise MotionInputError("reset_input must be boolean")
     command_bytes = _serial_command_bytes(command)
     _require_open_serial_port(serial_port)
     _validate_write_lock(write_lock)
@@ -2090,6 +2093,7 @@ def exchange_serial_line(
             control_ack_timeout,
             control_response_timeout,
             write_started_event,
+            reset_input,
         )
     except (SerialTransportQuarantinedError, SerialTransportTimeout) as exc:
         operation_error = exc
@@ -2128,14 +2132,23 @@ def _exchange_serial_line_with_timeout(
     control_ack_timeout,
     control_response_timeout,
     write_started_event,
+    reset_input,
 ):
     _set_serial_timeout(serial_port, timeout)
 
-    reset_input = getattr(serial_port, "reset_input_buffer", None)
-    if not callable(reset_input):
-        reset_input = getattr(serial_port, "flushInput", None)
-    if not callable(reset_input):
-        raise TypeError("serial connection does not support input-buffer reset")
+    reset_input_method = None
+    if reset_input:
+        reset_input_method = getattr(
+            serial_port,
+            "reset_input_buffer",
+            None,
+        )
+        if not callable(reset_input_method):
+            reset_input_method = getattr(serial_port, "flushInput", None)
+        if not callable(reset_input_method):
+            raise TypeError(
+                "serial connection does not support input-buffer reset"
+            )
 
     readline = getattr(serial_port, "readline", None)
     read_until = getattr(serial_port, "read_until", None)
@@ -2210,7 +2223,7 @@ def _exchange_serial_line_with_timeout(
             serial_port,
             command_bytes,
             write_lock,
-            reset_input=reset_input,
+            reset_input=reset_input_method,
             write_admission_check=require_initial_write_admission,
             write_started_event=(
                 initial_write_started

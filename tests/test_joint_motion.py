@@ -1949,6 +1949,29 @@ class SerialLineExchangeTests(unittest.TestCase):
         self.assertEqual(serial_port.flush_count, 1)
         self.assertEqual(serial_port.timeout, 7.5)
 
+    def test_nonresetting_exchange_preserves_input_boundary(self):
+        serial_port = FakeSerial(response=b"queued frame\n")
+
+        response = exchange_serial_line(
+            serial_port,
+            "HR\n",
+            120,
+            reset_input=False,
+        )
+
+        self.assertEqual(response, "queued frame")
+        self.assertEqual(serial_port.commands, [b"HR\n"])
+        self.assertEqual(serial_port.reset_count, 0)
+        self.assertEqual(serial_port.flush_count, 1)
+
+        with self.assertRaisesRegex(MotionInputError, "reset_input"):
+            exchange_serial_line(
+                FakeSerial(),
+                "HR\n",
+                120,
+                reset_input=1,
+            )
+
     def test_exchange_marks_write_start_before_serial_write(self):
         write_started = threading.Event()
 

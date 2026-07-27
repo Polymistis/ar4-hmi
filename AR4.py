@@ -18453,6 +18453,7 @@ def _query_primary_home_reference(serial_port):
     "HR\n",
     SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
     write_lock=serial_write_lock,
+    reset_input=False,
   )
   try:
     return parse_primary_home_reference_response(response)
