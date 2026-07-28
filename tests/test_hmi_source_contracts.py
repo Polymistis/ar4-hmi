@@ -344,6 +344,30 @@ class HmiSourceContractTests(unittest.TestCase):
 
     def compile_function(self, name, namespace, *, preserve_decorators=False):
         self.add_motion_request_dependencies(namespace)
+        namespace.setdefault("gcode_storage_state_lock", threading.Lock())
+        namespace.setdefault(
+            "controller_identity_state_lock",
+            threading.Lock(),
+        )
+        namespace.setdefault(
+            "MainControllerIdentityBinding",
+            SimpleNamespace,
+        )
+        namespace.setdefault("main_controller_identity_binding", None)
+        namespace.setdefault("joint_actual_position_source_snapshot", None)
+        resynchronization_helper = (
+            "_require_controller_position_resynchronization"
+        )
+        if (
+            name != resynchronization_helper
+            and resynchronization_helper not in namespace
+            and any(
+                isinstance(node, ast.Name)
+                and node.id == resynchronization_helper
+                for node in ast.walk(self.module_functions[name])
+            )
+        ):
+            self.compile_function(resynchronization_helper, namespace)
         main_identity_cleanup_callers = (
             "_apply_gcode_storage_result",
             "_close_failed_controller_startup",
@@ -402,7 +426,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         namespace.setdefault(
             "_finish_joint_motion_visualization",
-            lambda: True,
+            lambda preserve_actual=False: True,
         )
         namespace.setdefault(
             "set_joint_slider_positions",
@@ -8433,8 +8457,10 @@ class HmiSourceContractTests(unittest.TestCase):
             # Controller identity helpers only bind or inspect the active handle;
             # callers retain transport ownership for any associated exchange.
             "_bind_main_controller_identity": {"ser"},
+            "_bind_gcode_storage_media": {"ser"},
             "_current_main_controller_identity": {"ser"},
             "_current_gcode_storage_media": {"ser"},
+            "_current_joint_actual_position_source": {"ser"},
             "_invalidate_bound_primary_home_reference": {"ser"},
             # The failed-start activity lease and serial lock remain reserved
             # until close and cleanup release both ownership layers.
@@ -10039,11 +10065,16 @@ class HmiSourceContractTests(unittest.TestCase):
         faults = []
         virtual_updates = []
         resynchronization_required = threading.Event()
+        controller_serial = SimpleNamespace(is_open=True)
+        initial_source_token = object()
+        controller_binding = SimpleNamespace(
+            serial_port=controller_serial
+        )
         dispatcher = Dispatcher()
         namespace = {
             **widgets,
             "CAL": {},
-            "RUN": {},
+            "RUN": {"ser": controller_serial},
             "confirmed_position_generation": 4,
             "parse_position_response": parse_position_response,
             "PositionResponse": PositionResponse,
@@ -10065,6 +10096,15 @@ class HmiSourceContractTests(unittest.TestCase):
             "controller_position_resynchronization_required": (
                 resynchronization_required
             ),
+            "gcode_storage_state_lock": threading.Lock(),
+            "controller_identity_state_lock": threading.Lock(),
+            "main_controller_identity_binding": controller_binding,
+            "joint_actual_position_source_snapshot": (
+                controller_serial,
+                initial_source_token,
+            ),
+            "MainControllerIdentityBinding": SimpleNamespace,
+            "serial_transport_quarantined": lambda serial_port: False,
             "_try_set_virtual_joint_target": (
                 lambda joints: virtual_updates.append(tuple(joints)) or True
             ),
@@ -10073,8 +10113,18 @@ class HmiSourceContractTests(unittest.TestCase):
             "almStatusLab": Widget(),
             "almStatusLab2": Widget(),
         }
+        namespace["_require_controller_position_resynchronization"] = (
+            self.compile_function(
+                "_require_controller_position_resynchronization",
+                namespace,
+            )
+        )
         namespace["_invalidate_joint_motion_state"] = self.compile_function(
             "_invalidate_joint_motion_state",
+            namespace,
+        )
+        actual_source = self.compile_function(
+            "_current_joint_actual_position_source",
             namespace,
         )
         display_position = self.compile_function("displayPosition", namespace)
@@ -10084,6 +10134,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         self.assertTrue(display_position(response))
+        self.assertIs(actual_source(), initial_source_token)
         self.assertEqual(
             tuple(namespace["CAL"][key] for key in (
                 "J1AngCur", "J2AngCur", "J3AngCur", "J4AngCur", "J5AngCur",
@@ -10130,6 +10181,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 ]
 
                 self.assertFalse(display_position(malformed_response))
+                self.assertIsNone(actual_source())
 
                 self.assertEqual(namespace["CAL"], calibration_before_malformed)
                 self.assertEqual(
@@ -10160,6 +10212,12 @@ class HmiSourceContractTests(unittest.TestCase):
         dispatcher.accept = True
         self.assertTrue(display_position(response))
         self.assertFalse(resynchronization_required.is_set())
+        recovered_source_token = actual_source()
+        self.assertIs(
+            recovered_source_token,
+            namespace["joint_actual_position_source_snapshot"][1],
+        )
+        self.assertIsNot(recovered_source_token, initial_source_token)
         self.assertEqual(
             virtual_updates[-1],
             (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
@@ -10170,6 +10228,7 @@ class HmiSourceContractTests(unittest.TestCase):
         scheduled_before_limit_failure = list(scheduled)
         out_of_range_response = response.replace("A1B", "A101B", 1)
         self.assertFalse(display_position(out_of_range_response))
+        self.assertIsNone(actual_source())
         self.assertEqual(namespace["CAL"], calibration_before_limit_failure)
         self.assertEqual(
             dispatcher.positions,
@@ -10184,10 +10243,15 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(resynchronization_required.is_set())
         self.assertTrue(display_position(response))
         self.assertFalse(resynchronization_required.is_set())
+        self.assertIs(
+            actual_source(),
+            namespace["joint_actual_position_source_snapshot"][1],
+        )
 
         fault_response = response.replace("O", "OEC000000", 1)
         generation_before_fault = namespace["confirmed_position_generation"]
         self.assertTrue(display_position(fault_response))
+        self.assertIsNone(actual_source())
         self.assertEqual(
             namespace["confirmed_position_generation"],
             generation_before_fault,
@@ -10200,13 +10264,22 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(faults, ["EC000000"])
         self.assertTrue(display_position(response))
         self.assertFalse(resynchronization_required.is_set())
+        self.assertIs(
+            actual_source(),
+            namespace["joint_actual_position_source_snapshot"][1],
+        )
 
         calibration_after_fault = dict(namespace["CAL"])
         self.assertFalse(display_position("malformed response"))
+        self.assertIsNone(actual_source())
         self.assertEqual(namespace["CAL"], calibration_after_fault)
         self.assertTrue(resynchronization_required.is_set())
         self.assertTrue(display_position(response))
         self.assertFalse(resynchronization_required.is_set())
+        self.assertIs(
+            actual_source(),
+            namespace["joint_actual_position_source_snapshot"][1],
+        )
         self.assertEqual(len(virtual_updates), 4)
         self.assertEqual(namespace["confirmed_position_generation"], 9)
         self.assertEqual(scheduled, [True] * 6)
@@ -12891,11 +12964,16 @@ class HmiSourceContractTests(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 invalidations = []
                 labels = []
+                resynchronization_required = threading.Event()
 
                 def request_position():
                     if isinstance(outcome, Exception):
                         raise outcome
                     return outcome
+
+                def invalidate_joint_motion(reason):
+                    resynchronization_required.set()
+                    invalidations.append(reason)
 
                 namespace = {
                     "finite_number": finite_number,
@@ -12907,7 +12985,10 @@ class HmiSourceContractTests(unittest.TestCase):
                     ),
                     "_exchange_position_acknowledgement": lambda command: True,
                     "requestPos": request_position,
-                    "_invalidate_joint_motion_state": invalidations.append,
+                    "_invalidate_joint_motion_state": invalidate_joint_motion,
+                    "controller_position_resynchronization_required": (
+                        resynchronization_required
+                    ),
                     "logger": SimpleNamespace(exception=lambda *args: None),
                     "almStatusLab": SimpleNamespace(
                         config=lambda **kwargs: labels.append(kwargs)
@@ -14321,6 +14402,252 @@ class HmiSourceContractTests(unittest.TestCase):
             }],
         )
 
+    def test_joint_actual_source_requires_bound_trusted_controller(self):
+        class Port:
+            is_open = True
+
+        class ForbiddenStorageLock:
+            def __enter__(self):
+                raise AssertionError(
+                    "encoder source read touched G-code storage locking"
+                )
+
+            def __exit__(self, *_args):
+                return False
+
+        port = Port()
+        binding = SimpleNamespace(serial_port=port)
+        resynchronization_required = threading.Event()
+        initial_source_token = object()
+        namespace = {
+            "controller_position_resynchronization_required": (
+                resynchronization_required
+            ),
+            "gcode_storage_state_lock": ForbiddenStorageLock(),
+            "controller_identity_state_lock": threading.Lock(),
+            "main_controller_identity_binding": binding,
+            "joint_actual_position_source_snapshot": (
+                port,
+                initial_source_token,
+            ),
+            "MainControllerIdentityBinding": SimpleNamespace,
+            "RUN": {"ser": port},
+            "serial_transport_quarantined": lambda serial_port: False,
+        }
+        require_resynchronization = self.compile_function(
+            "_require_controller_position_resynchronization",
+            namespace,
+        )
+        actual_source = self.compile_function(
+            "_current_joint_actual_position_source",
+            namespace,
+        )
+
+        self.assertIs(actual_source(), initial_source_token)
+
+        self.assertTrue(require_resynchronization())
+        self.assertIsNone(actual_source())
+
+        resynchronization_required.clear()
+        replacement_source_token = actual_source()
+        self.assertIsNotNone(replacement_source_token)
+        self.assertIsNot(replacement_source_token, initial_source_token)
+
+        namespace["main_controller_identity_binding"] = None
+        namespace["joint_actual_position_source_snapshot"] = None
+        self.assertIsNone(actual_source())
+
+    def test_joint_actual_source_rejects_open_quarantined_controller(self):
+        class Port:
+            is_open = True
+
+            def close(self):
+                raise OSError("close failed")
+
+        port = Port()
+        source_token = object()
+        namespace = {
+            "controller_position_resynchronization_required": (
+                threading.Event()
+            ),
+            "joint_actual_position_source_snapshot": (
+                port,
+                source_token,
+            ),
+            "RUN": {"ser": port},
+            "serial_transport_quarantined": serial_transport_quarantined,
+        }
+        actual_source = self.compile_function(
+            "_current_joint_actual_position_source",
+            namespace,
+        )
+
+        self.assertIs(actual_source(), source_token)
+
+        with self.assertRaises(SerialTransportQuarantinedError):
+            quarantine_serial_transport(
+                port,
+                "test controller framing became uncertain",
+            )
+
+        self.assertTrue(port.is_open)
+        self.assertTrue(serial_transport_quarantined(port))
+        self.assertIsNone(actual_source())
+
+    def test_main_controller_binding_rotates_encoder_source_token(self):
+        class Port:
+            is_open = True
+
+        class ForbiddenStorageLock:
+            def __enter__(self):
+                raise AssertionError(
+                    "controller identity touched G-code storage locking"
+                )
+
+            def __exit__(self, *_args):
+                return False
+
+        port = Port()
+        identity = parse_controller_identity_response(
+            VALID_CONTROLLER_IDENTITY_RESPONSE
+        )
+        namespace = {
+            "dataclass": dataclass,
+            "Optional": Optional,
+            "ControllerIdentity": ControllerIdentity,
+            "MotionInputError": MotionInputError,
+            "GCodeStorageMediaBinding": type(
+                "GCodeStorageMediaBinding",
+                (),
+                {},
+            ),
+            "validate_controller_hardware_id": (
+                validate_controller_hardware_id
+            ),
+            "gcode_storage_state_lock": ForbiddenStorageLock(),
+            "controller_identity_state_lock": threading.Lock(),
+            "main_controller_identity_binding": None,
+            "joint_actual_position_source_snapshot": None,
+            "gcode_storage_media_binding": object(),
+            "RUN": {"ser": port},
+            "logger": SimpleNamespace(error=lambda *args: None),
+        }
+        namespace["MainControllerIdentityBinding"] = self.compile_class(
+            "MainControllerIdentityBinding",
+            namespace,
+        )
+        bind_identity = self.compile_function(
+            "_bind_main_controller_identity",
+            namespace,
+        )
+        clear_identity = self.compile_function(
+            "_clear_main_controller_identity",
+            namespace,
+        )
+
+        bind_identity(port, identity)
+        first_source_snapshot = namespace[
+            "joint_actual_position_source_snapshot"
+        ]
+        self.assertIs(first_source_snapshot[0], port)
+        first_source_token = first_source_snapshot[1]
+        self.assertIsNotNone(first_source_token)
+
+        self.assertTrue(clear_identity(port))
+        self.assertIsNone(
+            namespace["joint_actual_position_source_snapshot"]
+        )
+
+        bind_identity(port, identity)
+        replacement_source_snapshot = namespace[
+            "joint_actual_position_source_snapshot"
+        ]
+        self.assertIs(replacement_source_snapshot[0], port)
+        replacement_source_token = replacement_source_snapshot[1]
+        self.assertIsNotNone(replacement_source_token)
+        self.assertIsNot(replacement_source_token, first_source_token)
+
+    def test_controller_identity_state_uses_dedicated_memory_lock(self):
+        for function_name in (
+            "_bind_main_controller_identity",
+            "_bind_main_controller_home_reference",
+            "_clear_main_controller_identity",
+            "_current_main_controller_identity",
+            "_invalidate_bound_primary_home_reference",
+            "_bind_gcode_storage_media",
+            "_current_gcode_storage_media",
+            "_require_controller_position_resynchronization",
+        ):
+            with self.subTest(function_name=function_name):
+                referenced_names = {
+                    node.id
+                    for node in ast.walk(
+                        self.module_functions[function_name]
+                    )
+                    if isinstance(node, ast.Name)
+                }
+                self.assertIn(
+                    "controller_identity_state_lock",
+                    referenced_names,
+                )
+                self.assertNotIn(
+                    "gcode_storage_state_lock",
+                    referenced_names,
+                )
+
+        source_names = {
+            node.id
+            for node in ast.walk(
+                self.module_functions[
+                    "_current_joint_actual_position_source"
+                ]
+            )
+            if isinstance(node, ast.Name)
+        }
+        self.assertNotIn("controller_identity_state_lock", source_names)
+        self.assertNotIn("gcode_storage_state_lock", source_names)
+        self.assertIn("serial_transport_quarantined", source_names)
+
+    def test_controller_identity_writers_invalidate_source_before_transition(self):
+        def direct_lock_assignments(function_name):
+            function = self.module_functions[function_name]
+            lock_block = next(
+                node
+                for node in function.body
+                if (
+                    isinstance(node, ast.With)
+                    and isinstance(node.items[0].context_expr, ast.Name)
+                    and node.items[0].context_expr.id
+                    == "controller_identity_state_lock"
+                )
+            )
+            return [
+                target.id
+                for statement in lock_block.body
+                if isinstance(statement, ast.Assign)
+                for target in statement.targets
+                if isinstance(target, ast.Name)
+            ]
+
+        self.assertEqual(
+            direct_lock_assignments("_bind_main_controller_identity"),
+            [
+                "joint_actual_position_source_snapshot",
+                "main_controller_identity_binding",
+                "gcode_storage_media_binding",
+                "joint_actual_position_source_snapshot",
+            ],
+        )
+        self.assertEqual(
+            direct_lock_assignments("_clear_main_controller_identity"),
+            [
+                "binding",
+                "joint_actual_position_source_snapshot",
+                "media_binding",
+                "main_controller_identity_binding",
+            ],
+        )
+
     def test_joint_motion_markers_are_distinct_and_wired_to_tk_polling(self):
         for toggle_name in (
             "showEstimatedMotion",
@@ -14354,12 +14681,12 @@ class HmiSourceContractTests(unittest.TestCase):
         for assignment_name, label, toggle_name in (
             (
                 "estimatedMotionCbut",
-                "Estimated trajectory (amber)",
+                "Estimated trajectory (cyan)",
                 "showEstimatedMotion",
             ),
             (
                 "encoderTelemetryCbut",
-                "Encoder sample (cyan, J1-J6)",
+                "Encoder sample (amber, J1-J6)",
                 "showEncoderTelemetry",
             ),
         ):
@@ -14407,6 +14734,33 @@ class HmiSourceContractTests(unittest.TestCase):
                     "_refresh_joint_motion_visualization",
                 )
 
+        legend_constructor = self.module_assignments[
+            "motionTrackingLegend"
+        ].value
+        self.assertIsInstance(legend_constructor, ast.Call)
+        self.assertIsInstance(legend_constructor.func, ast.Name)
+        self.assertEqual(legend_constructor.func.id, "Label")
+        self.assertEqual(
+            tuple(argument.id for argument in legend_constructor.args),
+            ("motionTrackingFrame",),
+        )
+        legend_keywords = {
+            keyword.arg: ast.literal_eval(keyword.value)
+            for keyword in legend_constructor.keywords
+        }
+        self.assertEqual(
+            legend_keywords,
+            {
+                "text": (
+                    "Slider thumb = desired input    "
+                    "Violet bar = active move target\n"
+                    "Cyan line = command estimate    "
+                    "Amber marker = latest encoder sample"
+                ),
+                "justify": "left",
+            },
+        )
+
         visualization_assignment = self.module_assignments[
             "joint_motion_visualization"
         ]
@@ -14427,6 +14781,11 @@ class HmiSourceContractTests(unittest.TestCase):
             tuple(f"J{axis}jogslide" for axis in range(1, 10)),
         )
         for marker_keyword, axis_count, role_name in (
+            (
+                "target_markers",
+                9,
+                "TARGET_MARKER_ROLE",
+            ),
             (
                 "estimated_markers",
                 9,
@@ -14479,6 +14838,13 @@ class HmiSourceContractTests(unittest.TestCase):
             self.assertIsInstance(provider.value.value, ast.Name)
             self.assertEqual(provider.value.value.id, "RUN")
             self.assertEqual(provider.value.slice.value, toggle_name)
+
+        actual_source_provider = keywords["actual_source_provider"]
+        self.assertIsInstance(actual_source_provider, ast.Name)
+        self.assertEqual(
+            actual_source_provider.id,
+            "_current_joint_actual_position_source",
+        )
 
         poll_calls = [
             node.func.id
@@ -23023,7 +23389,9 @@ class HmiSourceContractTests(unittest.TestCase):
                 lambda target: target_display_calls.append(target)
             ),
             "_finish_joint_motion_visualization": (
-                lambda: finish_calls.append(True)
+                lambda preserve_actual: finish_calls.append(
+                    preserve_actual
+                )
             ),
             "_try_dispatch_deferred_joint_adjustments": lambda: False,
             "application_closing": Closing(),
@@ -23116,7 +23484,9 @@ class HmiSourceContractTests(unittest.TestCase):
                 lambda *args: start_calls.append(args)
             ),
             "_finish_joint_motion_visualization": (
-                lambda: finish_calls.append(True)
+                lambda preserve_actual: finish_calls.append(
+                    preserve_actual
+                )
             ),
             "_try_dispatch_deferred_joint_adjustments": lambda: False,
             "application_closing": Closing(),
@@ -23169,7 +23539,9 @@ class HmiSourceContractTests(unittest.TestCase):
                 lambda: refreshed.append(True)
             ),
             "_finish_joint_motion_visualization": (
-                lambda: finished.append(True)
+                lambda preserve_actual: finished.append(
+                    preserve_actual
+                )
             ),
             "application_closing": SimpleNamespace(is_set=lambda: True),
         }
@@ -23230,6 +23602,11 @@ class HmiSourceContractTests(unittest.TestCase):
             "displayPosition": lambda *args, **kwargs: VALID_CONTROLLER_POSITION,
             "_set_virtual_from_joint_result": fail_virtual_sync,
             "_invalidate_joint_motion_state": invalidate,
+            "_finish_joint_motion_visualization": (
+                lambda preserve_actual: sequence.append(
+                    ("finished", preserve_actual)
+                )
+            ),
             "application_closing": SimpleNamespace(is_set=lambda: True),
             "almStatusLab": first_label,
             "almStatusLab2": second_label,
@@ -23245,6 +23622,7 @@ class HmiSourceContractTests(unittest.TestCase):
                     "invalidated",
                     "completed joint motion could not update the virtual model",
                 ),
+                ("finished", False),
                 "acknowledged",
             ],
         )

@@ -256,6 +256,7 @@ from ARrobots.HMI.joint_motion import (
 from ARrobots.HMI.joint_visualization import (
   ENCODER_MARKER_ROLE,
   ESTIMATED_MARKER_ROLE,
+  TARGET_MARKER_ROLE,
   GhostSliderMarker,
   JointMotionVisualization,
   set_joint_slider_positions,
@@ -484,7 +485,9 @@ gcode_storage_pending_delete_reconciliation = None
 gcode_storage_persistent_state_loaded = False
 gcode_storage_persistent_state_error = None
 gcode_storage_state_path_override = None
+controller_identity_state_lock = threading.Lock()
 main_controller_identity_binding = None
+joint_actual_position_source_snapshot = None
 gcode_storage_media_binding = None
 gcode_view_generation = 0
 gcode_conversion_active = threading.Event()
@@ -2488,6 +2491,7 @@ def _bind_main_controller_identity(
   home_reference=None,
 ):
   global main_controller_identity_binding
+  global joint_actual_position_source_snapshot
   global gcode_storage_media_binding
 
   binding = MainControllerIdentityBinding(
@@ -2499,9 +2503,14 @@ def _bind_main_controller_identity(
     raise ConnectionError(
       "main controller changed before identity binding"
     )
-  with gcode_storage_state_lock:
+  with controller_identity_state_lock:
+    joint_actual_position_source_snapshot = None
     main_controller_identity_binding = binding
     gcode_storage_media_binding = None
+    joint_actual_position_source_snapshot = (
+      serial_port,
+      object(),
+    )
   return binding
 
 
@@ -2512,7 +2521,7 @@ def _bind_main_controller_home_reference(serial_port, home_reference):
     raise MotionInputError(
       "main controller home-reference update is invalid"
     )
-  with gcode_storage_state_lock:
+  with controller_identity_state_lock:
     binding = main_controller_identity_binding
     if (
       not isinstance(binding, MainControllerIdentityBinding)
@@ -2535,9 +2544,10 @@ def _bind_main_controller_home_reference(serial_port, home_reference):
 
 def _clear_main_controller_identity(serial_port=None):
   global main_controller_identity_binding
+  global joint_actual_position_source_snapshot
   global gcode_storage_media_binding
 
-  with gcode_storage_state_lock:
+  with controller_identity_state_lock:
     binding = main_controller_identity_binding
     if (
       serial_port is not None
@@ -2549,7 +2559,7 @@ def _clear_main_controller_identity(serial_port=None):
         "controller changed"
       )
       return False
-    main_controller_identity_binding = None
+    joint_actual_position_source_snapshot = None
     media_binding = gcode_storage_media_binding
     if (
       serial_port is None
@@ -2557,6 +2567,7 @@ def _clear_main_controller_identity(serial_port=None):
       or media_binding.serial_port is serial_port
     ):
       gcode_storage_media_binding = None
+    main_controller_identity_binding = None
   return True
 
 
@@ -2569,7 +2580,7 @@ def _require_main_controller_identity_cleanup(serial_port, context):
 
 
 def _current_main_controller_identity(serial_port=None):
-  with gcode_storage_state_lock:
+  with controller_identity_state_lock:
     binding = main_controller_identity_binding
   if not isinstance(binding, MainControllerIdentityBinding):
     return None
@@ -2592,7 +2603,7 @@ def _current_primary_home_reference(serial_port=None):
 def _invalidate_bound_primary_home_reference(serial_port):
   global main_controller_identity_binding
 
-  with gcode_storage_state_lock:
+  with controller_identity_state_lock:
     binding = main_controller_identity_binding
     if not isinstance(binding, MainControllerIdentityBinding):
       reason = "no main-controller identity is bound"
@@ -2656,21 +2667,29 @@ def _bind_gcode_storage_media(
     controller_hardware_id,
     media_id,
   )
-  with gcode_storage_state_lock:
+  with controller_identity_state_lock:
+    current_controller_binding = main_controller_identity_binding
+    if (
+      current_controller_binding is not controller_binding
+      or RUN.get('ser') is not serial_port
+      or not getattr(serial_port, "is_open", False)
+    ):
+      raise ConnectionError(
+        "G-code storage listing controller identity changed"
+      )
     gcode_storage_media_binding = binding
   return binding
 
 
 def _current_gcode_storage_media(serial_port=None):
-  with gcode_storage_state_lock:
+  with controller_identity_state_lock:
     binding = gcode_storage_media_binding
+    controller_binding = main_controller_identity_binding
   if not isinstance(binding, GCodeStorageMediaBinding):
     return None
-  controller_binding = _current_main_controller_identity(
-    binding.serial_port
-  )
   if (
-    controller_binding is None
+    not isinstance(controller_binding, MainControllerIdentityBinding)
+    or controller_binding.serial_port is not binding.serial_port
     or RUN.get('ser') is not binding.serial_port
     or not getattr(binding.serial_port, "is_open", False)
     or (serial_port is not None and binding.serial_port is not serial_port)
@@ -7501,7 +7520,7 @@ def _start_manual_motion(
     return True
 
   def require_controller_resynchronization():
-    controller_position_resynchronization_required.set()
+    _require_controller_position_resynchronization()
 
   def restore_untransmitted_preview():
     restored = apply_confirmed_pose(
@@ -14057,7 +14076,7 @@ def _invalidate_joint_motion_state(reason):
     reason = "controller state became uncertain"
   else:
     reason = reason.strip()
-  controller_position_resynchronization_required.set()
+  _require_controller_position_resynchronization()
   pending_discarded = joint_motion_dispatcher.invalidate(reason)
   deferred_discarded = deferred_joint_adjustments.pending
   _clear_deferred_joint_adjustments()
@@ -14750,13 +14769,50 @@ def _observe_joint_motion_telemetry(telemetry):
   try:
     return joint_motion_visualization.observe_actual(telemetry.joints)
   except Exception:
-    logger.exception("Unable to update actual joint-position display")
+    logger.exception("Unable to update joint encoder-sample display")
     return False
 
 
-def _finish_joint_motion_visualization():
+def _require_controller_position_resynchronization():
+  global joint_actual_position_source_snapshot
+
+  controller_position_resynchronization_required.set()
+  with controller_identity_state_lock:
+    binding = main_controller_identity_binding
+    if isinstance(binding, MainControllerIdentityBinding):
+      joint_actual_position_source_snapshot = (
+        binding.serial_port,
+        object(),
+      )
+    else:
+      joint_actual_position_source_snapshot = None
+  return True
+
+
+def _current_joint_actual_position_source():
+  snapshot = joint_actual_position_source_snapshot
+  if (
+    not isinstance(snapshot, tuple)
+    or len(snapshot) != 2
+  ):
+    return None
+  serial_port, source = snapshot
+  if (
+    controller_position_resynchronization_required.is_set()
+    or serial_port is None
+    or source is None
+    or RUN.get('ser') is not serial_port
+    or not getattr(serial_port, "is_open", False)
+    or joint_actual_position_source_snapshot is not snapshot
+    or serial_transport_quarantined(serial_port)
+  ):
+    return None
+  return source
+
+
+def _finish_joint_motion_visualization(preserve_actual=False):
   try:
-    return joint_motion_visualization.finish()
+    return joint_motion_visualization.finish(preserve_actual)
   except Exception:
     logger.exception("Unable to finish joint-motion tracking display")
     return False
@@ -15005,6 +15061,7 @@ def _start_offline_joint_motion(command):
 def _poll_joint_motion_events():
   try:
     for event in joint_motion_dispatcher.drain_events():
+      preserve_actual_position = False
       try:
         try:
           if event.kind == "started":
@@ -15040,6 +15097,9 @@ def _poll_joint_motion_events():
                 "joint response application returned an invalid position result"
             )
             if applied_position is not None:
+              preserve_actual_position = (
+                not controller_position_resynchronization_required.is_set()
+              )
               if applied_position.speed_violation:
                 pending_discarded = (
                   joint_motion_dispatcher.discard_pending_after_completion(
@@ -15053,6 +15113,7 @@ def _poll_joint_motion_events():
                     "Pending joint target discarded after a controller speed violation"
                   )
               if _set_virtual_from_joint_result(event.position) is not True:
+                preserve_actual_position = False
                 _invalidate_joint_motion_state(
                   "completed joint motion could not update the virtual model"
                 )
@@ -15088,7 +15149,14 @@ def _poll_joint_motion_events():
                 "joint response application returned an invalid position result"
               )
             if applied_position is not None:
-              _set_virtual_from_joint_result(event.position)
+              preserve_actual_position = (
+                not controller_position_resynchronization_required.is_set()
+              )
+              if _set_virtual_from_joint_result(event.position) is not True:
+                preserve_actual_position = False
+                _invalidate_joint_motion_state(
+                  "failed joint motion could not update the virtual model"
+                )
           elif event.response is not None and event.response.startswith('E'):
             _try_set_virtual_joint_target(_current_joint_positions())
             _invalidate_joint_motion_state(
@@ -15105,6 +15173,7 @@ def _poll_joint_motion_events():
           if event.pending_discarded:
             logger.warning("Pending joint target discarded because controller state is unknown")
         except Exception as exc:
+          preserve_actual_position = False
           message = f"Unable to apply joint-motion result: {exc}"
           logger.exception(message)
           _invalidate_joint_motion_state(message)
@@ -15112,7 +15181,9 @@ def _poll_joint_motion_events():
           almStatusLab2.config(text=message, style="Alarm.TLabel")
       finally:
         if event.kind not in ("started", "telemetry"):
-          _finish_joint_motion_visualization()
+          _finish_joint_motion_visualization(
+            preserve_actual_position
+          )
         event.acknowledge()
 
     if not _finish_joint_motion_request_if_idle():
@@ -18937,7 +19008,7 @@ def _restore_calibration_pose_snapshot(snapshot):
   with acknowledged_forced_position_lock:
     acknowledged_forced_position_target = snapshot.acknowledged_forced_target
   if snapshot.resynchronization_required:
-    controller_position_resynchronization_required.set()
+    _require_controller_position_resynchronization()
   else:
     controller_position_resynchronization_required.clear()
 
@@ -20478,7 +20549,6 @@ def _record_acknowledged_forced_position_target(target):
   )
   with acknowledged_forced_position_lock:
     acknowledged_forced_position_target = target
-  controller_position_resynchronization_required.set()
   _invalidate_joint_motion_state(
     "controller acknowledged a forced position; position recovery is required"
   )
@@ -24451,7 +24521,7 @@ motionTrackingFrame.grid_columnconfigure(1, weight=1)
 
 estimatedMotionCbut = Checkbutton(
   motionTrackingFrame,
-  text="Estimated trajectory (amber)",
+  text="Estimated trajectory (cyan)",
   variable=RUN['showEstimatedMotion'],
   command=_refresh_joint_motion_visualization,
 )
@@ -24463,7 +24533,7 @@ estimatedMotionCbut.grid(
 
 encoderTelemetryCbut = Checkbutton(
   motionTrackingFrame,
-  text="Encoder sample (cyan, J1-J6)",
+  text="Encoder sample (amber, J1-J6)",
   variable=RUN['showEncoderTelemetry'],
   command=_refresh_joint_motion_visualization,
 )
@@ -24471,6 +24541,24 @@ encoderTelemetryCbut.grid(
   row=0,
   column=1,
   sticky="w",
+)
+
+motionTrackingLegend = Label(
+  motionTrackingFrame,
+  text=(
+    "Slider thumb = desired input    "
+    "Violet bar = active move target\n"
+    "Cyan line = command estimate    "
+    "Amber marker = latest encoder sample"
+  ),
+  justify="left",
+)
+motionTrackingLegend.grid(
+  row=1,
+  column=0,
+  columnspan=2,
+  sticky="w",
+  pady=(2, 0),
 )
 
 namedPositionFrame = Frame(jointFrame)
@@ -25007,6 +25095,35 @@ joint_motion_visualization = JointMotionVisualization(
     J4jogslide, J5jogslide, J6jogslide,
     J7jogslide, J8jogslide, J9jogslide,
   ),
+  target_markers=(
+    GhostSliderMarker(
+      J1jogFrame, J1jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J2jogFrame, J2jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J3jogFrame, J3jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J4jogFrame, J4jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J5jogFrame, J5jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J6jogFrame, J6jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J7jogFrame, J7jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J8jogFrame, J8jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J9jogFrame, J9jogslide, TARGET_MARKER_ROLE
+    ),
+  ),
   estimated_markers=(
     GhostSliderMarker(
       J1jogFrame, J1jogslide, ESTIMATED_MARKER_ROLE
@@ -25058,6 +25175,7 @@ joint_motion_visualization = JointMotionVisualization(
   ),
   estimated_enabled_provider=RUN['showEstimatedMotion'].get,
   encoder_enabled_provider=RUN['showEncoderTelemetry'].get,
+  actual_source_provider=_current_joint_actual_position_source,
 )
 
 # Command builders (IF, SET, WAIT - reordered and aligned)

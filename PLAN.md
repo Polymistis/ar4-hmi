@@ -516,21 +516,38 @@ Display contract:
 
 - The normal J1-J9 slider thumb represents the active operator input or the
   latest accepted desired target.
-- A narrow amber marker represents the commanded coordinated-`RJ` estimate.
-  Encoder telemetry never replaces or recolors this marker.
-- A separate wide cyan marker represents only the latest validated J1-J6
-  encoder sample received during the owning `RJ` exchange. Cyan remains absent
-  before the first sample, never falls back to estimated data, and is never
-  presented for J7-J9.
+- A violet marker represents the endpoint of the coordinated `RJ` command
+  currently executing on the controller. Later coalesced input moves the
+  normal slider thumb immediately, while the violet marker remains fixed until
+  the current command settles and the retained target becomes active.
+- A narrow cyan marker represents the commanded coordinated-`RJ` estimate.
+  Encoder or terminal position feedback never replaces or recolors this
+  marker.
+- A separate wide amber marker represents only the latest validated J1-J6
+  encoder sample received through request-scoped telemetry. Amber remains
+  absent before the first validated telemetry sample, never falls back to
+  estimated, startup, terminal, or step-counter data, remains visible while
+  idle only while the same open, non-quarantined controller identity remains
+  bound, stays above overlapping target and estimate markers, and is never
+  presented for J7-J9. Controller trust or identity loss, transport quarantine,
+  and a coordinated-joint terminal result without a validated position clear
+  the retained amber display because the sample source or controller state is
+  unknown.
 - Independent controls permit estimate-only, encoder-only, combined, or
-  disabled presentation without changing the motion request.
+  disabled estimate and encoder-sample presentation without changing the
+  motion request. The active-target marker remains visible for an executing
+  coordinated move.
+- A legend identifies the normal thumb as desired input, violet as the active
+  move target, cyan as the command estimate, and amber as the latest encoder
+  sample.
 - The estimate follows the controller's calibrated step conversion,
   synchronized high-step progression, and acceleration, cruise, and
   deceleration timing envelope.
-- Controllers without `JOINT_TELEMETRY_V1` report joint position only in the
-  terminal response and can display only the amber estimate. Telemetry-capable
-  controllers emit request-scoped interim samples that never advance confirmed
-  calibration state.
+- Controllers without `JOINT_TELEMETRY_V1` expose no encoder-sample marker.
+  Startup and terminal position responses continue to update confirmed host
+  state and normal sliders but never populate the amber channel.
+  Telemetry-capable controllers emit request-scoped interim samples that never
+  advance confirmed calibration state.
 - Terminal position feedback remains authoritative for confirmed state and
   reconciles every idle normal slider. An actively dragged slider retains
   operator input until pointer release. Faults or unavailable estimates hide
@@ -546,10 +563,15 @@ Acceptance criteria:
 - J1-J9 desired targets remain interactive while an accepted coordinated move
   owns the serial interface.
 - Marker updates run only on the Tk event thread and perform no serial I/O,
-  sleeps, or worker waits.
+  sleeps, persistence-lock acquisition, or worker waits. The source check reads
+  an immutable in-memory controller snapshot without taking the controller
+  identity mutation lock.
 - Deterministic hardware-free tests cover step-derived duration, synchronized
   multi-axis interpolation, terminal clamping, toggle behavior, desired-target
-  preservation, active-drag preservation, and marker geometry.
+  preservation, fixed active-target presentation during coalesced input,
+  persistent same-controller encoder samples, source-loss invalidation,
+  active-drag preservation, marker geometry, and deterministic
+  target-below-estimate-below-encoder layering.
 - Live-arm comparison is recorded separately; hardware-free telemetry fixtures
   do not establish physical encoder accuracy, cadence, or motion-timing impact.
 
@@ -559,20 +581,27 @@ Implemented evidence:
   calibration conversion, coordinated step timing, and average
   pulse-distribution overhead without reading or mutating Tk state.
 - A Tk-thread visualization owner updates the J1-J9 estimate markers and
-  separate J1-J6 encoder markers from the existing joint-motion poll, preserves
-  active pointer drags and coalesced desired targets across delayed worker
-  events, uses the worker's monotonic dispatch timestamp, and never substitutes
-  one marker channel for the other.
-- The complete Windows and Ubuntu hardware-free suites pass. Tracked marker
-  tests exercise distinct styling, independent channel selection, encoder
-  absence before telemetry, complementary marker geometry, change-driven
-  deterministic amber-above-cyan layering, shared pointer forwarding, drag
-  preservation, redraw suppression, and cleanup without opening the
-  application entry point or a serial transport. A mapped real-Tk integration
-  test verifies actual amber-versus-cyan sibling stacking, reassertion after a
-  changed cyan placement, overlay cleanup from a grid-managed scale, and the
-  global release binding shared by sibling widgets on display-capable test
-  hosts; the test skips explicitly when no Tk display exists.
+  active-target markers plus separate J1-J6 encoder-sample markers from the
+  existing joint-motion poll, preserves active pointer drags and coalesced
+  desired targets across delayed worker events, retains the active command
+  endpoint independently from newer desired input, binds retained samples to
+  an open, non-quarantined controller source, reads an atomic source snapshot
+  independent of G-code persistence locking, uses the worker's monotonic
+  dispatch timestamp, and never substitutes one marker channel for another.
+- The complete Windows hardware-free suite passes. Ubuntu verification of the
+  expanded target, estimate, and encoder marker unit remains pending. Tracked
+  marker tests exercise distinct styling, independent estimate and encoder
+  selection, encoder-sample absence before validated telemetry, persistent
+  same-source idle display, source-loss and open-quarantine invalidation,
+  dedicated identity-lock isolation, complementary marker geometry, fixed
+  active targets during queued input, change-driven
+  deterministic amber-above-cyan-above-violet layering, shared pointer
+  forwarding, drag preservation, redraw suppression, and cleanup without
+  opening the application entry point or a serial transport. A mapped real-Tk
+  integration test verifies sibling stacking, explicit layer reassertion,
+  overlay cleanup from a grid-managed scale, and the global release binding
+  shared by sibling widgets on display-capable test hosts; the test skips
+  explicitly when no Tk display exists.
 
 ### M4A6 - Main-control workspace and named positions
 
@@ -590,9 +619,11 @@ Control contract:
 - Tool Frame controls use matching vertical relative-jog rows. Absolute sliders
   remain unavailable because tool-frame jog represents signed displacement
   along the moving tool axes rather than an absolute tool-frame position.
-- The encoder marker uses a wide bright-cyan body while the estimated marker
-  uses a narrow amber body. Both retain contrasting outlines, deterministic
-  stacking, pointer forwarding, and desired-slider interaction.
+- The encoder-sample marker uses a wide amber body while the estimated marker
+  uses a narrow bright-cyan body. A shallow violet active-target marker
+  distinguishes the executing endpoint from newer desired input. All markers
+  retain contrasting outlines, deterministic stacking, pointer forwarding,
+  and desired-slider interaction.
 - `Start Position` submits the canonical post-calibration J1-J6 target
   `(0, 0, 0, 0, 45, 0)`.
 - `Shutdown Position` keeps J3-J6 at the canonical start values and uses the
@@ -651,8 +682,10 @@ Protocol contract:
 - `JOINT_TELEMETRY_V1` is optional. A connected controller must advertise the
   capability before the host appends `T1` to a coordinated `RJ` command.
   Controllers without the capability retain the estimator-only path.
-- `T1` is request-scoped. No telemetry persists after the owning `RJ` exchange,
-  and no other motion opcode can enable the stream.
+- `T1` is request-scoped. Telemetry acquisition stops after the owning `RJ`
+  exchange, and no other motion opcode can enable the stream. The HMI may
+  retain the latest validated sample only while the same open,
+  non-quarantined controller identity remains bound.
 - The Teensy samples the encoder-backed primary joints at a ten-hertz target
   cadence and emits one bounded ASCII frame containing signed J1-J6
   millidegrees. J7-J9 have no matching encoder source and remain command
@@ -720,6 +753,8 @@ Research direction:
 - Future-state prediction and reachable intercept selection.
 - Global planning plus fast local replanning or visual servo control.
 - Synchronized velocity, acceleration, and jerk constrained trajectory generation.
+- Measured acceleration and deceleration profile tuning from controller traces
+  before changing the current motion curves.
 - A non-blocking controller interface supporting replaceable setpoints, state feedback, hold, cancel, watchdog, and fault states.
 
 Acceptance criteria:
@@ -800,8 +835,15 @@ Known M5 deviations:
   accepted submissions resume confirmed-position display updates, and
   cancelled or abandoned edits restore the latest confirmed position.
 - Negotiated `JOINT_TELEMETRY_V1` coordinated-joint exchanges demultiplex
-  request-scoped J1-J6 encoder samples into a dedicated cyan Tk overlay while
-  the amber J1-J9 command estimate remains separate. Samples are dropped under
+  request-scoped J1-J6 encoder samples into a dedicated amber Tk overlay while
+  the cyan J1-J9 command estimate and violet active target remain separate.
+  The amber marker may retain the latest encoder sample while idle only while
+  the same open, non-quarantined controller identity remains bound; startup and
+  terminal step-counter positions never populate that channel. The retained
+  sample clears on controller trust, identity, or quarantine loss and when a
+  coordinated-joint terminal result cannot validate controller position.
+  Source reads use an immutable snapshot without controller or persistence
+  locking and cannot wait on G-code persistence. Samples are dropped under
   firmware USB backpressure, never update confirmed host state, and never
   create a J7-J9 encoder marker. Hardware timing and encoder accuracy remain
   unverified.

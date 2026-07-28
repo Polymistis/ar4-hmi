@@ -16,6 +16,9 @@ from ARrobots.HMI.joint_visualization import (
     ESTIMATED_MARKER_COLOR,
     ESTIMATED_MARKER_ROLE,
     ESTIMATED_MARKER_WIDTH,
+    TARGET_MARKER_COLOR,
+    TARGET_MARKER_ROLE,
+    TARGET_MARKER_WIDTH,
     GhostSliderMarker,
     JointMotionVisualization,
     _SLIDER_DRAG_ATTRIBUTE,
@@ -317,6 +320,11 @@ class GhostSliderMarkerTests(unittest.TestCase):
                 slider,
                 ENCODER_MARKER_ROLE,
             )
+            target_marker = GhostSliderMarker(
+                parent,
+                slider,
+                TARGET_MARKER_ROLE,
+            )
             # Tk drops synthetic pointer events for withdrawn widgets; a
             # one-pixel override-redirect root keeps a mapped event surface
             # without presenting a normal window.
@@ -325,11 +333,16 @@ class GhostSliderMarkerTests(unittest.TestCase):
             root.deiconify()
             root.update()
 
-            self.assertTrue(encoder_marker.show(25))
+            self.assertTrue(target_marker.show(25))
             self.assertTrue(estimated_marker.show(25))
+            self.assertTrue(encoder_marker.show(25))
             root.update()
 
             self.assertEqual(slider.winfo_manager(), "grid")
+            self.assertEqual(
+                target_marker._marker.winfo_manager(),
+                "place",
+            )
             self.assertEqual(
                 estimated_marker._marker.winfo_manager(),
                 "place",
@@ -341,21 +354,32 @@ class GhostSliderMarkerTests(unittest.TestCase):
             children = parent.winfo_children()
             self.assertGreater(
                 children.index(estimated_marker._marker),
-                children.index(encoder_marker._marker),
+                children.index(target_marker._marker),
             )
-            self.assertTrue(encoder_marker.show(50))
-            root.update()
-            children = parent.winfo_children()
             self.assertGreater(
                 children.index(encoder_marker._marker),
                 children.index(estimated_marker._marker),
+            )
+            self.assertTrue(target_marker.show(50))
+            root.update()
+            children = parent.winfo_children()
+            self.assertGreater(
+                children.index(target_marker._marker),
+                children.index(encoder_marker._marker),
             )
             self.assertTrue(estimated_marker.raise_above())
             root.update()
             children = parent.winfo_children()
             self.assertGreater(
                 children.index(estimated_marker._marker),
+                children.index(target_marker._marker),
+            )
+            self.assertTrue(encoder_marker.raise_above())
+            root.update()
+            children = parent.winfo_children()
+            self.assertGreater(
                 children.index(encoder_marker._marker),
+                children.index(estimated_marker._marker),
             )
             self.assertTrue(root.bind_all("<ButtonRelease-1>"))
             setattr(slider, _SLIDER_DRAG_ATTRIBUTE, True)
@@ -463,9 +487,14 @@ class GhostSliderMarkerTests(unittest.TestCase):
             self.assertFalse(
                 getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
             )
+            self.assertTrue(target_marker.hide())
             self.assertTrue(estimated_marker.hide())
             self.assertTrue(encoder_marker.hide())
             root.update_idletasks()
+            self.assertEqual(
+                target_marker._marker.winfo_manager(),
+                "",
+            )
             self.assertEqual(
                 estimated_marker._marker.winfo_manager(),
                 "",
@@ -547,6 +576,11 @@ class GhostSliderMarkerTests(unittest.TestCase):
                 slider,
                 ENCODER_MARKER_ROLE,
             )
+            target = GhostSliderMarker(
+                object(),
+                slider,
+                TARGET_MARKER_ROLE,
+            )
 
         self.assertEqual(
             estimated._marker.options["background"],
@@ -556,8 +590,21 @@ class GhostSliderMarkerTests(unittest.TestCase):
             encoder._marker.options["background"],
             ENCODER_MARKER_COLOR,
         )
+        self.assertEqual(
+            target._marker.options["background"],
+            TARGET_MARKER_COLOR,
+        )
+        self.assertTrue(target.show(0))
         self.assertTrue(encoder.show(0))
         self.assertTrue(estimated.show(0))
+        self.assertEqual(
+            target._marker.placements[-1]["width"],
+            TARGET_MARKER_WIDTH,
+        )
+        self.assertEqual(
+            target._marker.placements[-1]["height"],
+            5,
+        )
         self.assertEqual(
             encoder._marker.placements[-1]["width"],
             ENCODER_MARKER_WIDTH,
@@ -574,8 +621,10 @@ class GhostSliderMarkerTests(unittest.TestCase):
             estimated._marker.placements[-1]["height"],
             20,
         )
+        self.assertTrue(target.raise_above())
         self.assertTrue(encoder.raise_above())
         self.assertTrue(estimated.raise_above())
+        self.assertEqual(target._marker.lift_count, 2)
         self.assertEqual(encoder._marker.lift_count, 2)
         self.assertEqual(estimated._marker.lift_count, 2)
         self.assertEqual(
@@ -676,17 +725,21 @@ class GhostSliderMarkerTests(unittest.TestCase):
 class JointMotionVisualizationTests(unittest.TestCase):
     def setUp(self):
         self.sliders = [FakeSlider() for _ in range(9)]
+        self.target_markers = [FakeMarker() for _ in range(9)]
         self.estimated_markers = [FakeMarker() for _ in range(9)]
         self.encoder_markers = [FakeMarker() for _ in range(6)]
         self.estimated_enabled = {"value": 1}
         self.encoder_enabled = {"value": 1}
+        self.actual_source = {"value": object()}
         self.clock = {"value": 10.0}
         self.visualization = JointMotionVisualization(
             self.sliders,
+            self.target_markers,
             self.estimated_markers,
             self.encoder_markers,
             lambda: self.estimated_enabled["value"],
             lambda: self.encoder_enabled["value"],
+            lambda: self.actual_source["value"],
             clock=lambda: self.clock["value"],
         )
 
@@ -708,10 +761,19 @@ class JointMotionVisualizationTests(unittest.TestCase):
             tuple(marker.value for marker in self.estimated_markers),
             (0.0,) * 9,
         )
+        self.assertEqual(
+            tuple(marker.value for marker in self.target_markers),
+            trajectory.target_positions,
+        )
+        self.assertTrue(
+            all(marker.visible for marker in self.target_markers)
+        )
         self.assertFalse(
             any(marker.visible for marker in self.encoder_markers)
         )
 
+        later_target = (30, 8, 6, 4, 2, 0, 7, 8, 9)
+        self.visualization.set_desired(later_target)
         self.clock["value"] += trajectory.duration_seconds / 2
         positions = self.visualization.refresh()
 
@@ -719,7 +781,11 @@ class JointMotionVisualizationTests(unittest.TestCase):
         self.assertAlmostEqual(positions[1], -2.5)
         self.assertEqual(
             tuple(slider.value for slider in self.sliders),
-            tuple(float(value) for value in queued_target),
+            tuple(float(value) for value in later_target),
+        )
+        self.assertEqual(
+            tuple(marker.value for marker in self.target_markers),
+            trajectory.target_positions,
         )
 
     def test_worker_timestamp_accounts_for_tk_poll_delay(self):
@@ -768,7 +834,7 @@ class JointMotionVisualizationTests(unittest.TestCase):
             all(marker.visible for marker in self.encoder_markers)
         )
 
-    def test_dual_marker_layering_tracks_changes_and_reenable(self):
+    def test_actual_marker_reasserts_topmost_layer_after_estimate_moves(self):
         trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
         self.clock["value"] += trajectory.duration_seconds / 2
         self.assertTrue(
@@ -779,18 +845,16 @@ class JointMotionVisualizationTests(unittest.TestCase):
 
         self.assertEqual(
             tuple(
-                marker.raise_count
-                for marker in self.estimated_markers[:6]
+                marker.raise_count for marker in self.encoder_markers
             ),
-            (1,) * 6,
+            (0,) * 6,
         )
         self.visualization.refresh()
         self.assertEqual(
             tuple(
-                marker.raise_count
-                for marker in self.estimated_markers[:6]
+                marker.raise_count for marker in self.encoder_markers
             ),
-            (1,) * 6,
+            (0,) * 6,
         )
 
         self.encoder_enabled["value"] = 0
@@ -799,20 +863,43 @@ class JointMotionVisualizationTests(unittest.TestCase):
         self.visualization.refresh()
         self.assertEqual(
             tuple(
-                marker.raise_count
-                for marker in self.estimated_markers[:6]
+                marker.raise_count for marker in self.encoder_markers
             ),
-            (2,) * 6,
+            (0,) * 6,
         )
 
         self.clock["value"] += trajectory.duration_seconds / 10
         self.visualization.refresh()
         self.assertEqual(
             tuple(
-                marker.raise_count
-                for marker in self.estimated_markers[:6]
+                marker.raise_count for marker in self.encoder_markers
             ),
-            (3, 3, 2, 2, 2, 2),
+            (1, 1, 0, 0, 0, 0),
+        )
+
+    def test_estimate_reasserts_above_a_restored_target_marker(self):
+        self.visualization.start((0,) * 9, joint_move(), 200)
+        self.assertTrue(
+            self.visualization.observe_actual((1, 2, 3, 4, 5, 6))
+        )
+        self.assertTrue(self.target_markers[0].hide())
+
+        self.visualization.refresh()
+
+        self.assertTrue(self.target_markers[0].visible)
+        self.assertEqual(
+            tuple(
+                marker.raise_count
+                for marker in self.estimated_markers
+            ),
+            (1, 0, 0, 0, 0, 0, 0, 0, 0),
+        )
+        self.assertEqual(
+            tuple(
+                marker.raise_count
+                for marker in self.encoder_markers
+            ),
+            (1, 0, 0, 0, 0, 0),
         )
 
     def test_actual_telemetry_requires_an_active_six_axis_sample(self):
@@ -827,12 +914,24 @@ class JointMotionVisualizationTests(unittest.TestCase):
                 with self.assertRaises(MotionInputError):
                     self.visualization.observe_actual(positions)
 
-    def test_new_motion_discards_prior_actual_sample(self):
+    def test_actual_telemetry_requires_a_trusted_source(self):
+        self.visualization.start((0,) * 9, joint_move(), 200)
+        self.actual_source["value"] = None
+
+        with self.assertRaisesRegex(RuntimeError, "source is unavailable"):
+            self.visualization.observe_actual((1, 2, 3, 4, 5, 6))
+
+        self.assertTrue(self.visualization.active)
+        self.assertFalse(
+            any(marker.visible for marker in self.encoder_markers)
+        )
+
+    def test_new_motion_preserves_latest_validated_actual_sample(self):
         trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
         self.assertTrue(
             self.visualization.observe_actual((1, 2, 3, 4, 5, 6))
         )
-        self.visualization.finish()
+        self.assertTrue(self.visualization.finish(True))
         self.clock["value"] += 1
 
         second = self.visualization.start((0,) * 9, joint_move(), 200)
@@ -841,24 +940,124 @@ class JointMotionVisualizationTests(unittest.TestCase):
 
         self.assertAlmostEqual(positions[0], 5.0)
         self.assertAlmostEqual(positions[1], -2.5)
+        self.assertTrue(
+            all(marker.visible for marker in self.encoder_markers)
+        )
+        self.assertEqual(
+            tuple(marker.value for marker in self.encoder_markers),
+            (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+        )
+        self.assertNotEqual(trajectory.duration_seconds, 0)
+
+    def test_idle_actual_sample_persists_and_respects_toggle(self):
+        actual = (1, 2, 3, 4, 5, 6)
+
+        self.visualization.start((0,) * 9, joint_move(), 200)
+        self.assertTrue(self.visualization.observe_actual(actual))
+        self.assertTrue(self.visualization.finish(True))
+
+        self.assertFalse(self.visualization.active)
+        self.assertTrue(
+            all(marker.visible for marker in self.encoder_markers)
+        )
+        self.assertEqual(
+            tuple(marker.value for marker in self.encoder_markers),
+            tuple(float(value) for value in actual),
+        )
+        self.assertFalse(
+            any(marker.visible for marker in self.target_markers)
+        )
+        self.assertFalse(
+            any(marker.visible for marker in self.estimated_markers)
+        )
+
+        self.encoder_enabled["value"] = 0
+        self.visualization.refresh()
         self.assertFalse(
             any(marker.visible for marker in self.encoder_markers)
         )
-        self.assertNotEqual(trajectory.duration_seconds, 0)
+
+        self.encoder_enabled["value"] = 1
+        self.visualization.refresh()
+        self.assertTrue(
+            all(marker.visible for marker in self.encoder_markers)
+        )
+
+    def test_actual_sample_clears_on_trust_or_identity_loss(self):
+        actual = (1, 2, 3, 4, 5, 6)
+        original_source = self.actual_source["value"]
+        self.visualization.start((0,) * 9, joint_move(), 200)
+        self.visualization.observe_actual(actual)
+        self.visualization.finish(True)
+
+        self.actual_source["value"] = None
+        self.visualization.refresh()
+        self.assertFalse(
+            any(marker.visible for marker in self.encoder_markers)
+        )
+
+        self.actual_source["value"] = original_source
+        self.visualization.refresh()
+        self.assertFalse(
+            any(marker.visible for marker in self.encoder_markers)
+        )
+
+        self.visualization.start((0,) * 9, joint_move(), 200)
+        self.visualization.observe_actual(actual)
+        self.visualization.finish(True)
+        self.actual_source["value"] = object()
+        self.visualization.refresh()
+        self.assertFalse(
+            any(marker.visible for marker in self.encoder_markers)
+        )
+
+    def test_finish_can_preserve_or_clear_latest_actual_position(self):
+        self.visualization.start((0,) * 9, joint_move(), 200)
+        self.visualization.observe_actual((1, 2, 3, 4, 5, 6))
+
+        self.assertTrue(self.visualization.finish(True))
+        self.assertTrue(
+            all(marker.visible for marker in self.encoder_markers)
+        )
+        self.assertFalse(
+            any(marker.visible for marker in self.target_markers)
+        )
+        self.assertFalse(
+            any(marker.visible for marker in self.estimated_markers)
+        )
+
+        self.assertTrue(self.visualization.finish(False))
+        self.assertFalse(
+            any(marker.visible for marker in self.encoder_markers)
+        )
+
+    def test_finish_rejects_non_boolean_preservation_before_mutation(self):
+        self.visualization.start((0,) * 9, joint_move(), 200)
+
+        with self.assertRaisesRegex(MotionInputError, "must be boolean"):
+            self.visualization.finish(1)
+
+        self.assertTrue(self.visualization.active)
+        self.assertTrue(
+            all(marker.visible for marker in self.target_markers)
+        )
 
     def test_toggle_hides_without_discarding_active_estimate(self):
         trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
         self.estimated_enabled["value"] = 0
 
-        self.assertIsNone(self.visualization.refresh())
+        self.assertIsNotNone(self.visualization.refresh())
         self.assertTrue(self.visualization.active)
+        self.assertTrue(
+            all(marker.visible for marker in self.target_markers)
+        )
         self.assertFalse(
             any(marker.visible for marker in self.estimated_markers)
         )
         hide_counts = tuple(
             marker.hide_count for marker in self.estimated_markers
         )
-        self.assertIsNone(self.visualization.refresh())
+        self.assertIsNotNone(self.visualization.refresh())
         self.assertEqual(
             tuple(
                 marker.hide_count
@@ -920,6 +1119,9 @@ class JointMotionVisualizationTests(unittest.TestCase):
 
         self.assertFalse(self.visualization.active)
         self.assertFalse(
+            any(marker.visible for marker in self.target_markers)
+        )
+        self.assertFalse(
             any(marker.visible for marker in self.estimated_markers)
         )
         self.assertFalse(
@@ -936,9 +1138,11 @@ class JointMotionVisualizationTests(unittest.TestCase):
         visualization = JointMotionVisualization(
             sliders,
             [FakeMarker() for _ in range(9)],
+            [FakeMarker() for _ in range(9)],
             [FakeMarker() for _ in range(6)],
             lambda: 1,
             lambda: 1,
+            object,
         )
 
         with self.assertRaisesRegex(RuntimeError, "joint slider"):
@@ -952,10 +1156,12 @@ class JointMotionVisualizationTests(unittest.TestCase):
         self.estimated_markers[2] = FakeMarker(fail_show=True)
         visualization = JointMotionVisualization(
             self.sliders,
+            self.target_markers,
             self.estimated_markers,
             self.encoder_markers,
             lambda: 1,
             lambda: 1,
+            object,
             clock=lambda: self.clock["value"],
         )
 
@@ -963,6 +1169,9 @@ class JointMotionVisualizationTests(unittest.TestCase):
             visualization.start((0,) * 9, joint_move(), 200)
 
         self.assertFalse(visualization.active)
+        self.assertFalse(
+            any(marker.visible for marker in self.target_markers)
+        )
         self.assertFalse(
             any(marker.visible for marker in self.estimated_markers)
         )
@@ -981,6 +1190,9 @@ class JointMotionVisualizationTests(unittest.TestCase):
             self.visualization.refresh()
 
         self.assertFalse(self.visualization.active)
+        self.assertFalse(
+            any(marker.visible for marker in self.target_markers)
+        )
         self.assertFalse(
             any(marker.visible for marker in self.estimated_markers)
         )
@@ -1003,6 +1215,9 @@ class JointMotionVisualizationTests(unittest.TestCase):
             self.visualization.refresh()
 
         self.assertFalse(self.visualization.active)
+        self.assertFalse(
+            any(marker.visible for marker in self.target_markers)
+        )
         self.assertFalse(
             any(marker.visible for marker in self.estimated_markers)
         )

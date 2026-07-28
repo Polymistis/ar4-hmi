@@ -1,4 +1,4 @@
-"""Tk-thread presentation for desired, estimated, and encoder joint positions."""
+"""Tk-thread presentation for desired, target, estimated, and actual joints."""
 
 import tkinter as tk
 import time
@@ -14,19 +14,50 @@ from ARrobots.HMI.joint_motion import (
 
 ESTIMATED_MARKER_ROLE = "estimated"
 ENCODER_MARKER_ROLE = "encoder"
-ESTIMATED_MARKER_COLOR = "#FFB000"
-ESTIMATED_MARKER_OUTLINE_COLOR = "#5C3A00"
+TARGET_MARKER_ROLE = "target"
+ESTIMATED_MARKER_COLOR = "#00D7FF"
+ESTIMATED_MARKER_OUTLINE_COLOR = "#003B49"
 ESTIMATED_MARKER_WIDTH = 3
 ESTIMATED_MARKER_HEIGHT_RATIO = 1.0
-ENCODER_MARKER_COLOR = "#00D7FF"
-ENCODER_MARKER_OUTLINE_COLOR = "#003B49"
+ESTIMATED_MARKER_MINIMUM_HEIGHT = 8
+ENCODER_MARKER_COLOR = "#FFB000"
+ENCODER_MARKER_OUTLINE_COLOR = "#5C3A00"
 ENCODER_MARKER_WIDTH = 9
 ENCODER_MARKER_HEIGHT_RATIO = 0.6
 ENCODER_MARKER_MINIMUM_HEIGHT = 8
+TARGET_MARKER_COLOR = "#D946EF"
+TARGET_MARKER_OUTLINE_COLOR = "#4A044E"
+TARGET_MARKER_WIDTH = 13
+TARGET_MARKER_HEIGHT_RATIO = 0.25
+TARGET_MARKER_MINIMUM_HEIGHT = 4
 GHOST_MARKER_MINIMUM_HEIGHT = 12
 GHOST_MARKER_MAXIMUM_HEIGHT = 24
 _SLIDER_DRAG_ATTRIBUTE = "_ar4_joint_slider_drag_active"
 _SLIDER_OVERLAY_BINDINGS_ATTRIBUTE = "_ar4_joint_overlay_bindings_installed"
+
+_MARKER_STYLES = {
+    ESTIMATED_MARKER_ROLE: (
+        ESTIMATED_MARKER_COLOR,
+        ESTIMATED_MARKER_OUTLINE_COLOR,
+        ESTIMATED_MARKER_WIDTH,
+        ESTIMATED_MARKER_HEIGHT_RATIO,
+        ESTIMATED_MARKER_MINIMUM_HEIGHT,
+    ),
+    ENCODER_MARKER_ROLE: (
+        ENCODER_MARKER_COLOR,
+        ENCODER_MARKER_OUTLINE_COLOR,
+        ENCODER_MARKER_WIDTH,
+        ENCODER_MARKER_HEIGHT_RATIO,
+        ENCODER_MARKER_MINIMUM_HEIGHT,
+    ),
+    TARGET_MARKER_ROLE: (
+        TARGET_MARKER_COLOR,
+        TARGET_MARKER_OUTLINE_COLOR,
+        TARGET_MARKER_WIDTH,
+        TARGET_MARKER_HEIGHT_RATIO,
+        TARGET_MARKER_MINIMUM_HEIGHT,
+    ),
+}
 
 
 def _fixed_items(values, expected_length, field_name):
@@ -197,24 +228,23 @@ class GhostSliderMarker:
             for method_name in required_slider_methods
         ):
             raise TypeError("slider does not satisfy the overlay contract")
-        if role == ESTIMATED_MARKER_ROLE:
-            color = ESTIMATED_MARKER_COLOR
-            outline_color = ESTIMATED_MARKER_OUTLINE_COLOR
-            width = ESTIMATED_MARKER_WIDTH
-            height_ratio = ESTIMATED_MARKER_HEIGHT_RATIO
-        elif role == ENCODER_MARKER_ROLE:
-            color = ENCODER_MARKER_COLOR
-            outline_color = ENCODER_MARKER_OUTLINE_COLOR
-            width = ENCODER_MARKER_WIDTH
-            height_ratio = ENCODER_MARKER_HEIGHT_RATIO
-        else:
+        style = _MARKER_STYLES.get(role)
+        if style is None:
             raise TypeError(
-                "ghost marker role must be 'estimated' or 'encoder'"
+                "ghost marker role must be 'target', 'estimated', or 'encoder'"
             )
+        (
+            color,
+            outline_color,
+            width,
+            height_ratio,
+            minimum_height,
+        ) = style
 
         self._slider = slider
         self._width = width
         self._height_ratio = height_ratio
+        self._minimum_height = minimum_height
         self._placement = None
         self._visible = False
         self._marker = tk.Frame(
@@ -310,7 +340,7 @@ class GhostSliderMarker:
             round(marker_y),
             self._width,
             max(
-                ENCODER_MARKER_MINIMUM_HEIGHT,
+                self._minimum_height,
                 round(marker_height * self._height_ratio),
             ),
         )
@@ -347,21 +377,28 @@ class GhostSliderMarker:
 
 
 class JointMotionVisualization:
-    """Keep commanded estimates distinct from received encoder samples."""
+    """Keep active targets, estimates, and actual samples distinct."""
 
     def __init__(
         self,
         sliders,
+        target_markers,
         estimated_markers,
         encoder_markers,
         estimated_enabled_provider,
         encoder_enabled_provider,
+        actual_source_provider,
         clock=time.monotonic,
     ):
         self._sliders = _fixed_items(
             sliders,
             JOINT_COUNT,
             "joint visualization sliders",
+        )
+        self._target_markers = _fixed_items(
+            target_markers,
+            JOINT_COUNT,
+            "target joint visualization markers",
         )
         self._estimated_markers = _fixed_items(
             estimated_markers,
@@ -384,7 +421,9 @@ class JointMotionVisualization:
             or not callable(getattr(marker, "hide", None))
             or not callable(getattr(marker, "raise_above", None))
             for marker in (
-                self._estimated_markers + self._encoder_markers
+                self._target_markers
+                + self._estimated_markers
+                + self._encoder_markers
             )
         ):
             raise TypeError("joint visualization marker contract is invalid")
@@ -396,15 +435,22 @@ class JointMotionVisualization:
             raise TypeError(
                 "encoder visualization enabled provider must be callable"
             )
+        if not callable(actual_source_provider):
+            raise TypeError(
+                "actual-position source provider must be callable"
+            )
         if not callable(clock):
             raise TypeError("joint visualization clock must be callable")
 
         self._estimated_enabled_provider = estimated_enabled_provider
         self._encoder_enabled_provider = encoder_enabled_provider
+        self._actual_source_provider = actual_source_provider
         self._clock = clock
         self._trajectory = None
         self._started_at = None
         self._actual_joint_positions = None
+        self._actual_position_source = None
+        self._target_markers_visible = False
         self._estimated_markers_visible = False
         self._encoder_markers_visible = False
 
@@ -458,6 +504,11 @@ class JointMotionVisualization:
                 "_estimated_markers_visible",
                 "estimated",
             ),
+            (
+                self._target_markers,
+                "_target_markers_visible",
+                "target",
+            ),
         ):
             try:
                 self._hide_marker_group(
@@ -491,19 +542,29 @@ class JointMotionVisualization:
     def set_desired(self, positions):
         return set_joint_slider_positions(self._sliders, positions)
 
-    def observe_actual(self, positions):
+    @staticmethod
+    def _actual_positions(positions):
         values = _fixed_items(
             positions,
             JOINT_TELEMETRY_AXIS_COUNT,
             "actual joint positions",
         )
-        normalized = tuple(
+        return tuple(
             finite_number(value, f"actual joint positions[{axis}]")
             for axis, value in enumerate(values, start=1)
         )
+
+    def observe_actual(self, positions):
+        normalized = self._actual_positions(positions)
         if self._trajectory is None:
             return False
+        source = self._actual_source_provider()
+        if source is None:
+            raise RuntimeError(
+                "actual-position source is unavailable"
+            )
         self._actual_joint_positions = normalized
+        self._actual_position_source = source
         return True
 
     def start(
@@ -528,13 +589,13 @@ class JointMotionVisualization:
         )
         self._trajectory = trajectory
         self._started_at = started_at
-        self._actual_joint_positions = None
         try:
             self.refresh()
         except Exception as exc:
             self._trajectory = None
             self._started_at = None
             self._actual_joint_positions = None
+            self._actual_position_source = None
             try:
                 self._hide_markers()
             except Exception as cleanup_exc:
@@ -545,9 +606,6 @@ class JointMotionVisualization:
         return trajectory
 
     def refresh(self):
-        if self._trajectory is None:
-            self._hide_markers()
-            return None
         try:
             estimated_enabled = self._enabled(
                 self._estimated_enabled_provider,
@@ -557,26 +615,53 @@ class JointMotionVisualization:
                 self._encoder_enabled_provider,
                 "encoder joint visualization toggle",
             )
+            actual_available = self._actual_joint_positions is not None
+            if actual_available:
+                current_source = self._actual_source_provider()
+                if (
+                    current_source is None
+                    or current_source is not self._actual_position_source
+                ):
+                    self._actual_joint_positions = None
+                    self._actual_position_source = None
+                    actual_available = False
+
+            if self._trajectory is None:
+                self._hide_marker_group(
+                    self._target_markers,
+                    "_target_markers_visible",
+                    "target",
+                )
+                self._hide_marker_group(
+                    self._estimated_markers,
+                    "_estimated_markers_visible",
+                    "estimated",
+                )
+                if (
+                    encoder_enabled
+                    and actual_available
+                ):
+                    self._show_marker_group(
+                        self._encoder_markers,
+                        self._actual_joint_positions,
+                        "_encoder_markers_visible",
+                    )
+                else:
+                    self._hide_marker_group(
+                        self._encoder_markers,
+                        "_encoder_markers_visible",
+                        "encoder",
+                    )
+                return None
 
             now = finite_number(self._clock(), "joint visualization clock")
             elapsed = max(0.0, now - self._started_at)
             estimated_positions = self._trajectory.positions_at(elapsed)
-            encoder_changes = (False,) * JOINT_TELEMETRY_AXIS_COUNT
-            if (
-                encoder_enabled
-                and self._actual_joint_positions is not None
-            ):
-                encoder_changes = self._show_marker_group(
-                    self._encoder_markers,
-                    self._actual_joint_positions,
-                    "_encoder_markers_visible",
-                )
-            else:
-                self._hide_marker_group(
-                    self._encoder_markers,
-                    "_encoder_markers_visible",
-                    "encoder",
-                )
+            target_changes = self._show_marker_group(
+                self._target_markers,
+                self._trajectory.target_positions,
+                "_target_markers_visible",
+            )
             estimated_changes = (False,) * JOINT_COUNT
             if estimated_enabled:
                 estimated_changes = self._show_marker_group(
@@ -590,32 +675,61 @@ class JointMotionVisualization:
                     "_estimated_markers_visible",
                     "estimated",
                 )
-            if (
-                estimated_enabled
-                and encoder_enabled
-                and self._actual_joint_positions is not None
-            ):
-                for axis, changed in enumerate(
-                    zip(estimated_changes, encoder_changes)
-                ):
-                    if any(changed):
-                        raised = self._estimated_markers[
-                            axis
-                        ].raise_above()
-                        if not isinstance(raised, bool) or not raised:
-                            raise RuntimeError(
-                                "visible estimated marker could not "
-                                "reassert deterministic layering"
-                            )
-            if not estimated_enabled and not (
+            encoder_changes = (False,) * JOINT_TELEMETRY_AXIS_COUNT
+            encoder_visible = (
                 encoder_enabled
-                and self._actual_joint_positions is not None
-            ):
-                return None
+                and actual_available
+            )
+            if encoder_visible:
+                encoder_changes = self._show_marker_group(
+                    self._encoder_markers,
+                    self._actual_joint_positions,
+                    "_encoder_markers_visible",
+                )
+            else:
+                self._hide_marker_group(
+                    self._encoder_markers,
+                    "_encoder_markers_visible",
+                    "encoder",
+                )
+
+            for axis, target_changed in enumerate(target_changes):
+                estimated_changed = estimated_changes[axis]
+                estimated_reasserted = False
+                if (
+                    target_changed
+                    and estimated_enabled
+                    and not estimated_changed
+                ):
+                    raised = self._estimated_markers[axis].raise_above()
+                    if not isinstance(raised, bool) or not raised:
+                        raise RuntimeError(
+                            "visible estimated marker could not "
+                            "reassert target layering"
+                        )
+                    estimated_reasserted = True
+                if axis >= JOINT_TELEMETRY_AXIS_COUNT:
+                    continue
+                encoder_changed = encoder_changes[axis]
+                if (
+                    encoder_visible
+                    and (target_changed or estimated_changed)
+                    and (
+                        not encoder_changed
+                        or estimated_reasserted
+                    )
+                ):
+                    raised = self._encoder_markers[axis].raise_above()
+                    if not isinstance(raised, bool) or not raised:
+                        raise RuntimeError(
+                            "visible encoder marker could not "
+                            "reassert topmost layering"
+                        )
         except Exception as exc:
             self._trajectory = None
             self._started_at = None
             self._actual_joint_positions = None
+            self._actual_position_source = None
             try:
                 self._hide_markers()
             except Exception as cleanup_exc:
@@ -625,8 +739,16 @@ class JointMotionVisualization:
             raise
         return estimated_positions
 
-    def finish(self):
+    def finish(self, preserve_actual=False):
+        if not isinstance(preserve_actual, bool):
+            raise MotionInputError(
+                "actual-position preservation state must be boolean"
+            )
         self._trajectory = None
         self._started_at = None
-        self._actual_joint_positions = None
-        return self._hide_markers()
+        if not preserve_actual:
+            self._actual_joint_positions = None
+            self._actual_position_source = None
+            return self._hide_markers()
+        self.refresh()
+        return True
