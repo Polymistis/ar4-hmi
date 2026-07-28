@@ -13891,21 +13891,54 @@ class HmiSourceContractTests(unittest.TestCase):
             'const char *HOME_REFERENCE_V2_CAPABILITY = "HOME_REFERENCE_V2";',
             firmware_source,
         )
+        capabilities_start = firmware_source.index(
+            "const char *const PROTOCOL_CAPABILITIES[]"
+        )
+        capabilities_end = firmware_source.index("};", capabilities_start)
+        advertised_capabilities = firmware_source[
+            capabilities_start:capabilities_end
+        ]
         self.assertIn(
-            'if (function == "HR")',
-            firmware_source,
+            "HOME_REFERENCE_V1_CAPABILITY",
+            advertised_capabilities,
         )
         self.assertIn(
-            'if (function == "H2")',
-            firmware_source,
+            "HOME_REFERENCE_V2_CAPABILITY",
+            advertised_capabilities,
         )
+
+        v1_handler_start = firmware_source.index(
+            "void handle_home_reference_v1_command()"
+        )
+        v2_handler_start = firmware_source.index(
+            "void handle_home_reference_v2_command()",
+            v1_handler_start,
+        )
+        next_handler_start = firmware_source.index(
+            "void handle_set_robot_id_command(",
+            v2_handler_start,
+        )
+        v1_handler = firmware_source[
+            v1_handler_start:v2_handler_start
+        ]
+        v2_handler = firmware_source[
+            v2_handler_start:next_handler_start
+        ]
         self.assertIn(
             "build_primary_home_reference_v1_response(",
-            firmware_source,
+            v1_handler,
+        )
+        self.assertNotIn(
+            "build_primary_home_reference_v2_response(",
+            v1_handler,
         )
         self.assertIn(
             "build_primary_home_reference_v2_response(",
-            firmware_source,
+            v2_handler,
+        )
+        self.assertNotIn(
+            "build_primary_home_reference_v1_response(",
+            v2_handler,
         )
         self.assertIn(
             "build_primary_home_reference_v1_response(",
@@ -13914,6 +13947,31 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIn(
             "build_primary_home_reference_v2_response(",
             home_reference_contract,
+        )
+
+        dispatch_start = firmware_source.index(
+            'if (function == "HR")'
+        )
+        dispatch_end = firmware_source.index(
+            'if (function == "RB")',
+            dispatch_start,
+        )
+        home_reference_dispatch = firmware_source[
+            dispatch_start:dispatch_end
+        ]
+        self.assertRegex(
+            home_reference_dispatch,
+            (
+                r'if\s*\(\s*function\s*==\s*"HR"\s*\)\s*\{\s*'
+                r"handle_home_reference_v1_command\(\);\s*\}"
+            ),
+        )
+        self.assertRegex(
+            home_reference_dispatch,
+            (
+                r'if\s*\(\s*function\s*==\s*"H2"\s*\)\s*\{\s*'
+                r"handle_home_reference_v2_command\(\);\s*\}"
+            ),
         )
         shutdown_function = self.module_functions[
             "MoveToShutdownPosition"
