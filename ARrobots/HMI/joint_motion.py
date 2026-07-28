@@ -59,6 +59,7 @@ CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1 = (
 )
 CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1 = "JT_WRIST_CONFIG_V1"
 CONTROLLER_CAPABILITY_HOME_REFERENCE_V1 = "HOME_REFERENCE_V1"
+CONTROLLER_CAPABILITY_HOME_REFERENCE_V2 = "HOME_REFERENCE_V2"
 CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1 = "JOINT_TELEMETRY_V1"
 JOINT_TELEMETRY_AXIS_COUNT = 6
 JOINT_TELEMETRY_PREFIX = "TMA"
@@ -455,26 +456,26 @@ class ControllerIdentity:
 
 @dataclass(frozen=True)
 class PrimaryHomeReference:
-    """Controller-reported J1/J2 parking-switch coordinates in degrees."""
+    """Controller-reported J1-J3 parking-switch coordinates in degrees."""
 
-    valid: Tuple[bool, bool]
-    positions: Tuple[float, float]
+    valid: Tuple[bool, bool, bool]
+    positions: Tuple[float, float, float]
 
     def __post_init__(self):
         if (
             not isinstance(self.valid, tuple)
-            or len(self.valid) != 2
+            or len(self.valid) != 3
             or any(not isinstance(value, bool) for value in self.valid)
         ):
             raise MotionInputError(
-                "primary home-reference validity must contain two booleans"
+                "primary home-reference validity must contain three booleans"
             )
         if (
             not isinstance(self.positions, tuple)
-            or len(self.positions) != 2
+            or len(self.positions) != 3
         ):
             raise MotionInputError(
-                "primary home-reference positions must contain two values"
+                "primary home-reference positions must contain three values"
             )
         normalized_positions = tuple(
             finite_number(value, f"J{axis} home-reference position")
@@ -2519,9 +2520,9 @@ def primary_shutdown_position(home_reference):
             "shutdown position requires a controller home reference"
         )
     missing_axes = tuple(
-        f"J{axis}"
-        for axis, valid in enumerate(home_reference.valid, start=1)
-        if not valid
+        f"J{axis + 1}"
+        for axis in (1, 2)
+        if not home_reference.valid[axis]
     )
     if missing_axes:
         raise MotionInputError(
@@ -2530,7 +2531,7 @@ def primary_shutdown_position(home_reference):
             + " under the active controller frame"
         )
     target = list(PRIMARY_START_POSITION)
-    target[:2] = home_reference.positions
+    target[1:3] = home_reference.positions[1:3]
     return tuple(target)
 
 
@@ -3525,11 +3526,19 @@ _POSITION_RESPONSE = re.compile(
     rf"O(?P<flag>(?:EB|EC[01]{{6}})?)"
     rf"P(?P<j7>{_NUMBER})Q(?P<j8>{_NUMBER})R(?P<j9>{_NUMBER})$"
 )
-_PRIMARY_HOME_REFERENCE_RESPONSE = re.compile(
+_PRIMARY_HOME_REFERENCE_V1_RESPONSE = re.compile(
     r"^A(?P<j1_valid>[01])"
     r"B(?P<j1_millidegrees>(?:0|-?[1-9][0-9]*))"
     r"C(?P<j2_valid>[01])"
     r"D(?P<j2_millidegrees>(?:0|-?[1-9][0-9]*))$"
+)
+_PRIMARY_HOME_REFERENCE_V2_RESPONSE = re.compile(
+    r"^A(?P<j1_valid>[01])"
+    r"B(?P<j1_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"C(?P<j2_valid>[01])"
+    r"D(?P<j2_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"E(?P<j3_valid>[01])"
+    r"F(?P<j3_millidegrees>(?:0|-?[1-9][0-9]*))$"
 )
 _JOINT_TELEMETRY_RESPONSE = re.compile(
     rf"^{re.escape(JOINT_TELEMETRY_PREFIX)}"
@@ -4054,7 +4063,11 @@ def parse_joint_motion_exchange_response(response):
     return None
 
 
-def parse_primary_home_reference_response(response):
+def _parse_primary_home_reference_response(
+    response,
+    response_pattern,
+    axis_groups,
+):
     if (
         not isinstance(response, str)
         or not response
@@ -4070,14 +4083,14 @@ def parse_primary_home_reference_response(response):
         raise ProtocolResponseError(
             "controller home-reference response must contain ASCII only"
         ) from exc
-    match = _PRIMARY_HOME_REFERENCE_RESPONSE.fullmatch(response)
+    match = response_pattern.fullmatch(response)
     if match is None:
         raise ProtocolResponseError(
             "controller home-reference response has invalid markers or values"
         )
     millidegrees = tuple(
-        int(match.group(name))
-        for name in ("j1_millidegrees", "j2_millidegrees")
+        int(match.group(position_group))
+        for _, position_group in axis_groups
     )
     if any(
         value < -CONTROLLER_SIGNED_INT_MAX - 1
@@ -4088,17 +4101,101 @@ def parse_primary_home_reference_response(response):
             "controller home-reference response exceeds the signed range"
         )
     try:
+        missing_axis_count = 3 - len(axis_groups)
         return PrimaryHomeReference(
-            valid=tuple(
-                match.group(name) == "1"
-                for name in ("j1_valid", "j2_valid")
+            valid=(
+                tuple(
+                    match.group(valid_group) == "1"
+                    for valid_group, _ in axis_groups
+                )
+                + (False,) * missing_axis_count
             ),
-            positions=tuple(value / 1000.0 for value in millidegrees),
+            positions=(
+                tuple(value / 1000.0 for value in millidegrees)
+                + (0.0,) * missing_axis_count
+            ),
         )
     except MotionInputError as exc:
         raise ProtocolResponseError(
             f"controller home-reference response is inconsistent: {exc}"
         ) from exc
+
+
+def parse_primary_home_reference_response(response):
+    return _parse_primary_home_reference_response(
+        response,
+        _PRIMARY_HOME_REFERENCE_V1_RESPONSE,
+        (
+            ("j1_valid", "j1_millidegrees"),
+            ("j2_valid", "j2_millidegrees"),
+        ),
+    )
+
+
+def parse_primary_home_reference_v2_response(response):
+    return _parse_primary_home_reference_response(
+        response,
+        _PRIMARY_HOME_REFERENCE_V2_RESPONSE,
+        (
+            ("j1_valid", "j1_millidegrees"),
+            ("j2_valid", "j2_millidegrees"),
+            ("j3_valid", "j3_millidegrees"),
+        ),
+    )
+
+
+def select_primary_home_reference_capability(protocol_capabilities):
+    if isinstance(protocol_capabilities, (str, bytes)):
+        raise MotionInputError(
+            "controller protocol capabilities must be a sequence"
+        )
+    try:
+        capabilities = tuple(protocol_capabilities)
+    except TypeError as exc:
+        raise MotionInputError(
+            "controller protocol capabilities must be a sequence"
+        ) from exc
+    if any(
+        not isinstance(capability, str) or not capability
+        for capability in capabilities
+    ):
+        raise MotionInputError(
+            "controller protocol capabilities contain an invalid value"
+        )
+    for capability in (
+        CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
+        CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+    ):
+        if capability in capabilities:
+            return capability
+    return None
+
+
+def primary_home_reference_command(protocol_capabilities):
+    capability = select_primary_home_reference_capability(
+        protocol_capabilities
+    )
+    if capability == CONTROLLER_CAPABILITY_HOME_REFERENCE_V2:
+        return "H2\n"
+    if capability == CONTROLLER_CAPABILITY_HOME_REFERENCE_V1:
+        return "HR\n"
+    return None
+
+
+def parse_primary_home_reference_capability_response(
+    response,
+    protocol_capabilities,
+):
+    capability = select_primary_home_reference_capability(
+        protocol_capabilities
+    )
+    if capability == CONTROLLER_CAPABILITY_HOME_REFERENCE_V2:
+        return parse_primary_home_reference_v2_response(response)
+    if capability == CONTROLLER_CAPABILITY_HOME_REFERENCE_V1:
+        return parse_primary_home_reference_response(response)
+    raise ProtocolResponseError(
+        "controller does not advertise a home-reference protocol"
+    )
 
 
 def parse_position_response(response):

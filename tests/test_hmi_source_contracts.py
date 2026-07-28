@@ -36,6 +36,7 @@ from ARrobots.HMI.joint_motion import (
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+    CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
     CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
     CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
     CONTROLLER_MAXIMUM_PULSE_DELAY_MICROSECONDS,
@@ -89,8 +90,11 @@ from ARrobots.HMI.joint_motion import (
     parse_joint_telemetry_response,
     parse_motion_wrist_config,
     parse_position_response,
+    parse_primary_home_reference_capability_response,
     parse_primary_home_reference_response,
+    parse_primary_home_reference_v2_response,
     parse_virtual_command_timing,
+    primary_home_reference_command,
     primary_shutdown_position,
     quarantine_serial_transport,
     read_serial_exact_response,
@@ -130,6 +134,9 @@ TEENSY_CARTESIAN_POSE_CONTRACT = TEENSY_SOURCE.with_name(
 )
 TEENSY_CONTROLLER_DOMAIN_CONTRACT = TEENSY_SOURCE.with_name(
     "controller_domain_contract.h"
+)
+TEENSY_HOME_REFERENCE_CONTRACT = TEENSY_SOURCE.with_name(
+    "home_reference_contract.h"
 )
 TEENSY_IDENTITY_CONTRACT = TEENSY_SOURCE.with_name("identity_contract.h")
 TEENSY_JOINT_TELEMETRY_CONTRACT = TEENSY_SOURCE.with_name(
@@ -460,6 +467,18 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault(
             "CONTROLLER_CAPABILITY_HOME_REFERENCE_V1",
             CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+        )
+        namespace.setdefault(
+            "CONTROLLER_CAPABILITY_HOME_REFERENCE_V2",
+            CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
+        )
+        namespace.setdefault(
+            "primary_home_reference_command",
+            primary_home_reference_command,
+        )
+        namespace.setdefault(
+            "parse_primary_home_reference_capability_response",
+            parse_primary_home_reference_capability_response,
         )
         namespace.setdefault(
             "parse_primary_home_reference_response",
@@ -1065,6 +1084,14 @@ class HmiSourceContractTests(unittest.TestCase):
             "CONTROLLER_CAPABILITY_HOME_REFERENCE_V1",
             CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
         )
+        namespace.setdefault(
+            "CONTROLLER_CAPABILITY_HOME_REFERENCE_V2",
+            CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
+        )
+        namespace.setdefault(
+            "primary_home_reference_command",
+            primary_home_reference_command,
+        )
         class_node = copy.deepcopy(self.module_classes[name])
         module = ast.Module(body=[class_node], type_ignores=[])
         compiled = compile(ast.fix_missing_locations(module), str(AR4_SOURCE), "exec")
@@ -1294,20 +1321,23 @@ class HmiSourceContractTests(unittest.TestCase):
         identity = ControllerIdentity(
             controller_hardware_id=base_identity.controller_hardware_id,
             driver_model=base_identity.driver_model,
-            firmware_version="6.7.1-ar4hmi.4",
+            firmware_version="6.7.1-ar4hmi.5",
             robot_model=base_identity.robot_model,
             robot_version=base_identity.robot_version,
             serial_number=base_identity.serial_number,
             asset_tag=base_identity.asset_tag,
             protocol_capabilities=(
                 base_identity.protocol_capabilities
-                + (CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,)
+                + (
+                    CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+                    CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
+                )
             ),
         )
         if initial_reference is None:
             initial_reference = PrimaryHomeReference(
-                (True, True),
-                (160.0, -40.0),
+                (True, True, False),
+                (160.0, -40.0, 0.0),
             )
         namespace.update({
             "Optional": Optional,
@@ -11827,13 +11857,13 @@ class HmiSourceContractTests(unittest.TestCase):
             successful_exchange
         )
         reference = PrimaryHomeReference(
-            (True, False),
-            (163.8, 0.0),
+            (True, False, False),
+            (163.8, 0.0, 0.0),
         )
         serial_port, query_calls = (
             self.install_calibration_home_reference_contract(
                 namespace,
-                "A1B163800C0D0",
+                "A1B163800C0D0E0F0",
             )
         )
 
@@ -11847,7 +11877,7 @@ class HmiSourceContractTests(unittest.TestCase):
             [
                 (
                     serial_port,
-                    "HR\n",
+                    "H2\n",
                     1.0,
                     namespace["serial_write_lock"],
                     False,
@@ -11886,7 +11916,7 @@ class HmiSourceContractTests(unittest.TestCase):
         serial_port, query_calls = (
             self.install_calibration_home_reference_contract(
                 namespace,
-                "A1B163800C1D-38200",
+                "A1B163800C1D-38200E0F0",
             )
         )
 
@@ -11894,7 +11924,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(write_committed.wait(timeout=2))
         self.assertEqual(
             namespace["_current_primary_home_reference"](serial_port),
-            PrimaryHomeReference((False, False), (0.0, 0.0)),
+            PrimaryHomeReference((False, False, False), (0.0, 0.0, 0.0)),
         )
 
         release_response.set()
@@ -11905,7 +11935,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(len(query_calls), 1)
         self.assertEqual(
             namespace["_current_primary_home_reference"](serial_port),
-            PrimaryHomeReference((True, True), (163.8, -38.2)),
+            PrimaryHomeReference((True, True, False), (163.8, -38.2, 0.0)),
         )
         self.assertFalse(state["motion_registry"].active)
 
@@ -11930,7 +11960,7 @@ class HmiSourceContractTests(unittest.TestCase):
         serial_port, query_calls = (
             self.install_calibration_home_reference_contract(
                 namespace,
-                "A0B0C0D0",
+                "A0B0C0D0E0F0",
             )
         )
         namespace["displayPosition"] = lambda response, parsed=None: None
@@ -11943,7 +11973,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(len(query_calls), 1)
         self.assertEqual(
             namespace["_current_primary_home_reference"](serial_port),
-            PrimaryHomeReference((False, False), (0.0, 0.0)),
+            PrimaryHomeReference((False, False, False), (0.0, 0.0, 0.0)),
         )
         self.assertEqual(
             state["invalidations"],
@@ -11973,7 +12003,7 @@ class HmiSourceContractTests(unittest.TestCase):
         serial_port, query_calls = (
             self.install_calibration_home_reference_contract(
                 namespace,
-                "A0B0C0D0",
+                "A0B0C0D0E0F0",
             )
         )
         namespace["displayPosition"] = lambda response, parsed=None: None
@@ -11996,7 +12026,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(len(query_calls), 1)
         self.assertEqual(
             namespace["_current_primary_home_reference"](serial_port),
-            PrimaryHomeReference((False, False), (0.0, 0.0)),
+            PrimaryHomeReference((False, False, False), (0.0, 0.0, 0.0)),
         )
         self.assertEqual(
             state["invalidations"],
@@ -13652,14 +13682,17 @@ class HmiSourceContractTests(unittest.TestCase):
         capability_identity = ControllerIdentity(
             controller_hardware_id=base_identity.controller_hardware_id,
             driver_model=base_identity.driver_model,
-            firmware_version="6.7.1-ar4hmi.4",
+            firmware_version="6.7.1-ar4hmi.5",
             robot_model=base_identity.robot_model,
             robot_version=base_identity.robot_version,
             serial_number=base_identity.serial_number,
             asset_tag=base_identity.asset_tag,
             protocol_capabilities=(
                 base_identity.protocol_capabilities
-                + (CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,)
+                + (
+                    CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+                    CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
+                )
             ),
         )
         port = SimpleNamespace(is_open=True)
@@ -13687,8 +13720,8 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace,
         )
         valid_reference = PrimaryHomeReference(
-            (True, True),
-            (163.8, -38.2),
+            (True, True, True),
+            (163.8, -38.2, -88.9),
         )
 
         with self.assertRaisesRegex(
@@ -13737,10 +13770,10 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(
             namespace["_current_primary_home_reference"](port),
-            PrimaryHomeReference((False, False), (0.0, 0.0)),
+            PrimaryHomeReference((False, False, False), (0.0, 0.0, 0.0)),
         )
 
-        responses = ["A1B163800C1D-38200"]
+        responses = ["A1B163800C1D-38200E1F-88900"]
 
         def exchange(
             serial_port,
@@ -13751,7 +13784,7 @@ class HmiSourceContractTests(unittest.TestCase):
             reset_input,
         ):
             self.assertIs(serial_port, port)
-            self.assertEqual(command, "HR\n")
+            self.assertEqual(command, "H2\n")
             self.assertFalse(reset_input)
             return responses.pop(0)
 
@@ -13809,7 +13842,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(
             namespace["_current_primary_home_reference"](port),
-            PrimaryHomeReference((False, False), (0.0, 0.0)),
+            PrimaryHomeReference((False, False, False), (0.0, 0.0, 0.0)),
         )
         self.assertEqual(
             invalidations,
@@ -13843,13 +13876,44 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         firmware_source = TEENSY_SOURCE.read_text(encoding="utf-8")
+        home_reference_contract = (
+            TEENSY_HOME_REFERENCE_CONTRACT.read_text(encoding="utf-8")
+        )
+        self.assertRegex(
+            home_reference_contract,
+            r"constexpr\s+size_t\s+kPrimaryHomeReferenceAxisCount\s*=\s*3\s*;",
+        )
         self.assertIn(
-            'const char *HOME_REFERENCE_CAPABILITY = "HOME_REFERENCE_V1";',
+            'const char *HOME_REFERENCE_V1_CAPABILITY = "HOME_REFERENCE_V1";',
+            firmware_source,
+        )
+        self.assertIn(
+            'const char *HOME_REFERENCE_V2_CAPABILITY = "HOME_REFERENCE_V2";',
             firmware_source,
         )
         self.assertIn(
             'if (function == "HR")',
             firmware_source,
+        )
+        self.assertIn(
+            'if (function == "H2")',
+            firmware_source,
+        )
+        self.assertIn(
+            "build_primary_home_reference_v1_response(",
+            firmware_source,
+        )
+        self.assertIn(
+            "build_primary_home_reference_v2_response(",
+            firmware_source,
+        )
+        self.assertIn(
+            "build_primary_home_reference_v1_response(",
+            home_reference_contract,
+        )
+        self.assertIn(
+            "build_primary_home_reference_v2_response(",
+            home_reference_contract,
         )
         shutdown_function = self.module_functions[
             "MoveToShutdownPosition"
@@ -14324,8 +14388,8 @@ class HmiSourceContractTests(unittest.TestCase):
     def test_shutdown_position_disables_unrelated_deferral(self):
         serial_port = object()
         reference = PrimaryHomeReference(
-            (True, True),
-            (163.8, -38.2),
+            (False, True, True),
+            (0.0, -38.2, -88.9),
         )
         queued = []
 
@@ -14359,7 +14423,7 @@ class HmiSourceContractTests(unittest.TestCase):
             queued,
             [
                 (
-                    (163.8, -38.2, 0.0, 0.0, 45.0, 0.0),
+                    (0.0, -38.2, -88.9, 0.0, 45.0, 0.0),
                     False,
                 )
             ],
@@ -19841,7 +19905,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertNotIn("fall back to unfiltered best", solver)
 
         self.assertIn(
-            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.4";',
+            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.5";',
             firmware,
         )
         self.assertIn('"JT_WRIST_CONFIG_V1"', firmware)
@@ -26331,8 +26395,11 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.__dict__.update(values)
 
         identity_payload = json.loads(VALID_CONTROLLER_IDENTITY_RESPONSE)
-        identity_payload["ProtocolCapabilities"].append(
-            CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
+        identity_payload["ProtocolCapabilities"].extend(
+            (
+                CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+                CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
+            )
         )
         identity_response = json.dumps(
             identity_payload,
@@ -26345,8 +26412,8 @@ class HmiSourceContractTests(unittest.TestCase):
             exchanges.append(command)
             if command == "HO\n":
                 return identity_response
-            if command == "HR\n":
-                return "A0B0C0D0"
+            if command == "H2\n":
+                return "A0B0C0D0E0F0"
             if command == "RP\n":
                 return raw_position
             return expected_response.decode("ascii").strip()
@@ -26368,11 +26435,11 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertEqual(
             result.home_reference,
-            PrimaryHomeReference((False, False), (0.0, 0.0)),
+            PrimaryHomeReference((False, False, False), (0.0, 0.0, 0.0)),
         )
         self.assertEqual(
             exchanges,
-            ["HO\n", "UPA1\n", "CEA1\n", "SPA1\n", "HR\n", "RP\n"],
+            ["HO\n", "UPA1\n", "CEA1\n", "SPA1\n", "H2\n", "RP\n"],
         )
 
     def test_main_startup_proceeds_without_an_auxiliary_controller(self):
@@ -26788,7 +26855,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 (),
                 None,
                 controller_identity,
-                PrimaryHomeReference((False, False), (0.0, 0.0)),
+                PrimaryHomeReference((False, False, False), (0.0, 0.0, 0.0)),
             )
         with self.assertRaisesRegex(
             ProtocolResponseError,
@@ -26806,11 +26873,11 @@ class HmiSourceContractTests(unittest.TestCase):
             (),
             None,
             capability_identity,
-            PrimaryHomeReference((False, False), (0.0, 0.0)),
+            PrimaryHomeReference((False, False, False), (0.0, 0.0, 0.0)),
         )
         self.assertEqual(
             capability_result.home_reference,
-            PrimaryHomeReference((False, False), (0.0, 0.0)),
+            PrimaryHomeReference((False, False, False), (0.0, 0.0, 0.0)),
         )
 
     def test_startup_exchange_consumes_exact_and_line_firmware_responses(self):

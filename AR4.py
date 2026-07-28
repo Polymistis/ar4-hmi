@@ -182,7 +182,6 @@ from ARrobots.HMI.joint_motion import (
   CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
   CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
   CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
-  CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
   CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
   CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
   CONTROLLER_HARDWARE_ID_LENGTH,
@@ -237,8 +236,9 @@ from ARrobots.HMI.joint_motion import (
   parse_joint_motion_exchange_response,
   parse_motion_wrist_config,
   parse_position_response,
-  parse_primary_home_reference_response,
+  parse_primary_home_reference_capability_response,
   parse_virtual_command_timing,
+  primary_home_reference_command,
   primary_shutdown_position,
   quarantine_serial_transport,
   read_serial_exact_response,
@@ -812,8 +812,10 @@ class MainControllerIdentityBinding:
         "main controller home-reference binding is invalid"
       )
     supports_home_reference = (
-      CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
-      in self.identity.protocol_capabilities
+      primary_home_reference_command(
+        self.identity.protocol_capabilities
+      )
+      is not None
     )
     if supports_home_reference != (self.home_reference is not None):
       raise MotionInputError(
@@ -2528,8 +2530,12 @@ def _bind_main_controller_home_reference(serial_port, home_reference):
       or binding.serial_port is not serial_port
       or RUN.get('ser') is not serial_port
       or not getattr(serial_port, "is_open", False)
-      or CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
-        not in binding.identity.protocol_capabilities
+      or (
+        primary_home_reference_command(
+          binding.identity.protocol_capabilities
+        )
+        is None
+      )
     ):
       raise ConnectionError(
         "main controller changed before home-reference binding"
@@ -2614,8 +2620,10 @@ def _invalidate_bound_primary_home_reference(serial_port):
     elif not getattr(serial_port, "is_open", False):
       reason = "the controller connection is closed"
     elif (
-      CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
-      not in binding.identity.protocol_capabilities
+      primary_home_reference_command(
+        binding.identity.protocol_capabilities
+      )
+      is None
     ):
       if binding.home_reference is None:
         return True
@@ -2634,7 +2642,10 @@ def _invalidate_bound_primary_home_reference(serial_port):
       replacement = MainControllerIdentityBinding(
         serial_port,
         binding.identity,
-        PrimaryHomeReference((False, False), (0.0, 0.0)),
+        PrimaryHomeReference(
+          (False, False, False),
+          (0.0, 0.0, 0.0),
+        ),
       )
     except ConnectionError as exc:
       logger.warning(
@@ -5781,8 +5792,10 @@ class ControllerStartupResult:
                 "controller startup identity has an invalid type"
             )
         supports_home_reference = (
-            CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
-            in self.controller_identity.protocol_capabilities
+            primary_home_reference_command(
+                self.controller_identity.protocol_capabilities
+            )
+            is not None
         )
         if (
             self.home_reference is not None
@@ -6369,13 +6382,17 @@ def startup(startup_request, cancel_event=None):
       cancel_event,
       expected_response=b"Done\n",
     )
+    home_reference_command = primary_home_reference_command(
+      controller_identity.protocol_capabilities
+    )
     home_reference = None
-    if (
-      CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
-      in controller_identity.protocol_capabilities
-    ):
-      home_reference = parse_primary_home_reference_response(
-        _startup_exchange_response("HR\n", cancel_event)
+    if home_reference_command is not None:
+      home_reference = parse_primary_home_reference_capability_response(
+        _startup_exchange_response(
+          home_reference_command,
+          cancel_event,
+        ),
+        controller_identity.protocol_capabilities,
       )
     position_text = _startup_exchange_response("RP\n", cancel_event)
     position = parse_position_response(position_text)
@@ -18569,20 +18586,23 @@ def _query_primary_home_reference(serial_port):
     raise ConnectionError(
       "home-reference query requires the bound controller"
     )
-  if (
-    CONTROLLER_CAPABILITY_HOME_REFERENCE_V1
-    not in binding.identity.protocol_capabilities
-  ):
+  command = primary_home_reference_command(
+    binding.identity.protocol_capabilities
+  )
+  if command is None:
     return None
   response = exchange_serial_line(
     serial_port,
-    "HR\n",
+    command,
     SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
     write_lock=serial_write_lock,
     reset_input=False,
   )
   try:
-    return parse_primary_home_reference_response(response)
+    return parse_primary_home_reference_capability_response(
+      response,
+      binding.identity.protocol_capabilities,
+    )
   except ProtocolResponseError as exc:
     reason = f"controller home-reference response is invalid: {exc}"
     raise ProtocolResponseError(reason) from exc

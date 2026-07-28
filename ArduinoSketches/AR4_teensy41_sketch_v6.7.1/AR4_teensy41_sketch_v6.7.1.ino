@@ -66,12 +66,13 @@
 // 6.6 - 2/22/26 - update kinematic solver to reduce J4/6 wrap | reimplement wrist N/F config
 // 6.7 - 3/11/26 MB holding reg bug fix
 // 6.7.1 - 3/11/26 bug fix calibration debounce
-const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.4";
+const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.5";
 const char *JT_WRIST_CONFIG_CAPABILITY = "JT_WRIST_CONFIG_V1";
 const char *GCODE_DIRECTORY_CAPABILITY = "GCODE_DIRECTORY_FRAMING_V1";
 const char *GCODE_DELETE_IDENTITY_CAPABILITY = "GCODE_DELETE_IDENTITY_V1";
 const char *GCODE_WRITE_IDENTITY_CAPABILITY = "GCODE_WRITE_IDENTITY_V1";
-const char *HOME_REFERENCE_CAPABILITY = "HOME_REFERENCE_V1";
+const char *HOME_REFERENCE_V1_CAPABILITY = "HOME_REFERENCE_V1";
+const char *HOME_REFERENCE_V2_CAPABILITY = "HOME_REFERENCE_V2";
 const char *JOINT_TELEMETRY_CAPABILITY = "JOINT_TELEMETRY_V1";
 
 //////////////////////////////////////////////////////////////////////////////
@@ -110,7 +111,8 @@ const char *const PROTOCOL_CAPABILITIES[] = {
   GCODE_DIRECTORY_CAPABILITY,
   GCODE_DELETE_IDENTITY_CAPABILITY,
   GCODE_WRITE_IDENTITY_CAPABILITY,
-  HOME_REFERENCE_CAPABILITY,
+  HOME_REFERENCE_V1_CAPABILITY,
+  HOME_REFERENCE_V2_CAPABILITY,
   JOINT_TELEMETRY_CAPABILITY,
 };
 constexpr size_t PROTOCOL_CAPABILITY_COUNT =
@@ -312,8 +314,8 @@ float J7calBaseOff = 0;
 float J8calBaseOff = 0;
 float J9calBaseOff = 0;
 ar4_protocol::PrimaryHomeReferenceState primaryHomeReference = {
-  { false, false },
-  { 0, 0 },
+  { false, false, false },
+  { 0, 0, 0 },
 };
 
 //reset collision indicators
@@ -1105,11 +1107,26 @@ void handle_hello_command() {
   Serial.println(response);
 }
 
-void handle_home_reference_command() {
+void handle_home_reference_v1_command() {
   char response[
-    ar4_protocol::kPrimaryHomeReferenceResponseCapacity
+    ar4_protocol::kPrimaryHomeReferenceV1ResponseCapacity
   ] = { 0 };
-  if (!ar4_protocol::build_primary_home_reference_response(
+  if (!ar4_protocol::build_primary_home_reference_v1_response(
+      primaryHomeReference,
+      response,
+      sizeof(response)
+  )) {
+    Serial.println("ER");
+    return;
+  }
+  Serial.println(response);
+}
+
+void handle_home_reference_v2_command() {
+  char response[
+    ar4_protocol::kPrimaryHomeReferenceV2ResponseCapacity
+  ] = { 0 };
+  if (!ar4_protocol::build_primary_home_reference_v2_response(
       primaryHomeReference,
       response,
       sizeof(response)
@@ -3909,7 +3926,11 @@ void loop() {
     }
 
     if (function == "HR") {
-      handle_home_reference_command();
+      handle_home_reference_v1_command();
+    }
+
+    if (function == "H2") {
+      handle_home_reference_v2_command();
     }
 
     if (function == "RB") {

@@ -15,6 +15,8 @@ from ARrobots.HMI.joint_motion import (
     CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+    CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+    CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
     CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
     CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
     CONTROLLER_DIRECTORY_SEPARATOR,
@@ -73,8 +75,11 @@ from ARrobots.HMI.joint_motion import (
     parse_joint_telemetry_response,
     parse_motion_wrist_config,
     parse_position_response,
+    parse_primary_home_reference_capability_response,
     parse_primary_home_reference_response,
+    parse_primary_home_reference_v2_response,
     parse_virtual_command_timing,
+    primary_home_reference_command,
     primary_shutdown_position,
     quarantine_serial_transport,
     read_serial_exact_response,
@@ -3595,14 +3600,15 @@ class NamedJointPositionTests(unittest.TestCase):
 
     def test_shutdown_position_uses_controller_switch_references(self):
         reference = PrimaryHomeReference(
-            (True, True),
-            (163.8, -38.2),
+            (False, True, True),
+            (0.0, -38.2, -88.9),
         )
         target = primary_shutdown_position(reference)
 
-        self.assertAlmostEqual(target[0], 163.8)
+        self.assertEqual(target[0], PRIMARY_START_POSITION[0])
         self.assertAlmostEqual(target[1], -38.2)
-        self.assertEqual(target[2:], PRIMARY_START_POSITION[2:])
+        self.assertAlmostEqual(target[2], -88.9)
+        self.assertEqual(target[3:], PRIMARY_START_POSITION[3:])
 
     def test_shutdown_position_requires_both_active_home_references(self):
         with self.assertRaisesRegex(
@@ -3610,7 +3616,20 @@ class NamedJointPositionTests(unittest.TestCase):
             "requires homing J2",
         ):
             primary_shutdown_position(
-                PrimaryHomeReference((True, False), (163.8, 0.0))
+                PrimaryHomeReference(
+                    (True, False, True),
+                    (163.8, 0.0, -88.9),
+                )
+            )
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "requires homing J3",
+        ):
+            primary_shutdown_position(
+                PrimaryHomeReference(
+                    (True, True, False),
+                    (163.8, -38.2, 0.0),
+                )
             )
         with self.assertRaisesRegex(
             MotionInputError,
@@ -3623,8 +3642,66 @@ class NamedJointPositionTests(unittest.TestCase):
             "A1B163800C1D-38200"
         )
 
-        self.assertEqual(reference.valid, (True, True))
-        self.assertEqual(reference.positions, (163.8, -38.2))
+        self.assertEqual(reference.valid, (True, True, False))
+        self.assertEqual(reference.positions, (163.8, -38.2, 0.0))
+
+        v2_reference = parse_primary_home_reference_v2_response(
+            "A1B163800C1D-38200E1F-88900"
+        )
+        self.assertEqual(v2_reference.valid, (True, True, True))
+        self.assertEqual(
+            v2_reference.positions,
+            (163.8, -38.2, -88.9),
+        )
+
+    def test_home_reference_protocol_prefers_v2_and_preserves_v1(self):
+        capabilities = (
+            CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+            CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
+        )
+        self.assertEqual(
+            primary_home_reference_command(capabilities),
+            "H2\n",
+        )
+        self.assertEqual(
+            parse_primary_home_reference_capability_response(
+                "A1B163800C1D-38200E1F-88900",
+                capabilities,
+            ),
+            PrimaryHomeReference(
+                (True, True, True),
+                (163.8, -38.2, -88.9),
+            ),
+        )
+
+        v1_capabilities = (CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,)
+        self.assertEqual(
+            primary_home_reference_command(v1_capabilities),
+            "HR\n",
+        )
+        legacy_reference = parse_primary_home_reference_capability_response(
+            "A1B163800C1D-38200",
+            v1_capabilities,
+        )
+        self.assertEqual(
+            legacy_reference,
+            PrimaryHomeReference(
+                (True, True, False),
+                (163.8, -38.2, 0.0),
+            ),
+        )
+        with self.assertRaisesRegex(MotionInputError, "requires homing J3"):
+            primary_shutdown_position(legacy_reference)
+
+        self.assertIsNone(primary_home_reference_command(()))
+        with self.assertRaisesRegex(
+            ProtocolResponseError,
+            "does not advertise",
+        ):
+            parse_primary_home_reference_capability_response(
+                "A0B0C0D0",
+                (),
+            )
 
     def test_home_reference_parser_rejects_invalid_or_stale_frames(self):
         for response in (
@@ -3636,6 +3713,15 @@ class NamedJointPositionTests(unittest.TestCase):
             with self.subTest(response=response):
                 with self.assertRaises(ProtocolResponseError):
                     parse_primary_home_reference_response(response)
+        for response in (
+            "A1B0C1D0",
+            "A1B0C1D0E0F1",
+            "A1B0C1D0E1F01",
+            "A1B0C1D0E1F2147483648",
+        ):
+            with self.subTest(v2_response=response):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_primary_home_reference_v2_response(response)
 
 
 class JointTelemetryProtocolTests(unittest.TestCase):

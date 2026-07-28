@@ -2258,24 +2258,34 @@ void test_tool_jog_signed_tcp_displacement() {
 
 void test_primary_home_reference_contract() {
     ar4_protocol::PrimaryHomeReferenceState state = {
-        {false, false},
-        {123, -456},
+        {false, false, false},
+        {123, -456, 789},
     };
-    char response[
-        ar4_protocol::kPrimaryHomeReferenceResponseCapacity
+    char v1_response[
+        ar4_protocol::kPrimaryHomeReferenceV1ResponseCapacity
+    ] = {};
+    char v2_response[
+        ar4_protocol::kPrimaryHomeReferenceV2ResponseCapacity
     ] = {};
     require(
-        ar4_protocol::build_primary_home_reference_response(
+        ar4_protocol::build_primary_home_reference_v1_response(
             state,
-            response,
-            sizeof(response)
+            v1_response,
+            sizeof(v1_response)
         )
-            && std::strcmp(response, "A0B0C0D0") == 0,
-        "invalid primary home references leaked stale coordinates"
+            && std::strcmp(v1_response, "A0B0C0D0") == 0
+            && ar4_protocol::build_primary_home_reference_v2_response(
+                state,
+                v2_response,
+                sizeof(v2_response)
+            )
+            && std::strcmp(v2_response, "A0B0C0D0E0F0") == 0,
+        "invalid primary home-reference responses leaked stale coordinates"
     );
 
     int32_t first = 0;
     int32_t second = 0;
+    int32_t third = 0;
     require(
         ar4_protocol::primary_home_reference_millidegrees(
             163.8004f,
@@ -2286,22 +2296,37 @@ void test_primary_home_reference_contract() {
                 -38.1996f,
                 second
             )
-            && second == -38200,
+            && second == -38200
+            && ar4_protocol::primary_home_reference_millidegrees(
+                72.5004f,
+                third
+            )
+            && third == 72500,
         "primary home-reference conversion changed millidegree rounding"
     );
     require(
         ar4_protocol::set_primary_home_reference(state, 0, first)
-            && ar4_protocol::set_primary_home_reference(state, 1, second),
+            && ar4_protocol::set_primary_home_reference(state, 1, second)
+            && ar4_protocol::set_primary_home_reference(state, 2, third),
         "valid primary home-reference update was rejected"
     );
     require(
-        ar4_protocol::build_primary_home_reference_response(
+        ar4_protocol::build_primary_home_reference_v1_response(
             state,
-            response,
-            sizeof(response)
+            v1_response,
+            sizeof(v1_response)
         )
-            && std::strcmp(response, "A1B163800C1D-38200") == 0,
-        "primary home-reference response changed wire framing"
+            && std::strcmp(v1_response, "A1B163800C1D-38200") == 0
+            && ar4_protocol::build_primary_home_reference_v2_response(
+                state,
+                v2_response,
+                sizeof(v2_response)
+            )
+            && std::strcmp(
+                v2_response,
+                "A1B163800C1D-38200E1F72500"
+            ) == 0,
+        "primary home-reference responses changed wire framing"
     );
 
     require(
@@ -2312,7 +2337,9 @@ void test_primary_home_reference_contract() {
         !state.valid[0]
             && state.millidegrees[0] == 0
             && state.valid[1]
-            && state.millidegrees[1] == second,
+            && state.millidegrees[1] == second
+            && state.valid[2]
+            && state.millidegrees[2] == third,
         "axis-local home-reference invalidation changed another axis"
     );
 
@@ -2320,8 +2347,10 @@ void test_primary_home_reference_contract() {
     require(
         !state.valid[0]
             && !state.valid[1]
+            && !state.valid[2]
             && state.millidegrees[0] == 0
-            && state.millidegrees[1] == 0,
+            && state.millidegrees[1] == 0
+            && state.millidegrees[2] == 0,
         "primary home-reference invalidation retained stale state"
     );
     require(
@@ -2334,15 +2363,17 @@ void test_primary_home_reference_contract() {
     );
     const ar4_protocol::PrimaryHomeReferenceState preserved = state;
     require(
-        !ar4_protocol::set_primary_home_reference(state, 2, 1)
+        !ar4_protocol::set_primary_home_reference(state, 3, 1)
             && !ar4_protocol::invalidate_primary_home_reference_axis(
                 state,
-                2
+                3
             )
             && state.valid[0] == preserved.valid[0]
             && state.valid[1] == preserved.valid[1]
+            && state.valid[2] == preserved.valid[2]
             && state.millidegrees[0] == preserved.millidegrees[0]
-            && state.millidegrees[1] == preserved.millidegrees[1],
+            && state.millidegrees[1] == preserved.millidegrees[1]
+            && state.millidegrees[2] == preserved.millidegrees[2],
         "out-of-range primary home-reference mutation was accepted"
     );
 }
