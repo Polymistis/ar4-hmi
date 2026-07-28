@@ -1,4 +1,4 @@
-"""Tk-thread presentation for desired and estimated joint positions."""
+"""Tk-thread presentation for desired, estimated, and encoder joint positions."""
 
 import tkinter as tk
 import time
@@ -12,12 +12,21 @@ from ARrobots.HMI.joint_motion import (
 )
 
 
-GHOST_MARKER_COLOR = "#00D7FF"
-GHOST_MARKER_OUTLINE_COLOR = "#003B49"
-GHOST_MARKER_WIDTH = 7
+ESTIMATED_MARKER_ROLE = "estimated"
+ENCODER_MARKER_ROLE = "encoder"
+ESTIMATED_MARKER_COLOR = "#FFB000"
+ESTIMATED_MARKER_OUTLINE_COLOR = "#5C3A00"
+ESTIMATED_MARKER_WIDTH = 3
+ESTIMATED_MARKER_HEIGHT_RATIO = 1.0
+ENCODER_MARKER_COLOR = "#00D7FF"
+ENCODER_MARKER_OUTLINE_COLOR = "#003B49"
+ENCODER_MARKER_WIDTH = 9
+ENCODER_MARKER_HEIGHT_RATIO = 0.6
+ENCODER_MARKER_MINIMUM_HEIGHT = 8
 GHOST_MARKER_MINIMUM_HEIGHT = 12
 GHOST_MARKER_MAXIMUM_HEIGHT = 24
 _SLIDER_DRAG_ATTRIBUTE = "_ar4_joint_slider_drag_active"
+_SLIDER_OVERLAY_BINDINGS_ATTRIBUTE = "_ar4_joint_overlay_bindings_installed"
 
 
 def _fixed_items(values, expected_length, field_name):
@@ -166,9 +175,9 @@ def slider_marker_geometry(
 
 
 class GhostSliderMarker:
-    """High-contrast overlay marker that leaves the slider thumb visible."""
+    """Role-specific overlay marker that leaves the slider thumb visible."""
 
-    def __init__(self, parent, slider, color=GHOST_MARKER_COLOR):
+    def __init__(self, parent, slider, role):
         required_slider_methods = (
             "cget",
             "event_generate",
@@ -188,18 +197,31 @@ class GhostSliderMarker:
             for method_name in required_slider_methods
         ):
             raise TypeError("slider does not satisfy the overlay contract")
-        if not isinstance(color, str) or not color:
-            raise TypeError("ghost marker color must be non-empty text")
+        if role == ESTIMATED_MARKER_ROLE:
+            color = ESTIMATED_MARKER_COLOR
+            outline_color = ESTIMATED_MARKER_OUTLINE_COLOR
+            width = ESTIMATED_MARKER_WIDTH
+            height_ratio = ESTIMATED_MARKER_HEIGHT_RATIO
+        elif role == ENCODER_MARKER_ROLE:
+            color = ENCODER_MARKER_COLOR
+            outline_color = ENCODER_MARKER_OUTLINE_COLOR
+            width = ENCODER_MARKER_WIDTH
+            height_ratio = ENCODER_MARKER_HEIGHT_RATIO
+        else:
+            raise TypeError(
+                "ghost marker role must be 'estimated' or 'encoder'"
+            )
 
         self._slider = slider
-        setattr(self._slider, _SLIDER_DRAG_ATTRIBUTE, False)
+        self._width = width
+        self._height_ratio = height_ratio
         self._placement = None
         self._visible = False
         self._marker = tk.Frame(
             parent,
             background=color,
             borderwidth=0,
-            highlightbackground=GHOST_MARKER_OUTLINE_COLOR,
+            highlightbackground=outline_color,
             highlightthickness=1,
             takefocus=0,
         )
@@ -215,33 +237,49 @@ class GhostSliderMarker:
                     event,
                 ),
             )
-        self._slider.bind(
-            "<ButtonPress-1>",
-            lambda _event: setattr(
+        bindings_installed = getattr(
+            self._slider,
+            _SLIDER_OVERLAY_BINDINGS_ATTRIBUTE,
+            False,
+        )
+        if not isinstance(bindings_installed, bool):
+            raise MotionInputError(
+                "joint slider overlay binding state must be boolean"
+            )
+        if not bindings_installed:
+            setattr(self._slider, _SLIDER_DRAG_ATTRIBUTE, False)
+            self._slider.bind(
+                "<ButtonPress-1>",
+                lambda _event: setattr(
+                    self._slider,
+                    _SLIDER_DRAG_ATTRIBUTE,
+                    True,
+                ),
+                add="+",
+            )
+            self._slider.bind(
+                "<ButtonRelease-1>",
+                lambda _event: setattr(
+                    self._slider,
+                    _SLIDER_DRAG_ATTRIBUTE,
+                    False,
+                ),
+                add="+",
+            )
+            self._slider.bind_all(
+                "<ButtonRelease-1>",
+                lambda _event: setattr(
+                    self._slider,
+                    _SLIDER_DRAG_ATTRIBUTE,
+                    False,
+                ),
+                add="+",
+            )
+            setattr(
                 self._slider,
-                _SLIDER_DRAG_ATTRIBUTE,
+                _SLIDER_OVERLAY_BINDINGS_ATTRIBUTE,
                 True,
-            ),
-            add="+",
-        )
-        self._slider.bind(
-            "<ButtonRelease-1>",
-            lambda _event: setattr(
-                self._slider,
-                _SLIDER_DRAG_ATTRIBUTE,
-                False,
-            ),
-            add="+",
-        )
-        self._slider.bind_all(
-            "<ButtonRelease-1>",
-            lambda _event: setattr(
-                self._slider,
-                _SLIDER_DRAG_ATTRIBUTE,
-                False,
-            ),
-            add="+",
-        )
+            )
 
     def _forward_pointer(self, sequence, event):
         x = int(event.x_root - self._slider.winfo_rootx())
@@ -270,8 +308,11 @@ class GhostSliderMarker:
         placement = (
             round(marker_x),
             round(marker_y),
-            GHOST_MARKER_WIDTH,
-            round(marker_height),
+            self._width,
+            max(
+                ENCODER_MARKER_MINIMUM_HEIGHT,
+                round(marker_height * self._height_ratio),
+            ),
         )
         if self._visible and placement == self._placement:
             return False
@@ -296,15 +337,25 @@ class GhostSliderMarker:
         self._visible = False
         return True
 
+    def raise_above(self):
+        """Raise a visible marker and report whether a raise was issued."""
+
+        if not self._visible:
+            return False
+        self._marker.lift()
+        return True
+
 
 class JointMotionVisualization:
-    """Coordinate target thumbs with actual or estimated in-flight markers."""
+    """Keep commanded estimates distinct from received encoder samples."""
 
     def __init__(
         self,
         sliders,
-        markers,
-        enabled_provider,
+        estimated_markers,
+        encoder_markers,
+        estimated_enabled_provider,
+        encoder_enabled_provider,
         clock=time.monotonic,
     ):
         self._sliders = _fixed_items(
@@ -312,10 +363,15 @@ class JointMotionVisualization:
             JOINT_COUNT,
             "joint visualization sliders",
         )
-        self._markers = _fixed_items(
-            markers,
+        self._estimated_markers = _fixed_items(
+            estimated_markers,
             JOINT_COUNT,
-            "joint visualization markers",
+            "estimated joint visualization markers",
+        )
+        self._encoder_markers = _fixed_items(
+            encoder_markers,
+            JOINT_TELEMETRY_AXIS_COUNT,
+            "encoder joint visualization markers",
         )
         if any(
             not callable(getattr(slider, "get", None))
@@ -326,51 +382,111 @@ class JointMotionVisualization:
         if any(
             not callable(getattr(marker, "show", None))
             or not callable(getattr(marker, "hide", None))
-            for marker in self._markers
+            or not callable(getattr(marker, "raise_above", None))
+            for marker in (
+                self._estimated_markers + self._encoder_markers
+            )
         ):
             raise TypeError("joint visualization marker contract is invalid")
-        if not callable(enabled_provider):
-            raise TypeError("joint visualization enabled provider must be callable")
+        if not callable(estimated_enabled_provider):
+            raise TypeError(
+                "estimated visualization enabled provider must be callable"
+            )
+        if not callable(encoder_enabled_provider):
+            raise TypeError(
+                "encoder visualization enabled provider must be callable"
+            )
         if not callable(clock):
             raise TypeError("joint visualization clock must be callable")
 
-        self._enabled_provider = enabled_provider
+        self._estimated_enabled_provider = estimated_enabled_provider
+        self._encoder_enabled_provider = encoder_enabled_provider
         self._clock = clock
         self._trajectory = None
         self._started_at = None
         self._actual_joint_positions = None
-        self._markers_visible = False
+        self._estimated_markers_visible = False
+        self._encoder_markers_visible = False
 
     @property
     def active(self):
         return self._trajectory is not None
 
-    def _enabled(self):
-        enabled = self._enabled_provider()
+    @staticmethod
+    def _enabled(provider, field_name):
+        enabled = provider()
         if isinstance(enabled, bool):
             return enabled
         if isinstance(enabled, int) and enabled in (0, 1):
             return enabled == 1
         raise MotionInputError(
-            "joint visualization toggle must contain zero or one"
+            f"{field_name} must contain zero or one"
         )
 
-    def _hide_markers(self):
-        if not self._markers_visible:
+    def _hide_marker_group(
+        self,
+        markers,
+        visibility_attribute,
+        group_name,
+    ):
+        if not getattr(self, visibility_attribute):
             return True
         failures = []
-        for axis, marker in enumerate(self._markers, start=1):
+        for axis, marker in enumerate(markers, start=1):
             try:
                 marker.hide()
             except Exception as exc:
                 failures.append(f"J{axis}: {exc}")
         if failures:
             raise RuntimeError(
-                "unable to hide estimated joint markers: "
+                f"unable to hide {group_name} joint markers: "
                 + "; ".join(failures)
             )
-        self._markers_visible = False
+        setattr(self, visibility_attribute, False)
         return True
+
+    def _hide_markers(self):
+        failures = []
+        for markers, visibility_attribute, group_name in (
+            (
+                self._encoder_markers,
+                "_encoder_markers_visible",
+                "encoder",
+            ),
+            (
+                self._estimated_markers,
+                "_estimated_markers_visible",
+                "estimated",
+            ),
+        ):
+            try:
+                self._hide_marker_group(
+                    markers,
+                    visibility_attribute,
+                    group_name,
+                )
+            except Exception as exc:
+                failures.append(str(exc))
+        if failures:
+            raise RuntimeError("; ".join(failures))
+        return True
+
+    def _show_marker_group(
+        self,
+        markers,
+        positions,
+        visibility_attribute,
+    ):
+        setattr(self, visibility_attribute, True)
+        changed = []
+        for marker, position in zip(markers, positions):
+            marker_changed = marker.show(position)
+            if not isinstance(marker_changed, bool):
+                raise RuntimeError(
+                    "joint visualization marker show result must be boolean"
+                )
+            changed.append(marker_changed)
+        return tuple(changed)
 
     def set_desired(self, positions):
         return set_joint_slider_positions(self._sliders, positions)
@@ -433,22 +549,69 @@ class JointMotionVisualization:
             self._hide_markers()
             return None
         try:
-            enabled = self._enabled()
-            if not enabled:
-                self._hide_markers()
-                return None
+            estimated_enabled = self._enabled(
+                self._estimated_enabled_provider,
+                "estimated joint visualization toggle",
+            )
+            encoder_enabled = self._enabled(
+                self._encoder_enabled_provider,
+                "encoder joint visualization toggle",
+            )
 
             now = finite_number(self._clock(), "joint visualization clock")
             elapsed = max(0.0, now - self._started_at)
-            positions = self._trajectory.positions_at(elapsed)
-            if self._actual_joint_positions is not None:
-                positions = (
-                    self._actual_joint_positions
-                    + positions[JOINT_TELEMETRY_AXIS_COUNT:]
+            estimated_positions = self._trajectory.positions_at(elapsed)
+            encoder_changes = (False,) * JOINT_TELEMETRY_AXIS_COUNT
+            if (
+                encoder_enabled
+                and self._actual_joint_positions is not None
+            ):
+                encoder_changes = self._show_marker_group(
+                    self._encoder_markers,
+                    self._actual_joint_positions,
+                    "_encoder_markers_visible",
                 )
-            self._markers_visible = True
-            for marker, position in zip(self._markers, positions):
-                marker.show(position)
+            else:
+                self._hide_marker_group(
+                    self._encoder_markers,
+                    "_encoder_markers_visible",
+                    "encoder",
+                )
+            estimated_changes = (False,) * JOINT_COUNT
+            if estimated_enabled:
+                estimated_changes = self._show_marker_group(
+                    self._estimated_markers,
+                    estimated_positions,
+                    "_estimated_markers_visible",
+                )
+            else:
+                self._hide_marker_group(
+                    self._estimated_markers,
+                    "_estimated_markers_visible",
+                    "estimated",
+                )
+            if (
+                estimated_enabled
+                and encoder_enabled
+                and self._actual_joint_positions is not None
+            ):
+                for axis, changed in enumerate(
+                    zip(estimated_changes, encoder_changes)
+                ):
+                    if any(changed):
+                        raised = self._estimated_markers[
+                            axis
+                        ].raise_above()
+                        if not isinstance(raised, bool) or not raised:
+                            raise RuntimeError(
+                                "visible estimated marker could not "
+                                "reassert deterministic layering"
+                            )
+            if not estimated_enabled and not (
+                encoder_enabled
+                and self._actual_joint_positions is not None
+            ):
+                return None
         except Exception as exc:
             self._trajectory = None
             self._started_at = None
@@ -460,7 +623,7 @@ class JointMotionVisualization:
                     f"{exc}; marker cleanup failed: {cleanup_exc}"
                 ) from exc
             raise
-        return positions
+        return estimated_positions
 
     def finish(self):
         self._trajectory = None

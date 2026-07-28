@@ -10,6 +10,12 @@ from ARrobots.HMI.joint_motion import (
     MotionProfile,
 )
 from ARrobots.HMI.joint_visualization import (
+    ENCODER_MARKER_COLOR,
+    ENCODER_MARKER_ROLE,
+    ENCODER_MARKER_WIDTH,
+    ESTIMATED_MARKER_COLOR,
+    ESTIMATED_MARKER_ROLE,
+    ESTIMATED_MARKER_WIDTH,
     GhostSliderMarker,
     JointMotionVisualization,
     _SLIDER_DRAG_ATTRIBUTE,
@@ -40,16 +46,27 @@ class FakeMarker:
         self.visible = False
         self.value = None
         self.hide_count = 0
+        self.raise_count = 0
 
     def show(self, value):
         if self.fail_show:
             raise RuntimeError("marker draw failed")
+        changed = not self.visible or self.value != value
         self.visible = True
         self.value = value
+        return changed
 
     def hide(self):
+        changed = self.visible
         self.visible = False
         self.hide_count += 1
+        return changed
+
+    def raise_above(self):
+        if not self.visible:
+            return False
+        self.raise_count += 1
+        return True
 
 
 class FakeMarkerFrame:
@@ -265,7 +282,7 @@ class SliderMarkerGeometryTests(unittest.TestCase):
 
 
 class GhostSliderMarkerTests(unittest.TestCase):
-    def test_real_tk_marker_geometry_routing_and_global_release(self):
+    def test_real_tk_marker_layering_geometry_and_routing(self):
         try:
             root = tk.Tk()
         except tk.TclError as exc:
@@ -290,7 +307,16 @@ class GhostSliderMarkerTests(unittest.TestCase):
             sibling = tk.Button(parent, text="sibling")
             sibling.grid(row=1, column=0)
             self.assertFalse(root.bind_all("<ButtonRelease-1>"))
-            marker = GhostSliderMarker(parent, slider)
+            estimated_marker = GhostSliderMarker(
+                parent,
+                slider,
+                ESTIMATED_MARKER_ROLE,
+            )
+            encoder_marker = GhostSliderMarker(
+                parent,
+                slider,
+                ENCODER_MARKER_ROLE,
+            )
             # Tk drops synthetic pointer events for withdrawn widgets; a
             # one-pixel override-redirect root keeps a mapped event surface
             # without presenting a normal window.
@@ -299,11 +325,38 @@ class GhostSliderMarkerTests(unittest.TestCase):
             root.deiconify()
             root.update()
 
-            self.assertTrue(marker.show(25))
+            self.assertTrue(encoder_marker.show(25))
+            self.assertTrue(estimated_marker.show(25))
             root.update()
 
             self.assertEqual(slider.winfo_manager(), "grid")
-            self.assertEqual(marker._marker.winfo_manager(), "place")
+            self.assertEqual(
+                estimated_marker._marker.winfo_manager(),
+                "place",
+            )
+            self.assertEqual(
+                encoder_marker._marker.winfo_manager(),
+                "place",
+            )
+            children = parent.winfo_children()
+            self.assertGreater(
+                children.index(estimated_marker._marker),
+                children.index(encoder_marker._marker),
+            )
+            self.assertTrue(encoder_marker.show(50))
+            root.update()
+            children = parent.winfo_children()
+            self.assertGreater(
+                children.index(encoder_marker._marker),
+                children.index(estimated_marker._marker),
+            )
+            self.assertTrue(estimated_marker.raise_above())
+            root.update()
+            children = parent.winfo_children()
+            self.assertGreater(
+                children.index(estimated_marker._marker),
+                children.index(encoder_marker._marker),
+            )
             self.assertTrue(root.bind_all("<ButtonRelease-1>"))
             setattr(slider, _SLIDER_DRAG_ATTRIBUTE, True)
             sibling.event_generate("<ButtonRelease-1>", x=0, y=0)
@@ -338,16 +391,16 @@ class GhostSliderMarkerTests(unittest.TestCase):
             event_x = 1
             event_y = 1
             expected_x = (
-                marker._marker.winfo_rootx()
+                estimated_marker._marker.winfo_rootx()
                 + event_x
                 - slider.winfo_rootx()
             )
             expected_y = (
-                marker._marker.winfo_rooty()
+                estimated_marker._marker.winfo_rooty()
                 + event_y
                 - slider.winfo_rooty()
             )
-            marker._marker.event_generate(
+            estimated_marker._marker.event_generate(
                 "<ButtonPress-1>",
                 x=event_x,
                 y=event_y,
@@ -363,16 +416,16 @@ class GhostSliderMarkerTests(unittest.TestCase):
             motion_x = 2
             motion_y = 2
             expected_motion_x = (
-                marker._marker.winfo_rootx()
+                estimated_marker._marker.winfo_rootx()
                 + motion_x
                 - slider.winfo_rootx()
             )
             expected_motion_y = (
-                marker._marker.winfo_rooty()
+                estimated_marker._marker.winfo_rooty()
                 + motion_y
                 - slider.winfo_rooty()
             )
-            marker._marker.event_generate(
+            estimated_marker._marker.event_generate(
                 "<B1-Motion>",
                 x=motion_x,
                 y=motion_y,
@@ -389,7 +442,7 @@ class GhostSliderMarkerTests(unittest.TestCase):
                     ),
                 ],
             )
-            marker._marker.event_generate(
+            estimated_marker._marker.event_generate(
                 "<ButtonRelease-1>",
                 x=event_x,
                 y=event_y,
@@ -410,9 +463,17 @@ class GhostSliderMarkerTests(unittest.TestCase):
             self.assertFalse(
                 getattr(slider, _SLIDER_DRAG_ATTRIBUTE)
             )
-            self.assertTrue(marker.hide())
+            self.assertTrue(estimated_marker.hide())
+            self.assertTrue(encoder_marker.hide())
             root.update_idletasks()
-            self.assertEqual(marker._marker.winfo_manager(), "")
+            self.assertEqual(
+                estimated_marker._marker.winfo_manager(),
+                "",
+            )
+            self.assertEqual(
+                encoder_marker._marker.winfo_manager(),
+                "",
+            )
         finally:
             root.destroy()
 
@@ -422,7 +483,11 @@ class GhostSliderMarkerTests(unittest.TestCase):
             "ARrobots.HMI.joint_visualization.tk.Frame",
             FakeMarkerFrame,
         ):
-            marker = GhostSliderMarker(object(), slider)
+            marker = GhostSliderMarker(
+                object(),
+                slider,
+                ESTIMATED_MARKER_ROLE,
+            )
 
         self.assertTrue(marker.show(0))
         self.assertFalse(marker.show(0))
@@ -432,11 +497,15 @@ class GhostSliderMarkerTests(unittest.TestCase):
                 "x": 110,
                 "y": 30,
                 "anchor": "center",
-                "width": 7,
+                "width": ESTIMATED_MARKER_WIDTH,
                 "height": 20,
             }],
         )
         self.assertEqual(marker._marker.lift_count, 1)
+        self.assertEqual(
+            marker._marker.options["background"],
+            ESTIMATED_MARKER_COLOR,
+        )
 
         event = SimpleNamespace(x_root=130, y_root=235)
         results = [
@@ -461,6 +530,67 @@ class GhostSliderMarkerTests(unittest.TestCase):
         self.assertFalse(marker.hide())
         self.assertEqual(marker._marker.hide_count, 1)
 
+    def test_marker_roles_are_distinct_and_share_slider_bindings(self):
+        global_bindings = {}
+        slider = OverlaySlider(global_bindings=global_bindings)
+        with patch(
+            "ARrobots.HMI.joint_visualization.tk.Frame",
+            FakeMarkerFrame,
+        ):
+            estimated = GhostSliderMarker(
+                object(),
+                slider,
+                ESTIMATED_MARKER_ROLE,
+            )
+            encoder = GhostSliderMarker(
+                object(),
+                slider,
+                ENCODER_MARKER_ROLE,
+            )
+
+        self.assertEqual(
+            estimated._marker.options["background"],
+            ESTIMATED_MARKER_COLOR,
+        )
+        self.assertEqual(
+            encoder._marker.options["background"],
+            ENCODER_MARKER_COLOR,
+        )
+        self.assertTrue(encoder.show(0))
+        self.assertTrue(estimated.show(0))
+        self.assertEqual(
+            encoder._marker.placements[-1]["width"],
+            ENCODER_MARKER_WIDTH,
+        )
+        self.assertEqual(
+            encoder._marker.placements[-1]["height"],
+            12,
+        )
+        self.assertEqual(
+            estimated._marker.placements[-1]["width"],
+            ESTIMATED_MARKER_WIDTH,
+        )
+        self.assertEqual(
+            estimated._marker.placements[-1]["height"],
+            20,
+        )
+        self.assertTrue(encoder.raise_above())
+        self.assertTrue(estimated.raise_above())
+        self.assertEqual(encoder._marker.lift_count, 2)
+        self.assertEqual(estimated._marker.lift_count, 2)
+        self.assertEqual(
+            len(slider.bindings["<ButtonPress-1>"]),
+            1,
+        )
+        self.assertEqual(
+            len(slider.bindings["<ButtonRelease-1>"]),
+            1,
+        )
+        self.assertEqual(
+            len(global_bindings["<ButtonRelease-1>"]),
+            1,
+        )
+
     def test_slider_updates_preserve_an_active_operator_drag(self):
         slider = OverlaySlider(5, global_bindings={})
         release_states = []
@@ -475,7 +605,11 @@ class GhostSliderMarkerTests(unittest.TestCase):
             "ARrobots.HMI.joint_visualization.tk.Frame",
             FakeMarkerFrame,
         ):
-            marker = GhostSliderMarker(object(), slider)
+            marker = GhostSliderMarker(
+                object(),
+                slider,
+                ESTIMATED_MARKER_ROLE,
+            )
         sliders = [slider] + [FakeSlider() for _ in range(8)]
         pointer = SimpleNamespace(x_root=130, y_root=235)
         marker._marker.bindings["<ButtonPress-1>"](pointer)
@@ -505,7 +639,11 @@ class GhostSliderMarkerTests(unittest.TestCase):
             "ARrobots.HMI.joint_visualization.tk.Frame",
             FakeMarkerFrame,
         ):
-            marker = GhostSliderMarker(object(), slider)
+            marker = GhostSliderMarker(
+                object(),
+                slider,
+                ESTIMATED_MARKER_ROLE,
+            )
         pointer = SimpleNamespace(x_root=130, y_root=235)
         marker._marker.bindings["<ButtonPress-1>"](pointer)
         self.assertTrue(slider._ar4_joint_slider_drag_active)
@@ -538,13 +676,17 @@ class GhostSliderMarkerTests(unittest.TestCase):
 class JointMotionVisualizationTests(unittest.TestCase):
     def setUp(self):
         self.sliders = [FakeSlider() for _ in range(9)]
-        self.markers = [FakeMarker() for _ in range(9)]
-        self.enabled = {"value": 1}
+        self.estimated_markers = [FakeMarker() for _ in range(9)]
+        self.encoder_markers = [FakeMarker() for _ in range(6)]
+        self.estimated_enabled = {"value": 1}
+        self.encoder_enabled = {"value": 1}
         self.clock = {"value": 10.0}
         self.visualization = JointMotionVisualization(
             self.sliders,
-            self.markers,
-            lambda: self.enabled["value"],
+            self.estimated_markers,
+            self.encoder_markers,
+            lambda: self.estimated_enabled["value"],
+            lambda: self.encoder_enabled["value"],
             clock=lambda: self.clock["value"],
         )
 
@@ -563,8 +705,11 @@ class JointMotionVisualizationTests(unittest.TestCase):
             tuple(float(value) for value in queued_target),
         )
         self.assertEqual(
-            tuple(marker.value for marker in self.markers),
+            tuple(marker.value for marker in self.estimated_markers),
             (0.0,) * 9,
+        )
+        self.assertFalse(
+            any(marker.visible for marker in self.encoder_markers)
         )
 
         self.clock["value"] += trajectory.duration_seconds / 2
@@ -589,10 +734,16 @@ class JointMotionVisualizationTests(unittest.TestCase):
             started_at_seconds=started_at,
         )
 
-        self.assertAlmostEqual(self.markers[0].value, 5.0)
-        self.assertAlmostEqual(self.markers[1].value, -2.5)
+        self.assertAlmostEqual(
+            self.estimated_markers[0].value,
+            5.0,
+        )
+        self.assertAlmostEqual(
+            self.estimated_markers[1].value,
+            -2.5,
+        )
 
-    def test_actual_telemetry_replaces_only_encoder_backed_estimates(self):
+    def test_encoder_telemetry_remains_distinct_from_estimates(self):
         trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
         self.clock["value"] += trajectory.duration_seconds / 2
         estimated = trajectory.positions_at(trajectory.duration_seconds / 2)
@@ -602,11 +753,66 @@ class JointMotionVisualizationTests(unittest.TestCase):
         )
         positions = self.visualization.refresh()
 
-        self.assertEqual(positions[:6], (1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
-        self.assertEqual(positions[6:], estimated[6:])
+        for observed, expected in zip(positions, estimated):
+            self.assertAlmostEqual(observed, expected)
+        for marker, expected in zip(
+            self.estimated_markers,
+            estimated,
+        ):
+            self.assertAlmostEqual(marker.value, expected)
         self.assertEqual(
-            tuple(marker.value for marker in self.markers[:6]),
-            positions[:6],
+            tuple(marker.value for marker in self.encoder_markers),
+            (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+        )
+        self.assertTrue(
+            all(marker.visible for marker in self.encoder_markers)
+        )
+
+    def test_dual_marker_layering_tracks_changes_and_reenable(self):
+        trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
+        self.clock["value"] += trajectory.duration_seconds / 2
+        self.assertTrue(
+            self.visualization.observe_actual((1, 2, 3, 4, 5, 6))
+        )
+
+        self.visualization.refresh()
+
+        self.assertEqual(
+            tuple(
+                marker.raise_count
+                for marker in self.estimated_markers[:6]
+            ),
+            (1,) * 6,
+        )
+        self.visualization.refresh()
+        self.assertEqual(
+            tuple(
+                marker.raise_count
+                for marker in self.estimated_markers[:6]
+            ),
+            (1,) * 6,
+        )
+
+        self.encoder_enabled["value"] = 0
+        self.visualization.refresh()
+        self.encoder_enabled["value"] = 1
+        self.visualization.refresh()
+        self.assertEqual(
+            tuple(
+                marker.raise_count
+                for marker in self.estimated_markers[:6]
+            ),
+            (2,) * 6,
+        )
+
+        self.clock["value"] += trajectory.duration_seconds / 10
+        self.visualization.refresh()
+        self.assertEqual(
+            tuple(
+                marker.raise_count
+                for marker in self.estimated_markers[:6]
+            ),
+            (3, 3, 2, 2, 2, 2),
         )
 
     def test_actual_telemetry_requires_an_active_six_axis_sample(self):
@@ -635,28 +841,75 @@ class JointMotionVisualizationTests(unittest.TestCase):
 
         self.assertAlmostEqual(positions[0], 5.0)
         self.assertAlmostEqual(positions[1], -2.5)
+        self.assertFalse(
+            any(marker.visible for marker in self.encoder_markers)
+        )
         self.assertNotEqual(trajectory.duration_seconds, 0)
 
     def test_toggle_hides_without_discarding_active_estimate(self):
         trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
-        self.enabled["value"] = 0
+        self.estimated_enabled["value"] = 0
 
         self.assertIsNone(self.visualization.refresh())
         self.assertTrue(self.visualization.active)
-        self.assertFalse(any(marker.visible for marker in self.markers))
-        hide_counts = tuple(marker.hide_count for marker in self.markers)
+        self.assertFalse(
+            any(marker.visible for marker in self.estimated_markers)
+        )
+        hide_counts = tuple(
+            marker.hide_count for marker in self.estimated_markers
+        )
         self.assertIsNone(self.visualization.refresh())
         self.assertEqual(
-            tuple(marker.hide_count for marker in self.markers),
+            tuple(
+                marker.hide_count
+                for marker in self.estimated_markers
+            ),
             hide_counts,
         )
 
         self.clock["value"] += trajectory.duration_seconds
-        self.enabled["value"] = 1
+        self.estimated_enabled["value"] = 1
         positions = self.visualization.refresh()
 
         self.assertEqual(positions, trajectory.target_positions)
-        self.assertTrue(all(marker.visible for marker in self.markers))
+        self.assertTrue(
+            all(marker.visible for marker in self.estimated_markers)
+        )
+
+    def test_marker_channels_can_be_selected_independently(self):
+        trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
+        self.clock["value"] += trajectory.duration_seconds / 2
+        self.assertTrue(
+            self.visualization.observe_actual((1, 2, 3, 4, 5, 6))
+        )
+        self.visualization.refresh()
+
+        self.encoder_enabled["value"] = 0
+        positions = self.visualization.refresh()
+
+        self.assertIsNotNone(positions)
+        self.assertTrue(
+            all(marker.visible for marker in self.estimated_markers)
+        )
+        self.assertFalse(
+            any(marker.visible for marker in self.encoder_markers)
+        )
+
+        self.encoder_enabled["value"] = 1
+        self.estimated_enabled["value"] = 0
+        positions = self.visualization.refresh()
+
+        self.assertIsNotNone(positions)
+        self.assertFalse(
+            any(marker.visible for marker in self.estimated_markers)
+        )
+        self.assertTrue(
+            all(marker.visible for marker in self.encoder_markers)
+        )
+        self.assertEqual(
+            tuple(marker.value for marker in self.encoder_markers),
+            (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+        )
 
     def test_finish_hides_markers_without_changing_queued_target(self):
         queued_target = (20, 4, 3, 2, 1, 0, 6, 7, 8)
@@ -666,7 +919,12 @@ class JointMotionVisualizationTests(unittest.TestCase):
         self.assertTrue(self.visualization.finish())
 
         self.assertFalse(self.visualization.active)
-        self.assertFalse(any(marker.visible for marker in self.markers))
+        self.assertFalse(
+            any(marker.visible for marker in self.estimated_markers)
+        )
+        self.assertFalse(
+            any(marker.visible for marker in self.encoder_markers)
+        )
         self.assertEqual(
             tuple(slider.value for slider in self.sliders),
             tuple(float(value) for value in queued_target),
@@ -678,6 +936,8 @@ class JointMotionVisualizationTests(unittest.TestCase):
         visualization = JointMotionVisualization(
             sliders,
             [FakeMarker() for _ in range(9)],
+            [FakeMarker() for _ in range(6)],
+            lambda: 1,
             lambda: 1,
         )
 
@@ -689,10 +949,12 @@ class JointMotionVisualizationTests(unittest.TestCase):
         self.assertEqual(sliders[3].value, 3)
 
     def test_marker_failure_hides_every_partial_overlay(self):
-        self.markers[2] = FakeMarker(fail_show=True)
+        self.estimated_markers[2] = FakeMarker(fail_show=True)
         visualization = JointMotionVisualization(
             self.sliders,
-            self.markers,
+            self.estimated_markers,
+            self.encoder_markers,
+            lambda: 1,
             lambda: 1,
             clock=lambda: self.clock["value"],
         )
@@ -701,15 +963,50 @@ class JointMotionVisualizationTests(unittest.TestCase):
             visualization.start((0,) * 9, joint_move(), 200)
 
         self.assertFalse(visualization.active)
-        self.assertFalse(any(marker.visible for marker in self.markers))
+        self.assertFalse(
+            any(marker.visible for marker in self.estimated_markers)
+        )
+        self.assertFalse(
+            any(marker.visible for marker in self.encoder_markers)
+        )
+
+    def test_encoder_failure_hides_every_partial_overlay(self):
+        self.visualization.start((0,) * 9, joint_move(), 200)
+        self.assertTrue(
+            self.visualization.observe_actual((1, 2, 3, 4, 5, 6))
+        )
+        self.encoder_markers[2].fail_show = True
+
+        with self.assertRaisesRegex(RuntimeError, "marker draw failed"):
+            self.visualization.refresh()
+
+        self.assertFalse(self.visualization.active)
+        self.assertFalse(
+            any(marker.visible for marker in self.estimated_markers)
+        )
+        self.assertFalse(
+            any(marker.visible for marker in self.encoder_markers)
+        )
+        self.assertEqual(
+            tuple(
+                marker.hide_count
+                for marker in self.encoder_markers
+            ),
+            (1,) * 6,
+        )
 
     def test_invalid_toggle_value_hides_markers_and_disables_estimate(self):
         trajectory = self.visualization.start((0,) * 9, joint_move(), 200)
-        self.enabled["value"] = "enabled"
+        self.estimated_enabled["value"] = "enabled"
 
         with self.assertRaisesRegex(MotionInputError, "zero or one"):
             self.visualization.refresh()
 
         self.assertFalse(self.visualization.active)
-        self.assertFalse(any(marker.visible for marker in self.markers))
+        self.assertFalse(
+            any(marker.visible for marker in self.estimated_markers)
+        )
+        self.assertFalse(
+            any(marker.visible for marker in self.encoder_markers)
+        )
         self.assertEqual(trajectory.target_positions[0], 10.0)

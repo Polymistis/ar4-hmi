@@ -254,6 +254,8 @@ from ARrobots.HMI.joint_motion import (
   write_serial_control,
 )
 from ARrobots.HMI.joint_visualization import (
+  ENCODER_MARKER_ROLE,
+  ESTIMATED_MARKER_ROLE,
   GhostSliderMarker,
   JointMotionVisualization,
   set_joint_slider_positions,
@@ -3264,6 +3266,7 @@ RUN['J9CalStat2'] = IntVar()
 
 RUN['IncJogStat'] = IntVar()
 RUN['showEstimatedMotion'] = IntVar(value=1)
+RUN['showEncoderTelemetry'] = IntVar(value=1)
 RUN['fullRot'] = IntVar()
 RUN['pick180'] = IntVar()
 RUN['pickClosest'] = IntVar()
@@ -14731,7 +14734,7 @@ def _start_joint_motion_visualization(move, started_at_seconds):
       started_at_seconds,
     )
   except Exception:
-    logger.exception("Unable to start estimated joint-position display")
+    logger.exception("Unable to start joint-motion tracking display")
     return False
 
 
@@ -14739,7 +14742,7 @@ def _refresh_joint_motion_visualization():
   try:
     return joint_motion_visualization.refresh()
   except Exception:
-    logger.exception("Unable to refresh estimated joint-position display")
+    logger.exception("Unable to refresh joint-motion tracking display")
     return False
 
 
@@ -14755,7 +14758,7 @@ def _finish_joint_motion_visualization():
   try:
     return joint_motion_visualization.finish()
   except Exception:
-    logger.exception("Unable to finish estimated joint-position display")
+    logger.exception("Unable to finish joint-motion tracking display")
     return False
 
 
@@ -24435,18 +24438,39 @@ def J6sliderExecute(foo):
 J6jogslide.config(command=J6sliderUpdate)
 J6jogslide.bind("<ButtonRelease-1>", J6sliderExecute)
 
+motionTrackingFrame = Frame(jointFrame)
+motionTrackingFrame.grid(
+  row=6,
+  column=0,
+  sticky="ew",
+  padx=4,
+  pady=(2, 0),
+)
+motionTrackingFrame.grid_columnconfigure(0, weight=1)
+motionTrackingFrame.grid_columnconfigure(1, weight=1)
+
 estimatedMotionCbut = Checkbutton(
-  jointFrame,
-  text="Show motion tracking (cyan marker)",
+  motionTrackingFrame,
+  text="Estimated trajectory (amber)",
   variable=RUN['showEstimatedMotion'],
   command=_refresh_joint_motion_visualization,
 )
 estimatedMotionCbut.grid(
-  row=6,
+  row=0,
   column=0,
   sticky="w",
-  padx=4,
-  pady=(2, 0),
+)
+
+encoderTelemetryCbut = Checkbutton(
+  motionTrackingFrame,
+  text="Encoder sample (cyan, J1-J6)",
+  variable=RUN['showEncoderTelemetry'],
+  command=_refresh_joint_motion_visualization,
+)
+encoderTelemetryCbut.grid(
+  row=0,
+  column=1,
+  sticky="w",
 )
 
 namedPositionFrame = Frame(jointFrame)
@@ -24983,18 +25007,57 @@ joint_motion_visualization = JointMotionVisualization(
     J4jogslide, J5jogslide, J6jogslide,
     J7jogslide, J8jogslide, J9jogslide,
   ),
-  markers=(
-    GhostSliderMarker(J1jogFrame, J1jogslide),
-    GhostSliderMarker(J2jogFrame, J2jogslide),
-    GhostSliderMarker(J3jogFrame, J3jogslide),
-    GhostSliderMarker(J4jogFrame, J4jogslide),
-    GhostSliderMarker(J5jogFrame, J5jogslide),
-    GhostSliderMarker(J6jogFrame, J6jogslide),
-    GhostSliderMarker(J7jogFrame, J7jogslide),
-    GhostSliderMarker(J8jogFrame, J8jogslide),
-    GhostSliderMarker(J9jogFrame, J9jogslide),
+  estimated_markers=(
+    GhostSliderMarker(
+      J1jogFrame, J1jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J2jogFrame, J2jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J3jogFrame, J3jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J4jogFrame, J4jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J5jogFrame, J5jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J6jogFrame, J6jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J7jogFrame, J7jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J8jogFrame, J8jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J9jogFrame, J9jogslide, ESTIMATED_MARKER_ROLE
+    ),
   ),
-  enabled_provider=RUN['showEstimatedMotion'].get,
+  encoder_markers=(
+    GhostSliderMarker(
+      J1jogFrame, J1jogslide, ENCODER_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J2jogFrame, J2jogslide, ENCODER_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J3jogFrame, J3jogslide, ENCODER_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J4jogFrame, J4jogslide, ENCODER_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J5jogFrame, J5jogslide, ENCODER_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J6jogFrame, J6jogslide, ENCODER_MARKER_ROLE
+    ),
+  ),
+  estimated_enabled_provider=RUN['showEstimatedMotion'].get,
+  encoder_enabled_provider=RUN['showEncoderTelemetry'].get,
 )
 
 # Command builders (IF, SET, WAIT - reordered and aligned)

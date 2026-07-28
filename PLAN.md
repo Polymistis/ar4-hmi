@@ -508,7 +508,7 @@ Implemented portions of the active integration unit:
   and length result contracts; full SD-library traversal remains
   hardware-free source and compile coverage.
 
-### M4A5 - Desired-versus-estimated joint display
+### M4A5 - Desired-versus-estimated-and-encoder joint display
 
 Status: `Tested`
 
@@ -516,14 +516,19 @@ Display contract:
 
 - The normal J1-J9 slider thumb represents the active operator input or the
   latest accepted desired target.
-- A toggleable cyan marker represents coordinated `RJ` motion. The marker uses
-  the commanded estimate until negotiated encoder telemetry arrives, then uses
-  actual J1-J6 samples while retaining the estimator for J7-J9.
+- A narrow amber marker represents the commanded coordinated-`RJ` estimate.
+  Encoder telemetry never replaces or recolors this marker.
+- A separate wide cyan marker represents only the latest validated J1-J6
+  encoder sample received during the owning `RJ` exchange. Cyan remains absent
+  before the first sample, never falls back to estimated data, and is never
+  presented for J7-J9.
+- Independent controls permit estimate-only, encoder-only, combined, or
+  disabled presentation without changing the motion request.
 - The estimate follows the controller's calibrated step conversion,
   synchronized high-step progression, and acceleration, cruise, and
   deceleration timing envelope.
 - Controllers without `JOINT_TELEMETRY_V1` report joint position only in the
-  terminal response and retain the estimate-only behavior. Telemetry-capable
+  terminal response and can display only the amber estimate. Telemetry-capable
   controllers emit request-scoped interim samples that never advance confirmed
   calibration state.
 - Terminal position feedback remains authoritative for confirmed state and
@@ -536,8 +541,8 @@ Display contract:
 
 Acceptance criteria:
 
-- Motion-tracking markers can be enabled or disabled without affecting motion
-  admission, serial ownership, or controller state.
+- Estimated and encoder motion markers can be enabled independently without
+  affecting motion admission, serial ownership, or controller state.
 - J1-J9 desired targets remain interactive while an accepted coordinated move
   owns the serial interface.
 - Marker updates run only on the Tk event thread and perform no serial I/O,
@@ -553,19 +558,21 @@ Implemented evidence:
 - A validated command-trajectory estimator models controller binary32
   calibration conversion, coordinated step timing, and average
   pulse-distribution overhead without reading or mutating Tk state.
-- A Tk-thread visualization owner updates the J1-J9 overlay markers from the
-  existing joint-motion poll, preserves active pointer drags and coalesced
-  desired targets across delayed worker events, uses the worker's monotonic
-  dispatch timestamp, replaces only J1-J6 estimates with validated encoder
-  samples, and disables only the display after presentation failure.
+- A Tk-thread visualization owner updates the J1-J9 estimate markers and
+  separate J1-J6 encoder markers from the existing joint-motion poll, preserves
+  active pointer drags and coalesced desired targets across delayed worker
+  events, uses the worker's monotonic dispatch timestamp, and never substitutes
+  one marker channel for the other.
 - The complete Windows and Ubuntu hardware-free suites pass. Tracked marker
-  tests exercise placement, pointer forwarding, drag preservation, redraw
-  suppression, and cleanup without opening the application entry point or a
-  serial transport. A mapped real-Tk integration test verifies that the
-  place-managed marker can overlay and clear from a grid-managed scale and
-  registers the global release binding shared by sibling widgets on
-  display-capable test hosts; the test skips explicitly when no Tk display
-  exists.
+  tests exercise distinct styling, independent channel selection, encoder
+  absence before telemetry, complementary marker geometry, change-driven
+  deterministic amber-above-cyan layering, shared pointer forwarding, drag
+  preservation, redraw suppression, and cleanup without opening the
+  application entry point or a serial transport. A mapped real-Tk integration
+  test verifies actual amber-versus-cyan sibling stacking, reassertion after a
+  changed cyan placement, overlay cleanup from a grid-managed scale, and the
+  global release binding shared by sibling widgets on display-capable test
+  hosts; the test skips explicitly when no Tk display exists.
 
 ### M4A6 - Main-control workspace and named positions
 
@@ -583,8 +590,9 @@ Control contract:
 - Tool Frame controls use matching vertical relative-jog rows. Absolute sliders
   remain unavailable because tool-frame jog represents signed displacement
   along the moving tool axes rather than an absolute tool-frame position.
-- The joint motion marker uses a wider bright-cyan body and contrasting
-  outline while retaining pointer forwarding and desired-slider interaction.
+- The encoder marker uses a wide bright-cyan body while the estimated marker
+  uses a narrow amber body. Both retain contrasting outlines, deterministic
+  stacking, pointer forwarding, and desired-slider interaction.
 - `Start Position` submits the canonical post-calibration J1-J6 target
   `(0, 0, 0, 0, 45, 0)`.
 - `Shutdown Position` keeps J3-J6 at the canonical start values and uses the
@@ -685,7 +693,7 @@ Acceptance criteria:
 - Host parsing, request-marker admission, interim-line demultiplexing,
   malformed-frame quarantine, response-budget enforcement,
   serial-versus-virtual suffix separation, bounded latest-sample coalescing,
-  dispatcher ordering, actual-versus-estimated overlay selection, and
+  dispatcher ordering, independent encoder-versus-estimate overlays, and
   stale-sample cleanup have deterministic tests.
 - Native sanitized checks cover encoder conversion, atomic validation,
   millidegree rounding, frame bounds, framing, wrap-safe cadence, and
@@ -792,10 +800,11 @@ Known M5 deviations:
   accepted submissions resume confirmed-position display updates, and
   cancelled or abandoned edits restore the latest confirmed position.
 - Negotiated `JOINT_TELEMETRY_V1` coordinated-joint exchanges demultiplex
-  request-scoped J1-J6 encoder samples into the Tk motion overlay. Samples are
-  dropped under firmware USB backpressure, never update confirmed host state,
-  and leave J7-J9 on the existing command estimator. Hardware timing and
-  encoder accuracy remain unverified.
+  request-scoped J1-J6 encoder samples into a dedicated cyan Tk overlay while
+  the amber J1-J9 command estimate remains separate. Samples are dropped under
+  firmware USB backpressure, never update confirmed host state, and never
+  create a J7-J9 encoder marker. Hardware timing and encoder accuracy remain
+  unverified.
 - Simple program movement routes now share request-scoped controller ownership, raw target validation, and offline physical-write rejection. The broader typed program state machine, non-motion row migration, Cartesian and tool-frame coalescing, complete main-controller response ownership, application lifecycle separation, and dynamic controller work remain incomplete.
 - Tracked Teensy `6.7.1-ar4hmi.4` `MA` and `MC` parsing stages `Tr` in a command-local value instead of writing beyond the Cartesian pose array and accepts only the supported zero value. `ML` accepts only `Q0` because wrist-suppression semantics remain unimplemented. The corrected source passes the Teensy toolchain compile. Host arc and circle program transmission remains disabled until deterministic trajectory simulation and an authorized hardware-validation plan cover the broader algorithms. Spline program transmission also remains disabled until one terminal response-owner contract replaces speculative acknowledgements.
 - Teensy coordinated joint pulse scheduling now deducts bounded telemetry work from the existing pulse wait. A telemetry-enabled `RJ` also owns response framing across the coordinated drive, so an interrupt latches the stop while the drive commits local progress, reconciles encoders, and emits the selected terminal response without reentrant USB transmission. A stop deferred after terminal selection becomes an admission block during atomic ownership commit; the next queued command receives an `EB` position response before parsing or motor output. Broader E-stop ownership remains unchanged: the `6.7.1-ar4hmi.4` protocol can race speculative spline responses and remains unsafe for claimed single-frame ownership, and non-telemetry drive routines still report completion after an E-stop terminates a pulse loop. Broader remediation requires a separate single-owner protocol design and hardware-validation plan. The missing-file behavior has a source-contract assertion, and the current line-oriented compatibility source passes a Teensy 4.1 syntax/toolchain compile. That compile does not satisfy the later correlated JSON safety prerequisite; simulation and live-arm verification remain pending.

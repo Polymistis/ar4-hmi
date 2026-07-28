@@ -14321,30 +14321,91 @@ class HmiSourceContractTests(unittest.TestCase):
             }],
         )
 
-    def test_joint_motion_estimate_is_toggleable_and_wired_to_tk_polling(self):
-        toggle_assignments = [
-            node
-            for node in self.tree.body
-            if isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Subscript)
-            and isinstance(node.targets[0].value, ast.Name)
-            and node.targets[0].value.id == "RUN"
-            and isinstance(node.targets[0].slice, ast.Constant)
-            and node.targets[0].slice.value == "showEstimatedMotion"
-        ]
-        self.assertEqual(len(toggle_assignments), 1)
-        toggle_constructor = toggle_assignments[0].value
-        self.assertIsInstance(toggle_constructor, ast.Call)
-        self.assertIsInstance(toggle_constructor.func, ast.Name)
-        self.assertEqual(toggle_constructor.func.id, "IntVar")
-        self.assertEqual(
-            {
-                keyword.arg: ast.literal_eval(keyword.value)
-                for keyword in toggle_constructor.keywords
-            },
-            {"value": 1},
-        )
+    def test_joint_motion_markers_are_distinct_and_wired_to_tk_polling(self):
+        for toggle_name in (
+            "showEstimatedMotion",
+            "showEncoderTelemetry",
+        ):
+            with self.subTest(toggle_name=toggle_name):
+                toggle_assignments = [
+                    node
+                    for node in self.tree.body
+                    if isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Subscript)
+                    and isinstance(node.targets[0].value, ast.Name)
+                    and node.targets[0].value.id == "RUN"
+                    and isinstance(node.targets[0].slice, ast.Constant)
+                    and node.targets[0].slice.value == toggle_name
+                ]
+                self.assertEqual(len(toggle_assignments), 1)
+                toggle_constructor = toggle_assignments[0].value
+                self.assertIsInstance(toggle_constructor, ast.Call)
+                self.assertIsInstance(toggle_constructor.func, ast.Name)
+                self.assertEqual(toggle_constructor.func.id, "IntVar")
+                self.assertEqual(
+                    {
+                        keyword.arg: ast.literal_eval(keyword.value)
+                        for keyword in toggle_constructor.keywords
+                    },
+                    {"value": 1},
+                )
+
+        for assignment_name, label, toggle_name in (
+            (
+                "estimatedMotionCbut",
+                "Estimated trajectory (amber)",
+                "showEstimatedMotion",
+            ),
+            (
+                "encoderTelemetryCbut",
+                "Encoder sample (cyan, J1-J6)",
+                "showEncoderTelemetry",
+            ),
+        ):
+            with self.subTest(assignment_name=assignment_name):
+                constructor = self.module_assignments[
+                    assignment_name
+                ].value
+                self.assertIsInstance(constructor, ast.Call)
+                self.assertIsInstance(constructor.func, ast.Name)
+                self.assertEqual(
+                    constructor.func.id,
+                    "Checkbutton",
+                )
+                self.assertEqual(
+                    tuple(
+                        argument.id
+                        for argument in constructor.args
+                    ),
+                    ("motionTrackingFrame",),
+                )
+                keywords = {
+                    keyword.arg: keyword.value
+                    for keyword in constructor.keywords
+                }
+                self.assertEqual(
+                    set(keywords),
+                    {"text", "variable", "command"},
+                )
+                self.assertEqual(
+                    ast.literal_eval(keywords["text"]),
+                    label,
+                )
+                variable = keywords["variable"]
+                self.assertIsInstance(variable, ast.Subscript)
+                self.assertIsInstance(variable.value, ast.Name)
+                self.assertEqual(variable.value.id, "RUN")
+                self.assertEqual(
+                    variable.slice.value,
+                    toggle_name,
+                )
+                command = keywords["command"]
+                self.assertIsInstance(command, ast.Name)
+                self.assertEqual(
+                    command.id,
+                    "_refresh_joint_motion_visualization",
+                )
 
         visualization_assignment = self.module_assignments[
             "joint_motion_visualization"
@@ -14365,16 +14426,59 @@ class HmiSourceContractTests(unittest.TestCase):
             slider_names,
             tuple(f"J{axis}jogslide" for axis in range(1, 10)),
         )
-        marker_calls = keywords["markers"].elts
-        self.assertEqual(len(marker_calls), 9)
-        for axis, marker_call in enumerate(marker_calls, start=1):
-            self.assertIsInstance(marker_call, ast.Call)
-            self.assertIsInstance(marker_call.func, ast.Name)
-            self.assertEqual(marker_call.func.id, "GhostSliderMarker")
-            self.assertEqual(
-                tuple(argument.id for argument in marker_call.args),
-                (f"J{axis}jogFrame", f"J{axis}jogslide"),
-            )
+        for marker_keyword, axis_count, role_name in (
+            (
+                "estimated_markers",
+                9,
+                "ESTIMATED_MARKER_ROLE",
+            ),
+            (
+                "encoder_markers",
+                6,
+                "ENCODER_MARKER_ROLE",
+            ),
+        ):
+            marker_calls = keywords[marker_keyword].elts
+            self.assertEqual(len(marker_calls), axis_count)
+            for axis, marker_call in enumerate(
+                marker_calls,
+                start=1,
+            ):
+                self.assertIsInstance(marker_call, ast.Call)
+                self.assertIsInstance(marker_call.func, ast.Name)
+                self.assertEqual(
+                    marker_call.func.id,
+                    "GhostSliderMarker",
+                )
+                self.assertEqual(
+                    tuple(
+                        argument.id
+                        for argument in marker_call.args
+                    ),
+                    (
+                        f"J{axis}jogFrame",
+                        f"J{axis}jogslide",
+                        role_name,
+                    ),
+                )
+
+        for provider_keyword, toggle_name in (
+            (
+                "estimated_enabled_provider",
+                "showEstimatedMotion",
+            ),
+            (
+                "encoder_enabled_provider",
+                "showEncoderTelemetry",
+            ),
+        ):
+            provider = keywords[provider_keyword]
+            self.assertIsInstance(provider, ast.Attribute)
+            self.assertEqual(provider.attr, "get")
+            self.assertIsInstance(provider.value, ast.Subscript)
+            self.assertIsInstance(provider.value.value, ast.Name)
+            self.assertEqual(provider.value.value.id, "RUN")
+            self.assertEqual(provider.value.slice.value, toggle_name)
 
         poll_calls = [
             node.func.id
