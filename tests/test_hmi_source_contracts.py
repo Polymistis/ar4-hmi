@@ -1,7 +1,7 @@
 import ast
 import copy
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import wraps
 import importlib
 import io
@@ -693,10 +693,19 @@ class HmiSourceContractTests(unittest.TestCase):
             "_schedule_calibration_save",
             "_flush_calibration_save",
             "_retain_calibration_persistence_retry",
+            "_reconcile_auxiliary_calibration_persistence_after_settle_failure",
         ):
             namespace.setdefault("_calibration_dirty", False)
             namespace.setdefault("_calibration_save_job", None)
             namespace.setdefault("_calibration_save_snapshot", None)
+        if (
+            name
+            == "_reconcile_auxiliary_calibration_persistence_after_settle_failure"
+        ):
+            namespace.setdefault(
+                "_retain_calibration_persistence_retry",
+                lambda calibration_snapshot=None: True,
+            )
         if name == "setCom2":
             namespace.setdefault(
                 "root",
@@ -704,12 +713,13 @@ class HmiSourceContractTests(unittest.TestCase):
             )
             namespace.setdefault(
                 "_retain_calibration_persistence_retry",
-                lambda: True,
+                lambda calibration_snapshot=None: True,
             )
             for helper_name in (
                 "_cancel_auxiliary_calibration_persistence_job",
                 "_begin_auxiliary_calibration_persistence_fence",
                 "_finish_auxiliary_calibration_persistence_fence",
+                "_reconcile_auxiliary_calibration_persistence_after_settle_failure",
                 "_apply_auxiliary_configuration_snapshot",
                 "_verify_auxiliary_configuration_snapshot",
             ):
@@ -5148,7 +5158,9 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_restore_controller_calibration": restore,
             "_retain_calibration_persistence_retry": (
-                lambda: calls.append("retry") or True
+                lambda calibration_snapshot=None: (
+                    calls.append("retry") or True
+                )
             ),
             "logger": SimpleNamespace(
                 exception=lambda *args: None,
@@ -5717,6 +5729,154 @@ class HmiSourceContractTests(unittest.TestCase):
             persisted_values,
             [{"J1AngCur": "0"}, {"J1AngCur": "0"}],
         )
+
+    def test_auxiliary_settle_reconciliation_preserves_live_job_ownership(self):
+        safe_snapshot = self._valid_runtime_calibration()
+        for mode in ("no-job", "cancelled", "cancel-failed", "ownership-changed"):
+            with self.subTest(mode=mode):
+                cancellations = []
+                errors = []
+                exceptions = []
+                namespace = {
+                    "_calibration_save_job": (
+                        None
+                        if mode == "no-job"
+                        else "pending-job"
+                    ),
+                    "_calibration_dirty": True,
+                    "_calibration_save_snapshot": {"J1AngCur": "0"},
+                    "logger": SimpleNamespace(
+                        error=lambda *args: errors.append(args),
+                        exception=lambda *args: exceptions.append(args),
+                    ),
+                }
+
+                def cancel(job):
+                    cancellations.append(job)
+                    if mode == "cancel-failed":
+                        raise RuntimeError("cancel failed")
+                    if mode == "ownership-changed":
+                        namespace["_calibration_save_job"] = "replacement-job"
+
+                namespace["root"] = SimpleNamespace(after_cancel=cancel)
+                reconcile = self.compile_function(
+                    "_reconcile_auxiliary_calibration_persistence_after_settle_failure",
+                    namespace,
+                )
+
+                expected = mode in ("no-job", "cancelled")
+                self.assertEqual(
+                    reconcile(False, None, safe_snapshot),
+                    expected,
+                )
+                self.assertEqual(
+                    namespace["_calibration_dirty"],
+                    not expected,
+                )
+                if expected:
+                    self.assertIsNone(
+                        namespace["_calibration_save_snapshot"]
+                    )
+                    self.assertIsNone(namespace["_calibration_save_job"])
+                else:
+                    self.assertEqual(
+                        namespace["_calibration_save_snapshot"],
+                        normalize_calibration_data(safe_snapshot),
+                    )
+                    self.assertEqual(
+                        namespace["_calibration_save_job"],
+                        (
+                            "replacement-job"
+                            if mode == "ownership-changed"
+                            else "pending-job"
+                        ),
+                    )
+                self.assertEqual(
+                    cancellations,
+                    [] if mode == "no-job" else ["pending-job"],
+                )
+                self.assertEqual(
+                    len(exceptions),
+                    1 if mode == "cancel-failed" else 0,
+                )
+                self.assertEqual(
+                    len(errors),
+                    1 if mode == "ownership-changed" else 0,
+                )
+
+    def test_auxiliary_settle_reconciliation_retains_safe_persistence_target(self):
+        safe_snapshot = self._valid_runtime_calibration()
+        for target in (None, safe_snapshot):
+            with self.subTest(explicit_snapshot=target is not None):
+                retained = []
+                namespace = {
+                    "_calibration_save_job": None,
+                    "_calibration_dirty": False,
+                    "_calibration_save_snapshot": None,
+                    "_retain_calibration_persistence_retry": (
+                        lambda snapshot=None: retained.append(snapshot) or True
+                    ),
+                    "root": SimpleNamespace(after_cancel=lambda job: None),
+                    "logger": SimpleNamespace(
+                        error=lambda *args: None,
+                        exception=lambda *args: None,
+                    ),
+                }
+                reconcile = self.compile_function(
+                    "_reconcile_auxiliary_calibration_persistence_after_settle_failure",
+                    namespace,
+                )
+
+                self.assertTrue(
+                    reconcile(True, target, safe_snapshot)
+                )
+                self.assertEqual(len(retained), 1)
+                if target is None:
+                    self.assertIsNone(retained[0])
+                else:
+                    self.assertEqual(
+                        retained[0],
+                        normalize_calibration_data(target),
+                    )
+
+        exceptions = []
+
+        def fail_cancel(job):
+            raise RuntimeError("cancel failed")
+
+        namespace = {
+            "_calibration_save_job": "pending-job",
+            "_calibration_dirty": True,
+            "_calibration_save_snapshot": None,
+            "_retain_calibration_persistence_retry": (
+                lambda snapshot=None: self.fail(
+                    "failed cancellation must not create a second job"
+                )
+            ),
+            "root": SimpleNamespace(after_cancel=fail_cancel),
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                exception=lambda *args: exceptions.append(args),
+            ),
+        }
+        reconcile = self.compile_function(
+            "_reconcile_auxiliary_calibration_persistence_after_settle_failure",
+            namespace,
+        )
+
+        self.assertFalse(
+            reconcile(True, safe_snapshot, safe_snapshot)
+        )
+        self.assertTrue(namespace["_calibration_dirty"])
+        self.assertEqual(
+            namespace["_calibration_save_job"],
+            "pending-job",
+        )
+        self.assertEqual(
+            namespace["_calibration_save_snapshot"],
+            normalize_calibration_data(safe_snapshot),
+        )
+        self.assertEqual(len(exceptions), 1)
 
     def test_shutdown_requests_online_and_offline_stop_before_final_flush(self):
         class Flag:
@@ -8014,7 +8174,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "cmdRecEntryField": received,
             "CAL": {},
             "_retain_calibration_persistence_retry": (
-                lambda: persisted.append(True) or True
+                lambda calibration_snapshot=None: (
+                    persisted.append(True) or True
+                )
             ),
             "_close_serial_port": (
                 lambda *args: closed.append(args) or True
@@ -9303,6 +9465,9 @@ class HmiSourceContractTests(unittest.TestCase):
             disable_close=True,
             disable=False,
             follow_up_error=None,
+            settle_failure=False,
+            initial_dirty=False,
+            verification_failure=False,
         ):
             port_selection = Selection("None" if disable else "COM9")
             board_selection = Selection(
@@ -9314,6 +9479,7 @@ class HmiSourceContractTests(unittest.TestCase):
             runtime = {"ser2": SimpleNamespace(is_open=True) if disable else None}
             replacement_calls = []
             persistence_calls = []
+            reconciliation_calls = []
             output_values = self._auxiliary_output_values(calibration)
 
             def replace(port, board):
@@ -9321,8 +9487,14 @@ class HmiSourceContractTests(unittest.TestCase):
                 if replacement_error is not None:
                     raise replacement_error
 
-            def retain_persistence():
-                persistence_calls.append(dict(calibration))
+            def retain_persistence(calibration_snapshot=None):
+                persistence_calls.append(
+                    dict(
+                        calibration
+                        if calibration_snapshot is None
+                        else calibration_snapshot
+                    )
+                )
                 return True
 
             def replace_output_values(values):
@@ -9335,7 +9507,25 @@ class HmiSourceContractTests(unittest.TestCase):
                 if follow_up_error is not None:
                     raise follow_up_error
 
+            def finish_persistence(*args):
+                if settle_failure:
+                    raise RuntimeError("persistence settle failed")
+                return True
+
+            def verify_configuration(*args):
+                if verification_failure:
+                    raise RuntimeError("configuration verification failed")
+                return True
+
             namespace = {
+                "_calibration_dirty": initial_dirty,
+                "_calibration_save_job": (
+                    "pending-job"
+                    if initial_dirty
+                    else None
+                ),
+                "_calibration_save_snapshot": None,
+                "root": SimpleNamespace(after_cancel=lambda job: None),
                 "wraps": wraps,
                 "motion_request_registry": MotionRequestRegistry(),
                 "application_closing": threading.Event(),
@@ -9364,6 +9554,24 @@ class HmiSourceContractTests(unittest.TestCase):
                 "open": lambda *args, **kwargs: object(),
                 "END": "end",
             }
+            if settle_failure:
+                namespace[
+                    "_finish_auxiliary_calibration_persistence_fence"
+                ] = finish_persistence
+                namespace[
+                    "_reconcile_auxiliary_calibration_persistence_after_settle_failure"
+                ] = (
+                    lambda required, snapshot, safe_snapshot: (
+                        reconciliation_calls.append(
+                            (required, snapshot, safe_snapshot)
+                        )
+                        or True
+                    )
+                )
+            if verification_failure:
+                namespace[
+                    "_verify_auxiliary_configuration_snapshot"
+                ] = verify_configuration
             namespace["_synchronous_motion_request"] = self.compile_function(
                 "_synchronous_motion_request",
                 namespace,
@@ -9383,6 +9591,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 board_selection,
                 replacement_calls,
                 persistence_calls,
+                reconciliation_calls,
             )
 
         success = run_case()
@@ -9451,6 +9660,85 @@ class HmiSourceContractTests(unittest.TestCase):
             "COM9",
         )
 
+        settle_failure = run_case(settle_failure=True)
+        self.assertFalse(settle_failure[0])
+        self.assertEqual(settle_failure[1]["com2Port"], "COM9")
+        self.assertEqual(
+            settle_failure[1]["auxiliaryBoard"],
+            AUXILIARY_BOARD_NANO,
+        )
+        self.assertEqual(len(settle_failure[6]), 1)
+        self.assertTrue(settle_failure[6][0][0])
+        self.assertIsNone(settle_failure[6][0][1])
+        self.assertEqual(
+            settle_failure[6][0][2]["com2Port"],
+            "COM9",
+        )
+        self.assertEqual(
+            settle_failure[6][0][2]["auxiliaryBoard"],
+            AUXILIARY_BOARD_NANO,
+        )
+
+        restored_settle_failure = run_case(
+            replacement_error=OSError("open failed"),
+            settle_failure=True,
+        )
+        self.assertFalse(restored_settle_failure[0])
+        self.assertEqual(len(restored_settle_failure[6]), 1)
+        self.assertFalse(restored_settle_failure[6][0][0])
+        self.assertIsNone(restored_settle_failure[6][0][1])
+        self.assertEqual(
+            restored_settle_failure[6][0][2]["com2Port"],
+            "COM2",
+        )
+
+        dirty_restored_settle_failure = run_case(
+            replacement_error=OSError("open failed"),
+            settle_failure=True,
+            initial_dirty=True,
+        )
+        self.assertFalse(dirty_restored_settle_failure[0])
+        self.assertEqual(len(dirty_restored_settle_failure[6]), 1)
+        self.assertTrue(dirty_restored_settle_failure[6][0][0])
+        self.assertEqual(
+            dirty_restored_settle_failure[6][0][1]["com2Port"],
+            "COM2",
+        )
+        self.assertEqual(
+            dirty_restored_settle_failure[6][0][2]["com2Port"],
+            "COM2",
+        )
+
+        clean_unverified_settle_failure = run_case(
+            settle_failure=True,
+            verification_failure=True,
+        )
+        self.assertFalse(clean_unverified_settle_failure[0])
+        self.assertEqual(len(clean_unverified_settle_failure[6]), 1)
+        self.assertFalse(clean_unverified_settle_failure[6][0][0])
+        self.assertIsNone(clean_unverified_settle_failure[6][0][1])
+        self.assertEqual(
+            clean_unverified_settle_failure[6][0][2]["com2Port"],
+            "COM2",
+        )
+
+        unverified_settle_failure = run_case(
+            settle_failure=True,
+            verification_failure=True,
+            initial_dirty=True,
+        )
+        self.assertFalse(unverified_settle_failure[0])
+        self.assertEqual(len(unverified_settle_failure[6]), 1)
+        self.assertTrue(unverified_settle_failure[6][0][0])
+        self.assertEqual(
+            unverified_settle_failure[6][0][1]["com2Port"],
+            "COM2",
+        )
+        self.assertEqual(
+            unverified_settle_failure[6][0][2]["com2Port"],
+            "COM2",
+        )
+
     def test_auxiliary_connection_failure_after_prior_close_restores_configuration(self):
         class Selection:
             def __init__(self, value):
@@ -9510,7 +9798,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "_replace_auxiliary_output_field_values": replace_output_values,
             "_close_serial_port": lambda *args: True,
             "_retain_calibration_persistence_retry": (
-                lambda: persistence_calls.append(dict(calibration)) or True
+                lambda calibration_snapshot=None: (
+                    persistence_calls.append(dict(calibration)) or True
+                )
             ),
             "logger": SimpleNamespace(
                 info=lambda *args: None,
@@ -9603,7 +9893,9 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_replace_auxiliary_output_field_values": replace_output_values,
             "_close_serial_port": lambda *args: True,
-            "_retain_calibration_persistence_retry": lambda: True,
+            "_retain_calibration_persistence_retry": (
+                lambda calibration_snapshot=None: True
+            ),
             "logger": SimpleNamespace(
                 info=lambda *args: None,
                 warning=lambda *args: None,
@@ -9933,7 +10225,9 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_replace_auxiliary_output_field_values": replace_fields,
                 "_replace_auxiliary_serial": replace_serial,
                 "_close_serial_port": lambda *args: True,
-                "_retain_calibration_persistence_retry": lambda: True,
+                "_retain_calibration_persistence_retry": (
+                    lambda calibration_snapshot=None: True
+                ),
                 "logger": SimpleNamespace(
                     info=lambda *args: None,
                     warning=lambda *args: None,
@@ -14614,6 +14908,7 @@ class HmiSourceContractTests(unittest.TestCase):
         slider_names = tuple(f"J{axis}jogslide" for axis in range(1, 10))
         root = Root()
         acknowledged_target = tuple(float(axis) for axis in range(1, 10))
+        saved_persistence_snapshot = self._valid_runtime_calibration()
         namespace = {
             "CALIBRATION_POSITION_KEYS": position_keys,
             "CAL": {
@@ -14633,8 +14928,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "acknowledged_forced_position_lock": threading.Lock(),
             "acknowledged_forced_position_target": acknowledged_target,
             "controller_position_resynchronization_required": threading.Event(),
-            "_calibration_dirty": False,
-            "_calibration_save_job": None,
+            "_calibration_dirty": True,
+            "_calibration_save_job": "saved-result-save",
+            "_calibration_save_snapshot": saved_persistence_snapshot,
             "application_closing": threading.Event(),
             "CALIBRATION_SAVE_DEBOUNCE_MS": 250,
             "_write_pending_calibration": lambda: True,
@@ -14671,7 +14967,35 @@ class HmiSourceContractTests(unittest.TestCase):
             "_restore_calibration_pose_snapshot",
             namespace,
         )
+        namespace["_calibration_dirty"] = False
+        namespace["_calibration_save_job"] = None
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "clean calibration persistence has a pending snapshot",
+        ):
+            capture()
+        namespace["_calibration_dirty"] = True
+        namespace["_calibration_save_job"] = "saved-result-save"
         snapshot = capture()
+        self.assertEqual(
+            snapshot.persistence_snapshot,
+            normalize_calibration_data(saved_persistence_snapshot),
+        )
+        self.assertIsNot(
+            snapshot.persistence_snapshot,
+            saved_persistence_snapshot,
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "clean calibration pose snapshot has pending persistence",
+        ):
+            restore(
+                replace(
+                    snapshot,
+                    persistence_dirty=False,
+                    persistence_job=None,
+                )
+            )
 
         for key in position_keys:
             namespace["CAL"][key] = "uncommitted-position"
@@ -14687,7 +15011,15 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace["acknowledged_forced_position_target"] = None
         namespace["controller_position_resynchronization_required"].set()
         namespace["_calibration_dirty"] = True
-        namespace["_calibration_save_job"] = "bad-result-save"
+        namespace["_calibration_save_job"] = "saved-result-save"
+        namespace["_calibration_save_snapshot"] = dict(
+            saved_persistence_snapshot,
+            curTheme=(
+                1
+                if saved_persistence_snapshot["curTheme"] == 0
+                else 0
+            ),
+        )
 
         self.assertTrue(restore(snapshot))
         self.assertEqual(
@@ -14725,9 +15057,13 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(
             namespace["controller_position_resynchronization_required"].is_set()
         )
-        self.assertEqual(root.cancelled, ["bad-result-save"])
+        self.assertEqual(root.cancelled, ["saved-result-save"])
         self.assertTrue(namespace["_calibration_dirty"])
         self.assertEqual(namespace["_calibration_save_job"], "repair-job-1")
+        self.assertEqual(
+            namespace["_calibration_save_snapshot"],
+            normalize_calibration_data(saved_persistence_snapshot),
+        )
         self.assertEqual(len(root.jobs), 1)
 
     def test_unowned_malformed_calibration_event_retains_active_ownership(self):

@@ -6922,6 +6922,64 @@ def _begin_auxiliary_calibration_persistence_fence(calibration_snapshot):
   return True, persistence_snapshot
 
 
+def _reconcile_auxiliary_calibration_persistence_after_settle_failure(
+  persistence_required,
+  persistence_snapshot,
+  safe_snapshot,
+):
+  global _calibration_dirty, _calibration_save_job
+  global _calibration_save_snapshot
+
+  if not isinstance(persistence_required, bool):
+    raise TypeError("calibration persistence requirement must be boolean")
+  safe_snapshot = normalize_calibration_data(
+    snapshot_calibration_values(safe_snapshot)
+  )
+  if persistence_snapshot is not None:
+    persistence_snapshot = normalize_calibration_data(
+      snapshot_calibration_values(persistence_snapshot)
+    )
+  if not persistence_required and persistence_snapshot is not None:
+    raise TypeError(
+      "clean calibration persistence cannot carry a recovery snapshot"
+    )
+  pending_job = _calibration_save_job
+  _calibration_dirty = False
+  _calibration_save_snapshot = None
+  if pending_job is None:
+    _calibration_save_job = None
+  else:
+    try:
+      root.after_cancel(pending_job)
+    except Exception:
+      logger.exception(
+        "Unable to cancel calibration persistence after auxiliary settle failure"
+      )
+      if _calibration_save_job is None:
+        _calibration_save_job = pending_job
+      _calibration_dirty = True
+      _calibration_save_snapshot = safe_snapshot
+      return False
+    if _calibration_save_job is not pending_job:
+      logger.error(
+        "Calibration persistence ownership changed during settle recovery"
+      )
+      _calibration_dirty = True
+      _calibration_save_snapshot = safe_snapshot
+      return False
+    _calibration_save_job = None
+  if not persistence_required:
+    return True
+  retained = _retain_calibration_persistence_retry(
+    persistence_snapshot
+  )
+  if not isinstance(retained, bool):
+    raise RuntimeError(
+      "calibration persistence retention returned an invalid result"
+    )
+  return retained
+
+
 def _finish_auxiliary_calibration_persistence_fence(
   previous_dirty,
   previous_persistence_snapshot,
@@ -7296,18 +7354,28 @@ def setCom2(misc=None):
       logger.exception(
         "Unable to settle auxiliary calibration persistence"
       )
-      if not target_verified:
-        try:
-          _finish_auxiliary_calibration_persistence_fence(
-            previous_persistence_dirty,
-            previous_persistence_snapshot,
-            persistence_state_changed,
-            False,
-          )
-        except Exception:
-          logger.exception(
-            "Unable to disable persistence after auxiliary recovery failure"
-          )
+      persistence_required = (
+        persistence_state_changed or previous_persistence_dirty
+      ) if target_verified else previous_persistence_dirty
+      persistence_snapshot = (
+        None
+        if target_verified and persistence_state_changed
+        else previous_persistence_snapshot
+      )
+      try:
+        _reconcile_auxiliary_calibration_persistence_after_settle_failure(
+          persistence_required,
+          persistence_snapshot,
+          (
+            target_calibration
+            if target_verified
+            else previous_calibration
+          ),
+        )
+      except Exception:
+        logger.exception(
+          "Unable to reconcile calibration persistence after settle failure"
+        )
     if not target_verified:
       logger.error(
         "AUXILIARY CONFIGURATION RECOVERY FAILED; OUTPUT PROFILE DISABLED "
@@ -19821,7 +19889,7 @@ def _restore_calibration_pose_snapshot(snapshot):
         )
     _calibration_save_job = None
     _calibration_dirty = True
-    _calibration_save_snapshot = None
+    _calibration_save_snapshot = persistence_snapshot
     try:
       shutdown_started = application_closing.is_set()
       if not isinstance(shutdown_started, bool):
