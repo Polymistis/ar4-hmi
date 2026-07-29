@@ -14,10 +14,13 @@
 
 #include "../../ARrobots/src/kinematics.cpp"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/cartesian_pose_contract.h"
+#include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/calibration_switch_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/command_queue_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/controller_domain_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/debug_contract.h"
+#include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/home_reference_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/identity_contract.h"
+#include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/joint_telemetry_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/motion_command_parse_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/motion_mode_transaction.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/numeric_parse_contract.h"
@@ -945,9 +948,42 @@ void test_firmware_numeric_parse_contract() {
         )
             && joint_move.positions[0] == 1.0f
             && joint_move.positions[8] == 0.0f
-            && joint_move.speed == 25.0f,
+            && joint_move.speed == 25.0f
+            && !joint_move.telemetry_requested,
         "canonical RJ command was rejected"
     );
+    require(
+        ar4_protocol::parse_joint_move_command(
+            FirmwareCommandText(
+                "A1B2C3D4E5F6J70J80J90Sp25Ac10Dc10Rm10"
+                "WALm010101T1"
+            ),
+            joint_move
+        )
+            && joint_move.telemetry_requested,
+        "request-scoped RJ telemetry marker was rejected"
+    );
+    for (const char* invalid_suffix : std::array<const char*, 3>{{
+        "T0",
+        "T1T1",
+        "junk",
+    }}) {
+        joint_move.telemetry_requested = false;
+        require(
+            !ar4_protocol::parse_joint_move_command(
+                FirmwareCommandText(
+                    std::string(
+                        "A1B2C3D4E5F6J70J80J90Sp25Ac10Dc10Rm10"
+                        "WALm010101"
+                    ) + invalid_suffix
+                ),
+                joint_move
+            )
+                && !joint_move.telemetry_requested,
+            std::string("invalid RJ telemetry suffix was accepted: ")
+                + invalid_suffix
+        );
+    }
     require(
         !ar4_protocol::parse_joint_move_command(
             FirmwareCommandText(
@@ -1110,6 +1146,61 @@ void test_firmware_numeric_parse_contract() {
 }
 
 void test_controller_domain_contract() {
+    int release_step_limit = 17;
+    require(
+        ar4_protocol::calibration_release_step_limit(
+            88.888f,
+            10.0f,
+            3000,
+            release_step_limit
+        )
+            && release_step_limit == 889,
+        "valid calibration switch-release travel was rejected"
+    );
+    release_step_limit = 17;
+    require(
+        ar4_protocol::calibration_release_step_limit(
+            100.0f,
+            10.0f,
+            500,
+            release_step_limit
+        )
+            && release_step_limit == 500,
+        "calibration switch-release travel exceeded full axis travel"
+    );
+    release_step_limit = 17;
+    require(
+        !ar4_protocol::calibration_release_step_limit(
+            0.0f,
+            10.0f,
+            3000,
+            release_step_limit
+        )
+            && release_step_limit == 17
+            && !ar4_protocol::calibration_release_step_limit(
+                100.0f,
+                0.0f,
+                3000,
+                release_step_limit
+            )
+            && release_step_limit == 17
+            && !ar4_protocol::calibration_release_step_limit(
+                100.0f,
+                10.0f,
+                0,
+                release_step_limit
+            )
+            && release_step_limit == 17
+            && !ar4_protocol::calibration_release_step_limit(
+                std::numeric_limits<float>::max(),
+                std::numeric_limits<float>::max(),
+                INT_MAX,
+                release_step_limit
+            )
+            && release_step_limit == 17,
+        "invalid calibration switch-release travel was accepted"
+    );
+
     int step_limit = 17;
     int zero_step = 19;
     require(
@@ -1253,6 +1344,23 @@ void test_controller_domain_contract() {
             && center_step == 19
             && joint_five_step == 23,
         "invalid calibration reference was accepted or mutated output"
+    );
+    require(
+        !ar4_protocol::calibration_reference_steps(
+            1,
+            0,
+            0.0f,
+            0.0f,
+            100.0f,
+            0,
+            0.0f,
+            0.0f,
+            false,
+            master_step,
+            center_step,
+            joint_five_step
+        ),
+        "requested zero-travel calibration reference was accepted"
     );
 
     std::uint32_t milliseconds = 17;
@@ -2146,6 +2254,478 @@ void test_tool_jog_signed_tcp_displacement() {
         && frame_index == 0
         && frame_offset == -tiny_rotation,
         "native-unit tool translation was rejected as an angular underflow"
+    );
+}
+
+void test_calibration_switch_contract() {
+    uint8_t states[ar4_protocol::kCalibrationSwitchCount] = {};
+    require(
+        ar4_protocol::decode_calibration_switch_mask(165, states),
+        "valid calibration-switch mask was rejected"
+    );
+    const uint8_t expected[] = {1, 0, 1, 0, 0, 1, 0, 1, 0};
+    require(
+        std::equal(std::begin(states), std::end(states), std::begin(expected)),
+        "calibration-switch mask axis order changed"
+    );
+    require(
+        ar4_protocol::decode_calibration_switch_mask(
+            ar4_protocol::kCalibrationSwitchMaskMaximum,
+            states
+        )
+            && std::all_of(
+                std::begin(states),
+                std::end(states),
+                [](uint8_t value) { return value == 1; }
+            ),
+        "all-HIGH calibration-switch mask was rejected"
+    );
+
+    std::fill(std::begin(states), std::end(states), 7);
+    require(
+        !ar4_protocol::decode_calibration_switch_mask(-1, states)
+            && !ar4_protocol::decode_calibration_switch_mask(512, states)
+            && std::all_of(
+                std::begin(states),
+                std::end(states),
+                [](uint8_t value) { return value == 7; }
+            ),
+        "invalid calibration-switch mask mutated staged state"
+    );
+    require(
+        ar4_protocol::calibration_switch_is_active(0, 0)
+            && ar4_protocol::calibration_switch_is_active(1, 1)
+            && ar4_protocol::calibration_switch_is_released(1, 0)
+            && ar4_protocol::calibration_switch_is_released(0, 1)
+            && !ar4_protocol::calibration_switch_is_active(2, 1)
+            && !ar4_protocol::calibration_switch_is_active(1, 2)
+            && !ar4_protocol::calibration_switch_is_released(0, 2)
+            && !ar4_protocol::calibration_switch_is_released(2, 1),
+        "calibration-switch active-state classification is invalid"
+    );
+}
+
+void test_primary_home_reference_contract() {
+    ar4_protocol::PrimaryHomeReferenceState state = {
+        {false, false, false},
+        {123, -456, 789},
+    };
+    char v1_response[
+        ar4_protocol::kPrimaryHomeReferenceV1ResponseCapacity
+    ] = {};
+    char v2_response[
+        ar4_protocol::kPrimaryHomeReferenceV2ResponseCapacity
+    ] = {};
+    require(
+        ar4_protocol::build_primary_home_reference_v1_response(
+            state,
+            v1_response,
+            sizeof(v1_response)
+        )
+            && std::strcmp(v1_response, "A0B0C0D0") == 0
+            && ar4_protocol::build_primary_home_reference_v2_response(
+                state,
+                v2_response,
+                sizeof(v2_response)
+            )
+            && std::strcmp(v2_response, "A0B0C0D0E0F0") == 0,
+        "invalid primary home-reference responses leaked stale coordinates"
+    );
+
+    int32_t first = 0;
+    int32_t second = 0;
+    int32_t third = 0;
+    require(
+        ar4_protocol::primary_home_reference_millidegrees(
+            163.8004f,
+            first
+        )
+            && first == 163800
+            && ar4_protocol::primary_home_reference_millidegrees(
+                -38.1996f,
+                second
+            )
+            && second == -38200
+            && ar4_protocol::primary_home_reference_millidegrees(
+                72.5004f,
+                third
+            )
+            && third == 72500,
+        "primary home-reference conversion changed millidegree rounding"
+    );
+    require(
+        ar4_protocol::set_primary_home_reference(state, 0, first)
+            && ar4_protocol::set_primary_home_reference(state, 1, second)
+            && ar4_protocol::set_primary_home_reference(state, 2, third),
+        "valid primary home-reference update was rejected"
+    );
+    require(
+        ar4_protocol::build_primary_home_reference_v1_response(
+            state,
+            v1_response,
+            sizeof(v1_response)
+        )
+            && std::strcmp(v1_response, "A1B163800C1D-38200") == 0
+            && ar4_protocol::build_primary_home_reference_v2_response(
+                state,
+                v2_response,
+                sizeof(v2_response)
+            )
+            && std::strcmp(
+                v2_response,
+                "A1B163800C1D-38200E1F72500"
+            ) == 0,
+        "primary home-reference responses changed wire framing"
+    );
+
+    require(
+        ar4_protocol::invalidate_primary_home_reference_axis(state, 0),
+        "valid primary home-reference invalidation was rejected"
+    );
+    require(
+        !state.valid[0]
+            && state.millidegrees[0] == 0
+            && state.valid[1]
+            && state.millidegrees[1] == second
+            && state.valid[2]
+            && state.millidegrees[2] == third,
+        "axis-local home-reference invalidation changed another axis"
+    );
+
+    ar4_protocol::invalidate_primary_home_reference(state);
+    require(
+        !state.valid[0]
+            && !state.valid[1]
+            && !state.valid[2]
+            && state.millidegrees[0] == 0
+            && state.millidegrees[1] == 0
+            && state.millidegrees[2] == 0,
+        "primary home-reference invalidation retained stale state"
+    );
+    require(
+        !ar4_protocol::primary_home_reference_millidegrees(
+            std::numeric_limits<float>::infinity(),
+            first
+        )
+            && first == 163800,
+        "non-finite primary home reference was accepted"
+    );
+    const ar4_protocol::PrimaryHomeReferenceState preserved = state;
+    require(
+        !ar4_protocol::set_primary_home_reference(state, 3, 1)
+            && !ar4_protocol::invalidate_primary_home_reference_axis(
+                state,
+                3
+            )
+            && state.valid[0] == preserved.valid[0]
+            && state.valid[1] == preserved.valid[1]
+            && state.valid[2] == preserved.valid[2]
+            && state.millidegrees[0] == preserved.millidegrees[0]
+            && state.millidegrees[1] == preserved.millidegrees[1]
+            && state.millidegrees[2] == preserved.millidegrees[2],
+        "out-of-range primary home-reference mutation was accepted"
+    );
+}
+
+void test_joint_telemetry_contract() {
+    const int32_t encoder_counts[
+        ar4_protocol::kJointTelemetryAxisCount
+    ] = {750, -1500, 2750, -3500, 200, -5500};
+    float encoder_multipliers[
+        ar4_protocol::kJointTelemetryAxisCount
+    ] = {5.0f, 5.0f, 5.0f, 5.0f, 2.5f, 5.0f};
+    const int32_t zero_steps[
+        ar4_protocol::kJointTelemetryAxisCount
+    ] = {50, -100, 250, -300, 30, -500};
+    const float steps_per_degree[
+        ar4_protocol::kJointTelemetryAxisCount
+    ] = {100.0f, 100.0f, 100.0f, 100.0f, 100.0f, 100.0f};
+    int32_t millidegrees[
+        ar4_protocol::kJointTelemetryAxisCount
+    ] = {};
+    require(
+        ar4_protocol::encoder_counts_to_joint_millidegrees(
+            encoder_counts,
+            encoder_multipliers,
+            zero_steps,
+            steps_per_degree,
+            millidegrees
+        ),
+        "valid encoder telemetry conversion was rejected"
+    );
+    const int32_t expected[
+        ar4_protocol::kJointTelemetryAxisCount
+    ] = {1000, -2000, 3000, -4000, 500, -6000};
+    for (
+        size_t axis = 0;
+        axis < ar4_protocol::kJointTelemetryAxisCount;
+        ++axis
+    ) {
+        require(
+            millidegrees[axis] == expected[axis],
+            "encoder telemetry conversion changed units or axis order"
+        );
+    }
+
+    int32_t rounded = 17;
+    require(
+        ar4_protocol::encoder_count_to_joint_millidegrees(
+            3,
+            2.0f,
+            1,
+            1000.0f,
+            rounded
+        )
+            && rounded == 1
+            && ar4_protocol::encoder_count_to_joint_millidegrees(
+                1,
+                2.0f,
+                1,
+                1000.0f,
+                rounded
+            )
+            && rounded == -1,
+        "encoder telemetry millidegree rounding changed"
+    );
+
+    int32_t preserved[
+        ar4_protocol::kJointTelemetryAxisCount
+    ] = {7, 7, 7, 7, 7, 7};
+    encoder_multipliers[2] = 0.0f;
+    require(
+        !ar4_protocol::encoder_counts_to_joint_millidegrees(
+            encoder_counts,
+            encoder_multipliers,
+            zero_steps,
+            steps_per_degree,
+            preserved
+        ),
+        "invalid encoder telemetry calibration was accepted"
+    );
+    for (int32_t value : preserved) {
+        require(
+            value == 7,
+            "rejected encoder telemetry conversion mutated output"
+        );
+    }
+
+    char frame[ar4_protocol::kJointTelemetryFrameCapacity] = {};
+    size_t frame_length = 17;
+    require(
+        ar4_protocol::build_joint_telemetry_frame(
+            expected,
+            frame,
+            sizeof(frame),
+            frame_length
+        )
+            && std::strcmp(
+                frame,
+                "TMA1000B-2000C3000D-4000E500F-6000\n"
+            ) == 0
+            && frame_length == std::strlen(frame),
+        "joint telemetry frame changed wire framing"
+    );
+
+    const int32_t range_limits[
+        ar4_protocol::kJointTelemetryAxisCount
+    ] = {
+        std::numeric_limits<int32_t>::min(),
+        std::numeric_limits<int32_t>::max(),
+        std::numeric_limits<int32_t>::min(),
+        std::numeric_limits<int32_t>::max(),
+        std::numeric_limits<int32_t>::min(),
+        std::numeric_limits<int32_t>::max(),
+    };
+    require(
+        ar4_protocol::build_joint_telemetry_frame(
+            range_limits,
+            frame,
+            sizeof(frame),
+            frame_length
+        )
+            && frame_length < sizeof(frame)
+            && std::strcmp(
+                frame,
+                "TMA-2147483648B2147483647C-2147483648D2147483647"
+                "E-2147483648F2147483647\n"
+            ) == 0,
+        "joint telemetry frame capacity rejected signed boundary values"
+    );
+
+    char short_frame[8] = {'s', 'e', 'n', 't', 'i', 'n', 'e', 'l'};
+    const std::array<char, 8> short_preserved = {
+        's', 'e', 'n', 't', 'i', 'n', 'e', 'l',
+    };
+    frame_length = 17;
+    require(
+        !ar4_protocol::build_joint_telemetry_frame(
+            expected,
+            short_frame,
+            sizeof(short_frame),
+            frame_length
+        )
+            && frame_length == 17
+            && std::equal(
+                std::begin(short_frame),
+                std::end(short_frame),
+                short_preserved.begin()
+            ),
+        "bounded telemetry frame failure mutated caller state"
+    );
+
+    require(
+        !ar4_protocol::joint_telemetry_due(99999u, 0u)
+            && ar4_protocol::joint_telemetry_due(100000u, 0u)
+            && ar4_protocol::joint_telemetry_due(
+                49999u,
+                std::numeric_limits<uint32_t>::max() - 50000u
+            ),
+        "joint telemetry cadence lost its wrap-safe boundary"
+    );
+
+    volatile ar4_protocol::JointTelemetryResponseOwnership ownership = {
+        false,
+        false,
+        false,
+    };
+    require(
+        !ar4_protocol::defer_joint_telemetry_estop_response(ownership),
+        "inactive telemetry ownership deferred an interrupt response"
+    );
+    ar4_protocol::begin_joint_telemetry_response_ownership(
+        true,
+        ownership
+    );
+    const ar4_protocol::JointTelemetryTerminalDecision normal_terminal =
+        ar4_protocol::decide_joint_telemetry_terminal(
+            true,
+            true,
+            false,
+            ownership
+        );
+    require(
+        ownership.active
+            && !ownership.estop_response_pending
+            && normal_terminal.kind
+                == ar4_protocol::JointTelemetryTerminalKind::kPosition
+            && !normal_terminal.emergency_stop,
+        "normal telemetry response ownership changed terminal selection"
+    );
+    require(
+        ar4_protocol::defer_joint_telemetry_estop_response(ownership)
+            && ownership.estop_response_pending,
+        "active telemetry ownership did not defer the interrupt response"
+    );
+    const ar4_protocol::JointTelemetryTerminalDecision stopped_terminal =
+        ar4_protocol::decide_joint_telemetry_terminal(
+            true,
+            true,
+            true,
+            ownership
+        );
+    require(
+        stopped_terminal.kind
+            == ar4_protocol::JointTelemetryTerminalKind::kPosition
+            && stopped_terminal.emergency_stop,
+        "deferred E-stop did not retain an owned position terminal"
+    );
+    require(
+        !ar4_protocol::commit_joint_telemetry_terminal(
+            stopped_terminal,
+            ownership
+        ),
+        "represented E-stop incorrectly blocked later command admission"
+    );
+    require(
+        !ownership.active
+            && !ownership.estop_response_pending
+            && !ownership.estop_admission_blocked,
+        "telemetry response ownership did not release atomically"
+    );
+
+    ar4_protocol::begin_joint_telemetry_response_ownership(
+        true,
+        ownership
+    );
+    const ar4_protocol::JointTelemetryTerminalDecision earlier_terminal =
+        ar4_protocol::decide_joint_telemetry_terminal(
+            true,
+            false,
+            true,
+            ownership
+        );
+    require(
+        earlier_terminal.kind
+            == ar4_protocol::JointTelemetryTerminalKind::kAlreadySent
+            && earlier_terminal.emergency_stop,
+        "pre-ownership E-stop response was not preserved as authoritative"
+    );
+    require(
+        !ar4_protocol::commit_joint_telemetry_terminal(
+            earlier_terminal,
+            ownership
+        )
+            && !ownership.estop_admission_blocked,
+        "previously reported E-stop incorrectly blocked command admission"
+    );
+
+    ar4_protocol::begin_joint_telemetry_response_ownership(
+        true,
+        ownership
+    );
+    const ar4_protocol::JointTelemetryTerminalDecision rejected_terminal =
+        ar4_protocol::decide_joint_telemetry_terminal(
+            true,
+            false,
+            false,
+            ownership
+        );
+    require(
+        rejected_terminal.kind
+            == ar4_protocol::JointTelemetryTerminalKind::kError
+            && !rejected_terminal.emergency_stop,
+        "non-E-stop drive rejection changed telemetry terminal selection"
+    );
+    require(
+        !ar4_protocol::commit_joint_telemetry_terminal(
+            rejected_terminal,
+            ownership
+        )
+            && !ownership.estop_admission_blocked,
+        "non-E-stop rejection incorrectly blocked command admission"
+    );
+
+    ar4_protocol::begin_joint_telemetry_response_ownership(
+        true,
+        ownership
+    );
+    const ar4_protocol::JointTelemetryTerminalDecision selected_terminal =
+        ar4_protocol::decide_joint_telemetry_terminal(
+            true,
+            true,
+            false,
+            ownership
+        );
+    require(
+        ar4_protocol::defer_joint_telemetry_estop_response(ownership),
+        "post-selection E-stop was not deferred by the active owner"
+    );
+    require(
+        ar4_protocol::commit_joint_telemetry_terminal(
+            selected_terminal,
+            ownership
+        )
+            && !ownership.active
+            && !ownership.estop_response_pending
+            && ar4_protocol::joint_telemetry_estop_admission_blocked(
+                ownership
+            ),
+        "post-selection E-stop did not become a durable admission block"
+    );
+    ar4_protocol::clear_joint_telemetry_estop_admission_block(ownership);
+    require(
+        !ar4_protocol::joint_telemetry_estop_admission_blocked(ownership),
+        "reported telemetry E-stop admission block did not clear"
     );
 }
 
@@ -3660,6 +4240,9 @@ int main(int argc, char** argv) {
         test_controller_domain_contract();
         test_tool_frame_axis_order();
         test_tool_jog_signed_tcp_displacement();
+        test_calibration_switch_contract();
+        test_primary_home_reference_contract();
+        test_joint_telemetry_contract();
         test_firmware_identity_contract();
         test_firmware_command_queue_consumption();
         test_firmware_spline_response_contract();

@@ -56,6 +56,7 @@ struct JointMoveCommandFields {
   float ramp;
   char wrist_config;
   int loop_modes[kMotionJointCount];
+  bool telemetry_requested;
 };
 
 struct LiveJogCommandFields {
@@ -469,11 +470,20 @@ inline bool parse_joint_move_command(
     command.indexOf('W'),
     command.indexOf("Lm"),
   };
+  const int loop_modes_end =
+    markers[14] + 2 + static_cast<int>(kMotionJointCount);
+  const bool telemetry_requested =
+    markers[14] >= 0
+    && loop_modes_end + 2 == static_cast<int>(command.length())
+    && command.charAt(loop_modes_end) == 'T'
+    && command.charAt(loop_modes_end + 1) == '1';
   if (
     !marker_positions_are_ordered_from(command.length(), markers, 0)
     || markers[13] + 2 != markers[14]
-    || markers[14] + 2 + static_cast<int>(kMotionJointCount)
-      != static_cast<int>(command.length())
+    || (
+      loop_modes_end != static_cast<int>(command.length())
+      && !telemetry_requested
+    )
   ) {
     return false;
   }
@@ -520,7 +530,7 @@ inline bool parse_joint_move_command(
     || !parse_binary_digit_span(
       command,
       markers[14] + 2,
-      static_cast<int>(command.length()),
+      loop_modes_end,
       loop_modes
     )
     || !valid_motion_profile(
@@ -542,6 +552,7 @@ inline bool parse_joint_move_command(
   staged.deceleration = parsed[11];
   staged.ramp = parsed[12];
   staged.wrist_config = wrist_config;
+  staged.telemetry_requested = telemetry_requested;
   for (size_t index = 0; index < kMotionJointCount; ++index) {
     staged.loop_modes[index] = loop_modes[index];
   }

@@ -7,11 +7,11 @@ event thread.
 
 from dataclasses import dataclass
 from contextlib import contextmanager
+from collections import deque
 from collections.abc import Mapping
 from enum import Enum
 import json
 import math
-from queue import Empty, Queue
 import re
 import struct
 import threading
@@ -20,6 +20,7 @@ from typing import Callable, Optional, Tuple
 
 
 JOINT_COUNT = 9
+PRIMARY_START_POSITION = (0.0, 0.0, 0.0, 0.0, 45.0, 0.0)
 MAX_COMMAND_LENGTH = 4096
 MAX_RESPONSE_PAYLOAD_LENGTH = 4096
 MAX_RESPONSE_FRAME_LENGTH = MAX_RESPONSE_PAYLOAD_LENGTH + 2
@@ -41,9 +42,11 @@ CONTROL_POLL_INTERVAL_SECONDS = 0.05
 RESPONSE_TIMEOUT_SAFETY_SCALE = 1.25
 FIRMWARE_MINIMUM_RAMP_PERCENT = 10.0
 FIRMWARE_LEGACY_RAMP_NUMERATOR = 200.0
+FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS = 30.0
 CONTROLLER_MAXIMUM_RAMP_PERCENT = 100.0
 CONTROLLER_FLOAT_MAX = 3.4028234663852886e38
 CONTROLLER_SIGNED_INT_MAX = 2147483647
+CONTROLLER_MAXIMUM_PULSE_DELAY_MICROSECONDS = 4294967295.0
 CONTROLLER_RADIANS_PER_DEGREE = math.pi / 180.0
 CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1 = (
     "GCODE_DIRECTORY_FRAMING_V1"
@@ -55,6 +58,17 @@ CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1 = (
     "GCODE_WRITE_IDENTITY_V1"
 )
 CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1 = "JT_WRIST_CONFIG_V1"
+CONTROLLER_CAPABILITY_HOME_REFERENCE_V1 = "HOME_REFERENCE_V1"
+CONTROLLER_CAPABILITY_HOME_REFERENCE_V2 = "HOME_REFERENCE_V2"
+CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1 = "JOINT_TELEMETRY_V1"
+CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1 = (
+    "CALIBRATION_SWITCH_POLARITY_V1"
+)
+JOINT_TELEMETRY_AXIS_COUNT = 6
+JOINT_TELEMETRY_PREFIX = "TMA"
+JOINT_TELEMETRY_FAMILY_PREFIX = JOINT_TELEMETRY_PREFIX[:2]
+JOINT_TELEMETRY_PERIOD_SECONDS = 0.1
+JOINT_TELEMETRY_RESPONSE_BUDGET_MARGIN = 2
 CONTROLLER_DIRECTORY_SEPARATOR = ","
 MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES = MAX_RESPONSE_PAYLOAD_LENGTH
 MAX_CONTROLLER_IDENTITY_FIELD_LENGTH = 31
@@ -81,6 +95,34 @@ _SERIAL_QUARANTINED_PORTS = {}
 
 class MotionInputError(ValueError):
     """A command input cannot be represented safely by the controller protocol."""
+
+
+def encode_calibration_switch_mask(states):
+    """Encode normalized J1-J9 active switch states for the controller."""
+    if isinstance(states, (str, bytes)):
+        raise MotionInputError(
+            "calibration switch states must be a nine-value sequence"
+        )
+    try:
+        states = tuple(states)
+    except TypeError as exc:
+        raise MotionInputError(
+            "calibration switch states must be a nine-value sequence"
+        ) from exc
+    if len(states) != JOINT_COUNT:
+        raise MotionInputError(
+            "calibration switch states must contain 9 values"
+        )
+
+    mask = 0
+    for axis, state in enumerate(states, start=1):
+        if state not in ("LOW", "HIGH"):
+            raise MotionInputError(
+                f"J{axis} calibration switch state must be normalized LOW or HIGH"
+            )
+        if state == "HIGH":
+            mask |= 1 << (axis - 1)
+    return mask
 
 
 def normalize_auxiliary_board_profile(value, allow_none=False):
@@ -441,6 +483,44 @@ class ControllerIdentity:
     serial_number: str
     asset_tag: str
     protocol_capabilities: tuple
+
+
+@dataclass(frozen=True)
+class PrimaryHomeReference:
+    """Controller-reported J1-J3 parking-switch coordinates in degrees."""
+
+    valid: Tuple[bool, bool, bool]
+    positions: Tuple[float, float, float]
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.valid, tuple)
+            or len(self.valid) != 3
+            or any(not isinstance(value, bool) for value in self.valid)
+        ):
+            raise MotionInputError(
+                "primary home-reference validity must contain three booleans"
+            )
+        if (
+            not isinstance(self.positions, tuple)
+            or len(self.positions) != 3
+        ):
+            raise MotionInputError(
+                "primary home-reference positions must contain three values"
+            )
+        normalized_positions = tuple(
+            finite_number(value, f"J{axis} home-reference position")
+            for axis, value in enumerate(self.positions, start=1)
+        )
+        for axis, (valid, position) in enumerate(
+            zip(self.valid, normalized_positions),
+            start=1,
+        ):
+            if not valid and position != 0.0:
+                raise MotionInputError(
+                    f"invalid J{axis} home reference must use a zero position"
+                )
+        object.__setattr__(self, "positions", normalized_positions)
 
 
 def validate_controller_hardware_id(value):
@@ -1975,15 +2055,39 @@ def exchange_serial_line(
     control_ack_timeout_seconds=None,
     control_response_timeout_seconds=None,
     write_started_event=None,
+    reset_input=True,
+    interim_response_handler=None,
+    interim_response_limit=None,
 ):
     """Perform a validated newline-delimited exchange on a serial-like object.
 
-    A write-start event is set after admission and reset checks, immediately
-    before the initial serial write call.
+    A write-start event is set after admission and any requested input reset,
+    immediately before the initial serial write call.
     """
     timeout = finite_number(response_timeout_seconds, "response_timeout_seconds")
     if timeout <= 0:
         raise MotionInputError("response_timeout_seconds must be positive")
+    if not isinstance(reset_input, bool):
+        raise MotionInputError("reset_input must be boolean")
+    if interim_response_handler is not None and not callable(
+        interim_response_handler
+    ):
+        raise MotionInputError(
+            "interim_response_handler must be callable or None"
+        )
+    if interim_response_handler is None:
+        if interim_response_limit is not None:
+            raise MotionInputError(
+                "interim_response_limit requires an interim_response_handler"
+            )
+    elif (
+        isinstance(interim_response_limit, bool)
+        or not isinstance(interim_response_limit, int)
+        or interim_response_limit <= 0
+    ):
+        raise MotionInputError(
+            "interim_response_limit must be a positive integer"
+        )
     command_bytes = _serial_command_bytes(command)
     _require_open_serial_port(serial_port)
     _validate_write_lock(write_lock)
@@ -2001,6 +2105,10 @@ def exchange_serial_line(
         control_ack_timeout = None
         control_response_timeout = None
     else:
+        if interim_response_handler is not None:
+            raise MotionInputError(
+                "interim responses are unsupported during live control"
+            )
         if not callable(getattr(control_event, "is_set", None)):
             raise MotionInputError("control_event must satisfy the event contract")
         if control_command is None:
@@ -2048,6 +2156,9 @@ def exchange_serial_line(
             control_ack_timeout,
             control_response_timeout,
             write_started_event,
+            reset_input,
+            interim_response_handler,
+            interim_response_limit,
         )
     except (SerialTransportQuarantinedError, SerialTransportTimeout) as exc:
         operation_error = exc
@@ -2086,14 +2197,25 @@ def _exchange_serial_line_with_timeout(
     control_ack_timeout,
     control_response_timeout,
     write_started_event,
+    reset_input,
+    interim_response_handler,
+    interim_response_limit,
 ):
     _set_serial_timeout(serial_port, timeout)
 
-    reset_input = getattr(serial_port, "reset_input_buffer", None)
-    if not callable(reset_input):
-        reset_input = getattr(serial_port, "flushInput", None)
-    if not callable(reset_input):
-        raise TypeError("serial connection does not support input-buffer reset")
+    reset_input_method = None
+    if reset_input:
+        reset_input_method = getattr(
+            serial_port,
+            "reset_input_buffer",
+            None,
+        )
+        if not callable(reset_input_method):
+            reset_input_method = getattr(serial_port, "flushInput", None)
+        if not callable(reset_input_method):
+            raise TypeError(
+                "serial connection does not support input-buffer reset"
+            )
 
     readline = getattr(serial_port, "readline", None)
     read_until = getattr(serial_port, "read_until", None)
@@ -2102,6 +2224,7 @@ def _exchange_serial_line_with_timeout(
         raise TypeError("serial connection does not satisfy the line-exchange contract")
 
     response_buffer = bytearray()
+    interim_response_count = 0
     control_sent = False
     control_attempted = False
     live_acknowledged = False
@@ -2168,7 +2291,7 @@ def _exchange_serial_line_with_timeout(
             serial_port,
             command_bytes,
             write_lock,
-            reset_input=reset_input,
+            reset_input=reset_input_method,
             write_admission_check=require_initial_write_admission,
             write_started_event=(
                 initial_write_started
@@ -2252,6 +2375,25 @@ def _exchange_serial_line_with_timeout(
             )
             response_buffer.clear()
             if response:
+                if interim_response_handler is not None:
+                    try:
+                        consumed = interim_response_handler(response)
+                    except Exception as exc:
+                        raise ProtocolResponseError(
+                            "interim response handler failed after "
+                            f"transmission: {exc}"
+                        ) from exc
+                    if not isinstance(consumed, bool):
+                        raise ProtocolResponseError(
+                            "interim response handler must return a boolean"
+                        )
+                    if consumed:
+                        interim_response_count += 1
+                        if interim_response_count > interim_response_limit:
+                            raise ProtocolResponseError(
+                                "controller exceeded the interim response limit"
+                            )
+                        continue
                 controller_estop = _is_physical_estop_position_response(response)
                 if control_bytes is not None and not controller_estop:
                     if not live_acknowledged:
@@ -2403,6 +2545,27 @@ def controller_protocol_decimal(value, field_name):
     return format(encoded, ".46f").rstrip("0").rstrip(".")
 
 
+def primary_shutdown_position(home_reference):
+    if not isinstance(home_reference, PrimaryHomeReference):
+        raise MotionInputError(
+            "shutdown position requires a controller home reference"
+        )
+    missing_axes = tuple(
+        f"J{axis + 1}"
+        for axis in (1, 2)
+        if not home_reference.valid[axis]
+    )
+    if missing_axes:
+        raise MotionInputError(
+            "shutdown position requires homing "
+            + " and ".join(missing_axes)
+            + " under the active controller frame"
+        )
+    target = list(PRIMARY_START_POSITION)
+    target[1:3] = home_reference.positions[1:3]
+    return tuple(target)
+
+
 def _finite_tuple(values, expected_length, field_name):
     if isinstance(values, (str, bytes)):
         raise MotionInputError(f"{field_name} must be a numeric sequence")
@@ -2421,6 +2584,68 @@ def _finite_tuple(values, expected_length, field_name):
     if len(normalized) != expected_length:
         raise MotionInputError(
             f"{field_name} must contain {expected_length} values; got {len(normalized)}"
+        )
+    return tuple(normalized)
+
+
+def _optional_finite_tuple(values, expected_length, field_name):
+    if isinstance(values, (str, bytes)):
+        raise MotionInputError(
+            f"{field_name} must be a numeric-or-empty sequence"
+        )
+    try:
+        iterator = iter(values)
+    except TypeError as exc:
+        raise MotionInputError(
+            f"{field_name} must be a numeric-or-empty sequence"
+        ) from exc
+
+    normalized = []
+    for index in range(expected_length + 1):
+        try:
+            value = next(iterator)
+        except StopIteration:
+            break
+        normalized.append(
+            None
+            if value is None
+            else finite_number(value, f"{field_name}[{index}]")
+        )
+    if len(normalized) != expected_length:
+        raise MotionInputError(
+            f"{field_name} must contain {expected_length} values; "
+            f"got {len(normalized)}"
+        )
+    if not any(value is not None for value in normalized):
+        raise MotionInputError(f"{field_name} must contain at least one target")
+    return tuple(normalized)
+
+
+def _nonnegative_integer_tuple(values, expected_length, field_name):
+    if isinstance(values, (str, bytes)):
+        raise MotionInputError(f"{field_name} must be an integer sequence")
+    try:
+        iterator = iter(values)
+    except TypeError as exc:
+        raise MotionInputError(
+            f"{field_name} must be an integer sequence"
+        ) from exc
+
+    normalized = []
+    for index in range(expected_length + 1):
+        try:
+            value = next(iterator)
+        except StopIteration:
+            break
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise MotionInputError(
+                f"{field_name}[{index}] must be a non-negative integer"
+            )
+        normalized.append(value)
+    if len(normalized) != expected_length:
+        raise MotionInputError(
+            f"{field_name} must contain {expected_length} values; "
+            f"got {len(normalized)}"
         )
     return tuple(normalized)
 
@@ -2659,6 +2884,515 @@ class JointMove:
         )
 
 
+@dataclass(frozen=True)
+class CommandedJointTrajectory:
+    """Display-only RJ estimate for firmware that reports terminal position."""
+
+    start_positions: Tuple[float, ...]
+    target_positions: Tuple[float, ...]
+    estimated_terminal_positions: Tuple[float, ...]
+    step_deltas: Tuple[int, ...]
+    high_steps: int
+    acceleration_steps: float
+    cruise_steps: float
+    deceleration_steps: float
+    average_distribution_delay_microseconds: float
+    cruise_delay_microseconds: float
+    start_delay_microseconds: float
+    end_delay_microseconds: float
+    acceleration_duration_seconds: float
+    cruise_duration_seconds: float
+    deceleration_duration_seconds: float
+    duration_seconds: float
+
+    def __post_init__(self):
+        start_positions = _finite_tuple(
+            self.start_positions,
+            JOINT_COUNT,
+            "trajectory start positions",
+        )
+        target_positions = _finite_tuple(
+            self.target_positions,
+            JOINT_COUNT,
+            "trajectory target positions",
+        )
+        estimated_terminal_positions = _finite_tuple(
+            self.estimated_terminal_positions,
+            JOINT_COUNT,
+            "trajectory estimated terminal positions",
+        )
+        step_deltas = _nonnegative_integer_tuple(
+            self.step_deltas,
+            JOINT_COUNT,
+            "trajectory step deltas",
+        )
+        if (
+            isinstance(self.high_steps, bool)
+            or not isinstance(self.high_steps, int)
+            or self.high_steps < 0
+            or self.high_steps != max(step_deltas)
+        ):
+            raise MotionInputError(
+                "trajectory coordinated step count is invalid"
+            )
+
+        numeric_fields = (
+            "acceleration_steps",
+            "cruise_steps",
+            "deceleration_steps",
+            "average_distribution_delay_microseconds",
+            "cruise_delay_microseconds",
+            "start_delay_microseconds",
+            "end_delay_microseconds",
+            "acceleration_duration_seconds",
+            "cruise_duration_seconds",
+            "deceleration_duration_seconds",
+            "duration_seconds",
+        )
+        numeric_values = {}
+        for field_name in numeric_fields:
+            value = finite_number(
+                getattr(self, field_name),
+                f"trajectory {field_name}",
+            )
+            if value < 0:
+                raise MotionInputError(
+                    f"trajectory {field_name} must be non-negative"
+                )
+            numeric_values[field_name] = value
+
+        phase_steps = (
+            numeric_values["acceleration_steps"]
+            + numeric_values["cruise_steps"]
+            + numeric_values["deceleration_steps"]
+        )
+        step_tolerance = max(0.001, self.high_steps * 1e-6)
+        if not math.isclose(
+            phase_steps,
+            self.high_steps,
+            rel_tol=0.0,
+            abs_tol=step_tolerance,
+        ):
+            raise MotionInputError(
+                "trajectory timing regions do not span the coordinated move"
+            )
+
+        phase_duration = (
+            numeric_values["acceleration_duration_seconds"]
+            + numeric_values["cruise_duration_seconds"]
+            + numeric_values["deceleration_duration_seconds"]
+        )
+        if not math.isclose(
+            phase_duration,
+            numeric_values["duration_seconds"],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        ):
+            raise MotionInputError(
+                "trajectory phase durations do not match the total duration"
+            )
+        if self.high_steps == 0:
+            if any(numeric_values.values()):
+                raise MotionInputError(
+                    "zero-step trajectory must have zero timing values"
+                )
+        elif (
+            numeric_values["cruise_delay_microseconds"] <= 0
+            or numeric_values["start_delay_microseconds"] <= 0
+            or numeric_values["end_delay_microseconds"] <= 0
+            or numeric_values["duration_seconds"] <= 0
+        ):
+            raise MotionInputError(
+                "moving trajectory requires positive timing values"
+            )
+
+        object.__setattr__(self, "start_positions", start_positions)
+        object.__setattr__(self, "target_positions", target_positions)
+        object.__setattr__(
+            self,
+            "estimated_terminal_positions",
+            estimated_terminal_positions,
+        )
+        object.__setattr__(self, "step_deltas", step_deltas)
+        for field_name, value in numeric_values.items():
+            object.__setattr__(self, field_name, value)
+
+    def progress_at(self, elapsed_seconds):
+        elapsed = finite_number(elapsed_seconds, "trajectory elapsed time")
+        if elapsed < 0:
+            raise MotionInputError(
+                "trajectory elapsed time must be non-negative"
+            )
+        if self.high_steps == 0:
+            return 0.0
+        if elapsed >= self.duration_seconds:
+            return 1.0
+
+        elapsed_microseconds = elapsed * 1_000_000.0
+        acceleration_duration = (
+            self.acceleration_duration_seconds * 1_000_000.0
+        )
+        cruise_duration = self.cruise_duration_seconds * 1_000_000.0
+
+        if elapsed_microseconds < acceleration_duration:
+            phase_steps = _linear_delay_phase_steps(
+                elapsed_microseconds,
+                self.acceleration_steps,
+                self.start_delay_microseconds,
+                self.cruise_delay_microseconds,
+            )
+            completed_steps = phase_steps
+        elif elapsed_microseconds < acceleration_duration + cruise_duration:
+            cruise_elapsed = elapsed_microseconds - acceleration_duration
+            completed_steps = self.acceleration_steps + (
+                cruise_elapsed / self.cruise_delay_microseconds
+            )
+        else:
+            deceleration_elapsed = (
+                elapsed_microseconds
+                - acceleration_duration
+                - cruise_duration
+            )
+            phase_steps = _linear_delay_phase_steps(
+                deceleration_elapsed,
+                self.deceleration_steps,
+                self.cruise_delay_microseconds,
+                self.end_delay_microseconds,
+            )
+            completed_steps = (
+                self.acceleration_steps
+                + self.cruise_steps
+                + phase_steps
+            )
+
+        return min(1.0, max(0.0, completed_steps / self.high_steps))
+
+    def positions_at(self, elapsed_seconds):
+        progress = self.progress_at(elapsed_seconds)
+        return tuple(
+            start + (target - start) * progress
+            for start, target in zip(
+                self.start_positions,
+                self.estimated_terminal_positions,
+            )
+        )
+
+
+def _linear_delay_phase_steps(
+    elapsed_microseconds,
+    phase_steps,
+    initial_delay_microseconds,
+    final_delay_microseconds,
+):
+    if phase_steps <= 0 or elapsed_microseconds <= 0:
+        return 0.0
+    phase_duration = (
+        phase_steps
+        * (initial_delay_microseconds + final_delay_microseconds)
+        * 0.5
+    )
+    if elapsed_microseconds >= phase_duration:
+        return phase_steps
+
+    delay_change = final_delay_microseconds - initial_delay_microseconds
+    if delay_change == 0:
+        return min(
+            phase_steps,
+            elapsed_microseconds / initial_delay_microseconds,
+        )
+
+    quadratic = delay_change / (2.0 * phase_steps)
+    discriminant = (
+        initial_delay_microseconds * initial_delay_microseconds
+        + 4.0 * quadratic * elapsed_microseconds
+    )
+    if discriminant < 0:
+        raise MotionInputError("trajectory phase timing is not invertible")
+    denominator = initial_delay_microseconds + math.sqrt(discriminant)
+    if denominator <= 0:
+        raise MotionInputError("trajectory phase timing is not invertible")
+    return min(
+        phase_steps,
+        max(0.0, 2.0 * elapsed_microseconds / denominator),
+    )
+
+
+def _controller_calibrated_step(position, calibration, axis):
+    position_float = _controller_float(position, f"J{axis} position")
+    negative_float = _controller_float(
+        calibration.negative_limits[axis - 1],
+        f"J{axis} negative limit",
+    )
+    scale_float = _controller_float(
+        calibration.steps_per_unit[axis - 1],
+        f"J{axis} steps per unit",
+    )
+    shifted_position = _controller_float(
+        position_float + negative_float,
+        f"J{axis} shifted position",
+    )
+    future_step = _controller_float_product(
+        shifted_position,
+        scale_float,
+        f"J{axis} future step position",
+    )
+    if future_step < 0 or future_step > CONTROLLER_SIGNED_INT_MAX:
+        raise MotionInputError(
+            f"J{axis} position exceeds the controller step range"
+        )
+    return int(future_step)
+
+
+def _controller_position_from_step(step, calibration, axis):
+    scale_float = _controller_float(
+        calibration.steps_per_unit[axis - 1],
+        f"J{axis} steps per unit",
+    )
+    negative_float = _controller_float(
+        calibration.negative_limits[axis - 1],
+        f"J{axis} negative limit",
+    )
+    zero_step_value = _controller_float_product(
+        negative_float,
+        scale_float,
+        f"J{axis} zero step position",
+    )
+    if zero_step_value < 0 or zero_step_value > CONTROLLER_SIGNED_INT_MAX:
+        raise MotionInputError(
+            f"J{axis} zero step exceeds the controller range"
+        )
+    zero_step = int(zero_step_value)
+    relative_step = step - zero_step
+    return _controller_float(
+        _controller_float(
+            relative_step,
+            f"J{axis} relative step position",
+        )
+        / scale_float,
+        f"J{axis} estimated terminal position",
+    )
+
+
+def estimate_commanded_joint_trajectory(
+    start_positions,
+    move,
+    minimum_step_delay_microseconds,
+):
+    """Estimate the coordinated RJ timing envelope without claiming telemetry."""
+
+    if not isinstance(move, JointMove):
+        raise MotionInputError("move must be a JointMove")
+    start = move.calibration.validate_positions(start_positions)
+    target = move.calibration.validate_positions(move.positions)
+    minimum_delay = _controller_float(
+        minimum_step_delay_microseconds,
+        "controller minimum step delay",
+    )
+    if minimum_delay <= 0:
+        raise MotionInputError(
+            "controller minimum step delay must be positive"
+        )
+
+    start_steps = tuple(
+        _controller_calibrated_step(position, move.calibration, axis)
+        for axis, position in enumerate(start, start=1)
+    )
+    target_steps = tuple(
+        _controller_calibrated_step(position, move.calibration, axis)
+        for axis, position in enumerate(target, start=1)
+    )
+    step_deltas = tuple(
+        abs(target_step - start_step)
+        for start_step, target_step in zip(start_steps, target_steps)
+    )
+    high_steps = max(step_deltas)
+    if high_steps == 0:
+        return CommandedJointTrajectory(
+            start_positions=start,
+            target_positions=target,
+            estimated_terminal_positions=start,
+            step_deltas=step_deltas,
+            high_steps=0,
+            acceleration_steps=0.0,
+            cruise_steps=0.0,
+            deceleration_steps=0.0,
+            average_distribution_delay_microseconds=0.0,
+            cruise_delay_microseconds=0.0,
+            start_delay_microseconds=0.0,
+            end_delay_microseconds=0.0,
+            acceleration_duration_seconds=0.0,
+            cruise_duration_seconds=0.0,
+            deceleration_duration_seconds=0.0,
+            duration_seconds=0.0,
+        )
+
+    estimated_terminal_positions = tuple(
+        (
+            _controller_position_from_step(
+                target_step,
+                move.calibration,
+                axis,
+            )
+            if step_delta > 0
+            else start_position
+        )
+        for axis, (
+            start_position,
+            target_step,
+            step_delta,
+        ) in enumerate(
+            zip(start, target_steps, step_deltas),
+            start=1,
+        )
+    )
+
+    high_steps_float = _controller_float(high_steps, "coordinated step count")
+    acceleration_ratio = _controller_float(
+        move.profile.acceleration / 100.0,
+        "acceleration ratio",
+    )
+    deceleration_ratio = _controller_float(
+        move.profile.deceleration / 100.0,
+        "deceleration ratio",
+    )
+    acceleration_steps = _controller_float_product(
+        high_steps_float,
+        acceleration_ratio,
+        "acceleration step count",
+    )
+    deceleration_steps = _controller_float_product(
+        high_steps_float,
+        deceleration_ratio,
+        "deceleration step count",
+    )
+    cruise_steps = _controller_float(
+        _controller_float(
+            high_steps_float - acceleration_steps,
+            "pre-deceleration step count",
+        )
+        - deceleration_steps,
+        "cruise step count",
+    )
+    if cruise_steps < 0:
+        raise MotionInputError(
+            "controller timing regions overlap after float encoding"
+        )
+
+    ramp = max(move.profile.ramp, FIRMWARE_MINIMUM_RAMP_PERCENT)
+    ramp_factor = _controller_float(
+        ramp / FIRMWARE_MINIMUM_RAMP_PERCENT,
+        "motion ramp factor",
+    )
+    acceleration_weight = _controller_float_product(
+        acceleration_steps,
+        _controller_float(1.0 + ramp_factor, "acceleration timing factor"),
+        "acceleration timing weight",
+    )
+    deceleration_weight = _controller_float_product(
+        deceleration_steps,
+        _controller_float(1.0 + ramp_factor, "deceleration timing factor"),
+        "deceleration timing weight",
+    )
+    ramp_weight = _controller_float(
+        acceleration_weight + deceleration_weight,
+        "ramp timing weight",
+    )
+    denominator = cruise_steps + ramp_weight * 0.5
+
+    if move.profile.speed_prefix == "Ss":
+        target_duration_microseconds = move.profile.speed * 1_000_000.0
+        if denominator <= 0:
+            cruise_delay = _controller_float(
+                target_duration_microseconds / high_steps,
+                "seconds-mode cruise delay",
+            )
+        else:
+            cruise_delay = _controller_float(
+                target_duration_microseconds / denominator,
+                "seconds-mode cruise delay",
+            )
+        cruise_delay = max(cruise_delay, minimum_delay)
+    else:
+        speed_ratio = _controller_float(
+            move.profile.speed / 100.0,
+            "percent speed ratio",
+        )
+        cruise_delay = _controller_float(
+            minimum_delay / speed_ratio,
+            "percent-mode cruise delay",
+        )
+
+    start_delay = _controller_float_product(
+        cruise_delay,
+        ramp_factor,
+        "motion start delay",
+    )
+    end_delay = _controller_float_product(
+        cruise_delay,
+        ramp_factor,
+        "motion end delay",
+    )
+    average_distribution_delay = (
+        FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS
+        * sum(step_deltas)
+        / high_steps
+    )
+    effective_delay_floor = minimum_delay + average_distribution_delay
+    cruise_delay = max(cruise_delay, effective_delay_floor)
+    start_delay = max(start_delay, effective_delay_floor)
+    end_delay = max(end_delay, effective_delay_floor)
+    for label, delay in (
+        ("cruise", cruise_delay),
+        ("start", start_delay),
+        ("end", end_delay),
+    ):
+        if (
+            delay <= 0
+            or delay > CONTROLLER_MAXIMUM_PULSE_DELAY_MICROSECONDS
+        ):
+            raise MotionInputError(
+                f"controller {label} delay is outside the firmware range"
+            )
+
+    acceleration_duration = (
+        acceleration_steps * (start_delay + cruise_delay) * 0.5
+    ) / 1_000_000.0
+    cruise_duration = (
+        cruise_steps * cruise_delay
+    ) / 1_000_000.0
+    deceleration_duration = (
+        deceleration_steps * (cruise_delay + end_delay) * 0.5
+    ) / 1_000_000.0
+    duration = (
+        acceleration_duration
+        + cruise_duration
+        + deceleration_duration
+    )
+    if not math.isfinite(duration) or duration <= 0:
+        raise MotionInputError("estimated joint trajectory duration is invalid")
+
+    return CommandedJointTrajectory(
+        start_positions=start,
+        target_positions=target,
+        estimated_terminal_positions=estimated_terminal_positions,
+        step_deltas=step_deltas,
+        high_steps=high_steps,
+        acceleration_steps=acceleration_steps,
+        cruise_steps=cruise_steps,
+        deceleration_steps=deceleration_steps,
+        average_distribution_delay_microseconds=(
+            average_distribution_delay
+        ),
+        cruise_delay_microseconds=cruise_delay,
+        start_delay_microseconds=start_delay,
+        end_delay_microseconds=end_delay,
+        acceleration_duration_seconds=acceleration_duration,
+        cruise_duration_seconds=cruise_duration,
+        deceleration_duration_seconds=deceleration_duration,
+        duration_seconds=duration,
+    )
+
+
 _NUMBER = r"-?(?:\d+(?:\.\d*)?|\.\d+)"
 _NONNEGATIVE_NUMBER = r"(?:\d+(?:\.\d*)?|\.\d+)"
 
@@ -2802,6 +3536,10 @@ _STANDARD_TIMING_SUFFIXES = {
         for opcode in ("WC", "WG")
     },
 }
+_SERIAL_TIMING_SUFFIXES = {
+    **_STANDARD_TIMING_SUFFIXES,
+    "RJ": re.compile(r"W[NFA]Lm[01]{6}(?:T1)?\n\Z"),
+}
 _LIVE_JOG_MAXIMUM_AXES = {
     "LC": 6,
     "LJ": JOINT_COUNT,
@@ -2819,6 +3557,30 @@ _POSITION_RESPONSE = re.compile(
     rf"O(?P<flag>(?:EB|EC[01]{{6}})?)"
     rf"P(?P<j7>{_NUMBER})Q(?P<j8>{_NUMBER})R(?P<j9>{_NUMBER})$"
 )
+_PRIMARY_HOME_REFERENCE_V1_RESPONSE = re.compile(
+    r"^A(?P<j1_valid>[01])"
+    r"B(?P<j1_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"C(?P<j2_valid>[01])"
+    r"D(?P<j2_millidegrees>(?:0|-?[1-9][0-9]*))$"
+)
+_PRIMARY_HOME_REFERENCE_V2_RESPONSE = re.compile(
+    r"^A(?P<j1_valid>[01])"
+    r"B(?P<j1_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"C(?P<j2_valid>[01])"
+    r"D(?P<j2_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"E(?P<j3_valid>[01])"
+    r"F(?P<j3_millidegrees>(?:0|-?[1-9][0-9]*))$"
+)
+_JOINT_TELEMETRY_RESPONSE = re.compile(
+    rf"^{re.escape(JOINT_TELEMETRY_PREFIX)}"
+    r"(?P<j1_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"B(?P<j2_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"C(?P<j3_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"D(?P<j4_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"E(?P<j5_millidegrees>(?:0|-?[1-9][0-9]*))"
+    r"F(?P<j6_millidegrees>(?:0|-?[1-9][0-9]*))$"
+)
+_JOINT_MOTION_ERROR_RESPONSE = re.compile(r"^(?:ER|EL[01]{9})$")
 
 
 @dataclass(frozen=True)
@@ -2977,7 +3739,11 @@ def _parse_command_contract(command, virtual):
     )
     envelope = envelopes.get(opcode)
     timing_pattern = _STANDARD_TIMING_PROFILE
-    suffix_pattern = _STANDARD_TIMING_SUFFIXES.get(opcode)
+    suffix_pattern = (
+        _STANDARD_TIMING_SUFFIXES.get(opcode)
+        if virtual
+        else _SERIAL_TIMING_SUFFIXES.get(opcode)
+    )
     if envelope is None:
         envelope = _LEGACY_TIMING_ENVELOPES.get(opcode)
         timing_pattern = _LEGACY_JOG_TIMING_PROFILE
@@ -3077,6 +3843,29 @@ def canonicalize_serial_command(command, calibration=None):
             )
         calibration.validate_axis_positions(axis_targets)
     return normalized
+
+
+def request_joint_telemetry(command):
+    normalized = _parse_command_contract(command, virtual=False)[1]
+    if normalized[:2] != "RJ":
+        raise MotionInputError("joint telemetry is available only for RJ commands")
+    if normalized.endswith("T1\n"):
+        return normalized
+    requested = normalized[:-1] + "T1\n"
+    return _parse_command_contract(requested, virtual=False)[1]
+
+
+def joint_telemetry_response_budget(response_timeout_seconds):
+    timeout = finite_number(
+        response_timeout_seconds,
+        "response_timeout_seconds",
+    )
+    if timeout <= 0:
+        raise MotionInputError("response_timeout_seconds must be positive")
+    return (
+        math.ceil(timeout / JOINT_TELEMETRY_PERIOD_SECONDS)
+        + JOINT_TELEMETRY_RESPONSE_BUDGET_MARGIN
+    )
 
 
 def canonicalize_virtual_command(command):
@@ -3239,6 +4028,207 @@ class PositionResponse:
     flag: str
 
 
+@dataclass(frozen=True)
+class JointTelemetry:
+    """Actual encoder positions sampled during one requested RJ exchange."""
+
+    raw: str
+    joints: Tuple[float, ...]
+
+
+def parse_joint_telemetry_response(response):
+    if (
+        not isinstance(response, str)
+        or not response
+        or response != response.strip()
+        or len(response) > MAX_RESPONSE_PAYLOAD_LENGTH
+    ):
+        raise ProtocolResponseError(
+            "controller joint telemetry response is invalid"
+        )
+    try:
+        response.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ProtocolResponseError(
+            "controller joint telemetry response must contain ASCII only"
+        ) from exc
+    match = _JOINT_TELEMETRY_RESPONSE.fullmatch(response)
+    if match is None:
+        raise ProtocolResponseError(
+            "controller joint telemetry response has invalid markers or values"
+        )
+    millidegrees = tuple(
+        int(match.group(f"j{axis}_millidegrees"))
+        for axis in range(1, JOINT_TELEMETRY_AXIS_COUNT + 1)
+    )
+    if any(
+        value < -CONTROLLER_SIGNED_INT_MAX - 1
+        or value > CONTROLLER_SIGNED_INT_MAX
+        for value in millidegrees
+    ):
+        raise ProtocolResponseError(
+            "controller joint telemetry response exceeds the signed range"
+        )
+    return JointTelemetry(
+        raw=response,
+        joints=tuple(value / 1000.0 for value in millidegrees),
+    )
+
+
+def parse_joint_motion_exchange_response(response):
+    if (
+        isinstance(response, str)
+        and response.startswith(JOINT_TELEMETRY_FAMILY_PREFIX)
+    ):
+        return parse_joint_telemetry_response(response)
+    try:
+        parse_position_response(response)
+    except ProtocolResponseError as exc:
+        if (
+            not isinstance(response, str)
+            or _JOINT_MOTION_ERROR_RESPONSE.fullmatch(response) is None
+        ):
+            raise ProtocolResponseError(
+                "controller joint-motion exchange returned an invalid frame"
+            ) from exc
+    return None
+
+
+def _parse_primary_home_reference_response(
+    response,
+    response_pattern,
+    axis_groups,
+):
+    if (
+        not isinstance(response, str)
+        or not response
+        or response != response.strip()
+        or len(response) > MAX_RESPONSE_PAYLOAD_LENGTH
+    ):
+        raise ProtocolResponseError(
+            "controller home-reference response is invalid"
+        )
+    try:
+        response.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ProtocolResponseError(
+            "controller home-reference response must contain ASCII only"
+        ) from exc
+    match = response_pattern.fullmatch(response)
+    if match is None:
+        raise ProtocolResponseError(
+            "controller home-reference response has invalid markers or values"
+        )
+    millidegrees = tuple(
+        int(match.group(position_group))
+        for _, position_group in axis_groups
+    )
+    if any(
+        value < -CONTROLLER_SIGNED_INT_MAX - 1
+        or value > CONTROLLER_SIGNED_INT_MAX
+        for value in millidegrees
+    ):
+        raise ProtocolResponseError(
+            "controller home-reference response exceeds the signed range"
+        )
+    try:
+        missing_axis_count = 3 - len(axis_groups)
+        return PrimaryHomeReference(
+            valid=(
+                tuple(
+                    match.group(valid_group) == "1"
+                    for valid_group, _ in axis_groups
+                )
+                + (False,) * missing_axis_count
+            ),
+            positions=(
+                tuple(value / 1000.0 for value in millidegrees)
+                + (0.0,) * missing_axis_count
+            ),
+        )
+    except MotionInputError as exc:
+        raise ProtocolResponseError(
+            f"controller home-reference response is inconsistent: {exc}"
+        ) from exc
+
+
+def parse_primary_home_reference_response(response):
+    return _parse_primary_home_reference_response(
+        response,
+        _PRIMARY_HOME_REFERENCE_V1_RESPONSE,
+        (
+            ("j1_valid", "j1_millidegrees"),
+            ("j2_valid", "j2_millidegrees"),
+        ),
+    )
+
+
+def parse_primary_home_reference_v2_response(response):
+    return _parse_primary_home_reference_response(
+        response,
+        _PRIMARY_HOME_REFERENCE_V2_RESPONSE,
+        (
+            ("j1_valid", "j1_millidegrees"),
+            ("j2_valid", "j2_millidegrees"),
+            ("j3_valid", "j3_millidegrees"),
+        ),
+    )
+
+
+def select_primary_home_reference_capability(protocol_capabilities):
+    if isinstance(protocol_capabilities, (str, bytes)):
+        raise MotionInputError(
+            "controller protocol capabilities must be a sequence"
+        )
+    try:
+        capabilities = tuple(protocol_capabilities)
+    except TypeError as exc:
+        raise MotionInputError(
+            "controller protocol capabilities must be a sequence"
+        ) from exc
+    if any(
+        not isinstance(capability, str) or not capability
+        for capability in capabilities
+    ):
+        raise MotionInputError(
+            "controller protocol capabilities contain an invalid value"
+        )
+    for capability in (
+        CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
+        CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+    ):
+        if capability in capabilities:
+            return capability
+    return None
+
+
+def primary_home_reference_command(protocol_capabilities):
+    capability = select_primary_home_reference_capability(
+        protocol_capabilities
+    )
+    if capability == CONTROLLER_CAPABILITY_HOME_REFERENCE_V2:
+        return "H2\n"
+    if capability == CONTROLLER_CAPABILITY_HOME_REFERENCE_V1:
+        return "HR\n"
+    return None
+
+
+def parse_primary_home_reference_capability_response(
+    response,
+    protocol_capabilities,
+):
+    capability = select_primary_home_reference_capability(
+        protocol_capabilities
+    )
+    if capability == CONTROLLER_CAPABILITY_HOME_REFERENCE_V2:
+        return parse_primary_home_reference_v2_response(response)
+    if capability == CONTROLLER_CAPABILITY_HOME_REFERENCE_V1:
+        return parse_primary_home_reference_response(response)
+    raise ProtocolResponseError(
+        "controller does not advertise a home-reference protocol"
+    )
+
+
 def parse_position_response(response):
     if not isinstance(response, str):
         raise ProtocolResponseError("controller response must be text")
@@ -3309,8 +4299,10 @@ class MotionSubmission:
 class MotionEvent:
     kind: str
     move: JointMove
+    started_at_seconds: Optional[float] = None
     response: Optional[str] = None
     position: Optional[PositionResponse] = None
+    telemetry: Optional[JointTelemetry] = None
     error: Optional[str] = None
     pending_discarded: bool = False
     _acknowledgement: Optional[threading.Event] = None
@@ -3367,7 +4359,20 @@ class DeferredJointAdjustments:
     def set_target(self, axis, target, profile, confirmed_position_generation):
         if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis < JOINT_COUNT:
             raise MotionInputError(f"axis must be an integer in [0, {JOINT_COUNT - 1}]")
-        normalized_target = finite_number(target, "target")
+        targets = [None] * JOINT_COUNT
+        targets[axis] = target
+        return self.set_targets(
+            targets,
+            profile,
+            confirmed_position_generation,
+        )
+
+    def set_targets(self, targets, profile, confirmed_position_generation):
+        normalized_targets = _optional_finite_tuple(
+            targets,
+            JOINT_COUNT,
+            "targets",
+        )
         if not isinstance(profile, MotionProfile):
             raise MotionInputError("profile must be a MotionProfile")
         self._validate_generation(confirmed_position_generation)
@@ -3376,11 +4381,14 @@ class DeferredJointAdjustments:
             if not self._pending_locked():
                 self._position_generation = confirmed_position_generation
             adjustments = list(self._adjustments)
-            targets = list(self._targets)
-            adjustments[axis] = 0.0
-            targets[axis] = normalized_target
+            merged_targets = list(self._targets)
+            for axis, target in enumerate(normalized_targets):
+                if target is None:
+                    continue
+                adjustments[axis] = 0.0
+                merged_targets[axis] = target
             self._adjustments = tuple(adjustments)
-            self._targets = tuple(targets)
+            self._targets = tuple(merged_targets)
             self._profile = profile
             return True
 
@@ -3495,7 +4503,9 @@ class CoalescingJointDispatcher:
         self._transport_lock = transport_lock
         self._activity_factory = activity_factory
         self._lock = threading.Lock()
-        self._events = Queue()
+        self._events = deque()
+        self._latest_telemetry_event = None
+        self._next_event_sequence = 0
         self._worker = None
         self._inflight = None
         self._pending = None
@@ -3559,14 +4569,29 @@ class CoalescingJointDispatcher:
     def submit_target(self, axis, target, actual_positions, profile):
         if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis < JOINT_COUNT:
             raise MotionInputError(f"axis must be an integer in [0, {JOINT_COUNT - 1}]")
-        normalized_target = finite_number(target, "target")
+        targets = [None] * JOINT_COUNT
+        targets[axis] = target
+        return self.submit_targets(
+            targets,
+            actual_positions,
+            profile,
+        )
+
+    def submit_targets(self, targets, actual_positions, profile):
+        normalized_targets = _optional_finite_tuple(
+            targets,
+            JOINT_COUNT,
+            "targets",
+        )
         actual = _finite_tuple(actual_positions, JOINT_COUNT, "actual_positions")
         if not isinstance(profile, MotionProfile):
             raise MotionInputError("profile must be a MotionProfile")
 
         def resolve_target(base):
             values = list(base)
-            values[axis] = normalized_target
+            for axis, target in enumerate(normalized_targets):
+                if target is not None:
+                    values[axis] = target
             return tuple(values)
 
         return self._submit_resolved_target(actual, profile, resolve_target)
@@ -3722,6 +4747,7 @@ class CoalescingJointDispatcher:
             self._closed = True
             self._pending = None
             self._desired = None
+            self._latest_telemetry_event = None
             acknowledgement = self._result_acknowledgement
             if self._worker is None and self._transport_reserved:
                 self._release_transport_locked()
@@ -3732,12 +4758,66 @@ class CoalescingJointDispatcher:
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
             raise MotionInputError("event limit must be a non-negative integer or None")
         events = []
-        while limit is None or len(events) < limit:
-            try:
-                events.append(self._events.get_nowait())
-            except Empty:
-                break
+        with self._lock:
+            while limit is None or len(events) < limit:
+                queued_event = self._events[0] if self._events else None
+                telemetry_event = self._latest_telemetry_event
+                if queued_event is None and telemetry_event is None:
+                    break
+                if (
+                    telemetry_event is not None
+                    and (
+                        queued_event is None
+                        or telemetry_event[0] < queued_event[0]
+                    )
+                ):
+                    self._latest_telemetry_event = None
+                    events.append(telemetry_event[1])
+                else:
+                    events.append(self._events.popleft()[1])
         return events
+
+    def _next_event_record_locked(self, event):
+        self._next_event_sequence += 1
+        return self._next_event_sequence, event
+
+    def _publish_event(self, event):
+        with self._lock:
+            self._events.append(
+                self._next_event_record_locked(event)
+            )
+
+    def publish_telemetry(self, telemetry):
+        if not isinstance(telemetry, JointTelemetry):
+            raise MotionInputError(
+                "joint telemetry event must contain validated telemetry"
+            )
+        try:
+            validated = parse_joint_telemetry_response(telemetry.raw)
+        except ProtocolResponseError as exc:
+            raise MotionInputError(
+                "joint telemetry event must contain validated telemetry"
+            ) from exc
+        if telemetry != validated:
+            raise MotionInputError(
+                "joint telemetry event must match its validated wire frame"
+            )
+        with self._lock:
+            if self._closed:
+                return False
+            move = self._inflight
+            if move is None:
+                raise MotionQueueFault(
+                    "joint telemetry arrived without an in-flight move"
+                )
+            self._latest_telemetry_event = self._next_event_record_locked(
+                MotionEvent(
+                    kind="telemetry",
+                    move=move,
+                    telemetry=validated,
+                )
+            )
+        return True
 
     def _run(self):
         while True:
@@ -3751,10 +4831,18 @@ class CoalescingJointDispatcher:
                     move = self._pending
                     self._pending = None
                     self._inflight = move
+                    self._latest_telemetry_event = None
             if move is None:
                 return
 
-            self._events.put(MotionEvent(kind="started", move=move))
+            started_at_seconds = time.monotonic()
+            self._publish_event(
+                MotionEvent(
+                    kind="started",
+                    move=move,
+                    started_at_seconds=started_at_seconds,
+                )
+            )
             response = None
             position = None
             try:
@@ -3784,7 +4872,7 @@ class CoalescingJointDispatcher:
                         self._result_acknowledgement = acknowledgement
                     else:
                         acknowledgement.set()
-                self._events.put(
+                self._publish_event(
                     MotionEvent(
                         kind="failed",
                         move=move,
@@ -3813,7 +4901,7 @@ class CoalescingJointDispatcher:
                 else:
                     acknowledgement.set()
 
-            self._events.put(
+            self._publish_event(
                 MotionEvent(
                     kind="completed",
                     move=move,

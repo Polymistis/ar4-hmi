@@ -15,11 +15,16 @@ from ARrobots.HMI.joint_motion import (
     CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+    CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
+    CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+    CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
+    CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
     CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
     CONTROLLER_DIRECTORY_SEPARATOR,
     CONTROLLER_MAXIMUM_RAMP_PERCENT,
     CoalescingJointDispatcher,
     CommandTiming,
+    CommandedJointTrajectory,
     ControllerIdentity,
     ControllerJointCalibration,
     DeferredLiveMotionArbiter,
@@ -29,12 +34,16 @@ from ARrobots.HMI.joint_motion import (
     MAX_RESPONSE_PAYLOAD_LENGTH,
     MAX_CONTROLLER_FILENAME_BYTES,
     DeferredJointAdjustments,
+    JointMove,
+    JointTelemetry,
     MotionInputError,
     MotionProfile,
     MotionQueueFault,
     MotionRequestLease,
     MotionRequestRegistry,
     MotionTransportBusy,
+    PRIMARY_START_POSITION,
+    PrimaryHomeReference,
     ProtocolResponseError,
     SerialActivityRegistry,
     SerialActivityRejected,
@@ -50,9 +59,12 @@ from ARrobots.HMI.joint_motion import (
     controller_number,
     controller_protocol_decimal,
     decode_serial_response_line,
+    encode_calibration_switch_mask,
     exchange_serial_line,
     exchange_serial_line_until_cancelled,
+    estimate_commanded_joint_trajectory,
     finite_number,
+    joint_telemetry_response_budget,
     motion_timing_response_timeout,
     normalize_auxiliary_board_profile,
     parse_auxiliary_output_command,
@@ -61,19 +73,71 @@ from ARrobots.HMI.joint_motion import (
     parse_command_timing,
     parse_controller_identity_response,
     parse_controller_modbus_response,
+    parse_joint_motion_exchange_response,
+    parse_joint_telemetry_response,
     parse_motion_wrist_config,
     parse_position_response,
+    parse_primary_home_reference_capability_response,
+    parse_primary_home_reference_response,
+    parse_primary_home_reference_v2_response,
     parse_virtual_command_timing,
+    primary_home_reference_command,
+    primary_shutdown_position,
     quarantine_serial_transport,
     read_serial_exact_response,
     read_serial_line_response,
     read_serial_line_response_with_optional_followup,
+    request_joint_telemetry,
     serial_transport_quarantined,
     validate_controller_filename,
     validate_auxiliary_output_command,
     validate_auxiliary_servo_command,
     write_serial_control,
 )
+
+
+class CalibrationSwitchProtocolTests(unittest.TestCase):
+    def test_switch_mask_encodes_j1_as_low_bit(self):
+        self.assertEqual(
+            encode_calibration_switch_mask(
+                (
+                    "HIGH",
+                    "LOW",
+                    "HIGH",
+                    "LOW",
+                    "LOW",
+                    "HIGH",
+                    "LOW",
+                    "HIGH",
+                    "LOW",
+                )
+            ),
+            165,
+        )
+        self.assertEqual(
+            CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
+            "CALIBRATION_SWITCH_POLARITY_V1",
+        )
+        self.assertEqual(
+            encode_calibration_switch_mask(("HIGH",) * 9),
+            511,
+        )
+        self.assertEqual(
+            encode_calibration_switch_mask(("LOW",) * 9),
+            0,
+        )
+
+    def test_switch_mask_rejects_unvalidated_states(self):
+        for states in (
+            "HIGH",
+            ("HIGH",) * 8,
+            ("HIGH",) * 8 + ("high",),
+            ("HIGH",) * 8 + (1,),
+        ):
+            with self.subTest(states=states):
+                with self.assertRaises(MotionInputError):
+                    encode_calibration_switch_mask(states)
+
 
 TEST_CONTROLLER_MEDIA_ID = "00112233445566778899AABBCCDDEEFF"
 
@@ -103,6 +167,142 @@ def controller_calibration(
         positive_limits=positive_limits,
         steps_per_unit=steps_per_unit,
     )
+
+
+def discrete_firmware_joint_duration(
+    step_counts,
+    profile,
+    minimum_delay_microseconds=200.0,
+    distribution_delay_microseconds=30.0,
+):
+    """Independent timing oracle for the active Teensy joint drive loop."""
+
+    steps = tuple(step_counts)
+    high_steps = max(steps)
+    if high_steps == 0:
+        return 0.0
+
+    acceleration_steps = high_steps * (profile.acceleration / 100.0)
+    deceleration_steps = high_steps * (profile.deceleration / 100.0)
+    cruise_steps = (
+        high_steps - acceleration_steps - deceleration_steps
+    )
+    ramp_factor = max(profile.ramp, 10.0) / 10.0
+    denominator = cruise_steps + (
+        acceleration_steps * (1.0 + ramp_factor)
+        + deceleration_steps * (1.0 + ramp_factor)
+    ) * 0.5
+    if profile.speed_prefix == "Ss":
+        cruise_delay = (
+            profile.speed * 1_000_000.0
+            / (denominator if denominator > 0 else high_steps)
+        )
+        cruise_delay = max(
+            cruise_delay,
+            minimum_delay_microseconds,
+        )
+    else:
+        cruise_delay = minimum_delay_microseconds / (
+            profile.speed / 100.0
+        )
+
+    start_delay = cruise_delay * ramp_factor
+    end_delay = cruise_delay * ramp_factor
+    acceleration_increment = (
+        (start_delay - cruise_delay) / acceleration_steps
+        if acceleration_steps > 0
+        else 0.0
+    )
+    deceleration_increment = (
+        (end_delay - cruise_delay) / deceleration_steps
+        if deceleration_steps > 0
+        else 0.0
+    )
+    current_delay = start_delay
+    current = [0] * 9
+    primary_error = [0] * 9
+    secondary_error_1 = [0] * 9
+    secondary_error_2 = [0] * 9
+    elapsed_microseconds = 0.0
+    high_step_current = 0
+
+    while any(
+        current[axis] < steps[axis]
+        for axis in range(9)
+    ):
+        if high_step_current < acceleration_steps:
+            current_delay = max(
+                cruise_delay,
+                current_delay - acceleration_increment,
+            )
+        elif high_step_current >= high_steps - deceleration_steps:
+            current_delay = min(
+                end_delay,
+                current_delay + deceleration_increment,
+            )
+        else:
+            current_delay = cruise_delay
+
+        emitted_steps = 0
+        for axis, step_count in enumerate(steps):
+            if current[axis] >= step_count:
+                continue
+            primary_period = high_steps // step_count
+            leftover_1 = high_steps - step_count * primary_period
+            secondary_period_1 = (
+                high_steps // leftover_1
+                if leftover_1 > 0
+                else 0
+            )
+            leftover_2 = (
+                high_steps
+                - (
+                    step_count * primary_period
+                    + (
+                        step_count * primary_period
+                    ) // secondary_period_1
+                )
+                if secondary_period_1 > 0
+                else 0
+            )
+            secondary_period_2 = (
+                high_steps // leftover_2
+                if leftover_2 > 0
+                else 0
+            )
+            if secondary_period_2 == 0:
+                secondary_error_2[axis] = 1
+            if secondary_error_2[axis] == secondary_period_2:
+                secondary_error_2[axis] = 0
+                continue
+            secondary_error_2[axis] += 1
+            if secondary_period_1 == 0:
+                secondary_error_1[axis] = 1
+            if secondary_error_1[axis] == secondary_period_1:
+                secondary_error_1[axis] = 0
+                continue
+            secondary_error_1[axis] += 1
+            primary_error[axis] += 1
+            if primary_error[axis] == primary_period:
+                current[axis] += 1
+                primary_error[axis] = 0
+                emitted_steps += 1
+
+        distribution_delay = (
+            emitted_steps * distribution_delay_microseconds
+        )
+        pulse_delay = math.ceil(max(
+            minimum_delay_microseconds,
+            current_delay - distribution_delay,
+        ))
+        elapsed_microseconds += distribution_delay + pulse_delay
+        high_step_current += 1
+        if high_step_current > high_steps * 2:
+            raise AssertionError(
+                "firmware timing oracle exceeded the coordinated step bound"
+            )
+
+    return elapsed_microseconds / 1_000_000.0
 
 
 def wait_until(predicate, timeout=2.0):
@@ -1806,6 +2006,308 @@ class SerialLineExchangeTests(unittest.TestCase):
         self.assertEqual(serial_port.flush_count, 1)
         self.assertEqual(serial_port.timeout, 7.5)
 
+    def test_exchange_demultiplexes_interim_telemetry_before_terminal_data(self):
+        terminal = position_response((1, 2, 3, 4, 5, 6))
+        serial_port = SequenceFakeSerial(
+            (
+                b"TMA1000B2000C3000D4000E5000F6000\n",
+                f"{terminal}\n".encode("ascii"),
+            )
+        )
+        observed = []
+
+        def consume_interim(response):
+            if not response.startswith("TM"):
+                return False
+            observed.append(parse_joint_telemetry_response(response))
+            return True
+
+        response = exchange_serial_line(
+            serial_port,
+            "RP\n",
+            120,
+            interim_response_handler=consume_interim,
+            interim_response_limit=10,
+        )
+
+        self.assertEqual(response, terminal)
+        self.assertEqual(
+            observed,
+            [
+                JointTelemetry(
+                    raw="TMA1000B2000C3000D4000E5000F6000",
+                    joints=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+                )
+            ],
+        )
+        self.assertTrue(serial_port.is_open)
+        self.assertFalse(serial_transport_quarantined(serial_port))
+
+    def test_interim_telemetry_does_not_extend_the_absolute_deadline(self):
+        class FakeClock:
+            def __init__(self):
+                self.now = 100.0
+
+            def monotonic(self):
+                return self.now
+
+        class TimedSequenceSerial(SequenceFakeSerial):
+            def __init__(self, responses, clock):
+                super().__init__(responses)
+                self.clock = clock
+
+            def readline(self):
+                response = super().readline()
+                self.clock.now += 0.06
+                return response
+
+        clock = FakeClock()
+        terminal = position_response((1, 2, 3, 4, 5, 6))
+        serial_port = TimedSequenceSerial(
+            (
+                b"TMA1B2C3D4E5F6\n",
+                b"TMA2B3C4D5E6F7\n",
+                f"{terminal}\n".encode("ascii"),
+            ),
+            clock,
+        )
+        observed = []
+
+        def consume_telemetry(response):
+            if not response.startswith("TM"):
+                return False
+            observed.append(response)
+            return True
+
+        with patch(
+            "ARrobots.HMI.joint_motion.time.monotonic",
+            side_effect=clock.monotonic,
+        ):
+            with self.assertRaisesRegex(
+                SerialTransportTimeout,
+                "within 0.1 seconds",
+            ):
+                exchange_serial_line(
+                    serial_port,
+                    "RP\n",
+                    0.1,
+                    interim_response_handler=consume_telemetry,
+                    interim_response_limit=10,
+                )
+
+        self.assertEqual(
+            observed,
+            [
+                "TMA1B2C3D4E5F6",
+                "TMA2B3C4D5E6F7",
+            ],
+        )
+        self.assertEqual(
+            serial_port.responses,
+            [f"{terminal}\n".encode("ascii")],
+        )
+        self.assertFalse(serial_port.is_open)
+        self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_invalid_interim_telemetry_quarantines_the_owned_exchange(self):
+        serial_port = SequenceFakeSerial((b"TMA1B2\n",))
+
+        with self.assertRaisesRegex(
+            SerialTransportQuarantinedError,
+            "invalid markers or values",
+        ):
+            exchange_serial_line(
+                serial_port,
+                "RP\n",
+                120,
+                interim_response_handler=lambda response: (
+                    parse_joint_motion_exchange_response(response) is not None
+                ),
+                interim_response_limit=10,
+            )
+
+        self.assertFalse(serial_port.is_open)
+        self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_interim_handler_exceptions_quarantine_the_owned_exchange(self):
+        terminal = position_response((1, 2, 3, 4, 5, 6))
+        exception_types = (
+            SerialTransportQuarantinedError,
+            SerialTransportTimeout,
+            MotionInputError,
+            SerialActivityRejected,
+        )
+
+        for exception_type in exception_types:
+            with self.subTest(exception_type=exception_type.__name__):
+                serial_port = SequenceFakeSerial(
+                    (
+                        b"TMA1B2C3D4E5F6\n",
+                        f"{terminal}\n".encode("ascii"),
+                    )
+                )
+
+                def fail_handler(_response, error_type=exception_type):
+                    raise error_type("callback failure")
+
+                with self.assertRaisesRegex(
+                    SerialTransportQuarantinedError,
+                    "interim response handler failed after transmission",
+                ):
+                    exchange_serial_line(
+                        serial_port,
+                        "RP\n",
+                        120,
+                        interim_response_handler=fail_handler,
+                        interim_response_limit=10,
+                    )
+
+                self.assertEqual(serial_port.commands, [b"RP\n"])
+                self.assertFalse(serial_port.is_open)
+                self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_unknown_interim_line_quarantines_before_terminal_data(self):
+        terminal = position_response((1, 2, 3, 4, 5, 6))
+        serial_port = SequenceFakeSerial(
+            (
+                b"unexpected\n",
+                f"{terminal}\n".encode("ascii"),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            SerialTransportQuarantinedError,
+            "invalid frame",
+        ):
+            exchange_serial_line(
+                serial_port,
+                "RP\n",
+                120,
+                interim_response_handler=lambda response: (
+                    parse_joint_motion_exchange_response(response) is not None
+                ),
+                interim_response_limit=10,
+            )
+
+        self.assertEqual(serial_port.commands, [b"RP\n"])
+        self.assertFalse(serial_port.is_open)
+        self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_interim_response_limit_quarantines_a_flooded_exchange(self):
+        terminal = position_response((1, 2, 3, 4, 5, 6))
+        telemetry = b"TMA1B2C3D4E5F6\n"
+        serial_port = SequenceFakeSerial(
+            (
+                telemetry,
+                telemetry,
+                telemetry,
+                f"{terminal}\n".encode("ascii"),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            SerialTransportQuarantinedError,
+            "exceeded the interim response limit",
+        ):
+            exchange_serial_line(
+                serial_port,
+                "RP\n",
+                120,
+                interim_response_handler=lambda response: (
+                    parse_joint_motion_exchange_response(response) is not None
+                ),
+                interim_response_limit=2,
+            )
+
+        self.assertFalse(serial_port.is_open)
+        self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_interim_response_handler_contract_is_validated(self):
+        serial_port = FakeSerial()
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "interim_response_handler",
+        ):
+            exchange_serial_line(
+                serial_port,
+                "RP\n",
+                120,
+                interim_response_handler="invalid",
+            )
+        self.assertEqual(serial_port.commands, [])
+        self.assertTrue(serial_port.is_open)
+
+        missing_limit_port = FakeSerial()
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "interim_response_limit must be a positive integer",
+        ):
+            exchange_serial_line(
+                missing_limit_port,
+                "RP\n",
+                120,
+                interim_response_handler=lambda _response: False,
+            )
+        self.assertEqual(missing_limit_port.commands, [])
+        self.assertTrue(missing_limit_port.is_open)
+
+        live_port = FakeSerial()
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "unsupported during live control",
+        ):
+            exchange_serial_line(
+                live_port,
+                "RP\n",
+                120,
+                control_event=threading.Event(),
+                control_command="S\n",
+                control_ack_timeout_seconds=1,
+                control_response_timeout_seconds=1,
+                interim_response_handler=lambda _response: False,
+                interim_response_limit=10,
+            )
+        self.assertEqual(live_port.commands, [])
+        self.assertTrue(live_port.is_open)
+
+        transmitted_port = FakeSerial(response=b"unexpected\n")
+        with self.assertRaisesRegex(
+            SerialTransportQuarantinedError,
+            "must return a boolean",
+        ):
+            exchange_serial_line(
+                transmitted_port,
+                "RP\n",
+                120,
+                interim_response_handler=lambda _response: None,
+                interim_response_limit=10,
+            )
+        self.assertFalse(transmitted_port.is_open)
+        self.assertTrue(serial_transport_quarantined(transmitted_port))
+
+    def test_nonresetting_exchange_preserves_input_boundary(self):
+        serial_port = FakeSerial(response=b"queued frame\n")
+
+        response = exchange_serial_line(
+            serial_port,
+            "HR\n",
+            120,
+            reset_input=False,
+        )
+
+        self.assertEqual(response, "queued frame")
+        self.assertEqual(serial_port.commands, [b"HR\n"])
+        self.assertEqual(serial_port.reset_count, 0)
+        self.assertEqual(serial_port.flush_count, 1)
+
+        with self.assertRaisesRegex(MotionInputError, "reset_input"):
+            exchange_serial_line(
+                FakeSerial(),
+                "HR\n",
+                120,
+                reset_input=1,
+            )
+
     def test_exchange_marks_write_start_before_serial_write(self):
         write_started = threading.Event()
 
@@ -3135,6 +3637,240 @@ class CommandResponseTimeoutTests(unittest.TestCase):
             motion_timing_response_timeout("invalid", 120, 100, 1000)
 
 
+class NamedJointPositionTests(unittest.TestCase):
+    def test_start_position_matches_post_calibration_pose(self):
+        self.assertEqual(
+            PRIMARY_START_POSITION,
+            (0.0, 0.0, 0.0, 0.0, 45.0, 0.0),
+        )
+
+    def test_shutdown_position_uses_controller_switch_references(self):
+        reference = PrimaryHomeReference(
+            (False, True, True),
+            (0.0, -38.2, -88.9),
+        )
+        target = primary_shutdown_position(reference)
+
+        self.assertEqual(target[0], PRIMARY_START_POSITION[0])
+        self.assertAlmostEqual(target[1], -38.2)
+        self.assertAlmostEqual(target[2], -88.9)
+        self.assertEqual(target[3:], PRIMARY_START_POSITION[3:])
+
+    def test_shutdown_position_requires_both_active_home_references(self):
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "requires homing J2",
+        ):
+            primary_shutdown_position(
+                PrimaryHomeReference(
+                    (True, False, True),
+                    (163.8, 0.0, -88.9),
+                )
+            )
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "requires homing J3",
+        ):
+            primary_shutdown_position(
+                PrimaryHomeReference(
+                    (True, True, False),
+                    (163.8, -38.2, 0.0),
+                )
+            )
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "requires a controller home reference",
+        ):
+            primary_shutdown_position(None)
+
+    def test_home_reference_parser_accepts_controller_millidegrees(self):
+        reference = parse_primary_home_reference_response(
+            "A1B163800C1D-38200"
+        )
+
+        self.assertEqual(reference.valid, (True, True, False))
+        self.assertEqual(reference.positions, (163.8, -38.2, 0.0))
+
+        v2_reference = parse_primary_home_reference_v2_response(
+            "A1B163800C1D-38200E1F-88900"
+        )
+        self.assertEqual(v2_reference.valid, (True, True, True))
+        self.assertEqual(
+            v2_reference.positions,
+            (163.8, -38.2, -88.9),
+        )
+
+    def test_home_reference_protocol_prefers_v2_and_preserves_v1(self):
+        capabilities = (
+            CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
+            CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
+        )
+        self.assertEqual(
+            primary_home_reference_command(capabilities),
+            "H2\n",
+        )
+        self.assertEqual(
+            parse_primary_home_reference_capability_response(
+                "A1B163800C1D-38200E1F-88900",
+                capabilities,
+            ),
+            PrimaryHomeReference(
+                (True, True, True),
+                (163.8, -38.2, -88.9),
+            ),
+        )
+
+        v1_capabilities = (CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,)
+        self.assertEqual(
+            primary_home_reference_command(v1_capabilities),
+            "HR\n",
+        )
+        legacy_reference = parse_primary_home_reference_capability_response(
+            "A1B163800C1D-38200",
+            v1_capabilities,
+        )
+        self.assertEqual(
+            legacy_reference,
+            PrimaryHomeReference(
+                (True, True, False),
+                (163.8, -38.2, 0.0),
+            ),
+        )
+        with self.assertRaisesRegex(MotionInputError, "requires homing J3"):
+            primary_shutdown_position(legacy_reference)
+
+        self.assertIsNone(primary_home_reference_command(()))
+        with self.assertRaisesRegex(
+            ProtocolResponseError,
+            "does not advertise",
+        ):
+            parse_primary_home_reference_capability_response(
+                "A0B0C0D0",
+                (),
+            )
+
+    def test_home_reference_parser_rejects_invalid_or_stale_frames(self):
+        for response in (
+            "A0B1C0D0",
+            "A1B01C1D0",
+            "A1B2147483648C1D0",
+            "A1B0C1D0\n",
+        ):
+            with self.subTest(response=response):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_primary_home_reference_response(response)
+        for response in (
+            "A1B0C1D0",
+            "A1B0C1D0E0F1",
+            "A1B0C1D0E1F01",
+            "A1B0C1D0E1F2147483648",
+        ):
+            with self.subTest(v2_response=response):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_primary_home_reference_v2_response(response)
+
+
+class JointTelemetryProtocolTests(unittest.TestCase):
+    def test_parser_accepts_canonical_encoder_millidegrees(self):
+        telemetry = parse_joint_telemetry_response(
+            "TMA-170000B90000C-88992D0E45000F180000"
+        )
+
+        self.assertEqual(
+            telemetry,
+            JointTelemetry(
+                raw="TMA-170000B90000C-88992D0E45000F180000",
+                joints=(-170.0, 90.0, -88.992, 0.0, 45.0, 180.0),
+            ),
+        )
+
+    def test_parser_rejects_malformed_or_out_of_range_frames(self):
+        for response in (
+            "TMA0B0C0D0E0",
+            "TMA00B0C0D0E0F0",
+            "TMA-0B0C0D0E0F0",
+            "TMA2147483648B0C0D0E0F0",
+            "TMA0B0C0D0E0F0\n",
+            "TMÃ0B0C0D0E0F0",
+        ):
+            with self.subTest(response=response):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_joint_telemetry_response(response)
+
+    def test_exchange_classifier_accepts_only_owned_response_families(self):
+        telemetry = parse_joint_motion_exchange_response(
+            "TMA1B2C3D4E5F6"
+        )
+
+        self.assertEqual(
+            telemetry,
+            JointTelemetry(
+                raw="TMA1B2C3D4E5F6",
+                joints=(0.001, 0.002, 0.003, 0.004, 0.005, 0.006),
+            ),
+        )
+        for response in (
+            position_response((1, 2, 3, 4, 5, 6)),
+            "ER",
+            "EL010101010",
+        ):
+            with self.subTest(response=response):
+                self.assertIsNone(
+                    parse_joint_motion_exchange_response(response)
+                )
+
+        for response in (
+            "unexpected",
+            "E",
+            "EL01010101",
+            "EL010101012",
+            "TMA1B2",
+        ):
+            with self.subTest(response=response):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_joint_motion_exchange_response(response)
+
+    def test_response_budget_is_deadline_bounded(self):
+        self.assertEqual(joint_telemetry_response_budget(0.1), 3)
+        self.assertEqual(joint_telemetry_response_budget(120), 1202)
+        for timeout in (0, -1, True, float("nan")):
+            with self.subTest(timeout=timeout):
+                with self.assertRaises(MotionInputError):
+                    joint_telemetry_response_budget(timeout)
+
+    def test_request_marker_is_rj_scoped_and_idempotent(self):
+        command = (
+            "RJA1B2C3D4E5F6J70J80J90"
+            "Sp50Ac10Dc20Rm25WNLm000000\n"
+        )
+        requested = request_joint_telemetry(command)
+
+        self.assertEqual(
+            requested,
+            command[:-1] + "T1\n",
+        )
+        self.assertEqual(request_joint_telemetry(requested), requested)
+        self.assertEqual(
+            canonicalize_serial_command(
+                requested,
+                controller_calibration(),
+            ),
+            requested,
+        )
+        with self.assertRaises(MotionInputError):
+            canonicalize_virtual_command(requested)
+        self.assertEqual(
+            CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
+            "JOINT_TELEMETRY_V1",
+        )
+
+        with self.assertRaisesRegex(MotionInputError, "only for RJ"):
+            request_joint_telemetry(
+                "MJX1Y2Z3Rz4Ry5Rx6J70J80J90"
+                "Sp50Ac10Dc20Rm25WNLm000000\n"
+            )
+
+
 class DeferredJointAdjustmentsTests(unittest.TestCase):
     def setUp(self):
         self.profile = MotionProfile("Sp", 50, 10, 10, 25, "N", "000000")
@@ -3213,6 +3949,45 @@ class DeferredJointAdjustmentsTests(unittest.TestCase):
             3,
         )
         self.assertEqual(target, (20.0, 15.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0))
+
+    def test_multi_axis_target_is_atomic_and_preserves_other_intent(self):
+        deferred = DeferredJointAdjustments()
+        deferred.add(6, 2, self.profile, 2)
+
+        self.assertTrue(
+            deferred.set_targets(
+                (0, 0, 0, 0, 45, 0, None, None, None),
+                self.profile,
+                2,
+            )
+        )
+
+        target, profile = self.consume(
+            deferred,
+            (10, 20, 30, 40, 50, 60, 7, 8, 9),
+            3,
+        )
+        self.assertEqual(
+            target,
+            (0.0, 0.0, 0.0, 0.0, 45.0, 0.0, 9.0, 8.0, 9.0),
+        )
+        self.assertIs(profile, self.profile)
+
+    def test_multi_axis_target_rejects_empty_or_wrong_length_input(self):
+        deferred = DeferredJointAdjustments()
+
+        with self.assertRaisesRegex(MotionInputError, "at least one target"):
+            deferred.set_targets(
+                (None,) * 9,
+                self.profile,
+                2,
+            )
+        with self.assertRaisesRegex(MotionInputError, "contain 9 values"):
+            deferred.set_targets(
+                (0,) * 8,
+                self.profile,
+                2,
+            )
 
     def test_concurrent_producers_preserve_every_accepted_axis(self):
         deferred = DeferredJointAdjustments()
@@ -3598,6 +4373,253 @@ class JointMotionProtocolTests(unittest.TestCase):
             MotionProfile("Sp", 50, 10, 10, 25, "N", None)
 
 
+class CommandedJointTrajectoryTests(unittest.TestCase):
+    def setUp(self):
+        self.calibration = controller_calibration()
+        self.start = (0,) * 9
+
+    def move(self, target, profile):
+        return JointMove(target, profile, self.calibration)
+
+    def test_percent_profile_models_synchronized_firmware_envelope(self):
+        profile = MotionProfile(
+            "Sp",
+            50,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move((10, -5, 0, 0, 0, 0, 0, 0, 0), profile),
+            200,
+        )
+
+        self.assertIsInstance(trajectory, CommandedJointTrajectory)
+        self.assertEqual(
+            trajectory.step_deltas,
+            (1000, 500, 0, 0, 0, 0, 0, 0, 0),
+        )
+        self.assertEqual(trajectory.high_steps, 1000)
+        self.assertAlmostEqual(
+            trajectory.duration_seconds,
+            discrete_firmware_joint_duration(
+                trajectory.step_deltas,
+                profile,
+            ),
+        )
+        self.assertEqual(trajectory.positions_at(0), (0.0,) * 9)
+        self.assertEqual(
+            trajectory.positions_at(trajectory.duration_seconds / 2)[:2],
+            (5.0, -2.5),
+        )
+        self.assertEqual(
+            trajectory.positions_at(trajectory.duration_seconds + 1),
+            (10.0, -5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        )
+
+    def test_seconds_profile_uses_requested_duration_when_not_clamped(self):
+        profile = MotionProfile(
+            "Ss",
+            2,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move((10, 0, 0, 0, 0, 0, 0, 0, 0), profile),
+            200,
+        )
+
+        self.assertAlmostEqual(trajectory.duration_seconds, 2.0, places=6)
+        self.assertAlmostEqual(trajectory.positions_at(1.0)[0], 5.0, places=5)
+
+    def test_fast_profile_includes_synchronized_pulse_distribution_cost(self):
+        profile = MotionProfile(
+            "Sp",
+            100,
+            20,
+            20,
+            10,
+            "N",
+            "000000",
+        )
+        single_axis = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move((10, 0, 0, 0, 0, 0, 0, 0, 0), profile),
+            200,
+        )
+        all_axes = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move((10,) * 9, profile),
+            200,
+        )
+
+        self.assertEqual(
+            single_axis.average_distribution_delay_microseconds,
+            30,
+        )
+        self.assertEqual(
+            all_axes.average_distribution_delay_microseconds,
+            270,
+        )
+        self.assertAlmostEqual(
+            single_axis.duration_seconds,
+            discrete_firmware_joint_duration(
+                single_axis.step_deltas,
+                profile,
+            ),
+        )
+        self.assertAlmostEqual(
+            all_axes.duration_seconds,
+            discrete_firmware_joint_duration(
+                all_axes.step_deltas,
+                profile,
+            ),
+        )
+
+    def test_average_distribution_model_tracks_discrete_firmware_loop(self):
+        profile = MotionProfile(
+            "Ss",
+            0.25,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move(
+                (10, 3.33, 1.11, 0.37, 0.12, 0.04, 0.01, 0, 0),
+                profile,
+            ),
+            200,
+        )
+        firmware_duration = discrete_firmware_joint_duration(
+            trajectory.step_deltas,
+            profile,
+        )
+        relative_error = abs(
+            trajectory.duration_seconds - firmware_duration
+        ) / firmware_duration
+
+        self.assertLessEqual(relative_error, 0.03)
+
+    def test_zero_step_delta_holds_confirmed_start_until_terminal_feedback(self):
+        profile = MotionProfile(
+            "Sp",
+            50,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move((0.009, 0, 0, 0, 0, 0, 0, 0, 0), profile),
+            200,
+        )
+
+        self.assertEqual(trajectory.high_steps, 0)
+        self.assertEqual(trajectory.duration_seconds, 0)
+        self.assertEqual(trajectory.positions_at(60), (0.0,) * 9)
+
+    def test_substep_axis_remains_at_confirmed_position_during_other_motion(self):
+        profile = MotionProfile(
+            "Sp",
+            50,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            self.move((10, 0.009, 0, 0, 0, 0, 0, 0, 0), profile),
+            200,
+        )
+
+        self.assertEqual(trajectory.target_positions[1], 0.009)
+        self.assertEqual(trajectory.step_deltas[1], 0)
+        self.assertEqual(trajectory.positions_at(trajectory.duration_seconds)[1], 0)
+
+    def test_terminal_estimate_uses_controller_integer_zero_step(self):
+        calibration = controller_calibration(
+            negative_limits=(170,) * 9,
+            positive_limits=(170,) * 9,
+            steps_per_unit=(6400 / 360,) * 9,
+        )
+        profile = MotionProfile(
+            "Sp",
+            50,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        target = 10.2
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            JointMove(
+                (target, 0, 0, 0, 0, 0, 0, 0, 0),
+                profile,
+                calibration,
+            ),
+            200,
+        )
+        float32 = lambda value: struct.unpack(
+            ">f",
+            struct.pack(">f", value),
+        )[0]
+        negative = float32(170)
+        scale = float32(6400 / 360)
+        zero_step = int(float32(negative * scale))
+        target_step = int(
+            float32(float32(float32(target) + negative) * scale)
+        )
+        expected = float32(float32(target_step - zero_step) / scale)
+
+        self.assertEqual(trajectory.estimated_terminal_positions[0], expected)
+
+    def test_estimator_rejects_invalid_timing_boundaries(self):
+        profile = MotionProfile(
+            "Sp",
+            50,
+            20,
+            20,
+            20,
+            "N",
+            "000000",
+        )
+        move = self.move((10, 0, 0, 0, 0, 0, 0, 0, 0), profile)
+
+        for invalid_delay in (0, -1, float("nan"), True):
+            with self.subTest(invalid_delay=invalid_delay):
+                with self.assertRaises(MotionInputError):
+                    estimate_commanded_joint_trajectory(
+                        self.start,
+                        move,
+                        invalid_delay,
+                    )
+
+        trajectory = estimate_commanded_joint_trajectory(
+            self.start,
+            move,
+            200,
+        )
+        with self.assertRaisesRegex(MotionInputError, "non-negative"):
+            trajectory.positions_at(-0.1)
+
+
 class CoalescingJointDispatcherTests(unittest.TestCase):
     def setUp(self):
         self.profile = MotionProfile("Sp", 50, 10, 10, 25, "N", "000000")
@@ -3610,6 +4632,86 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
             lambda: self.calibration,
             **kwargs,
         )
+
+    def test_telemetry_events_preserve_exchange_order(self):
+        dispatcher = None
+        telemetry = parse_joint_telemetry_response(
+            "TMA100B200C300D400E500F600"
+        )
+
+        def exchange(_command):
+            self.assertTrue(dispatcher.publish_telemetry(telemetry))
+            return position_response((1, 2, 3, 4, 5, 6))
+
+        dispatcher = self.make_dispatcher(exchange)
+        dispatcher.submit_positions(
+            (1, 2, 3, 4, 5, 6, 0, 0, 0),
+            self.actual,
+            self.profile,
+        )
+        events = collect_events_until_idle(dispatcher)
+
+        self.assertEqual(
+            [event.kind for event in events],
+            ["started", "telemetry", "completed"],
+        )
+        self.assertEqual(events[1].telemetry, telemetry)
+        self.assertIs(events[1].move, events[0].move)
+
+    def test_telemetry_events_coalesce_without_delaying_completion(self):
+        dispatcher = None
+        final_telemetry = None
+        publication_finished = threading.Event()
+
+        def exchange(_command):
+            nonlocal final_telemetry
+            for sample in range(10000):
+                final_telemetry = parse_joint_telemetry_response(
+                    f"TMA{sample}B2C3D4E5F6"
+                )
+                self.assertTrue(
+                    dispatcher.publish_telemetry(final_telemetry)
+                )
+            publication_finished.set()
+            return position_response((1, 2, 3, 4, 5, 6))
+
+        dispatcher = self.make_dispatcher(exchange)
+        dispatcher.submit_positions(
+            (1, 2, 3, 4, 5, 6, 0, 0, 0),
+            self.actual,
+            self.profile,
+        )
+        self.assertTrue(publication_finished.wait(2))
+        events = collect_events_until_idle(dispatcher)
+
+        self.assertEqual(
+            [event.kind for event in events],
+            ["started", "telemetry", "completed"],
+        )
+        self.assertEqual(events[1].telemetry, final_telemetry)
+
+    def test_telemetry_publication_requires_an_active_validated_exchange(self):
+        dispatcher = self.make_dispatcher(
+            lambda _command: position_response((0, 0, 0, 0, 0, 0))
+        )
+        telemetry = parse_joint_telemetry_response(
+            "TMA0B0C0D0E0F0"
+        )
+
+        with self.assertRaisesRegex(MotionQueueFault, "in-flight"):
+            dispatcher.publish_telemetry(telemetry)
+        with self.assertRaisesRegex(MotionInputError, "validated telemetry"):
+            dispatcher.publish_telemetry((0,) * 6)
+        with self.assertRaisesRegex(MotionInputError, "validated wire frame"):
+            dispatcher.publish_telemetry(
+                JointTelemetry(
+                    raw="TMA0B0C0D0E0F0",
+                    joints=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+                )
+            )
+
+        dispatcher.close()
+        self.assertFalse(dispatcher.publish_telemetry(telemetry))
 
     def test_many_adjustments_become_one_latest_pending_target(self):
         first_started = threading.Event()
@@ -3651,6 +4753,20 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         self.assertEqual(
             [event.kind for event in events],
             ["started", "completed", "started", "completed"],
+        )
+        started_events = [
+            event for event in events if event.kind == "started"
+        ]
+        self.assertTrue(
+            all(
+                isinstance(event.started_at_seconds, float)
+                and math.isfinite(event.started_at_seconds)
+                for event in started_events
+            )
+        )
+        self.assertLessEqual(
+            started_events[0].started_at_seconds,
+            started_events[1].started_at_seconds,
         )
 
     def test_repeated_absolute_targets_replace_instead_of_accumulating(self):
@@ -3726,6 +4842,34 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         self.assertEqual(submission.target, (1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
         self.assertEqual(len(commands), 1)
         self.assertTrue(commands[0].startswith("RJA1B2C3D0E0F0J70J80J90"))
+
+    def test_submits_partial_multi_axis_target_as_one_command(self):
+        commands = []
+
+        def exchange(command):
+            commands.append(command)
+            return position_response(
+                (0, 0, 0, 0, 45, 0),
+                external=(7, 8, 9),
+            )
+
+        dispatcher = self.make_dispatcher(exchange)
+        actual = (10, 20, 30, 40, 50, 60, 7, 8, 9)
+        submission = dispatcher.submit_targets(
+            (0, 0, 0, 0, 45, 0, None, None, None),
+            actual,
+            self.profile,
+        )
+        collect_events_until_idle(dispatcher)
+
+        self.assertEqual(
+            submission.target,
+            (0.0, 0.0, 0.0, 0.0, 45.0, 0.0, 7.0, 8.0, 9.0),
+        )
+        self.assertEqual(len(commands), 1)
+        self.assertTrue(
+            commands[0].startswith("RJA0B0C0D0E45F0J77J88J99")
+        )
 
     def test_uses_latest_confirmed_position_before_tk_consumes_event(self):
         commands = []

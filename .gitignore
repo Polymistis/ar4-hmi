@@ -17,6 +17,11 @@ dist/
 /custom.json
 /ErrorLog
 /ARbot.cal
+/ARbot.cal.bak
+# Preserve backups created by pre-rename builds on case-sensitive filesystems.
+/Arbot.cal.bak
+/.ARconfig.json.*.tmp
+/.custom.json.*.tmp
 /curImage.jpg
 /temp.jpg
 /gcode-storage-state.json

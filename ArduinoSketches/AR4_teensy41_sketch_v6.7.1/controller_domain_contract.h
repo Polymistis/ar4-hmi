@@ -68,6 +68,42 @@ inline bool checked_nonnegative_double_to_int(double value, int &output) {
   return value >= 0.0 && checked_double_to_int(value, output);
 }
 
+inline bool calibration_release_step_limit(
+  float steps_per_unit,
+  float maximum_travel,
+  int configured_step_limit,
+  int &step_limit
+) {
+  if (
+    !isfinite(steps_per_unit)
+    || !isfinite(maximum_travel)
+    || steps_per_unit <= 0.0f
+    || maximum_travel <= 0.0f
+    || configured_step_limit <= 0
+  ) {
+    return false;
+  }
+  const double required_steps = ceil(
+    static_cast<double>(steps_per_unit)
+    * static_cast<double>(maximum_travel)
+  );
+  int staged_step_limit = 0;
+  if (
+    required_steps < 1.0
+    || !checked_nonnegative_double_to_int(
+      required_steps,
+      staged_step_limit
+    )
+  ) {
+    return false;
+  }
+  if (staged_step_limit > configured_step_limit) {
+    staged_step_limit = configured_step_limit;
+  }
+  step_limit = staged_step_limit;
+  return true;
+}
+
 inline bool validate_axis_calibration(
   float negative_limit,
   float positive_limit,
@@ -253,6 +289,7 @@ inline bool calibration_reference_steps(
       checked_step_limit,
       zero_step
     )
+    || checked_step_limit <= 0
     || checked_step_limit != step_limit
   ) {
     return false;

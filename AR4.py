@@ -144,10 +144,10 @@ import ctypes
 
 import math
 import numpy as np
-from numpy import mean
 
 import pickle
 import serial
+import tempfile
 
 from matplotlib import pyplot as plt
 
@@ -173,7 +173,17 @@ import cv2
 import re
 
 import ARrobots.robot_kinematics as robot
-from ARrobots.Calibration import load_calibration, save_calibration
+from ARrobots.Calibration import (
+  load_calibration,
+  save_calibration,
+  snapshot_calibration_values,
+)
+from ARrobots.calibration_schema import (
+  CalibrationSchemaError,
+  normalize_calibration_data,
+  normalize_vision_background_color,
+  reconcile_auxiliary_output_assignments,
+)
 from ARrobots.HMI.Calibration import apply_calibration
 from ARrobots.HMI.joint_motion import (
   AUXILIARY_BOARD_MEGA,
@@ -182,6 +192,8 @@ from ARrobots.HMI.joint_motion import (
   CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
   CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
   CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+  CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
+  CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
   CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
   CONTROLLER_HARDWARE_ID_LENGTH,
   CONTROLLER_MEDIA_ID_LENGTH,
@@ -202,7 +214,9 @@ from ARrobots.HMI.joint_motion import (
   MotionRequestLease,
   MotionRequestRegistry,
   MotionTransportBusy,
+  PRIMARY_START_POSITION,
   PositionResponse,
+  PrimaryHomeReference,
   ProtocolResponseError,
   SerialTransportQuarantinedError,
   SerialTransportTimeout,
@@ -219,9 +233,11 @@ from ARrobots.HMI.joint_motion import (
   controller_protocol_decimal,
   controller_ratio,
   decode_serial_response_line,
+  encode_calibration_switch_mask,
   exchange_serial_line,
   exchange_serial_line_until_cancelled,
   finite_number,
+  joint_telemetry_response_budget,
   motion_timing_response_timeout,
   normalize_auxiliary_board_profile,
   parse_auxiliary_output_command,
@@ -229,13 +245,18 @@ from ARrobots.HMI.joint_motion import (
   parse_command_timing,
   parse_controller_identity_response,
   parse_controller_modbus_response,
+  parse_joint_motion_exchange_response,
   parse_motion_wrist_config,
   parse_position_response,
+  parse_primary_home_reference_capability_response,
   parse_virtual_command_timing,
+  primary_home_reference_command,
+  primary_shutdown_position,
   quarantine_serial_transport,
   read_serial_exact_response,
   read_serial_line_response,
   read_serial_line_response_with_optional_followup,
+  request_joint_telemetry,
   serial_transport_quarantined,
   validate_auxiliary_output_command,
   validate_auxiliary_servo_command,
@@ -243,6 +264,14 @@ from ARrobots.HMI.joint_motion import (
   validate_controller_hardware_id,
   validate_controller_media_id,
   write_serial_control,
+)
+from ARrobots.HMI.joint_visualization import (
+  ENCODER_MARKER_ROLE,
+  ESTIMATED_MARKER_ROLE,
+  TARGET_MARKER_ROLE,
+  GhostSliderMarker,
+  JointMotionVisualization,
+  set_joint_slider_positions,
 )
 
 #####################################################################################
@@ -261,6 +290,10 @@ Config = AR4_Configuration()
 CE = Config.Environment
 CAL = Config.Calibration
 RUN = Config.RuntimeState # Not implemented yet
+PROGRAM_REGISTER_COUNT = 16
+PROGRAM_POSITION_REGISTER_ELEMENT_COUNT = 6
+program_register_entry_fields = {}
+program_position_register_entry_fields = {}
 
 
 def _load_startup_calibration():
@@ -468,7 +501,9 @@ gcode_storage_pending_delete_reconciliation = None
 gcode_storage_persistent_state_loaded = False
 gcode_storage_persistent_state_error = None
 gcode_storage_state_path_override = None
+controller_identity_state_lock = threading.Lock()
 main_controller_identity_binding = None
+joint_actual_position_source_snapshot = None
 gcode_storage_media_binding = None
 gcode_view_generation = 0
 gcode_conversion_active = threading.Event()
@@ -546,18 +581,23 @@ class CalibrationCancellationBoundary:
 
 
 class CalibrationWriteCommitment:
-  def __init__(self, shared_event):
+  def __init__(self, shared_event, on_commit=None):
     if not all(
       callable(getattr(shared_event, method_name, None))
       for method_name in ("set", "clear", "is_set")
     ):
       raise TypeError("calibration commitment event contract is invalid")
+    if on_commit is not None and not callable(on_commit):
+      raise TypeError("calibration commitment callback must be callable")
     self._shared_event = shared_event
     self._local_event = threading.Event()
+    self._on_commit = on_commit
 
   def set(self):
     self._shared_event.set()
     self._local_event.set()
+    if self._on_commit is not None:
+      self._on_commit()
 
   def is_set(self):
     committed = self._local_event.is_set()
@@ -637,6 +677,7 @@ GCODE_LISTBOX_STYLE_OPTIONS = (
   "selectforeground",
 )
 CONTROLLER_STARTUP_REQUIRED_CAPABILITIES = (
+  CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
   CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
   CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
   CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
@@ -771,6 +812,7 @@ class ManualAuxiliaryResult:
 class MainControllerIdentityBinding:
   serial_port: object
   identity: ControllerIdentity
+  home_reference: Optional[PrimaryHomeReference] = None
 
   def __post_init__(self):
     if self.serial_port is None or not getattr(self.serial_port, "is_open", False):
@@ -779,6 +821,23 @@ class MainControllerIdentityBinding:
       )
     if not isinstance(self.identity, ControllerIdentity):
       raise MotionInputError("main controller identity binding is invalid")
+    if (
+      self.home_reference is not None
+      and not isinstance(self.home_reference, PrimaryHomeReference)
+    ):
+      raise MotionInputError(
+        "main controller home-reference binding is invalid"
+      )
+    supports_home_reference = (
+      primary_home_reference_command(
+        self.identity.protocol_capabilities
+      )
+      is not None
+    )
+    if supports_home_reference != (self.home_reference is not None):
+      raise MotionInputError(
+        "main controller home-reference capability is inconsistent"
+      )
     validate_controller_hardware_id(
       self.identity.controller_hardware_id
     )
@@ -2445,26 +2504,73 @@ def _request_manual_output(row, on_state, entry):
   )
 
 
-def _bind_main_controller_identity(serial_port, identity):
+def _bind_main_controller_identity(
+  serial_port,
+  identity,
+  home_reference=None,
+):
   global main_controller_identity_binding
+  global joint_actual_position_source_snapshot
   global gcode_storage_media_binding
 
-  binding = MainControllerIdentityBinding(serial_port, identity)
+  binding = MainControllerIdentityBinding(
+    serial_port,
+    identity,
+    home_reference,
+  )
   if RUN.get('ser') is not serial_port:
     raise ConnectionError(
       "main controller changed before identity binding"
     )
-  with gcode_storage_state_lock:
+  with controller_identity_state_lock:
+    joint_actual_position_source_snapshot = None
     main_controller_identity_binding = binding
     gcode_storage_media_binding = None
+    joint_actual_position_source_snapshot = (
+      serial_port,
+      object(),
+    )
   return binding
+
+
+def _bind_main_controller_home_reference(serial_port, home_reference):
+  global main_controller_identity_binding
+
+  if not isinstance(home_reference, PrimaryHomeReference):
+    raise MotionInputError(
+      "main controller home-reference update is invalid"
+    )
+  with controller_identity_state_lock:
+    binding = main_controller_identity_binding
+    if (
+      not isinstance(binding, MainControllerIdentityBinding)
+      or binding.serial_port is not serial_port
+      or RUN.get('ser') is not serial_port
+      or not getattr(serial_port, "is_open", False)
+      or (
+        primary_home_reference_command(
+          binding.identity.protocol_capabilities
+        )
+        is None
+      )
+    ):
+      raise ConnectionError(
+        "main controller changed before home-reference binding"
+      )
+    main_controller_identity_binding = MainControllerIdentityBinding(
+      serial_port,
+      binding.identity,
+      home_reference,
+    )
+    return main_controller_identity_binding
 
 
 def _clear_main_controller_identity(serial_port=None):
   global main_controller_identity_binding
+  global joint_actual_position_source_snapshot
   global gcode_storage_media_binding
 
-  with gcode_storage_state_lock:
+  with controller_identity_state_lock:
     binding = main_controller_identity_binding
     if (
       serial_port is not None
@@ -2476,7 +2582,7 @@ def _clear_main_controller_identity(serial_port=None):
         "controller changed"
       )
       return False
-    main_controller_identity_binding = None
+    joint_actual_position_source_snapshot = None
     media_binding = gcode_storage_media_binding
     if (
       serial_port is None
@@ -2484,6 +2590,7 @@ def _clear_main_controller_identity(serial_port=None):
       or media_binding.serial_port is serial_port
     ):
       gcode_storage_media_binding = None
+    main_controller_identity_binding = None
   return True
 
 
@@ -2496,7 +2603,7 @@ def _require_main_controller_identity_cleanup(serial_port, context):
 
 
 def _current_main_controller_identity(serial_port=None):
-  with gcode_storage_state_lock:
+  with controller_identity_state_lock:
     binding = main_controller_identity_binding
   if not isinstance(binding, MainControllerIdentityBinding):
     return None
@@ -2507,6 +2614,64 @@ def _current_main_controller_identity(serial_port=None):
   ):
     return None
   return binding
+
+
+def _current_primary_home_reference(serial_port=None):
+  binding = _current_main_controller_identity(serial_port)
+  if binding is None:
+    return None
+  return binding.home_reference
+
+
+def _invalidate_bound_primary_home_reference(serial_port):
+  global main_controller_identity_binding
+
+  with controller_identity_state_lock:
+    binding = main_controller_identity_binding
+    if not isinstance(binding, MainControllerIdentityBinding):
+      reason = "no main-controller identity is bound"
+    elif binding.serial_port is not serial_port:
+      reason = "the bound controller changed"
+    elif RUN.get('ser') is not serial_port:
+      reason = "the active controller changed"
+    elif not getattr(serial_port, "is_open", False):
+      reason = "the controller connection is closed"
+    elif (
+      primary_home_reference_command(
+        binding.identity.protocol_capabilities
+      )
+      is None
+    ):
+      if binding.home_reference is None:
+        return True
+      reason = (
+        "a controller without home-reference capability retained a reference"
+      )
+    else:
+      reason = None
+    if reason is not None:
+      logger.warning(
+        "Primary home-reference invalidation skipped: %s",
+        reason,
+      )
+      return False
+    try:
+      replacement = MainControllerIdentityBinding(
+        serial_port,
+        binding.identity,
+        PrimaryHomeReference(
+          (False, False, False),
+          (0.0, 0.0, 0.0),
+        ),
+      )
+    except ConnectionError as exc:
+      logger.warning(
+        "Primary home-reference invalidation lost the controller: %s",
+        exc,
+      )
+      return False
+    main_controller_identity_binding = replacement
+    return True
 
 
 def _bind_gcode_storage_media(
@@ -2530,21 +2695,29 @@ def _bind_gcode_storage_media(
     controller_hardware_id,
     media_id,
   )
-  with gcode_storage_state_lock:
+  with controller_identity_state_lock:
+    current_controller_binding = main_controller_identity_binding
+    if (
+      current_controller_binding is not controller_binding
+      or RUN.get('ser') is not serial_port
+      or not getattr(serial_port, "is_open", False)
+    ):
+      raise ConnectionError(
+        "G-code storage listing controller identity changed"
+      )
     gcode_storage_media_binding = binding
   return binding
 
 
 def _current_gcode_storage_media(serial_port=None):
-  with gcode_storage_state_lock:
+  with controller_identity_state_lock:
     binding = gcode_storage_media_binding
+    controller_binding = main_controller_identity_binding
   if not isinstance(binding, GCodeStorageMediaBinding):
     return None
-  controller_binding = _current_main_controller_identity(
-    binding.serial_port
-  )
   if (
-    controller_binding is None
+    not isinstance(controller_binding, MainControllerIdentityBinding)
+    or controller_binding.serial_port is not binding.serial_port
     or RUN.get('ser') is not binding.serial_port
     or not getattr(binding.serial_port, "is_open", False)
     or (serial_port is not None and binding.serial_port is not serial_port)
@@ -3139,6 +3312,8 @@ RUN['J9CalStat2'] = IntVar()
 '''
 
 RUN['IncJogStat'] = IntVar()
+RUN['showEstimatedMotion'] = IntVar(value=1)
+RUN['showEncoderTelemetry'] = IntVar(value=1)
 RUN['fullRot'] = IntVar()
 RUN['pick180'] = IntVar()
 RUN['pickClosest'] = IntVar()
@@ -4929,24 +5104,24 @@ def toggle_offline_mode():
                 RUN['offlineMode'] = True
                 _set_offline_mode_status(True)
                 RUN['VR_angles'] = [0.000, 0.000, 0.000, 0.000, 90.000, 0.000]
-                J1negLimLab.config(text="-"+CAL['J1NegLim'], style="Jointlim.TLabel")
+                J1negLimLab.config(text=f"-{CAL['J1NegLim']}", style="Jointlim.TLabel")
                 J1posLimLab.config(text=CAL['J1PosLim'], style="Jointlim.TLabel")
-                J1jogslide.config(from_=float("-"+CAL['J1NegLim']), to=float(CAL['J1PosLim']),  length=180, orient=HORIZONTAL,  command=J1sliderUpdate)
-                J2negLimLab.config(text="-"+CAL['J2NegLim'], style="Jointlim.TLabel")
+                J1jogslide.config(from_=-float(CAL['J1NegLim']), to=float(CAL['J1PosLim']),  length=180, orient=HORIZONTAL,  command=J1sliderUpdate)
+                J2negLimLab.config(text=f"-{CAL['J2NegLim']}", style="Jointlim.TLabel")
                 J2posLimLab.config(text=CAL['J2PosLim'], style="Jointlim.TLabel")
-                J2jogslide.config(from_=float("-"+CAL['J2NegLim']), to=float(CAL['J2PosLim']),  length=180, orient=HORIZONTAL,  command=J2sliderUpdate)
-                J3negLimLab.config(text="-"+CAL['J3NegLim'], style="Jointlim.TLabel")
+                J2jogslide.config(from_=-float(CAL['J2NegLim']), to=float(CAL['J2PosLim']),  length=180, orient=HORIZONTAL,  command=J2sliderUpdate)
+                J3negLimLab.config(text=f"-{CAL['J3NegLim']}", style="Jointlim.TLabel")
                 J3posLimLab.config(text=CAL['J3PosLim'], style="Jointlim.TLabel")
-                J3jogslide.config(from_=float("-"+CAL['J3NegLim']), to=float(CAL['J3PosLim']),  length=180, orient=HORIZONTAL,  command=J3sliderUpdate)
-                J4negLimLab.config(text="-"+CAL['J4NegLim'], style="Jointlim.TLabel")
+                J3jogslide.config(from_=-float(CAL['J3NegLim']), to=float(CAL['J3PosLim']),  length=180, orient=HORIZONTAL,  command=J3sliderUpdate)
+                J4negLimLab.config(text=f"-{CAL['J4NegLim']}", style="Jointlim.TLabel")
                 J4posLimLab.config(text=CAL['J4PosLim'], style="Jointlim.TLabel")
-                J4jogslide.config(from_=float("-"+CAL['J4NegLim']), to=float(CAL['J4PosLim']),  length=180, orient=HORIZONTAL,  command=J4sliderUpdate)
-                J5negLimLab.config(text="-"+CAL['J5NegLim'], style="Jointlim.TLabel")
+                J4jogslide.config(from_=-float(CAL['J4NegLim']), to=float(CAL['J4PosLim']),  length=180, orient=HORIZONTAL,  command=J4sliderUpdate)
+                J5negLimLab.config(text=f"-{CAL['J5NegLim']}", style="Jointlim.TLabel")
                 J5posLimLab.config(text=CAL['J5PosLim'], style="Jointlim.TLabel")
-                J5jogslide.config(from_=float("-"+CAL['J5NegLim']), to=float(CAL['J5PosLim']),  length=180, orient=HORIZONTAL,  command=J5sliderUpdate)
-                J6negLimLab.config(text="-"+CAL['J6NegLim'], style="Jointlim.TLabel")
+                J5jogslide.config(from_=-float(CAL['J5NegLim']), to=float(CAL['J5PosLim']),  length=180, orient=HORIZONTAL,  command=J5sliderUpdate)
+                J6negLimLab.config(text=f"-{CAL['J6NegLim']}", style="Jointlim.TLabel")
                 J6posLimLab.config(text=CAL['J6PosLim'], style="Jointlim.TLabel")
-                J6jogslide.config(from_=float("-"+CAL['J6NegLim']), to=float(CAL['J6PosLim']),  length=180, orient=HORIZONTAL,  command=J6sliderUpdate)
+                J6jogslide.config(from_=-float(CAL['J6NegLim']), to=float(CAL['J6PosLim']),  length=180, orient=HORIZONTAL,  command=J6sliderUpdate)
                 try:
                     refresh_gui_from_joint_angles(RUN['VR_angles'])
                 except MotionInputError as exc:
@@ -5621,6 +5796,7 @@ class ControllerStartupResult:
     visual_options: tuple
     auxiliary_serial: object
     controller_identity: ControllerIdentity
+    home_reference: Optional[PrimaryHomeReference] = None
     auxiliary_error: Optional[str] = None
 
     def __post_init__(self):
@@ -5631,6 +5807,23 @@ class ControllerStartupResult:
         if not isinstance(self.controller_identity, ControllerIdentity):
             raise ProtocolResponseError(
                 "controller startup identity has an invalid type"
+            )
+        supports_home_reference = (
+            primary_home_reference_command(
+                self.controller_identity.protocol_capabilities
+            )
+            is not None
+        )
+        if (
+            self.home_reference is not None
+            and not isinstance(self.home_reference, PrimaryHomeReference)
+        ):
+            raise ProtocolResponseError(
+                "controller startup home reference has an invalid type"
+            )
+        if supports_home_reference != (self.home_reference is not None):
+            raise ProtocolResponseError(
+                "controller startup home-reference capability is inconsistent"
             )
         if isinstance(self.visual_options, (str, bytes)):
             raise ProtocolResponseError("visual options must be a sequence")
@@ -6206,6 +6399,18 @@ def startup(startup_request, cancel_event=None):
       cancel_event,
       expected_response=b"Done\n",
     )
+    home_reference_command = primary_home_reference_command(
+      controller_identity.protocol_capabilities
+    )
+    home_reference = None
+    if home_reference_command is not None:
+      home_reference = parse_primary_home_reference_capability_response(
+        _startup_exchange_response(
+          home_reference_command,
+          cancel_event,
+        ),
+        controller_identity.protocol_capabilities,
+      )
     position_text = _startup_exchange_response("RP\n", cancel_event)
     position = parse_position_response(position_text)
     if position.flag:
@@ -6217,6 +6422,7 @@ def startup(startup_request, cancel_event=None):
       visual_options=_startup_visual_options(),
       auxiliary_serial=auxiliary_serial,
       controller_identity=controller_identity,
+      home_reference=home_reference,
       auxiliary_error=auxiliary_error,
     )
   except BaseException:
@@ -6295,6 +6501,7 @@ def _apply_controller_startup_result(
     _bind_main_controller_identity(
       startup_serial,
       result.controller_identity,
+      result.home_reference,
     )
   except Exception:
     if calibration_applied:
@@ -6623,6 +6830,327 @@ def _replace_auxiliary_serial(port, board_profile):
   return replacement
 
 
+def _auxiliary_output_field_bindings():
+  return (
+    ('DO1on', DO1onEntryField),
+    ('DO1off', DO1offEntryField),
+    ('DO2on', DO2onEntryField),
+    ('DO2off', DO2offEntryField),
+    ('DO3on', DO3onEntryField),
+    ('DO3off', DO3offEntryField),
+    ('DO4on', DO4onEntryField),
+    ('DO4off', DO4offEntryField),
+    ('DO5on', DO5onEntryField),
+    ('DO5off', DO5offEntryField),
+    ('DO6on', DO6onEntryField),
+    ('DO6off', DO6offEntryField),
+  )
+
+
+def _read_auxiliary_output_field_values():
+  return {
+    key: field.get()
+    for key, field in _auxiliary_output_field_bindings()
+  }
+
+
+def _replace_auxiliary_output_field_values(values):
+  if not isinstance(values, dict):
+    raise MotionInputError("auxiliary output values must be a dictionary")
+  bindings = _auxiliary_output_field_bindings()
+  previous = {
+    key: field.get()
+    for key, field in bindings
+  }
+  try:
+    for key, field in bindings:
+      if key not in values:
+        continue
+      field.delete(0, 'end')
+      field.insert(0, str(values[key]))
+  except Exception as exc:
+    rollback_failed = False
+    for key, field in bindings:
+      try:
+        field.delete(0, 'end')
+        field.insert(0, previous[key])
+      except Exception:
+        rollback_failed = True
+        logger.exception(
+          "Unable to restore an auxiliary output field after update failure"
+        )
+    if rollback_failed:
+      raise RuntimeError(
+        "auxiliary output field update and rollback failed"
+      ) from exc
+    raise
+  return previous
+
+
+def _cancel_auxiliary_calibration_persistence_job():
+  global _calibration_save_job
+
+  pending_job = _calibration_save_job
+  if pending_job is None:
+    return False
+  root.after_cancel(pending_job)
+  if _calibration_save_job is not pending_job:
+    raise RuntimeError(
+      "calibration persistence job changed during auxiliary fencing"
+    )
+  _calibration_save_job = None
+  return True
+
+
+def _begin_auxiliary_calibration_persistence_fence(calibration_snapshot):
+  global _calibration_save_snapshot
+
+  if not isinstance(calibration_snapshot, dict):
+    raise MotionInputError("auxiliary calibration snapshot must be a dictionary")
+  if not isinstance(_calibration_dirty, bool):
+    raise RuntimeError("calibration persistence dirty state is invalid")
+  if _calibration_save_job is not None and not _calibration_dirty:
+    logger.error(
+      "Cancelling an auxiliary calibration persistence job without dirty state"
+    )
+  _cancel_auxiliary_calibration_persistence_job()
+  if not _calibration_dirty:
+    _calibration_save_snapshot = None
+    return False, None
+  if _calibration_save_snapshot is None:
+    persistence_snapshot = dict(calibration_snapshot)
+  else:
+    persistence_snapshot = normalize_calibration_data(
+      snapshot_calibration_values(_calibration_save_snapshot)
+    )
+  return True, persistence_snapshot
+
+
+def _reconcile_auxiliary_calibration_persistence_after_settle_failure(
+  persistence_required,
+  persistence_snapshot,
+  safe_snapshot,
+):
+  global _calibration_dirty, _calibration_save_job
+  global _calibration_save_snapshot
+
+  if not isinstance(persistence_required, bool):
+    raise TypeError("calibration persistence requirement must be boolean")
+  safe_snapshot = normalize_calibration_data(
+    snapshot_calibration_values(safe_snapshot)
+  )
+  if persistence_snapshot is not None:
+    persistence_snapshot = normalize_calibration_data(
+      snapshot_calibration_values(persistence_snapshot)
+    )
+  if not persistence_required and persistence_snapshot is not None:
+    raise TypeError(
+      "clean calibration persistence cannot carry a recovery snapshot"
+    )
+  pending_job = _calibration_save_job
+  _calibration_dirty = False
+  _calibration_save_snapshot = None
+  cancellation_failed = False
+  if pending_job is not None:
+    try:
+      root.after_cancel(pending_job)
+    except Exception:
+      cancellation_failed = True
+      logger.exception(
+        "Unable to cancel calibration persistence after auxiliary settle failure"
+      )
+      if _calibration_save_job is None:
+        _calibration_save_job = pending_job
+    else:
+      if _calibration_save_job is not pending_job:
+        cancellation_failed = True
+        logger.error(
+          "Calibration persistence ownership changed during settle recovery"
+        )
+      else:
+        _calibration_save_job = None
+    if cancellation_failed:
+      # An armed callback needs a verified payload and dirty state until firing.
+      _calibration_dirty = True
+      _calibration_save_snapshot = (
+        persistence_snapshot
+        if persistence_required and persistence_snapshot is not None
+        else safe_snapshot
+      )
+      return False
+  if not persistence_required:
+    return True
+  retained = _retain_calibration_persistence_retry(
+    persistence_snapshot
+  )
+  if not isinstance(retained, bool):
+    raise RuntimeError(
+      "calibration persistence retention returned an invalid result"
+    )
+  return retained
+
+
+def _finish_auxiliary_calibration_persistence_fence(
+  previous_dirty,
+  previous_persistence_snapshot,
+  state_changed,
+  state_verified,
+):
+  global _calibration_dirty, _calibration_save_snapshot
+
+  if not isinstance(previous_dirty, bool):
+    raise TypeError("prior calibration persistence state must be boolean")
+  if previous_dirty:
+    if not isinstance(previous_persistence_snapshot, dict):
+      raise TypeError(
+        "prior calibration persistence snapshot must be a dictionary"
+      )
+  elif previous_persistence_snapshot is not None:
+    raise TypeError(
+      "clean calibration persistence cannot carry a pending snapshot"
+    )
+  if not isinstance(state_changed, bool):
+    raise TypeError("auxiliary configuration change state must be boolean")
+  if not isinstance(state_verified, bool):
+    raise TypeError("auxiliary configuration verification state must be boolean")
+  if not state_verified:
+    _cancel_auxiliary_calibration_persistence_job()
+    if previous_dirty:
+      retained = _retain_calibration_persistence_retry(
+        previous_persistence_snapshot
+      )
+      if not isinstance(retained, bool):
+        raise RuntimeError(
+          "calibration persistence retention returned an invalid result"
+        )
+      if not retained:
+        raise RuntimeError(
+          "auxiliary calibration persistence retry was not retained"
+        )
+      return
+    _calibration_dirty = False
+    _calibration_save_snapshot = None
+    return
+  _cancel_auxiliary_calibration_persistence_job()
+  if state_changed:
+    retained = _retain_calibration_persistence_retry()
+    if not isinstance(retained, bool):
+      raise RuntimeError(
+        "calibration persistence retention returned an invalid result"
+      )
+    if not retained:
+      raise RuntimeError(
+        "auxiliary calibration persistence retry was not retained"
+      )
+    return
+  if previous_dirty:
+    retained = _retain_calibration_persistence_retry(
+      previous_persistence_snapshot
+    )
+    if not isinstance(retained, bool):
+      raise RuntimeError(
+        "calibration persistence retention returned an invalid result"
+      )
+    if not retained:
+      raise RuntimeError(
+        "auxiliary calibration persistence retry was not retained"
+      )
+    return
+  _calibration_dirty = False
+  _calibration_save_snapshot = None
+
+
+def _apply_auxiliary_configuration_snapshot(
+  calibration_snapshot,
+  output_values,
+  port,
+  board,
+):
+  if not isinstance(calibration_snapshot, dict):
+    raise MotionInputError("auxiliary calibration snapshot must be a dictionary")
+  if not isinstance(output_values, dict):
+    raise MotionInputError("auxiliary output snapshot must be a dictionary")
+  if not isinstance(port, str):
+    raise MotionInputError("auxiliary port snapshot must be text")
+  normalized_board = normalize_auxiliary_board_profile(
+    board,
+    allow_none=True,
+  ) or AUXILIARY_BOARD_NONE
+  normalized_calibration = normalize_calibration_data(
+    calibration_snapshot
+  )
+  normalized_output_values = {
+    key: str(output_values.get(key, ""))
+    for key, _ in _auxiliary_output_field_bindings()
+  }
+  errors = []
+  try:
+    apply_calibration(normalized_calibration, CAL)
+    for key in tuple(CAL):
+      if key not in normalized_calibration:
+        del CAL[key]
+  except Exception as exc:
+    errors.append(f"live calibration update failed: {exc}")
+  try:
+    _replace_auxiliary_output_field_values(normalized_output_values)
+  except Exception as exc:
+    errors.append(f"output field update failed: {exc}")
+  try:
+    com2SelectedValue.set(port)
+  except Exception as exc:
+    errors.append(f"port selection update failed: {exc}")
+  try:
+    auxiliaryBoardSelectedValue.set(normalized_board)
+  except Exception as exc:
+    errors.append(f"board selection update failed: {exc}")
+  if errors:
+    raise RuntimeError("; ".join(errors))
+  return True
+
+
+def _verify_auxiliary_configuration_snapshot(
+  calibration_snapshot,
+  output_values,
+  port,
+  board,
+):
+  expected_calibration = normalize_calibration_data(calibration_snapshot)
+  observed_calibration = normalize_calibration_data(
+    snapshot_calibration_values(CAL)
+  )
+  if observed_calibration != expected_calibration:
+    raise RuntimeError(
+      "live calibration does not match the auxiliary configuration"
+    )
+  expected_output_values = {
+    key: str(output_values.get(key, ""))
+    for key, _ in _auxiliary_output_field_bindings()
+  }
+  observed_output_values = _read_auxiliary_output_field_values()
+  if observed_output_values != expected_output_values:
+    raise RuntimeError(
+      "output fields do not match the auxiliary configuration"
+    )
+  observed_port = com2SelectedValue.get()
+  if observed_port != port:
+    raise RuntimeError(
+      "port selection does not match the auxiliary configuration"
+    )
+  expected_board = normalize_auxiliary_board_profile(
+    board,
+    allow_none=True,
+  ) or AUXILIARY_BOARD_NONE
+  observed_board = normalize_auxiliary_board_profile(
+    auxiliaryBoardSelectedValue.get(),
+    allow_none=True,
+  ) or AUXILIARY_BOARD_NONE
+  if observed_board != expected_board:
+    raise RuntimeError(
+      "board selection does not match the auxiliary configuration"
+    )
+  return True
+
+
 @_synchronous_motion_request(
   "Auxiliary connection change",
   requires_kinematics=False,
@@ -6636,8 +7164,35 @@ def setCom2(misc=None):
   if not auxiliary_serial_lock.acquire(blocking=False):
     logger.warning("Auxiliary connection change rejected while the transport is busy")
     return False
-  previous_port = CAL.get('com2Port', "None")
-  previous_board = CAL.get('auxiliaryBoard', AUXILIARY_BOARD_NONE)
+  try:
+    previous_calibration = normalize_calibration_data(
+      snapshot_calibration_values(CAL)
+    )
+    previous_output_values = _read_auxiliary_output_field_values()
+  except Exception:
+    logger.exception(
+      "Auxiliary connection change found invalid live configuration values"
+    )
+    auxiliary_serial_lock.release()
+    return False
+  try:
+    (
+      previous_persistence_dirty,
+      previous_persistence_snapshot,
+    ) = (
+      _begin_auxiliary_calibration_persistence_fence(
+        previous_calibration
+      )
+    )
+  except Exception:
+    logger.exception(
+      "Auxiliary connection change could not fence calibration persistence"
+    )
+    auxiliary_serial_lock.release()
+    return False
+  previous_serial = RUN.get('ser2')
+  staged_calibration = None
+  connection_change_completed = False
   try:
     selected_port = com2SelectedValue.get()
     if not isinstance(selected_port, str):
@@ -6649,6 +7204,29 @@ def setCom2(misc=None):
       auxiliaryBoardSelectedValue.get(),
       allow_none=True,
     )
+    committed_port = selected_port or "None"
+    committed_board = selected_board or AUXILIARY_BOARD_NONE
+    staged_calibration = dict(previous_calibration)
+    staged_calibration.update(previous_output_values)
+    staged_calibration['com2Port'] = committed_port
+    staged_calibration = reconcile_auxiliary_output_assignments(
+      staged_calibration,
+      committed_board,
+    )
+    staged_calibration = normalize_calibration_data(staged_calibration)
+    _apply_auxiliary_configuration_snapshot(
+      staged_calibration,
+      staged_calibration,
+      committed_port,
+      committed_board,
+    )
+    _verify_auxiliary_configuration_snapshot(
+      staged_calibration,
+      staged_calibration,
+      committed_port,
+      committed_board,
+    )
+
     if selected_port is None or selected_board is None:
       if RUN.get('ser2') is not None and not _close_serial_port(
         'ser2',
@@ -6656,23 +7234,26 @@ def setCom2(misc=None):
       ):
         raise OSError("Unable to close the prior auxiliary connection")
       _clear_auxiliary_board_profile()
+      connection_change_completed = True
       logger.warning(
         "Auxiliary controller disabled until both a COM port and board profile "
         "are selected"
       )
     else:
       _replace_auxiliary_serial(selected_port, selected_board)
+      connection_change_completed = True
       logger.info(
         "COMMUNICATIONS STARTED WITH %s ARDUINO IO BOARD on port: %s",
         selected_board,
         selected_port,
       )
 
-    committed_port = selected_port or "None"
-    committed_board = selected_board or AUXILIARY_BOARD_NONE
-    CAL['com2Port'] = committed_port
-    CAL['auxiliaryBoard'] = committed_board
-    _retain_calibration_persistence_retry()
+    _finish_auxiliary_calibration_persistence_fence(
+      previous_persistence_dirty,
+      previous_persistence_snapshot,
+      True,
+      True,
+    )
     try:
       value = tab8.ElogView.get(0, END)
       pickle.dump(value, open("ErrorLog", "wb"))
@@ -6680,17 +7261,163 @@ def setCom2(misc=None):
       logger.exception("Unable to persist the auxiliary connection log")
     return True
   except Exception as e:
-    CAL['com2Port'] = previous_port
-    CAL['auxiliaryBoard'] = previous_board
     try:
-      com2SelectedValue.set(previous_port)
-      auxiliaryBoardSelectedValue.set(previous_board)
+      _cancel_auxiliary_calibration_persistence_job()
     except Exception:
-      logger.exception("Unable to restore the auxiliary configuration selection")
-    logger.error(
-      "UNABLE TO ESTABLISH COMMUNICATIONS WITH ARDUINO IO BOARD: %s",
-      e,
-    )
+      logger.exception(
+        "Unable to cancel auxiliary calibration persistence during recovery"
+      )
+    active_serial = RUN.get('ser2')
+    if (
+      not connection_change_completed
+      and active_serial is not None
+      and active_serial is not previous_serial
+      and not _close_serial_port(
+        'ser2',
+        "failed auxiliary connection replacement",
+      )
+    ):
+      _clear_auxiliary_board_profile(active_serial)
+    if connection_change_completed and staged_calibration is not None:
+      target_calibration = staged_calibration
+      target_output_values = staged_calibration
+      target_port = staged_calibration['com2Port']
+      target_board = staged_calibration['auxiliaryBoard']
+      apply_target = False
+      persistence_state_changed = True
+    else:
+      target_calibration = previous_calibration
+      target_output_values = previous_output_values
+      target_port = previous_calibration.get('com2Port', "None")
+      target_board = previous_calibration.get(
+        'auxiliaryBoard',
+        AUXILIARY_BOARD_NONE,
+      )
+      apply_target = True
+      persistence_state_changed = False
+
+    target_verified = False
+    if apply_target:
+      try:
+        _apply_auxiliary_configuration_snapshot(
+          target_calibration,
+          target_output_values,
+          target_port,
+          target_board,
+        )
+      except Exception:
+        logger.exception(
+          "Unable to apply auxiliary recovery configuration"
+        )
+    try:
+      _verify_auxiliary_configuration_snapshot(
+        target_calibration,
+        target_output_values,
+        target_port,
+        target_board,
+      )
+      target_verified = True
+    except Exception:
+      logger.exception(
+        "Auxiliary recovery verification failed"
+      )
+
+    if not target_verified:
+      active_serial = RUN.get('ser2')
+      if active_serial is not None:
+        if not _close_serial_port(
+          'ser2',
+          "failed auxiliary configuration recovery",
+        ):
+          _clear_auxiliary_board_profile(active_serial)
+      else:
+        _clear_auxiliary_board_profile()
+      try:
+        target_calibration = previous_calibration
+        target_output_values = previous_output_values
+        target_port = previous_calibration.get('com2Port', "None")
+        target_board = previous_calibration.get(
+          'auxiliaryBoard',
+          AUXILIARY_BOARD_NONE,
+        )
+        _apply_auxiliary_configuration_snapshot(
+          target_calibration,
+          target_output_values,
+          target_port,
+          target_board,
+        )
+        _verify_auxiliary_configuration_snapshot(
+          target_calibration,
+          target_output_values,
+          target_port,
+          target_board,
+        )
+        target_verified = True
+        persistence_state_changed = False
+      except Exception:
+        logger.exception(
+          "Unable to restore the prior auxiliary configuration"
+        )
+        active_serial = RUN.get('ser2')
+        if active_serial is not None:
+          _clear_auxiliary_board_profile(active_serial)
+        else:
+          _clear_auxiliary_board_profile()
+
+    try:
+      _finish_auxiliary_calibration_persistence_fence(
+        previous_persistence_dirty,
+        previous_persistence_snapshot,
+        persistence_state_changed,
+        target_verified,
+      )
+    except Exception:
+      logger.exception(
+        "Unable to settle auxiliary calibration persistence"
+      )
+      persistence_required = (
+        persistence_state_changed or previous_persistence_dirty
+      ) if target_verified else previous_persistence_dirty
+      persistence_snapshot = (
+        None
+        if target_verified and persistence_state_changed
+        else previous_persistence_snapshot
+      )
+      try:
+        persistence_reconciled = (
+          _reconcile_auxiliary_calibration_persistence_after_settle_failure(
+            persistence_required,
+            persistence_snapshot,
+            (
+              target_calibration
+              if target_verified
+              else previous_calibration
+            ),
+          )
+        )
+        if persistence_reconciled is not True:
+          logger.error(
+            "Auxiliary calibration persistence reconciliation did not complete"
+          )
+      except Exception:
+        logger.exception(
+          "Unable to reconcile calibration persistence after settle failure"
+        )
+    if not target_verified:
+      logger.error(
+        "AUXILIARY CONFIGURATION RECOVERY FAILED; OUTPUT PROFILE DISABLED "
+        "AND THE UNVERIFIED STATE WILL NOT BE PERSISTED"
+      )
+    if connection_change_completed:
+      logger.error(
+        "AUXILIARY CONNECTION CHANGED BUT FOLLOW-UP FAILED: %s",
+        e,
+      )
+    else:
+      logger.error(
+        "UNABLE TO ESTABLISH COMMUNICATIONS WITH ARDUINO IO BOARD: %s",
+        e,
+      )
     try:
       value = tab8.ElogView.get(0, END)
       pickle.dump(value, open("ErrorLog", "wb"))
@@ -7347,7 +8074,7 @@ def _start_manual_motion(
     return True
 
   def require_controller_resynchronization():
-    controller_position_resynchronization_required.set()
+    _require_controller_position_resynchronization()
 
   def restore_untransmitted_preview():
     restored = apply_confirmed_pose(
@@ -10785,6 +11512,140 @@ def _dispatch_program_gcode(filename, completion_callback):
     return ROW_EXECUTION_REJECTED
   return ROW_EXECUTION_COMPLETE
 
+
+def _decode_program_row_content(row):
+  if isinstance(row, (bytes, bytearray)):
+    try:
+      text = bytes(row).decode('utf-8')
+    except UnicodeDecodeError as exc:
+      raise MotionInputError(
+        "program rows must contain UTF-8 text"
+      ) from exc
+  elif isinstance(row, str):
+    text = row
+  else:
+    raise MotionInputError("program rows must contain encoded or text rows")
+  if text.endswith('\r\n'):
+    text = text[:-2]
+  elif text.endswith('\n'):
+    text = text[:-1]
+  if '\r' in text or '\n' in text:
+    raise MotionInputError("program rows must contain one logical line")
+  return text
+
+
+def _program_row_index(rows, expected_row):
+  if (
+    isinstance(rows, (str, bytes, bytearray))
+    or not isinstance(rows, (tuple, list))
+  ):
+    raise MotionInputError("program rows must be a sequence")
+  if (
+    not isinstance(expected_row, str)
+    or '\r' in expected_row
+    or '\n' in expected_row
+  ):
+    raise MotionInputError("program row target must be one text line")
+  for index, row in enumerate(rows):
+    if _decode_program_row_content(row) == expected_row:
+      return index
+  raise MotionInputError(f"program row {expected_row!r} does not exist")
+
+
+def _program_tab_row_index(rows, tab_number):
+  if not isinstance(tab_number, str):
+    raise MotionInputError("program tab number must be text")
+  tab_number = tab_number.strip()
+  if re.fullmatch(r"\d+", tab_number) is None:
+    raise MotionInputError(
+      "program tab number must be a non-negative integer"
+    )
+  return _program_row_index(rows, f"Tab Number {tab_number}")
+
+
+def _program_bounded_index(value, label, maximum):
+  if (
+    isinstance(maximum, bool)
+    or not isinstance(maximum, int)
+    or maximum <= 0
+  ):
+    raise RuntimeError(f"{label} maximum is invalid")
+  if (
+    not isinstance(value, str)
+    or re.fullmatch(r"[1-9][0-9]*", value) is None
+  ):
+    raise MotionInputError(f"{label} must be a positive integer")
+  maximum_text = str(maximum)
+  if (
+    len(value) > len(maximum_text)
+    or (
+      len(value) == len(maximum_text)
+      and value > maximum_text
+    )
+  ):
+    raise MotionInputError(f"{label} must be between 1 and {maximum}")
+  return int(value)
+
+
+def _program_registry_entry(registry, key, label):
+  if not isinstance(registry, dict):
+    raise RuntimeError(f"{label} registry is invalid")
+  entry = registry.get(key)
+  if entry is None or not all(
+    callable(getattr(entry, method, None))
+    for method in ("get", "delete", "insert")
+  ):
+    raise MotionInputError(f"{label} is unavailable")
+  return entry
+
+
+def _program_register_entry(register_number):
+  register = _program_bounded_index(
+    register_number,
+    "program register",
+    PROGRAM_REGISTER_COUNT,
+  )
+  return _program_registry_entry(
+    program_register_entry_fields,
+    register,
+    f"program register {register}",
+  )
+
+
+def _program_position_register_entry(register_number, element_number):
+  register = _program_bounded_index(
+    register_number,
+    "program position register",
+    PROGRAM_REGISTER_COUNT,
+  )
+  element = _program_bounded_index(
+    element_number,
+    "program position-register element",
+    PROGRAM_POSITION_REGISTER_ELEMENT_COUNT,
+  )
+  return _program_registry_entry(
+    program_position_register_entry_fields,
+    (register, element),
+    f"program position register {register} element {element}",
+  )
+
+
+def _program_position_register_values(register_number):
+  register = _program_bounded_index(
+    register_number,
+    "program position register",
+    PROGRAM_REGISTER_COUNT,
+  )
+  return tuple(
+    _program_registry_entry(
+      program_position_register_entry_fields,
+      (register, element),
+      f"program position register {register} element {element}",
+    ).get()
+    for element in range(1, PROGRAM_POSITION_REGISTER_ELEMENT_COUNT + 1)
+  )
+
+
 def runProg():
   execution_request = _begin_program_execution("run")
   if execution_request is None:
@@ -10837,9 +11698,11 @@ def runProg():
       except:
         if(tab1.lastProg == ""):
           selRow = 1
-          progLoop = ("## START PROGRAM LOOP ##\r\n").encode('utf-8')
           try:
-            index = tab1.progView.get(0, "end").index(progLoop)
+            index = _program_row_index(
+              tab1.progView.get(0, "end"),
+              "## START PROGRAM LOOP ##",
+            )
             tab1.progView.selection_clear(0, END)
             tab1.progView.select_set(index)
           except:
@@ -10946,9 +11809,11 @@ def stepFwd():
       except:
         if(tab1.lastProg == ""):
           selRow = 1
-          progLoop = ("## START PROGRAM LOOP ##\r\n").encode('utf-8')
           try:
-            index = tab1.progView.get(0, "end").index(progLoop)
+            index = _program_row_index(
+              tab1.progView.get(0, "end"),
+              "## START PROGRAM LOOP ##",
+            )
             tab1.progView.selection_clear(0, END)
             tab1.progView.select_set(index)
           except:
@@ -11386,8 +12251,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11435,8 +12302,7 @@ def executeRow(motion_complete=None):
     inputNum = str(command[inputIndex+2:valIndex-1])
     valNum = int(command[valIndex+2:actionIndex-1])
     action = str(command[actionIndex+2:actionIndex+6])
-    regEntry = "R"+inputNum+"EntryField"
-    curRegVal = eval(regEntry).get()
+    curRegVal = _program_register_entry(inputNum).get()
     if (int(curRegVal) == valNum):
       if(action == "Call"):
         tab1.lastRow = tab1.progView.curselection()[0]
@@ -11451,8 +12317,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11487,8 +12355,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11533,8 +12403,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11579,8 +12451,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11625,8 +12499,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11671,8 +12547,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11784,61 +12662,32 @@ def executeRow(motion_complete=None):
    
               
 
-  ''' 
-    if (RUN['moveInProc'] == 1):
-        RUN['moveInProc'] = 2
-    tabIndex = command.find("Tab-")
-    tabNum = ("Tab Number " + str(command[tabIndex+4:]) + "\r\n").encode('utf-8')
-    index = tab1.progView.get(0, "end").index(tabNum)
-    tab1.progView.selection_clear(0, END)
-    tab1.progView.select_set(index) 
-  ''' 
-  
   if RUN['cmdType'] == "Jump T":
-      if (RUN['moveInProc'] == 1):
-        RUN['moveInProc'] = 2
-
-      tabIndex = command.find("Tab-")
-      if tabIndex == -1:
-          print("[Jump T] Malformed command, missing 'Tab-':", repr(command))
-          _finish_execute_row()
-          return ROW_EXECUTION_REJECTED
-
-      # keep your original tabNum (bytes with CRLF)
-      tabNum = ("Tab Number " + str(command[tabIndex+4:]) + "\r\n").encode('utf-8')
-
-      def _norm(x):
-          # bytes -> str; strip CR/LF and outer spaces; lower for case-insensitive match
-          if isinstance(x, bytes):
-              try:
-                  x = x.decode("utf-8", "replace")
-              except Exception:
-                  x = str(x)
-          return str(x).replace("\r", "").replace("\n", "").strip().lower()
-
-      target_norm = _norm(tabNum)
-
-      # Always read current items in the widget
-      items = list(tab1.progView.get(0, tk.END))
-
-      # 1) Try exact normalized match (works whether items are bytes or str)
-      idx = next((i for i, it in enumerate(items) if _norm(it) == target_norm), None)
-
-      if idx is None:
-          # 2) Optional fallback: if your rows are like "Jump Tab-3", match by number
-          #    Extract the number from tabNum and look for common forms
-          m = re.search(r'\d+', _norm(tabNum))
-          if m:
-              n = m.group(0)
-              forms = {f"tab number {n}", f"tab-{n}", f"tab {n}", f"tab: {n}", f"jump tab-{n}"}
-              idx = next((i for i, it in enumerate(items) if _norm(it) in forms), None)
-
-      if idx is None:
-          print(f"[Jump T] Not found: {repr(tabNum)}")
-      else:
-          tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(idx)
-          tab1.progView.see(idx)
+    if (RUN['moveInProc'] == 1):
+      RUN['moveInProc'] = 2
+    tabIndex = command.find("Tab-")
+    if tabIndex == -1:
+      message = "Jump command rejected: missing Tab- target"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
+    try:
+      index = _program_tab_row_index(
+        tab1.progView.get(0, "end"),
+        str(command[tabIndex+4:]),
+      )
+    except MotionInputError as exc:
+      message = f"Jump command rejected: {exc}"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
+    tab1.progView.selection_clear(0, END)
+    tab1.progView.select_set(index)
+    tab1.progView.see(index)
 
 
 
@@ -11950,20 +12799,20 @@ def executeRow(motion_complete=None):
     regNumIndex = command.find("Register ")
     regEqIndex = command.find(" = ")
     regNumVal = str(command[regNumIndex+9:regEqIndex])
-    regEntry = "R"+regNumVal+"EntryField"
+    register_entry = _program_register_entry(regNumVal)
     testOper = str(command[regEqIndex+3:regEqIndex+5])
     if (testOper == "++"):
       regCEqVal = str(command[regEqIndex+5:])
-      curRegVal = eval(regEntry).get()
+      curRegVal = register_entry.get()
       regEqVal = str(int(regCEqVal)+int(curRegVal))      
     elif (testOper == "--"):
       regCEqVal = str(command[regEqIndex+5:])
-      curRegVal = eval(regEntry).get()
+      curRegVal = register_entry.get()
       regEqVal = str(int(curRegVal)-int(regCEqVal))
     else:
       regEqVal = str(command[regEqIndex+3:])    
-    eval(regEntry).delete(0, 'end')
-    eval(regEntry).insert(0,regEqVal)
+    register_entry.delete(0, 'end')
+    register_entry.insert(0,regEqVal)
 
   if (RUN['cmdType'] == "Positi"):
     if (RUN['moveInProc'] == 1):
@@ -11973,20 +12822,23 @@ def executeRow(motion_complete=None):
     regEqIndex = command.find(" = ")
     regNumVal = str(command[regNumIndex+18:regElIndex-1])
     regNumEl = str(command[regElIndex+8:regEqIndex])
-    regEntry = "SP_"+regNumVal+"_E"+regNumEl+"_EntryField"
+    position_register_entry = _program_position_register_entry(
+      regNumVal,
+      regNumEl,
+    )
     testOper = str(command[regEqIndex+3:regEqIndex+5])
     if (testOper == "++"):
-      regCEqVal = str(command[regEqIndex+4:])
-      curRegVal = eval(regEntry).get()
+      regCEqVal = str(command[regEqIndex+5:])
+      curRegVal = position_register_entry.get()
       regEqVal = str(float(regCEqVal)+float(curRegVal))      
     elif (testOper == "--"):
       regCEqVal = str(command[regEqIndex+5:])
-      curRegVal = eval(regEntry).get()
+      curRegVal = position_register_entry.get()
       regEqVal = str(float(curRegVal)-float(regCEqVal))
     else:
       regEqVal = str(command[regEqIndex+3:])    
-    eval(regEntry).delete(0, 'end')
-    eval(regEntry).insert(0,regEqVal)
+    position_register_entry.delete(0, 'end')
+    position_register_entry.insert(0,regEqVal)
     
 
   if RUN['cmdType'] in {
@@ -12092,12 +12944,7 @@ def executeRow(motion_complete=None):
     ACCrampIndex = command.find(" Rm ")
     WristConfIndex = command.find(" $")
     SP = str(command[SPnewInex+6:SPendInex])
-    cx = eval("SP_"+SP+"_E1_EntryField").get()
-    cy = eval("SP_"+SP+"_E2_EntryField").get()
-    cz = eval("SP_"+SP+"_E3_EntryField").get()
-    crz = eval("SP_"+SP+"_E4_EntryField").get()
-    cry = eval("SP_"+SP+"_E5_EntryField").get()
-    crx = eval("SP_"+SP+"_E6_EntryField").get()
+    cx, cy, cz, crz, cry, crx = _program_position_register_values(SP)
     RUN['xVal'] = str(float(cx) + float(command[xIndex+3:yIndex]))
     RUN['yVal'] = str(float(cy) + float(command[yIndex+3:zIndex]))
     RUN['zVal'] = str(float(cz) + float(command[zIndex+3:rzIndex]))
@@ -12147,12 +12994,7 @@ def executeRow(motion_complete=None):
     ACCrampIndex = command.find(" Rm ")
     WristConfIndex = command.find(" $")
     SP = str(command[SPnewInex+6:SPendInex])
-    cx = eval("SP_"+SP+"_E1_EntryField").get()
-    cy = eval("SP_"+SP+"_E2_EntryField").get()
-    cz = eval("SP_"+SP+"_E3_EntryField").get()
-    crz = eval("SP_"+SP+"_E4_EntryField").get()
-    cry = eval("SP_"+SP+"_E5_EntryField").get()
-    crx = eval("SP_"+SP+"_E6_EntryField").get()
+    cx, cy, cz, crz, cry, crx = _program_position_register_values(SP)
     RUN['xVal'] = str(float(cx) + float(VisRetXrobEntryField.get()))
     RUN['yVal'] = str(float(cy) + float(VisRetYrobEntryField.get()))
     RUN['zVal'] = str(float(cz) + float(command[zIndex+3:rzIndex]))
@@ -12197,12 +13039,7 @@ def executeRow(motion_complete=None):
     ACCrampIndex = command.find(" Rm ")
     WristConfIndex = command.find(" $")
     SP = str(command[SPnewInex+6:SPendInex])
-    cx = eval("SP_"+SP+"_E1_EntryField").get()
-    cy = eval("SP_"+SP+"_E2_EntryField").get()
-    cz = eval("SP_"+SP+"_E3_EntryField").get()
-    crz = eval("SP_"+SP+"_E4_EntryField").get()
-    cry = eval("SP_"+SP+"_E5_EntryField").get()
-    crx = eval("SP_"+SP+"_E6_EntryField").get()
+    cx, cy, cz, crz, cry, crx = _program_position_register_values(SP)
     RUN['xVal'] = str(float(cx))
     RUN['yVal'] = str(float(cy))
     RUN['zVal'] = str(float(cz))
@@ -12249,12 +13086,14 @@ def executeRow(motion_complete=None):
     WristConfIndex = command.find(" $")
     SP = str(command[SPnewInex+6:SPendInex])
     SP2 = str(command[SP2newInex+7:SP2endInex])
-    RUN['xVal'] = str(float(eval("SP_"+SP+"_E1_EntryField").get()) + float(eval("SP_"+SP2+"_E1_EntryField").get()))
-    RUN['yVal'] = str(float(eval("SP_"+SP+"_E2_EntryField").get()) + float(eval("SP_"+SP2+"_E2_EntryField").get()))
-    RUN['zVal'] = str(float(eval("SP_"+SP+"_E3_EntryField").get()) + float(eval("SP_"+SP2+"_E3_EntryField").get()))
-    rzVal = str(float(eval("SP_"+SP+"_E4_EntryField").get()) + float(eval("SP_"+SP2+"_E4_EntryField").get()))
-    ryVal = str(float(eval("SP_"+SP+"_E5_EntryField").get()) + float(eval("SP_"+SP2+"_E5_EntryField").get()))
-    rxVal = str(float(eval("SP_"+SP+"_E6_EntryField").get()) + float(eval("SP_"+SP2+"_E6_EntryField").get()))	
+    position_values = _program_position_register_values(SP)
+    offset_values = _program_position_register_values(SP2)
+    RUN['xVal'] = str(float(position_values[0]) + float(offset_values[0]))
+    RUN['yVal'] = str(float(position_values[1]) + float(offset_values[1]))
+    RUN['zVal'] = str(float(position_values[2]) + float(offset_values[2]))
+    rzVal = str(float(position_values[3]) + float(offset_values[3]))
+    ryVal = str(float(position_values[4]) + float(offset_values[4]))
+    rxVal = str(float(position_values[5]) + float(offset_values[5]))
     J7Val = command[J7Index+4:J8Index]
     J8Val = command[J8Index+4:J9Index]
     J9Val = command[J9Index+4:SpeedIndex]
@@ -12427,30 +13266,79 @@ def executeRow(motion_complete=None):
   if(RUN['cmdType'] == "Vis Fi"):
     #if (RUN['moveInProc'] == 1):
       #RUN['moveInProc'] = 2
-    templateIndex = command.find("Vis Find - ")
-    bgColorIndex = command.find(" - BGcolor ")
-    scoreIndex = command.find(" Score ")
-    passIndex = command.find(" Pass ")
-    failIndex = command.find(" Fail ")
-    template = command[templateIndex+11:bgColorIndex]
-    checkBG = command[bgColorIndex+11:scoreIndex]
-    if(checkBG == "(Auto)"):
-      background = "Auto"
-    else:  
-      background = eval(command[bgColorIndex+11:scoreIndex])
-    min_score = float(command[scoreIndex+7:passIndex])*.01
-    take_pic()
-    status = visFind(template,min_score,background)
-    if (status == "pass"):
-      tabNum = ("Tab Number " + str(command[passIndex+6:failIndex]) + "\r\n").encode('utf-8')
-      index = tab1.progView.get(0, "end").index(tabNum)
+    try:
+      templateIndex = command.find("Vis Find - ")
+      bgColorIndex = command.find(" - BGcolor ")
+      scoreIndex = command.find(" Score ")
+      passIndex = command.find(" Pass ")
+      failIndex = command.find(" Fail ")
+      if (
+        templateIndex != 0
+        or not (
+          templateIndex < bgColorIndex < scoreIndex < passIndex < failIndex
+        )
+      ):
+        raise MotionInputError("vision program row delimiters are invalid")
+      template = command[templateIndex+11:bgColorIndex]
+      if not template:
+        raise MotionInputError("vision program template must not be empty")
+      checkBG = command[bgColorIndex+11:scoreIndex]
+      if(checkBG == "(Auto)"):
+        background = None
+        capture_background = "Auto"
+      else:
+        capture_background = normalize_vision_background_color(checkBG)
+        background = _vision_background_grayscale(capture_background)
+      score = finite_number(
+        command[scoreIndex+7:passIndex],
+        "vision program score",
+      )
+      if score < 0 or score > 100:
+        raise MotionInputError(
+          "vision program score must be between 0 and 100"
+        )
+      pass_tab = command[passIndex+6:failIndex].strip()
+      fail_tab = command[failIndex+6:].strip()
+      for label, value in (
+        ("vision pass tab", pass_tab),
+        ("vision fail tab", fail_tab),
+      ):
+        if re.fullmatch(r"\d+", value) is None:
+          raise MotionInputError(
+            f"{label} must be a non-negative integer"
+          )
+      min_score = score*.01
+      if take_pic(capture_background) is not True:
+        raise MotionInputError("vision capture failed")
+      if background is None:
+        background = _vision_background_grayscale(RUN['BGavg'])
+      status = visFind(template,min_score,background)
+      if status == "pass":
+        selected_tab = pass_tab
+      elif status == "fail":
+        selected_tab = fail_tab
+      else:
+        raise MotionInputError(
+          "vision matching returned an invalid result"
+        )
+      try:
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          selected_tab,
+        )
+      except MotionInputError as exc:
+        raise MotionInputError(
+          f"vision result tab {selected_tab} does not exist"
+        ) from exc
       tab1.progView.selection_clear(0, END)
-      tab1.progView.select_set(index)  
-    elif (status == "fail"): 
-      tabNum = ("Tab Number " + str(command[failIndex+6:]) + "\r\n").encode('utf-8')
-      index = tab1.progView.get(0, "end").index(tabNum)
-      tab1.progView.selection_clear(0, END)
-      tab1.progView.select_set(index) 
+      tab1.progView.select_set(index)
+    except Exception as exc:
+      message = f"Vision program row rejected: {exc}"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
   
 
 
@@ -13290,6 +14178,8 @@ def _exchange_serial_line(
   command,
   control_event=None,
   write_started_event=None,
+  interim_response_handler=None,
+  interim_response_limit=None,
 ):
   command = _canonicalize_main_serial_command(command)
   serial_port = RUN.get('ser')
@@ -13298,6 +14188,13 @@ def _exchange_serial_line(
       if control_event is not None:
         raise MotionInputError(
           "G-code playback does not support live-jog control injection"
+        )
+      if (
+        interim_response_handler is not None
+        or interim_response_limit is not None
+      ):
+        raise MotionInputError(
+          "G-code playback does not support interim response handling"
         )
       parse_command_timing(command)
       return exchange_serial_line_until_cancelled(
@@ -13326,6 +14223,8 @@ def _exchange_serial_line(
         else None
       ),
       write_started_event=write_started_event,
+      interim_response_handler=interim_response_handler,
+      interim_response_limit=interim_response_limit,
     )
   finally:
     if (
@@ -13892,7 +14791,7 @@ def _invalidate_joint_motion_state(reason):
     reason = "controller state became uncertain"
   else:
     reason = reason.strip()
-  controller_position_resynchronization_required.set()
+  _require_controller_position_resynchronization()
   pending_discarded = joint_motion_dispatcher.invalidate(reason)
   deferred_discarded = deferred_joint_adjustments.pending
   _clear_deferred_joint_adjustments()
@@ -14518,7 +15417,28 @@ def _current_joint_motion_profile():
 
 
 def _exchange_joint_motion(command):
-  return _exchange_serial_line(command)
+  binding = _current_main_controller_identity()
+  if (
+    binding is None
+    or CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1
+      not in binding.identity.protocol_capabilities
+  ):
+    return _exchange_serial_line(command)
+
+  def consume_joint_telemetry(response):
+    telemetry = parse_joint_motion_exchange_response(response)
+    if telemetry is None:
+      return False
+    joint_motion_dispatcher.publish_telemetry(telemetry)
+    return True
+
+  return _exchange_serial_line(
+    request_joint_telemetry(command),
+    interim_response_handler=consume_joint_telemetry,
+    interim_response_limit=joint_telemetry_response_budget(
+      _controller_response_timeout(command)
+    ),
+  )
 
 
 joint_motion_dispatcher = CoalescingJointDispatcher(
@@ -14529,6 +15449,88 @@ joint_motion_dispatcher = CoalescingJointDispatcher(
 )
 confirmed_position_generation = 0
 deferred_joint_adjustments = DeferredJointAdjustments()
+
+
+def _set_joint_motion_target_display(target_positions):
+  try:
+    return joint_motion_visualization.set_desired(target_positions)
+  except Exception:
+    logger.exception("Unable to update desired joint slider positions")
+    return False
+
+
+def _start_joint_motion_visualization(move, started_at_seconds):
+  try:
+    return joint_motion_visualization.start(
+      _current_joint_positions(),
+      move,
+      _runtime_number('minSpeedDelay'),
+      started_at_seconds,
+    )
+  except Exception:
+    logger.exception("Unable to start joint-motion tracking display")
+    return False
+
+
+def _refresh_joint_motion_visualization():
+  try:
+    return joint_motion_visualization.refresh()
+  except Exception:
+    logger.exception("Unable to refresh joint-motion tracking display")
+    return False
+
+
+def _observe_joint_motion_telemetry(telemetry):
+  try:
+    return joint_motion_visualization.observe_actual(telemetry.joints)
+  except Exception:
+    logger.exception("Unable to update joint encoder-sample display")
+    return False
+
+
+def _require_controller_position_resynchronization():
+  global joint_actual_position_source_snapshot
+
+  controller_position_resynchronization_required.set()
+  with controller_identity_state_lock:
+    binding = main_controller_identity_binding
+    if isinstance(binding, MainControllerIdentityBinding):
+      joint_actual_position_source_snapshot = (
+        binding.serial_port,
+        object(),
+      )
+    else:
+      joint_actual_position_source_snapshot = None
+  return True
+
+
+def _current_joint_actual_position_source():
+  snapshot = joint_actual_position_source_snapshot
+  if (
+    not isinstance(snapshot, tuple)
+    or len(snapshot) != 2
+  ):
+    return None
+  serial_port, source = snapshot
+  if (
+    controller_position_resynchronization_required.is_set()
+    or serial_port is None
+    or source is None
+    or RUN.get('ser') is not serial_port
+    or not getattr(serial_port, "is_open", False)
+    or joint_actual_position_source_snapshot is not snapshot
+    or serial_transport_quarantined(serial_port)
+  ):
+    return None
+  return source
+
+
+def _finish_joint_motion_visualization(preserve_actual=False):
+  try:
+    return joint_motion_visualization.finish(preserve_actual)
+  except Exception:
+    logger.exception("Unable to finish joint-motion tracking display")
+    return False
 
 
 def _reserve_joint_motion_request():
@@ -14659,6 +15661,7 @@ def _try_dispatch_deferred_joint_adjustments(allow_current_generation=False):
   almStatusLab.config(text=status, style="OK.TLabel")
   almStatusLab2.config(text=status, style="OK.TLabel")
   _try_set_virtual_joint_target(submission.target)
+  _set_joint_motion_target_display(submission.target)
   return True
 
 
@@ -14773,6 +15776,7 @@ def _start_offline_joint_motion(command):
 def _poll_joint_motion_events():
   try:
     for event in joint_motion_dispatcher.drain_events():
+      preserve_actual_position = False
       try:
         try:
           if event.kind == "started":
@@ -14780,6 +15784,18 @@ def _poll_joint_motion_events():
             cmdSentEntryField.insert(0, event.move.command)
             almStatusLab.config(text="JOINT MOVE IN PROGRESS", style="OK.TLabel")
             almStatusLab2.config(text="JOINT MOVE IN PROGRESS", style="OK.TLabel")
+            _start_joint_motion_visualization(
+              event.move,
+              event.started_at_seconds,
+            )
+            continue
+
+          if event.kind == "telemetry":
+            if event.telemetry is None:
+              raise RuntimeError(
+                "joint telemetry event omitted validated positions"
+              )
+            _observe_joint_motion_telemetry(event.telemetry)
             continue
 
           if event.kind == "completed":
@@ -14796,6 +15812,9 @@ def _poll_joint_motion_events():
                 "joint response application returned an invalid position result"
             )
             if applied_position is not None:
+              preserve_actual_position = (
+                not controller_position_resynchronization_required.is_set()
+              )
               if applied_position.speed_violation:
                 pending_discarded = (
                   joint_motion_dispatcher.discard_pending_after_completion(
@@ -14809,6 +15828,7 @@ def _poll_joint_motion_events():
                     "Pending joint target discarded after a controller speed violation"
                   )
               if _set_virtual_from_joint_result(event.position) is not True:
+                preserve_actual_position = False
                 _invalidate_joint_motion_state(
                   "completed joint motion could not update the virtual model"
                 )
@@ -14822,6 +15842,12 @@ def _poll_joint_motion_events():
               )
               almStatusLab.config(text=status, style="OK.TLabel")
               almStatusLab2.config(text=status, style="OK.TLabel")
+              desired_target = joint_motion_dispatcher.desired_target
+              if (
+                joint_motion_dispatcher.pending
+                and desired_target is not None
+              ):
+                _set_joint_motion_target_display(desired_target)
             continue
 
           if event.position is not None:
@@ -14838,7 +15864,14 @@ def _poll_joint_motion_events():
                 "joint response application returned an invalid position result"
               )
             if applied_position is not None:
-              _set_virtual_from_joint_result(event.position)
+              preserve_actual_position = (
+                not controller_position_resynchronization_required.is_set()
+              )
+              if _set_virtual_from_joint_result(event.position) is not True:
+                preserve_actual_position = False
+                _invalidate_joint_motion_state(
+                  "failed joint motion could not update the virtual model"
+                )
           elif event.response is not None and event.response.startswith('E'):
             _try_set_virtual_joint_target(_current_joint_positions())
             _invalidate_joint_motion_state(
@@ -14855,16 +15888,22 @@ def _poll_joint_motion_events():
           if event.pending_discarded:
             logger.warning("Pending joint target discarded because controller state is unknown")
         except Exception as exc:
+          preserve_actual_position = False
           message = f"Unable to apply joint-motion result: {exc}"
           logger.exception(message)
           _invalidate_joint_motion_state(message)
           almStatusLab.config(text=message, style="Alarm.TLabel")
           almStatusLab2.config(text=message, style="Alarm.TLabel")
       finally:
+        if event.kind not in ("started", "telemetry"):
+          _finish_joint_motion_visualization(
+            preserve_actual_position
+          )
         event.acknowledge()
 
     if not _finish_joint_motion_request_if_idle():
       _try_dispatch_deferred_joint_adjustments()
+    _refresh_joint_motion_visualization()
   finally:
     _reschedule_event_poll("joint-motion")
 
@@ -14984,6 +16023,7 @@ def _queue_joint_motion(axis, value, absolute):
       almStatusLab2.config(text=status, style="OK.TLabel")
       if submission is not None:
         _try_set_virtual_joint_target(submission.target)
+        _set_joint_motion_target_display(submission.target)
     return True
   except (KeyError, TypeError, ValueError, MotionInputError, MotionQueueFault) as exc:
     message = f"Joint motion rejected: {exc}"
@@ -14999,6 +16039,186 @@ def _queue_joint_jog(axis, delta):
 
 def _queue_joint_target(axis, target):
   return _queue_joint_motion(axis, target, absolute=True)
+
+
+def _queue_primary_joint_position(
+  primary_positions,
+  *,
+  allow_unrelated_defer=True,
+):
+  try:
+    if not isinstance(allow_unrelated_defer, bool):
+      raise TypeError(
+        "named-position unrelated-defer state must be boolean"
+      )
+    if application_closing.is_set():
+      raise MotionQueueFault(
+        "joint motion is unavailable during application shutdown"
+      )
+    if controller_correction_requested.is_set():
+      raise MotionQueueFault(
+        "joint motion is unavailable during controller correction"
+      )
+    if isinstance(primary_positions, (str, bytes)):
+      raise MotionInputError(
+        "primary joint position must be a numeric sequence"
+      )
+    try:
+      primary_positions = tuple(primary_positions)
+    except TypeError as exc:
+      raise MotionInputError(
+        "primary joint position must be a numeric sequence"
+      ) from exc
+    if len(primary_positions) != 6:
+      raise MotionInputError(
+        "primary joint position must contain 6 values"
+      )
+    primary_positions = tuple(
+      finite_number(value, f"J{axis} named position")
+      for axis, value in enumerate(primary_positions, start=1)
+    )
+
+    current_positions = _current_joint_positions()
+    _current_controller_joint_calibration().validate_positions(
+      primary_positions + current_positions[6:]
+    )
+    profile = _current_joint_motion_profile()
+    target_updates = primary_positions + (None, None, None)
+    deferred = False
+    submission = None
+
+    if RUN['xboxUse'] != 1:
+      almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
+      almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+
+    if RUN['offlineMode']:
+      if not _start_offline_joint_motion(
+        build_virtual_joint_command(primary_positions, profile)
+      ):
+        raise MotionQueueFault(_motion_request_rejection_message(
+          "offline virtual joint motion did not start"
+        ))
+      coalesced = False
+    elif (
+      deferred_joint_adjustments.pending
+      or (
+        motion_request_registry.active
+        and not joint_motion_dispatcher.active
+      )
+    ):
+      if not allow_unrelated_defer:
+        raise MotionQueueFault(
+          "controller-reference position cannot be deferred during "
+          "another motion request"
+        )
+      deferred = True
+      coalesced = deferred_joint_adjustments.set_targets(
+        target_updates,
+        profile,
+        confirmed_position_generation,
+      )
+    else:
+      request_lease = None
+      lease_created = False
+      try:
+        request_lease, lease_created = _reserve_joint_motion_request()
+        if request_lease is None:
+          raise MotionTransportBusy(_motion_request_rejection_message(
+            "another motion request is active"
+          ))
+        submission = joint_motion_dispatcher.submit_targets(
+          target_updates,
+          current_positions,
+          profile,
+        )
+        coalesced = submission.coalesced
+      except MotionTransportBusy:
+        if lease_created and not joint_motion_dispatcher.active:
+          _abandon_joint_motion_request(request_lease)
+        if not allow_unrelated_defer:
+          raise MotionQueueFault(
+            "controller-reference position cannot be deferred during "
+            "another motion request"
+          )
+        if (
+          not legacy_serial_result_pending.is_set()
+          and not motion_request_registry.active
+        ):
+          raise MotionQueueFault(
+            "controller transport is busy outside the legacy motion queue"
+          )
+        deferred = True
+        coalesced = deferred_joint_adjustments.set_targets(
+          target_updates,
+          profile,
+          confirmed_position_generation,
+        )
+      except Exception:
+        if lease_created and not joint_motion_dispatcher.active:
+          _abandon_joint_motion_request(request_lease)
+        raise
+
+    if not RUN['offlineMode']:
+      if deferred and not coalesced:
+        if live_serial_result_pending.is_set():
+          status = "LIVE JOG IN PROGRESS"
+        elif (
+          legacy_serial_result_pending.is_set()
+          or serial_lock.locked()
+          or joint_motion_dispatcher.active
+        ):
+          status = "CONTROLLER MOVE IN PROGRESS"
+        else:
+          status = "SYSTEM READY"
+      else:
+        status = (
+          "JOINT TARGET QUEUED"
+          if coalesced
+          else "JOINT MOVE IN PROGRESS"
+        )
+      almStatusLab.config(text=status, style="OK.TLabel")
+      almStatusLab2.config(text=status, style="OK.TLabel")
+      if submission is not None:
+        _try_set_virtual_joint_target(submission.target)
+        _set_joint_motion_target_display(submission.target)
+    return True
+  except (
+    KeyError,
+    TypeError,
+    ValueError,
+    MotionInputError,
+    MotionQueueFault,
+  ) as exc:
+    message = f"Named joint position rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+
+
+def MoveToStartPosition():
+  return _queue_primary_joint_position(PRIMARY_START_POSITION)
+
+
+def MoveToShutdownPosition():
+  try:
+    if RUN.get('offlineMode') is True:
+      raise MotionInputError(
+        "shutdown position requires online controller mode"
+      )
+    target = primary_shutdown_position(
+      _current_primary_home_reference(RUN.get('ser'))
+    )
+  except (KeyError, TypeError, ValueError, MotionInputError) as exc:
+    message = f"Shutdown position rejected: {exc}"
+    logger.error(message)
+    almStatusLab.config(text=message, style="Alarm.TLabel")
+    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    return False
+  return _queue_primary_joint_position(
+    target,
+    allow_unrelated_defer=False,
+  )
 
 
 PRIMARY_JOINT_COUNT = 6
@@ -17834,36 +19054,151 @@ def reloadProg():
   save_calibration(CAL)      
 
 
-def insertvisFind():
+def _serialize_program_items(items):
+  if (
+    isinstance(items, (str, bytes, bytearray))
+    or not isinstance(items, (tuple, list))
+  ):
+    raise MotionInputError("program rows must be a sequence")
+  serialized = []
+  for item in items:
+    if not isinstance(item, (bytes, bytearray)):
+      raise MotionInputError("program rows must contain encoded text")
+    row = _decode_program_row_content(item)
+    serialized.append(row + '\n')
+  return ''.join(serialized)
+
+
+def _write_program_items_atomically(file_path, items):
+  program_text = _serialize_program_items(items)
+  path_value = os.fspath(file_path)
+  if not isinstance(path_value, str):
+    raise MotionInputError("program path must be text")
+  target = os.path.abspath(path_value)
+  directory = os.path.dirname(target)
+  if not os.path.isdir(directory):
+    raise FileNotFoundError(
+      f"program directory does not exist: {directory}"
+    )
+  descriptor = None
+  temporary_path = None
   try:
-    selRow = tab1.progView.curselection()[0]
-    selRow += 1
-  except:
-    last = tab1.progView.index('end')
-    selRow = last
+    descriptor, temporary_path = tempfile.mkstemp(
+      prefix=f".{os.path.basename(target)}.",
+      suffix=".tmp",
+      dir=directory,
+      text=True,
+    )
+    with os.fdopen(
+      descriptor,
+      'w',
+      encoding='utf-8',
+      newline='\n',
+    ) as program_file:
+      descriptor = None
+      written = program_file.write(program_text)
+      if written != len(program_text):
+        raise OSError("program write was incomplete")
+      program_file.flush()
+      os.fsync(program_file.fileno())
+    os.replace(temporary_path, target)
+    temporary_path = None
+    return True
+  finally:
+    if descriptor is not None:
+      os.close(descriptor)
+    if temporary_path is not None:
+      try:
+        os.unlink(temporary_path)
+      except FileNotFoundError:
+        pass
+      except OSError:
+        logger.exception("Unable to remove a temporary program file")
+
+
+def insertvisFind():
+  inserted = False
+  prior_selection = ()
+  selRow = None
+  try:
+    prior_selection = tuple(tab1.progView.curselection())
+    if prior_selection:
+      selRow = prior_selection[0] + 1
+    else:
+      selRow = tab1.progView.index('end')
+
+    template = RUN['selectedTemplate'].get()
+    if not isinstance(template, str):
+      raise MotionInputError("vision template must be text")
+    if any(ord(character) < 32 or ord(character) == 127 for character in template):
+      raise MotionInputError("vision template contains control characters")
+    if any(
+      delimiter in template
+      for delimiter in (" - BGcolor ", " Score ", " Pass ", " Fail ")
+    ):
+      raise MotionInputError("vision template contains a reserved delimiter")
+    if template == "":
+      template = "None_Selected.jpg"
+
+    auto_background = int(RUN['autoBG'].get())
+    if auto_background not in (0, 1):
+      raise MotionInputError("vision automatic background must be binary")
+    if auto_background == 1:
+      background_text = "(Auto)"
+    else:
+      background_text = str(normalize_vision_background_color(
+        VisBacColorEntryField.get()
+      ))
+
+    score_text = VisScoreEntryField.get()
+    score = finite_number(score_text, "vision score")
+    if score < 0 or score > 100:
+      raise MotionInputError("vision score must be between 0 and 100")
+    score_text = str(score_text).strip()
+
+    pass_tab = visPassEntryField.get()
+    fail_tab = visFailEntryField.get()
+    for label, value in (
+      ("vision pass tab", pass_tab),
+      ("vision fail tab", fail_tab),
+    ):
+      if not isinstance(value, str) or re.fullmatch(r"\d+", value.strip()) is None:
+        raise MotionInputError(f"{label} must be a non-negative integer")
+    pass_tab = pass_tab.strip()
+    fail_tab = fail_tab.strip()
+    file_path = path.relpath(ProgEntryField.get())
+    value = (
+      f"Vis Find - {template} - BGcolor {background_text} "
+      f"Score {score_text} Pass {pass_tab} Fail {fail_tab}"
+    )
+
+    tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8'))
+    inserted = True
+    tab1.progView.selection_clear(0, END)
     tab1.progView.select_set(selRow)
-  template = RUN['selectedTemplate'].get()
-  if (template == ""):
-    template = "None_Selected.jpg"
-  CAL['autoBGVal'] = int(RUN['autoBG'].get())
-  if (CAL['autoBGVal'] == 1):
-    BGcolor = "(Auto)"
-  else:
-    BGcolor = VisBacColorEntryField.get()
-  score = VisScoreEntryField.get()
-  passTab = visPassEntryField.get()
-  failTab = visFailEntryField.get()
-  value = "Vis Find - "+template+" - BGcolor "+BGcolor+" Score "+score+" Pass "+passTab+" Fail "+failTab
-  tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8'))
-  tab1.progView.selection_clear(0, END)
-  tab1.progView.select_set(selRow)
-  items = tab1.progView.get(0,END)
-  file_path = path.relpath(ProgEntryField.get())
-  with open(file_path,'w', encoding='utf-8') as f:
-    for item in items:
-      f.write(str(item.strip(), encoding='utf-8'))
-      f.write('\n')
-    f.close()
+    items = tab1.progView.get(0,END)
+    _write_program_items_atomically(file_path, items)
+    apply_calibration({'autoBGVal': auto_background}, CAL)
+    return True
+  except Exception as exc:
+    if inserted and selRow is not None:
+      try:
+        tab1.progView.delete(selRow)
+        tab1.progView.selection_clear(0, END)
+        for row in prior_selection:
+          tab1.progView.select_set(row)
+      except Exception:
+        logger.exception(
+          "Unable to restore the program editor after vision insertion failed"
+        )
+    message = f"Vision program insertion failed: {exc}"
+    logger.exception(message)
+    for status_label in (almStatusLab, almStatusLab2):
+      try:
+        status_label.config(text=message, style="Alarm.TLabel")
+      except Exception:
+        logger.exception("Unable to display the vision insertion failure")
+    return False
 
 def insertRegister():  
   try:
@@ -18058,6 +19393,64 @@ def _calibration_available():
   return False
 
 
+def _query_primary_home_reference(serial_port):
+  binding = _current_main_controller_identity(serial_port)
+  if binding is None:
+    raise ConnectionError(
+      "home-reference query requires the bound controller"
+    )
+  command = primary_home_reference_command(
+    binding.identity.protocol_capabilities
+  )
+  if command is None:
+    return None
+  response = exchange_serial_line(
+    serial_port,
+    command,
+    SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+    write_lock=serial_write_lock,
+    reset_input=False,
+  )
+  try:
+    return parse_primary_home_reference_capability_response(
+      response,
+      binding.identity.protocol_capabilities,
+    )
+  except ProtocolResponseError as exc:
+    reason = f"controller home-reference response is invalid: {exc}"
+    raise ProtocolResponseError(reason) from exc
+
+
+def _apply_calibration_home_reference(
+  serial_port,
+  home_reference,
+  error,
+):
+  if home_reference is None and error is None:
+    return True
+  if home_reference is not None:
+    if error is not None:
+      raise RuntimeError(
+        "calibration home-reference result contains data and an error"
+      )
+    _bind_main_controller_home_reference(serial_port, home_reference)
+    return True
+  if (
+    not isinstance(error, str)
+    or not error.strip()
+    or error != error.strip()
+  ):
+    raise RuntimeError(
+      "calibration home-reference failure is invalid"
+    )
+  _invalidate_bound_primary_home_reference(serial_port)
+  reason = (
+    "calibration home-reference synchronization failed: "
+    + error
+  )
+  return _invalidate_uncertain_controller_calibration(reason)
+
+
 def _binary_controller_flag(value, field_name):
   number = finite_number(value, field_name)
   if number not in (0, 1):
@@ -18080,6 +19473,8 @@ def _prepare_calibration_command(selections):
     _binary_controller_flag(value, f"J{axis} calibration selection")
     for axis, value in enumerate(selections, start=1)
   )
+  if not any(normalized_selections):
+    raise MotionInputError("calibration requires at least one selected axis")
   offsets = tuple(
     finite_number(CAL[f'J{axis}calOff'], f"J{axis} calibration offset")
     for axis in range(1, 10)
@@ -18140,6 +19535,14 @@ def _record_calibration_response(
       else None
     )
     succeeded = applied_position is not None
+    if (
+      parsed_position is not None
+      and applied_position is None
+      and controller_write_started
+    ):
+      _invalidate_uncertain_controller_calibration(
+        "calibration command position could not be applied"
+      )
   if parsed_position is None and controller_write_started:
     _invalidate_uncertain_controller_calibration(
       position_validation_reason
@@ -18218,6 +19621,8 @@ class CalibrationWorkerResult:
   response: object
   error: object
   write_started: object
+  home_reference: object = None
+  home_reference_error: object = None
 
 
 CALIBRATION_POSITION_KEYS = (
@@ -18244,6 +19649,7 @@ class CalibrationPoseSnapshot:
   resynchronization_required: bool
   persistence_dirty: bool
   persistence_job: object
+  persistence_snapshot: object
 
 
 @dataclass
@@ -18381,6 +19787,15 @@ def _capture_calibration_pose_snapshot():
     raise RuntimeError("calibration persistence state is invalid")
   if _calibration_save_job is not None and not persistence_dirty:
     raise RuntimeError("calibration persistence job has no dirty state")
+  persistence_snapshot = _calibration_save_snapshot
+  if persistence_snapshot is not None:
+    if not persistence_dirty:
+      raise RuntimeError(
+        "clean calibration persistence has a pending snapshot"
+      )
+    persistence_snapshot = normalize_calibration_data(
+      snapshot_calibration_values(persistence_snapshot)
+    )
 
   return CalibrationPoseSnapshot(
     calibration_values,
@@ -18396,12 +19811,14 @@ def _capture_calibration_pose_snapshot():
     resynchronization_required,
     persistence_dirty,
     _calibration_save_job,
+    persistence_snapshot,
   )
 
 
 def _restore_calibration_pose_snapshot(snapshot):
   global _calibration_dirty
   global _calibration_save_job
+  global _calibration_save_snapshot
   global acknowledged_forced_position_target
   global confirmed_position_generation
 
@@ -18424,6 +19841,18 @@ def _restore_calibration_pose_snapshot(snapshot):
     raise RuntimeError("calibration resynchronization snapshot is invalid")
   if not isinstance(snapshot.persistence_dirty, bool):
     raise RuntimeError("calibration persistence snapshot is invalid")
+  if (
+    snapshot.persistence_snapshot is not None
+    and not snapshot.persistence_dirty
+  ):
+    raise RuntimeError(
+      "clean calibration pose snapshot has pending persistence"
+    )
+  persistence_snapshot = None
+  if snapshot.persistence_snapshot is not None:
+    persistence_snapshot = normalize_calibration_data(
+      snapshot.persistence_snapshot
+    )
 
   for key, value in snapshot.calibration_values:
     CAL[key] = value
@@ -18436,7 +19865,7 @@ def _restore_calibration_pose_snapshot(snapshot):
   with acknowledged_forced_position_lock:
     acknowledged_forced_position_target = snapshot.acknowledged_forced_target
   if snapshot.resynchronization_required:
-    controller_position_resynchronization_required.set()
+    _require_controller_position_resynchronization()
   else:
     controller_position_resynchronization_required.clear()
 
@@ -18474,6 +19903,7 @@ def _restore_calibration_pose_snapshot(snapshot):
   persistence_changed = (
     _calibration_dirty != snapshot.persistence_dirty
     or _calibration_save_job is not snapshot.persistence_job
+    or _calibration_save_snapshot != persistence_snapshot
   )
   if persistence_changed:
     pending_job = _calibration_save_job
@@ -18486,6 +19916,7 @@ def _restore_calibration_pose_snapshot(snapshot):
         )
     _calibration_save_job = None
     _calibration_dirty = True
+    _calibration_save_snapshot = persistence_snapshot
     try:
       shutdown_started = application_closing.is_set()
       if not isinstance(shutdown_started, bool):
@@ -18636,8 +20067,12 @@ def _run_calibration_stage_safe(
   command,
 ):
   write_commitment = CalibrationWriteCommitment(
-    calibration_serial_write_committed
+    calibration_serial_write_committed,
+    lambda: _invalidate_bound_primary_home_reference(serial_port),
   )
+  response = None
+  home_reference = None
+  home_reference_error = None
   try:
     with _require_calibration_terminal_response(
       write_commitment
@@ -18650,6 +20085,13 @@ def _run_calibration_stage_safe(
         write_boundary_lock=application_lifecycle_lock,
         write_started_event=write_commitment,
       )
+      try:
+        home_reference = _query_primary_home_reference(serial_port)
+      except Exception as exc:
+        home_reference_error = (
+          " ".join(str(exc).split())
+          or exc.__class__.__name__
+        )
     event = CalibrationWorkerResult(
       worker_token,
       request_id,
@@ -18658,6 +20100,8 @@ def _run_calibration_stage_safe(
       response,
       None,
       write_commitment.is_set(),
+      home_reference,
+      home_reference_error,
     )
   except Exception as exc:
     message = str(exc).strip() or "calibration exchange failed without details"
@@ -18669,6 +20113,8 @@ def _run_calibration_stage_safe(
       None,
       message,
       write_commitment.is_set(),
+      None,
+      None,
     )
   calibration_serial_event_queue.put(event)
 
@@ -18820,6 +20266,8 @@ def _claim_calibration_worker_result(event):
   response = event.response
   error = event.error
   write_started = event.write_started
+  home_reference = event.home_reference
+  home_reference_error = event.home_reference_error
   if event_type not in ("completed", "failed"):
     raise RuntimeError("calibration worker emitted an unknown event type")
   if (
@@ -18843,6 +20291,25 @@ def _claim_calibration_worker_result(event):
       or error is not None
     ):
       raise RuntimeError("calibration worker emitted an invalid success result")
+    if home_reference is not None and not isinstance(
+      home_reference,
+      PrimaryHomeReference,
+    ):
+      raise RuntimeError(
+        "calibration worker emitted an invalid home reference"
+      )
+    if home_reference_error is not None and (
+      not isinstance(home_reference_error, str)
+      or not home_reference_error.strip()
+      or home_reference_error != home_reference_error.strip()
+    ):
+      raise RuntimeError(
+        "calibration worker emitted an invalid home-reference error"
+      )
+    if home_reference is not None and home_reference_error is not None:
+      raise RuntimeError(
+        "calibration worker emitted home-reference data and an error"
+      )
   elif (
     response is not None
     or not isinstance(error, str)
@@ -18850,6 +20317,10 @@ def _claim_calibration_worker_result(event):
     or error != error.strip()
   ):
     raise RuntimeError("calibration worker emitted an invalid failure result")
+  elif home_reference is not None or home_reference_error is not None:
+    raise RuntimeError(
+      "failed calibration worker emitted a home-reference result"
+    )
 
   with calibration_operation_lock:
     operation = calibration_operation
@@ -18875,6 +20346,8 @@ def _claim_calibration_worker_result(event):
     response,
     error,
     write_started,
+    home_reference,
+    home_reference_error,
   )
 
 
@@ -18916,12 +20389,21 @@ def _apply_calibration_worker_result(event):
     response,
     error,
     write_started,
+    home_reference,
+    home_reference_error,
   ) = _claim_calibration_worker_result(event)
   try:
     cmdRecEntryField.delete(0, 'end')
     cmdRecEntryField.insert(0, response if event_type == "completed" else error)
     if event_type == "failed":
       logger.error("Calibration controller exchange failed: %s", error)
+    reference_synchronized = True
+    if home_reference is not None:
+      reference_synchronized = _apply_calibration_home_reference(
+        operation.serial_port,
+        home_reference,
+        None,
+      )
     succeeded = _record_calibration_response(
       response,
       stage.success_message,
@@ -18934,7 +20416,13 @@ def _apply_calibration_worker_result(event):
         else None
       ),
     )
-    if not succeeded:
+    if home_reference is None:
+      reference_synchronized = _apply_calibration_home_reference(
+        operation.serial_port,
+        None,
+        home_reference_error,
+      )
+    if not succeeded or not reference_synchronized:
       return _finish_calibration_operation(operation, False)
 
     with calibration_operation_lock:
@@ -18999,17 +20487,21 @@ def _execute_calibration_command(
   *,
   update_virtual=True,
 ):
+  serial_port = RUN.get('ser')
   try:
     pose_snapshot = _capture_calibration_pose_snapshot()
   except Exception:
     logger.exception("Unable to capture the pre-command calibration pose")
     return False
   write_commitment = CalibrationWriteCommitment(
-    calibration_serial_write_committed
+    calibration_serial_write_committed,
+    lambda: _invalidate_bound_primary_home_reference(serial_port),
   )
   calibration_serial_write_committed.clear()
   response = None
   uncertainty_reason = None
+  home_reference = None
+  home_reference_error = None
   try:
     try:
       with _require_calibration_terminal_response(
@@ -19018,13 +20510,22 @@ def _execute_calibration_command(
         cmdSentEntryField.delete(0, 'end')
         cmdSentEntryField.insert(0, command)
         response = exchange_serial_line_until_cancelled(
-          RUN.get('ser'),
+          serial_port,
           command,
           response_requirement,
           write_lock=serial_write_lock,
           write_boundary_lock=application_lifecycle_lock,
           write_started_event=write_commitment,
         )
+        try:
+          home_reference = _query_primary_home_reference(
+            serial_port
+          )
+        except Exception as exc:
+          home_reference_error = (
+            " ".join(str(exc).split())
+            or exc.__class__.__name__
+          )
     except Exception:
       if write_commitment.is_set():
         uncertainty_reason = (
@@ -19035,7 +20536,14 @@ def _execute_calibration_command(
     try:
       cmdRecEntryField.delete(0, 'end')
       cmdRecEntryField.insert(0, "" if response is None else response)
-      return _record_calibration_response(
+      reference_synchronized = True
+      if home_reference is not None:
+        reference_synchronized = _apply_calibration_home_reference(
+          serial_port,
+          home_reference,
+          None,
+        )
+      succeeded = _record_calibration_response(
         response,
         success_message,
         failure_message,
@@ -19043,6 +20551,13 @@ def _execute_calibration_command(
         controller_write_started=write_commitment.is_set(),
         uncertainty_reason=uncertainty_reason,
       )
+      if home_reference is None:
+        reference_synchronized = _apply_calibration_home_reference(
+          serial_port,
+          None,
+          home_reference_error,
+        )
+      return succeeded and reference_synchronized
     except Exception as exc:
       if write_commitment.is_set():
         _handle_calibration_result_application_failure(
@@ -19331,6 +20846,7 @@ def _collect_update_parameter_values():
   field_groups = (
     ('MotDir', (J1MotDirEntryField, J2MotDirEntryField, J3MotDirEntryField, J4MotDirEntryField, J5MotDirEntryField, J6MotDirEntryField, J7MotDirEntryField, J8MotDirEntryField, J9MotDirEntryField)),
     ('CalDir', (J1CalDirEntryField, J2CalDirEntryField, J3CalDirEntryField, J4CalDirEntryField, J5CalDirEntryField, J6CalDirEntryField, J7CalDirEntryField, J8CalDirEntryField, J9CalDirEntryField)),
+    ('CalSwitch', (J1CalSwitchField, J2CalSwitchField, J3CalSwitchField, J4CalSwitchField, J5CalSwitchField, J6CalSwitchField, J7CalSwitchField, J8CalSwitchField, J9CalSwitchField)),
     ('PosLim', (J1PosLimEntryField, J2PosLimEntryField, J3PosLimEntryField, J4PosLimEntryField, J5PosLimEntryField, J6PosLimEntryField)),
     ('NegLim', (J1NegLimEntryField, J2NegLimEntryField, J3NegLimEntryField, J4NegLimEntryField, J5NegLimEntryField, J6NegLimEntryField)),
     ('StepDeg', (J1StepDegEntryField, J2StepDegEntryField, J3StepDegEntryField, J4StepDegEntryField, J5StepDegEntryField, J6StepDegEntryField)),
@@ -19383,6 +20899,7 @@ def _prepare_update_parameters_from_values(source_values):
     for suffix, axis_count in (
       ('MotDir', 9),
       ('CalDir', 9),
+      ('CalSwitch', 9),
       ('PosLim', 6),
       ('NegLim', 6),
       ('StepDeg', 6),
@@ -19408,6 +20925,23 @@ def _prepare_update_parameters_from_values(source_values):
         values[f'J{axis}{suffix}'],
         f"J{axis} {suffix}",
       )
+  switch_values = {
+    f'J{axis}CalSwitch': values[f'J{axis}CalSwitch']
+    for axis in range(1, 10)
+  }
+  try:
+    switch_values = normalize_calibration_data(
+      switch_values,
+      require_runtime_fields=False,
+      migrate_legacy_switches=False,
+      migrate_legacy_auxiliary_board=False,
+    )
+  except CalibrationSchemaError as exc:
+    raise MotionInputError(str(exc)) from exc
+  values.update(switch_values)
+  calibration_switch_mask = encode_calibration_switch_mask(
+    tuple(values[f'J{axis}CalSwitch'] for axis in range(1, 10))
+  )
   _robot_joint_calibration_from_values(values)
   encoder_multipliers = []
   for axis in range(1, 7):
@@ -19481,6 +21015,7 @@ def _prepare_update_parameters_from_values(source_values):
     ("<", ">", "?", "{", "}", "~"),
     tuple(values[f'J{axis}aDHpar'] for axis in range(1, 7)),
   ))
+  command_fields.append(("|", calibration_switch_mask))
   return values, _build_startup_numeric_command("UP", command_fields)
 
 
@@ -19525,6 +21060,12 @@ def _exchange_controller_calibration_acknowledgement(
   command,
   write_started_event=None,
 ):
+  invalidates_home_reference = (
+    isinstance(command, str)
+    and command.startswith("UP")
+  )
+  if invalidates_home_reference and write_started_event is None:
+    write_started_event = threading.Event()
   serial_port = RUN.get('ser')
   try:
     write_serial_control(
@@ -19540,18 +21081,26 @@ def _exchange_controller_calibration_acknowledgement(
       SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
     ) == "Done"
   finally:
-    if (
-      RUN.get('ser') is serial_port
-      and not getattr(serial_port, "is_open", False)
-    ):
-      RUN['ser'] = None
-      _require_main_controller_identity_cleanup(
-        serial_port,
-        "controller calibration exchange cleanup",
-      )
+    try:
+      if (
+        invalidates_home_reference
+        and write_started_event.is_set()
+      ):
+        _invalidate_bound_primary_home_reference(serial_port)
+    finally:
+      if (
+        RUN.get('ser') is serial_port
+        and not getattr(serial_port, "is_open", False)
+      ):
+        RUN['ser'] = None
+        _require_main_controller_identity_cleanup(
+          serial_port,
+          "controller calibration exchange cleanup",
+        )
 
 
 def _transmit_update_parameters(command, write_started_event=None):
+  command = _validated_startup_command(command, "UP")
   return _exchange_controller_calibration_acknowledgement(
     command,
     write_started_event,
@@ -19593,7 +21142,7 @@ def _apply_single_calibration_transaction(
     logger.exception("Calibration transport preflight failed during %s", context)
     return False
 
-  snapshot = dict(CAL)
+  snapshot = snapshot_calibration_values(CAL)
   try:
     apply_values(values)
   except Exception:
@@ -19636,7 +21185,7 @@ def updateParams(transmit=True):
     raise TypeError("update-parameters transmit flag must be boolean")
   values, command = _prepare_update_parameters()
   if not transmit:
-    snapshot = dict(CAL)
+    snapshot = snapshot_calibration_values(CAL)
     try:
       _apply_update_parameter_values(values)
     except Exception:
@@ -19746,6 +21295,7 @@ def _apply_external_axis_values(values):
 
 
 def _transmit_external_axis_parameters(command, write_started_event=None):
+  command = _validated_startup_command(command, "CE")
   return _exchange_controller_calibration_acknowledgement(
     command,
     write_started_event,
@@ -19763,7 +21313,7 @@ def _prepare_controller_calibration():
 
 
 def _apply_controller_calibration(update_values, external_values):
-  snapshot = dict(CAL)
+  snapshot = snapshot_calibration_values(CAL)
   try:
     _apply_update_parameter_values(update_values)
     _apply_external_axis_values(external_values)
@@ -19785,7 +21335,7 @@ def calExtAxis(transmit=True):
     raise TypeError("external-axis transmit flag must be boolean")
   values, command = _prepare_external_axis_parameters()
   if not transmit:
-    snapshot = dict(CAL)
+    snapshot = snapshot_calibration_values(CAL)
     try:
       _apply_external_axis_values(values)
     except Exception:
@@ -19878,7 +21428,6 @@ def _record_acknowledged_forced_position_target(target):
   )
   with acknowledged_forced_position_lock:
     acknowledged_forced_position_target = target
-  controller_position_resynchronization_required.set()
   _invalidate_joint_motion_state(
     "controller acknowledged a forced position; position recovery is required"
   )
@@ -19989,15 +21538,19 @@ def _exchange_position_acknowledgement(command):
         )
     raise
   finally:
-    if (
-      RUN.get('ser') is serial_port
-      and not getattr(serial_port, "is_open", False)
-    ):
-      RUN['ser'] = None
-      _require_main_controller_identity_cleanup(
-        serial_port,
-        "controller position exchange cleanup",
-      )
+    try:
+      if write_started.is_set():
+        _invalidate_bound_primary_home_reference(serial_port)
+    finally:
+      if (
+        RUN.get('ser') is serial_port
+        and not getattr(serial_port, "is_open", False)
+      ):
+        RUN['ser'] = None
+        _require_main_controller_identity_cleanup(
+          serial_port,
+          "controller position exchange cleanup",
+        )
 
 
 @_synchronous_motion_request("Set controller position")
@@ -20055,23 +21608,32 @@ def CalRestPos():
 CALIBRATION_SAVE_DEBOUNCE_MS = 250
 _calibration_save_job = None
 _calibration_dirty = False
+_calibration_save_snapshot = None
 
 
 def _write_pending_calibration():
   global _calibration_save_job, _calibration_dirty
+  global _calibration_save_snapshot
   _calibration_save_job = None
   if not _calibration_dirty:
+    _calibration_save_snapshot = None
     return True
 
+  persistence_target = (
+    CAL
+    if _calibration_save_snapshot is None
+    else _calibration_save_snapshot
+  )
   failure_logged = False
   try:
-    persisted = save_calibration(CAL)
+    persisted = save_calibration(persistence_target)
   except Exception:
     persisted = False
     failure_logged = True
     logger.exception("Unable to persist the latest calibration state")
   if persisted is True:
     _calibration_dirty = False
+    _calibration_save_snapshot = None
     return True
 
   if persisted is not False:
@@ -20089,9 +21651,17 @@ def _write_pending_calibration():
   return False
 
 
-def _schedule_calibration_save():
+def _schedule_calibration_save(calibration_snapshot=None):
   global _calibration_save_job, _calibration_dirty
+  global _calibration_save_snapshot
+  if calibration_snapshot is None:
+    normalized_snapshot = None
+  else:
+    normalized_snapshot = normalize_calibration_data(
+      snapshot_calibration_values(calibration_snapshot)
+    )
   _calibration_dirty = True
+  _calibration_save_snapshot = normalized_snapshot
   if _calibration_save_job is not None:
     root.after_cancel(_calibration_save_job)
     _calibration_save_job = None
@@ -20113,11 +21683,11 @@ def _flush_calibration_save():
   return _write_pending_calibration()
 
 
-def _retain_calibration_persistence_retry():
+def _retain_calibration_persistence_retry(calibration_snapshot=None):
   global _calibration_dirty
 
   try:
-    _schedule_calibration_save()
+    _schedule_calibration_save(calibration_snapshot)
   except Exception:
     _calibration_dirty = True
     logger.exception("Unable to schedule calibration persistence retry")
@@ -20189,11 +21759,10 @@ def displayPosition(response, parsed=None, synchronize_dispatcher=True):
   for entry_field, value in zip(entry_fields, position_values):
     _write_joint_position_entry(entry_field, value)
 
-  for jog_slider, value in zip(
+  set_joint_slider_positions(
     jog_sliders,
     parsed.joint_text + parsed.external_text,
-  ):
-    jog_slider.set(value)
+  )
 
   manEntryField.delete(0, 'end')
   manEntryField.insert(0, parsed.debug)
@@ -20294,6 +21863,12 @@ def ClearKinTabFields():
   J4aEntryField.delete(0, 'end')
   J5aEntryField.delete(0, 'end')
   J6aEntryField.delete(0, 'end')
+  for field in (
+    J1CalSwitchField, J2CalSwitchField, J3CalSwitchField,
+    J4CalSwitchField, J5CalSwitchField, J6CalSwitchField,
+    J7CalSwitchField, J8CalSwitchField, J9CalSwitchField,
+  ):
+    field.set("HIGH")
 
 
 def LoadAR4Mk3default():
@@ -20677,6 +22252,7 @@ def _custom_calibration_profile_keys():
   for suffix, axis_count in (
     ('MotDir', 9),
     ('CalDir', 9),
+    ('CalSwitch', 9),
     ('PosLim', 6),
     ('NegLim', 6),
     ('StepDeg', 6),
@@ -20712,7 +22288,16 @@ def _custom_calibration_field_values(calibration_values):
 
 
 def _prepare_custom_calibration_profile(loaded_calibration):
-  profile_values = _custom_calibration_field_values(loaded_calibration)
+  try:
+    migrated_calibration = normalize_calibration_data(
+      loaded_calibration,
+      require_runtime_fields=False,
+      migrate_legacy_switches=True,
+      migrate_legacy_auxiliary_board=False,
+    )
+  except CalibrationSchemaError as exc:
+    raise MotionInputError(str(exc)) from exc
+  profile_values = _custom_calibration_field_values(migrated_calibration)
   update_values, _ = _prepare_update_parameters_from_values(profile_values)
   staged_values = dict(CAL)
   staged_values.update(update_values)
@@ -20755,6 +22340,7 @@ def save_custom_calibration():
     persisted = save_calibration(
       calibration_file='custom.json',
       calibration_data=profile_values,
+      require_runtime_fields=False,
     )
   except Exception:
     logger.exception("Custom calibration validation or persistence failed")
@@ -20770,6 +22356,7 @@ def load_custom_calibration():
     loaded_calibration = load_calibration(
       calibration_file='custom.json',
       allow_fallback=False,
+      require_runtime_fields=False,
     )
     profile_values = _prepare_custom_calibration_profile(loaded_calibration)
     sync_calibration_to_fields(profile_values)
@@ -20798,6 +22385,11 @@ def _custom_calibration_field_bindings(calibration_values):
     J1CalDirEntryField, J2CalDirEntryField, J3CalDirEntryField,
     J4CalDirEntryField, J5CalDirEntryField, J6CalDirEntryField,
     J7CalDirEntryField, J8CalDirEntryField, J9CalDirEntryField,
+  ))
+  fields.extend((
+    J1CalSwitchField, J2CalSwitchField, J3CalSwitchField,
+    J4CalSwitchField, J5CalSwitchField, J6CalSwitchField,
+    J7CalSwitchField, J8CalSwitchField, J9CalSwitchField,
   ))
   for field_group in (
     (J1PosLimEntryField, J2PosLimEntryField, J3PosLimEntryField,
@@ -20834,7 +22426,7 @@ def _custom_calibration_field_bindings(calibration_values):
   if len(fields) != len(keys):
     raise RuntimeError("custom calibration field mapping is inconsistent")
   return tuple(
-    (field, values[key])
+    (field, values[key], key.endswith('CalSwitch'))
     for field, key in zip(fields, keys)
   )
 
@@ -20842,9 +22434,12 @@ def _custom_calibration_field_bindings(calibration_values):
 def sync_calibration_to_fields(calibration_values=None):
   source_values = CAL if calibration_values is None else calibration_values
   bindings = _custom_calibration_field_bindings(source_values)
-  for field, value in bindings:
-    field.delete(0, 'end')
-    field.insert(0, str(value))
+  for field, value, is_selector in bindings:
+    if is_selector:
+      field.set(str(value))
+    else:
+      field.delete(0, 'end')
+      field.insert(0, str(value))
   return True
 
 def _collect_fields_to_calibration():
@@ -20872,7 +22467,9 @@ def _collect_fields_to_calibration():
     'VisProg': visoptions.get(),
     'VisBrightVal': finite_number(VisBrightSlide.get(), "vision brightness"),
     'VisContVal': finite_number(VisContrastSlide.get(), "vision contrast"),
-    'VisBacColor': str(VisBacColorEntryField.get()),
+    'VisBacColor': normalize_vision_background_color(
+      VisBacColorEntryField.get()
+    ),
     'VisScore': finite_number(VisScoreEntryField.get(), "vision score"),
     'VisX1Val': int(VisX1PixEntryField.get()),
     'VisY1Val': int(VisY1PixEntryField.get()),
@@ -20934,8 +22531,7 @@ def _collect_fields_to_calibration():
 
 
 def _restore_controller_calibration(snapshot):
-  CAL.clear()
-  CAL.update(snapshot)
+  apply_calibration(snapshot, CAL)
   _set_cpp_kinematics_from_values(snapshot)
   _apply_joint_limit_widgets(snapshot)
   _apply_external_axis_values({
@@ -20991,7 +22587,11 @@ def _invalidate_uncertain_controller_calibration(reason):
 )
 @_tracked_serial_operation("ser")
 def SaveAndApplyCalibration():
-  snapshot = dict(CAL)
+  try:
+    snapshot = snapshot_calibration_values(CAL)
+  except Exception:
+    logger.exception("Calibration snapshot failed")
+    return False
   try:
     field_values = _collect_fields_to_calibration()
     (
@@ -21000,27 +22600,36 @@ def SaveAndApplyCalibration():
       external_values,
       external_command,
     ) = _prepare_controller_calibration()
-    staged_values = dict(CAL)
+    staged_values = dict(snapshot)
     staged_values.update(field_values)
     staged_values.update(update_values)
     staged_values.update(external_values)
+    staged_values = normalize_calibration_data(staged_values)
     _validate_controller_pose(staged_values)
+    field_values = {
+      key: staged_values[key]
+      for key in field_values
+    }
+    update_values = {
+      key: staged_values[key]
+      for key in update_values
+    }
+    external_values = {
+      key: staged_values[key]
+      for key in external_values
+    }
   except Exception:
     logger.exception("Calibration validation failed")
-    CAL.clear()
-    CAL.update(snapshot)
     return False
 
   try:
     _preflight_controller_calibration_transport()
   except Exception:
     logger.exception("Calibration transport preflight failed")
-    CAL.clear()
-    CAL.update(snapshot)
     return False
 
   try:
-    CAL.update(field_values)
+    apply_calibration(field_values, CAL)
     _apply_controller_calibration(update_values, external_values)
   except Exception:
     logger.exception("Calibration application failed")
@@ -21352,7 +22961,127 @@ def stop_vid():
 
 #vismenu.size
 
-def take_pic():
+def _vision_background_bgr(value):
+  red, green, blue = normalize_vision_background_color(value)
+  return blue, green, red
+
+
+def _vision_background_grayscale(value):
+  rgb_pixel = np.asarray(
+    [[normalize_vision_background_color(value)]],
+    dtype=np.uint8,
+  )
+  grayscale = cv2.cvtColor(rgb_pixel, cv2.COLOR_RGB2GRAY)
+  return int(grayscale[0][0])
+
+
+def _average_vision_grayscale_samples(samples):
+  try:
+    sample_values = np.asarray(samples, dtype=np.float64)
+  except (TypeError, ValueError, OverflowError) as exc:
+    raise MotionInputError(
+      "vision grayscale samples must be numeric"
+    ) from exc
+  if (
+    sample_values.ndim != 1
+    or sample_values.size == 0
+    or not np.all(np.isfinite(sample_values))
+    or np.any(sample_values < 0)
+    or np.any(sample_values > 255)
+  ):
+    raise MotionInputError(
+      "vision grayscale samples must contain finite byte values"
+    )
+  return int(np.rint(np.mean(sample_values)))
+
+
+def _average_vision_bgr_samples(samples):
+  try:
+    sample_values = np.asarray(samples, dtype=np.float64)
+  except (TypeError, ValueError, OverflowError) as exc:
+    raise MotionInputError(
+      "vision BGR samples must be numeric"
+    ) from exc
+  if (
+    sample_values.ndim != 2
+    or sample_values.shape[0] == 0
+    or sample_values.shape[1] != 3
+    or not np.all(np.isfinite(sample_values))
+    or np.any(sample_values < 0)
+    or np.any(sample_values > 255)
+  ):
+    raise MotionInputError(
+      "vision BGR samples must contain finite three-channel byte values"
+    )
+  averaged_bgr = tuple(
+    int(component)
+    for component in np.rint(np.mean(sample_values, axis=0))
+  )
+  averaged_rgb = tuple(reversed(averaged_bgr))
+  return averaged_bgr, averaged_rgb
+
+
+def _vision_sample_coordinate(value, label):
+  if isinstance(value, bool):
+    raise MotionInputError(f"{label} must be an integer")
+  if isinstance(value, str):
+    token = value.strip()
+    if re.fullmatch(r"\d+", token) is None:
+      raise MotionInputError(f"{label} must be a non-negative integer")
+    return int(token)
+  number = finite_number(value, label)
+  if number < 0 or not number.is_integer():
+    raise MotionInputError(f"{label} must be a non-negative integer")
+  return int(number)
+
+
+def _validated_vision_sample_pixels(image, points):
+  shape = getattr(image, "shape", None)
+  if (
+    not isinstance(shape, (tuple, list))
+    or len(shape) < 2
+  ):
+    raise MotionInputError("vision sample image has no two-dimensional shape")
+  first_limit = _vision_sample_coordinate(
+    shape[0],
+    "vision image first dimension",
+  )
+  second_limit = _vision_sample_coordinate(
+    shape[1],
+    "vision image second dimension",
+  )
+  if first_limit <= 0 or second_limit <= 0:
+    raise MotionInputError("vision sample image dimensions must be positive")
+  if (
+    isinstance(points, (str, bytes))
+    or not isinstance(points, (tuple, list))
+    or not points
+  ):
+    raise MotionInputError("vision sample points must be a non-empty sequence")
+
+  samples = []
+  for index, point in enumerate(points, start=1):
+    if not isinstance(point, (tuple, list)) or len(point) != 2:
+      raise MotionInputError(
+        f"vision sample point {index} must contain two coordinates"
+      )
+    first = _vision_sample_coordinate(
+      point[0],
+      f"vision sample point {index} first coordinate",
+    )
+    second = _vision_sample_coordinate(
+      point[1],
+      f"vision sample point {index} second coordinate",
+    )
+    if first >= first_limit or second >= second_limit:
+      raise MotionInputError(
+        f"vision sample point {index} is outside the current image"
+      )
+    samples.append(image[first][second])
+  return tuple(samples)
+
+
+def take_pic(background_override=None):
   # global RUN['selectedCam']
   #global cap
   # global RUN['BGavg']
@@ -21372,6 +23101,8 @@ def take_pic():
           RUN['selectedCam'] = i
       RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
       ret, frame = RUN['cap'].read()
+    if not ret or frame is None:
+      raise MotionInputError("camera did not return a captured frame")
 
     brightness = int(VisBrightSlide.get())
     contrast = int(VisContrastSlide.get())
@@ -21397,18 +23128,28 @@ def take_pic():
     cropped = cv2image[minX:maxX, minY:maxY]
     cv2image = cv2.resize(cropped, (width, height))
 
-    CAL['autoBGVal'] = int(RUN['autoBG'].get())
-    if(CAL['autoBGVal']==1):
-      x1 = int(float(VisX1PixEntryField.get()))
-      y1 = int(float(VisY1PixEntryField.get()))
-      x2 = int(float(VisX2PixEntryField.get()))
-      y2 = int(float(VisY1PixEntryField.get()))
-      x3 = int(float(VisX1PixEntryField.get()))
-      y3 = int(float(VisY2PixEntryField.get()))
-      BG1 = cv2image[x1][y1]
-      BG2 = cv2image[x2][y2]
-      BG3 = cv2image[x3][y3]
-      avg = int(mean([BG1,BG2,BG3]))
+    if background_override is None:
+      auto_background = int(RUN['autoBG'].get())
+      CAL['autoBGVal'] = auto_background
+      manual_background = VisBacColorEntryField.get()
+    elif background_override == "Auto":
+      auto_background = 1
+      manual_background = None
+    else:
+      auto_background = 0
+      manual_background = normalize_vision_background_color(
+        background_override
+      )
+    if(auto_background==1):
+      BG1, BG2, BG3 = _validated_vision_sample_pixels(
+        cv2image,
+        (
+          (VisX1PixEntryField.get(), VisY1PixEntryField.get()),
+          (VisX2PixEntryField.get(), VisY1PixEntryField.get()),
+          (VisX1PixEntryField.get(), VisY2PixEntryField.get()),
+        ),
+      )
+      avg = _average_vision_grayscale_samples((BG1, BG2, BG3))
       RUN['BGavg'] = (avg,avg,avg) 
       background = avg
       VisBacColorEntryField.configure(state='enabled')  
@@ -21416,11 +23157,9 @@ def take_pic():
       VisBacColorEntryField.insert(0,str(RUN['BGavg']))
       VisBacColorEntryField.configure(state='disabled')  
     else:
-      temp = VisBacColorEntryField.get()  
-      startIndex = temp.find("(")
-      endIndex = temp.find(",")
-      background = int(temp[startIndex+1:endIndex])
-      #background = eval(VisBacColorEntryField.get())
+      background = _vision_background_grayscale(
+        manual_background
+      )
 
     h = cv2image.shape[0]
     w = cv2image.shape[1]
@@ -21438,9 +23177,12 @@ def take_pic():
     vid_lbl.imgtk = imgtk    
     vid_lbl.configure(image=imgtk) 
     filename = 'curImage.jpg'
-    cv2.imwrite(filename, cv2image)
-  except:
-    print("camera failed")
+    if not cv2.imwrite(filename, cv2image):
+      raise OSError("captured vision frame could not be persisted")
+    return True
+  except Exception:
+    logger.exception("Vision capture failed")
+    return False
 
 def mask_pic():
   # global RUN['selectedCam']
@@ -21461,6 +23203,8 @@ def mask_pic():
         RUN['selectedCam'] = i
     RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
     ret, frame = RUN['cap'].read()
+  if not ret or frame is None:
+    raise MotionInputError("camera did not return a mask frame")
   brightness = int(VisBrightSlide.get())
   contrast = int(VisContrastSlide.get())
   CAL['zoom'] = int(VisZoomSlide.get())
@@ -21483,13 +23227,15 @@ def mask_pic():
   #vid_lbl.imgtk = imgtk    
   #vid_lbl.configure(image=imgtk) 
   filename = 'curImage.jpg'
-  cv2.imwrite(filename, cv2image)
+  if not cv2.imwrite(filename, cv2image):
+    raise OSError("captured mask frame could not be persisted")
+  return True
 
   
 
 
 
-def mask_crop(event, x, y, flags, param):
+def _mask_crop(event, x, y, flags, param):
     # global RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'], RUN['cropping']
     #global oriImage
     # global RUN['box_points']
@@ -21535,18 +23281,26 @@ def mask_crop(event, x, y, flags, param):
 
         CAL['autoBGVal'] = int(RUN['autoBG'].get())
         if(CAL['autoBGVal']==1):
-          BG1 = RUN['oriImage'][int(VisX1PixEntryField.get())][int(VisY1PixEntryField.get())]
-          BG2 = RUN['oriImage'][int(VisX1PixEntryField.get())][int(VisY2PixEntryField.get())]
-          BG3 = RUN['oriImage'][int(VisX2PixEntryField.get())][int(VisY2PixEntryField.get())]
-          avg = int(mean([BG1,BG2,BG3]))
-          RUN['BGavg'] = (avg,avg,avg) 
-          background = avg
+          BG1, BG2, BG3 = _validated_vision_sample_pixels(
+            RUN['oriImage'],
+            (
+              (VisX1PixEntryField.get(), VisY1PixEntryField.get()),
+              (VisX1PixEntryField.get(), VisY2PixEntryField.get()),
+              (VisX2PixEntryField.get(), VisY2PixEntryField.get()),
+            ),
+          )
+          background, canonical_rgb = _average_vision_bgr_samples(
+            (BG1, BG2, BG3)
+          )
+          RUN['BGavg'] = canonical_rgb
           VisBacColorEntryField.configure(state='enabled')  
           VisBacColorEntryField.delete(0, 'end')
           VisBacColorEntryField.insert(0,str(RUN['BGavg']))
           VisBacColorEntryField.configure(state='disabled')   
         else:  
-          background = eval(VisBacColorEntryField.get())
+          background = _vision_background_bgr(
+            VisBacColorEntryField.get()
+          )
 
         h = RUN['oriImage'].shape[0]
         w = RUN['oriImage'].shape[1]
@@ -21556,29 +23310,56 @@ def mask_crop(event, x, y, flags, param):
                 # change the pixel
                 RUN['oriImage'][y, x] = background if x >= RUN['mX2'] or x <= RUN['mX1'] or y <= RUN['mY1'] or y >= RUN['mY2'] else RUN['oriImage'][y, x]
 
-        img = Image.fromarray(RUN['oriImage'])
+        display_image = cv2.cvtColor(
+            RUN['oriImage'],
+            cv2.COLOR_BGR2RGB,
+        )
+        img = Image.fromarray(display_image)
         imgtk = ImageTk.PhotoImage(image=img) 
         vid_lbl.imgtk = imgtk    
         vid_lbl.configure(image=imgtk) 
         filename = 'curImage.jpg'
-        cv2.imwrite(filename, RUN['oriImage'])
+        if not cv2.imwrite(filename, RUN['oriImage']):
+            raise OSError("masked vision frame could not be persisted")
         cv2.destroyAllWindows()
+    return True
 
+
+def mask_crop(event, x, y, flags, param):
+    try:
+        return _mask_crop(event, x, y, flags, param)
+    except Exception:
+        logger.exception("Vision mask processing failed")
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            logger.exception("Unable to close vision mask windows")
+        return False
 
 
 def selectMask():
-  #global oriImage
-  # global RUN['button_down']
-  RUN['button_down'] = False
-  RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
-  mask_pic()
+  try:
+    RUN['button_down'] = False
+    RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
+    if mask_pic() is not True:
+      raise MotionInputError("vision mask capture failed")
 
-  image = cv2.imread('curImage.jpg')
-  RUN['oriImage'] = image.copy()
-  
-  cv2.namedWindow("image")
-  cv2.setMouseCallback("image", mask_crop)
-  cv2.imshow("image", image)
+    image = cv2.imread('curImage.jpg')
+    if image is None:
+      raise MotionInputError("captured mask frame could not be reloaded")
+    RUN['oriImage'] = image.copy()
+
+    cv2.namedWindow("image")
+    cv2.setMouseCallback("image", mask_crop)
+    cv2.imshow("image", image)
+    return True
+  except Exception:
+    logger.exception("Vision mask selection failed")
+    try:
+      cv2.destroyAllWindows()
+    except Exception:
+      logger.exception("Unable to close vision mask windows")
+    return False
 
 
 
@@ -21649,19 +23430,26 @@ def selectTemplate():
 def snapFind():
   # global RUN['selectedTemplate']
   # global RUN['BGavg']
-  take_pic()
-  template = RUN['selectedTemplate'].get()
-  min_score = float(VisScoreEntryField.get())*.01
-  CAL['autoBGVal'] = int(RUN['autoBG'].get())
-  if(CAL['autoBGVal']==1):
-    background = RUN['BGavg']
-    VisBacColorEntryField.configure(state='enabled')  
-    VisBacColorEntryField.delete(0, 'end')
-    VisBacColorEntryField.insert(0,str(RUN['BGavg']))
-    VisBacColorEntryField.configure(state='disabled')  
-  else:  
-    background = eval(VisBacColorEntryField.get())
-  visFind(template,min_score,background)
+  try:
+    if take_pic() is not True:
+      return False
+    template = RUN['selectedTemplate'].get()
+    min_score = float(VisScoreEntryField.get())*.01
+    CAL['autoBGVal'] = int(RUN['autoBG'].get())
+    if(CAL['autoBGVal']==1):
+      background = _vision_background_grayscale(RUN['BGavg'])
+      VisBacColorEntryField.configure(state='enabled')
+      VisBacColorEntryField.delete(0, 'end')
+      VisBacColorEntryField.insert(0,str(RUN['BGavg']))
+      VisBacColorEntryField.configure(state='disabled')
+    else:
+      background = _vision_background_grayscale(
+        VisBacColorEntryField.get()
+      )
+    return visFind(template,min_score,background)
+  except Exception:
+    logger.exception("Vision matching failed")
+    return False
 
 
 
@@ -21672,27 +23460,44 @@ def rotate_image(img,angle,background):
     result = cv2.warpAffine(img, rot_mat, img.shape[1::-1],borderMode=cv2.BORDER_CONSTANT, borderValue=background, flags=cv2.INTER_LINEAR)
     return result
 
+
+def _vision_match_maximum(result):
+    _, maximum, _, location = cv2.minMaxLoc(result)
+    maximum = finite_number(maximum, "vision template score")
+    if maximum < -1 or maximum > 1:
+        raise MotionInputError(
+            "vision template score must be between -1 and 1"
+        )
+    return maximum, location
+
+
 def visFind(template,min_score,background):
     # global RUN['xMMpos']
     # global RUN['yMMpos']
     #global autoBG
 
-    if(background == "Auto"):
-      background = RUN['BGavg']
-      VisBacColorEntryField.configure(state='enabled')  
-      VisBacColorEntryField.delete(0, 'end')
-      VisBacColorEntryField.insert(0,str(RUN['BGavg']))
-      VisBacColorEntryField.configure(state='disabled')  
-      
-
     green = (0,255,0)
-    red = (255,0,0)
+    red = (0,0,255)
     blue = (0,0,255)
     dkgreen = (0,128,0)
     status = "fail"
-    highscore = 0
-    img1 = cv2.imread('curImage.jpg')  # target Image
-    img2 = cv2.imread(template)  # target Image
+    highscore = -math.inf
+    min_score = finite_number(min_score, "vision minimum score")
+    if min_score < 0 or min_score > 1:
+      raise MotionInputError(
+        "vision minimum score must be between 0 and 1"
+      )
+    background = _average_vision_grayscale_samples((background,))
+    img1 = cv2.imread('curImage.jpg', cv2.IMREAD_GRAYSCALE)
+    if img1 is None:
+      raise MotionInputError("captured vision frame could not be loaded")
+    img2 = cv2.imread(template, cv2.IMREAD_GRAYSCALE)
+    if img2 is None:
+      raise MotionInputError("vision template could not be loaded")
+    if img2.shape[0] > img1.shape[0] or img2.shape[1] > img1.shape[1]:
+      raise MotionInputError(
+        "vision template must not exceed the captured frame dimensions"
+      )
     
     #method = cv2.TM_CCOEFF_NORMED
     #method = cv2.TM_CCORR_NORMED
@@ -21713,14 +23518,14 @@ def visFind(template,min_score,background):
         ## fist pass 1/3rds
         curangle = 0
         highangle = 0
-        highscore = 0
-        highmax_loc = 0
+        highscore = -math.inf
+        highmax_loc = (0, 0)
         for x in range(3):
           template = img2
           template = rotate_image(img2,curangle,background)
           w, h = template.shape[1::-1]
           res = cv2.matchTemplate(img,template,method)
-          min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+          max_val, max_loc = _vision_match_maximum(res)
           if(max_val>highscore):
             highscore=max_val
             highangle=curangle
@@ -21739,7 +23544,7 @@ def visFind(template,min_score,background):
           template = rotate_image(img2,nextangle1,background)
           w, h = template.shape[1::-1]
           res = cv2.matchTemplate(img,template,method)
-          min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+          max_val, max_loc = _vision_match_maximum(res)
           if(max_val>highscore):
             highscore=max_val
             highangle=nextangle1
@@ -21749,7 +23554,7 @@ def visFind(template,min_score,background):
           template = rotate_image(img2,nextangle2,background)
           w, h = template.shape[1::-1]
           res = cv2.matchTemplate(img,template,method)
-          min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+          max_val, max_loc = _vision_match_maximum(res)
           if(max_val>highscore):
             highscore=max_val
             highangle=nextangle2
@@ -21765,7 +23570,7 @@ def visFind(template,min_score,background):
           img = img1.copy()
           # Apply template Matching
           res = cv2.matchTemplate(img,template,method)
-          min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+          max_val, max_loc = _vision_match_maximum(res)
           highscore=max_val
           highangle=i
           highmax_loc=max_loc
@@ -21777,6 +23582,7 @@ def visFind(template,min_score,background):
       if highscore >= min_score:
         break         
 
+    display_image = cv2.cvtColor(img1, cv2.COLOR_GRAY2BGR)
     if highscore >= min_score:
       status = "pass"
       #normalize angle to increment of +180 to -180
@@ -21801,7 +23607,6 @@ def visFind(template,min_score,background):
         status = "fail"
 
       top_left = highmax_loc
-      bottom_right = (top_left[0] + highw, top_left[1] + highh)
       #find center
       center = (top_left[0] + highw/2, top_left[1] + highh/2)
       xPos = int(center[1])
@@ -21813,35 +23618,36 @@ def visFind(template,min_score,background):
       #find line 1 end
       line1x = int(imgxPos + 60*math.cos(math.radians(highangle-90)))
       line1y = int(imgyPos + 60*math.sin(math.radians(highangle-90)))
-      cv2.line(img, (imgxPos,imgyPos), (line1x,line1y), green, 3) 
+      cv2.line(display_image, (imgxPos,imgyPos), (line1x,line1y), green, 3)
 
       #find line 2 end
       line2x = int(imgxPos + 60*math.cos(math.radians(highangle+90)))
       line2y = int(imgyPos + 60*math.sin(math.radians(highangle+90)))
-      cv2.line(img, (imgxPos,imgyPos), (line2x,line2y), green, 3)  
+      cv2.line(display_image, (imgxPos,imgyPos), (line2x,line2y), green, 3)
 
       #find line 3 end
       line3x = int(imgxPos + 30*math.cos(math.radians(highangle)))
       line3y = int(imgyPos + 30*math.sin(math.radians(highangle)))
-      cv2.line(img, (imgxPos,imgyPos), (line3x,line3y), green, 3)
+      cv2.line(display_image, (imgxPos,imgyPos), (line3x,line3y), green, 3)
 
       #find line 4 end
       line4x = int(imgxPos + 30*math.cos(math.radians(highangle+180)))
       line4y = int(imgyPos + 30*math.sin(math.radians(highangle+180)))
-      cv2.line(img, (imgxPos,imgyPos), (line4x,line4y), green, 3) 
+      cv2.line(display_image, (imgxPos,imgyPos), (line4x,line4y), green, 3)
 
       #find tip start
       lineTx = int(imgxPos + 56*math.cos(math.radians(highangle-90)))
       lineTy = int(imgyPos + 56*math.sin(math.radians(highangle-90)))
-      cv2.line(img, (lineTx,lineTy), (line1x,line1y), dkgreen, 2) 
+      cv2.line(display_image, (lineTx,lineTy), (line1x,line1y), dkgreen, 2)
 
 
 
-      cv2.circle(img, (imgxPos,imgyPos), 20, green, 1)
-      #cv2.rectangle(img,top_left, bottom_right, green, 2)
-      cv2.imwrite('temp.jpg', img)
-      img = Image.fromarray(img).resize((640,480))
-      imgtk = ImageTk.PhotoImage(image=img)        
+      cv2.circle(display_image, (imgxPos,imgyPos), 20, green, 1)
+      if not cv2.imwrite('temp.jpg', display_image):
+        raise OSError("vision result frame could not be persisted")
+      display_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
+      display = Image.fromarray(display_rgb).resize((640,480))
+      imgtk = ImageTk.PhotoImage(image=display)
       vid_lbl.imgtk = imgtk    
       vid_lbl.configure(image=imgtk)
       VisRetScoreEntryField.delete(0, 'end')
@@ -21867,10 +23673,12 @@ def visFind(template,min_score,background):
 
 
     if status == "fail":
-      cv2.rectangle(img,(5,5), (635,475), red, 5)
-      cv2.imwrite('temp.jpg', img)
-      img = Image.fromarray(img).resize((640,480))
-      imgtk = ImageTk.PhotoImage(image=img)        
+      cv2.rectangle(display_image,(5,5), (635,475), red, 5)
+      if not cv2.imwrite('temp.jpg', display_image):
+        raise OSError("vision result frame could not be persisted")
+      display_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
+      display = Image.fromarray(display_rgb).resize((640,480))
+      imgtk = ImageTk.PhotoImage(image=display)
       vid_lbl.imgtk = imgtk    
       vid_lbl.configure(image=imgtk)
       VisRetScoreEntryField.delete(0, 'end')
@@ -22058,10 +23866,10 @@ def zeroBrCn():
   VisBrightSlide.set(0)
   VisContrastSlide.set(0)
   #VisZoomSlide.set(50)
-  take_pic()
+  return take_pic()
 
 def VisUpdateBriCon(foo):
-  take_pic()  
+  return take_pic()
 
   
   
@@ -23461,8 +25269,8 @@ visFailEntryField.grid(row=3, column=1, sticky="ew", padx=(1, 2), pady=(0, 2))
 # Vision Find additional fields (placeholders - full UI on Tab 6)
 VisBacColorEntryField = Entry(tab1, width=6)  # Hidden, used by insertvisFind
 VisScoreEntryField = Entry(tab1, width=6)  # Hidden, used by insertvisFind
-VisBacColorEntryField.insert(0, "116, 116, 116")  # Default background color
-VisScoreEntryField.insert(0, "85")  # Default score threshold
+VisBacColorEntryField.insert(0, "[116, 116, 116]")
+VisScoreEntryField.insert(0, "85")
 
 # Row 9: Wait container
 waitContainer = LabelFrame(leftPanel, text="Wait - Stop", padding=5)
@@ -23593,34 +25401,41 @@ reloadBut.grid(row=1, column=4, sticky="ew", padx=2, pady=2)
 # Duplicate buttons removed - now in proper containers
 
 # ============================================================================
-# RIGHT PANEL - Joint and Cartesian Controls
+# RIGHT PANEL - Motion and Command Controls
 # ============================================================================
 rightPanel = Frame(tab1)
 rightPanel.grid(row=0, column=2, sticky="nsew", padx=2, pady=2)
 
 # Configure right panel grid
-rightPanel.grid_rowconfigure(0, weight=0)  # Joint controls - fixed height
-rightPanel.grid_rowconfigure(1, weight=0)  # Cartesian controls - fixed height
-rightPanel.grid_rowconfigure(2, weight=0)  # Tool controls - fixed height
-rightPanel.grid_rowconfigure(3, weight=0)  # Command builders - fixed height
-rightPanel.grid_rowconfigure(4, weight=0)  # Navigation - fixed height
-rightPanel.grid_rowconfigure(5, weight=0)  # Register commands - fixed height
-rightPanel.grid_rowconfigure(6, weight=0)  # Device commands - fixed height
-rightPanel.grid_rowconfigure(7, weight=1)  # Additional axes - compresses first when height reduced
-rightPanel.grid_rowconfigure(8, weight=2)  # Spacer - expands most
+rightPanel.grid_rowconfigure(0, weight=1)
+rightPanel.grid_rowconfigure(1, weight=0)
+rightPanel.grid_rowconfigure(2, weight=0)
+rightPanel.grid_rowconfigure(3, weight=0)
+rightPanel.grid_rowconfigure(4, weight=0)
+rightPanel.grid_rowconfigure(5, weight=0)
+rightPanel.grid_rowconfigure(6, weight=1)
 rightPanel.grid_columnconfigure(0, weight=1)
 rightPanel.grid_columnconfigure(1, weight=1)
 
-# Joint controls container (J1-J6)
-jointFrame = LabelFrame(
-    rightPanel,
-    text="Joint Control (J1-J6) - type target, press Enter",
-    padding=5,
+# Coordinate-space tabs keep unrelated jog modes out of the active workspace.
+motionControlNotebook = ttk_bootstrap.Notebook(rightPanel)
+motionControlNotebook.grid(
+  row=0,
+  column=0,
+  columnspan=2,
+  sticky="nsew",
+  padx=5,
+  pady=5,
 )
-jointFrame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+
+jointFrame = ttk_bootstrap.Frame(motionControlNotebook, padding=5)
+CartjogFrame = ttk_bootstrap.Frame(motionControlNotebook, padding=5)
+TooljogFrame = ttk_bootstrap.Frame(motionControlNotebook, padding=5)
+motionControlNotebook.add(jointFrame, text=" Joint ")
+motionControlNotebook.add(CartjogFrame, text=" Cartesian ")
+motionControlNotebook.add(TooljogFrame, text=" Tool Frame ")
 
 jointFrame.grid_columnconfigure(0, weight=1)
-jointFrame.grid_columnconfigure(1, weight=1)
 
 def create_joint_jog_frame(parent, row, col, joint_name, joint_num):
     frame = Frame(parent)
@@ -23659,7 +25474,6 @@ def create_joint_jog_frame(parent, row, col, joint_name, joint_num):
     
     return frame, entry, neg_but, pos_but, slider, slide_label, neg_lim_lab, pos_lim_lab
 
-# Create J1-J6 frames (2 columns x 3 rows)
 ##J1
 J1jogFrame, J1curAngEntryField, J1jogNegBut, J1jogPosBut, J1jogslide, J1slidelabel, J1negLimLab, J1posLimLab = create_joint_jog_frame(jointFrame, 0, 0, "J1", 1)
 
@@ -23746,7 +25560,7 @@ J3jogslide.config(command=J3sliderUpdate)
 J3jogslide.bind("<ButtonRelease-1>", J3sliderExecute)
 
 ##J4
-J4jogFrame, J4curAngEntryField, J4jogNegBut, J4jogPosBut, J4jogslide, J4slidelabel, J4negLimLab, J4posLimLab = create_joint_jog_frame(jointFrame, 0, 1, "J4", 4)
+J4jogFrame, J4curAngEntryField, J4jogNegBut, J4jogPosBut, J4jogslide, J4slidelabel, J4negLimLab, J4posLimLab = create_joint_jog_frame(jointFrame, 3, 0, "J4", 4)
 
 def SelJ4jogNeg(self):
   IncJogStatVal = int(RUN['IncJogStat'].get())
@@ -23774,7 +25588,7 @@ J4jogslide.config(command=J4sliderUpdate)
 J4jogslide.bind("<ButtonRelease-1>", J4sliderExecute)
 
 ##J5
-J5jogFrame, J5curAngEntryField, J5jogNegBut, J5jogPosBut, J5jogslide, J5slidelabel, J5negLimLab, J5posLimLab = create_joint_jog_frame(jointFrame, 1, 1, "J5", 5)
+J5jogFrame, J5curAngEntryField, J5jogNegBut, J5jogPosBut, J5jogslide, J5slidelabel, J5negLimLab, J5posLimLab = create_joint_jog_frame(jointFrame, 4, 0, "J5", 5)
 
 def SelJ5jogNeg(self):
   IncJogStatVal = int(RUN['IncJogStat'].get())
@@ -23802,7 +25616,7 @@ J5jogslide.config(command=J5sliderUpdate)
 J5jogslide.bind("<ButtonRelease-1>", J5sliderExecute)
 
 ##J6
-J6jogFrame, J6curAngEntryField, J6jogNegBut, J6jogPosBut, J6jogslide, J6slidelabel, J6negLimLab, J6posLimLab = create_joint_jog_frame(jointFrame, 2, 1, "J6", 6)
+J6jogFrame, J6curAngEntryField, J6jogNegBut, J6jogPosBut, J6jogslide, J6slidelabel, J6negLimLab, J6posLimLab = create_joint_jog_frame(jointFrame, 5, 0, "J6", 6)
 
 def SelJ6jogNeg(self):
   IncJogStatVal = int(RUN['IncJogStat'].get())
@@ -23829,43 +25643,120 @@ def J6sliderExecute(foo):
 J6jogslide.config(command=J6sliderUpdate)
 J6jogslide.bind("<ButtonRelease-1>", J6sliderExecute)
 
-# Cartesian jog controls
-CartjogFrame = LabelFrame(rightPanel, text="Cartesian Control (X Y Z Rz Ry Rx)", padding=5)
-CartjogFrame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+motionTrackingFrame = Frame(jointFrame)
+motionTrackingFrame.grid(
+  row=6,
+  column=0,
+  sticky="ew",
+  padx=4,
+  pady=(2, 0),
+)
+motionTrackingFrame.grid_columnconfigure(0, weight=1)
+motionTrackingFrame.grid_columnconfigure(1, weight=1)
+
+estimatedMotionCbut = Checkbutton(
+  motionTrackingFrame,
+  text="Estimated trajectory (cyan)",
+  variable=RUN['showEstimatedMotion'],
+  command=_refresh_joint_motion_visualization,
+)
+estimatedMotionCbut.grid(
+  row=0,
+  column=0,
+  sticky="w",
+)
+
+encoderTelemetryCbut = Checkbutton(
+  motionTrackingFrame,
+  text="Encoder sample (amber, J1-J6)",
+  variable=RUN['showEncoderTelemetry'],
+  command=_refresh_joint_motion_visualization,
+)
+encoderTelemetryCbut.grid(
+  row=0,
+  column=1,
+  sticky="w",
+)
+
+motionTrackingLegend = Label(
+  motionTrackingFrame,
+  text=(
+    "Slider thumb = desired input    "
+    "Violet bar = active move target\n"
+    "Cyan line = command estimate    "
+    "Amber marker = latest encoder sample"
+  ),
+  justify="left",
+)
+motionTrackingLegend.grid(
+  row=1,
+  column=0,
+  columnspan=2,
+  sticky="w",
+  pady=(2, 0),
+)
+
+namedPositionFrame = Frame(jointFrame)
+namedPositionFrame.grid(
+  row=7,
+  column=0,
+  sticky="ew",
+  padx=2,
+  pady=(4, 2),
+)
+namedPositionFrame.grid_columnconfigure(0, weight=1)
+namedPositionFrame.grid_columnconfigure(1, weight=1)
+
+startPositionBut = Button(
+  namedPositionFrame,
+  text="Start Position",
+  command=MoveToStartPosition,
+)
+startPositionBut.grid(row=0, column=0, sticky="ew", padx=(0, 2))
+
+shutdownPositionBut = Button(
+  namedPositionFrame,
+  text="Shutdown Position",
+  command=MoveToShutdownPosition,
+)
+shutdownPositionBut.grid(row=0, column=1, sticky="ew", padx=(2, 0))
 
 CartjogFrame.grid_columnconfigure(0, weight=1)
-CartjogFrame.grid_columnconfigure(1, weight=1)
-CartjogFrame.grid_columnconfigure(2, weight=1)
-CartjogFrame.grid_columnconfigure(3, weight=1)
-CartjogFrame.grid_columnconfigure(4, weight=1)
-CartjogFrame.grid_columnconfigure(5, weight=1)
 
 
-def create_cart_control(parent, row, col, label_text):
-    Label(parent, font=("Arial", 14), text=label_text).grid(row=row, column=col, pady=2)
-    
-    entry = Entry(parent, width=6, justify="center")
-    entry.grid(row=row+1, column=col, pady=2)
-    
-    # Create frame for horizontal button layout
-    button_frame = Frame(parent)
-    button_frame.grid(row=row+2, column=col, pady=2)
-    
-    neg_but = Button(button_frame, text="-", width=3)
-    neg_but.grid(row=0, column=0, padx=1)
-    
-    pos_but = Button(button_frame, text="+", width=3)
-    pos_but.grid(row=0, column=1, padx=1)
-    
+def create_cart_control(parent, row, label_text):
+    frame = Frame(parent)
+    frame.grid(row=row, column=0, sticky="ew", padx=2, pady=3)
+    frame.grid_columnconfigure(0, weight=0)
+    frame.grid_columnconfigure(1, weight=0)
+    frame.grid_columnconfigure(2, weight=1)
+    frame.grid_columnconfigure(3, weight=0)
+
+    Label(frame, font=("Arial", 14), text=label_text, width=4).grid(
+      row=0,
+      column=0,
+      padx=2,
+    )
+    entry = Entry(frame, width=10, justify="center")
+    entry.grid(row=0, column=1, padx=2)
+    neg_but = Button(frame, text="-", width=5)
+    neg_but.grid(row=0, column=2, sticky="e", padx=2)
+    pos_but = Button(frame, text="+", width=5)
+    pos_but.grid(row=0, column=3, padx=2)
     return entry, neg_but, pos_but
 
 # Create cartesian controls
-XcurEntryField, XjogNegBut, XjogPosBut = create_cart_control(CartjogFrame, 0, 0, "X")
-YcurEntryField, YjogNegBut, YjogPosBut = create_cart_control(CartjogFrame, 0, 1, "Y")
-ZcurEntryField, ZjogNegBut, ZjogPosBut = create_cart_control(CartjogFrame, 0, 2, "Z")
-RzcurEntryField, RzjogNegBut, RzjogPosBut = create_cart_control(CartjogFrame, 0, 3, "Rz")
-RycurEntryField, RyjogNegBut, RyjogPosBut = create_cart_control(CartjogFrame, 0, 4, "Ry")
-RxcurEntryField, RxjogNegBut, RxjogPosBut = create_cart_control(CartjogFrame, 0, 5, "Rx")
+XcurEntryField, XjogNegBut, XjogPosBut = create_cart_control(CartjogFrame, 0, "X")
+YcurEntryField, YjogNegBut, YjogPosBut = create_cart_control(CartjogFrame, 1, "Y")
+ZcurEntryField, ZjogNegBut, ZjogPosBut = create_cart_control(CartjogFrame, 2, "Z")
+RzcurEntryField, RzjogNegBut, RzjogPosBut = create_cart_control(CartjogFrame, 3, "Rz")
+RycurEntryField, RyjogNegBut, RyjogPosBut = create_cart_control(CartjogFrame, 4, "Ry")
+RxcurEntryField, RxjogNegBut, RxjogPosBut = create_cart_control(CartjogFrame, 5, "Rx")
+
+Label(
+  CartjogFrame,
+  text="Cartesian travel is kinematics-limited; no fixed slider bounds.",
+).grid(row=6, column=0, sticky="w", padx=4, pady=(6, 2))
 
 # Bind cartesian button events
 def SelXjogNeg(self):
@@ -23976,30 +25867,29 @@ def SelRxjogPos(self):
 RxjogPosBut.bind("<ButtonPress>", SelRxjogPos)
 RxjogPosBut.bind("<ButtonRelease>", StopJog)
 
-# Tool frame controls
-TooljogFrame = LabelFrame(rightPanel, text="Tool Frame Control (Tx Ty Tz Trz Try Trx)", padding=5)
-TooljogFrame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
-
 TooljogFrame.grid_columnconfigure(0, weight=1)
-TooljogFrame.grid_columnconfigure(1, weight=1)
-TooljogFrame.grid_columnconfigure(2, weight=1)
-TooljogFrame.grid_columnconfigure(3, weight=1)
-TooljogFrame.grid_columnconfigure(4, weight=1)
-TooljogFrame.grid_columnconfigure(5, weight=1)
 
-def create_tool_control(parent, col, label_text):
-    Label(parent, font=("Arial", 14), text=label_text).grid(row=0, column=col, pady=2)
-    
-    # Create frame for horizontal button layout
-    button_frame = Frame(parent)
-    button_frame.grid(row=1, column=col, pady=2)
-    
-    neg_but = Button(button_frame, text="-", width=3)
-    neg_but.grid(row=0, column=0, padx=1)
-    
-    pos_but = Button(button_frame, text="+", width=3)
-    pos_but.grid(row=0, column=1, padx=1)
-    
+def create_tool_control(parent, row, label_text):
+    frame = Frame(parent)
+    frame.grid(row=row, column=0, sticky="ew", padx=2, pady=3)
+    frame.grid_columnconfigure(0, weight=0)
+    frame.grid_columnconfigure(1, weight=1)
+    frame.grid_columnconfigure(2, weight=0)
+    Label(frame, font=("Arial", 14), text=label_text, width=4).grid(
+      row=0,
+      column=0,
+      padx=2,
+    )
+    Label(frame, text="Relative jog").grid(
+      row=0,
+      column=1,
+      sticky="w",
+      padx=4,
+    )
+    neg_but = Button(frame, text="-", width=5)
+    neg_but.grid(row=0, column=2, padx=2)
+    pos_but = Button(frame, text="+", width=5)
+    pos_but.grid(row=0, column=3, padx=2)
     return neg_but, pos_but
 
 # Create tool frame controls (no entry fields)
@@ -24009,6 +25899,11 @@ TZjogNegBut, TZjogPosBut = create_tool_control(TooljogFrame, 2, "Tz")
 TRzjogNegBut, TRzjogPosBut = create_tool_control(TooljogFrame, 3, "Trz")
 TRyjogNegBut, TRyjogPosBut = create_tool_control(TooljogFrame, 4, "Try")
 TRxjogNegBut, TRxjogPosBut = create_tool_control(TooljogFrame, 5, "Trx")
+
+Label(
+  TooljogFrame,
+  text="Tool-frame motion is relative; no absolute slider position exists.",
+).grid(row=6, column=0, sticky="w", padx=4, pady=(6, 2))
 
 # Bind tool frame button events
 def SelTXjogNeg(self):
@@ -24122,7 +26017,7 @@ TRxjogPosBut.bind("<ButtonRelease>", StopJog)
 
 # Extra axes (J7, J8, J9)
 extraAxesFrame = LabelFrame(rightPanel, text="Additional Axes", padding=5)
-extraAxesFrame.grid(row=7, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+extraAxesFrame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
 
 extraAxesFrame.grid_columnconfigure(0, weight=1)
 extraAxesFrame.grid_columnconfigure(1, weight=1)
@@ -24329,9 +26224,98 @@ def J9sliderExecute(foo):
 J9jogslide.config(command=J9sliderUpdate)
 J9jogslide.bind("<ButtonRelease-1>", J9sliderExecute)
 
+joint_motion_visualization = JointMotionVisualization(
+  sliders=(
+    J1jogslide, J2jogslide, J3jogslide,
+    J4jogslide, J5jogslide, J6jogslide,
+    J7jogslide, J8jogslide, J9jogslide,
+  ),
+  target_markers=(
+    GhostSliderMarker(
+      J1jogFrame, J1jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J2jogFrame, J2jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J3jogFrame, J3jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J4jogFrame, J4jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J5jogFrame, J5jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J6jogFrame, J6jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J7jogFrame, J7jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J8jogFrame, J8jogslide, TARGET_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J9jogFrame, J9jogslide, TARGET_MARKER_ROLE
+    ),
+  ),
+  estimated_markers=(
+    GhostSliderMarker(
+      J1jogFrame, J1jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J2jogFrame, J2jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J3jogFrame, J3jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J4jogFrame, J4jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J5jogFrame, J5jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J6jogFrame, J6jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J7jogFrame, J7jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J8jogFrame, J8jogslide, ESTIMATED_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J9jogFrame, J9jogslide, ESTIMATED_MARKER_ROLE
+    ),
+  ),
+  encoder_markers=(
+    GhostSliderMarker(
+      J1jogFrame, J1jogslide, ENCODER_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J2jogFrame, J2jogslide, ENCODER_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J3jogFrame, J3jogslide, ENCODER_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J4jogFrame, J4jogslide, ENCODER_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J5jogFrame, J5jogslide, ENCODER_MARKER_ROLE
+    ),
+    GhostSliderMarker(
+      J6jogFrame, J6jogslide, ENCODER_MARKER_ROLE
+    ),
+  ),
+  estimated_enabled_provider=RUN['showEstimatedMotion'].get,
+  encoder_enabled_provider=RUN['showEncoderTelemetry'].get,
+  actual_source_provider=_current_joint_actual_position_source,
+)
+
 # Command builders (IF, SET, WAIT - reordered and aligned)
 cmdFrame = LabelFrame(rightPanel, text="Command Builders", padding=5)
-cmdFrame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=(5, 2))
+cmdFrame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=(5, 2))
 
 # Configure columns for proper alignment
 cmdFrame.grid_columnconfigure(0, weight=0, minsize=45)   # Label
@@ -24428,7 +26412,7 @@ insertWaitBut.grid(row=2, column=8, sticky="ew", padx=2, pady=2)
 
 # Navigation container (2x2 grid layout)
 navFrame = LabelFrame(rightPanel, text="Navigation", padding=5)
-navFrame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+navFrame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
 
 # Configure 4 columns for 2x2 grid (button, entry, button, entry)
 navFrame.grid_columnconfigure(0, weight=1, minsize=100)  # Button 1
@@ -24464,7 +26448,7 @@ PlayGCEntryField.grid(row=1, column=3, sticky="ew", padx=2, pady=2)
 
 # Register Commands container
 regFrame = LabelFrame(rightPanel, text="Register Commands", padding=5)
-regFrame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+regFrame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
 
 # Configure columns for side-by-side layout
 regFrame.grid_columnconfigure(0, weight=1, minsize=120)  # Register button
@@ -24510,7 +26494,7 @@ posRegEntryField = storPosNumEntryField
 
 # Device Commands container
 devFrame = LabelFrame(rightPanel, text="Device Commands", padding=5)
-devFrame.grid(row=6, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+devFrame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
 
 # Configure columns
 devFrame.grid_columnconfigure(0, weight=1, minsize=100)  # Servo button
@@ -25062,7 +27046,7 @@ cmdFrame.grid(row=2, column=0, columnspan=5, sticky="ew", padx=5, pady=5)
 
 cmdFrame.grid_columnconfigure(0, weight=1)
 
-cmdSentLab = Label(cmdFrame, text="Last Command Sent to Controller")
+cmdSentLab = Label(cmdFrame, text="Last Requested Command")
 cmdSentLab.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 2))
 
 cmdSentEntryField = Entry(cmdFrame, width=120, justify="center")
@@ -25081,7 +27065,7 @@ cmdRecEntryField.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
 # ============================================================================
 tab3.grid_rowconfigure(0, weight=1)
 tab3.grid_rowconfigure(1, weight=1)
-tab3.grid_columnconfigure(0, weight=0, minsize=180)  # Motor Dir, Cal Dir
+tab3.grid_columnconfigure(0, weight=0, minsize=300)  # Motor Dir, Cal Dir/Switch
 tab3.grid_columnconfigure(1, weight=0, minsize=180)  # Pos Limits, Steps/Deg
 tab3.grid_columnconfigure(2, weight=0, minsize=220)  # Drive MS, Encoder CPR
 tab3.grid_columnconfigure(3, weight=0, minsize=280)  # DH Parameters, Tool Frame
@@ -25144,55 +27128,83 @@ J9MotDirEntryField.grid(row=8, column=1, sticky="w", padx=5, pady=2)
 # ============================================================================
 # Calibration Direction Frame (Row 1, Column 0)
 # ============================================================================
-calDirFrame = LabelFrame(tab3, text="Calibration Direction", padding=10)
+calDirFrame = LabelFrame(
+  tab3,
+  text="Calibration Direction / Active Switch",
+  padding=10,
+)
 calDirFrame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
 calDirFrame.grid_columnconfigure(0, weight=0)
-calDirFrame.grid_columnconfigure(1, weight=1)
+calDirFrame.grid_columnconfigure(1, weight=0)
+calDirFrame.grid_columnconfigure(2, weight=0)
+calDirFrame.grid_columnconfigure(3, weight=1)
+
+
+def _create_calibration_switch_field(parent, row):
+  active_label = Label(parent, font=("Arial", 8), text="Active")
+  active_label.grid(row=row, column=2, sticky="e", padx=(8, 2), pady=2)
+  field = ttk.Combobox(
+    parent,
+    values=("HIGH", "LOW"),
+    state="readonly",
+    width=6,
+  )
+  field.grid(row=row, column=3, sticky="w", padx=(2, 5), pady=2)
+  return field
 
 J1CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J1 Calibration Dir.")
 J1CalDirLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
 J1CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J1CalDirEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+J1CalSwitchField = _create_calibration_switch_field(calDirFrame, 0)
 
 J2CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J2 Calibration Dir.")
 J2CalDirLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
 J2CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J2CalDirEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+J2CalSwitchField = _create_calibration_switch_field(calDirFrame, 1)
 
 J3CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J3 Calibration Dir.")
 J3CalDirLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
 J3CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J3CalDirEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+J3CalSwitchField = _create_calibration_switch_field(calDirFrame, 2)
 
 J4CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J4 Calibration Dir.")
 J4CalDirLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
 J4CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J4CalDirEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+J4CalSwitchField = _create_calibration_switch_field(calDirFrame, 3)
 
 J5CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J5 Calibration Dir.")
 J5CalDirLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
 J5CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J5CalDirEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+J5CalSwitchField = _create_calibration_switch_field(calDirFrame, 4)
 
 J6CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J6 Calibration Dir.")
 J6CalDirLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
 J6CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J6CalDirEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
+J6CalSwitchField = _create_calibration_switch_field(calDirFrame, 5)
 
 J7CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J7 Calibration Dir.")
 J7CalDirLab_grid.grid(row=6, column=0, sticky="w", padx=5, pady=2)
 J7CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J7CalDirEntryField.grid(row=6, column=1, sticky="w", padx=5, pady=2)
+J7CalSwitchField = _create_calibration_switch_field(calDirFrame, 6)
 
 J8CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J8 Calibration Dir.")
 J8CalDirLab_grid.grid(row=7, column=0, sticky="w", padx=5, pady=2)
 J8CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J8CalDirEntryField.grid(row=7, column=1, sticky="w", padx=5, pady=2)
+J8CalSwitchField = _create_calibration_switch_field(calDirFrame, 7)
 
 J9CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J9 Calibration Dir.")
 J9CalDirLab_grid.grid(row=8, column=0, sticky="w", padx=5, pady=2)
 J9CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J9CalDirEntryField.grid(row=8, column=1, sticky="w", padx=5, pady=2)
+J9CalSwitchField = _create_calibration_switch_field(calDirFrame, 8)
 
 # ============================================================================
 # Position Limits Frame (Row 0, Column 1)
@@ -26875,6 +28887,168 @@ SP_16_E6_EntryField.grid(row=16, column=5, padx=1, pady=2)
 SP16Lab = Label(posRegistersFrame, text="PR16")
 SP16Lab.grid(row=16, column=6, sticky="w", padx=2, pady=2)
 
+program_register_entry_fields.update({
+  register: entry
+  for register, entry in enumerate(
+    (
+      R1EntryField,
+      R2EntryField,
+      R3EntryField,
+      R4EntryField,
+      R5EntryField,
+      R6EntryField,
+      R7EntryField,
+      R8EntryField,
+      R9EntryField,
+      R10EntryField,
+      R11EntryField,
+      R12EntryField,
+      R13EntryField,
+      R14EntryField,
+      R15EntryField,
+      R16EntryField,
+    ),
+    start=1,
+  )
+})
+program_position_register_entry_fields.update({
+  (register, element): entry
+  for register, entries in enumerate(
+    (
+      (
+        SP_1_E1_EntryField,
+        SP_1_E2_EntryField,
+        SP_1_E3_EntryField,
+        SP_1_E4_EntryField,
+        SP_1_E5_EntryField,
+        SP_1_E6_EntryField,
+      ),
+      (
+        SP_2_E1_EntryField,
+        SP_2_E2_EntryField,
+        SP_2_E3_EntryField,
+        SP_2_E4_EntryField,
+        SP_2_E5_EntryField,
+        SP_2_E6_EntryField,
+      ),
+      (
+        SP_3_E1_EntryField,
+        SP_3_E2_EntryField,
+        SP_3_E3_EntryField,
+        SP_3_E4_EntryField,
+        SP_3_E5_EntryField,
+        SP_3_E6_EntryField,
+      ),
+      (
+        SP_4_E1_EntryField,
+        SP_4_E2_EntryField,
+        SP_4_E3_EntryField,
+        SP_4_E4_EntryField,
+        SP_4_E5_EntryField,
+        SP_4_E6_EntryField,
+      ),
+      (
+        SP_5_E1_EntryField,
+        SP_5_E2_EntryField,
+        SP_5_E3_EntryField,
+        SP_5_E4_EntryField,
+        SP_5_E5_EntryField,
+        SP_5_E6_EntryField,
+      ),
+      (
+        SP_6_E1_EntryField,
+        SP_6_E2_EntryField,
+        SP_6_E3_EntryField,
+        SP_6_E4_EntryField,
+        SP_6_E5_EntryField,
+        SP_6_E6_EntryField,
+      ),
+      (
+        SP_7_E1_EntryField,
+        SP_7_E2_EntryField,
+        SP_7_E3_EntryField,
+        SP_7_E4_EntryField,
+        SP_7_E5_EntryField,
+        SP_7_E6_EntryField,
+      ),
+      (
+        SP_8_E1_EntryField,
+        SP_8_E2_EntryField,
+        SP_8_E3_EntryField,
+        SP_8_E4_EntryField,
+        SP_8_E5_EntryField,
+        SP_8_E6_EntryField,
+      ),
+      (
+        SP_9_E1_EntryField,
+        SP_9_E2_EntryField,
+        SP_9_E3_EntryField,
+        SP_9_E4_EntryField,
+        SP_9_E5_EntryField,
+        SP_9_E6_EntryField,
+      ),
+      (
+        SP_10_E1_EntryField,
+        SP_10_E2_EntryField,
+        SP_10_E3_EntryField,
+        SP_10_E4_EntryField,
+        SP_10_E5_EntryField,
+        SP_10_E6_EntryField,
+      ),
+      (
+        SP_11_E1_EntryField,
+        SP_11_E2_EntryField,
+        SP_11_E3_EntryField,
+        SP_11_E4_EntryField,
+        SP_11_E5_EntryField,
+        SP_11_E6_EntryField,
+      ),
+      (
+        SP_12_E1_EntryField,
+        SP_12_E2_EntryField,
+        SP_12_E3_EntryField,
+        SP_12_E4_EntryField,
+        SP_12_E5_EntryField,
+        SP_12_E6_EntryField,
+      ),
+      (
+        SP_13_E1_EntryField,
+        SP_13_E2_EntryField,
+        SP_13_E3_EntryField,
+        SP_13_E4_EntryField,
+        SP_13_E5_EntryField,
+        SP_13_E6_EntryField,
+      ),
+      (
+        SP_14_E1_EntryField,
+        SP_14_E2_EntryField,
+        SP_14_E3_EntryField,
+        SP_14_E4_EntryField,
+        SP_14_E5_EntryField,
+        SP_14_E6_EntryField,
+      ),
+      (
+        SP_15_E1_EntryField,
+        SP_15_E2_EntryField,
+        SP_15_E3_EntryField,
+        SP_15_E4_EntryField,
+        SP_15_E5_EntryField,
+        SP_15_E6_EntryField,
+      ),
+      (
+        SP_16_E1_EntryField,
+        SP_16_E2_EntryField,
+        SP_16_E3_EntryField,
+        SP_16_E4_EntryField,
+        SP_16_E5_EntryField,
+        SP_16_E6_EntryField,
+      ),
+    ),
+    start=1,
+  )
+  for element, entry in enumerate(entries, start=1)
+})
+
 
 ####TAB 6
 
@@ -27688,6 +29862,15 @@ J6CalDirEntryField.insert(0,str(CAL['J6CalDir']))
 J7CalDirEntryField.insert(0,str(CAL['J7CalDir']))
 J8CalDirEntryField.insert(0,str(CAL['J8CalDir']))
 J9CalDirEntryField.insert(0,str(CAL['J9CalDir']))
+J1CalSwitchField.set(CAL['J1CalSwitch'])
+J2CalSwitchField.set(CAL['J2CalSwitch'])
+J3CalSwitchField.set(CAL['J3CalSwitch'])
+J4CalSwitchField.set(CAL['J4CalSwitch'])
+J5CalSwitchField.set(CAL['J5CalSwitch'])
+J6CalSwitchField.set(CAL['J6CalSwitch'])
+J7CalSwitchField.set(CAL['J7CalSwitch'])
+J8CalSwitchField.set(CAL['J8CalSwitch'])
+J9CalSwitchField.set(CAL['J9CalSwitch'])
 J1PosLimEntryField.insert(0,str(CAL['J1PosLim']))
 J1NegLimEntryField.insert(0,str(CAL['J1NegLim']))
 J2PosLimEntryField.insert(0,str(CAL['J2PosLim']))
