@@ -520,6 +520,21 @@ Implemented portions of the active integration unit:
   changes use the same snapshot boundary, clear output assignments outside the
   selected board's pin range before replacing the serial connection, and
   preserve existing Tk binding identity when applying normalized values.
+  A failed replacement restores the prior validated configuration without
+  rewriting the stored port, board, or digital-output assignments. Active
+  connection authority remains in the serial handle and its board-profile
+  binding; an orphaned replacement that cannot be closed loses that binding
+  and cannot authorize output commands.
+  A completed connection change retains the staged configuration after a
+  later persistence or logging failure. Existing calibration persistence is
+  fenced before local mutation. A completed connection is verified without
+  rewriting committed local state; recovery targets are normalized and
+  re-read across live calibration, digital-output fields, and the relevant
+  selectors before persistence becomes dirty. Failed or partial recovery
+  disables the output profile and prevents an unverified queued save.
+  Pre-existing dirty persistence retains an isolated pre-attempt snapshot as
+  the recovery retry target, so the transaction's unverified state cannot
+  replace the already queued write.
   Calibration persistence verifies the complete temporary text write,
   synchronizes file contents, and uses platform-specific durable replacement;
   any pre-replacement failure preserves the prior profile.

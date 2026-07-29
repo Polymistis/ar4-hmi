@@ -6883,6 +6883,195 @@ def _replace_auxiliary_output_field_values(values):
   return previous
 
 
+def _cancel_auxiliary_calibration_persistence_job():
+  global _calibration_save_job
+
+  pending_job = _calibration_save_job
+  if pending_job is None:
+    return False
+  root.after_cancel(pending_job)
+  if _calibration_save_job is not pending_job:
+    raise RuntimeError(
+      "calibration persistence job changed during auxiliary fencing"
+    )
+  _calibration_save_job = None
+  return True
+
+
+def _begin_auxiliary_calibration_persistence_fence(calibration_snapshot):
+  global _calibration_save_snapshot
+
+  if not isinstance(calibration_snapshot, dict):
+    raise MotionInputError("auxiliary calibration snapshot must be a dictionary")
+  if not isinstance(_calibration_dirty, bool):
+    raise RuntimeError("calibration persistence dirty state is invalid")
+  if _calibration_save_job is not None and not _calibration_dirty:
+    logger.error(
+      "Cancelling an auxiliary calibration persistence job without dirty state"
+    )
+  _cancel_auxiliary_calibration_persistence_job()
+  if not _calibration_dirty:
+    _calibration_save_snapshot = None
+    return False, None
+  if _calibration_save_snapshot is None:
+    persistence_snapshot = dict(calibration_snapshot)
+  else:
+    persistence_snapshot = normalize_calibration_data(
+      snapshot_calibration_values(_calibration_save_snapshot)
+    )
+  return True, persistence_snapshot
+
+
+def _finish_auxiliary_calibration_persistence_fence(
+  previous_dirty,
+  previous_persistence_snapshot,
+  state_changed,
+  state_verified,
+):
+  global _calibration_dirty, _calibration_save_snapshot
+
+  if not isinstance(previous_dirty, bool):
+    raise TypeError("prior calibration persistence state must be boolean")
+  if previous_dirty:
+    if not isinstance(previous_persistence_snapshot, dict):
+      raise TypeError(
+        "prior calibration persistence snapshot must be a dictionary"
+      )
+  elif previous_persistence_snapshot is not None:
+    raise TypeError(
+      "clean calibration persistence cannot carry a pending snapshot"
+    )
+  if not isinstance(state_changed, bool):
+    raise TypeError("auxiliary configuration change state must be boolean")
+  if not isinstance(state_verified, bool):
+    raise TypeError("auxiliary configuration verification state must be boolean")
+  if not state_verified:
+    _cancel_auxiliary_calibration_persistence_job()
+    if previous_dirty:
+      retained = _retain_calibration_persistence_retry(
+        previous_persistence_snapshot
+      )
+      if not isinstance(retained, bool):
+        raise RuntimeError(
+          "calibration persistence retention returned an invalid result"
+        )
+      return retained
+    _calibration_dirty = False
+    _calibration_save_snapshot = None
+    return False
+  _cancel_auxiliary_calibration_persistence_job()
+  if state_changed:
+    retained = _retain_calibration_persistence_retry()
+    if not isinstance(retained, bool):
+      raise RuntimeError(
+        "calibration persistence retention returned an invalid result"
+      )
+    return retained
+  if previous_dirty:
+    retained = _retain_calibration_persistence_retry(
+      previous_persistence_snapshot
+    )
+    if not isinstance(retained, bool):
+      raise RuntimeError(
+        "calibration persistence retention returned an invalid result"
+      )
+    return retained
+  _calibration_dirty = False
+  _calibration_save_snapshot = None
+  return True
+
+
+def _apply_auxiliary_configuration_snapshot(
+  calibration_snapshot,
+  output_values,
+  port,
+  board,
+):
+  if not isinstance(calibration_snapshot, dict):
+    raise MotionInputError("auxiliary calibration snapshot must be a dictionary")
+  if not isinstance(output_values, dict):
+    raise MotionInputError("auxiliary output snapshot must be a dictionary")
+  if not isinstance(port, str):
+    raise MotionInputError("auxiliary port snapshot must be text")
+  normalized_board = normalize_auxiliary_board_profile(
+    board,
+    allow_none=True,
+  ) or AUXILIARY_BOARD_NONE
+  normalized_calibration = normalize_calibration_data(
+    calibration_snapshot
+  )
+  normalized_output_values = {
+    key: str(output_values.get(key, ""))
+    for key, _ in _auxiliary_output_field_bindings()
+  }
+  errors = []
+  try:
+    apply_calibration(normalized_calibration, CAL)
+    for key in tuple(CAL):
+      if key not in normalized_calibration:
+        del CAL[key]
+  except Exception as exc:
+    errors.append(f"live calibration update failed: {exc}")
+  try:
+    _replace_auxiliary_output_field_values(normalized_output_values)
+  except Exception as exc:
+    errors.append(f"output field update failed: {exc}")
+  try:
+    com2SelectedValue.set(port)
+  except Exception as exc:
+    errors.append(f"port selection update failed: {exc}")
+  try:
+    auxiliaryBoardSelectedValue.set(normalized_board)
+  except Exception as exc:
+    errors.append(f"board selection update failed: {exc}")
+  if errors:
+    raise RuntimeError("; ".join(errors))
+  return True
+
+
+def _verify_auxiliary_configuration_snapshot(
+  calibration_snapshot,
+  output_values,
+  port,
+  board,
+):
+  expected_calibration = normalize_calibration_data(calibration_snapshot)
+  observed_calibration = normalize_calibration_data(
+    snapshot_calibration_values(CAL)
+  )
+  if observed_calibration != expected_calibration:
+    raise RuntimeError(
+      "live calibration does not match the auxiliary configuration"
+    )
+  expected_output_values = {
+    key: str(output_values.get(key, ""))
+    for key, _ in _auxiliary_output_field_bindings()
+  }
+  observed_output_values = _read_auxiliary_output_field_values()
+  if observed_output_values != expected_output_values:
+    raise RuntimeError(
+      "output fields do not match the auxiliary configuration"
+    )
+  observed_port = com2SelectedValue.get()
+  if observed_port != port:
+    raise RuntimeError(
+      "port selection does not match the auxiliary configuration"
+    )
+  expected_board = normalize_auxiliary_board_profile(
+    board,
+    allow_none=True,
+  ) or AUXILIARY_BOARD_NONE
+  observed_board = normalize_auxiliary_board_profile(
+    auxiliaryBoardSelectedValue.get(),
+    allow_none=True,
+  ) or AUXILIARY_BOARD_NONE
+  if observed_board != expected_board:
+    raise RuntimeError(
+      "board selection does not match the auxiliary configuration"
+    )
+  return True
+
+
 @_synchronous_motion_request(
   "Auxiliary connection change",
   requires_kinematics=False,
@@ -6897,19 +7086,34 @@ def setCom2(misc=None):
     logger.warning("Auxiliary connection change rejected while the transport is busy")
     return False
   try:
-    previous_calibration = snapshot_calibration_values(CAL)
+    previous_calibration = normalize_calibration_data(
+      snapshot_calibration_values(CAL)
+    )
+    previous_output_values = _read_auxiliary_output_field_values()
   except Exception:
     logger.exception(
-      "Auxiliary connection change could not read live calibration values"
+      "Auxiliary connection change found invalid live configuration values"
     )
     auxiliary_serial_lock.release()
     return False
-  previous_port = previous_calibration.get('com2Port', "None")
-  previous_board = previous_calibration.get(
-    'auxiliaryBoard',
-    AUXILIARY_BOARD_NONE,
-  )
-  previous_output_values = None
+  try:
+    (
+      previous_persistence_dirty,
+      previous_persistence_snapshot,
+    ) = (
+      _begin_auxiliary_calibration_persistence_fence(
+        previous_calibration
+      )
+    )
+  except Exception:
+    logger.exception(
+      "Auxiliary connection change could not fence calibration persistence"
+    )
+    auxiliary_serial_lock.release()
+    return False
+  previous_serial = RUN.get('ser2')
+  staged_calibration = None
+  connection_change_completed = False
   try:
     selected_port = com2SelectedValue.get()
     if not isinstance(selected_port, str):
@@ -6924,17 +7128,25 @@ def setCom2(misc=None):
     committed_port = selected_port or "None"
     committed_board = selected_board or AUXILIARY_BOARD_NONE
     staged_calibration = dict(previous_calibration)
-    current_output_values = _read_auxiliary_output_field_values()
-    staged_calibration.update(current_output_values)
+    staged_calibration.update(previous_output_values)
     staged_calibration['com2Port'] = committed_port
     staged_calibration = reconcile_auxiliary_output_assignments(
       staged_calibration,
       committed_board,
     )
     staged_calibration = normalize_calibration_data(staged_calibration)
-    previous_output_values = current_output_values
-    _replace_auxiliary_output_field_values(staged_calibration)
-    apply_calibration(staged_calibration, CAL)
+    _apply_auxiliary_configuration_snapshot(
+      staged_calibration,
+      staged_calibration,
+      committed_port,
+      committed_board,
+    )
+    _verify_auxiliary_configuration_snapshot(
+      staged_calibration,
+      staged_calibration,
+      committed_port,
+      committed_board,
+    )
 
     if selected_port is None or selected_board is None:
       if RUN.get('ser2') is not None and not _close_serial_port(
@@ -6943,19 +7155,26 @@ def setCom2(misc=None):
       ):
         raise OSError("Unable to close the prior auxiliary connection")
       _clear_auxiliary_board_profile()
+      connection_change_completed = True
       logger.warning(
         "Auxiliary controller disabled until both a COM port and board profile "
         "are selected"
       )
     else:
       _replace_auxiliary_serial(selected_port, selected_board)
+      connection_change_completed = True
       logger.info(
         "COMMUNICATIONS STARTED WITH %s ARDUINO IO BOARD on port: %s",
         selected_board,
         selected_port,
       )
 
-    _retain_calibration_persistence_retry()
+    _finish_auxiliary_calibration_persistence_fence(
+      previous_persistence_dirty,
+      previous_persistence_snapshot,
+      True,
+      True,
+    )
     try:
       value = tab8.ElogView.get(0, END)
       pickle.dump(value, open("ErrorLog", "wb"))
@@ -6964,27 +7183,146 @@ def setCom2(misc=None):
     return True
   except Exception as e:
     try:
-      apply_calibration(previous_calibration, CAL)
+      _cancel_auxiliary_calibration_persistence_job()
     except Exception:
       logger.exception(
-        "Unable to restore live calibration after connection failure"
+        "Unable to cancel auxiliary calibration persistence during recovery"
       )
-    if previous_output_values is not None:
+    active_serial = RUN.get('ser2')
+    if (
+      not connection_change_completed
+      and active_serial is not None
+      and active_serial is not previous_serial
+      and not _close_serial_port(
+        'ser2',
+        "failed auxiliary connection replacement",
+      )
+    ):
+      _clear_auxiliary_board_profile(active_serial)
+    if connection_change_completed and staged_calibration is not None:
+      target_calibration = staged_calibration
+      target_output_values = staged_calibration
+      target_port = staged_calibration['com2Port']
+      target_board = staged_calibration['auxiliaryBoard']
+      apply_target = False
+      persistence_state_changed = True
+    else:
+      target_calibration = previous_calibration
+      target_output_values = previous_output_values
+      target_port = previous_calibration.get('com2Port', "None")
+      target_board = previous_calibration.get(
+        'auxiliaryBoard',
+        AUXILIARY_BOARD_NONE,
+      )
+      apply_target = True
+      persistence_state_changed = False
+
+    target_verified = False
+    if apply_target:
       try:
-        _replace_auxiliary_output_field_values(previous_output_values)
+        _apply_auxiliary_configuration_snapshot(
+          target_calibration,
+          target_output_values,
+          target_port,
+          target_board,
+        )
       except Exception:
         logger.exception(
-          "Unable to restore auxiliary output fields after connection failure"
+          "Unable to apply auxiliary recovery configuration"
         )
     try:
-      com2SelectedValue.set(previous_port)
-      auxiliaryBoardSelectedValue.set(previous_board)
+      _verify_auxiliary_configuration_snapshot(
+        target_calibration,
+        target_output_values,
+        target_port,
+        target_board,
+      )
+      target_verified = True
     except Exception:
-      logger.exception("Unable to restore the auxiliary configuration selection")
-    logger.error(
-      "UNABLE TO ESTABLISH COMMUNICATIONS WITH ARDUINO IO BOARD: %s",
-      e,
-    )
+      logger.exception(
+        "Auxiliary recovery verification failed"
+      )
+
+    if not target_verified:
+      active_serial = RUN.get('ser2')
+      if active_serial is not None:
+        if not _close_serial_port(
+          'ser2',
+          "failed auxiliary configuration recovery",
+        ):
+          _clear_auxiliary_board_profile(active_serial)
+      else:
+        _clear_auxiliary_board_profile()
+      try:
+        target_calibration = previous_calibration
+        target_output_values = previous_output_values
+        target_port = previous_calibration.get('com2Port', "None")
+        target_board = previous_calibration.get(
+          'auxiliaryBoard',
+          AUXILIARY_BOARD_NONE,
+        )
+        _apply_auxiliary_configuration_snapshot(
+          target_calibration,
+          target_output_values,
+          target_port,
+          target_board,
+        )
+        _verify_auxiliary_configuration_snapshot(
+          target_calibration,
+          target_output_values,
+          target_port,
+          target_board,
+        )
+        target_verified = True
+        persistence_state_changed = False
+      except Exception:
+        logger.exception(
+          "Unable to restore the prior auxiliary configuration"
+        )
+        active_serial = RUN.get('ser2')
+        if active_serial is not None:
+          _clear_auxiliary_board_profile(active_serial)
+        else:
+          _clear_auxiliary_board_profile()
+
+    try:
+      _finish_auxiliary_calibration_persistence_fence(
+        previous_persistence_dirty,
+        previous_persistence_snapshot,
+        persistence_state_changed,
+        target_verified,
+      )
+    except Exception:
+      logger.exception(
+        "Unable to settle auxiliary calibration persistence"
+      )
+      if not target_verified:
+        try:
+          _finish_auxiliary_calibration_persistence_fence(
+            previous_persistence_dirty,
+            previous_persistence_snapshot,
+            persistence_state_changed,
+            False,
+          )
+        except Exception:
+          logger.exception(
+            "Unable to disable persistence after auxiliary recovery failure"
+          )
+    if not target_verified:
+      logger.error(
+        "AUXILIARY CONFIGURATION RECOVERY FAILED; OUTPUT PROFILE DISABLED "
+        "AND THE UNVERIFIED STATE WILL NOT BE PERSISTED"
+      )
+    if connection_change_completed:
+      logger.error(
+        "AUXILIARY CONNECTION CHANGED BUT FOLLOW-UP FAILED: %s",
+        e,
+      )
+    else:
+      logger.error(
+        "UNABLE TO ESTABLISH COMMUNICATIONS WITH ARDUINO IO BOARD: %s",
+        e,
+      )
     try:
       value = tab8.ElogView.get(0, END)
       pickle.dump(value, open("ErrorLog", "wb"))
@@ -19216,6 +19554,7 @@ class CalibrationPoseSnapshot:
   resynchronization_required: bool
   persistence_dirty: bool
   persistence_job: object
+  persistence_snapshot: object
 
 
 @dataclass
@@ -19353,6 +19692,15 @@ def _capture_calibration_pose_snapshot():
     raise RuntimeError("calibration persistence state is invalid")
   if _calibration_save_job is not None and not persistence_dirty:
     raise RuntimeError("calibration persistence job has no dirty state")
+  persistence_snapshot = _calibration_save_snapshot
+  if persistence_snapshot is not None:
+    if not persistence_dirty:
+      raise RuntimeError(
+        "clean calibration persistence has a pending snapshot"
+      )
+    persistence_snapshot = normalize_calibration_data(
+      snapshot_calibration_values(persistence_snapshot)
+    )
 
   return CalibrationPoseSnapshot(
     calibration_values,
@@ -19368,12 +19716,14 @@ def _capture_calibration_pose_snapshot():
     resynchronization_required,
     persistence_dirty,
     _calibration_save_job,
+    persistence_snapshot,
   )
 
 
 def _restore_calibration_pose_snapshot(snapshot):
   global _calibration_dirty
   global _calibration_save_job
+  global _calibration_save_snapshot
   global acknowledged_forced_position_target
   global confirmed_position_generation
 
@@ -19396,6 +19746,18 @@ def _restore_calibration_pose_snapshot(snapshot):
     raise RuntimeError("calibration resynchronization snapshot is invalid")
   if not isinstance(snapshot.persistence_dirty, bool):
     raise RuntimeError("calibration persistence snapshot is invalid")
+  if (
+    snapshot.persistence_snapshot is not None
+    and not snapshot.persistence_dirty
+  ):
+    raise RuntimeError(
+      "clean calibration pose snapshot has pending persistence"
+    )
+  persistence_snapshot = None
+  if snapshot.persistence_snapshot is not None:
+    persistence_snapshot = normalize_calibration_data(
+      snapshot.persistence_snapshot
+    )
 
   for key, value in snapshot.calibration_values:
     CAL[key] = value
@@ -19446,6 +19808,7 @@ def _restore_calibration_pose_snapshot(snapshot):
   persistence_changed = (
     _calibration_dirty != snapshot.persistence_dirty
     or _calibration_save_job is not snapshot.persistence_job
+    or _calibration_save_snapshot != persistence_snapshot
   )
   if persistence_changed:
     pending_job = _calibration_save_job
@@ -19458,6 +19821,7 @@ def _restore_calibration_pose_snapshot(snapshot):
         )
     _calibration_save_job = None
     _calibration_dirty = True
+    _calibration_save_snapshot = None
     try:
       shutdown_started = application_closing.is_set()
       if not isinstance(shutdown_started, bool):
@@ -21129,23 +21493,32 @@ def CalRestPos():
 CALIBRATION_SAVE_DEBOUNCE_MS = 250
 _calibration_save_job = None
 _calibration_dirty = False
+_calibration_save_snapshot = None
 
 
 def _write_pending_calibration():
   global _calibration_save_job, _calibration_dirty
+  global _calibration_save_snapshot
   _calibration_save_job = None
   if not _calibration_dirty:
+    _calibration_save_snapshot = None
     return True
 
+  persistence_target = (
+    CAL
+    if _calibration_save_snapshot is None
+    else _calibration_save_snapshot
+  )
   failure_logged = False
   try:
-    persisted = save_calibration(CAL)
+    persisted = save_calibration(persistence_target)
   except Exception:
     persisted = False
     failure_logged = True
     logger.exception("Unable to persist the latest calibration state")
   if persisted is True:
     _calibration_dirty = False
+    _calibration_save_snapshot = None
     return True
 
   if persisted is not False:
@@ -21163,9 +21536,17 @@ def _write_pending_calibration():
   return False
 
 
-def _schedule_calibration_save():
+def _schedule_calibration_save(calibration_snapshot=None):
   global _calibration_save_job, _calibration_dirty
+  global _calibration_save_snapshot
+  if calibration_snapshot is None:
+    normalized_snapshot = None
+  else:
+    normalized_snapshot = normalize_calibration_data(
+      snapshot_calibration_values(calibration_snapshot)
+    )
   _calibration_dirty = True
+  _calibration_save_snapshot = normalized_snapshot
   if _calibration_save_job is not None:
     root.after_cancel(_calibration_save_job)
     _calibration_save_job = None
@@ -21187,11 +21568,11 @@ def _flush_calibration_save():
   return _write_pending_calibration()
 
 
-def _retain_calibration_persistence_retry():
+def _retain_calibration_persistence_retry(calibration_snapshot=None):
   global _calibration_dirty
 
   try:
-    _schedule_calibration_save()
+    _schedule_calibration_save(calibration_snapshot)
   except Exception:
     _calibration_dirty = True
     logger.exception("Unable to schedule calibration persistence retry")

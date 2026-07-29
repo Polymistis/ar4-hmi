@@ -540,6 +540,11 @@ class HmiSourceContractTests(unittest.TestCase):
                 "CalibrationPoseSnapshot",
                 namespace,
             )
+        if name in (
+            "_capture_calibration_pose_snapshot",
+            "_restore_calibration_pose_snapshot",
+        ):
+            namespace.setdefault("_calibration_save_snapshot", None)
         if (
             name != "_motion_request_rejection_message"
             and "_motion_request_rejection_message" not in namespace
@@ -597,6 +602,14 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault(
             "reconcile_auxiliary_output_assignments",
             reconcile_auxiliary_output_assignments,
+        )
+        namespace.setdefault(
+            "_auxiliary_output_field_bindings",
+            lambda: tuple(
+                (f"DO{output}{state}", None)
+                for output in range(1, 7)
+                for state in ("on", "off")
+            ),
         )
         namespace.setdefault(
             "validate_controller_filename",
@@ -674,6 +687,34 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace.setdefault("_auxiliary_stop_not_required", lambda: False)
         if name == "setCom" and "_set_com_admitted" not in namespace:
             self.compile_function("_set_com_admitted", namespace)
+        if name in (
+            "setCom2",
+            "_write_pending_calibration",
+            "_schedule_calibration_save",
+            "_flush_calibration_save",
+            "_retain_calibration_persistence_retry",
+        ):
+            namespace.setdefault("_calibration_dirty", False)
+            namespace.setdefault("_calibration_save_job", None)
+            namespace.setdefault("_calibration_save_snapshot", None)
+        if name == "setCom2":
+            namespace.setdefault(
+                "root",
+                SimpleNamespace(after_cancel=lambda job: None),
+            )
+            namespace.setdefault(
+                "_retain_calibration_persistence_retry",
+                lambda: True,
+            )
+            for helper_name in (
+                "_cancel_auxiliary_calibration_persistence_job",
+                "_begin_auxiliary_calibration_persistence_fence",
+                "_finish_auxiliary_calibration_persistence_fence",
+                "_apply_auxiliary_configuration_snapshot",
+                "_verify_auxiliary_configuration_snapshot",
+            ):
+                if helper_name not in namespace:
+                    self.compile_function(helper_name, namespace)
         if name in (
             "_read_auxiliary_inactive_stop_response",
             "_run_auxiliary_stop_safe",
@@ -1465,6 +1506,17 @@ class HmiSourceContractTests(unittest.TestCase):
         return json.loads(
             (PROJECT_ROOT / "defaults.json").read_text(encoding="utf-8")
         )
+
+    @staticmethod
+    def _auxiliary_output_values(calibration):
+        return {
+            f"DO{output}{state}": calibration.get(
+                f"DO{output}{state}",
+                "",
+            )
+            for output in range(1, 7)
+            for state in ("on", "off")
+        }
 
     @classmethod
     def _valid_custom_calibration_profile(cls):
@@ -5621,12 +5673,19 @@ class HmiSourceContractTests(unittest.TestCase):
                 return False
 
         outcomes = [False, True]
+        persisted_values = []
         root = Root()
         logger = Logger()
         namespace = {
             "_calibration_save_job": "initial-job",
             "_calibration_dirty": True,
-            "save_calibration": lambda calibration: outcomes.pop(0),
+            "_calibration_save_snapshot": {"J1AngCur": "0"},
+            "save_calibration": (
+                lambda calibration: (
+                    persisted_values.append(dict(calibration))
+                    or outcomes.pop(0)
+                )
+            ),
             "CAL": {"J1AngCur": "1"},
             "logger": logger,
             "application_closing": Closing(),
@@ -5643,12 +5702,21 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(write_pending())
         self.assertTrue(namespace["_calibration_dirty"])
         self.assertEqual(namespace["_calibration_save_job"], "job-1")
+        self.assertEqual(
+            namespace["_calibration_save_snapshot"],
+            {"J1AngCur": "0"},
+        )
         self.assertEqual(len(root.jobs), 1)
         self.assertEqual(logger.exceptions, [])
 
         self.assertTrue(write_pending())
         self.assertFalse(namespace["_calibration_dirty"])
         self.assertIsNone(namespace["_calibration_save_job"])
+        self.assertIsNone(namespace["_calibration_save_snapshot"])
+        self.assertEqual(
+            persisted_values,
+            [{"J1AngCur": "0"}, {"J1AngCur": "0"}],
+        )
 
     def test_shutdown_requests_online_and_offline_stop_before_final_flush(self):
         class Flag:
@@ -9129,6 +9197,15 @@ class HmiSourceContractTests(unittest.TestCase):
             "_replace_auxiliary_output_field_values",
             namespace,
         )
+        self.assertEqual(
+            tuple(
+                key
+                for key, _ in namespace[
+                    "_auxiliary_output_field_bindings"
+                ]()
+            ),
+            tuple(self._auxiliary_output_values({})),
+        )
         original = read_values()
 
         with self.assertRaisesRegex(RuntimeError, "field update failed"):
@@ -9151,6 +9228,7 @@ class HmiSourceContractTests(unittest.TestCase):
             calibration = self._valid_runtime_calibration()
             calibration["com2Port"] = "COM2"
             calibration["auxiliaryBoard"] = AUXILIARY_BOARD_MEGA
+            output_values = self._auxiliary_output_values(calibration)
             namespace = {
                 "wraps": wraps,
                 "motion_request_registry": motion_registry,
@@ -9169,7 +9247,9 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_replace_auxiliary_serial": (
                     lambda port, board: replacement_calls.append((port, board))
                 ),
-                "_read_auxiliary_output_field_values": lambda: {},
+                "_read_auxiliary_output_field_values": (
+                    lambda: dict(output_values)
+                ),
                 "_replace_auxiliary_output_field_values": lambda values: {},
                 "_close_serial_port": lambda *args: True,
                 "logger": SimpleNamespace(
@@ -9205,7 +9285,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.assertFalse(namespace["auxiliary_serial_lock"].locked())
                 self.assertEqual(namespace["CAL"]["com2Port"], "COM2")
 
-    def test_auxiliary_connection_transaction_commits_only_after_success(self):
+    def test_auxiliary_connection_transaction_reconciles_failure_state(self):
         class Selection:
             def __init__(self, value):
                 self.value = value
@@ -9218,7 +9298,12 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.value = value
                 self.set_calls.append(value)
 
-        def run_case(replacement_error=None, disable_close=True, disable=False):
+        def run_case(
+            replacement_error=None,
+            disable_close=True,
+            disable=False,
+            follow_up_error=None,
+        ):
             port_selection = Selection("None" if disable else "COM9")
             board_selection = Selection(
                 AUXILIARY_BOARD_NONE if disable else AUXILIARY_BOARD_NANO
@@ -9229,11 +9314,26 @@ class HmiSourceContractTests(unittest.TestCase):
             runtime = {"ser2": SimpleNamespace(is_open=True) if disable else None}
             replacement_calls = []
             persistence_calls = []
+            output_values = self._auxiliary_output_values(calibration)
 
             def replace(port, board):
                 replacement_calls.append((port, board))
                 if replacement_error is not None:
                     raise replacement_error
+
+            def retain_persistence():
+                persistence_calls.append(dict(calibration))
+                return True
+
+            def replace_output_values(values):
+                previous = dict(output_values)
+                for key in output_values:
+                    output_values[key] = str(values[key])
+                return previous
+
+            def log_connection(*args):
+                if follow_up_error is not None:
+                    raise follow_up_error
 
             namespace = {
                 "wraps": wraps,
@@ -9245,14 +9345,16 @@ class HmiSourceContractTests(unittest.TestCase):
                 "com2SelectedValue": port_selection,
                 "auxiliaryBoardSelectedValue": board_selection,
                 "_replace_auxiliary_serial": replace,
-                "_read_auxiliary_output_field_values": lambda: {},
-                "_replace_auxiliary_output_field_values": lambda values: {},
-                "_close_serial_port": lambda *args: disable_close,
-                "_retain_calibration_persistence_retry": (
-                    lambda: persistence_calls.append(dict(calibration)) or True
+                "_read_auxiliary_output_field_values": (
+                    lambda: dict(output_values)
                 ),
+                "_replace_auxiliary_output_field_values": (
+                    replace_output_values
+                ),
+                "_close_serial_port": lambda *args: disable_close,
+                "_retain_calibration_persistence_retry": retain_persistence,
                 "logger": SimpleNamespace(
-                    info=lambda *args: None,
+                    info=log_connection,
                     warning=lambda *args: None,
                     error=lambda *args: None,
                     exception=lambda *args: None,
@@ -9303,18 +9405,450 @@ class HmiSourceContractTests(unittest.TestCase):
         open_failure = run_case(replacement_error=OSError("open failed"))
         self.assertFalse(open_failure[0])
         self.assertEqual(open_failure[1]["com2Port"], "COM2")
-        self.assertEqual(open_failure[1]["auxiliaryBoard"], AUXILIARY_BOARD_MEGA)
-        self.assertEqual(open_failure[2].set_calls, ["COM2"])
-        self.assertEqual(open_failure[3].set_calls, [AUXILIARY_BOARD_MEGA])
+        self.assertEqual(
+            open_failure[1]["auxiliaryBoard"],
+            AUXILIARY_BOARD_MEGA,
+        )
+        self.assertEqual(open_failure[2].set_calls, ["COM9", "COM2"])
+        self.assertEqual(
+            open_failure[3].set_calls,
+            [AUXILIARY_BOARD_NANO, AUXILIARY_BOARD_MEGA],
+        )
         self.assertEqual(open_failure[5], [])
 
         close_failure = run_case(disable=True, disable_close=False)
         self.assertFalse(close_failure[0])
         self.assertEqual(close_failure[1]["com2Port"], "COM2")
         self.assertEqual(close_failure[1]["auxiliaryBoard"], AUXILIARY_BOARD_MEGA)
-        self.assertEqual(close_failure[2].set_calls, ["COM2"])
-        self.assertEqual(close_failure[3].set_calls, [AUXILIARY_BOARD_MEGA])
+        self.assertEqual(close_failure[2].set_calls, ["None", "COM2"])
+        self.assertEqual(
+            close_failure[3].set_calls,
+            [AUXILIARY_BOARD_NONE, AUXILIARY_BOARD_MEGA],
+        )
         self.assertEqual(close_failure[5], [])
+
+        follow_up_failure = run_case(
+            follow_up_error=RuntimeError("logging failed"),
+        )
+        self.assertFalse(follow_up_failure[0])
+        self.assertEqual(follow_up_failure[1]["com2Port"], "COM9")
+        self.assertEqual(
+            follow_up_failure[1]["auxiliaryBoard"],
+            AUXILIARY_BOARD_NANO,
+        )
+        self.assertEqual(follow_up_failure[2].set_calls, ["COM9"])
+        self.assertEqual(
+            follow_up_failure[3].set_calls,
+            [AUXILIARY_BOARD_NANO],
+        )
+        self.assertEqual(
+            follow_up_failure[4],
+            [("COM9", AUXILIARY_BOARD_NANO)],
+        )
+        self.assertEqual(len(follow_up_failure[5]), 1)
+        self.assertEqual(
+            follow_up_failure[5][0]["com2Port"],
+            "COM9",
+        )
+
+    def test_auxiliary_connection_failure_after_prior_close_restores_configuration(self):
+        class Selection:
+            def __init__(self, value):
+                self.value = value
+                self.set_calls = []
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+                self.set_calls.append(value)
+
+        previous_serial = SimpleNamespace(is_open=True)
+        runtime = {
+            "ser2": previous_serial,
+            "ser2BoardProfile": (
+                previous_serial,
+                AUXILIARY_BOARD_MEGA,
+            ),
+        }
+        calibration = self._valid_runtime_calibration()
+        calibration.update({
+            "com2Port": "COM2",
+            "auxiliaryBoard": AUXILIARY_BOARD_MEGA,
+            "DO1on": "28",
+        })
+        output_values = self._auxiliary_output_values(calibration)
+        persistence_calls = []
+        port_selection = Selection("COM9")
+        board_selection = Selection(AUXILIARY_BOARD_NANO)
+
+        def replace_output_values(values):
+            previous = dict(output_values)
+            output_values["DO1on"] = values["DO1on"]
+            return previous
+
+        def fail_after_close(port, board):
+            previous_serial.is_open = False
+            runtime["ser2"] = None
+            runtime["ser2BoardProfile"] = None
+            raise OSError("replacement open failed")
+
+        namespace = {
+            "wraps": wraps,
+            "motion_request_registry": MotionRequestRegistry(),
+            "application_closing": threading.Event(),
+            "auxiliary_serial_lock": threading.Lock(),
+            "CAL": calibration,
+            "RUN": runtime,
+            "com2SelectedValue": port_selection,
+            "auxiliaryBoardSelectedValue": board_selection,
+            "_replace_auxiliary_serial": fail_after_close,
+            "_read_auxiliary_output_field_values": (
+                lambda: dict(output_values)
+            ),
+            "_replace_auxiliary_output_field_values": replace_output_values,
+            "_close_serial_port": lambda *args: True,
+            "_retain_calibration_persistence_retry": (
+                lambda: persistence_calls.append(dict(calibration)) or True
+            ),
+            "logger": SimpleNamespace(
+                info=lambda *args: None,
+                warning=lambda *args: None,
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "tab8": SimpleNamespace(
+                ElogView=SimpleNamespace(get=lambda *args: ())
+            ),
+            "pickle": SimpleNamespace(dump=lambda *args: None),
+            "open": lambda *args, **kwargs: object(),
+            "END": "end",
+        }
+        namespace["_synchronous_motion_request"] = self.compile_function(
+            "_synchronous_motion_request",
+            namespace,
+        )
+        callback = self.compile_function(
+            "setCom2",
+            namespace,
+            preserve_decorators=True,
+        )
+
+        self.assertFalse(callback())
+        self.assertIsNone(runtime["ser2"])
+        self.assertEqual(calibration["com2Port"], "COM2")
+        self.assertEqual(
+            calibration["auxiliaryBoard"],
+            AUXILIARY_BOARD_MEGA,
+        )
+        self.assertEqual(calibration["DO1on"], "28")
+        self.assertEqual(output_values["DO1on"], "28")
+        self.assertEqual(port_selection.set_calls, ["COM9", "COM2"])
+        self.assertEqual(
+            board_selection.set_calls,
+            [AUXILIARY_BOARD_NANO, AUXILIARY_BOARD_MEGA],
+        )
+        self.assertEqual(persistence_calls, [])
+        self.assertFalse(namespace["auxiliary_serial_lock"].locked())
+        self.assertFalse(namespace["motion_request_registry"].active)
+
+    def test_auxiliary_connection_retries_failed_output_field_rollback(self):
+        class Selection:
+            def __init__(self, value):
+                self.value = value
+                self.set_calls = []
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+                self.set_calls.append(value)
+
+        calibration = self._valid_runtime_calibration()
+        calibration.update({
+            "com2Port": "COM2",
+            "auxiliaryBoard": AUXILIARY_BOARD_MEGA,
+            "DO1on": "28",
+        })
+        output_values = self._auxiliary_output_values(calibration)
+        replacement_calls = []
+        replacement_attempts = []
+
+        def replace_output_values(values):
+            replacement_attempts.append(dict(values))
+            for key in output_values:
+                output_values[key] = str(values[key])
+            if len(replacement_attempts) == 1:
+                raise RuntimeError("field update and rollback failed")
+            return {}
+
+        port_selection = Selection("COM9")
+        board_selection = Selection(AUXILIARY_BOARD_NANO)
+        namespace = {
+            "wraps": wraps,
+            "motion_request_registry": MotionRequestRegistry(),
+            "application_closing": threading.Event(),
+            "auxiliary_serial_lock": threading.Lock(),
+            "CAL": calibration,
+            "RUN": {"ser2": None},
+            "com2SelectedValue": port_selection,
+            "auxiliaryBoardSelectedValue": board_selection,
+            "_replace_auxiliary_serial": (
+                lambda *args: replacement_calls.append(args)
+            ),
+            "_read_auxiliary_output_field_values": (
+                lambda: dict(output_values)
+            ),
+            "_replace_auxiliary_output_field_values": replace_output_values,
+            "_close_serial_port": lambda *args: True,
+            "_retain_calibration_persistence_retry": lambda: True,
+            "logger": SimpleNamespace(
+                info=lambda *args: None,
+                warning=lambda *args: None,
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "tab8": SimpleNamespace(
+                ElogView=SimpleNamespace(get=lambda *args: ())
+            ),
+            "pickle": SimpleNamespace(dump=lambda *args: None),
+            "open": lambda *args, **kwargs: object(),
+            "END": "end",
+        }
+        namespace["_synchronous_motion_request"] = self.compile_function(
+            "_synchronous_motion_request",
+            namespace,
+        )
+        callback = self.compile_function(
+            "setCom2",
+            namespace,
+            preserve_decorators=True,
+        )
+
+        self.assertFalse(callback())
+        self.assertEqual(len(replacement_attempts), 2)
+        self.assertEqual(replacement_attempts[0]["DO1on"], "")
+        self.assertEqual(replacement_attempts[1]["DO1on"], "28")
+        self.assertEqual(
+            set(replacement_attempts[1]),
+            set(output_values),
+        )
+        self.assertEqual(output_values["DO1on"], "28")
+        self.assertEqual(calibration["com2Port"], "COM2")
+        self.assertEqual(
+            calibration["auxiliaryBoard"],
+            AUXILIARY_BOARD_MEGA,
+        )
+        self.assertEqual(port_selection.set_calls, ["COM9", "COM2"])
+        self.assertEqual(
+            board_selection.set_calls,
+            [AUXILIARY_BOARD_NANO, AUXILIARY_BOARD_MEGA],
+        )
+        self.assertEqual(replacement_calls, [])
+        self.assertFalse(namespace["auxiliary_serial_lock"].locked())
+        self.assertFalse(namespace["motion_request_registry"].active)
+
+    def test_auxiliary_post_connection_failures_retain_prior_persistence(self):
+        class Selection:
+            def __init__(self, value, fail_on_call=None):
+                self.value = value
+                self.fail_on_call = fail_on_call
+                self.set_calls = []
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.set_calls.append(value)
+                if len(self.set_calls) == self.fail_on_call:
+                    self.value = "BROKEN"
+                    raise RuntimeError("selection rollback failed")
+                self.value = value
+
+        for failed_boundary in ("calibration", "output", "selection"):
+            with self.subTest(failed_boundary=failed_boundary):
+                previous_serial = SimpleNamespace(is_open=True)
+                runtime = {
+                    "ser2": previous_serial,
+                    "ser2BoardProfile": (
+                        previous_serial,
+                        AUXILIARY_BOARD_MEGA,
+                    ),
+                }
+                calibration = self._valid_runtime_calibration()
+                calibration.update({
+                    "com2Port": "COM2",
+                    "auxiliaryBoard": AUXILIARY_BOARD_MEGA,
+                    "DO1on": "28",
+                })
+                output_values = self._auxiliary_output_values(calibration)
+                output_replacements = []
+                calibration_applications = []
+                persistence_calls = []
+                cancelled_jobs = []
+                errors = []
+                port_selection = Selection(
+                    "COM9",
+                    fail_on_call=(
+                        2
+                        if failed_boundary == "selection"
+                        else None
+                    ),
+                )
+                board_selection = Selection(AUXILIARY_BOARD_NANO)
+
+                def replace_serial(port, board):
+                    replacement = SimpleNamespace(is_open=True)
+                    runtime["ser2"] = replacement
+                    runtime["ser2BoardProfile"] = (
+                        replacement,
+                        board,
+                    )
+                    return replacement
+
+                def close_serial(name, context):
+                    serial_port = runtime.get(name)
+                    if serial_port is not None:
+                        serial_port.is_open = False
+                    runtime[name] = None
+                    runtime["ser2BoardProfile"] = None
+                    return True
+
+                def replace_output_values(values):
+                    output_replacements.append(dict(values))
+                    for key in output_values:
+                        output_values[key] = str(values[key])
+                    if (
+                        failed_boundary == "output"
+                        and len(output_replacements) == 2
+                    ):
+                        output_values["DO1on"] = "BROKEN"
+                        raise RuntimeError("output rollback failed")
+                    return {}
+
+                def apply_values(values, target):
+                    calibration_applications.append(dict(values))
+                    apply_calibration(values, target)
+                    if (
+                        failed_boundary == "calibration"
+                        and len(calibration_applications) == 2
+                    ):
+                        target["com2Port"] = "BROKEN"
+                        raise RuntimeError("calibration rollback failed")
+
+                def fail_connection_log(*args):
+                    if failed_boundary == "calibration":
+                        calibration["com2Port"] = "BROKEN"
+                    elif failed_boundary == "output":
+                        output_values["DO1on"] = "BROKEN"
+                    else:
+                        port_selection.value = "BROKEN"
+                    raise RuntimeError("post-connection logging failed")
+
+                namespace = {
+                    "_calibration_dirty": True,
+                    "_calibration_save_job": "pending-job",
+                    "root": SimpleNamespace(
+                        after_cancel=cancelled_jobs.append,
+                    ),
+                    "wraps": wraps,
+                    "motion_request_registry": MotionRequestRegistry(),
+                    "application_closing": threading.Event(),
+                    "auxiliary_serial_lock": threading.Lock(),
+                    "CAL": calibration,
+                    "RUN": runtime,
+                    "apply_calibration": apply_values,
+                    "com2SelectedValue": port_selection,
+                    "auxiliaryBoardSelectedValue": board_selection,
+                    "_replace_auxiliary_serial": replace_serial,
+                    "_read_auxiliary_output_field_values": (
+                        lambda: dict(output_values)
+                    ),
+                    "_replace_auxiliary_output_field_values": (
+                        replace_output_values
+                    ),
+                    "_close_serial_port": close_serial,
+                    "_retain_calibration_persistence_retry": (
+                        lambda snapshot=None: (
+                            persistence_calls.append(snapshot)
+                            or True
+                        )
+                    ),
+                    "logger": SimpleNamespace(
+                        info=fail_connection_log,
+                        warning=lambda *args: None,
+                        error=lambda *args: errors.append(args),
+                        exception=lambda *args: None,
+                    ),
+                    "tab8": SimpleNamespace(
+                        ElogView=SimpleNamespace(get=lambda *args: ())
+                    ),
+                    "pickle": SimpleNamespace(dump=lambda *args: None),
+                    "open": lambda *args, **kwargs: object(),
+                    "END": "end",
+                }
+                namespace["_synchronous_motion_request"] = (
+                    self.compile_function(
+                        "_synchronous_motion_request",
+                        namespace,
+                    )
+                )
+                callback = self.compile_function(
+                    "setCom2",
+                    namespace,
+                    preserve_decorators=True,
+                )
+
+                self.assertFalse(callback())
+                self.assertEqual(len(persistence_calls), 1)
+                self.assertEqual(
+                    persistence_calls[0]["com2Port"],
+                    "COM2",
+                )
+                self.assertEqual(
+                    persistence_calls[0]["auxiliaryBoard"],
+                    AUXILIARY_BOARD_MEGA,
+                )
+                self.assertEqual(
+                    persistence_calls[0]["DO1on"],
+                    "28",
+                )
+                self.assertEqual(cancelled_jobs, ["pending-job"])
+                self.assertIsNone(namespace["_calibration_save_job"])
+                self.assertTrue(namespace["_calibration_dirty"])
+                self.assertIsNone(runtime["ser2"])
+                self.assertIsNone(runtime["ser2BoardProfile"])
+                self.assertEqual(
+                    board_selection.get(),
+                    AUXILIARY_BOARD_MEGA,
+                )
+                if failed_boundary == "calibration":
+                    self.assertEqual(calibration["com2Port"], "BROKEN")
+                    self.assertEqual(output_values["DO1on"], "28")
+                    self.assertEqual(port_selection.get(), "COM2")
+                elif failed_boundary == "output":
+                    self.assertEqual(calibration["com2Port"], "COM2")
+                    self.assertEqual(output_values["DO1on"], "BROKEN")
+                    self.assertEqual(port_selection.get(), "COM2")
+                else:
+                    self.assertEqual(calibration["com2Port"], "COM2")
+                    self.assertEqual(output_values["DO1on"], "28")
+                    self.assertEqual(port_selection.get(), "BROKEN")
+                self.assertTrue(
+                    any(
+                        "unverified state will not be persisted"
+                        in str(entry[0]).lower()
+                        for entry in errors
+                    )
+                )
+                self.assertFalse(
+                    namespace["auxiliary_serial_lock"].locked()
+                )
+                self.assertFalse(
+                    namespace["motion_request_registry"].active
+                )
 
     def test_auxiliary_connection_validates_and_reconciles_before_replacement(self):
         class Selection:
@@ -9341,7 +9875,12 @@ class HmiSourceContractTests(unittest.TestCase):
                     raise RuntimeError("binding update failed")
                 self.value = value
 
-        def run_case(vision_score, fail_binding=False):
+        def run_case(
+            vision_score,
+            fail_binding=False,
+            omit_optional_outputs=False,
+            fail_replacement=False,
+        ):
             events = []
             calibration = self._valid_runtime_calibration()
             binding = Binding(0, fail_binding)
@@ -9349,11 +9888,15 @@ class HmiSourceContractTests(unittest.TestCase):
                 "com2Port": "COM2",
                 "auxiliaryBoard": AUXILIARY_BOARD_MEGA,
                 "DO1on": "28",
-                "DO2on": "8",
                 "VisScore": vision_score,
             })
             calibration["J1CalStatVal"] = binding
-            output_fields = {"DO1on": "28", "DO2on": "8"}
+            if omit_optional_outputs:
+                for output in range(3, 7):
+                    calibration.pop(f"DO{output}on")
+                    calibration.pop(f"DO{output}off")
+            output_fields = self._auxiliary_output_values(calibration)
+            output_fields["DO2on"] = "8"
 
             def validate(values):
                 events.append(("validate", dict(values)))
@@ -9361,7 +9904,15 @@ class HmiSourceContractTests(unittest.TestCase):
 
             def replace_fields(values):
                 events.append(("fields", dict(values)))
-                return dict(output_fields)
+                previous = dict(output_fields)
+                for key in output_fields:
+                    output_fields[key] = str(values[key])
+                return previous
+
+            def replace_serial(port, board):
+                events.append(("replace", port, board))
+                if fail_replacement:
+                    raise OSError("replacement failed")
 
             namespace = {
                 "application_closing": threading.Event(),
@@ -9380,11 +9931,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 ),
                 "normalize_calibration_data": validate,
                 "_replace_auxiliary_output_field_values": replace_fields,
-                "_replace_auxiliary_serial": (
-                    lambda port, board: events.append(
-                        ("replace", port, board)
-                    )
-                ),
+                "_replace_auxiliary_serial": replace_serial,
                 "_close_serial_port": lambda *args: True,
                 "_retain_calibration_persistence_retry": lambda: True,
                 "logger": SimpleNamespace(
@@ -9401,13 +9948,20 @@ class HmiSourceContractTests(unittest.TestCase):
                 "END": "end",
             }
             callback = self.compile_function("setCom2", namespace)
-            return callback(), calibration, events, binding
+            return (
+                callback(),
+                calibration,
+                events,
+                binding,
+                output_fields,
+            )
 
-        result, calibration, events, binding = run_case(85)
-        self.assertTrue(result)
-        self.assertEqual(
-            [event[0] for event in events],
-            ["validate", "fields", "replace"],
+        result, calibration, events, binding, _ = run_case(85)
+        self.assertTrue(result, events)
+        event_kinds = [event[0] for event in events]
+        self.assertLess(
+            event_kinds.index("fields"),
+            event_kinds.index("replace"),
         )
         self.assertEqual(calibration["auxiliaryBoard"], AUXILIARY_BOARD_NANO)
         self.assertEqual(calibration["DO1on"], "")
@@ -9415,20 +9969,32 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIs(calibration["J1CalStatVal"], binding)
         self.assertEqual(binding.get(), 0)
 
-        result, calibration, events, binding = run_case(101)
+        result, calibration, events, binding, _ = run_case(101)
         self.assertFalse(result)
         self.assertEqual([event[0] for event in events], ["validate"])
         self.assertEqual(calibration["auxiliaryBoard"], AUXILIARY_BOARD_MEGA)
         self.assertEqual(calibration["DO1on"], "28")
         self.assertIs(calibration["J1CalStatVal"], binding)
 
-        result, calibration, events, binding = run_case(85, True)
+        result, calibration, events, binding, _ = run_case(85, True)
         self.assertFalse(result)
         self.assertNotIn("replace", [event[0] for event in events])
         self.assertEqual(calibration["auxiliaryBoard"], AUXILIARY_BOARD_MEGA)
         self.assertEqual(calibration["DO1on"], "28")
         self.assertIs(calibration["J1CalStatVal"], binding)
         self.assertEqual(binding.get(), 0)
+
+        result, calibration, _, _, output_fields = run_case(
+            85,
+            omit_optional_outputs=True,
+            fail_replacement=True,
+        )
+        self.assertFalse(result)
+        for output in range(3, 7):
+            self.assertNotIn(f"DO{output}on", calibration)
+            self.assertNotIn(f"DO{output}off", calibration)
+            self.assertEqual(output_fields[f"DO{output}on"], "")
+            self.assertEqual(output_fields[f"DO{output}off"], "")
 
     def test_auxiliary_connection_persistence_retries_and_restores_on_restart(self):
         class Root:
@@ -9469,9 +10035,11 @@ class HmiSourceContractTests(unittest.TestCase):
             calibration_file = Path(directory) / "ARconfig.json"
             outcomes = [False, True]
             root = Root()
+            exceptions = []
             calibration = self._valid_runtime_calibration()
             calibration["com2Port"] = "COM2"
             calibration["auxiliaryBoard"] = AUXILIARY_BOARD_MEGA
+            output_values = self._auxiliary_output_values(calibration)
 
             def persist(values):
                 if outcomes.pop(0) is False:
@@ -9496,14 +10064,21 @@ class HmiSourceContractTests(unittest.TestCase):
                     info=lambda *args: None,
                     warning=lambda *args: None,
                     error=lambda *args: None,
-                    exception=lambda *args: None,
+                    exception=lambda *args: exceptions.append(args),
                 ),
                 "auxiliary_serial_lock": threading.Lock(),
                 "com2SelectedValue": Selection("COM9"),
                 "auxiliaryBoardSelectedValue": Selection(AUXILIARY_BOARD_NANO),
                 "_replace_auxiliary_serial": lambda *args: None,
-                "_read_auxiliary_output_field_values": lambda: {},
-                "_replace_auxiliary_output_field_values": lambda values: {},
+                "_read_auxiliary_output_field_values": (
+                    lambda: dict(output_values)
+                ),
+                "_replace_auxiliary_output_field_values": (
+                    lambda values: output_values.update({
+                        key: str(values[key])
+                        for key in output_values
+                    })
+                ),
                 "_close_serial_port": lambda *args: True,
                 "tab8": SimpleNamespace(ElogView=SimpleNamespace(get=lambda *args: ())),
                 "pickle": SimpleNamespace(dump=lambda *args: None),
@@ -9524,7 +10099,7 @@ class HmiSourceContractTests(unittest.TestCase):
             )
             set_auxiliary = self.compile_function("setCom2", namespace)
 
-            self.assertTrue(set_auxiliary())
+            self.assertTrue(set_auxiliary(), exceptions)
             self.assertTrue(namespace["_calibration_dirty"])
             self.assertEqual(len(root.jobs), 1)
             self.assertFalse(root.run_next())
@@ -9540,6 +10115,163 @@ class HmiSourceContractTests(unittest.TestCase):
             )
             self.assertEqual(restored["com2Port"], "COM9")
             self.assertEqual(restored["auxiliaryBoard"], AUXILIARY_BOARD_NANO)
+
+    def test_auxiliary_failed_open_preserves_saved_configuration_for_restart(self):
+        class Root:
+            def __init__(self):
+                self.jobs = {}
+                self.next_job = 0
+
+            def after(self, delay, callback):
+                self.next_job += 1
+                job = f"job-{self.next_job}"
+                self.jobs[job] = (delay, callback)
+                return job
+
+            def after_cancel(self, job):
+                self.jobs.pop(job, None)
+
+        class Selection:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        from ARrobots.Calibration import (
+            load_calibration as load_file,
+            save_calibration as save_file,
+        )
+
+        with BoundedTemporaryDirectory() as directory:
+            calibration_file = Path(directory) / "ARconfig.json"
+            calibration = self._valid_runtime_calibration()
+            calibration.update({
+                "com2Port": "COM2",
+                "auxiliaryBoard": AUXILIARY_BOARD_MEGA,
+                "DO1on": "28",
+            })
+            self.assertTrue(
+                save_file(
+                    calibration,
+                    str(calibration_file),
+                    require_runtime_fields=False,
+                )
+            )
+            output_values = self._auxiliary_output_values(calibration)
+            closing = threading.Event()
+            root = Root()
+
+            def persist(values):
+                return save_file(
+                    values,
+                    str(calibration_file),
+                    require_runtime_fields=False,
+                )
+
+            def replace_output_values(values):
+                previous = dict(output_values)
+                output_values["DO1on"] = values["DO1on"]
+                return previous
+
+            def fail_open(port, board):
+                raise OSError("replacement open failed")
+
+            namespace = {
+                "_calibration_save_job": None,
+                "_calibration_dirty": False,
+                "CALIBRATION_SAVE_DEBOUNCE_MS": 250,
+                "CAL": calibration,
+                "RUN": {"ser2": None},
+                "save_calibration": persist,
+                "application_closing": closing,
+                "root": root,
+                "tk": SimpleNamespace(TclError=RuntimeError),
+                "logger": SimpleNamespace(
+                    info=lambda *args: None,
+                    warning=lambda *args: None,
+                    error=lambda *args: None,
+                    exception=lambda *args: None,
+                ),
+                "wraps": wraps,
+                "motion_request_registry": MotionRequestRegistry(),
+                "auxiliary_serial_lock": threading.Lock(),
+                "com2SelectedValue": Selection("COM9"),
+                "auxiliaryBoardSelectedValue": Selection(
+                    AUXILIARY_BOARD_NANO
+                ),
+                "_replace_auxiliary_serial": fail_open,
+                "_read_auxiliary_output_field_values": (
+                    lambda: dict(output_values)
+                ),
+                "_replace_auxiliary_output_field_values": (
+                    replace_output_values
+                ),
+                "_close_serial_port": lambda *args: True,
+                "tab8": SimpleNamespace(
+                    ElogView=SimpleNamespace(get=lambda *args: ())
+                ),
+                "pickle": SimpleNamespace(dump=lambda *args: None),
+                "open": lambda *args, **kwargs: object(),
+                "END": "end",
+            }
+            namespace["_write_pending_calibration"] = self.compile_function(
+                "_write_pending_calibration",
+                namespace,
+            )
+            namespace["_schedule_calibration_save"] = self.compile_function(
+                "_schedule_calibration_save",
+                namespace,
+            )
+            namespace["_retain_calibration_persistence_retry"] = (
+                self.compile_function(
+                    "_retain_calibration_persistence_retry",
+                    namespace,
+                )
+            )
+            flush_calibration = self.compile_function(
+                "_flush_calibration_save",
+                namespace,
+            )
+            namespace["_synchronous_motion_request"] = self.compile_function(
+                "_synchronous_motion_request",
+                namespace,
+            )
+            set_auxiliary = self.compile_function(
+                "setCom2",
+                namespace,
+                preserve_decorators=True,
+            )
+
+            self.assertFalse(set_auxiliary())
+            self.assertFalse(namespace["_calibration_dirty"])
+            self.assertEqual(root.jobs, {})
+            self.assertEqual(calibration["com2Port"], "COM2")
+            self.assertEqual(
+                calibration["auxiliaryBoard"],
+                AUXILIARY_BOARD_MEGA,
+            )
+            self.assertEqual(calibration["DO1on"], "28")
+
+            closing.set()
+            self.assertTrue(flush_calibration())
+            self.assertFalse(namespace["_calibration_dirty"])
+            self.assertEqual(root.jobs, {})
+
+            restored = load_file(
+                str(calibration_file),
+                allow_fallback=False,
+                require_runtime_fields=False,
+            )
+            self.assertEqual(restored["com2Port"], "COM2")
+            self.assertEqual(
+                restored["auxiliaryBoard"],
+                AUXILIARY_BOARD_MEGA,
+            )
+            self.assertEqual(restored["DO1on"], "28")
 
     def test_auxiliary_replacement_retains_open_handle_after_cleanup_failure(self):
         class Replacement:
