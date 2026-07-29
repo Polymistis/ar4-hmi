@@ -7019,10 +7019,14 @@ def _finish_auxiliary_calibration_persistence_fence(
         raise RuntimeError(
           "calibration persistence retention returned an invalid result"
         )
-      return retained
+      if not retained:
+        raise RuntimeError(
+          "auxiliary calibration persistence retry was not retained"
+        )
+      return
     _calibration_dirty = False
     _calibration_save_snapshot = None
-    return False
+    return
   _cancel_auxiliary_calibration_persistence_job()
   if state_changed:
     retained = _retain_calibration_persistence_retry()
@@ -7030,7 +7034,11 @@ def _finish_auxiliary_calibration_persistence_fence(
       raise RuntimeError(
         "calibration persistence retention returned an invalid result"
       )
-    return retained
+    if not retained:
+      raise RuntimeError(
+        "auxiliary calibration persistence retry was not retained"
+      )
+    return
   if previous_dirty:
     retained = _retain_calibration_persistence_retry(
       previous_persistence_snapshot
@@ -7039,10 +7047,13 @@ def _finish_auxiliary_calibration_persistence_fence(
       raise RuntimeError(
         "calibration persistence retention returned an invalid result"
       )
-    return retained
+    if not retained:
+      raise RuntimeError(
+        "auxiliary calibration persistence retry was not retained"
+      )
+    return
   _calibration_dirty = False
   _calibration_save_snapshot = None
-  return True
 
 
 def _apply_auxiliary_configuration_snapshot(

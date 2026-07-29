@@ -5804,6 +5804,116 @@ class HmiSourceContractTests(unittest.TestCase):
                     1 if mode == "ownership-changed" else 0,
                 )
 
+    def test_auxiliary_persistence_fence_requires_retry_retention(self):
+        pending_snapshot = self._valid_runtime_calibration()
+        successful_cases = (
+            ("clean-unverified", False, None, False, False, ()),
+            (
+                "dirty-unverified",
+                True,
+                pending_snapshot,
+                False,
+                False,
+                (pending_snapshot,),
+            ),
+            ("changed-verified", False, None, True, True, (None,)),
+            (
+                "dirty-unchanged-verified",
+                True,
+                pending_snapshot,
+                False,
+                True,
+                (pending_snapshot,),
+            ),
+            ("clean-unchanged-verified", False, None, False, True, ()),
+        )
+        for (
+            name,
+            previous_dirty,
+            previous_snapshot,
+            state_changed,
+            state_verified,
+            expected_retained,
+        ) in successful_cases:
+            with self.subTest(name=name):
+                cancellations = []
+                retained = []
+                namespace = {
+                    "_calibration_dirty": True,
+                    "_calibration_save_snapshot": {"stale": "value"},
+                    "_cancel_auxiliary_calibration_persistence_job": (
+                        lambda: cancellations.append(True)
+                    ),
+                    "_retain_calibration_persistence_retry": (
+                        lambda snapshot=None: retained.append(snapshot) or True
+                    ),
+                }
+                finish = self.compile_function(
+                    "_finish_auxiliary_calibration_persistence_fence",
+                    namespace,
+                )
+
+                self.assertIsNone(
+                    finish(
+                        previous_dirty,
+                        previous_snapshot,
+                        state_changed,
+                        state_verified,
+                    )
+                )
+                self.assertEqual(cancellations, [True])
+                self.assertEqual(retained, list(expected_retained))
+                if not expected_retained:
+                    self.assertFalse(namespace["_calibration_dirty"])
+                    self.assertIsNone(
+                        namespace["_calibration_save_snapshot"]
+                    )
+
+        failing_cases = (
+            ("dirty-unverified", True, pending_snapshot, False, False),
+            ("changed-verified", False, None, True, True),
+            (
+                "dirty-unchanged-verified",
+                True,
+                pending_snapshot,
+                False,
+                True,
+            ),
+        )
+        for (
+            name,
+            previous_dirty,
+            previous_snapshot,
+            state_changed,
+            state_verified,
+        ) in failing_cases:
+            with self.subTest(name=f"{name}-retention-failed"):
+                namespace = {
+                    "_calibration_dirty": True,
+                    "_calibration_save_snapshot": None,
+                    "_cancel_auxiliary_calibration_persistence_job": (
+                        lambda: None
+                    ),
+                    "_retain_calibration_persistence_retry": (
+                        lambda snapshot=None: False
+                    ),
+                }
+                finish = self.compile_function(
+                    "_finish_auxiliary_calibration_persistence_fence",
+                    namespace,
+                )
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "persistence retry was not retained",
+                ):
+                    finish(
+                        previous_dirty,
+                        previous_snapshot,
+                        state_changed,
+                        state_verified,
+                    )
+
     def test_auxiliary_settle_reconciliation_preserves_persistence_target(self):
         safe_snapshot = self._valid_runtime_calibration()
         for target in (None, safe_snapshot):
@@ -9475,9 +9585,21 @@ class HmiSourceContractTests(unittest.TestCase):
             follow_up_error=None,
             settle_failure=False,
             reconciliation_result=True,
+            reconciliation_exception=None,
+            persistence_result=True,
             initial_dirty=False,
             verification_failure=False,
         ):
+            if (
+                not settle_failure
+                and (
+                    reconciliation_result is not True
+                    or reconciliation_exception is not None
+                )
+            ):
+                raise ValueError(
+                    "reconciliation controls require settle_failure"
+                )
             port_selection = Selection("None" if disable else "COM9")
             board_selection = Selection(
                 AUXILIARY_BOARD_NONE if disable else AUXILIARY_BOARD_NANO
@@ -9490,6 +9612,7 @@ class HmiSourceContractTests(unittest.TestCase):
             persistence_calls = []
             reconciliation_calls = []
             error_calls = []
+            exception_calls = []
             output_values = self._auxiliary_output_values(calibration)
 
             def replace(port, board):
@@ -9505,7 +9628,7 @@ class HmiSourceContractTests(unittest.TestCase):
                         else calibration_snapshot
                     )
                 )
-                return True
+                return persistence_result
 
             def replace_output_values(values):
                 previous = dict(output_values)
@@ -9520,7 +9643,14 @@ class HmiSourceContractTests(unittest.TestCase):
             def finish_persistence(*args):
                 if settle_failure:
                     raise RuntimeError("persistence settle failed")
-                return True
+
+            def reconcile_persistence(required, snapshot, safe_snapshot):
+                reconciliation_calls.append(
+                    (required, snapshot, safe_snapshot)
+                )
+                if reconciliation_exception is not None:
+                    raise reconciliation_exception
+                return reconciliation_result
 
             def verify_configuration(*args):
                 if verification_failure:
@@ -9557,7 +9687,7 @@ class HmiSourceContractTests(unittest.TestCase):
                     info=log_connection,
                     warning=lambda *args: None,
                     error=lambda *args: error_calls.append(args),
-                    exception=lambda *args: None,
+                    exception=lambda *args: exception_calls.append(args),
                 ),
                 "tab8": SimpleNamespace(ElogView=SimpleNamespace(get=lambda *args: ())),
                 "pickle": SimpleNamespace(dump=lambda *args: None),
@@ -9570,14 +9700,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 ] = finish_persistence
                 namespace[
                     "_reconcile_auxiliary_calibration_persistence_after_settle_failure"
-                ] = (
-                    lambda required, snapshot, safe_snapshot: (
-                        reconciliation_calls.append(
-                            (required, snapshot, safe_snapshot)
-                        )
-                        or reconciliation_result
-                    )
-                )
+                ] = reconcile_persistence
             if verification_failure:
                 namespace[
                     "_verify_auxiliary_configuration_snapshot"
@@ -9603,6 +9726,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 persistence_calls,
                 reconciliation_calls,
                 error_calls,
+                exception_calls,
             )
 
         success = run_case()
@@ -9620,6 +9744,28 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(
             success[5][0]["auxiliaryBoard"],
             AUXILIARY_BOARD_NANO,
+        )
+
+        reconciliation_error = (
+            "Auxiliary calibration persistence reconciliation "
+            "did not complete",
+        )
+        persistence_failure = run_case(persistence_result=False)
+        self.assertFalse(persistence_failure[0])
+        self.assertEqual(persistence_failure[1]["com2Port"], "COM9")
+        self.assertEqual(
+            persistence_failure[1]["auxiliaryBoard"],
+            AUXILIARY_BOARD_NANO,
+        )
+        self.assertEqual(len(persistence_failure[5]), 3)
+        self.assertIn(reconciliation_error, persistence_failure[7])
+        self.assertTrue(
+            any(
+                call
+                and call[0]
+                == "AUXILIARY CONNECTION CHANGED BUT FOLLOW-UP FAILED: %s"
+                for call in persistence_failure[7]
+            )
         )
 
         open_failure = run_case(replacement_error=OSError("open failed"))
@@ -9671,10 +9817,6 @@ class HmiSourceContractTests(unittest.TestCase):
             "COM9",
         )
 
-        reconciliation_error = (
-            "Auxiliary calibration persistence reconciliation "
-            "did not complete",
-        )
         settle_failure = run_case(settle_failure=True)
         self.assertFalse(settle_failure[0])
         self.assertEqual(settle_failure[1]["com2Port"], "COM9")
@@ -9703,6 +9845,21 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIn(
             reconciliation_error,
             unreconciled_settle_failure[7],
+        )
+
+        reconciliation_exception = run_case(
+            settle_failure=True,
+            reconciliation_exception=RuntimeError(
+                "persistence reconciliation failed"
+            ),
+        )
+        self.assertFalse(reconciliation_exception[0])
+        self.assertIn(
+            (
+                "Unable to reconcile calibration persistence "
+                "after settle failure",
+            ),
+            reconciliation_exception[8],
         )
 
         restored_settle_failure = run_case(

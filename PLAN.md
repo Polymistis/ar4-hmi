@@ -534,7 +534,9 @@ Implemented portions of the active integration unit:
   disables the output profile and prevents an unverified queued save.
   Pre-existing dirty persistence retains an isolated pre-attempt snapshot as
   the recovery retry target, so the transaction's unverified state cannot
-  replace the already queued write.
+  replace the already queued write. Persistence-fence completion is
+  exception-based: a successful no-write settlement returns normally, while a
+  failed retry retention enters the existing recovery and reconciliation path.
   Calibration persistence verifies the complete temporary text write,
   synchronizes file contents, and uses platform-specific durable replacement;
   any pre-replacement failure preserves the prior profile.
