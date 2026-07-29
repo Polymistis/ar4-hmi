@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Optional
 import unittest
 
+import cv2
 import numpy as np
 
 if __package__:
@@ -110,6 +111,14 @@ from ARrobots.HMI.joint_motion import (
     write_serial_control,
 )
 from ARrobots.HMI.joint_visualization import set_joint_slider_positions
+from ARrobots.HMI.Calibration import apply_calibration
+from ARrobots.Calibration import snapshot_calibration_values
+from ARrobots.calibration_schema import (
+    CalibrationSchemaError,
+    normalize_calibration_data,
+    normalize_vision_background_color,
+    reconcile_auxiliary_output_assignments,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -576,6 +585,19 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         namespace.setdefault("controller_number", controller_number)
         namespace.setdefault("finite_number", finite_number)
+        namespace.setdefault("apply_calibration", apply_calibration)
+        namespace.setdefault(
+            "snapshot_calibration_values",
+            snapshot_calibration_values,
+        )
+        namespace.setdefault(
+            "normalize_calibration_data",
+            normalize_calibration_data,
+        )
+        namespace.setdefault(
+            "reconcile_auxiliary_output_assignments",
+            reconcile_auxiliary_output_assignments,
+        )
         namespace.setdefault(
             "validate_controller_filename",
             validate_controller_filename,
@@ -1437,6 +1459,12 @@ class HmiSourceContractTests(unittest.TestCase):
                 }
             )
         return values
+
+    @staticmethod
+    def _valid_runtime_calibration():
+        return json.loads(
+            (PROJECT_ROOT / "defaults.json").read_text(encoding="utf-8")
+        )
 
     @classmethod
     def _valid_custom_calibration_profile(cls):
@@ -2667,6 +2695,81 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.assertEqual(calibration, {"sentinel": "unchanged"})
                 self.assertEqual(calls, [])
 
+    def test_calibration_rollbacks_preserve_live_binding_identity(self):
+        class Binding:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        for function_name in ("updateParams", "_apply_controller_calibration"):
+            with self.subTest(function=function_name):
+                binding = Binding(0)
+                calibration = {"J1CalStatVal": binding}
+                snapshots = []
+
+                def restore(snapshot):
+                    snapshots.append(dict(snapshot))
+                    apply_calibration(snapshot, calibration)
+
+                namespace = {
+                    "CAL": calibration,
+                    "_restore_controller_calibration": restore,
+                }
+                if function_name == "updateParams":
+                    namespace.update({
+                        "_prepare_update_parameters": (
+                            lambda: ({"J1CalStatVal": 1}, "UPA1\n")
+                        ),
+                        "_apply_update_parameter_values": (
+                            lambda values: (
+                                binding.set(values["J1CalStatVal"])
+                                or (_ for _ in ()).throw(
+                                    RuntimeError("application failed")
+                                )
+                            )
+                        ),
+                    })
+                    function = self.compile_function(
+                        function_name,
+                        namespace,
+                    )
+                    arguments = ()
+                    keywords = {"transmit": False}
+                else:
+                    namespace.update({
+                        "_apply_update_parameter_values": (
+                            lambda values: binding.set(
+                                values["J1CalStatVal"]
+                            )
+                        ),
+                        "_apply_external_axis_values": (
+                            lambda values: (_ for _ in ()).throw(
+                                RuntimeError("application failed")
+                            )
+                        ),
+                    })
+                    function = self.compile_function(
+                        function_name,
+                        namespace,
+                    )
+                    arguments = ({"J1CalStatVal": 1}, {})
+                    keywords = {}
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "application failed",
+                ):
+                    function(*arguments, **keywords)
+
+                self.assertEqual(snapshots, [{"J1CalStatVal": 0}])
+                self.assertIs(calibration["J1CalStatVal"], binding)
+                self.assertEqual(binding.get(), 0)
+
     def test_update_parameter_write_invalidates_cached_home_reference(self):
         port = SimpleNamespace(is_open=True)
         for outcome in (True, RuntimeError("acknowledgement failed")):
@@ -2806,6 +2909,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         namespace = {
             "finite_number": finite_number,
+            "normalize_vision_background_color": normalize_vision_background_color,
             "com1SelectedValue": Entry("COM1"),
             "com2SelectedValue": Entry("COM2"),
             "auxiliaryBoardSelectedValue": Entry(AUXILIARY_BOARD_NANO),
@@ -2815,7 +2919,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "visoptions": Entry("camera"),
             "VisBrightSlide": Entry(),
             "VisContrastSlide": Entry(),
-            "VisBacColorEntryField": Entry("black"),
+            "VisBacColorEntryField": Entry("(0, 0, 0)"),
             "VisScoreEntryField": Entry(),
             "VisX1PixEntryField": Entry(),
             "VisY1PixEntryField": Entry(),
@@ -2844,6 +2948,7 @@ class HmiSourceContractTests(unittest.TestCase):
             collect()["auxiliaryBoard"],
             AUXILIARY_BOARD_NANO,
         )
+        self.assertEqual(collect()["VisBacColor"], [0, 0, 0])
 
         for field_name, invalid, expected in (
             ("J7curAngEntryField", "nan", "J7 current position"),
@@ -2862,6 +2967,1000 @@ class HmiSourceContractTests(unittest.TestCase):
                         collect()
                 finally:
                     field.value = original
+
+        namespace["VisBacColorEntryField"].value = "__import__('os').getcwd()"
+        with self.assertRaises(CalibrationSchemaError):
+            collect()
+
+    def test_vision_samples_validate_current_frame_bounds(self):
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "finite_number": finite_number,
+            "re": re,
+        }
+        namespace["_vision_sample_coordinate"] = self.compile_function(
+            "_vision_sample_coordinate",
+            namespace,
+        )
+        sample_pixels = self.compile_function(
+            "_validated_vision_sample_pixels",
+            namespace,
+        )
+        image = np.arange(18).reshape((2, 3, 3))
+
+        samples = sample_pixels(image, ((0, 0), ("1", "2")))
+
+        np.testing.assert_array_equal(samples[0], image[0][0])
+        np.testing.assert_array_equal(samples[1], image[1][2])
+        for point in ((2, 0), (0, 3), (-1, 0), ("1.0", 0)):
+            with self.subTest(point=point):
+                with self.assertRaises(MotionInputError):
+                    sample_pixels(image, (point,))
+
+    def test_vision_background_converts_rgb_for_opencv_boundaries(self):
+        source = AR4_SOURCE.read_text(encoding="utf-8")
+        self.assertNotIn("eval(VisBacColorEntryField.get())", source)
+        self.assertNotIn(
+            "background = eval(command[bgColorIndex+11:scoreIndex])",
+            source,
+        )
+
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "cv2": cv2,
+            "np": np,
+            "normalize_vision_background_color": (
+                normalize_vision_background_color
+            ),
+        }
+        to_bgr = self.compile_function("_vision_background_bgr", namespace)
+        to_grayscale = self.compile_function(
+            "_vision_background_grayscale",
+            namespace,
+        )
+        average_bgr = self.compile_function(
+            "_average_vision_bgr_samples",
+            namespace,
+        )
+        average_grayscale = self.compile_function(
+            "_average_vision_grayscale_samples",
+            namespace,
+        )
+
+        self.assertEqual(to_bgr([255, 1, 2]), (2, 1, 255))
+        expected_grayscale = int(
+            cv2.cvtColor(
+                np.asarray([[[255, 1, 2]]], dtype=np.uint8),
+                cv2.COLOR_RGB2GRAY,
+            )[0][0]
+        )
+        self.assertEqual(to_grayscale([255, 1, 2]), expected_grayscale)
+        self.assertEqual(
+            average_bgr(((10, 20, 30), (30, 40, 50))),
+            ((20, 30, 40), (40, 30, 20)),
+        )
+        self.assertEqual(average_grayscale((10, 30, 50)), 30)
+
+    def test_vision_matching_uses_grayscale_inputs_and_border(self):
+        class Entry:
+            def __init__(self, value="0"):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+        class PillowImage:
+            def resize(self, size):
+                return self
+
+        reads = []
+        borders = []
+        match_shapes = []
+        displays = []
+        writes = []
+        write_succeeds = [True]
+        match_score = [0.1]
+        unavailable_images = set()
+        target = np.zeros((480, 640), dtype=np.uint8)
+        template = np.zeros((20, 20), dtype=np.uint8)
+
+        def read_image(path, mode):
+            reads.append((path, mode))
+            if path in unavailable_images:
+                return None
+            return target.copy() if path == "curImage.jpg" else template.copy()
+
+        def warp_affine(image, matrix, size, **kwargs):
+            borders.append(kwargs["borderValue"])
+            return cv2.warpAffine(image, matrix, size, **kwargs)
+
+        def match_template(image, rotated_template, method):
+            match_shapes.append((image.shape, rotated_template.shape))
+            return np.asarray([[match_score[0]]], dtype=np.float32)
+
+        vision_cv2 = SimpleNamespace(
+            IMREAD_GRAYSCALE=cv2.IMREAD_GRAYSCALE,
+            COLOR_GRAY2BGR=cv2.COLOR_GRAY2BGR,
+            COLOR_BGR2RGB=cv2.COLOR_BGR2RGB,
+            BORDER_CONSTANT=cv2.BORDER_CONSTANT,
+            INTER_LINEAR=cv2.INTER_LINEAR,
+            TM_CCOEFF_NORMED=cv2.TM_CCOEFF_NORMED,
+            TM_CCORR_NORMED=cv2.TM_CCORR_NORMED,
+            imread=read_image,
+            getRotationMatrix2D=cv2.getRotationMatrix2D,
+            warpAffine=warp_affine,
+            matchTemplate=match_template,
+            minMaxLoc=cv2.minMaxLoc,
+            cvtColor=cv2.cvtColor,
+            rectangle=cv2.rectangle,
+            line=cv2.line,
+            circle=cv2.circle,
+            imwrite=lambda filename, image: (
+                writes.append((filename, image.copy()))
+                or write_succeeds[0]
+            ),
+        )
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "math": math,
+            "np": np,
+            "cv2": vision_cv2,
+            "CAL": {
+                "fullRotVal": 0,
+                "J6PosLim": 170,
+                "J6NegLim": 170,
+            },
+            "RUN": {
+                "fullRot": Entry("0"),
+                "pick180": Entry("0"),
+                "pickClosest": Entry("0"),
+                "xMMpos": 0,
+                "yMMpos": 0,
+            },
+            "Image": SimpleNamespace(
+                fromarray=lambda image: (
+                    displays.append(image.copy()) or PillowImage()
+                ),
+            ),
+            "ImageTk": SimpleNamespace(
+                PhotoImage=lambda image: object(),
+            ),
+            "vid_lbl": SimpleNamespace(
+                imgtk=None,
+                configure=lambda **kwargs: None,
+            ),
+            "VisRetScoreEntryField": Entry(),
+            "VisRetAngleEntryField": Entry(),
+            "VisRetXpixEntryField": Entry(),
+            "VisRetYpixEntryField": Entry(),
+            "VisRetXrobEntryField": Entry(),
+            "VisRetYrobEntryField": Entry(),
+            "viscalc": lambda: None,
+        }
+        namespace["_average_vision_grayscale_samples"] = self.compile_function(
+            "_average_vision_grayscale_samples",
+            namespace,
+        )
+        namespace["rotate_image"] = self.compile_function(
+            "rotate_image",
+            namespace,
+        )
+        namespace["_vision_match_maximum"] = self.compile_function(
+            "_vision_match_maximum",
+            namespace,
+        )
+        vision_match = self.compile_function("visFind", namespace)
+
+        self.assertEqual(vision_match("template.jpg", 0.9, 77), "fail")
+        self.assertEqual(
+            reads,
+            [
+                ("curImage.jpg", cv2.IMREAD_GRAYSCALE),
+                ("template.jpg", cv2.IMREAD_GRAYSCALE),
+            ],
+        )
+        self.assertTrue(borders)
+        self.assertTrue(all(border == 77 for border in borders))
+        self.assertTrue(match_shapes)
+        self.assertTrue(
+            all(len(image_shape) == 2 for image_shape, _ in match_shapes)
+        )
+        self.assertEqual(writes[0][0], "temp.jpg")
+        self.assertEqual(displays[0].shape, (480, 640, 3))
+        np.testing.assert_array_equal(
+            writes[0][1][5, 5],
+            np.asarray([0, 0, 255], dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            displays[0][5, 5],
+            np.asarray([255, 0, 0], dtype=np.uint8),
+        )
+
+        match_score[0] = 0.95
+        self.assertEqual(vision_match("template.jpg", 0.9, 77), "pass")
+        self.assertTrue(
+            np.any(np.all(writes[1][1] == (0, 255, 0), axis=2))
+        )
+        self.assertTrue(
+            np.any(np.all(displays[1] == (0, 255, 0), axis=2))
+        )
+
+        unavailable_images.add("template.jpg")
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "template could not be loaded",
+        ):
+            vision_match("template.jpg", 0.9, 77)
+
+        unavailable_images.clear()
+        write_succeeds[0] = False
+        with self.assertRaisesRegex(
+            OSError,
+            "result frame could not be persisted",
+        ):
+            vision_match("template.jpg", 0.9, 77)
+
+    def test_take_pic_propagates_failure_and_uses_rgb_grayscale(self):
+        class Entry:
+            def __init__(self, value="0"):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def configure(self, **kwargs):
+                pass
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+        class Capture:
+            succeeds = True
+
+            @classmethod
+            def read(cls):
+                if not cls.succeeds:
+                    return False, None
+                return True, np.zeros((4, 4, 3), dtype=np.uint8)
+
+        class PillowImage:
+            def resize(self, size):
+                return self
+
+        writes = []
+        write_succeeds = [True]
+        errors = []
+        vision_cv2 = SimpleNamespace(
+            COLOR_BGR2GRAY=cv2.COLOR_BGR2GRAY,
+            COLOR_RGB2GRAY=cv2.COLOR_RGB2GRAY,
+            cvtColor=cv2.cvtColor,
+            resize=cv2.resize,
+            imwrite=lambda filename, image: (
+                writes.append((filename, image.copy()))
+                or write_succeeds[0]
+            ),
+        )
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "finite_number": finite_number,
+            "normalize_vision_background_color": (
+                normalize_vision_background_color
+            ),
+            "np": np,
+            "cv2": vision_cv2,
+            "re": re,
+            "logger": SimpleNamespace(
+                exception=lambda *args: errors.append(args),
+            ),
+            "RUN": {
+                "cam_on": True,
+                "cap": Capture(),
+                "autoBG": Entry("0"),
+                "mX1": 10,
+                "mY1": 0,
+                "mX2": 10,
+                "mY2": 10,
+            },
+            "CAL": {"zoom": 50},
+            "VisBrightSlide": Entry("0"),
+            "VisContrastSlide": Entry("0"),
+            "VisZoomSlide": Entry("50"),
+            "VisBacColorEntryField": Entry("[255, 1, 2]"),
+            "VisX1PixEntryField": Entry("0"),
+            "VisY1PixEntryField": Entry("0"),
+            "VisX2PixEntryField": Entry("1"),
+            "VisY2PixEntryField": Entry("1"),
+            "Image": SimpleNamespace(
+                fromarray=lambda image: PillowImage(),
+            ),
+            "ImageTk": SimpleNamespace(
+                PhotoImage=lambda image: object(),
+            ),
+            "vid_lbl": SimpleNamespace(
+                imgtk=None,
+                configure=lambda **kwargs: None,
+            ),
+        }
+        namespace["_vision_background_grayscale"] = self.compile_function(
+            "_vision_background_grayscale",
+            namespace,
+        )
+        namespace["_average_vision_grayscale_samples"] = self.compile_function(
+            "_average_vision_grayscale_samples",
+            namespace,
+        )
+        namespace["_vision_sample_coordinate"] = self.compile_function(
+            "_vision_sample_coordinate",
+            namespace,
+        )
+        namespace["_validated_vision_sample_pixels"] = self.compile_function(
+            "_validated_vision_sample_pixels",
+            namespace,
+        )
+        take_pic = self.compile_function("take_pic", namespace)
+
+        self.assertTrue(take_pic())
+        self.assertEqual(len(writes), 1)
+        expected_grayscale = int(
+            cv2.cvtColor(
+                np.asarray([[[255, 1, 2]]], dtype=np.uint8),
+                cv2.COLOR_RGB2GRAY,
+            )[0][0]
+        )
+        self.assertTrue(np.all(writes[0][1] == expected_grayscale))
+        self.assertEqual(errors, [])
+
+        namespace["VisX1PixEntryField"].value = "99"
+        self.assertFalse(take_pic("Auto"))
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(namespace["CAL"]["autoBGVal"], 0)
+
+        namespace["VisX1PixEntryField"].value = "0"
+        self.assertTrue(take_pic("Auto"))
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(namespace["RUN"]["BGavg"], (0, 0, 0))
+        self.assertEqual(namespace["CAL"]["autoBGVal"], 0)
+
+        Capture.succeeds = False
+        self.assertFalse(take_pic())
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(len(errors), 2)
+
+        Capture.succeeds = True
+        write_succeeds[0] = False
+        self.assertFalse(take_pic())
+        self.assertEqual(len(writes), 3)
+        self.assertEqual(len(errors), 3)
+
+    def test_snap_find_stops_after_capture_failure_and_converts_rgb(self):
+        class Entry:
+            def __init__(self, value="0"):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def configure(self, **kwargs):
+                pass
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+        matches = []
+        namespace = {
+            "normalize_vision_background_color": (
+                normalize_vision_background_color
+            ),
+            "re": re,
+            "cv2": cv2,
+            "np": np,
+            "logger": SimpleNamespace(exception=lambda *args: None),
+            "RUN": {
+                "selectedTemplate": Entry("template.jpg"),
+                "autoBG": Entry("0"),
+                "BGavg": (255, 1, 2),
+            },
+            "CAL": {},
+            "VisScoreEntryField": Entry("85"),
+            "VisBacColorEntryField": Entry("[255, 1, 2]"),
+            "visFind": lambda template, score, background: (
+                matches.append((template, score, background)) or "pass"
+            ),
+            "take_pic": lambda: False,
+        }
+        namespace["_vision_background_grayscale"] = self.compile_function(
+            "_vision_background_grayscale",
+            namespace,
+        )
+        snap_find = self.compile_function("snapFind", namespace)
+        expected_background = namespace["_vision_background_grayscale"](
+            [255, 1, 2]
+        )
+
+        self.assertFalse(snap_find())
+        self.assertEqual(matches, [])
+
+        namespace["take_pic"] = lambda: True
+        self.assertEqual(snap_find(), "pass")
+        self.assertEqual(
+            matches[-1],
+            ("template.jpg", 0.85, expected_background),
+        )
+
+        namespace["RUN"]["autoBG"].value = "1"
+        self.assertEqual(snap_find(), "pass")
+        self.assertEqual(
+            matches[-1],
+            ("template.jpg", 0.85, expected_background),
+        )
+
+    def test_execute_row_rejects_failed_vision_capture_before_matching(self):
+        class ProgramView:
+            command = (
+                "Vis Find - template.jpg - BGcolor [255, 1, 2] "
+                "Score 85 Pass 1 Fail 2"
+            ).encode("ascii")
+            rows = (
+                b"Tab Number 1\n",
+                b"Tab Number 2\r\n",
+            )
+            selected = []
+
+            @staticmethod
+            def curselection():
+                return (0,)
+
+            @staticmethod
+            def see(row):
+                pass
+
+            @classmethod
+            def get(cls, *args):
+                if len(args) == 2:
+                    return cls.rows
+                return cls.command
+
+            @classmethod
+            def selection_clear(cls, *args):
+                cls.selected.clear()
+
+            @classmethod
+            def select_set(cls, row):
+                cls.selected.append(row)
+
+        finishes = []
+        alarms = []
+        matches = []
+        captures = []
+        namespace = {
+            "RUN": {
+                "progRunning": False,
+                "cmdType": None,
+                "cmdTypeLong": None,
+                "moveInProc": 0,
+                "BGavg": (255, 1, 2),
+            },
+            "tab1": SimpleNamespace(progView=ProgramView()),
+            "END": "end",
+            "normalize_vision_background_color": (
+                normalize_vision_background_color
+            ),
+            "re": re,
+            "cv2": cv2,
+            "np": np,
+            "take_pic": lambda background: (
+                captures.append(background) or False
+            ),
+            "visFind": lambda *args: matches.append(args) or "pass",
+            "logger": SimpleNamespace(error=lambda *args: None),
+            "almStatusLab": SimpleNamespace(
+                config=lambda **kwargs: alarms.append(kwargs),
+            ),
+            "almStatusLab2": SimpleNamespace(
+                config=lambda **kwargs: alarms.append(kwargs),
+            ),
+            "_finish_execute_row": lambda: finishes.append(True),
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "ROW_EXECUTION_PENDING": "pending",
+            "ROW_EXECUTION_COMPLETE": "complete",
+        }
+        namespace["_vision_background_grayscale"] = self.compile_function(
+            "_vision_background_grayscale",
+            namespace,
+        )
+        namespace["_decode_program_row_content"] = self.compile_function(
+            "_decode_program_row_content",
+            namespace,
+        )
+        namespace["_program_row_index"] = self.compile_function(
+            "_program_row_index",
+            namespace,
+        )
+        namespace["_program_tab_row_index"] = self.compile_function(
+            "_program_tab_row_index",
+            namespace,
+        )
+        execute = self.compile_function("executeRow", namespace)
+        expected_background = namespace["_vision_background_grayscale"](
+            [255, 1, 2]
+        )
+
+        self.assertEqual(execute(), "rejected")
+        self.assertEqual(finishes, [True])
+        self.assertEqual(matches, [])
+        self.assertEqual(captures, [[255, 1, 2]])
+        self.assertEqual(len(alarms), 2)
+
+        namespace["take_pic"] = lambda background: (
+            captures.append(background) or True
+        )
+        finishes.clear()
+        alarms.clear()
+        self.assertEqual(execute(), "complete")
+        self.assertEqual(
+            matches[-1],
+            ("template.jpg", 0.85, expected_background),
+        )
+        self.assertEqual(captures[-1], [255, 1, 2])
+        self.assertEqual(ProgramView.selected, [0])
+        self.assertEqual(finishes, [True])
+        self.assertEqual(alarms, [])
+
+        ProgramView.command = (
+            "Vis Find - template.jpg - BGcolor (Auto) "
+            "Score 85 Pass 1 Fail 2"
+        ).encode("ascii")
+        finishes.clear()
+        self.assertEqual(execute(), "complete")
+        self.assertEqual(captures[-1], "Auto")
+        self.assertEqual(
+            matches[-1],
+            ("template.jpg", 0.85, expected_background),
+        )
+        self.assertEqual(finishes, [True])
+
+        ProgramView.command = (
+            "Vis Find - template.jpg - BGcolor 255, 1, 2 "
+            "Score 85 Pass 1 Fail 2"
+        ).encode("ascii")
+        finishes.clear()
+        self.assertEqual(execute(), "complete")
+        self.assertEqual(captures[-1], [255, 1, 2])
+        self.assertEqual(
+            matches[-1],
+            ("template.jpg", 0.85, expected_background),
+        )
+        self.assertEqual(finishes, [True])
+
+        ProgramView.command = (
+            "Vis Find - template.jpg - BGcolor __import__('os').getcwd() "
+            "Score 85 Pass 1 Fail 2"
+        ).encode("ascii")
+        capture_count = len(captures)
+        finishes.clear()
+        self.assertEqual(execute(), "rejected")
+        self.assertEqual(len(captures), capture_count)
+        self.assertEqual(finishes, [True])
+
+        ProgramView.command = (
+            "Vis Find - template.jpg - BGcolor 255, 1, 2 "
+            "Score 85 Pass invalid Fail 2"
+        ).encode("ascii")
+        finishes.clear()
+        self.assertEqual(execute(), "rejected")
+        self.assertEqual(len(captures), capture_count)
+        self.assertEqual(finishes, [True])
+
+        ProgramView.command = (
+            "Vis Find - template.jpg - BGcolor 255, 1, 2 "
+            "Score 85 Pass 7 Fail 2"
+        ).encode("ascii")
+        finishes.clear()
+        self.assertEqual(execute(), "rejected")
+        self.assertEqual(finishes, [True])
+
+    def test_mask_crop_writes_manual_rgb_as_bgr(self):
+        class Entry:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def configure(self, **kwargs):
+                pass
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+        writes = []
+        displays = []
+        write_succeeds = [True]
+        errors = []
+        vision_cv2 = SimpleNamespace(
+            EVENT_LBUTTONDOWN=1,
+            EVENT_MOUSEMOVE=2,
+            EVENT_LBUTTONUP=3,
+            COLOR_BGR2RGB=cv2.COLOR_BGR2RGB,
+            cvtColor=cv2.cvtColor,
+            rectangle=lambda *args, **kwargs: None,
+            imshow=lambda *args, **kwargs: None,
+            imwrite=lambda filename, image: (
+                writes.append((filename, image.copy()))
+                or write_succeeds[0]
+            ),
+            destroyAllWindows=lambda: None,
+        )
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        namespace = {
+            "normalize_vision_background_color": (
+                normalize_vision_background_color
+            ),
+            "cv2": vision_cv2,
+            "logger": SimpleNamespace(
+                exception=lambda *args: errors.append(args),
+            ),
+            "RUN": {
+                "button_down": True,
+                "box_points": [(0, 0)],
+                "oriImage": image,
+                "x_start": 0,
+                "y_start": 0,
+                "x_end": 0,
+                "y_end": 0,
+                "cropping": True,
+                "autoBG": Entry("0"),
+            },
+            "CAL": {},
+            "VisBacColorEntryField": Entry("[255, 1, 2]"),
+            "Image": SimpleNamespace(
+                fromarray=lambda value: (
+                    displays.append(value.copy()) or object()
+                ),
+            ),
+            "ImageTk": SimpleNamespace(
+                PhotoImage=lambda image: object(),
+            ),
+            "vid_lbl": SimpleNamespace(
+                imgtk=None,
+                configure=lambda **kwargs: None,
+            ),
+        }
+        namespace["_vision_background_bgr"] = self.compile_function(
+            "_vision_background_bgr",
+            namespace,
+        )
+        namespace["_mask_crop"] = self.compile_function(
+            "_mask_crop",
+            namespace,
+        )
+        mask_crop = self.compile_function("mask_crop", namespace)
+
+        self.assertTrue(
+            mask_crop(vision_cv2.EVENT_LBUTTONUP, 4, 4, None, None)
+        )
+
+        self.assertEqual(len(writes), 1)
+        self.assertTrue(
+            np.all(writes[0][1] == np.asarray([2, 1, 255], dtype=np.uint8))
+        )
+        self.assertEqual(len(displays), 1)
+        self.assertTrue(
+            np.all(displays[0] == np.asarray([255, 1, 2], dtype=np.uint8))
+        )
+
+        namespace["RUN"].update({
+            "button_down": True,
+            "box_points": [(0, 0)],
+            "oriImage": np.zeros((4, 4, 3), dtype=np.uint8),
+            "x_start": 0,
+            "y_start": 0,
+            "cropping": True,
+        })
+        namespace["VisBacColorEntryField"].value = "not-a-color"
+        self.assertFalse(
+            mask_crop(vision_cv2.EVENT_LBUTTONUP, 4, 4, None, None)
+        )
+        self.assertEqual(len(errors), 1)
+
+        namespace["RUN"].update({
+            "button_down": True,
+            "box_points": [(0, 0)],
+            "oriImage": np.zeros((4, 4, 3), dtype=np.uint8),
+            "x_start": 0,
+            "y_start": 0,
+            "cropping": True,
+        })
+        namespace["VisBacColorEntryField"].value = "[255, 1, 2]"
+        write_succeeds[0] = False
+        self.assertFalse(
+            mask_crop(vision_cv2.EVENT_LBUTTONUP, 4, 4, None, None)
+        )
+        self.assertEqual(len(errors), 2)
+
+    def test_select_mask_contains_capture_reload_and_window_failures(self):
+        errors = []
+        callbacks = []
+        destroy_calls = []
+        image_result = [np.zeros((2, 2, 3), dtype=np.uint8)]
+        window_failure = [False]
+
+        def show_image(name, image):
+            if window_failure[0]:
+                raise RuntimeError("window unavailable")
+
+        vision_cv2 = SimpleNamespace(
+            imread=lambda filename: image_result[0],
+            namedWindow=lambda name: None,
+            setMouseCallback=lambda name, callback: callbacks.append(callback),
+            imshow=show_image,
+            destroyAllWindows=lambda: destroy_calls.append(True),
+        )
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "RUN": {},
+            "cv2": vision_cv2,
+            "mask_pic": lambda: (_ for _ in ()).throw(
+                MotionInputError("camera did not return a mask frame")
+            ),
+            "mask_crop": object(),
+            "logger": SimpleNamespace(
+                exception=lambda *args: errors.append(args),
+            ),
+        }
+        select_mask = self.compile_function("selectMask", namespace)
+
+        self.assertFalse(select_mask())
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(len(destroy_calls), 1)
+
+        namespace["mask_pic"] = lambda: True
+        image_result[0] = None
+        self.assertFalse(select_mask())
+        self.assertEqual(len(errors), 2)
+
+        image_result[0] = np.zeros((2, 2, 3), dtype=np.uint8)
+        window_failure[0] = True
+        self.assertFalse(select_mask())
+        self.assertEqual(len(errors), 3)
+
+        window_failure[0] = False
+        self.assertTrue(select_mask())
+        self.assertIs(namespace["RUN"]["oriImage"].base, None)
+        self.assertIs(callbacks[-1], namespace["mask_crop"])
+
+    def test_program_item_writer_replaces_only_complete_utf8_documents(self):
+        from unittest.mock import patch
+
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "os": os,
+            "re": re,
+            "tempfile": tempfile,
+            "logger": SimpleNamespace(exception=lambda *args: None),
+        }
+        namespace["_decode_program_row_content"] = self.compile_function(
+            "_decode_program_row_content",
+            namespace,
+        )
+        namespace["_program_row_index"] = self.compile_function(
+            "_program_row_index",
+            namespace,
+        )
+        namespace["_program_tab_row_index"] = self.compile_function(
+            "_program_tab_row_index",
+            namespace,
+        )
+        namespace["_serialize_program_items"] = self.compile_function(
+            "_serialize_program_items",
+            namespace,
+        )
+        write_program = self.compile_function(
+            "_write_program_items_atomically",
+            namespace,
+        )
+
+        with BoundedTemporaryDirectory(prefix="ar4-program-write-") as directory:
+            program_path = Path(directory) / "program.ar4"
+            program_path.write_text("preserved\n", encoding="utf-8")
+
+            self.assertTrue(
+                write_program(
+                    str(program_path),
+                    (b"Base\r\n", b"Tab Number 2\n"),
+                )
+            )
+            self.assertEqual(
+                program_path.read_bytes(),
+                b"Base\nTab Number 2\n",
+            )
+            with program_path.open("rb") as program_file:
+                reloaded_rows = tuple(program_file)
+            self.assertEqual(
+                namespace["_program_tab_row_index"](reloaded_rows, "2"),
+                1,
+            )
+            self.assertEqual(
+                namespace["_program_tab_row_index"](
+                    (b"Tab Number 2\r\n",),
+                    "2",
+                ),
+                0,
+            )
+
+            program_path.write_text("preserved\n", encoding="utf-8")
+            with (
+                patch("os.replace", side_effect=OSError("replace failed")),
+                self.assertRaisesRegex(OSError, "replace failed"),
+            ):
+                write_program(str(program_path), (b"replacement\n",))
+            self.assertEqual(
+                program_path.read_text(encoding="utf-8"),
+                "preserved\n",
+            )
+            self.assertEqual(
+                tuple(Path(directory).glob(".program.ar4.*.tmp")),
+                (),
+            )
+
+            with self.assertRaisesRegex(
+                MotionInputError,
+                "encoded text",
+            ):
+                write_program(str(program_path), ("not encoded",))
+            self.assertEqual(
+                program_path.read_text(encoding="utf-8"),
+                "preserved\n",
+            )
+            with self.assertRaisesRegex(
+                MotionInputError,
+                "one logical line",
+            ):
+                write_program(str(program_path), (b"First\nSecond\n",))
+            with self.assertRaisesRegex(
+                MotionInputError,
+                "UTF-8",
+            ):
+                write_program(str(program_path), (b"\xff\n",))
+
+    def test_insert_vision_find_serializes_canonical_rgb(self):
+        class Entry:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class ProgramView:
+            def __init__(self):
+                self.rows = [b"Base\n"]
+                self.selection = (0,)
+
+            def curselection(self):
+                return self.selection
+
+            def index(self, value):
+                return len(self.rows)
+
+            def insert(self, row, value):
+                self.rows.insert(row, value)
+
+            def delete(self, row):
+                del self.rows[row]
+
+            def selection_clear(self, *args):
+                self.selection = ()
+
+            def select_set(self, row):
+                self.selection = (row,)
+
+            def get(self, start, end):
+                return tuple(self.rows)
+
+        program_view = ProgramView()
+        persisted = []
+        fail_write = [False]
+        errors = []
+        alarms = []
+
+        def write_program(file_path, items):
+            if fail_write[0]:
+                raise OSError("program write failed")
+            persisted.append((file_path, tuple(items)))
+            return True
+
+        namespace = {
+            "normalize_vision_background_color": (
+                normalize_vision_background_color
+            ),
+            "re": re,
+            "RUN": {
+                "selectedTemplate": Entry("template.jpg"),
+                "autoBG": Entry("0"),
+            },
+            "CAL": {"autoBGVal": 0},
+            "VisBacColorEntryField": Entry("[255, 1, 2]"),
+            "VisScoreEntryField": Entry("85"),
+            "visPassEntryField": Entry("1"),
+            "visFailEntryField": Entry("2"),
+            "ProgEntryField": Entry("program.ar4"),
+            "tab1": SimpleNamespace(progView=program_view),
+            "END": "end",
+            "path": SimpleNamespace(relpath=lambda value: value),
+            "_write_program_items_atomically": write_program,
+            "logger": SimpleNamespace(
+                exception=lambda *args: errors.append(args),
+            ),
+            "almStatusLab": SimpleNamespace(
+                config=lambda **kwargs: alarms.append(kwargs),
+            ),
+            "almStatusLab2": SimpleNamespace(
+                config=lambda **kwargs: alarms.append(kwargs),
+            ),
+        }
+        insert_vision_find = self.compile_function(
+            "insertvisFind",
+            namespace,
+        )
+
+        self.assertTrue(insert_vision_find())
+
+        self.assertEqual(len(program_view.rows), 2)
+        self.assertIn(
+            "BGcolor [255, 1, 2]",
+            program_view.rows[1].decode("utf-8"),
+        )
+        self.assertEqual(namespace["CAL"]["autoBGVal"], 0)
+        self.assertEqual(persisted[-1][0], "program.ar4")
+        self.assertEqual(persisted[-1][1], tuple(program_view.rows))
+        self.assertEqual(errors, [])
+
+        for delimiter in (
+            " - BGcolor ",
+            " Score ",
+            " Pass ",
+            " Fail ",
+        ):
+            with self.subTest(delimiter=delimiter):
+                namespace["RUN"]["selectedTemplate"].value = (
+                    f"template{delimiter}collision.jpg"
+                )
+                prior_rows = tuple(program_view.rows)
+                prior_persisted = tuple(persisted)
+
+                self.assertFalse(insert_vision_find())
+                self.assertEqual(tuple(program_view.rows), prior_rows)
+                self.assertEqual(tuple(persisted), prior_persisted)
+
+        self.assertEqual(len(errors), 4)
+        namespace["RUN"]["selectedTemplate"].value = "template.jpg"
+        namespace["VisBacColorEntryField"].value = "not-a-color"
+        self.assertFalse(insert_vision_find())
+        self.assertEqual(len(program_view.rows), 2)
+        self.assertEqual(len(errors), 5)
+        self.assertEqual(len(alarms), 10)
+
+        namespace["VisBacColorEntryField"].value = "[255, 1, 2]"
+        fail_write[0] = True
+        self.assertFalse(insert_vision_find())
+        self.assertEqual(len(program_view.rows), 2)
+        self.assertEqual(len(errors), 6)
 
     def test_default_calibration_requires_explicit_auxiliary_board_selection(self):
         defaults = json.loads(
@@ -3110,6 +4209,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 {
                     "calibration_file": "custom.json",
                     "allow_fallback": False,
+                    "require_runtime_fields": False,
                 },
             ),
             calls,
@@ -3139,77 +4239,65 @@ class HmiSourceContractTests(unittest.TestCase):
             [{
                 "calibration_file": "custom.json",
                 "calibration_data": saved_profile,
+                "require_runtime_fields": False,
             }],
         )
 
     def test_custom_profile_loader_does_not_fall_back_to_defaults(self):
-        calibration_tree = ast.parse(
-            CALIBRATION_SOURCE.read_text(encoding="utf-8"),
-            filename=str(CALIBRATION_SOURCE),
-        )
-        function = next(
-            node
-            for node in calibration_tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "load_calibration"
-        )
-        namespace = {
-            "os": SimpleNamespace(
-                path=SimpleNamespace(
-                    exists=lambda filename: filename == "defaults.json"
+        from ARrobots.Calibration import load_calibration as load_file
+        from unittest.mock import patch
+
+        with BoundedTemporaryDirectory() as directory:
+            custom_path = Path(directory) / "custom.json"
+
+            with self.assertLogs("ARrobots.Calibration", level="ERROR"):
+                self.assertIsNone(
+                    load_file(
+                        calibration_file=str(custom_path),
+                        allow_fallback=False,
+                        require_runtime_fields=False,
+                    )
                 )
-            ),
-            "json": json,
-            "logger": SimpleNamespace(
-                debug=lambda *args: None,
-                error=lambda *args: None,
-                info=lambda *args: None,
-            ),
-            "convert_calibration": lambda: {"fallback": "legacy"},
-            "save_calibration": lambda values: True,
-            "open": lambda filename, mode: io.StringIO(
-                '{"fallback": "defaults"}'
-            ),
-        }
-        module = ast.Module(body=[copy.deepcopy(function)], type_ignores=[])
-        compiled = compile(
-            ast.fix_missing_locations(module),
-            str(CALIBRATION_SOURCE),
-            "exec",
-        )
-        exec(compiled, namespace)
-        load_calibration_file = namespace["load_calibration"]
 
-        self.assertIsNone(
-            load_calibration_file(
-                calibration_file="custom.json",
-                allow_fallback=False,
+            path_exists = os.path.exists
+            with patch(
+                "ARrobots.Calibration.os.path.exists",
+                side_effect=lambda filename: (
+                    False
+                    if filename == "ARbot.cal"
+                    else path_exists(filename)
+                ),
+            ):
+                fallback = load_file(
+                    calibration_file=str(custom_path),
+                    defaults_file=str(PROJECT_ROOT / "defaults.json"),
+                )
+            self.assertEqual(
+                fallback,
+                json.loads(
+                    (PROJECT_ROOT / "defaults.json").read_text(encoding="utf-8")
+                ),
             )
-        )
-        self.assertEqual(
-            load_calibration_file(calibration_file="custom.json"),
-            {"fallback": "defaults"},
-        )
 
-        def corrupt_json(source_file):
-            raise json.JSONDecodeError("invalid calibration", "{", 1)
+            custom_path.write_text("{", encoding="utf-8")
+            with self.assertLogs("ARrobots.Calibration", level="ERROR"):
+                self.assertIsNone(
+                    load_file(
+                        calibration_file=str(custom_path),
+                        allow_fallback=False,
+                        require_runtime_fields=False,
+                    )
+                )
 
-        namespace["os"].path.exists = lambda filename: filename == "custom.json"
-        namespace["json"] = SimpleNamespace(load=corrupt_json)
-        self.assertIsNone(
-            load_calibration_file(
-                calibration_file="custom.json",
-                allow_fallback=False,
-            )
-        )
-
-        namespace["json"] = SimpleNamespace(load=lambda source_file: [])
-        self.assertIsNone(
-            load_calibration_file(
-                calibration_file="custom.json",
-                allow_fallback=False,
-            )
-        )
+            custom_path.write_text("[]", encoding="utf-8")
+            with self.assertLogs("ARrobots.Calibration", level="ERROR"):
+                self.assertIsNone(
+                    load_file(
+                        calibration_file=str(custom_path),
+                        allow_fallback=False,
+                        require_runtime_fields=False,
+                    )
+                )
 
     def test_startup_calibration_rejects_loader_failure_before_application(self):
         startup_assignment = next(
@@ -3541,7 +4629,8 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
     def test_save_and_apply_does_not_persist_failed_validation(self):
-        calibration = {"sentinel": "unchanged"}
+        calibration = self._valid_runtime_calibration()
+        calibration["setColor"] = "unchanged"
         calls = []
 
         def reject_calibration():
@@ -3550,7 +4639,7 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace = {
             "CAL": calibration,
             "MotionInputError": MotionInputError,
-            "_collect_fields_to_calibration": lambda: {"sentinel": "new"},
+            "_collect_fields_to_calibration": lambda: {"VisScore": 90},
             "_prepare_controller_calibration": reject_calibration,
             "_apply_controller_calibration": (
                 lambda *args: calls.append("apply") or True
@@ -3576,22 +4665,76 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         self.assertFalse(save_and_apply())
-        self.assertEqual(calibration, {"sentinel": "unchanged"})
+        self.assertEqual(calibration["setColor"], "unchanged")
+        self.assertEqual(calls, [])
+
+    def test_save_and_apply_normalizes_complete_snapshot_before_mutation(self):
+        class Binding:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        calibration = self._valid_runtime_calibration()
+        binding = Binding(calibration["J1CalStatVal"])
+        calibration["J1CalStatVal"] = binding
+        calls = []
+
+        namespace = {
+            "CAL": calibration,
+            "_collect_fields_to_calibration": lambda: {"VisScore": 101},
+            "_prepare_controller_calibration": lambda: (
+                {"TFx": 1},
+                "UPA1\n",
+                {"J7PosLim": 2},
+                "CEA2\n",
+            ),
+            "_preflight_controller_calibration_transport": (
+                lambda: calls.append("preflight") or True
+            ),
+            "_apply_controller_calibration": (
+                lambda *args: calls.append("apply") or True
+            ),
+            "_transmit_update_parameters": (
+                lambda *args: calls.append("update") or True
+            ),
+            "_transmit_external_axis_parameters": (
+                lambda *args: calls.append("external") or True
+            ),
+            "save_calibration": (
+                lambda prepared: calls.append("save") or True
+            ),
+            "logger": SimpleNamespace(exception=lambda *args: None),
+        }
+        self.add_save_and_apply_dependencies(namespace)
+        save_and_apply = self.compile_function(
+            "SaveAndApplyCalibration",
+            namespace,
+        )
+
+        self.assertFalse(save_and_apply())
+        self.assertEqual(calibration["VisScore"], 85)
+        self.assertIs(calibration["J1CalStatVal"], binding)
         self.assertEqual(calls, [])
 
     def test_save_and_apply_rolls_back_prewrite_transmission_failure(self):
-        calibration = {"sentinel": "unchanged"}
+        calibration = self._valid_runtime_calibration()
+        calibration["setColor"] = "unchanged"
         calls = []
 
         def apply_calibration(*args):
             calls.append("apply")
-            calibration["sentinel"] = "applied"
+            calibration["setColor"] = "applied"
             return True
 
         def restore(snapshot):
             calls.append("restore")
-            calibration.clear()
-            calibration.update(snapshot)
+            apply_calibration_values = namespace["apply_calibration"]
+            apply_calibration_values(snapshot, calibration)
             return True
 
         def reject_before_write(command, write_started_event):
@@ -3601,11 +4744,11 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace = {
             "CAL": calibration,
             "SerialActivityRejected": SerialActivityRejected,
-            "_collect_fields_to_calibration": lambda: {"sentinel": "field"},
+            "_collect_fields_to_calibration": lambda: {"VisScore": 90},
             "_prepare_controller_calibration": lambda: (
-                {"update": 1},
+                {"TFx": 1},
                 "UPA1\n",
-                {"external": 2},
+                {"J7PosLim": 2},
                 "CEA2\n",
             ),
             "_apply_controller_calibration": apply_calibration,
@@ -3633,16 +4776,17 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         self.assertFalse(save_and_apply())
-        self.assertEqual(calibration, {"sentinel": "unchanged"})
+        self.assertEqual(calibration["setColor"], "unchanged")
         self.assertEqual(calls, ["apply", "update", "restore"])
 
     def test_save_and_apply_retains_state_after_partial_controller_apply(self):
-        calibration = {"sentinel": "unchanged"}
+        calibration = self._valid_runtime_calibration()
+        calibration["setColor"] = "unchanged"
         calls = []
 
         def apply_calibration(*args):
             calls.append("apply")
-            calibration["sentinel"] = "applied"
+            calibration["setColor"] = "applied"
             return True
 
         def invalidate(reason):
@@ -3661,11 +4805,11 @@ class HmiSourceContractTests(unittest.TestCase):
 
         namespace = {
             "CAL": calibration,
-            "_collect_fields_to_calibration": lambda: {"sentinel": "field"},
+            "_collect_fields_to_calibration": lambda: {"VisScore": 90},
             "_prepare_controller_calibration": lambda: (
-                {"update": 1},
+                {"TFx": 1},
                 "UPA1\n",
-                {"external": 2},
+                {"J7PosLim": 2},
                 "CEA2\n",
             ),
             "_apply_controller_calibration": apply_calibration,
@@ -3688,19 +4832,20 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         self.assertFalse(save_and_apply())
-        self.assertEqual(calibration, {"sentinel": "applied"})
+        self.assertEqual(calibration["setColor"], "applied")
         self.assertEqual(calls[:3], ["apply", "update", "external"])
         self.assertEqual(calls[3][0], "invalidate")
         self.assertNotIn("restore", calls)
         self.assertNotIn("save", calls)
 
     def test_save_and_apply_quarantines_uncertain_first_transmission(self):
-        calibration = {"sentinel": "unchanged"}
+        calibration = self._valid_runtime_calibration()
+        calibration["setColor"] = "unchanged"
         calls = []
 
         def apply_calibration(*args):
             calls.append("apply")
-            calibration["sentinel"] = "applied"
+            calibration["setColor"] = "applied"
             return True
 
         def fail_transmission(command, write_started_event):
@@ -3710,11 +4855,11 @@ class HmiSourceContractTests(unittest.TestCase):
 
         namespace = {
             "CAL": calibration,
-            "_collect_fields_to_calibration": lambda: {"sentinel": "field"},
+            "_collect_fields_to_calibration": lambda: {"VisScore": 90},
             "_prepare_controller_calibration": lambda: (
-                {"update": 1},
+                {"TFx": 1},
                 "UPA1\n",
-                {"external": 2},
+                {"J7PosLim": 2},
                 "CEA2\n",
             ),
             "_apply_controller_calibration": apply_calibration,
@@ -3745,7 +4890,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         self.assertFalse(save_and_apply())
-        self.assertEqual(calibration, {"sentinel": "applied"})
+        self.assertEqual(calibration["setColor"], "applied")
         self.assertEqual(calls[:2], ["apply", "update"])
         self.assertEqual(calls[2][0], "invalidate")
         self.assertNotIn("restore", calls)
@@ -3753,20 +4898,21 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertNotIn("save", calls)
 
     def test_save_and_apply_invalidates_state_when_local_rollback_fails(self):
-        calibration = {"sentinel": "unchanged"}
+        calibration = self._valid_runtime_calibration()
+        calibration["setColor"] = "unchanged"
         calls = []
 
         def fail_application(*args):
-            calibration["sentinel"] = "partially-applied"
+            calibration["setColor"] = "partially-applied"
             raise RuntimeError("native application failed")
 
         namespace = {
             "CAL": calibration,
-            "_collect_fields_to_calibration": lambda: {"sentinel": "field"},
+            "_collect_fields_to_calibration": lambda: {"VisScore": 90},
             "_prepare_controller_calibration": lambda: (
-                {"update": 1},
+                {"TFx": 1},
                 "UPA1\n",
-                {"external": 2},
+                {"J7PosLim": 2},
                 "CEA2\n",
             ),
             "_apply_controller_calibration": fail_application,
@@ -3874,18 +5020,18 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
     def test_save_and_apply_retains_acknowledged_state_for_persistence_retry(self):
-        calibration = {"sentinel": "unchanged"}
+        calibration = self._valid_runtime_calibration()
+        calibration["setColor"] = "unchanged"
         calls = []
 
         def apply_calibration(*args):
             calls.append("apply")
-            calibration["sentinel"] = "applied"
+            calibration["setColor"] = "applied"
             return True
 
         def restore(snapshot):
             calls.append("restore")
-            calibration.clear()
-            calibration.update(snapshot)
+            namespace["apply_calibration"](snapshot, calibration)
             return True
 
         def acknowledge_update(command, write_started_event):
@@ -3901,11 +5047,11 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace = {
             "CAL": calibration,
             "SerialActivityRejected": SerialActivityRejected,
-            "_collect_fields_to_calibration": lambda: {"sentinel": "field"},
+            "_collect_fields_to_calibration": lambda: {"VisScore": 90},
             "_prepare_controller_calibration": lambda: (
-                {"update": 1},
+                {"TFx": 1},
                 "UPA1\n",
-                {"external": 2},
+                {"J7PosLim": 2},
                 "CEA2\n",
             ),
             "_apply_controller_calibration": apply_calibration,
@@ -3930,7 +5076,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         self.assertFalse(save_and_apply())
-        self.assertEqual(calibration, {"sentinel": "applied"})
+        self.assertEqual(calibration["setColor"], "applied")
         self.assertEqual(
             calls,
             ["apply", "update", "external", "save", "retry"],
@@ -7902,6 +9048,63 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(first_label.text, "SYSTEM READY; AUXILIARY CONTROLLER NOT CONFIGURED")
         self.assertEqual(second_label.text, first_label.text)
 
+    def test_auxiliary_output_field_replacement_rolls_back_partial_update(self):
+        class Entry:
+            def __init__(self, value, fail_on=None):
+                self.value = value
+                self.fail_on = fail_on
+
+            def get(self):
+                return self.value
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                if value == self.fail_on:
+                    raise RuntimeError("field update failed")
+                self.value = value
+
+        keys = tuple(
+            f"DO{output}{state}"
+            for output in range(1, 7)
+            for state in ("on", "off")
+        )
+        entries = {
+            key: Entry(str(index))
+            for index, key in enumerate(keys, start=1)
+        }
+        entries["DO2on"].fail_on = "broken"
+        namespace = {
+            f"{key}EntryField": entry
+            for key, entry in entries.items()
+        }
+        namespace.update({
+            "MotionInputError": MotionInputError,
+            "logger": SimpleNamespace(exception=lambda *args: None),
+        })
+        namespace["_auxiliary_output_field_bindings"] = self.compile_function(
+            "_auxiliary_output_field_bindings",
+            namespace,
+        )
+        read_values = self.compile_function(
+            "_read_auxiliary_output_field_values",
+            namespace,
+        )
+        replace_values = self.compile_function(
+            "_replace_auxiliary_output_field_values",
+            namespace,
+        )
+        original = read_values()
+
+        with self.assertRaisesRegex(RuntimeError, "field update failed"):
+            replace_values({"DO1on": "8", "DO2on": "broken"})
+        self.assertEqual(read_values(), original)
+
+        previous = replace_values({"DO1on": "8"})
+        self.assertEqual(previous, original)
+        self.assertEqual(read_values()["DO1on"], "8")
+
     def test_auxiliary_connection_wrapper_enforces_logical_and_shutdown_admission(self):
         def build_namespace(*, closing=False, active=False):
             motion_registry = MotionRequestRegistry()
@@ -7911,15 +9114,15 @@ class HmiSourceContractTests(unittest.TestCase):
             if closing:
                 closing_event.set()
             replacement_calls = []
+            calibration = self._valid_runtime_calibration()
+            calibration["com2Port"] = "COM2"
+            calibration["auxiliaryBoard"] = AUXILIARY_BOARD_MEGA
             namespace = {
                 "wraps": wraps,
                 "motion_request_registry": motion_registry,
                 "application_closing": closing_event,
                 "auxiliary_serial_lock": threading.Lock(),
-                "CAL": {
-                    "com2Port": "COM2",
-                    "auxiliaryBoard": AUXILIARY_BOARD_MEGA,
-                },
+                "CAL": calibration,
                 "RUN": {"ser2": None},
                 "com2SelectedValue": SimpleNamespace(
                     get=lambda: "COM9",
@@ -7932,6 +9135,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_replace_auxiliary_serial": (
                     lambda port, board: replacement_calls.append((port, board))
                 ),
+                "_read_auxiliary_output_field_values": lambda: {},
+                "_replace_auxiliary_output_field_values": lambda values: {},
                 "_close_serial_port": lambda *args: True,
                 "logger": SimpleNamespace(
                     info=lambda *args: None,
@@ -7984,10 +9189,9 @@ class HmiSourceContractTests(unittest.TestCase):
             board_selection = Selection(
                 AUXILIARY_BOARD_NONE if disable else AUXILIARY_BOARD_NANO
             )
-            calibration = {
-                "com2Port": "COM2",
-                "auxiliaryBoard": AUXILIARY_BOARD_MEGA,
-            }
+            calibration = self._valid_runtime_calibration()
+            calibration["com2Port"] = "COM2"
+            calibration["auxiliaryBoard"] = AUXILIARY_BOARD_MEGA
             runtime = {"ser2": SimpleNamespace(is_open=True) if disable else None}
             replacement_calls = []
             persistence_calls = []
@@ -8007,6 +9211,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 "com2SelectedValue": port_selection,
                 "auxiliaryBoardSelectedValue": board_selection,
                 "_replace_auxiliary_serial": replace,
+                "_read_auxiliary_output_field_values": lambda: {},
+                "_replace_auxiliary_output_field_values": lambda values: {},
                 "_close_serial_port": lambda *args: disable_close,
                 "_retain_calibration_persistence_retry": (
                     lambda: persistence_calls.append(dict(calibration)) or True
@@ -8052,8 +9258,12 @@ class HmiSourceContractTests(unittest.TestCase):
             [("COM9", AUXILIARY_BOARD_NANO)],
         )
         self.assertEqual(
-            success[5],
-            [{"com2Port": "COM9", "auxiliaryBoard": AUXILIARY_BOARD_NANO}],
+            success[5][0]["com2Port"],
+            "COM9",
+        )
+        self.assertEqual(
+            success[5][0]["auxiliaryBoard"],
+            AUXILIARY_BOARD_NANO,
         )
 
         open_failure = run_case(replacement_error=OSError("open failed"))
@@ -8071,6 +9281,120 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(close_failure[2].set_calls, ["COM2"])
         self.assertEqual(close_failure[3].set_calls, [AUXILIARY_BOARD_MEGA])
         self.assertEqual(close_failure[5], [])
+
+    def test_auxiliary_connection_validates_and_reconciles_before_replacement(self):
+        class Selection:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class Binding:
+            def __init__(self, value, fail_next=False):
+                self.value = value
+                self.fail_next = fail_next
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                if self.fail_next:
+                    self.fail_next = False
+                    raise RuntimeError("binding update failed")
+                self.value = value
+
+        def run_case(vision_score, fail_binding=False):
+            events = []
+            calibration = self._valid_runtime_calibration()
+            binding = Binding(0, fail_binding)
+            calibration.update({
+                "com2Port": "COM2",
+                "auxiliaryBoard": AUXILIARY_BOARD_MEGA,
+                "DO1on": "28",
+                "DO2on": "8",
+                "VisScore": vision_score,
+            })
+            calibration["J1CalStatVal"] = binding
+            output_fields = {"DO1on": "28", "DO2on": "8"}
+
+            def validate(values):
+                events.append(("validate", dict(values)))
+                return normalize_calibration_data(values)
+
+            def replace_fields(values):
+                events.append(("fields", dict(values)))
+                return dict(output_fields)
+
+            namespace = {
+                "application_closing": threading.Event(),
+                "auxiliary_serial_lock": threading.Lock(),
+                "CAL": calibration,
+                "RUN": {"ser2": None},
+                "com2SelectedValue": Selection("COM9"),
+                "auxiliaryBoardSelectedValue": Selection(
+                    AUXILIARY_BOARD_NANO
+                ),
+                "_read_auxiliary_output_field_values": (
+                    lambda: dict(output_fields)
+                ),
+                "reconcile_auxiliary_output_assignments": (
+                    reconcile_auxiliary_output_assignments
+                ),
+                "normalize_calibration_data": validate,
+                "_replace_auxiliary_output_field_values": replace_fields,
+                "_replace_auxiliary_serial": (
+                    lambda port, board: events.append(
+                        ("replace", port, board)
+                    )
+                ),
+                "_close_serial_port": lambda *args: True,
+                "_retain_calibration_persistence_retry": lambda: True,
+                "logger": SimpleNamespace(
+                    info=lambda *args: None,
+                    warning=lambda *args: None,
+                    error=lambda *args: None,
+                    exception=lambda *args: None,
+                ),
+                "tab8": SimpleNamespace(
+                    ElogView=SimpleNamespace(get=lambda *args: ())
+                ),
+                "pickle": SimpleNamespace(dump=lambda *args: None),
+                "open": lambda *args, **kwargs: object(),
+                "END": "end",
+            }
+            callback = self.compile_function("setCom2", namespace)
+            return callback(), calibration, events, binding
+
+        result, calibration, events, binding = run_case(85)
+        self.assertTrue(result)
+        self.assertEqual(
+            [event[0] for event in events],
+            ["validate", "fields", "replace"],
+        )
+        self.assertEqual(calibration["auxiliaryBoard"], AUXILIARY_BOARD_NANO)
+        self.assertEqual(calibration["DO1on"], "")
+        self.assertEqual(calibration["DO2on"], "8")
+        self.assertIs(calibration["J1CalStatVal"], binding)
+        self.assertEqual(binding.get(), 0)
+
+        result, calibration, events, binding = run_case(101)
+        self.assertFalse(result)
+        self.assertEqual([event[0] for event in events], ["validate"])
+        self.assertEqual(calibration["auxiliaryBoard"], AUXILIARY_BOARD_MEGA)
+        self.assertEqual(calibration["DO1on"], "28")
+        self.assertIs(calibration["J1CalStatVal"], binding)
+
+        result, calibration, events, binding = run_case(85, True)
+        self.assertFalse(result)
+        self.assertNotIn("replace", [event[0] for event in events])
+        self.assertEqual(calibration["auxiliaryBoard"], AUXILIARY_BOARD_MEGA)
+        self.assertEqual(calibration["DO1on"], "28")
+        self.assertIs(calibration["J1CalStatVal"], binding)
+        self.assertEqual(binding.get(), 0)
 
     def test_auxiliary_connection_persistence_retries_and_restores_on_restart(self):
         class Root:
@@ -8102,53 +9426,27 @@ class HmiSourceContractTests(unittest.TestCase):
             def set(self, value):
                 self.value = value
 
-        calibration_tree = ast.parse(
-            CALIBRATION_SOURCE.read_text(encoding="utf-8"),
-            filename=str(CALIBRATION_SOURCE),
+        from ARrobots.Calibration import (
+            load_calibration as load_file,
+            save_calibration as save_file,
         )
-        persistence_functions = [
-            copy.deepcopy(node)
-            for node in calibration_tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name in {"save_calibration", "load_calibration"}
-        ]
-        persistence_namespace = {
-            "os": os,
-            "json": json,
-            "logger": SimpleNamespace(
-                debug=lambda *args: None,
-                info=lambda *args: None,
-                warning=lambda *args: None,
-                error=lambda *args: None,
-            ),
-            "convert_calibration": lambda: None,
-        }
-        exec(
-            compile(
-                ast.fix_missing_locations(
-                    ast.Module(body=persistence_functions, type_ignores=[])
-                ),
-                str(CALIBRATION_SOURCE),
-                "exec",
-            ),
-            persistence_namespace,
-        )
-        save_file = persistence_namespace["save_calibration"]
-        load_file = persistence_namespace["load_calibration"]
 
         with BoundedTemporaryDirectory() as directory:
             calibration_file = Path(directory) / "ARconfig.json"
             outcomes = [False, True]
             root = Root()
-            calibration = {
-                "com2Port": "COM2",
-                "auxiliaryBoard": AUXILIARY_BOARD_MEGA,
-            }
+            calibration = self._valid_runtime_calibration()
+            calibration["com2Port"] = "COM2"
+            calibration["auxiliaryBoard"] = AUXILIARY_BOARD_MEGA
 
             def persist(values):
                 if outcomes.pop(0) is False:
                     return False
-                return save_file(values, str(calibration_file))
+                return save_file(
+                    values,
+                    str(calibration_file),
+                    require_runtime_fields=False,
+                )
 
             namespace = {
                 "_calibration_save_job": None,
@@ -8170,6 +9468,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 "com2SelectedValue": Selection("COM9"),
                 "auxiliaryBoardSelectedValue": Selection(AUXILIARY_BOARD_NANO),
                 "_replace_auxiliary_serial": lambda *args: None,
+                "_read_auxiliary_output_field_values": lambda: {},
+                "_replace_auxiliary_output_field_values": lambda values: {},
                 "_close_serial_port": lambda *args: True,
                 "tab8": SimpleNamespace(ElogView=SimpleNamespace(get=lambda *args: ())),
                 "pickle": SimpleNamespace(dump=lambda *args: None),
@@ -8202,6 +9502,7 @@ class HmiSourceContractTests(unittest.TestCase):
             restored = load_file(
                 str(calibration_file),
                 allow_fallback=False,
+                require_runtime_fields=False,
             )
             self.assertEqual(restored["com2Port"], "COM9")
             self.assertEqual(restored["auxiliaryBoard"], AUXILIARY_BOARD_NANO)
@@ -13273,8 +14574,8 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace = {
             "RUN": runtime,
             "CAL": {
-                **{f"J{axis}NegLim": "100" for axis in range(1, 7)},
-                **{f"J{axis}PosLim": "100" for axis in range(1, 7)},
+                **{f"J{axis}NegLim": 100.0 for axis in range(1, 7)},
+                **{f"J{axis}PosLim": 100.0 for axis in range(1, 7)},
             },
             "_reserve_main_serial_operation": reserve_transport,
             "_mode_change_is_blocked": lambda *args, **kwargs: False,

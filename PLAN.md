@@ -444,7 +444,7 @@ Integration unit status:
 - Native inverse kinematics, safe configuration, and command-local wrist propagation: `Tested`.
 - Line-oriented strict numeric syntax and shared motion-command grammar: `Tested`.
 - Line-oriented command-specific numeric and safety-domain coverage: `In progress`.
-- Typed configuration normalization and MK5 calibration-switch polarity: `Proposed`.
+- Typed configuration normalization and MK5 calibration-switch polarity: `In progress`.
 - Correlated host/Teensy JSON protocol and firmware safety corrections: `Proposed`.
 - Hardened HMI transport adoption of the correlated protocol: `Proposed`.
 - Mega/Nano 2.0 JSON capability integration: `Proposed`.
@@ -474,6 +474,67 @@ Acceptance criteria:
 
 Implemented portions of the active integration unit:
 
+- Runtime and custom-profile JSON now pass through a shared calibration schema
+  before application or persistence. Accepted profiles contain only known
+  fields, scalar values, and a structured three-component RGB background
+  color. Duplicate keys, non-finite numbers, invalid enumerations,
+  non-migratable missing runtime fields, unsupported compound values, and
+  values outside the field-specific numeric ranges fail before mutation.
+  JSON fractions retain decimal precision through integer and range
+  validation, preventing fractional integer fields, negative underflow, or
+  upper-bound overflow from rounding into accepted values.
+  Compatibility loading supplies only the documented switch, disconnected
+  port, and inferable auxiliary-board fields. Complete runtime profiles also
+  apply the shared controller binary32, degree-to-radian, ratio,
+  calibrated-step, and J1-J9 pose-limit contracts. Optional J7-J9 travel may
+  remain zero while each external-axis rotation and step scale remains
+  positive. Servo positions use the auxiliary-controller range, and nonempty
+  digital-output fields require pins valid for the selected Nano or Mega
+  profile. Saved position text remains strict plain-decimal text because the
+  current program serializer consumes that representation.
+  Vision background parsing no longer evaluates profile or program text and
+  accepts the prior bare and parenthesized RGB triplets through strict
+  non-evaluating compatibility parsers. Serialized background colors use RGB
+  order; OpenCV color-mask buffers receive an explicit BGR conversion, image
+  capture and matching use grayscale buffers, and canonical RGB background
+  values use OpenCV's RGB-to-gray conversion. Vision sample coordinates are
+  checked against the current frame
+  immediately before pixel access. Capture, mask, and program-insertion
+  callbacks expose logged Boolean failures; template loading and result-image
+  writing propagate into logged snap or program-row failure results. Failed
+  capture or matching cannot silently reuse an older captured image or choose
+  a program branch. Program insertion
+  validates every reserved vision-row delimiter before changing calibration
+  or editor state, atomically replaces a completely encoded program with
+  canonical LF line endings, and removes the inserted row when program
+  persistence fails. Program branch lookup compares decoded logical row
+  content, so LF and CRLF input select the same tab without weakening UTF-8 or
+  single-line validation. Save/apply resolves live Tk
+  bindings into a separate schema snapshot and validates the complete merged
+  calibration before local or controller mutation. Auxiliary connection
+  changes use the same snapshot boundary, clear output assignments outside the
+  selected board's pin range before replacing the serial connection, and
+  preserve existing Tk binding identity when applying normalized values.
+  Calibration persistence verifies the complete temporary text write,
+  synchronizes file contents, and uses platform-specific durable replacement;
+  any pre-replacement failure preserves the prior profile.
+  Legacy pickle migration bounds the source file, forbids global construction
+  and trailing data, validates the indexed scalar format without stringifying
+  typed values, maps null ports to the disconnected sentinel, maps null
+  mapped-servo and digital-output fields to empty values, and rejects nulls in
+  every other legacy field. Migration commits the normalized JSON profile
+  before a best-effort backup rename and does not report a backup-only failure
+  as conversion failure. Non-default runtime paths
+  use colocated legacy input, JSON output, and backup paths. Legacy JSON runtime
+  profiles gain the current all-`HIGH` J1-J9
+  calibration-switch behavior and disconnected-port sentinels without
+  rewriting the source file. A missing auxiliary-board profile is inferred
+  only when every configured output belongs to one disjoint Nano or Mega pin
+  range; mixed or unknown assignments require an explicit migration choice,
+  while profiles without configured outputs remain disconnected.
+  Switch polarity is not yet exposed in the HMI or transmitted to the
+  controller; paired host and firmware protocol work remains required before
+  any `LOW` selection can affect calibration behavior.
 - Native inverse kinematics rejects wrong-size, non-finite, and unrepresentable motion inputs, keeps candidate state local, enforces configured joint limits, validates selected-candidate round trips, and shares physical-displacement wrist seed and ranking rules with Teensy firmware through singular and wrap-boundary poses.
 - `AR4.py` uses the wrist mode encoded in each validated motion command for virtual inverse kinematics and rejects any physical/virtual mismatch before dispatch. Motion requires the wrist-aware configured solver; legacy solver fallback is rejected before invocation.
 - Native configuration stages and validates binary32 values, derived tool-frame radians, and public-unit round trips before atomic binding application. Motion requires the atomic configuration setter and wrist-aware configured solver, so bundled legacy Linux extensions fail closed without mutating native state. Configuration repair, generic non-motion program exchanges, and controller reconnection remain admissible without enabling kinematics-dependent motion.

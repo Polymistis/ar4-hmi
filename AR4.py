@@ -144,10 +144,10 @@ import ctypes
 
 import math
 import numpy as np
-from numpy import mean
 
 import pickle
 import serial
+import tempfile
 
 from matplotlib import pyplot as plt
 
@@ -173,7 +173,16 @@ import cv2
 import re
 
 import ARrobots.robot_kinematics as robot
-from ARrobots.Calibration import load_calibration, save_calibration
+from ARrobots.Calibration import (
+  load_calibration,
+  save_calibration,
+  snapshot_calibration_values,
+)
+from ARrobots.calibration_schema import (
+  normalize_calibration_data,
+  normalize_vision_background_color,
+  reconcile_auxiliary_output_assignments,
+)
 from ARrobots.HMI.Calibration import apply_calibration
 from ARrobots.HMI.joint_motion import (
   AUXILIARY_BOARD_MEGA,
@@ -5087,24 +5096,24 @@ def toggle_offline_mode():
                 RUN['offlineMode'] = True
                 _set_offline_mode_status(True)
                 RUN['VR_angles'] = [0.000, 0.000, 0.000, 0.000, 90.000, 0.000]
-                J1negLimLab.config(text="-"+CAL['J1NegLim'], style="Jointlim.TLabel")
+                J1negLimLab.config(text=f"-{CAL['J1NegLim']}", style="Jointlim.TLabel")
                 J1posLimLab.config(text=CAL['J1PosLim'], style="Jointlim.TLabel")
-                J1jogslide.config(from_=float("-"+CAL['J1NegLim']), to=float(CAL['J1PosLim']),  length=180, orient=HORIZONTAL,  command=J1sliderUpdate)
-                J2negLimLab.config(text="-"+CAL['J2NegLim'], style="Jointlim.TLabel")
+                J1jogslide.config(from_=-float(CAL['J1NegLim']), to=float(CAL['J1PosLim']),  length=180, orient=HORIZONTAL,  command=J1sliderUpdate)
+                J2negLimLab.config(text=f"-{CAL['J2NegLim']}", style="Jointlim.TLabel")
                 J2posLimLab.config(text=CAL['J2PosLim'], style="Jointlim.TLabel")
-                J2jogslide.config(from_=float("-"+CAL['J2NegLim']), to=float(CAL['J2PosLim']),  length=180, orient=HORIZONTAL,  command=J2sliderUpdate)
-                J3negLimLab.config(text="-"+CAL['J3NegLim'], style="Jointlim.TLabel")
+                J2jogslide.config(from_=-float(CAL['J2NegLim']), to=float(CAL['J2PosLim']),  length=180, orient=HORIZONTAL,  command=J2sliderUpdate)
+                J3negLimLab.config(text=f"-{CAL['J3NegLim']}", style="Jointlim.TLabel")
                 J3posLimLab.config(text=CAL['J3PosLim'], style="Jointlim.TLabel")
-                J3jogslide.config(from_=float("-"+CAL['J3NegLim']), to=float(CAL['J3PosLim']),  length=180, orient=HORIZONTAL,  command=J3sliderUpdate)
-                J4negLimLab.config(text="-"+CAL['J4NegLim'], style="Jointlim.TLabel")
+                J3jogslide.config(from_=-float(CAL['J3NegLim']), to=float(CAL['J3PosLim']),  length=180, orient=HORIZONTAL,  command=J3sliderUpdate)
+                J4negLimLab.config(text=f"-{CAL['J4NegLim']}", style="Jointlim.TLabel")
                 J4posLimLab.config(text=CAL['J4PosLim'], style="Jointlim.TLabel")
-                J4jogslide.config(from_=float("-"+CAL['J4NegLim']), to=float(CAL['J4PosLim']),  length=180, orient=HORIZONTAL,  command=J4sliderUpdate)
-                J5negLimLab.config(text="-"+CAL['J5NegLim'], style="Jointlim.TLabel")
+                J4jogslide.config(from_=-float(CAL['J4NegLim']), to=float(CAL['J4PosLim']),  length=180, orient=HORIZONTAL,  command=J4sliderUpdate)
+                J5negLimLab.config(text=f"-{CAL['J5NegLim']}", style="Jointlim.TLabel")
                 J5posLimLab.config(text=CAL['J5PosLim'], style="Jointlim.TLabel")
-                J5jogslide.config(from_=float("-"+CAL['J5NegLim']), to=float(CAL['J5PosLim']),  length=180, orient=HORIZONTAL,  command=J5sliderUpdate)
-                J6negLimLab.config(text="-"+CAL['J6NegLim'], style="Jointlim.TLabel")
+                J5jogslide.config(from_=-float(CAL['J5NegLim']), to=float(CAL['J5PosLim']),  length=180, orient=HORIZONTAL,  command=J5sliderUpdate)
+                J6negLimLab.config(text=f"-{CAL['J6NegLim']}", style="Jointlim.TLabel")
                 J6posLimLab.config(text=CAL['J6PosLim'], style="Jointlim.TLabel")
-                J6jogslide.config(from_=float("-"+CAL['J6NegLim']), to=float(CAL['J6PosLim']),  length=180, orient=HORIZONTAL,  command=J6sliderUpdate)
+                J6jogslide.config(from_=-float(CAL['J6NegLim']), to=float(CAL['J6PosLim']),  length=180, orient=HORIZONTAL,  command=J6sliderUpdate)
                 try:
                     refresh_gui_from_joint_angles(RUN['VR_angles'])
                 except MotionInputError as exc:
@@ -6813,6 +6822,63 @@ def _replace_auxiliary_serial(port, board_profile):
   return replacement
 
 
+def _auxiliary_output_field_bindings():
+  return (
+    ('DO1on', DO1onEntryField),
+    ('DO1off', DO1offEntryField),
+    ('DO2on', DO2onEntryField),
+    ('DO2off', DO2offEntryField),
+    ('DO3on', DO3onEntryField),
+    ('DO3off', DO3offEntryField),
+    ('DO4on', DO4onEntryField),
+    ('DO4off', DO4offEntryField),
+    ('DO5on', DO5onEntryField),
+    ('DO5off', DO5offEntryField),
+    ('DO6on', DO6onEntryField),
+    ('DO6off', DO6offEntryField),
+  )
+
+
+def _read_auxiliary_output_field_values():
+  return {
+    key: field.get()
+    for key, field in _auxiliary_output_field_bindings()
+  }
+
+
+def _replace_auxiliary_output_field_values(values):
+  if not isinstance(values, dict):
+    raise MotionInputError("auxiliary output values must be a dictionary")
+  bindings = _auxiliary_output_field_bindings()
+  previous = {
+    key: field.get()
+    for key, field in bindings
+  }
+  try:
+    for key, field in bindings:
+      if key not in values:
+        continue
+      field.delete(0, 'end')
+      field.insert(0, str(values[key]))
+  except Exception as exc:
+    rollback_failed = False
+    for key, field in bindings:
+      try:
+        field.delete(0, 'end')
+        field.insert(0, previous[key])
+      except Exception:
+        rollback_failed = True
+        logger.exception(
+          "Unable to restore an auxiliary output field after update failure"
+        )
+    if rollback_failed:
+      raise RuntimeError(
+        "auxiliary output field update and rollback failed"
+      ) from exc
+    raise
+  return previous
+
+
 @_synchronous_motion_request(
   "Auxiliary connection change",
   requires_kinematics=False,
@@ -6826,8 +6892,20 @@ def setCom2(misc=None):
   if not auxiliary_serial_lock.acquire(blocking=False):
     logger.warning("Auxiliary connection change rejected while the transport is busy")
     return False
-  previous_port = CAL.get('com2Port', "None")
-  previous_board = CAL.get('auxiliaryBoard', AUXILIARY_BOARD_NONE)
+  try:
+    previous_calibration = snapshot_calibration_values(CAL)
+  except Exception:
+    logger.exception(
+      "Auxiliary connection change could not read live calibration values"
+    )
+    auxiliary_serial_lock.release()
+    return False
+  previous_port = previous_calibration.get('com2Port', "None")
+  previous_board = previous_calibration.get(
+    'auxiliaryBoard',
+    AUXILIARY_BOARD_NONE,
+  )
+  previous_output_values = None
   try:
     selected_port = com2SelectedValue.get()
     if not isinstance(selected_port, str):
@@ -6839,6 +6917,21 @@ def setCom2(misc=None):
       auxiliaryBoardSelectedValue.get(),
       allow_none=True,
     )
+    committed_port = selected_port or "None"
+    committed_board = selected_board or AUXILIARY_BOARD_NONE
+    staged_calibration = dict(previous_calibration)
+    current_output_values = _read_auxiliary_output_field_values()
+    staged_calibration.update(current_output_values)
+    staged_calibration['com2Port'] = committed_port
+    staged_calibration = reconcile_auxiliary_output_assignments(
+      staged_calibration,
+      committed_board,
+    )
+    staged_calibration = normalize_calibration_data(staged_calibration)
+    previous_output_values = current_output_values
+    _replace_auxiliary_output_field_values(staged_calibration)
+    apply_calibration(staged_calibration, CAL)
+
     if selected_port is None or selected_board is None:
       if RUN.get('ser2') is not None and not _close_serial_port(
         'ser2',
@@ -6858,10 +6951,6 @@ def setCom2(misc=None):
         selected_port,
       )
 
-    committed_port = selected_port or "None"
-    committed_board = selected_board or AUXILIARY_BOARD_NONE
-    CAL['com2Port'] = committed_port
-    CAL['auxiliaryBoard'] = committed_board
     _retain_calibration_persistence_retry()
     try:
       value = tab8.ElogView.get(0, END)
@@ -6870,8 +6959,19 @@ def setCom2(misc=None):
       logger.exception("Unable to persist the auxiliary connection log")
     return True
   except Exception as e:
-    CAL['com2Port'] = previous_port
-    CAL['auxiliaryBoard'] = previous_board
+    try:
+      apply_calibration(previous_calibration, CAL)
+    except Exception:
+      logger.exception(
+        "Unable to restore live calibration after connection failure"
+      )
+    if previous_output_values is not None:
+      try:
+        _replace_auxiliary_output_field_values(previous_output_values)
+      except Exception:
+        logger.exception(
+          "Unable to restore auxiliary output fields after connection failure"
+        )
     try:
       com2SelectedValue.set(previous_port)
       auxiliaryBoardSelectedValue.set(previous_board)
@@ -10975,6 +11075,57 @@ def _dispatch_program_gcode(filename, completion_callback):
     return ROW_EXECUTION_REJECTED
   return ROW_EXECUTION_COMPLETE
 
+
+def _decode_program_row_content(row):
+  if isinstance(row, (bytes, bytearray)):
+    try:
+      text = bytes(row).decode('utf-8')
+    except UnicodeDecodeError as exc:
+      raise MotionInputError(
+        "program rows must contain UTF-8 text"
+      ) from exc
+  elif isinstance(row, str):
+    text = row
+  else:
+    raise MotionInputError("program rows must contain encoded or text rows")
+  if text.endswith('\r\n'):
+    text = text[:-2]
+  elif text.endswith('\n'):
+    text = text[:-1]
+  if '\r' in text or '\n' in text:
+    raise MotionInputError("program rows must contain one logical line")
+  return text
+
+
+def _program_row_index(rows, expected_row):
+  if (
+    isinstance(rows, (str, bytes, bytearray))
+    or not isinstance(rows, (tuple, list))
+  ):
+    raise MotionInputError("program rows must be a sequence")
+  if (
+    not isinstance(expected_row, str)
+    or '\r' in expected_row
+    or '\n' in expected_row
+  ):
+    raise MotionInputError("program row target must be one text line")
+  for index, row in enumerate(rows):
+    if _decode_program_row_content(row) == expected_row:
+      return index
+  raise MotionInputError(f"program row {expected_row!r} does not exist")
+
+
+def _program_tab_row_index(rows, tab_number):
+  if not isinstance(tab_number, str):
+    raise MotionInputError("program tab number must be text")
+  tab_number = tab_number.strip()
+  if re.fullmatch(r"\d+", tab_number) is None:
+    raise MotionInputError(
+      "program tab number must be a non-negative integer"
+    )
+  return _program_row_index(rows, f"Tab Number {tab_number}")
+
+
 def runProg():
   execution_request = _begin_program_execution("run")
   if execution_request is None:
@@ -11027,9 +11178,11 @@ def runProg():
       except:
         if(tab1.lastProg == ""):
           selRow = 1
-          progLoop = ("## START PROGRAM LOOP ##\r\n").encode('utf-8')
           try:
-            index = tab1.progView.get(0, "end").index(progLoop)
+            index = _program_row_index(
+              tab1.progView.get(0, "end"),
+              "## START PROGRAM LOOP ##",
+            )
             tab1.progView.selection_clear(0, END)
             tab1.progView.select_set(index)
           except:
@@ -11136,9 +11289,11 @@ def stepFwd():
       except:
         if(tab1.lastProg == ""):
           selRow = 1
-          progLoop = ("## START PROGRAM LOOP ##\r\n").encode('utf-8')
           try:
-            index = tab1.progView.get(0, "end").index(progLoop)
+            index = _program_row_index(
+              tab1.progView.get(0, "end"),
+              "## START PROGRAM LOOP ##",
+            )
             tab1.progView.selection_clear(0, END)
             tab1.progView.select_set(index)
           except:
@@ -11576,8 +11731,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11641,8 +11798,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11677,8 +11836,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11723,8 +11884,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11769,8 +11932,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11815,8 +11980,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11861,8 +12028,10 @@ def executeRow(motion_complete=None):
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
-        tabNum = ("Tab Number " + tabNum + "\r\n").encode('utf-8')
-        index = tab1.progView.get(0, "end").index(tabNum)
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          tabNum,
+        )
         index = index-1
         tab1.progView.selection_clear(0, END)
         tab1.progView.select_set(index)
@@ -11974,61 +12143,32 @@ def executeRow(motion_complete=None):
    
               
 
-  ''' 
-    if (RUN['moveInProc'] == 1):
-        RUN['moveInProc'] = 2
-    tabIndex = command.find("Tab-")
-    tabNum = ("Tab Number " + str(command[tabIndex+4:]) + "\r\n").encode('utf-8')
-    index = tab1.progView.get(0, "end").index(tabNum)
-    tab1.progView.selection_clear(0, END)
-    tab1.progView.select_set(index) 
-  ''' 
-  
   if RUN['cmdType'] == "Jump T":
-      if (RUN['moveInProc'] == 1):
-        RUN['moveInProc'] = 2
-
-      tabIndex = command.find("Tab-")
-      if tabIndex == -1:
-          print("[Jump T] Malformed command, missing 'Tab-':", repr(command))
-          _finish_execute_row()
-          return ROW_EXECUTION_REJECTED
-
-      # keep your original tabNum (bytes with CRLF)
-      tabNum = ("Tab Number " + str(command[tabIndex+4:]) + "\r\n").encode('utf-8')
-
-      def _norm(x):
-          # bytes -> str; strip CR/LF and outer spaces; lower for case-insensitive match
-          if isinstance(x, bytes):
-              try:
-                  x = x.decode("utf-8", "replace")
-              except Exception:
-                  x = str(x)
-          return str(x).replace("\r", "").replace("\n", "").strip().lower()
-
-      target_norm = _norm(tabNum)
-
-      # Always read current items in the widget
-      items = list(tab1.progView.get(0, tk.END))
-
-      # 1) Try exact normalized match (works whether items are bytes or str)
-      idx = next((i for i, it in enumerate(items) if _norm(it) == target_norm), None)
-
-      if idx is None:
-          # 2) Optional fallback: if your rows are like "Jump Tab-3", match by number
-          #    Extract the number from tabNum and look for common forms
-          m = re.search(r'\d+', _norm(tabNum))
-          if m:
-              n = m.group(0)
-              forms = {f"tab number {n}", f"tab-{n}", f"tab {n}", f"tab: {n}", f"jump tab-{n}"}
-              idx = next((i for i, it in enumerate(items) if _norm(it) in forms), None)
-
-      if idx is None:
-          print(f"[Jump T] Not found: {repr(tabNum)}")
-      else:
-          tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(idx)
-          tab1.progView.see(idx)
+    if (RUN['moveInProc'] == 1):
+      RUN['moveInProc'] = 2
+    tabIndex = command.find("Tab-")
+    if tabIndex == -1:
+      message = "Jump command rejected: missing Tab- target"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
+    try:
+      index = _program_tab_row_index(
+        tab1.progView.get(0, "end"),
+        str(command[tabIndex+4:]),
+      )
+    except MotionInputError as exc:
+      message = f"Jump command rejected: {exc}"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
+    tab1.progView.selection_clear(0, END)
+    tab1.progView.select_set(index)
+    tab1.progView.see(index)
 
 
 
@@ -12617,30 +12757,79 @@ def executeRow(motion_complete=None):
   if(RUN['cmdType'] == "Vis Fi"):
     #if (RUN['moveInProc'] == 1):
       #RUN['moveInProc'] = 2
-    templateIndex = command.find("Vis Find - ")
-    bgColorIndex = command.find(" - BGcolor ")
-    scoreIndex = command.find(" Score ")
-    passIndex = command.find(" Pass ")
-    failIndex = command.find(" Fail ")
-    template = command[templateIndex+11:bgColorIndex]
-    checkBG = command[bgColorIndex+11:scoreIndex]
-    if(checkBG == "(Auto)"):
-      background = "Auto"
-    else:  
-      background = eval(command[bgColorIndex+11:scoreIndex])
-    min_score = float(command[scoreIndex+7:passIndex])*.01
-    take_pic()
-    status = visFind(template,min_score,background)
-    if (status == "pass"):
-      tabNum = ("Tab Number " + str(command[passIndex+6:failIndex]) + "\r\n").encode('utf-8')
-      index = tab1.progView.get(0, "end").index(tabNum)
+    try:
+      templateIndex = command.find("Vis Find - ")
+      bgColorIndex = command.find(" - BGcolor ")
+      scoreIndex = command.find(" Score ")
+      passIndex = command.find(" Pass ")
+      failIndex = command.find(" Fail ")
+      if (
+        templateIndex != 0
+        or not (
+          templateIndex < bgColorIndex < scoreIndex < passIndex < failIndex
+        )
+      ):
+        raise MotionInputError("vision program row delimiters are invalid")
+      template = command[templateIndex+11:bgColorIndex]
+      if not template:
+        raise MotionInputError("vision program template must not be empty")
+      checkBG = command[bgColorIndex+11:scoreIndex]
+      if(checkBG == "(Auto)"):
+        background = None
+        capture_background = "Auto"
+      else:
+        capture_background = normalize_vision_background_color(checkBG)
+        background = _vision_background_grayscale(capture_background)
+      score = finite_number(
+        command[scoreIndex+7:passIndex],
+        "vision program score",
+      )
+      if score < 0 or score > 100:
+        raise MotionInputError(
+          "vision program score must be between 0 and 100"
+        )
+      pass_tab = command[passIndex+6:failIndex].strip()
+      fail_tab = command[failIndex+6:].strip()
+      for label, value in (
+        ("vision pass tab", pass_tab),
+        ("vision fail tab", fail_tab),
+      ):
+        if re.fullmatch(r"\d+", value) is None:
+          raise MotionInputError(
+            f"{label} must be a non-negative integer"
+          )
+      min_score = score*.01
+      if take_pic(capture_background) is not True:
+        raise MotionInputError("vision capture failed")
+      if background is None:
+        background = _vision_background_grayscale(RUN['BGavg'])
+      status = visFind(template,min_score,background)
+      if status == "pass":
+        selected_tab = pass_tab
+      elif status == "fail":
+        selected_tab = fail_tab
+      else:
+        raise MotionInputError(
+          "vision matching returned an invalid result"
+        )
+      try:
+        index = _program_tab_row_index(
+          tab1.progView.get(0, "end"),
+          selected_tab,
+        )
+      except MotionInputError as exc:
+        raise MotionInputError(
+          f"vision result tab {selected_tab} does not exist"
+        ) from exc
       tab1.progView.selection_clear(0, END)
-      tab1.progView.select_set(index)  
-    elif (status == "fail"): 
-      tabNum = ("Tab Number " + str(command[failIndex+6:]) + "\r\n").encode('utf-8')
-      index = tab1.progView.get(0, "end").index(tabNum)
-      tab1.progView.selection_clear(0, END)
-      tab1.progView.select_set(index) 
+      tab1.progView.select_set(index)
+    except Exception as exc:
+      message = f"Vision program row rejected: {exc}"
+      logger.error(message)
+      almStatusLab.config(text=message, style="Alarm.TLabel")
+      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
   
 
 
@@ -18356,36 +18545,151 @@ def reloadProg():
   save_calibration(CAL)      
 
 
-def insertvisFind():
+def _serialize_program_items(items):
+  if (
+    isinstance(items, (str, bytes, bytearray))
+    or not isinstance(items, (tuple, list))
+  ):
+    raise MotionInputError("program rows must be a sequence")
+  serialized = []
+  for item in items:
+    if not isinstance(item, (bytes, bytearray)):
+      raise MotionInputError("program rows must contain encoded text")
+    row = _decode_program_row_content(item)
+    serialized.append(row + '\n')
+  return ''.join(serialized)
+
+
+def _write_program_items_atomically(file_path, items):
+  program_text = _serialize_program_items(items)
+  path_value = os.fspath(file_path)
+  if not isinstance(path_value, str):
+    raise MotionInputError("program path must be text")
+  target = os.path.abspath(path_value)
+  directory = os.path.dirname(target)
+  if not os.path.isdir(directory):
+    raise FileNotFoundError(
+      f"program directory does not exist: {directory}"
+    )
+  descriptor = None
+  temporary_path = None
   try:
-    selRow = tab1.progView.curselection()[0]
-    selRow += 1
-  except:
-    last = tab1.progView.index('end')
-    selRow = last
+    descriptor, temporary_path = tempfile.mkstemp(
+      prefix=f".{os.path.basename(target)}.",
+      suffix=".tmp",
+      dir=directory,
+      text=True,
+    )
+    with os.fdopen(
+      descriptor,
+      'w',
+      encoding='utf-8',
+      newline='\n',
+    ) as program_file:
+      descriptor = None
+      written = program_file.write(program_text)
+      if written != len(program_text):
+        raise OSError("program write was incomplete")
+      program_file.flush()
+      os.fsync(program_file.fileno())
+    os.replace(temporary_path, target)
+    temporary_path = None
+    return True
+  finally:
+    if descriptor is not None:
+      os.close(descriptor)
+    if temporary_path is not None:
+      try:
+        os.unlink(temporary_path)
+      except FileNotFoundError:
+        pass
+      except OSError:
+        logger.exception("Unable to remove a temporary program file")
+
+
+def insertvisFind():
+  inserted = False
+  prior_selection = ()
+  selRow = None
+  try:
+    prior_selection = tuple(tab1.progView.curselection())
+    if prior_selection:
+      selRow = prior_selection[0] + 1
+    else:
+      selRow = tab1.progView.index('end')
+
+    template = RUN['selectedTemplate'].get()
+    if not isinstance(template, str):
+      raise MotionInputError("vision template must be text")
+    if any(ord(character) < 32 or ord(character) == 127 for character in template):
+      raise MotionInputError("vision template contains control characters")
+    if any(
+      delimiter in template
+      for delimiter in (" - BGcolor ", " Score ", " Pass ", " Fail ")
+    ):
+      raise MotionInputError("vision template contains a reserved delimiter")
+    if template == "":
+      template = "None_Selected.jpg"
+
+    auto_background = int(RUN['autoBG'].get())
+    if auto_background not in (0, 1):
+      raise MotionInputError("vision automatic background must be binary")
+    if auto_background == 1:
+      background_text = "(Auto)"
+    else:
+      background_text = str(normalize_vision_background_color(
+        VisBacColorEntryField.get()
+      ))
+
+    score_text = VisScoreEntryField.get()
+    score = finite_number(score_text, "vision score")
+    if score < 0 or score > 100:
+      raise MotionInputError("vision score must be between 0 and 100")
+    score_text = str(score_text).strip()
+
+    pass_tab = visPassEntryField.get()
+    fail_tab = visFailEntryField.get()
+    for label, value in (
+      ("vision pass tab", pass_tab),
+      ("vision fail tab", fail_tab),
+    ):
+      if not isinstance(value, str) or re.fullmatch(r"\d+", value.strip()) is None:
+        raise MotionInputError(f"{label} must be a non-negative integer")
+    pass_tab = pass_tab.strip()
+    fail_tab = fail_tab.strip()
+    file_path = path.relpath(ProgEntryField.get())
+    value = (
+      f"Vis Find - {template} - BGcolor {background_text} "
+      f"Score {score_text} Pass {pass_tab} Fail {fail_tab}"
+    )
+
+    tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8'))
+    inserted = True
+    tab1.progView.selection_clear(0, END)
     tab1.progView.select_set(selRow)
-  template = RUN['selectedTemplate'].get()
-  if (template == ""):
-    template = "None_Selected.jpg"
-  CAL['autoBGVal'] = int(RUN['autoBG'].get())
-  if (CAL['autoBGVal'] == 1):
-    BGcolor = "(Auto)"
-  else:
-    BGcolor = VisBacColorEntryField.get()
-  score = VisScoreEntryField.get()
-  passTab = visPassEntryField.get()
-  failTab = visFailEntryField.get()
-  value = "Vis Find - "+template+" - BGcolor "+BGcolor+" Score "+score+" Pass "+passTab+" Fail "+failTab
-  tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8'))
-  tab1.progView.selection_clear(0, END)
-  tab1.progView.select_set(selRow)
-  items = tab1.progView.get(0,END)
-  file_path = path.relpath(ProgEntryField.get())
-  with open(file_path,'w', encoding='utf-8') as f:
-    for item in items:
-      f.write(str(item.strip(), encoding='utf-8'))
-      f.write('\n')
-    f.close()
+    items = tab1.progView.get(0,END)
+    _write_program_items_atomically(file_path, items)
+    apply_calibration({'autoBGVal': auto_background}, CAL)
+    return True
+  except Exception as exc:
+    if inserted and selRow is not None:
+      try:
+        tab1.progView.delete(selRow)
+        tab1.progView.selection_clear(0, END)
+        for row in prior_selection:
+          tab1.progView.select_set(row)
+      except Exception:
+        logger.exception(
+          "Unable to restore the program editor after vision insertion failed"
+        )
+    message = f"Vision program insertion failed: {exc}"
+    logger.exception(message)
+    for status_label in (almStatusLab, almStatusLab2):
+      try:
+        status_label.config(text=message, style="Alarm.TLabel")
+      except Exception:
+        logger.exception("Unable to display the vision insertion failure")
+    return False
 
 def insertRegister():  
   try:
@@ -20283,7 +20587,7 @@ def _apply_single_calibration_transaction(
     logger.exception("Calibration transport preflight failed during %s", context)
     return False
 
-  snapshot = dict(CAL)
+  snapshot = snapshot_calibration_values(CAL)
   try:
     apply_values(values)
   except Exception:
@@ -20326,7 +20630,7 @@ def updateParams(transmit=True):
     raise TypeError("update-parameters transmit flag must be boolean")
   values, command = _prepare_update_parameters()
   if not transmit:
-    snapshot = dict(CAL)
+    snapshot = snapshot_calibration_values(CAL)
     try:
       _apply_update_parameter_values(values)
     except Exception:
@@ -20454,7 +20758,7 @@ def _prepare_controller_calibration():
 
 
 def _apply_controller_calibration(update_values, external_values):
-  snapshot = dict(CAL)
+  snapshot = snapshot_calibration_values(CAL)
   try:
     _apply_update_parameter_values(update_values)
     _apply_external_axis_values(external_values)
@@ -20476,7 +20780,7 @@ def calExtAxis(transmit=True):
     raise TypeError("external-axis transmit flag must be boolean")
   values, command = _prepare_external_axis_parameters()
   if not transmit:
-    snapshot = dict(CAL)
+    snapshot = snapshot_calibration_values(CAL)
     try:
       _apply_external_axis_values(values)
     except Exception:
@@ -21448,6 +21752,7 @@ def save_custom_calibration():
     persisted = save_calibration(
       calibration_file='custom.json',
       calibration_data=profile_values,
+      require_runtime_fields=False,
     )
   except Exception:
     logger.exception("Custom calibration validation or persistence failed")
@@ -21463,6 +21768,7 @@ def load_custom_calibration():
     loaded_calibration = load_calibration(
       calibration_file='custom.json',
       allow_fallback=False,
+      require_runtime_fields=False,
     )
     profile_values = _prepare_custom_calibration_profile(loaded_calibration)
     sync_calibration_to_fields(profile_values)
@@ -21565,7 +21871,9 @@ def _collect_fields_to_calibration():
     'VisProg': visoptions.get(),
     'VisBrightVal': finite_number(VisBrightSlide.get(), "vision brightness"),
     'VisContVal': finite_number(VisContrastSlide.get(), "vision contrast"),
-    'VisBacColor': str(VisBacColorEntryField.get()),
+    'VisBacColor': normalize_vision_background_color(
+      VisBacColorEntryField.get()
+    ),
     'VisScore': finite_number(VisScoreEntryField.get(), "vision score"),
     'VisX1Val': int(VisX1PixEntryField.get()),
     'VisY1Val': int(VisY1PixEntryField.get()),
@@ -21627,8 +21935,7 @@ def _collect_fields_to_calibration():
 
 
 def _restore_controller_calibration(snapshot):
-  CAL.clear()
-  CAL.update(snapshot)
+  apply_calibration(snapshot, CAL)
   _set_cpp_kinematics_from_values(snapshot)
   _apply_joint_limit_widgets(snapshot)
   _apply_external_axis_values({
@@ -21684,7 +21991,11 @@ def _invalidate_uncertain_controller_calibration(reason):
 )
 @_tracked_serial_operation("ser")
 def SaveAndApplyCalibration():
-  snapshot = dict(CAL)
+  try:
+    snapshot = snapshot_calibration_values(CAL)
+  except Exception:
+    logger.exception("Calibration snapshot failed")
+    return False
   try:
     field_values = _collect_fields_to_calibration()
     (
@@ -21693,27 +22004,36 @@ def SaveAndApplyCalibration():
       external_values,
       external_command,
     ) = _prepare_controller_calibration()
-    staged_values = dict(CAL)
+    staged_values = dict(snapshot)
     staged_values.update(field_values)
     staged_values.update(update_values)
     staged_values.update(external_values)
+    staged_values = normalize_calibration_data(staged_values)
     _validate_controller_pose(staged_values)
+    field_values = {
+      key: staged_values[key]
+      for key in field_values
+    }
+    update_values = {
+      key: staged_values[key]
+      for key in update_values
+    }
+    external_values = {
+      key: staged_values[key]
+      for key in external_values
+    }
   except Exception:
     logger.exception("Calibration validation failed")
-    CAL.clear()
-    CAL.update(snapshot)
     return False
 
   try:
     _preflight_controller_calibration_transport()
   except Exception:
     logger.exception("Calibration transport preflight failed")
-    CAL.clear()
-    CAL.update(snapshot)
     return False
 
   try:
-    CAL.update(field_values)
+    apply_calibration(field_values, CAL)
     _apply_controller_calibration(update_values, external_values)
   except Exception:
     logger.exception("Calibration application failed")
@@ -22045,7 +22365,127 @@ def stop_vid():
 
 #vismenu.size
 
-def take_pic():
+def _vision_background_bgr(value):
+  red, green, blue = normalize_vision_background_color(value)
+  return blue, green, red
+
+
+def _vision_background_grayscale(value):
+  rgb_pixel = np.asarray(
+    [[normalize_vision_background_color(value)]],
+    dtype=np.uint8,
+  )
+  grayscale = cv2.cvtColor(rgb_pixel, cv2.COLOR_RGB2GRAY)
+  return int(grayscale[0][0])
+
+
+def _average_vision_grayscale_samples(samples):
+  try:
+    sample_values = np.asarray(samples, dtype=np.float64)
+  except (TypeError, ValueError, OverflowError) as exc:
+    raise MotionInputError(
+      "vision grayscale samples must be numeric"
+    ) from exc
+  if (
+    sample_values.ndim != 1
+    or sample_values.size == 0
+    or not np.all(np.isfinite(sample_values))
+    or np.any(sample_values < 0)
+    or np.any(sample_values > 255)
+  ):
+    raise MotionInputError(
+      "vision grayscale samples must contain finite byte values"
+    )
+  return int(np.rint(np.mean(sample_values)))
+
+
+def _average_vision_bgr_samples(samples):
+  try:
+    sample_values = np.asarray(samples, dtype=np.float64)
+  except (TypeError, ValueError, OverflowError) as exc:
+    raise MotionInputError(
+      "vision BGR samples must be numeric"
+    ) from exc
+  if (
+    sample_values.ndim != 2
+    or sample_values.shape[0] == 0
+    or sample_values.shape[1] != 3
+    or not np.all(np.isfinite(sample_values))
+    or np.any(sample_values < 0)
+    or np.any(sample_values > 255)
+  ):
+    raise MotionInputError(
+      "vision BGR samples must contain finite three-channel byte values"
+    )
+  averaged_bgr = tuple(
+    int(component)
+    for component in np.rint(np.mean(sample_values, axis=0))
+  )
+  averaged_rgb = tuple(reversed(averaged_bgr))
+  return averaged_bgr, averaged_rgb
+
+
+def _vision_sample_coordinate(value, label):
+  if isinstance(value, bool):
+    raise MotionInputError(f"{label} must be an integer")
+  if isinstance(value, str):
+    token = value.strip()
+    if re.fullmatch(r"\d+", token) is None:
+      raise MotionInputError(f"{label} must be a non-negative integer")
+    return int(token)
+  number = finite_number(value, label)
+  if number < 0 or not number.is_integer():
+    raise MotionInputError(f"{label} must be a non-negative integer")
+  return int(number)
+
+
+def _validated_vision_sample_pixels(image, points):
+  shape = getattr(image, "shape", None)
+  if (
+    not isinstance(shape, (tuple, list))
+    or len(shape) < 2
+  ):
+    raise MotionInputError("vision sample image has no two-dimensional shape")
+  first_limit = _vision_sample_coordinate(
+    shape[0],
+    "vision image first dimension",
+  )
+  second_limit = _vision_sample_coordinate(
+    shape[1],
+    "vision image second dimension",
+  )
+  if first_limit <= 0 or second_limit <= 0:
+    raise MotionInputError("vision sample image dimensions must be positive")
+  if (
+    isinstance(points, (str, bytes))
+    or not isinstance(points, (tuple, list))
+    or not points
+  ):
+    raise MotionInputError("vision sample points must be a non-empty sequence")
+
+  samples = []
+  for index, point in enumerate(points, start=1):
+    if not isinstance(point, (tuple, list)) or len(point) != 2:
+      raise MotionInputError(
+        f"vision sample point {index} must contain two coordinates"
+      )
+    first = _vision_sample_coordinate(
+      point[0],
+      f"vision sample point {index} first coordinate",
+    )
+    second = _vision_sample_coordinate(
+      point[1],
+      f"vision sample point {index} second coordinate",
+    )
+    if first >= first_limit or second >= second_limit:
+      raise MotionInputError(
+        f"vision sample point {index} is outside the current image"
+      )
+    samples.append(image[first][second])
+  return tuple(samples)
+
+
+def take_pic(background_override=None):
   # global RUN['selectedCam']
   #global cap
   # global RUN['BGavg']
@@ -22065,6 +22505,8 @@ def take_pic():
           RUN['selectedCam'] = i
       RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
       ret, frame = RUN['cap'].read()
+    if not ret or frame is None:
+      raise MotionInputError("camera did not return a captured frame")
 
     brightness = int(VisBrightSlide.get())
     contrast = int(VisContrastSlide.get())
@@ -22090,18 +22532,28 @@ def take_pic():
     cropped = cv2image[minX:maxX, minY:maxY]
     cv2image = cv2.resize(cropped, (width, height))
 
-    CAL['autoBGVal'] = int(RUN['autoBG'].get())
-    if(CAL['autoBGVal']==1):
-      x1 = int(float(VisX1PixEntryField.get()))
-      y1 = int(float(VisY1PixEntryField.get()))
-      x2 = int(float(VisX2PixEntryField.get()))
-      y2 = int(float(VisY1PixEntryField.get()))
-      x3 = int(float(VisX1PixEntryField.get()))
-      y3 = int(float(VisY2PixEntryField.get()))
-      BG1 = cv2image[x1][y1]
-      BG2 = cv2image[x2][y2]
-      BG3 = cv2image[x3][y3]
-      avg = int(mean([BG1,BG2,BG3]))
+    if background_override is None:
+      auto_background = int(RUN['autoBG'].get())
+      CAL['autoBGVal'] = auto_background
+      manual_background = VisBacColorEntryField.get()
+    elif background_override == "Auto":
+      auto_background = 1
+      manual_background = None
+    else:
+      auto_background = 0
+      manual_background = normalize_vision_background_color(
+        background_override
+      )
+    if(auto_background==1):
+      BG1, BG2, BG3 = _validated_vision_sample_pixels(
+        cv2image,
+        (
+          (VisX1PixEntryField.get(), VisY1PixEntryField.get()),
+          (VisX2PixEntryField.get(), VisY1PixEntryField.get()),
+          (VisX1PixEntryField.get(), VisY2PixEntryField.get()),
+        ),
+      )
+      avg = _average_vision_grayscale_samples((BG1, BG2, BG3))
       RUN['BGavg'] = (avg,avg,avg) 
       background = avg
       VisBacColorEntryField.configure(state='enabled')  
@@ -22109,11 +22561,9 @@ def take_pic():
       VisBacColorEntryField.insert(0,str(RUN['BGavg']))
       VisBacColorEntryField.configure(state='disabled')  
     else:
-      temp = VisBacColorEntryField.get()  
-      startIndex = temp.find("(")
-      endIndex = temp.find(",")
-      background = int(temp[startIndex+1:endIndex])
-      #background = eval(VisBacColorEntryField.get())
+      background = _vision_background_grayscale(
+        manual_background
+      )
 
     h = cv2image.shape[0]
     w = cv2image.shape[1]
@@ -22131,9 +22581,12 @@ def take_pic():
     vid_lbl.imgtk = imgtk    
     vid_lbl.configure(image=imgtk) 
     filename = 'curImage.jpg'
-    cv2.imwrite(filename, cv2image)
-  except:
-    print("camera failed")
+    if not cv2.imwrite(filename, cv2image):
+      raise OSError("captured vision frame could not be persisted")
+    return True
+  except Exception:
+    logger.exception("Vision capture failed")
+    return False
 
 def mask_pic():
   # global RUN['selectedCam']
@@ -22154,6 +22607,8 @@ def mask_pic():
         RUN['selectedCam'] = i
     RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
     ret, frame = RUN['cap'].read()
+  if not ret or frame is None:
+    raise MotionInputError("camera did not return a mask frame")
   brightness = int(VisBrightSlide.get())
   contrast = int(VisContrastSlide.get())
   CAL['zoom'] = int(VisZoomSlide.get())
@@ -22176,13 +22631,15 @@ def mask_pic():
   #vid_lbl.imgtk = imgtk    
   #vid_lbl.configure(image=imgtk) 
   filename = 'curImage.jpg'
-  cv2.imwrite(filename, cv2image)
+  if not cv2.imwrite(filename, cv2image):
+    raise OSError("captured mask frame could not be persisted")
+  return True
 
   
 
 
 
-def mask_crop(event, x, y, flags, param):
+def _mask_crop(event, x, y, flags, param):
     # global RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'], RUN['cropping']
     #global oriImage
     # global RUN['box_points']
@@ -22228,18 +22685,26 @@ def mask_crop(event, x, y, flags, param):
 
         CAL['autoBGVal'] = int(RUN['autoBG'].get())
         if(CAL['autoBGVal']==1):
-          BG1 = RUN['oriImage'][int(VisX1PixEntryField.get())][int(VisY1PixEntryField.get())]
-          BG2 = RUN['oriImage'][int(VisX1PixEntryField.get())][int(VisY2PixEntryField.get())]
-          BG3 = RUN['oriImage'][int(VisX2PixEntryField.get())][int(VisY2PixEntryField.get())]
-          avg = int(mean([BG1,BG2,BG3]))
-          RUN['BGavg'] = (avg,avg,avg) 
-          background = avg
+          BG1, BG2, BG3 = _validated_vision_sample_pixels(
+            RUN['oriImage'],
+            (
+              (VisX1PixEntryField.get(), VisY1PixEntryField.get()),
+              (VisX1PixEntryField.get(), VisY2PixEntryField.get()),
+              (VisX2PixEntryField.get(), VisY2PixEntryField.get()),
+            ),
+          )
+          background, canonical_rgb = _average_vision_bgr_samples(
+            (BG1, BG2, BG3)
+          )
+          RUN['BGavg'] = canonical_rgb
           VisBacColorEntryField.configure(state='enabled')  
           VisBacColorEntryField.delete(0, 'end')
           VisBacColorEntryField.insert(0,str(RUN['BGavg']))
           VisBacColorEntryField.configure(state='disabled')   
         else:  
-          background = eval(VisBacColorEntryField.get())
+          background = _vision_background_bgr(
+            VisBacColorEntryField.get()
+          )
 
         h = RUN['oriImage'].shape[0]
         w = RUN['oriImage'].shape[1]
@@ -22249,29 +22714,56 @@ def mask_crop(event, x, y, flags, param):
                 # change the pixel
                 RUN['oriImage'][y, x] = background if x >= RUN['mX2'] or x <= RUN['mX1'] or y <= RUN['mY1'] or y >= RUN['mY2'] else RUN['oriImage'][y, x]
 
-        img = Image.fromarray(RUN['oriImage'])
+        display_image = cv2.cvtColor(
+            RUN['oriImage'],
+            cv2.COLOR_BGR2RGB,
+        )
+        img = Image.fromarray(display_image)
         imgtk = ImageTk.PhotoImage(image=img) 
         vid_lbl.imgtk = imgtk    
         vid_lbl.configure(image=imgtk) 
         filename = 'curImage.jpg'
-        cv2.imwrite(filename, RUN['oriImage'])
+        if not cv2.imwrite(filename, RUN['oriImage']):
+            raise OSError("masked vision frame could not be persisted")
         cv2.destroyAllWindows()
+    return True
 
+
+def mask_crop(event, x, y, flags, param):
+    try:
+        return _mask_crop(event, x, y, flags, param)
+    except Exception:
+        logger.exception("Vision mask processing failed")
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            logger.exception("Unable to close vision mask windows")
+        return False
 
 
 def selectMask():
-  #global oriImage
-  # global RUN['button_down']
-  RUN['button_down'] = False
-  RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
-  mask_pic()
+  try:
+    RUN['button_down'] = False
+    RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
+    if mask_pic() is not True:
+      raise MotionInputError("vision mask capture failed")
 
-  image = cv2.imread('curImage.jpg')
-  RUN['oriImage'] = image.copy()
-  
-  cv2.namedWindow("image")
-  cv2.setMouseCallback("image", mask_crop)
-  cv2.imshow("image", image)
+    image = cv2.imread('curImage.jpg')
+    if image is None:
+      raise MotionInputError("captured mask frame could not be reloaded")
+    RUN['oriImage'] = image.copy()
+
+    cv2.namedWindow("image")
+    cv2.setMouseCallback("image", mask_crop)
+    cv2.imshow("image", image)
+    return True
+  except Exception:
+    logger.exception("Vision mask selection failed")
+    try:
+      cv2.destroyAllWindows()
+    except Exception:
+      logger.exception("Unable to close vision mask windows")
+    return False
 
 
 
@@ -22342,19 +22834,26 @@ def selectTemplate():
 def snapFind():
   # global RUN['selectedTemplate']
   # global RUN['BGavg']
-  take_pic()
-  template = RUN['selectedTemplate'].get()
-  min_score = float(VisScoreEntryField.get())*.01
-  CAL['autoBGVal'] = int(RUN['autoBG'].get())
-  if(CAL['autoBGVal']==1):
-    background = RUN['BGavg']
-    VisBacColorEntryField.configure(state='enabled')  
-    VisBacColorEntryField.delete(0, 'end')
-    VisBacColorEntryField.insert(0,str(RUN['BGavg']))
-    VisBacColorEntryField.configure(state='disabled')  
-  else:  
-    background = eval(VisBacColorEntryField.get())
-  visFind(template,min_score,background)
+  try:
+    if take_pic() is not True:
+      return False
+    template = RUN['selectedTemplate'].get()
+    min_score = float(VisScoreEntryField.get())*.01
+    CAL['autoBGVal'] = int(RUN['autoBG'].get())
+    if(CAL['autoBGVal']==1):
+      background = _vision_background_grayscale(RUN['BGavg'])
+      VisBacColorEntryField.configure(state='enabled')
+      VisBacColorEntryField.delete(0, 'end')
+      VisBacColorEntryField.insert(0,str(RUN['BGavg']))
+      VisBacColorEntryField.configure(state='disabled')
+    else:
+      background = _vision_background_grayscale(
+        VisBacColorEntryField.get()
+      )
+    return visFind(template,min_score,background)
+  except Exception:
+    logger.exception("Vision matching failed")
+    return False
 
 
 
@@ -22365,27 +22864,44 @@ def rotate_image(img,angle,background):
     result = cv2.warpAffine(img, rot_mat, img.shape[1::-1],borderMode=cv2.BORDER_CONSTANT, borderValue=background, flags=cv2.INTER_LINEAR)
     return result
 
+
+def _vision_match_maximum(result):
+    _, maximum, _, location = cv2.minMaxLoc(result)
+    maximum = finite_number(maximum, "vision template score")
+    if maximum < -1 or maximum > 1:
+        raise MotionInputError(
+            "vision template score must be between -1 and 1"
+        )
+    return maximum, location
+
+
 def visFind(template,min_score,background):
     # global RUN['xMMpos']
     # global RUN['yMMpos']
     #global autoBG
 
-    if(background == "Auto"):
-      background = RUN['BGavg']
-      VisBacColorEntryField.configure(state='enabled')  
-      VisBacColorEntryField.delete(0, 'end')
-      VisBacColorEntryField.insert(0,str(RUN['BGavg']))
-      VisBacColorEntryField.configure(state='disabled')  
-      
-
     green = (0,255,0)
-    red = (255,0,0)
+    red = (0,0,255)
     blue = (0,0,255)
     dkgreen = (0,128,0)
     status = "fail"
-    highscore = 0
-    img1 = cv2.imread('curImage.jpg')  # target Image
-    img2 = cv2.imread(template)  # target Image
+    highscore = -math.inf
+    min_score = finite_number(min_score, "vision minimum score")
+    if min_score < 0 or min_score > 1:
+      raise MotionInputError(
+        "vision minimum score must be between 0 and 1"
+      )
+    background = _average_vision_grayscale_samples((background,))
+    img1 = cv2.imread('curImage.jpg', cv2.IMREAD_GRAYSCALE)
+    if img1 is None:
+      raise MotionInputError("captured vision frame could not be loaded")
+    img2 = cv2.imread(template, cv2.IMREAD_GRAYSCALE)
+    if img2 is None:
+      raise MotionInputError("vision template could not be loaded")
+    if img2.shape[0] > img1.shape[0] or img2.shape[1] > img1.shape[1]:
+      raise MotionInputError(
+        "vision template must not exceed the captured frame dimensions"
+      )
     
     #method = cv2.TM_CCOEFF_NORMED
     #method = cv2.TM_CCORR_NORMED
@@ -22406,14 +22922,14 @@ def visFind(template,min_score,background):
         ## fist pass 1/3rds
         curangle = 0
         highangle = 0
-        highscore = 0
-        highmax_loc = 0
+        highscore = -math.inf
+        highmax_loc = (0, 0)
         for x in range(3):
           template = img2
           template = rotate_image(img2,curangle,background)
           w, h = template.shape[1::-1]
           res = cv2.matchTemplate(img,template,method)
-          min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+          max_val, max_loc = _vision_match_maximum(res)
           if(max_val>highscore):
             highscore=max_val
             highangle=curangle
@@ -22432,7 +22948,7 @@ def visFind(template,min_score,background):
           template = rotate_image(img2,nextangle1,background)
           w, h = template.shape[1::-1]
           res = cv2.matchTemplate(img,template,method)
-          min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+          max_val, max_loc = _vision_match_maximum(res)
           if(max_val>highscore):
             highscore=max_val
             highangle=nextangle1
@@ -22442,7 +22958,7 @@ def visFind(template,min_score,background):
           template = rotate_image(img2,nextangle2,background)
           w, h = template.shape[1::-1]
           res = cv2.matchTemplate(img,template,method)
-          min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+          max_val, max_loc = _vision_match_maximum(res)
           if(max_val>highscore):
             highscore=max_val
             highangle=nextangle2
@@ -22458,7 +22974,7 @@ def visFind(template,min_score,background):
           img = img1.copy()
           # Apply template Matching
           res = cv2.matchTemplate(img,template,method)
-          min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+          max_val, max_loc = _vision_match_maximum(res)
           highscore=max_val
           highangle=i
           highmax_loc=max_loc
@@ -22470,6 +22986,7 @@ def visFind(template,min_score,background):
       if highscore >= min_score:
         break         
 
+    display_image = cv2.cvtColor(img1, cv2.COLOR_GRAY2BGR)
     if highscore >= min_score:
       status = "pass"
       #normalize angle to increment of +180 to -180
@@ -22494,7 +23011,6 @@ def visFind(template,min_score,background):
         status = "fail"
 
       top_left = highmax_loc
-      bottom_right = (top_left[0] + highw, top_left[1] + highh)
       #find center
       center = (top_left[0] + highw/2, top_left[1] + highh/2)
       xPos = int(center[1])
@@ -22506,35 +23022,36 @@ def visFind(template,min_score,background):
       #find line 1 end
       line1x = int(imgxPos + 60*math.cos(math.radians(highangle-90)))
       line1y = int(imgyPos + 60*math.sin(math.radians(highangle-90)))
-      cv2.line(img, (imgxPos,imgyPos), (line1x,line1y), green, 3) 
+      cv2.line(display_image, (imgxPos,imgyPos), (line1x,line1y), green, 3)
 
       #find line 2 end
       line2x = int(imgxPos + 60*math.cos(math.radians(highangle+90)))
       line2y = int(imgyPos + 60*math.sin(math.radians(highangle+90)))
-      cv2.line(img, (imgxPos,imgyPos), (line2x,line2y), green, 3)  
+      cv2.line(display_image, (imgxPos,imgyPos), (line2x,line2y), green, 3)
 
       #find line 3 end
       line3x = int(imgxPos + 30*math.cos(math.radians(highangle)))
       line3y = int(imgyPos + 30*math.sin(math.radians(highangle)))
-      cv2.line(img, (imgxPos,imgyPos), (line3x,line3y), green, 3)
+      cv2.line(display_image, (imgxPos,imgyPos), (line3x,line3y), green, 3)
 
       #find line 4 end
       line4x = int(imgxPos + 30*math.cos(math.radians(highangle+180)))
       line4y = int(imgyPos + 30*math.sin(math.radians(highangle+180)))
-      cv2.line(img, (imgxPos,imgyPos), (line4x,line4y), green, 3) 
+      cv2.line(display_image, (imgxPos,imgyPos), (line4x,line4y), green, 3)
 
       #find tip start
       lineTx = int(imgxPos + 56*math.cos(math.radians(highangle-90)))
       lineTy = int(imgyPos + 56*math.sin(math.radians(highangle-90)))
-      cv2.line(img, (lineTx,lineTy), (line1x,line1y), dkgreen, 2) 
+      cv2.line(display_image, (lineTx,lineTy), (line1x,line1y), dkgreen, 2)
 
 
 
-      cv2.circle(img, (imgxPos,imgyPos), 20, green, 1)
-      #cv2.rectangle(img,top_left, bottom_right, green, 2)
-      cv2.imwrite('temp.jpg', img)
-      img = Image.fromarray(img).resize((640,480))
-      imgtk = ImageTk.PhotoImage(image=img)        
+      cv2.circle(display_image, (imgxPos,imgyPos), 20, green, 1)
+      if not cv2.imwrite('temp.jpg', display_image):
+        raise OSError("vision result frame could not be persisted")
+      display_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
+      display = Image.fromarray(display_rgb).resize((640,480))
+      imgtk = ImageTk.PhotoImage(image=display)
       vid_lbl.imgtk = imgtk    
       vid_lbl.configure(image=imgtk)
       VisRetScoreEntryField.delete(0, 'end')
@@ -22560,10 +23077,12 @@ def visFind(template,min_score,background):
 
 
     if status == "fail":
-      cv2.rectangle(img,(5,5), (635,475), red, 5)
-      cv2.imwrite('temp.jpg', img)
-      img = Image.fromarray(img).resize((640,480))
-      imgtk = ImageTk.PhotoImage(image=img)        
+      cv2.rectangle(display_image,(5,5), (635,475), red, 5)
+      if not cv2.imwrite('temp.jpg', display_image):
+        raise OSError("vision result frame could not be persisted")
+      display_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
+      display = Image.fromarray(display_rgb).resize((640,480))
+      imgtk = ImageTk.PhotoImage(image=display)
       vid_lbl.imgtk = imgtk    
       vid_lbl.configure(image=imgtk)
       VisRetScoreEntryField.delete(0, 'end')
@@ -22751,10 +23270,10 @@ def zeroBrCn():
   VisBrightSlide.set(0)
   VisContrastSlide.set(0)
   #VisZoomSlide.set(50)
-  take_pic()
+  return take_pic()
 
 def VisUpdateBriCon(foo):
-  take_pic()  
+  return take_pic()
 
   
   
@@ -24154,8 +24673,8 @@ visFailEntryField.grid(row=3, column=1, sticky="ew", padx=(1, 2), pady=(0, 2))
 # Vision Find additional fields (placeholders - full UI on Tab 6)
 VisBacColorEntryField = Entry(tab1, width=6)  # Hidden, used by insertvisFind
 VisScoreEntryField = Entry(tab1, width=6)  # Hidden, used by insertvisFind
-VisBacColorEntryField.insert(0, "116, 116, 116")  # Default background color
-VisScoreEntryField.insert(0, "85")  # Default score threshold
+VisBacColorEntryField.insert(0, "[116, 116, 116]")
+VisScoreEntryField.insert(0, "85")
 
 # Row 9: Wait container
 waitContainer = LabelFrame(leftPanel, text="Wait - Stop", padding=5)
