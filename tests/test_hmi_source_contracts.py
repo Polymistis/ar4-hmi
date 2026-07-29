@@ -5840,6 +5840,14 @@ class HmiSourceContractTests(unittest.TestCase):
                     )
 
         exceptions = []
+        queued_snapshot = dict(
+            safe_snapshot,
+            curTheme=(
+                1
+                if safe_snapshot["curTheme"] == 0
+                else 0
+            ),
+        )
 
         def fail_cancel(job):
             raise RuntimeError("cancel failed")
@@ -5865,7 +5873,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         self.assertFalse(
-            reconcile(True, safe_snapshot, safe_snapshot)
+            reconcile(True, queued_snapshot, safe_snapshot)
         )
         self.assertTrue(namespace["_calibration_dirty"])
         self.assertEqual(
@@ -5874,7 +5882,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(
             namespace["_calibration_save_snapshot"],
-            normalize_calibration_data(safe_snapshot),
+            normalize_calibration_data(queued_snapshot),
         )
         self.assertEqual(len(exceptions), 1)
 

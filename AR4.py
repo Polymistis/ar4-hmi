@@ -6946,28 +6946,34 @@ def _reconcile_auxiliary_calibration_persistence_after_settle_failure(
   pending_job = _calibration_save_job
   _calibration_dirty = False
   _calibration_save_snapshot = None
-  if pending_job is None:
-    _calibration_save_job = None
-  else:
+  cancellation_failed = False
+  if pending_job is not None:
     try:
       root.after_cancel(pending_job)
     except Exception:
+      cancellation_failed = True
       logger.exception(
         "Unable to cancel calibration persistence after auxiliary settle failure"
       )
       if _calibration_save_job is None:
         _calibration_save_job = pending_job
+    else:
+      if _calibration_save_job is not pending_job:
+        cancellation_failed = True
+        logger.error(
+          "Calibration persistence ownership changed during settle recovery"
+        )
+      else:
+        _calibration_save_job = None
+    if cancellation_failed:
+      # An armed callback needs a verified payload and dirty state until firing.
       _calibration_dirty = True
-      _calibration_save_snapshot = safe_snapshot
-      return False
-    if _calibration_save_job is not pending_job:
-      logger.error(
-        "Calibration persistence ownership changed during settle recovery"
+      _calibration_save_snapshot = (
+        persistence_snapshot
+        if persistence_required and persistence_snapshot is not None
+        else safe_snapshot
       )
-      _calibration_dirty = True
-      _calibration_save_snapshot = safe_snapshot
       return False
-    _calibration_save_job = None
   if not persistence_required:
     return True
   retained = _retain_calibration_persistence_retry(
@@ -7363,15 +7369,21 @@ def setCom2(misc=None):
         else previous_persistence_snapshot
       )
       try:
-        _reconcile_auxiliary_calibration_persistence_after_settle_failure(
-          persistence_required,
-          persistence_snapshot,
-          (
-            target_calibration
-            if target_verified
-            else previous_calibration
-          ),
+        persistence_reconciled = (
+          _reconcile_auxiliary_calibration_persistence_after_settle_failure(
+            persistence_required,
+            persistence_snapshot,
+            (
+              target_calibration
+              if target_verified
+              else previous_calibration
+            ),
+          )
         )
+        if persistence_reconciled is not True:
+          logger.error(
+            "Auxiliary calibration persistence remains on a retained safe retry"
+          )
       except Exception:
         logger.exception(
           "Unable to reconcile calibration persistence after settle failure"
