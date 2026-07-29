@@ -7382,7 +7382,7 @@ def setCom2(misc=None):
         )
         if persistence_reconciled is not True:
           logger.error(
-            "Auxiliary calibration persistence remains on a retained safe retry"
+            "Auxiliary calibration persistence reconciliation did not complete"
           )
       except Exception:
         logger.exception(

@@ -5804,7 +5804,7 @@ class HmiSourceContractTests(unittest.TestCase):
                     1 if mode == "ownership-changed" else 0,
                 )
 
-    def test_auxiliary_settle_reconciliation_retains_safe_persistence_target(self):
+    def test_auxiliary_settle_reconciliation_preserves_persistence_target(self):
         safe_snapshot = self._valid_runtime_calibration()
         for target in (None, safe_snapshot):
             with self.subTest(explicit_snapshot=target is not None):
@@ -9474,6 +9474,7 @@ class HmiSourceContractTests(unittest.TestCase):
             disable=False,
             follow_up_error=None,
             settle_failure=False,
+            reconciliation_result=True,
             initial_dirty=False,
             verification_failure=False,
         ):
@@ -9488,6 +9489,7 @@ class HmiSourceContractTests(unittest.TestCase):
             replacement_calls = []
             persistence_calls = []
             reconciliation_calls = []
+            error_calls = []
             output_values = self._auxiliary_output_values(calibration)
 
             def replace(port, board):
@@ -9554,7 +9556,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 "logger": SimpleNamespace(
                     info=log_connection,
                     warning=lambda *args: None,
-                    error=lambda *args: None,
+                    error=lambda *args: error_calls.append(args),
                     exception=lambda *args: None,
                 ),
                 "tab8": SimpleNamespace(ElogView=SimpleNamespace(get=lambda *args: ())),
@@ -9573,7 +9575,7 @@ class HmiSourceContractTests(unittest.TestCase):
                         reconciliation_calls.append(
                             (required, snapshot, safe_snapshot)
                         )
-                        or True
+                        or reconciliation_result
                     )
                 )
             if verification_failure:
@@ -9600,6 +9602,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 replacement_calls,
                 persistence_calls,
                 reconciliation_calls,
+                error_calls,
             )
 
         success = run_case()
@@ -9668,6 +9671,10 @@ class HmiSourceContractTests(unittest.TestCase):
             "COM9",
         )
 
+        reconciliation_error = (
+            "Auxiliary calibration persistence reconciliation "
+            "did not complete",
+        )
         settle_failure = run_case(settle_failure=True)
         self.assertFalse(settle_failure[0])
         self.assertEqual(settle_failure[1]["com2Port"], "COM9")
@@ -9685,6 +9692,17 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(
             settle_failure[6][0][2]["auxiliaryBoard"],
             AUXILIARY_BOARD_NANO,
+        )
+        self.assertNotIn(reconciliation_error, settle_failure[7])
+
+        unreconciled_settle_failure = run_case(
+            settle_failure=True,
+            reconciliation_result=False,
+        )
+        self.assertFalse(unreconciled_settle_failure[0])
+        self.assertIn(
+            reconciliation_error,
+            unreconciled_settle_failure[7],
         )
 
         restored_settle_failure = run_case(
