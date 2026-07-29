@@ -745,6 +745,15 @@ Acceptance criteria:
 - Hardware verification remains pending for observed cadence, encoder accuracy,
   USB load, terminal priority, and pulse-timing behavior across representative
   speeds and simultaneous-axis moves.
+- During drive-off deployment on 2026-07-29, Arduino CLI returned exit code
+  `0`, and the re-enumerated Teensy 4.1 hardware identity `1705B6`
+  self-reported version `6.7.1-ar4hmi.5`. Live `HO` and `H2` responses reported
+  the required capabilities and invalid J1-J3 home references without an
+  operator-issued motion command. Those responses do not
+  cryptographically bind the running binary to the cited source commit or a
+  transient build artifact. The dated procedure and observations are recorded
+  in `docs/hardware-verification-2026-07-29.md`. Powered M4A7 cadence,
+  accuracy, load, priority, and timing observations remain pending.
 
 ### M4B - Repeatability and dynamic interception pass
 
