@@ -3748,6 +3748,20 @@ class HmiSourceContractTests(unittest.TestCase):
     def test_program_item_writer_replaces_only_complete_utf8_documents(self):
         from unittest.mock import patch
 
+        class PartialProgramFile:
+            def __init__(self, descriptor):
+                self.descriptor = descriptor
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                os.close(self.descriptor)
+
+            @staticmethod
+            def write(value):
+                return len(value) - 1
+
         namespace = {
             "MotionInputError": MotionInputError,
             "os": os,
@@ -3808,6 +3822,26 @@ class HmiSourceContractTests(unittest.TestCase):
             with (
                 patch("os.replace", side_effect=OSError("replace failed")),
                 self.assertRaisesRegex(OSError, "replace failed"),
+            ):
+                write_program(str(program_path), (b"replacement\n",))
+            self.assertEqual(
+                program_path.read_text(encoding="utf-8"),
+                "preserved\n",
+            )
+            self.assertEqual(
+                tuple(Path(directory).glob(".program.ar4.*.tmp")),
+                (),
+            )
+
+            program_path.write_text("preserved\n", encoding="utf-8")
+            with (
+                patch(
+                    "os.fdopen",
+                    side_effect=lambda descriptor, *args, **kwargs: (
+                        PartialProgramFile(descriptor)
+                    ),
+                ),
+                self.assertRaisesRegex(OSError, "write was incomplete"),
             ):
                 write_program(str(program_path), (b"replacement\n",))
             self.assertEqual(
@@ -11727,6 +11761,12 @@ class HmiSourceContractTests(unittest.TestCase):
             def get(self):
                 return self.value
 
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
         class ProgramView:
             def __init__(self, command):
                 self.command = command.encode("ascii")
@@ -11785,6 +11825,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 mv_dispatch = lambda value: value
                 rj_dispatch = lambda value: value
                 namespace = {
+                    "re": re,
                     "RUN": {
                         "progRunning": False,
                         "cmdType": None,
@@ -11816,11 +11857,33 @@ class HmiSourceContractTests(unittest.TestCase):
                     "ROW_EXECUTION_PENDING": "pending",
                     "ROW_EXECUTION_COMPLETE": "complete",
                 }
+                position_register_entries = {}
                 for register in (1, 2):
                     for element in range(1, 7):
-                        namespace[
-                            f"SP_{register}_E{element}_EntryField"
-                        ] = Entry(str(element))
+                        position_register_entries[(register, element)] = (
+                            Entry(str(element))
+                        )
+                namespace.update({
+                    "PROGRAM_REGISTER_COUNT": 16,
+                    "PROGRAM_POSITION_REGISTER_ELEMENT_COUNT": 6,
+                    "program_position_register_entry_fields": (
+                        position_register_entries
+                    ),
+                })
+                namespace["_program_bounded_index"] = self.compile_function(
+                    "_program_bounded_index",
+                    namespace,
+                )
+                namespace["_program_registry_entry"] = self.compile_function(
+                    "_program_registry_entry",
+                    namespace,
+                )
+                namespace["_program_position_register_values"] = (
+                    self.compile_function(
+                        "_program_position_register_values",
+                        namespace,
+                    )
+                )
 
                 execute = self.compile_function("executeRow", namespace)
                 self.assertEqual(execute(), "complete")
@@ -11836,6 +11899,143 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
                 self.assertTrue(dispatches[0][2].startswith(expected_virtual.upper()))
                 self.assertEqual(finishes, [True])
+
+    def test_program_registers_use_bounded_explicit_widget_registries(self):
+        class Entry:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+        class ProgramView:
+            command = b"Register 1 = ++ 2"
+
+            @staticmethod
+            def curselection():
+                return (0,)
+
+            @staticmethod
+            def see(row):
+                pass
+
+            @classmethod
+            def get(cls, row):
+                return cls.command
+
+        register_entry = Entry("3")
+        position_entry = Entry("4")
+        finishes = []
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "re": re,
+            "PROGRAM_REGISTER_COUNT": 16,
+            "PROGRAM_POSITION_REGISTER_ELEMENT_COUNT": 6,
+            "program_register_entry_fields": {1: register_entry},
+            "program_position_register_entry_fields": {
+                (2, 6): position_entry,
+            },
+            "RUN": {
+                "progRunning": False,
+                "cmdType": None,
+                "cmdTypeLong": None,
+                "moveInProc": 0,
+            },
+            "tab1": SimpleNamespace(progView=ProgramView()),
+            "_finish_execute_row": lambda: finishes.append(True),
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "ROW_EXECUTION_PENDING": "pending",
+            "ROW_EXECUTION_COMPLETE": "complete",
+        }
+        namespace["_program_bounded_index"] = self.compile_function(
+            "_program_bounded_index",
+            namespace,
+        )
+        namespace["_program_registry_entry"] = self.compile_function(
+            "_program_registry_entry",
+            namespace,
+        )
+        namespace["_program_register_entry"] = self.compile_function(
+            "_program_register_entry",
+            namespace,
+        )
+        namespace["_program_position_register_entry"] = self.compile_function(
+            "_program_position_register_entry",
+            namespace,
+        )
+        execute = self.compile_function("executeRow", namespace)
+
+        self.assertEqual(execute(), "complete")
+        self.assertEqual(register_entry.get(), "5")
+        self.assertEqual(finishes, [True])
+
+        ProgramView.command = b"Position Register 2 Element 6 = -- 1.5"
+        finishes.clear()
+        self.assertEqual(execute(), "complete")
+        self.assertEqual(position_entry.get(), "2.5")
+        self.assertEqual(finishes, [True])
+
+        for token in (
+            "0",
+            "01",
+            "17",
+            "1١",
+            "9" * 5000,
+            "1 or __import__('os').system('not-run')",
+        ):
+            with self.subTest(token=token):
+                with self.assertRaises(MotionInputError):
+                    namespace["_program_register_entry"](token)
+        with self.assertRaises(MotionInputError):
+            namespace["_program_position_register_entry"]("2", "7")
+        with self.assertRaisesRegex(MotionInputError, "unavailable"):
+            namespace["_program_register_entry"]("2")
+
+        eval_calls = [
+            node
+            for node in ast.walk(self.module_functions["executeRow"])
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "eval"
+            )
+        ]
+        self.assertEqual(eval_calls, [])
+
+        source = AR4_SOURCE.read_text(encoding="utf-8")
+        registry_start = source.index("program_register_entry_fields.update")
+        registry_end = source.index("####TAB 6", registry_start)
+        registry_source = source[registry_start:registry_end]
+        self.assertEqual(
+            {
+                int(value)
+                for value in re.findall(
+                    r"\bR(\d+)EntryField\b",
+                    registry_source,
+                )
+            },
+            set(range(1, 17)),
+        )
+        self.assertEqual(
+            {
+                (int(register), int(element))
+                for register, element in re.findall(
+                    r"\bSP_(\d+)_E(\d+)_EntryField\b",
+                    registry_source,
+                )
+            },
+            {
+                (register, element)
+                for register in range(1, 17)
+                for element in range(1, 7)
+            },
+        )
 
     def test_default_program_motion_holds_owner_and_offline_default_rejects(self):
         class Entry:

@@ -308,6 +308,11 @@ Implemented portion:
   focus selects the complete value before replacement. Hardware-free
   source-contract coverage passes; live verification requires a later
   controlled HMI relaunch.
+- `.ar4` register and position-register rows resolve only through explicit
+  widget registries after bounded decimal validation. General registers accept
+  the defined 1-16 range; position-register elements accept 1-6. Program text
+  cannot become a Python expression, and missing registry bindings fail before
+  widget access.
 - Direct 5V I/O servo and output buttons validate widget values on Tk and
   serialize exact-response exchanges through a worker. A bounded FIFO retains
   additional manual I/O only behind an active manual exchange; unrelated

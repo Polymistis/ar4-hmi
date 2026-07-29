@@ -287,6 +287,10 @@ Config = AR4_Configuration()
 CE = Config.Environment
 CAL = Config.Calibration
 RUN = Config.RuntimeState # Not implemented yet
+PROGRAM_REGISTER_COUNT = 16
+PROGRAM_POSITION_REGISTER_ELEMENT_COUNT = 6
+program_register_entry_fields = {}
+program_position_register_entry_fields = {}
 
 
 def _load_startup_calibration():
@@ -11126,6 +11130,89 @@ def _program_tab_row_index(rows, tab_number):
   return _program_row_index(rows, f"Tab Number {tab_number}")
 
 
+def _program_bounded_index(value, label, maximum):
+  if (
+    isinstance(maximum, bool)
+    or not isinstance(maximum, int)
+    or maximum <= 0
+  ):
+    raise RuntimeError(f"{label} maximum is invalid")
+  if (
+    not isinstance(value, str)
+    or re.fullmatch(r"[1-9][0-9]*", value) is None
+  ):
+    raise MotionInputError(f"{label} must be a positive integer")
+  maximum_text = str(maximum)
+  if (
+    len(value) > len(maximum_text)
+    or (
+      len(value) == len(maximum_text)
+      and value > maximum_text
+    )
+  ):
+    raise MotionInputError(f"{label} must be between 1 and {maximum}")
+  return int(value)
+
+
+def _program_registry_entry(registry, key, label):
+  if not isinstance(registry, dict):
+    raise RuntimeError(f"{label} registry is invalid")
+  entry = registry.get(key)
+  if entry is None or not all(
+    callable(getattr(entry, method, None))
+    for method in ("get", "delete", "insert")
+  ):
+    raise MotionInputError(f"{label} is unavailable")
+  return entry
+
+
+def _program_register_entry(register_number):
+  register = _program_bounded_index(
+    register_number,
+    "program register",
+    PROGRAM_REGISTER_COUNT,
+  )
+  return _program_registry_entry(
+    program_register_entry_fields,
+    register,
+    f"program register {register}",
+  )
+
+
+def _program_position_register_entry(register_number, element_number):
+  register = _program_bounded_index(
+    register_number,
+    "program position register",
+    PROGRAM_REGISTER_COUNT,
+  )
+  element = _program_bounded_index(
+    element_number,
+    "program position-register element",
+    PROGRAM_POSITION_REGISTER_ELEMENT_COUNT,
+  )
+  return _program_registry_entry(
+    program_position_register_entry_fields,
+    (register, element),
+    f"program position register {register} element {element}",
+  )
+
+
+def _program_position_register_values(register_number):
+  register = _program_bounded_index(
+    register_number,
+    "program position register",
+    PROGRAM_REGISTER_COUNT,
+  )
+  return tuple(
+    _program_registry_entry(
+      program_position_register_entry_fields,
+      (register, element),
+      f"program position register {register} element {element}",
+    ).get()
+    for element in range(1, PROGRAM_POSITION_REGISTER_ELEMENT_COUNT + 1)
+  )
+
+
 def runProg():
   execution_request = _begin_program_execution("run")
   if execution_request is None:
@@ -11782,8 +11869,7 @@ def executeRow(motion_complete=None):
     inputNum = str(command[inputIndex+2:valIndex-1])
     valNum = int(command[valIndex+2:actionIndex-1])
     action = str(command[actionIndex+2:actionIndex+6])
-    regEntry = "R"+inputNum+"EntryField"
-    curRegVal = eval(regEntry).get()
+    curRegVal = _program_register_entry(inputNum).get()
     if (int(curRegVal) == valNum):
       if(action == "Call"):
         tab1.lastRow = tab1.progView.curselection()[0]
@@ -12280,20 +12366,20 @@ def executeRow(motion_complete=None):
     regNumIndex = command.find("Register ")
     regEqIndex = command.find(" = ")
     regNumVal = str(command[regNumIndex+9:regEqIndex])
-    regEntry = "R"+regNumVal+"EntryField"
+    register_entry = _program_register_entry(regNumVal)
     testOper = str(command[regEqIndex+3:regEqIndex+5])
     if (testOper == "++"):
       regCEqVal = str(command[regEqIndex+5:])
-      curRegVal = eval(regEntry).get()
+      curRegVal = register_entry.get()
       regEqVal = str(int(regCEqVal)+int(curRegVal))      
     elif (testOper == "--"):
       regCEqVal = str(command[regEqIndex+5:])
-      curRegVal = eval(regEntry).get()
+      curRegVal = register_entry.get()
       regEqVal = str(int(curRegVal)-int(regCEqVal))
     else:
       regEqVal = str(command[regEqIndex+3:])    
-    eval(regEntry).delete(0, 'end')
-    eval(regEntry).insert(0,regEqVal)
+    register_entry.delete(0, 'end')
+    register_entry.insert(0,regEqVal)
 
   if (RUN['cmdType'] == "Positi"):
     if (RUN['moveInProc'] == 1):
@@ -12303,20 +12389,23 @@ def executeRow(motion_complete=None):
     regEqIndex = command.find(" = ")
     regNumVal = str(command[regNumIndex+18:regElIndex-1])
     regNumEl = str(command[regElIndex+8:regEqIndex])
-    regEntry = "SP_"+regNumVal+"_E"+regNumEl+"_EntryField"
+    position_register_entry = _program_position_register_entry(
+      regNumVal,
+      regNumEl,
+    )
     testOper = str(command[regEqIndex+3:regEqIndex+5])
     if (testOper == "++"):
       regCEqVal = str(command[regEqIndex+4:])
-      curRegVal = eval(regEntry).get()
+      curRegVal = position_register_entry.get()
       regEqVal = str(float(regCEqVal)+float(curRegVal))      
     elif (testOper == "--"):
       regCEqVal = str(command[regEqIndex+5:])
-      curRegVal = eval(regEntry).get()
+      curRegVal = position_register_entry.get()
       regEqVal = str(float(curRegVal)-float(regCEqVal))
     else:
       regEqVal = str(command[regEqIndex+3:])    
-    eval(regEntry).delete(0, 'end')
-    eval(regEntry).insert(0,regEqVal)
+    position_register_entry.delete(0, 'end')
+    position_register_entry.insert(0,regEqVal)
     
 
   if RUN['cmdType'] in {
@@ -12422,12 +12511,7 @@ def executeRow(motion_complete=None):
     ACCrampIndex = command.find(" Rm ")
     WristConfIndex = command.find(" $")
     SP = str(command[SPnewInex+6:SPendInex])
-    cx = eval("SP_"+SP+"_E1_EntryField").get()
-    cy = eval("SP_"+SP+"_E2_EntryField").get()
-    cz = eval("SP_"+SP+"_E3_EntryField").get()
-    crz = eval("SP_"+SP+"_E4_EntryField").get()
-    cry = eval("SP_"+SP+"_E5_EntryField").get()
-    crx = eval("SP_"+SP+"_E6_EntryField").get()
+    cx, cy, cz, crz, cry, crx = _program_position_register_values(SP)
     RUN['xVal'] = str(float(cx) + float(command[xIndex+3:yIndex]))
     RUN['yVal'] = str(float(cy) + float(command[yIndex+3:zIndex]))
     RUN['zVal'] = str(float(cz) + float(command[zIndex+3:rzIndex]))
@@ -12477,12 +12561,7 @@ def executeRow(motion_complete=None):
     ACCrampIndex = command.find(" Rm ")
     WristConfIndex = command.find(" $")
     SP = str(command[SPnewInex+6:SPendInex])
-    cx = eval("SP_"+SP+"_E1_EntryField").get()
-    cy = eval("SP_"+SP+"_E2_EntryField").get()
-    cz = eval("SP_"+SP+"_E3_EntryField").get()
-    crz = eval("SP_"+SP+"_E4_EntryField").get()
-    cry = eval("SP_"+SP+"_E5_EntryField").get()
-    crx = eval("SP_"+SP+"_E6_EntryField").get()
+    cx, cy, cz, crz, cry, crx = _program_position_register_values(SP)
     RUN['xVal'] = str(float(cx) + float(VisRetXrobEntryField.get()))
     RUN['yVal'] = str(float(cy) + float(VisRetYrobEntryField.get()))
     RUN['zVal'] = str(float(cz) + float(command[zIndex+3:rzIndex]))
@@ -12527,12 +12606,7 @@ def executeRow(motion_complete=None):
     ACCrampIndex = command.find(" Rm ")
     WristConfIndex = command.find(" $")
     SP = str(command[SPnewInex+6:SPendInex])
-    cx = eval("SP_"+SP+"_E1_EntryField").get()
-    cy = eval("SP_"+SP+"_E2_EntryField").get()
-    cz = eval("SP_"+SP+"_E3_EntryField").get()
-    crz = eval("SP_"+SP+"_E4_EntryField").get()
-    cry = eval("SP_"+SP+"_E5_EntryField").get()
-    crx = eval("SP_"+SP+"_E6_EntryField").get()
+    cx, cy, cz, crz, cry, crx = _program_position_register_values(SP)
     RUN['xVal'] = str(float(cx))
     RUN['yVal'] = str(float(cy))
     RUN['zVal'] = str(float(cz))
@@ -12579,12 +12653,14 @@ def executeRow(motion_complete=None):
     WristConfIndex = command.find(" $")
     SP = str(command[SPnewInex+6:SPendInex])
     SP2 = str(command[SP2newInex+7:SP2endInex])
-    RUN['xVal'] = str(float(eval("SP_"+SP+"_E1_EntryField").get()) + float(eval("SP_"+SP2+"_E1_EntryField").get()))
-    RUN['yVal'] = str(float(eval("SP_"+SP+"_E2_EntryField").get()) + float(eval("SP_"+SP2+"_E2_EntryField").get()))
-    RUN['zVal'] = str(float(eval("SP_"+SP+"_E3_EntryField").get()) + float(eval("SP_"+SP2+"_E3_EntryField").get()))
-    rzVal = str(float(eval("SP_"+SP+"_E4_EntryField").get()) + float(eval("SP_"+SP2+"_E4_EntryField").get()))
-    ryVal = str(float(eval("SP_"+SP+"_E5_EntryField").get()) + float(eval("SP_"+SP2+"_E5_EntryField").get()))
-    rxVal = str(float(eval("SP_"+SP+"_E6_EntryField").get()) + float(eval("SP_"+SP2+"_E6_EntryField").get()))	
+    position_values = _program_position_register_values(SP)
+    offset_values = _program_position_register_values(SP2)
+    RUN['xVal'] = str(float(position_values[0]) + float(offset_values[0]))
+    RUN['yVal'] = str(float(position_values[1]) + float(offset_values[1]))
+    RUN['zVal'] = str(float(position_values[2]) + float(offset_values[2]))
+    rzVal = str(float(position_values[3]) + float(offset_values[3]))
+    ryVal = str(float(position_values[4]) + float(offset_values[4]))
+    rxVal = str(float(position_values[5]) + float(offset_values[5]))
     J7Val = command[J7Index+4:J8Index]
     J8Val = command[J8Index+4:J9Index]
     J9Val = command[J9Index+4:SpeedIndex]
@@ -28262,6 +28338,168 @@ SP_16_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
 SP_16_E6_EntryField.grid(row=16, column=5, padx=1, pady=2)
 SP16Lab = Label(posRegistersFrame, text="PR16")
 SP16Lab.grid(row=16, column=6, sticky="w", padx=2, pady=2)
+
+program_register_entry_fields.update({
+  register: entry
+  for register, entry in enumerate(
+    (
+      R1EntryField,
+      R2EntryField,
+      R3EntryField,
+      R4EntryField,
+      R5EntryField,
+      R6EntryField,
+      R7EntryField,
+      R8EntryField,
+      R9EntryField,
+      R10EntryField,
+      R11EntryField,
+      R12EntryField,
+      R13EntryField,
+      R14EntryField,
+      R15EntryField,
+      R16EntryField,
+    ),
+    start=1,
+  )
+})
+program_position_register_entry_fields.update({
+  (register, element): entry
+  for register, entries in enumerate(
+    (
+      (
+        SP_1_E1_EntryField,
+        SP_1_E2_EntryField,
+        SP_1_E3_EntryField,
+        SP_1_E4_EntryField,
+        SP_1_E5_EntryField,
+        SP_1_E6_EntryField,
+      ),
+      (
+        SP_2_E1_EntryField,
+        SP_2_E2_EntryField,
+        SP_2_E3_EntryField,
+        SP_2_E4_EntryField,
+        SP_2_E5_EntryField,
+        SP_2_E6_EntryField,
+      ),
+      (
+        SP_3_E1_EntryField,
+        SP_3_E2_EntryField,
+        SP_3_E3_EntryField,
+        SP_3_E4_EntryField,
+        SP_3_E5_EntryField,
+        SP_3_E6_EntryField,
+      ),
+      (
+        SP_4_E1_EntryField,
+        SP_4_E2_EntryField,
+        SP_4_E3_EntryField,
+        SP_4_E4_EntryField,
+        SP_4_E5_EntryField,
+        SP_4_E6_EntryField,
+      ),
+      (
+        SP_5_E1_EntryField,
+        SP_5_E2_EntryField,
+        SP_5_E3_EntryField,
+        SP_5_E4_EntryField,
+        SP_5_E5_EntryField,
+        SP_5_E6_EntryField,
+      ),
+      (
+        SP_6_E1_EntryField,
+        SP_6_E2_EntryField,
+        SP_6_E3_EntryField,
+        SP_6_E4_EntryField,
+        SP_6_E5_EntryField,
+        SP_6_E6_EntryField,
+      ),
+      (
+        SP_7_E1_EntryField,
+        SP_7_E2_EntryField,
+        SP_7_E3_EntryField,
+        SP_7_E4_EntryField,
+        SP_7_E5_EntryField,
+        SP_7_E6_EntryField,
+      ),
+      (
+        SP_8_E1_EntryField,
+        SP_8_E2_EntryField,
+        SP_8_E3_EntryField,
+        SP_8_E4_EntryField,
+        SP_8_E5_EntryField,
+        SP_8_E6_EntryField,
+      ),
+      (
+        SP_9_E1_EntryField,
+        SP_9_E2_EntryField,
+        SP_9_E3_EntryField,
+        SP_9_E4_EntryField,
+        SP_9_E5_EntryField,
+        SP_9_E6_EntryField,
+      ),
+      (
+        SP_10_E1_EntryField,
+        SP_10_E2_EntryField,
+        SP_10_E3_EntryField,
+        SP_10_E4_EntryField,
+        SP_10_E5_EntryField,
+        SP_10_E6_EntryField,
+      ),
+      (
+        SP_11_E1_EntryField,
+        SP_11_E2_EntryField,
+        SP_11_E3_EntryField,
+        SP_11_E4_EntryField,
+        SP_11_E5_EntryField,
+        SP_11_E6_EntryField,
+      ),
+      (
+        SP_12_E1_EntryField,
+        SP_12_E2_EntryField,
+        SP_12_E3_EntryField,
+        SP_12_E4_EntryField,
+        SP_12_E5_EntryField,
+        SP_12_E6_EntryField,
+      ),
+      (
+        SP_13_E1_EntryField,
+        SP_13_E2_EntryField,
+        SP_13_E3_EntryField,
+        SP_13_E4_EntryField,
+        SP_13_E5_EntryField,
+        SP_13_E6_EntryField,
+      ),
+      (
+        SP_14_E1_EntryField,
+        SP_14_E2_EntryField,
+        SP_14_E3_EntryField,
+        SP_14_E4_EntryField,
+        SP_14_E5_EntryField,
+        SP_14_E6_EntryField,
+      ),
+      (
+        SP_15_E1_EntryField,
+        SP_15_E2_EntryField,
+        SP_15_E3_EntryField,
+        SP_15_E4_EntryField,
+        SP_15_E5_EntryField,
+        SP_15_E6_EntryField,
+      ),
+      (
+        SP_16_E1_EntryField,
+        SP_16_E2_EntryField,
+        SP_16_E3_EntryField,
+        SP_16_E4_EntryField,
+        SP_16_E5_EntryField,
+        SP_16_E6_EntryField,
+      ),
+    ),
+    start=1,
+  )
+  for element, entry in enumerate(entries, start=1)
+})
 
 
 ####TAB 6
