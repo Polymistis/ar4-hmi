@@ -12395,7 +12395,7 @@ def executeRow(motion_complete=None):
     )
     testOper = str(command[regEqIndex+3:regEqIndex+5])
     if (testOper == "++"):
-      regCEqVal = str(command[regEqIndex+4:])
+      regCEqVal = str(command[regEqIndex+5:])
       curRegVal = position_register_entry.get()
       regEqVal = str(float(regCEqVal)+float(curRegVal))      
     elif (testOper == "--"):

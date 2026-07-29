@@ -11981,6 +11981,12 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(position_entry.get(), "2.5")
         self.assertEqual(finishes, [True])
 
+        ProgramView.command = b"Position Register 2 Element 6 = ++ 1.5"
+        finishes.clear()
+        self.assertEqual(execute(), "complete")
+        self.assertEqual(position_entry.get(), "4.0")
+        self.assertEqual(finishes, [True])
+
         for token in (
             "0",
             "01",
@@ -12012,29 +12018,33 @@ class HmiSourceContractTests(unittest.TestCase):
         registry_start = source.index("program_register_entry_fields.update")
         registry_end = source.index("####TAB 6", registry_start)
         registry_source = source[registry_start:registry_end]
-        self.assertEqual(
-            {
-                int(value)
-                for value in re.findall(
-                    r"\bR(\d+)EntryField\b",
-                    registry_source,
+        registry_namespace = {
+            "program_register_entry_fields": {},
+            "program_position_register_entry_fields": {},
+        }
+        expected_register_entries = {}
+        expected_position_register_entries = {}
+        for register in range(1, 17):
+            entry_name = f"R{register}EntryField"
+            registry_namespace[entry_name] = entry_name
+            expected_register_entries[register] = entry_name
+            for element in range(1, 7):
+                entry_name = f"SP_{register}_E{element}_EntryField"
+                registry_namespace[entry_name] = entry_name
+                expected_position_register_entries[(register, element)] = (
+                    entry_name
                 )
-            },
-            set(range(1, 17)),
+        exec(
+            compile(registry_source, str(AR4_SOURCE), "exec"),
+            registry_namespace,
         )
         self.assertEqual(
-            {
-                (int(register), int(element))
-                for register, element in re.findall(
-                    r"\bSP_(\d+)_E(\d+)_EntryField\b",
-                    registry_source,
-                )
-            },
-            {
-                (register, element)
-                for register in range(1, 17)
-                for element in range(1, 7)
-            },
+            registry_namespace["program_register_entry_fields"],
+            expected_register_entries,
+        )
+        self.assertEqual(
+            registry_namespace["program_position_register_entry_fields"],
+            expected_position_register_entries,
         )
 
     def test_default_program_motion_holds_owner_and_offline_default_rejects(self):
