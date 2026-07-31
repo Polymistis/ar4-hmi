@@ -15033,10 +15033,30 @@ def stepFwd():
         raise RuntimeError("Step Forward selection is out of range")
       if not selected_rows:
         if tab1.lastProg == "":
-          index = _program_row_index(
-            tab1.progView.get(0, "end"),
-            "## START PROGRAM LOOP ##",
-          )
+          program_rows = tab1.progView.get(0, "end")
+          try:
+            index = _program_row_index(
+              program_rows,
+              "## START PROGRAM LOOP ##",
+            )
+          except Exception:
+            try:
+              _set_manual_auxiliary_status(
+                "PROGRAM STEP FORWARD SETUP FAILED",
+                "Alarm.TLabel",
+              )
+            except Exception:
+              logger.exception(
+                "Unable to publish the Step Forward setup failure"
+              )
+            try:
+              stopProg()
+            except Exception:
+              logger.exception(
+                "Unable to dispatch the auxiliary stop after Step Forward "
+                "loop-marker lookup failure"
+              )
+            raise
           tab1.progView.selection_clear(0, END)
           tab1.progView.select_set(index)
           if tuple(tab1.progView.curselection()) != (index,):
@@ -15063,13 +15083,6 @@ def stepFwd():
         return False
       _set_application_status("SYSTEM READY", "OK.TLabel")
     except Exception:
-      try:
-        stopProg()
-      except Exception:
-        logger.exception(
-          "Unable to dispatch the auxiliary stop after Step Forward setup "
-          "failure"
-        )
       _abort_program_row_execution()
       _finish_program_execution(execution_request)
       logger.exception("Program step-forward setup failed")
@@ -31112,7 +31125,6 @@ commFrame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
 
 commFrame.grid_columnconfigure(0, weight=1)
 
-# COM port detection function (from original)
 def detect_ports():
   from serial.tools import list_ports
   ports = list(list_ports.comports())
@@ -31131,16 +31143,16 @@ def detect_ports():
       continue
     if device not in choices:
       choices.append(device)
-  return choices, "None", "None"
+  return choices
 
-port_choices, default_comport1, default_comport2 = detect_ports()
+port_choices = detect_ports()
 logger.debug(f"Available Comm Ports: {port_choices}")
 
 # Teensy COM Port
 ComPortLab = Label(commFrame, text="TEENSY COM PORT:")
 ComPortLab.grid(row=0, column=0, sticky="w", padx=5, pady=(5, 2))
 
-com1SelectedValue = tk.StringVar(value=default_comport1 or "None")
+com1SelectedValue = tk.StringVar(value="None")
 com1Select = tk.OptionMenu(commFrame, com1SelectedValue, *port_choices, command=setCom)
 com1Select.grid(row=1, column=0, sticky="ew", padx=5, pady=2)
 
@@ -31162,7 +31174,7 @@ auxiliaryBoardSelect.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
 ComPortLab2 = Label(commFrame, text="5v IO BOARD COM PORT:")
 ComPortLab2.grid(row=4, column=0, sticky="w", padx=5, pady=(15, 2))
 
-com2SelectedValue = tk.StringVar(value=default_comport2 or "None")
+com2SelectedValue = tk.StringVar(value="None")
 com2Select = tk.OptionMenu(commFrame, com2SelectedValue, *port_choices, command=setCom2)
 com2Select.grid(row=5, column=0, sticky="ew", padx=5, pady=2)
 

@@ -13472,7 +13472,56 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(restored_ports, ["None"])
 
-    def test_detect_ports_returns_current_devices_and_neutral_defaults(self):
+    def test_connection_rejection_uses_exception_type_for_blank_detail(self):
+        class BlankRejected(Exception):
+            pass
+
+        restored_ports = []
+        statuses = []
+        warnings = []
+        transport_lock = threading.Lock()
+        namespace = {
+            "application_closing": threading.Event(),
+            "port_choices": ("None", "COM7"),
+            "com1SelectedValue": SimpleNamespace(
+                set=restored_ports.append,
+            ),
+            "serial_lock": transport_lock,
+            "manual_controller_cleanup_lock": threading.Lock(),
+            "manual_controller_cleanup_pending": None,
+            "serial_activity_registry": SimpleNamespace(
+                lease=lambda name: (_ for _ in ()).throw(BlankRejected())
+            ),
+            "SerialActivityRejected": BlankRejected,
+            "logger": SimpleNamespace(
+                warning=warnings.append,
+                exception=lambda *args: None,
+            ),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+        }
+        set_connection = self.compile_function(
+            "_set_com_admitted",
+            namespace,
+        )
+
+        self.assertFalse(
+            set_connection(
+                object(),
+                {"transferred": False},
+                previous_main_port="None",
+            )
+        )
+        expected_message = (
+            "Controller connection change rejected: BlankRejected"
+        )
+        self.assertEqual(restored_ports, ["None"])
+        self.assertEqual(warnings, [expected_message])
+        self.assertEqual(statuses, [(expected_message, "Warn.TLabel")])
+        self.assertFalse(transport_lock.locked())
+
+    def test_detect_ports_returns_current_devices(self):
         warnings = []
         namespace = {
             "logger": SimpleNamespace(
@@ -13492,11 +13541,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "serial.tools.list_ports.comports",
             return_value=available,
         ):
-            choices, main_default, auxiliary_default = detect_ports()
+            choices = detect_ports()
 
         self.assertEqual(choices, ["None", "COM7", "COM8"])
-        self.assertEqual(main_default, "None")
-        self.assertEqual(auxiliary_default, "None")
         self.assertEqual(len(warnings), 2)
 
     def test_startup_port_selectors_normalize_only_available_devices(self):
@@ -13522,6 +13569,15 @@ class HmiSourceContractTests(unittest.TestCase):
                 {
                     "comPort": " COM0 ",
                     "com2Port": " COM9 ",
+                }
+            ),
+            ("None", "None"),
+        )
+        self.assertEqual(
+            selector_values(
+                {
+                    "comPort": None,
+                    "com2Port": "",
                 }
             ),
             ("None", "None"),
@@ -13879,7 +13935,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 function_name,
             )
 
-    def test_missing_program_loop_dispatches_stop_for_run_and_step(self):
+    def test_missing_program_loop_dispatches_stop_for_run(self):
         class SelectionEvent:
             def __init__(self, request, action, style_rows=False):
                 self.action = action
@@ -13967,56 +14023,7 @@ class HmiSourceContractTests(unittest.TestCase):
             [("PROGRAM EXECUTION FAILED", "Alarm.TLabel")],
         )
 
-        step_stops = []
-        step_finishes = []
-        step_statuses = []
-        step_namespace = {
-            "tab1": SimpleNamespace(
-                lastProg="",
-                progView=SimpleNamespace(
-                    curselection=lambda: (),
-                    index=lambda value: 1,
-                    get=lambda *args: ("row",),
-                ),
-            ),
-            "logger": SimpleNamespace(
-                warning=lambda *args: None,
-                exception=lambda *args: None,
-            ),
-            "_begin_program_execution": lambda mode: request,
-            "_program_execution_busy_message": lambda: "busy",
-            "_program_execution_request_cancelled": (
-                lambda active_request: False
-            ),
-            "_set_application_status": lambda *args: None,
-            "_set_manual_auxiliary_status": (
-                lambda message, style: step_statuses.append((message, style))
-            ),
-            "_program_row_index": (
-                lambda rows, expected: (_ for _ in ()).throw(
-                    MotionInputError(
-                        "program row '## START PROGRAM LOOP ##' "
-                        "does not exist"
-                    )
-                )
-            ),
-            "_abort_program_row_execution": lambda: None,
-            "_finish_program_execution": (
-                lambda active: step_finishes.append(active) or True
-            ),
-            "stopProg": lambda: step_stops.append("step"),
-        }
-        step_forward = self.compile_function("stepFwd", step_namespace)
-
-        self.assertFalse(step_forward())
-        self.assertEqual(step_stops, ["step"])
-        self.assertEqual(step_finishes, [request])
-        self.assertEqual(
-            step_statuses,
-            [("PROGRAM STEP FORWARD SETUP FAILED", "Alarm.TLabel")],
-        )
-
-    def test_step_forward_setup_failures_dispatch_stop(self):
+    def test_step_forward_setup_failures_use_expected_stop_policy(self):
         class ProgramView:
             def __init__(self, selection, row_count):
                 self.selection = selection
@@ -14033,18 +14040,37 @@ class HmiSourceContractTests(unittest.TestCase):
                 return ("row",)
 
         cases = (
-            ("multiple", (0, 1), 2, "", 0),
-            ("empty-view", (), 0, "", 0),
-            ("out-of-range", (3,), 2, "", 0),
-            ("invalid-return", (), 2, "caller.ar4", True),
-            ("missing-loop", (), 2, "", 0),
+            ("multiple", (0, 1), 2, "", 0, False),
+            ("empty-view", (), 0, "", 0, False),
+            ("out-of-range", (3,), 2, "", 0, False),
+            ("invalid-return", (), 2, "caller.ar4", True, False),
+            ("missing-loop", (), 2, "", 0, True),
         )
-        for name, selection, row_count, last_program, last_row in cases:
+        for (
+            name,
+            selection,
+            row_count,
+            last_program,
+            last_row,
+            expected_stop,
+        ) in cases:
             with self.subTest(name=name):
                 request = object()
                 stops = []
                 finishes = []
                 statuses = []
+                status_reserved = {"value": False}
+
+                def present_status(message, style):
+                    if status_reserved["value"]:
+                        return False
+                    statuses.append((message, style))
+                    return True
+
+                def stop_program():
+                    stops.append(True)
+                    status_reserved["value"] = True
+
                 namespace = {
                     "tab1": SimpleNamespace(
                         lastProg=last_program,
@@ -14061,11 +14087,7 @@ class HmiSourceContractTests(unittest.TestCase):
                         lambda active_request: False
                     ),
                     "_set_application_status": lambda *args: None,
-                    "_set_manual_auxiliary_status": (
-                        lambda message, style: statuses.append(
-                            (message, style)
-                        )
-                    ),
+                    "_set_manual_auxiliary_status": present_status,
                     "_program_row_index": (
                         lambda rows, expected: (_ for _ in ()).throw(
                             MotionInputError(
@@ -14077,7 +14099,7 @@ class HmiSourceContractTests(unittest.TestCase):
                     "_finish_program_execution": (
                         lambda active: finishes.append(active) or True
                     ),
-                    "stopProg": lambda: stops.append(True),
+                    "stopProg": stop_program,
                 }
                 step_forward = self.compile_function(
                     "stepFwd",
@@ -14085,7 +14107,84 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
 
                 self.assertFalse(step_forward())
-                self.assertEqual(stops, [True])
+                self.assertEqual(stops, [True] if expected_stop else [])
+                self.assertEqual(finishes, [request])
+                self.assertEqual(
+                    statuses,
+                    [
+                        (
+                            "PROGRAM STEP FORWARD SETUP FAILED",
+                            "Alarm.TLabel",
+                        )
+                    ],
+                )
+
+    def test_step_forward_loop_view_and_selection_failures_do_not_stop(self):
+        class ProgramView:
+            def __init__(self, failure):
+                self.failure = failure
+
+            def curselection(self):
+                return ()
+
+            @staticmethod
+            def index(value):
+                return 1
+
+            def get(self, *args):
+                if self.failure == "read":
+                    raise RuntimeError("program view unavailable")
+                return ("## START PROGRAM LOOP ##",)
+
+            @staticmethod
+            def selection_clear(*args):
+                pass
+
+            def select_set(self, index):
+                if self.failure == "selection":
+                    raise RuntimeError("selection unavailable")
+
+        for failure in ("read", "selection"):
+            with self.subTest(failure=failure):
+                request = object()
+                stops = []
+                finishes = []
+                statuses = []
+                namespace = {
+                    "tab1": SimpleNamespace(
+                        lastProg="",
+                        progView=ProgramView(failure),
+                    ),
+                    "logger": SimpleNamespace(
+                        warning=lambda *args: None,
+                        exception=lambda *args: None,
+                    ),
+                    "_begin_program_execution": lambda mode: request,
+                    "_program_execution_busy_message": lambda: "busy",
+                    "_program_execution_request_cancelled": (
+                        lambda active_request: False
+                    ),
+                    "_set_application_status": lambda *args: None,
+                    "_set_manual_auxiliary_status": (
+                        lambda message, style: statuses.append(
+                            (message, style)
+                        )
+                    ),
+                    "_program_row_index": lambda rows, expected: 0,
+                    "_abort_program_row_execution": lambda: None,
+                    "_finish_program_execution": (
+                        lambda active: finishes.append(active) or True
+                    ),
+                    "stopProg": lambda: stops.append(True),
+                    "END": "end",
+                }
+                step_forward = self.compile_function(
+                    "stepFwd",
+                    namespace,
+                )
+
+                self.assertFalse(step_forward())
+                self.assertEqual(stops, [])
                 self.assertEqual(finishes, [request])
                 self.assertEqual(
                     statuses,
@@ -14098,35 +14197,54 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
 
     def test_cancelled_step_forward_setup_does_not_publish_ready(self):
-        request = object()
-        finishes = []
-        ready_statuses = []
-        stops = []
-        namespace = {
-            "logger": SimpleNamespace(
-                warning=lambda *args: None,
-            ),
-            "_begin_program_execution": lambda mode: request,
-            "_program_execution_busy_message": lambda: "busy",
-            "_program_execution_request_cancelled": (
-                lambda active_request: True
-            ),
-            "_abort_program_row_execution": lambda: None,
-            "_finish_program_execution": (
-                lambda active: finishes.append(active) or True
-            ),
-            "_set_application_status": (
-                lambda *args, **kwargs: ready_statuses.append((args, kwargs))
-            ),
-            "_set_manual_auxiliary_status": lambda *args: None,
-            "stopProg": lambda: stops.append(True),
-        }
-        step_forward = self.compile_function("stepFwd", namespace)
+        for name, cancellation_states in (
+            ("before-setup", [True]),
+            ("after-selection", [False, True]),
+        ):
+            with self.subTest(name=name):
+                request = object()
+                finishes = []
+                ready_statuses = []
+                stops = []
+                states = iter(cancellation_states)
+                namespace = {
+                    "tab1": SimpleNamespace(
+                        lastProg="",
+                        progView=SimpleNamespace(
+                            curselection=lambda: (0,),
+                            index=lambda value: 1,
+                        ),
+                    ),
+                    "logger": SimpleNamespace(
+                        warning=lambda *args: None,
+                        exception=lambda *args: None,
+                    ),
+                    "_begin_program_execution": lambda mode: request,
+                    "_program_execution_busy_message": lambda: "busy",
+                    "_program_execution_request_cancelled": (
+                        lambda active_request: next(states)
+                    ),
+                    "_abort_program_row_execution": lambda: None,
+                    "_finish_program_execution": (
+                        lambda active: finishes.append(active) or True
+                    ),
+                    "_set_application_status": (
+                        lambda *args, **kwargs: ready_statuses.append(
+                            (args, kwargs)
+                        )
+                    ),
+                    "_set_manual_auxiliary_status": lambda *args: None,
+                    "stopProg": lambda: stops.append(True),
+                }
+                step_forward = self.compile_function(
+                    "stepFwd",
+                    namespace,
+                )
 
-        self.assertFalse(step_forward())
-        self.assertEqual(finishes, [request])
-        self.assertEqual(ready_statuses, [])
-        self.assertEqual(stops, [])
+                self.assertFalse(step_forward())
+                self.assertEqual(finishes, [request])
+                self.assertEqual(ready_statuses, [])
+                self.assertEqual(stops, [])
 
     def test_step_forward_selection_failure_dispatches_stop(self):
         class SelectionEvent:
