@@ -14218,14 +14218,17 @@ class HmiSourceContractTests(unittest.TestCase):
                 log_messages = []
                 status_calls = []
                 stop_attempts = []
+                call_order = []
 
                 def present_status(message, style):
+                    call_order.append("status")
                     status_calls.append((message, style))
                     if failure == "status":
                         raise RuntimeError("status unavailable")
                     return True
 
                 def stop_program():
+                    call_order.append("stop")
                     stop_attempts.append(True)
                     if failure == "stop":
                         raise RuntimeError("stop unavailable")
@@ -14273,6 +14276,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.assertEqual(finishes, [request])
                 self.assertEqual(stop_attempts, [True])
                 self.assertEqual(len(status_calls), 1)
+                self.assertEqual(call_order, ["status", "stop"])
                 if failure == "status":
                     self.assertIn(
                         "Unable to publish the Step Forward setup failure",
@@ -17990,10 +17994,16 @@ class HmiSourceContractTests(unittest.TestCase):
 
         def stop_program():
             worker_stop_calls.append(True)
-            runtime["programStopStatusLatched"] = True
             tab.runTrue = 0
-            namespace["program_stop_status_event_queue"].put(
-                authoritative_stop_event
+            namespace["_set_program_stop_status"]("completed")
+
+        class SelectionEvent:
+            def __init__(self, request, action, style_rows=False):
+                self.action = action
+
+        def fail_program_selection(event):
+            raise RuntimeError(
+                f"selection transition unavailable: {event.action}"
             )
 
         namespace.update(
@@ -18013,10 +18023,15 @@ class HmiSourceContractTests(unittest.TestCase):
                     Lock=threading.Lock,
                     Thread=CapturedThread,
                 ),
-                "_set_program_stop_status": lambda state: True,
                 "stopProg": stop_program,
+                "ProgramSelectionEvent": SelectionEvent,
+                "PROGRAM_SELECTION_INITIALIZE_RUN": "initialize-run",
+                "PROGRAM_SELECTION_PREPARE_RUN": "prepare-run",
+                "PROGRAM_SELECTION_ADVANCE": "advance",
+                "_dispatch_program_selection": fail_program_selection,
             }
         )
+        self.compile_function("_set_program_stop_status", namespace)
         namespace["_manual_auxiliary_status_reserved"] = lambda: bool(
             runtime["programStopStatusLatched"]
             or runtime["programStopRequestId"] is not None
@@ -18090,6 +18105,7 @@ class HmiSourceContractTests(unittest.TestCase):
             raise RuntimeError("stop unavailable")
 
         namespace["stopProg"] = fail_stop_program
+        failed_stop_log_start = len(logged)
         self.assertTrue(run_program())
         runtime["progRunning"] = True
         runtime["rowinproc"] = 1
@@ -18104,6 +18120,16 @@ class HmiSourceContractTests(unittest.TestCase):
             ("PROGRAM EXECUTION FAILED", "Alarm.TLabel", False),
         )
         self.assertTrue(namespace["program_stop_status_event_queue"].empty())
+        self.assertIn(
+            (
+                "exception",
+                (
+                    "Unable to dispatch the auxiliary stop after "
+                    "program failure",
+                ),
+            ),
+            logged[failed_stop_log_start:],
+        )
         namespace["stopProg"] = stop_program
 
         runtime["programStopRequestId"] = 7
@@ -18145,6 +18171,34 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertTrue(namespace["program_stop_status_event_queue"].empty())
         runtime["programStopStatusLatched"] = False
+
+        namespace["stopProg"] = fail_stop_program
+        failed_stop_log_start = len(logged)
+        self.assertTrue(step_forward())
+        runtime["progRunning"] = True
+        runtime["rowinproc"] = 1
+        CapturedThread.target()
+        self.assertFalse(runtime["progRunning"])
+        self.assertEqual(runtime["rowinproc"], 0)
+        self.assertFalse(execution_active())
+        self.assertEqual(failed_stop_attempts, [True, True])
+        self.assertFalse(runtime["programStopStatusLatched"])
+        self.assertEqual(
+            namespace["program_stop_status_event_queue"].get_nowait(),
+            ("PROGRAM STEP FORWARD FAILED", "Alarm.TLabel", False),
+        )
+        self.assertTrue(namespace["program_stop_status_event_queue"].empty())
+        self.assertIn(
+            (
+                "exception",
+                (
+                    "Unable to dispatch the auxiliary stop after "
+                    "Step Forward failure",
+                ),
+            ),
+            logged[failed_stop_log_start:],
+        )
+        namespace["stopProg"] = stop_program
 
         callbacks = []
         completions = []
