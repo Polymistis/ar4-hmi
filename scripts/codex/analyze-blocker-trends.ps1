@@ -651,8 +651,7 @@ if ($SelfTest) {
     'scripts/claude/commit.ps1:142 - Bypass-flag parser rejects --no-verbose alongside --no-verify' 'WORKFLOW-INFRA'
   # Synthetic inputs avoid live source claims. INSTALL.md findings about
   # core.hooksPath still belong to WORKFLOW-INFRA because the documented
-  # behavior controls gate installation; the bootstrap.ps1 citation exercises
-  # the same classifier through a source path.
+  # behavior controls gate installation.
   Assert-Archetype 'A27: WORKFLOW-INFRA (bootstrap.ps1 path)' `
     'bootstrap.ps1:1 - Synthetic installer workflow finding' 'WORKFLOW-INFRA'
   Assert-Archetype 'A28: WORKFLOW-INFRA (core.hooksPath doc drift)' `
