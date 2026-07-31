@@ -393,6 +393,25 @@ Implemented portion:
   focus selects the complete value before replacement. Hardware-free
   source-contract coverage passes; live verification requires a later
   controlled HMI relaunch.
+- A rejected main-controller replacement restores the last accepted port when
+  that port remains in the current menu snapshot, or the `None` menu state
+  otherwise, across synchronous rejection, asynchronous startup failure, and
+  timeout settlement. Startup-scheduler failure invokes the Tk-owned timeout
+  restoration before worker-side cleanup begins.
+- Run and Step Forward treat selection state as mandatory program execution
+  state. Run initialization, pre-row selection preparation, and completed-row
+  advancement use request-scoped worker-to-Tk events; shutdown or cancellation
+  declines pending transitions without publishing a false program failure.
+  A selection error aborts row state, requests the program stop path, and
+  publishes a program alarm instead of silently replaying a completed row.
+  Step Forward clears the selection at end of program so the existing loop or
+  caller-return path handles the next step. Styling and current-row display
+  failures remain diagnostic-only after the selection commits.
+- Vision template matching and preview loading read one bounded regular-file
+  image, validate encoded size and header dimensions before OpenCV decode, and
+  verify decoded dimensions against the admitted header. Preview formatting
+  preserves a positive resized width and height for extreme aspect ratios, and
+  preview failures produce a stable HMI alarm.
 - `.ar4` register and position-register rows resolve only through explicit
   widget registries after bounded decimal validation. General registers accept
   the defined 1-16 range; position-register elements accept 1-6. Program text

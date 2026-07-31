@@ -21,6 +21,7 @@ import time
 from types import SimpleNamespace
 from typing import Optional
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -943,6 +944,8 @@ class HmiSourceContractTests(unittest.TestCase):
             position_response_is_physical_estop,
         )
         namespace.setdefault("time", time)
+        if name == "_program_execution_request_cancelled":
+            namespace.setdefault("application_closing", threading.Event())
         if name in (
             "_read_auxiliary_inactive_stop_response",
             "_run_auxiliary_stop_safe",
@@ -954,6 +957,16 @@ class HmiSourceContractTests(unittest.TestCase):
             )
         if name in ("_try_dispatch_auxiliary_stop", "_request_auxiliary_stop"):
             namespace.setdefault("_auxiliary_stop_not_required", lambda: False)
+        if name in ("setCom", "_set_com_admitted"):
+            namespace.setdefault(
+                "port_choices",
+                ("None", "COM0", "COM1", "COM7", "COM9"),
+            )
+            if "_main_port_selector_value" not in namespace:
+                self.compile_function(
+                    "_main_port_selector_value",
+                    namespace,
+                )
         if name == "setCom" and "_set_com_admitted" not in namespace:
             self.compile_function("_set_com_admitted", namespace)
         if name in (
@@ -1418,6 +1431,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_poll_called_program_navigation_events",
             lambda: None,
         )
+        namespace.setdefault("_poll_program_selection_events", lambda: None)
         namespace.setdefault("_poll_virtual_motion_events", lambda: None)
         namespace.setdefault("_poll_xbox_auxiliary_events", lambda: None)
         namespace.setdefault(
@@ -3500,6 +3514,12 @@ class HmiSourceContractTests(unittest.TestCase):
                 return None
             return target.copy() if path == "curImage.jpg" else template.copy()
 
+        def load_image(path, mode, field_name):
+            image = read_image(path, mode)
+            if image is None:
+                raise MotionInputError(f"{field_name} could not be loaded")
+            return image
+
         def warp_affine(image, matrix, size, **kwargs):
             borders.append(kwargs["borderValue"])
             return cv2.warpAffine(image, matrix, size, **kwargs)
@@ -3535,6 +3555,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "math": math,
             "np": np,
             "cv2": vision_cv2,
+            "load_bounded_vision_image": load_image,
             "CAL": {
                 "fullRotVal": 0,
                 "J6PosLim": 170,
@@ -3629,6 +3650,80 @@ class HmiSourceContractTests(unittest.TestCase):
             "result frame could not be persisted",
         ):
             vision_match("template.jpg", 0.9, 77)
+
+    def test_template_preview_reports_decode_failure_and_applies_square_image(self):
+        statuses = []
+        logged = []
+        configured = []
+        label = SimpleNamespace(imgtk=None)
+        label.configure = lambda **kwargs: configured.append(kwargs)
+        namespace = {
+            "RUN": {
+                "selectedTemplate": SimpleNamespace(
+                    get=lambda: "template.jpg"
+                )
+            },
+            "logger": SimpleNamespace(
+                info=lambda *args: None,
+                exception=lambda *args: logged.append(args),
+            ),
+            "cv2": cv2,
+            "Image": SimpleNamespace(fromarray=lambda image: image.copy()),
+            "ImageTk": SimpleNamespace(PhotoImage=lambda image: image),
+            "template_lbl": label,
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+            "fit_vision_preview_square": (
+                lambda image, size: np.zeros(
+                    (size, size, 3),
+                    dtype=np.uint8,
+                )
+            ),
+            "load_bounded_vision_image": (
+                lambda *args: (_ for _ in ()).throw(
+                    MotionInputError(
+                        "vision template could not be decoded"
+                    )
+                )
+            ),
+        }
+        update_preview = self.compile_function("VisOpUpdate", namespace)
+
+        self.assertFalse(update_preview(None))
+        self.assertEqual(
+            statuses,
+            [
+                (
+                    "VISION TEMPLATE PREVIEW FAILED: "
+                    "vision template could not be decoded",
+                    "Alarm.TLabel",
+                )
+            ],
+        )
+        self.assertTrue(logged)
+        self.assertEqual(configured, [])
+
+        namespace["load_bounded_vision_image"] = (
+            lambda *args: (_ for _ in ()).throw(
+                RuntimeError("\npreview decoder failed\n")
+            )
+        )
+        self.assertFalse(update_preview(None))
+        self.assertEqual(
+            statuses[-1],
+            (
+                "VISION TEMPLATE PREVIEW FAILED: preview decoder failed",
+                "Alarm.TLabel",
+            ),
+        )
+
+        namespace["load_bounded_vision_image"] = (
+            lambda *args: np.zeros((1, 8192, 3), dtype=np.uint8)
+        )
+        self.assertTrue(update_preview(None))
+        self.assertEqual(configured[-1]["anchor"], "center")
+        self.assertEqual(label.imgtk.shape, (150, 150, 3))
 
     def test_take_pic_propagates_failure_and_uses_rgb_grayscale(self):
         class Entry:
@@ -4130,7 +4225,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 raise RuntimeError("window unavailable")
 
         vision_cv2 = SimpleNamespace(
-            imread=lambda filename: image_result[0],
+            IMREAD_COLOR=cv2.IMREAD_COLOR,
             namedWindow=lambda name: None,
             setMouseCallback=lambda name, callback: callbacks.append(callback),
             imshow=show_image,
@@ -4140,6 +4235,17 @@ class HmiSourceContractTests(unittest.TestCase):
             "MotionInputError": MotionInputError,
             "RUN": {},
             "cv2": vision_cv2,
+            "load_bounded_vision_image": (
+                lambda *args: (
+                    image_result[0]
+                    if image_result[0] is not None
+                    else (_ for _ in ()).throw(
+                        MotionInputError(
+                            "captured mask frame could not be decoded"
+                        )
+                    )
+                )
+            ),
             "mask_pic": lambda: (_ for _ in ()).throw(
                 MotionInputError("camera did not return a mask frame")
             ),
@@ -4168,6 +4274,49 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(select_mask())
         self.assertIs(namespace["RUN"]["oriImage"].base, None)
         self.assertIs(callbacks[-1], namespace["mask_crop"])
+
+    def test_select_template_uses_bounded_reload_and_reports_failure(self):
+        errors = []
+        callbacks = []
+        destroy_calls = []
+        image_result = [None]
+        vision_cv2 = SimpleNamespace(
+            IMREAD_COLOR=cv2.IMREAD_COLOR,
+            namedWindow=lambda name: None,
+            setMouseCallback=lambda name, callback: callbacks.append(callback),
+            imshow=lambda name, image: None,
+            destroyAllWindows=lambda: destroy_calls.append(True),
+        )
+
+        def load_image(*args):
+            if image_result[0] is None:
+                raise MotionInputError(
+                    "captured template frame could not be decoded"
+                )
+            return image_result[0]
+
+        namespace = {
+            "RUN": {},
+            "cv2": vision_cv2,
+            "load_bounded_vision_image": load_image,
+            "mouse_crop": object(),
+            "logger": SimpleNamespace(
+                exception=lambda *args: errors.append(args),
+            ),
+        }
+        select_template = self.compile_function(
+            "selectTemplate",
+            namespace,
+        )
+
+        self.assertFalse(select_template())
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(len(destroy_calls), 1)
+
+        image_result[0] = np.zeros((2, 2, 3), dtype=np.uint8)
+        self.assertTrue(select_template())
+        self.assertIs(namespace["RUN"]["oriImage"].base, None)
+        self.assertIs(callbacks[-1], namespace["mouse_crop"])
 
     def test_program_item_writer_replaces_only_complete_utf8_documents(self):
         from unittest.mock import patch
@@ -5922,9 +6071,11 @@ class HmiSourceContractTests(unittest.TestCase):
         port = Port()
         runtime = {"ser": None}
         calibration = {
+            "comPort": "COM0",
             "com2Port": "old",
             "sentinel": "unchanged",
         }
+        selected_ports = []
         serial_lock = threading.Lock()
         activity = SerialActivityRegistry(("ser",))
         invalidations = []
@@ -5982,7 +6133,10 @@ class HmiSourceContractTests(unittest.TestCase):
             "almStatusLab2": second_label,
             "CAL": calibration,
             "RUN": runtime,
-            "com1SelectedValue": SimpleNamespace(get=lambda: "COM1"),
+            "com1SelectedValue": SimpleNamespace(
+                get=lambda: "COM1",
+                set=selected_ports.append,
+            ),
             "serial": SimpleNamespace(Serial=lambda **kwargs: port),
             "SERIAL_WRITE_TIMEOUT_SECONDS": 5.0,
             "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 2.0,
@@ -6039,6 +6193,7 @@ class HmiSourceContractTests(unittest.TestCase):
             ],
         )
         self.assertEqual(cleanup_calls, [None])
+        self.assertEqual(selected_ports, ["COM0"])
         self.assertEqual(close_calls, [port])
         self.assertEqual(port.close_count, 1)
         self.assertIsNone(runtime["ser"])
@@ -10906,10 +11061,14 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace["manual_controller_cleanup_pending"].last_error,
         )
         replacement_attempts = []
+        restored_ports = []
         namespace["serial"] = SimpleNamespace(
             Serial=lambda **options: replacement_attempts.append(options)
         )
-        namespace["com1SelectedValue"] = SimpleNamespace(get=lambda: "COM9")
+        namespace["com1SelectedValue"] = SimpleNamespace(
+            get=lambda: "COM9",
+            set=restored_ports.append,
+        )
         set_connection = self.compile_function(
             "_set_com_admitted",
             namespace,
@@ -10918,9 +11077,11 @@ class HmiSourceContractTests(unittest.TestCase):
             set_connection(
                 object(),
                 {"transferred": False},
+                previous_main_port="None",
             )
         )
         self.assertEqual(replacement_attempts, [])
+        self.assertEqual(restored_ports, ["None"])
         self.assertIs(runtime["ser"], port)
         self.assertTrue(port.is_open)
         self.assertFalse(transport_lock.locked())
@@ -12973,9 +13134,15 @@ class HmiSourceContractTests(unittest.TestCase):
 
     def test_connection_switch_releases_transport_when_port_selection_fails(self):
         class Selection:
+            restored = []
+
             @staticmethod
             def get():
                 raise RuntimeError("selection unavailable")
+
+            @classmethod
+            def set(cls, value):
+                cls.restored.append(value)
 
         class Label:
             def config(self, **kwargs):
@@ -12996,7 +13163,7 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "almStatusLab": Label(),
             "almStatusLab2": Label(),
-            "CAL": {},
+            "CAL": {"comPort": "COM0"},
             "RUN": {"ser": None},
             "com1SelectedValue": Selection(),
             "tab8": SimpleNamespace(ElogView=SimpleNamespace(get=lambda *args: ())),
@@ -13018,6 +13185,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(transport_lock.acquire(blocking=False))
         transport_lock.release()
         self.assertTrue(activity.idle())
+        self.assertEqual(Selection.restored, ["COM0"])
         self.assertTrue(
             any(
                 "persist the controller startup error log" in args[0]
@@ -13146,6 +13314,725 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(calibration["comPort"], "COM7")
         self.assertEqual(first_label.text, "SYSTEM READY; AUXILIARY CONTROLLER NOT CONFIGURED")
         self.assertEqual(second_label.text, first_label.text)
+
+    def test_controller_startup_timeout_restores_normalized_accepted_port(self):
+        class Port:
+            def __init__(self):
+                self.is_open = True
+                self.timeout = None
+
+            @staticmethod
+            def reset_input_buffer():
+                pass
+
+            @staticmethod
+            def reset_output_buffer():
+                pass
+
+            def close(self):
+                self.is_open = False
+
+        class Label:
+            def __init__(self):
+                self.text = None
+
+            def config(self, **kwargs):
+                self.text = kwargs.get("text")
+
+        class StartupResult:
+            pass
+
+        port = Port()
+        callbacks = {}
+        selected_ports = []
+        transport_lock = threading.Lock()
+        activity = SerialActivityRegistry(("ser",))
+        motion_registry = MotionRequestRegistry()
+        calibration = {"comPort": " COM0 "}
+        runtime = {"ser": None}
+
+        def startup_with_spinner(
+            root,
+            request,
+            on_finished,
+            on_timeout,
+            on_abandoned,
+            timeout,
+        ):
+            callbacks.update(
+                finished=on_finished,
+                timeout=on_timeout,
+                abandoned=on_abandoned,
+            )
+            return SimpleNamespace()
+
+        namespace = {
+            "application_closing": threading.Event(),
+            "motion_request_registry": motion_registry,
+            "serial_lock": transport_lock,
+            "serial_activity_registry": activity,
+            "SerialActivityRejected": SerialActivityRejected,
+            "logger": SimpleNamespace(
+                info=lambda *args: None,
+                warning=lambda *args: None,
+                error=lambda *args, **kwargs: None,
+                exception=lambda *args: None,
+            ),
+            "almStatusLab": Label(),
+            "almStatusLab2": Label(),
+            "CAL": calibration,
+            "RUN": runtime,
+            "com1SelectedValue": SimpleNamespace(
+                get=lambda: " COM7 ",
+                set=selected_ports.append,
+            ),
+            "serial": SimpleNamespace(Serial=lambda **kwargs: port),
+            "SERIAL_WRITE_TIMEOUT_SECONDS": 5.0,
+            "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 2.0,
+            "time": SimpleNamespace(sleep=lambda seconds: None),
+            "_prepare_controller_startup": lambda: (
+                SimpleNamespace(auxiliary_port=None),
+                {},
+                {},
+            ),
+            "ControllerStartupResult": StartupResult,
+            "startup_with_spinner": startup_with_spinner,
+            "root": SimpleNamespace(),
+            "_request_startup_auxiliary_cleanup": lambda serial_port: None,
+            "_abandon_failed_controller_startup": lambda *args: None,
+            "tab8": SimpleNamespace(ElogView=SimpleNamespace(get=lambda *args: ())),
+            "pickle": SimpleNamespace(dump=lambda *args: None),
+            "open": lambda *args, **kwargs: object(),
+            "END": "end",
+        }
+        namespace["_release_async_main_serial_transport"] = self.compile_function(
+            "_release_async_main_serial_transport",
+            namespace,
+        )
+
+        def close_failed(
+            serial_port,
+            activity_lease,
+            request_lease,
+        ):
+            serial_port.close()
+            if runtime.get("ser") is serial_port:
+                runtime["ser"] = None
+            namespace["_release_async_main_serial_transport"](
+                activity_lease,
+                request_lease,
+            )
+            return True
+
+        namespace["_poll_failed_controller_close"] = close_failed
+        set_com = self.compile_function("setCom", namespace)
+
+        self.assertTrue(set_com())
+        callbacks["timeout"]()
+        self.assertEqual(selected_ports, ["COM0"])
+        callbacks["finished"](TimeoutError("startup timed out"), True)
+
+        self.assertEqual(selected_ports, ["COM0", "COM0"])
+        self.assertEqual(calibration["comPort"], " COM0 ")
+        self.assertIsNone(runtime["ser"])
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(activity.idle())
+        self.assertFalse(motion_registry.active)
+
+    def test_rejected_connection_uses_none_when_accepted_port_is_absent(self):
+        restored_ports = []
+        closing = threading.Event()
+        closing.set()
+        namespace = {
+            "application_closing": closing,
+            "port_choices": ("None", "COM7"),
+            "com1SelectedValue": SimpleNamespace(
+                set=restored_ports.append,
+            ),
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+        }
+        set_connection = self.compile_function(
+            "_set_com_admitted",
+            namespace,
+        )
+
+        self.assertFalse(
+            set_connection(
+                object(),
+                {"transferred": False},
+                previous_main_port="COM0",
+            )
+        )
+        self.assertEqual(restored_ports, ["None"])
+
+    def test_detect_ports_uses_only_currently_available_saved_devices(self):
+        namespace = {
+            "CAL": {
+                "comPort": " COM0 ",
+                "com2Port": " COM7 ",
+            },
+        }
+        detect_ports = self.compile_function("detect_ports", namespace)
+        available = [
+            SimpleNamespace(device="COM7"),
+            SimpleNamespace(device="COM8"),
+        ]
+
+        with patch(
+            "serial.tools.list_ports.comports",
+            return_value=available,
+        ):
+            choices, main_default, auxiliary_default = detect_ports()
+
+        self.assertEqual(choices, ["None", "COM7", "COM8"])
+        self.assertEqual(main_default, "None")
+        self.assertEqual(auxiliary_default, "COM7")
+
+    def test_program_selection_events_run_on_tk_and_preserve_terminal_state(self):
+        class Entry:
+            def __init__(self, fail=False):
+                self.value = None
+                self.fail = fail
+
+            def delete(self, *args):
+                if self.fail:
+                    raise RuntimeError("row display unavailable")
+                self.value = None
+
+            def insert(self, index, value):
+                self.value = value
+
+        class ProgramView:
+            def __init__(
+                self,
+                selection,
+                last_row,
+                fail_selection=False,
+                fail_style=False,
+                rows=None,
+            ):
+                self.selection = selection
+                self.last_row = last_row
+                self.fail_selection = fail_selection
+                self.fail_style = fail_style
+                self.rows = tuple(rows or ("row",) * last_row)
+                self.styles = []
+
+            def curselection(self):
+                return self.selection
+
+            def index(self, value):
+                return self.last_row
+
+            def get(self, first, last):
+                return self.rows
+
+            def selection_clear(self, *args):
+                if self.fail_selection:
+                    raise RuntimeError("selection unavailable")
+                self.selection = ()
+
+            def select_set(self, row):
+                self.selection = (row,)
+
+            def itemconfig(self, *args, **kwargs):
+                if self.fail_style:
+                    raise RuntimeError("style unavailable")
+                self.styles.append((args, kwargs))
+
+        class Request:
+            pass
+
+        request = Request()
+        action_constants = {
+            "PROGRAM_SELECTION_INITIALIZE_RUN": "initialize-run",
+            "PROGRAM_SELECTION_PREPARE_RUN": "prepare-run",
+            "PROGRAM_SELECTION_ADVANCE": "advance",
+            "PROGRAM_SELECTION_ACTIONS": frozenset(
+                ("initialize-run", "prepare-run", "advance")
+            ),
+        }
+
+        def run_case(
+            program_view,
+            current_row,
+            action,
+            *,
+            style_rows=False,
+            last_program="",
+            last_row=0,
+            cancelled=False,
+        ):
+            queue = Queue()
+            logged = []
+            namespace = {
+                **action_constants,
+                "ProgramExecutionRequest": Request,
+                "application_tk_thread_id": threading.get_ident(),
+                "application_lifecycle_lock": threading.Lock(),
+                "application_closing": threading.Event(),
+                "program_selection_event_queue": queue,
+                "tab1": SimpleNamespace(
+                    progView=program_view,
+                    lastProg=last_program,
+                    lastRow=last_row,
+                ),
+                "curRowEntryField": current_row,
+                "END": "end",
+                "_program_row_index": (
+                    lambda rows, expected: tuple(rows).index(expected)
+                ),
+                "_program_execution_request_cancelled": (
+                    lambda active_request: cancelled
+                ),
+                "threading": threading,
+                "Empty": Empty,
+                "_reschedule_event_poll": lambda name: None,
+                "logger": SimpleNamespace(
+                    error=lambda *args: logged.append(("error", args)),
+                    exception=lambda *args: logged.append(("exception", args)),
+                ),
+            }
+            result_type = self.compile_class(
+                "ProgramSelectionResult",
+                namespace,
+            )
+            namespace["ProgramSelectionResult"] = result_type
+            event_type = self.compile_class(
+                "ProgramSelectionEvent",
+                namespace,
+            )
+            namespace["ProgramSelectionEvent"] = event_type
+            apply_selection = self.compile_function(
+                "_apply_program_selection_event",
+                namespace,
+            )
+            namespace["_apply_program_selection_event"] = apply_selection
+            settle_selection = self.compile_function(
+                "_settle_program_selection",
+                namespace,
+            )
+            namespace["_settle_program_selection"] = settle_selection
+            poll_selection = self.compile_function(
+                "_poll_program_selection_events",
+                namespace,
+            )
+            dispatch_selection = self.compile_function(
+                "_dispatch_program_selection",
+                namespace,
+            )
+
+            event = event_type(request, action, style_rows=style_rows)
+            result = []
+            failure = []
+
+            def dispatch_from_worker():
+                try:
+                    result.append(dispatch_selection(event))
+                except Exception as exc:
+                    failure.append(exc)
+
+            worker = threading.Thread(target=dispatch_from_worker)
+            worker.start()
+            deadline = time.monotonic() + 1
+            while queue.empty() and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertFalse(queue.empty())
+            poll_selection()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            return (
+                result,
+                failure,
+                logged,
+                result_type,
+                event_type,
+                dispatch_selection,
+                namespace,
+            )
+
+        styled_failure = ProgramView((2,), 5, fail_style=True)
+        current_row = Entry()
+        result, failure, logged, *_ = run_case(
+            styled_failure,
+            current_row,
+            "advance",
+            style_rows=True,
+        )
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0].ready)
+        self.assertEqual(failure, [])
+        self.assertEqual(styled_failure.selection, (3,))
+        self.assertEqual(current_row.value, 3)
+        self.assertTrue(
+            any(
+                level == "exception"
+                and args[0] == "Unable to update Step Forward row styling"
+                for level, args in logged
+            )
+        )
+
+        terminal = ProgramView((4,), 5)
+        current_row = Entry(fail=True)
+        result, failure, logged, *_ = run_case(
+            terminal,
+            current_row,
+            "advance",
+            style_rows=True,
+        )
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0].ready)
+        self.assertEqual(failure, [])
+        self.assertEqual(terminal.selection, ())
+        self.assertTrue(
+            any(
+                level == "exception"
+                and args[0] == "Unable to update the current program-row display"
+                for level, args in logged
+            )
+        )
+
+        selection_failure = ProgramView((2,), 5, fail_selection=True)
+        result, failure, logged, *_ = run_case(
+            selection_failure,
+            Entry(),
+            "advance",
+            style_rows=True,
+        )
+        self.assertEqual(result, [])
+        self.assertEqual(len(failure), 1)
+        self.assertIn(
+            "program selection event failed",
+            str(failure[0]),
+        )
+        self.assertEqual(selection_failure.selection, (2,))
+        self.assertTrue(
+            any(
+                level == "exception"
+                and args[0] == "Unable to apply a program selection event"
+                for level, args in logged
+            )
+        )
+
+        initialized = ProgramView((), 5)
+        result, failure, _, *_ = run_case(
+            initialized,
+            Entry(),
+            "initialize-run",
+        )
+        self.assertEqual(failure, [])
+        self.assertTrue(result[0].ready)
+        self.assertEqual(initialized.selection, (1,))
+        self.assertEqual(len(initialized.styles), 5)
+
+        loop_rows = ("first", "## START PROGRAM LOOP ##", "last")
+        loop_view = ProgramView((), len(loop_rows), rows=loop_rows)
+        result, failure, _, *_ = run_case(
+            loop_view,
+            Entry(),
+            "prepare-run",
+        )
+        self.assertEqual(failure, [])
+        self.assertTrue(result[0].ready)
+        self.assertEqual(loop_view.selection, (1,))
+
+        returning = ProgramView((), 3)
+        result, failure, _, result_type, event_type, dispatch, namespace = (
+            run_case(
+                returning,
+                Entry(),
+                "prepare-run",
+                last_program="caller.ar4",
+                last_row=2,
+            )
+        )
+        self.assertEqual(failure, [])
+        self.assertEqual(
+            result[0].return_program,
+            ("caller.ar4", 3),
+        )
+
+        with self.assertRaises(TypeError):
+            result_type("ready")
+        with self.assertRaises(ValueError):
+            result_type(False, ("caller.ar4", 3))
+        with self.assertRaises(TypeError):
+            event_type(request, "unknown")
+        with self.assertRaises(TypeError):
+            event_type(request, [])
+        with self.assertRaises(ValueError):
+            event_type(request, "prepare-run", style_rows=True)
+
+        settlement = event_type(request, "advance")
+        with self.assertRaises(ValueError):
+            settlement.settle()
+        with self.assertRaises(TypeError):
+            settlement.settle(result=True)
+        settled_result = result_type(True)
+        self.assertTrue(settlement.settle(result=settled_result))
+        self.assertIs(settlement.wait(), settled_result)
+        with self.assertRaises(RuntimeError):
+            settlement.settle(result=settled_result)
+
+        namespace["application_closing"].set()
+        closing_event = event_type(request, "advance")
+        closing_results = []
+        closing_worker = threading.Thread(
+            target=lambda: closing_results.append(dispatch(closing_event))
+        )
+        closing_worker.start()
+        closing_worker.join(1)
+        self.assertFalse(closing_worker.is_alive())
+        self.assertEqual(len(closing_results), 1)
+        self.assertFalse(closing_results[0].ready)
+
+        cancelled_result, failure, _, *_ = run_case(
+            ProgramView((1,), 3),
+            Entry(),
+            "advance",
+            cancelled=True,
+        )
+        self.assertEqual(failure, [])
+        self.assertFalse(cancelled_result[0].ready)
+
+    def test_program_workers_delegate_selection_widget_access_to_tk(self):
+        expected_dispatch_calls = {"runProg": 3, "stepFwd": 1}
+        for function_name, expected_count in expected_dispatch_calls.items():
+            function = self.module_functions[function_name]
+            thread_function = next(
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "threadProg"
+            )
+            self.assertFalse(
+                any(
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Attribute)
+                    and isinstance(node.value.value, ast.Name)
+                    and node.value.value.id == "tab1"
+                    and node.value.attr == "progView"
+                    for node in ast.walk(thread_function)
+                ),
+                function_name,
+            )
+            dispatch_calls = [
+                node
+                for node in ast.walk(thread_function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_dispatch_program_selection"
+            ]
+            self.assertEqual(
+                len(dispatch_calls),
+                expected_count,
+                function_name,
+            )
+
+    def test_missing_program_loop_dispatches_stop_for_run_and_step(self):
+        class SelectionEvent:
+            def __init__(self, request, action, style_rows=False):
+                self.action = action
+
+        class SelectionResult:
+            def __init__(self, ready):
+                self.ready = ready
+                self.return_program = None
+
+        class CapturedThread:
+            target = None
+
+            def __init__(self, target):
+                type(self).target = target
+
+            def start(self):
+                pass
+
+        request = object()
+        stops = []
+        finishes = []
+        statuses = []
+        runtime = {
+            "programStopState": "completed",
+            "rowinproc": 0,
+            "progRunning": False,
+        }
+        run_namespace = {
+            "RUN": runtime,
+            "tab1": SimpleNamespace(runTrue=0),
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "threading": SimpleNamespace(Thread=CapturedThread),
+            "ProgramSelectionEvent": SelectionEvent,
+            "PROGRAM_SELECTION_INITIALIZE_RUN": "initialize-run",
+            "PROGRAM_SELECTION_PREPARE_RUN": "prepare-run",
+            "PROGRAM_SELECTION_ADVANCE": "advance",
+            "_begin_program_execution": lambda mode: request,
+            "_program_execution_request_cancelled": lambda active: False,
+            "_dispatch_program_selection": (
+                lambda event: (
+                    SelectionResult(True)
+                    if event.action == "initialize-run"
+                    else (_ for _ in ()).throw(
+                        MotionInputError(
+                            "program row '## START PROGRAM LOOP ##' "
+                            "does not exist"
+                        )
+                    )
+                )
+            ),
+            "_abort_program_row_execution": lambda: runtime.update(
+                rowinproc=0,
+                progRunning=False,
+            ),
+            "_finish_program_execution": (
+                lambda active: finishes.append(active) or True
+            ),
+            "_queue_program_execution_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+            "_set_program_stop_status": lambda state: None,
+            "_set_application_status": lambda *args: None,
+            "_set_manual_auxiliary_status": lambda *args: None,
+            "_program_execution_busy_message": lambda: "busy",
+            "stopProg": lambda: stops.append("run"),
+            "program_stop_state_lock": threading.Lock(),
+            "executeRow": lambda **kwargs: self.fail(
+                "missing loop marker must prevent row execution"
+            ),
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "time": SimpleNamespace(sleep=lambda seconds: None),
+        }
+        run_program = self.compile_function("runProg", run_namespace)
+
+        self.assertTrue(run_program())
+        CapturedThread.target()
+        self.assertEqual(stops, ["run"])
+        self.assertEqual(finishes, [request])
+        self.assertEqual(
+            statuses,
+            [("PROGRAM EXECUTION FAILED", "Alarm.TLabel")],
+        )
+
+        step_stops = []
+        step_finishes = []
+        step_statuses = []
+        step_namespace = {
+            "tab1": SimpleNamespace(
+                lastProg="",
+                progView=SimpleNamespace(
+                    curselection=lambda: (),
+                    index=lambda value: 1,
+                    get=lambda *args: ("row",),
+                ),
+            ),
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "_begin_program_execution": lambda mode: request,
+            "_program_execution_busy_message": lambda: "busy",
+            "_set_application_status": lambda *args: None,
+            "_set_manual_auxiliary_status": (
+                lambda message, style: step_statuses.append((message, style))
+            ),
+            "_program_row_index": (
+                lambda rows, expected: (_ for _ in ()).throw(
+                    MotionInputError(
+                        "program row '## START PROGRAM LOOP ##' "
+                        "does not exist"
+                    )
+                )
+            ),
+            "_abort_program_row_execution": lambda: None,
+            "_finish_program_execution": (
+                lambda active: step_finishes.append(active) or True
+            ),
+            "stopProg": lambda: step_stops.append("step"),
+        }
+        step_forward = self.compile_function("stepFwd", step_namespace)
+
+        self.assertFalse(step_forward())
+        self.assertEqual(step_stops, ["step"])
+        self.assertEqual(step_finishes, [request])
+        self.assertEqual(
+            step_statuses,
+            [("PROGRAM STEP FORWARD SETUP FAILED", "Alarm.TLabel")],
+        )
+
+    def test_step_forward_selection_failure_dispatches_stop(self):
+        class SelectionEvent:
+            def __init__(self, request, action, style_rows=False):
+                self.action = action
+
+        class CapturedThread:
+            target = None
+
+            def __init__(self, target):
+                type(self).target = target
+
+            def start(self):
+                pass
+
+        request = object()
+        stops = []
+        finishes = []
+        statuses = []
+        aborts = []
+        namespace = {
+            "tab1": SimpleNamespace(
+                lastProg="",
+                progView=SimpleNamespace(
+                    curselection=lambda: (1,),
+                    index=lambda value: 3,
+                ),
+            ),
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "threading": SimpleNamespace(Thread=CapturedThread),
+            "ProgramSelectionEvent": SelectionEvent,
+            "PROGRAM_SELECTION_ADVANCE": "advance",
+            "_begin_program_execution": lambda mode: request,
+            "_program_execution_busy_message": lambda: "busy",
+            "_set_application_status": lambda *args: None,
+            "_set_manual_auxiliary_status": lambda *args: None,
+            "_program_execution_request_cancelled": lambda active: False,
+            "executeRow": lambda **kwargs: "complete",
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "_dispatch_program_selection": (
+                lambda event: (_ for _ in ()).throw(
+                    RuntimeError("selection unavailable")
+                )
+            ),
+            "_abort_program_row_execution": lambda: aborts.append(True),
+            "_finish_program_execution": (
+                lambda active: finishes.append(active) or True
+            ),
+            "_queue_program_execution_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+            "stopProg": lambda: stops.append(True),
+        }
+        step_forward = self.compile_function("stepFwd", namespace)
+
+        self.assertTrue(step_forward())
+        CapturedThread.target()
+        self.assertEqual(stops, [True])
+        self.assertTrue(aborts)
+        self.assertEqual(finishes, [request])
+        self.assertEqual(
+            statuses,
+            [("PROGRAM STEP FORWARD FAILED", "Alarm.TLabel")],
+        )
 
     def test_auxiliary_output_field_replacement_rolls_back_partial_update(self):
         class Entry:
@@ -16514,6 +17401,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "program_execution_active_request": None,
             "gcode_storage_program_admission_active": False,
             "manual_controller_program_admission_active": False,
+            "application_closing": threading.Event(),
             "RUN": {
                 "programStopRequestId": None,
                 "programStopStatusLatched": False,
@@ -16550,6 +17438,10 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         request_active = self.compile_function(
             "_program_execution_request_active",
+            namespace,
+        )
+        request_cancelled = self.compile_function(
+            "_program_execution_request_cancelled",
             namespace,
         )
         self.compile_function(
@@ -16621,6 +17513,10 @@ class HmiSourceContractTests(unittest.TestCase):
         first_request = begin_execution("run")
         self.assertTrue(execution_active())
         self.assertTrue(request_active(first_request))
+        namespace["application_closing"].set()
+        self.assertTrue(request_cancelled(first_request))
+        namespace["application_closing"].clear()
+        self.assertFalse(request_cancelled(first_request))
         self.assertEqual(begin_conversion(), "program-active")
         self.assertEqual(begin_storage(False), "program-active")
         self.assertFalse(namespace["gcode_conversion_active"].is_set())
@@ -16678,7 +17574,13 @@ class HmiSourceContractTests(unittest.TestCase):
             def start(self):
                 pass
 
-        tab = SimpleNamespace(runTrue=0, progView=object())
+        tab = SimpleNamespace(
+            runTrue=0,
+            progView=SimpleNamespace(
+                curselection=lambda: (0,),
+                index=lambda value: 1,
+            ),
+        )
         first_label = Widget()
         second_label = Widget()
         logged = []

@@ -287,6 +287,10 @@ from ARrobots.HMI.joint_visualization import (
   JointMotionVisualization,
   set_joint_slider_positions,
 )
+from ARrobots.HMI.vision_io import (
+  fit_vision_preview_square,
+  load_bounded_vision_image,
+)
 
 #####################################################################################
 # Cross-Compat Patch
@@ -486,6 +490,7 @@ motion_request_admission_state = threading.local()
 serial_write_lock = threading.Lock()
 serial_event_queue = Queue()
 called_program_navigation_event_queue = Queue()
+program_selection_event_queue = Queue()
 calibration_serial_event_queue = Queue()
 calibration_operation_lock = threading.Lock()
 calibration_operation = None
@@ -749,6 +754,16 @@ XBOX_AUXILIARY_FIXED_EXCHANGES = frozenset(
 )
 MANUAL_AUXILIARY_QUEUE_LIMIT = 64
 PROGRAM_EXECUTION_MODES = frozenset(("run", "step-forward", "step-reverse"))
+PROGRAM_SELECTION_INITIALIZE_RUN = "initialize-run"
+PROGRAM_SELECTION_PREPARE_RUN = "prepare-run"
+PROGRAM_SELECTION_ADVANCE = "advance"
+PROGRAM_SELECTION_ACTIONS = frozenset(
+  (
+    PROGRAM_SELECTION_INITIALIZE_RUN,
+    PROGRAM_SELECTION_PREPARE_RUN,
+    PROGRAM_SELECTION_ADVANCE,
+  )
+)
 GCODE_STORAGE_OPERATIONS = frozenset(("delete", "list"))
 GCODE_STORAGE_DELETE_TERMINAL_RESPONSES = frozenset(("P", "F", "ER"))
 GCODE_STORAGE_DETAILED_ERROR_PREFIX = "EG: "
@@ -789,6 +804,7 @@ EVENT_POLL_CALLBACK_NAMES = {
   "manual-auxiliary": "_poll_manual_auxiliary_events",
   "gcode-storage": "_poll_gcode_storage_events",
   "called-program": "_poll_called_program_navigation_events",
+  "program-selection": "_poll_program_selection_events",
   "xbox-auxiliary": "_poll_xbox_auxiliary_events",
   "virtual-motion": "_poll_virtual_motion_events",
   "joint-motion": "_poll_joint_motion_events",
@@ -892,6 +908,93 @@ class ProgramExecutionRequest:
       raise MotionInputError(
         "program execution cancellation boundary is invalid"
       )
+
+
+class ProgramSelectionResult:
+  """Describe one Tk-owned program-selection transition."""
+
+  def __init__(self, ready, return_program=None):
+    if not isinstance(ready, bool):
+      raise TypeError("program selection readiness must be boolean")
+    if return_program is not None:
+      if not ready:
+        raise ValueError(
+          "an unavailable program selection cannot return to a caller"
+        )
+      if (
+        not isinstance(return_program, tuple)
+        or len(return_program) != 2
+        or not isinstance(return_program[0], str)
+        or not return_program[0]
+        or isinstance(return_program[1], bool)
+        or not isinstance(return_program[1], int)
+        or return_program[1] < 0
+      ):
+        raise TypeError("program selection return state is invalid")
+    self.ready = ready
+    self.return_program = return_program
+
+
+class ProgramSelectionEvent:
+  """Carry one program-selection operation to the Tk event owner."""
+
+  def __init__(self, execution_request, action, style_rows=False):
+    if not isinstance(execution_request, ProgramExecutionRequest):
+      raise TypeError("program selection request is invalid")
+    if (
+      not isinstance(action, str)
+      or action not in PROGRAM_SELECTION_ACTIONS
+    ):
+      raise TypeError("program selection action is invalid")
+    if not isinstance(style_rows, bool):
+      raise TypeError("program row-style option must be boolean")
+    if action != PROGRAM_SELECTION_ADVANCE and style_rows:
+      raise ValueError(
+        "program row styling is valid only while advancing a row"
+      )
+    self.execution_request = execution_request
+    self.action = action
+    self.style_rows = style_rows
+    self._completion = threading.Event()
+    self._settlement_lock = threading.Lock()
+    self._settled = False
+    self._result = None
+    self._error = None
+
+  def settle(self, result=None, error=None):
+    if result is not None and not isinstance(result, ProgramSelectionResult):
+      raise TypeError("program selection settlement result is invalid")
+    if error is not None and not isinstance(error, Exception):
+      raise TypeError("program selection settlement error is invalid")
+    if (result is None) == (error is None):
+      raise ValueError(
+        "program selection settlement requires one result or error"
+      )
+    with self._settlement_lock:
+      if self._settled:
+        raise RuntimeError("program selection settled more than once")
+      self._settled = True
+      self._result = result
+      self._error = error
+      self._completion.set()
+    return True
+
+  def wait(self):
+    self._completion.wait()
+    with self._settlement_lock:
+      if not self._settled:
+        raise RuntimeError(
+          "program selection completion was signaled before settlement"
+        )
+      result = self._result
+      error = self._error
+    if error is not None:
+      raise RuntimeError(
+        f"program selection event failed: {error}"
+      ) from error
+    if not isinstance(result, ProgramSelectionResult):
+      raise RuntimeError("program selection settled without a valid result")
+    return result
 
 
 class CalledProgramNavigation:
@@ -2999,6 +3102,8 @@ def _program_execution_request_active(request):
 def _program_execution_request_cancelled(request):
   if not isinstance(request, ProgramExecutionRequest):
     raise TypeError("program execution cancellation request is invalid")
+  if application_closing.is_set():
+    return True
   if program_execution_cancelled.is_set():
     return True
   if request.cancellation_boundary.is_set():
@@ -4274,6 +4379,7 @@ def _poll_application_close():
   _poll_manual_auxiliary_events()
   _poll_gcode_storage_events()
   _poll_called_program_navigation_events()
+  _poll_program_selection_events()
   _poll_joint_motion_events()
   _poll_virtual_motion_events()
   _poll_xbox_auxiliary_events()
@@ -7595,7 +7701,38 @@ def _apply_controller_startup_result(
   return applied_position
 
 
+def _main_port_selector_value(port):
+  if (
+    not isinstance(port, str)
+    or not port
+    or port != port.strip()
+  ):
+    raise MotionInputError(
+      "accepted main-controller port selection must be normalized text"
+    )
+  if (
+    not isinstance(port_choices, (tuple, list))
+    or "None" not in port_choices
+    or any(
+      not isinstance(choice, str)
+      or not choice
+      or choice != choice.strip()
+      for choice in port_choices
+    )
+  ):
+    raise RuntimeError("available main-controller ports are invalid")
+  return port if port in port_choices else "None"
+
+
 def setCom(misc=None):
+  previous_main_port = CAL.get('comPort', "None")
+  if isinstance(previous_main_port, str):
+    previous_main_port = previous_main_port.strip()
+  else:
+    previous_main_port = "None"
+  if not previous_main_port:
+    previous_main_port = "None"
+  restored_main_port = _main_port_selector_value(previous_main_port)
   request_lease = _acquire_motion_request(
     "Controller connection change",
     allow_position_recovery=True,
@@ -7605,11 +7742,22 @@ def setCom(misc=None):
     message = _motion_request_rejection_message(
       "Controller connection change not started"
     )
+    try:
+      com1SelectedValue.set(restored_main_port)
+    except Exception:
+      logger.exception(
+        "Unable to restore the accepted main-controller port selection"
+      )
     _set_application_status(message, "Warn.TLabel")
     return False
   request_state = {"transferred": False}
   try:
-    return _set_com_admitted(request_lease, request_state, misc)
+    return _set_com_admitted(
+      request_lease,
+      request_state,
+      misc,
+      previous_main_port=previous_main_port,
+    )
   finally:
     if (
       not request_state["transferred"]
@@ -7618,11 +7766,37 @@ def setCom(misc=None):
       _finish_motion_request(request_lease)
 
 
-def _set_com_admitted(request_lease, request_state, misc=None):
+def _set_com_admitted(
+  request_lease,
+  request_state,
+  misc=None,
+  *,
+  previous_main_port,
+):
+  if (
+    not isinstance(previous_main_port, str)
+    or not previous_main_port
+    or previous_main_port != previous_main_port.strip()
+  ):
+    raise MotionInputError(
+      "accepted main-controller port selection must be normalized text"
+    )
+  restored_main_port = _main_port_selector_value(previous_main_port)
+
+  def restore_port_selection():
+    try:
+      com1SelectedValue.set(restored_main_port)
+    except Exception:
+      logger.exception(
+        "Unable to restore the accepted main-controller port selection"
+      )
+
   if application_closing.is_set():
+    restore_port_selection()
     logger.warning("Controller connection change rejected during application shutdown")
     return False
   if not serial_lock.acquire(blocking=False):
+    restore_port_selection()
     message = "Controller connection change rejected while the transport is busy"
     logger.warning(message)
     _set_application_status(message, "Warn.TLabel")
@@ -7631,6 +7805,7 @@ def _set_com_admitted(request_lease, request_state, misc=None):
     cleanup_pending = manual_controller_cleanup_pending is not None
   if cleanup_pending:
     serial_lock.release()
+    restore_port_selection()
     message = (
       "Controller connection change rejected while controller I/O "
       "cleanup is pending"
@@ -7642,12 +7817,14 @@ def _set_com_admitted(request_lease, request_state, misc=None):
     activity_lease = serial_activity_registry.lease("ser")
   except SerialActivityRejected as exc:
     serial_lock.release()
+    restore_port_selection()
     message = f"Controller connection change rejected: {exc}"
     logger.warning(message)
     _set_application_status(message, "Warn.TLabel")
     return False
   except Exception:
     serial_lock.release()
+    restore_port_selection()
     raise
   release_transport = True
   try:
@@ -7711,12 +7888,14 @@ def _set_com_admitted(request_lease, request_state, misc=None):
         logger.exception("Unable to update controller startup status")
 
     def report_startup_timeout():
+      restore_port_selection()
       message = "CONTROLLER STARTUP TIMED OUT; WAITING FOR CLEANUP"
       logger.error(message)
       set_startup_status(message, "Alarm.TLabel")
 
     def finish_startup(result, timed_out):
       if RUN.get('ser') is not startup_serial:
+        restore_port_selection()
         logger.error("Main serial reference changed during controller startup")
         if isinstance(result, ControllerStartupResult):
           _request_startup_auxiliary_cleanup(result.auxiliary_serial)
@@ -7732,6 +7911,7 @@ def _set_com_admitted(request_lease, request_state, misc=None):
         or isinstance(result, BaseException)
         or not isinstance(result, ControllerStartupResult)
       ):
+        restore_port_selection()
         if isinstance(result, BaseException) and not (
           timed_out and isinstance(result, TimeoutError)
         ):
@@ -7768,6 +7948,7 @@ def _set_com_admitted(request_lease, request_state, misc=None):
           original_startup_timeout,
         )
       except Exception:
+        restore_port_selection()
         logger.exception("Unable to finalize the Teensy 4.1 controller connection")
         _request_startup_auxiliary_cleanup(result.auxiliary_serial)
         message = "UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER"
@@ -7827,6 +8008,7 @@ def _set_com_admitted(request_lease, request_state, misc=None):
     return True
 
   except Exception:
+    restore_port_selection()
     failed_serial = RUN.get('ser')
     if failed_serial is not None:
       release_transport = False
@@ -10637,6 +10819,161 @@ def _finish_step_reverse_selection(sel_row):
   except Exception:
     curRowEntryField.delete(0, 'end')
     curRowEntryField.insert(0, "---")
+
+
+def _apply_program_selection_event(event):
+  if not isinstance(event, ProgramSelectionEvent):
+    raise TypeError("program selection event is invalid")
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "program selection commitment must run on the Tk event thread"
+    )
+  if (
+    application_closing.is_set()
+    or _program_execution_request_cancelled(event.execution_request)
+  ):
+    return ProgramSelectionResult(False)
+
+  selected_rows = tuple(tab1.progView.curselection())
+  if len(selected_rows) > 1:
+    raise RuntimeError(
+      "program execution requires at most one selected row"
+    )
+  last_row = tab1.progView.index('end')
+  if (
+    isinstance(last_row, bool)
+    or not isinstance(last_row, int)
+    or last_row <= 0
+  ):
+    raise RuntimeError("robot program view has no executable rows")
+  if selected_rows and (
+    isinstance(selected_rows[0], bool)
+    or not isinstance(selected_rows[0], int)
+    or not 0 <= selected_rows[0] < last_row
+  ):
+    raise RuntimeError("robot program selection is out of range")
+
+  if event.action == PROGRAM_SELECTION_INITIALIZE_RUN:
+    for row in range(0, last_row):
+      tab1.progView.itemconfig(row, {'fg': "#FFFFFF"})
+    if not selected_rows:
+      if last_row <= 1:
+        raise RuntimeError("robot program view has no executable row")
+      tab1.progView.selection_clear(0, END)
+      tab1.progView.select_set(1)
+      if tuple(tab1.progView.curselection()) != (1,):
+        raise RuntimeError("program execution could not select the first row")
+    return ProgramSelectionResult(True)
+
+  if event.action == PROGRAM_SELECTION_PREPARE_RUN:
+    if selected_rows:
+      return ProgramSelectionResult(True)
+    if tab1.lastProg == "":
+      index = _program_row_index(
+        tab1.progView.get(0, "end"),
+        "## START PROGRAM LOOP ##",
+      )
+      tab1.progView.selection_clear(0, END)
+      tab1.progView.select_set(index)
+      if tuple(tab1.progView.curselection()) != (index,):
+        raise RuntimeError(
+          "program execution could not select the program-loop entry"
+        )
+      return ProgramSelectionResult(True)
+    if (
+      not isinstance(tab1.lastProg, str)
+      or not tab1.lastProg
+      or "\r" in tab1.lastProg
+      or "\n" in tab1.lastProg
+      or isinstance(tab1.lastRow, bool)
+      or not isinstance(tab1.lastRow, int)
+      or tab1.lastRow < -1
+    ):
+      raise RuntimeError("program caller return state is invalid")
+    return ProgramSelectionResult(
+      True,
+      (tab1.lastProg, tab1.lastRow + 1),
+    )
+
+  if event.action != PROGRAM_SELECTION_ADVANCE:
+    raise RuntimeError("program selection action was not implemented")
+  if len(selected_rows) != 1:
+    raise RuntimeError(
+      "completed program row does not have one selected row"
+    )
+  selected_row = selected_rows[0]
+
+  next_row = selected_row + 1
+  tab1.progView.selection_clear(0, END)
+  if next_row < last_row:
+    tab1.progView.select_set(next_row)
+    expected_selection = (next_row,)
+    displayed_row = next_row
+  else:
+    expected_selection = ()
+    displayed_row = "---"
+  if tuple(tab1.progView.curselection()) != expected_selection:
+    raise RuntimeError(
+      "program selection did not advance after the completed row"
+    )
+
+  try:
+    curRowEntryField.delete(0, 'end')
+    curRowEntryField.insert(0, displayed_row)
+  except Exception:
+    logger.exception("Unable to update the current program-row display")
+
+  if event.style_rows:
+    try:
+      for row in range(0, selected_row):
+        tab1.progView.itemconfig(row, {'fg': "#1E90FF"})
+      tab1.progView.itemconfig(selected_row, {'fg': "#0561BD"})
+      for row in range(selected_row + 1, last_row):
+        tab1.progView.itemconfig(row, {'fg': "#9E9E9E"})
+    except Exception:
+      logger.exception("Unable to update Step Forward row styling")
+  return ProgramSelectionResult(True)
+
+
+def _settle_program_selection(event):
+  if not isinstance(event, ProgramSelectionEvent):
+    raise TypeError("program selection event is invalid")
+  try:
+    result = _apply_program_selection_event(event)
+  except Exception as exc:
+    event.settle(error=exc)
+    logger.exception("Unable to apply a program selection event")
+    return False
+  event.settle(result=result)
+  return True
+
+
+def _poll_program_selection_events():
+  try:
+    while True:
+      try:
+        event = program_selection_event_queue.get_nowait()
+      except Empty:
+        break
+      _settle_program_selection(event)
+  except Exception:
+    logger.exception("Unable to settle a program selection event")
+  finally:
+    _reschedule_event_poll("program-selection")
+
+
+def _dispatch_program_selection(event):
+  if not isinstance(event, ProgramSelectionEvent):
+    raise TypeError("program selection dispatch is invalid")
+  if threading.get_ident() == application_tk_thread_id:
+    _settle_program_selection(event)
+    return event.wait()
+  with application_lifecycle_lock:
+    if application_closing.is_set():
+      event.settle(result=ProgramSelectionResult(False))
+    else:
+      program_selection_event_queue.put(event)
+  return event.wait()
 
 
 def _virtual_motion_active(ignored_request_lease=None):
@@ -14523,54 +14860,46 @@ def runProg():
     return False
 
   def threadProg():
-    last = tab1.progView.index('end')
-    for row in range (0,last):
-      tab1.progView.itemconfig(row, {'fg': "#FFFFFF"})
-
-    try:
-      curRow = tab1.progView.curselection()[0]
-      if (curRow == 0):
-        curRow=1
-    except:
-      curRow=1
-      tab1.progView.selection_clear(0, END)
-      tab1.progView.select_set(curRow)
+    selection_result = _dispatch_program_selection(
+      ProgramSelectionEvent(
+        execution_request,
+        PROGRAM_SELECTION_INITIALIZE_RUN,
+      )
+    )
+    if not selection_result.ready:
+      _abort_program_row_execution()
+      return
     while (
       tab1.runTrue == 1
       and not _program_execution_request_cancelled(execution_request)
     ):
+      selection_result = _dispatch_program_selection(
+        ProgramSelectionEvent(
+          execution_request,
+          PROGRAM_SELECTION_PREPARE_RUN,
+        )
+      )
+      if not selection_result.ready:
+        _abort_program_row_execution()
+        break
+      if selection_result.return_program is not None and not callProg(
+        selection_result.return_program[0],
+        execution_request,
+        selection_result.return_program[1],
+        clear_return_state=True,
+        update_current_row=True,
+      ):
+        _abort_program_row_execution()
+        break
+      if _program_execution_request_cancelled(execution_request):
+        _abort_program_row_execution()
+        break
       if (tab1.runTrue == 0):
         _set_program_stop_status(RUN['programStopState'])
       else:
         _set_application_status("PROGRAM RUNNING", "OK.TLabel")
       with program_stop_state_lock:
         RUN['rowinproc'] = 1
-      try:
-        selRow = tab1.progView.curselection()[0]
-      except:
-        if(tab1.lastProg == ""):
-          selRow = 1
-          try:
-            index = _program_row_index(
-              tab1.progView.get(0, "end"),
-              "## START PROGRAM LOOP ##",
-            )
-            tab1.progView.selection_clear(0, END)
-            tab1.progView.select_set(index)
-          except:
-            stopProg()
-        else:
-          lastRow = tab1.lastRow + 1
-          lastProg = tab1.lastProg
-          if not callProg(
-            lastProg,
-            execution_request,
-            lastRow,
-            clear_return_state=True,
-            update_current_row=True,
-          ):
-            _abort_program_row_execution()
-            break
       if (
         tab1.runTrue == 1
         and not _program_execution_request_cancelled(execution_request)
@@ -14596,18 +14925,15 @@ def runProg():
         if _program_execution_request_cancelled(execution_request):
           _abort_program_row_execution()
           break
-        try:
-          selRow = tab1.progView.curselection()[0]
-          selRow += 1
-          tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(selRow)
-          curRowEntryField.delete(0, 'end')
-          curRowEntryField.insert(0,selRow)
-        except:
-          curRow=1
-          tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(curRow)
-        time.sleep(.1)
+        selection_result = _dispatch_program_selection(
+          ProgramSelectionEvent(
+            execution_request,
+            PROGRAM_SELECTION_ADVANCE,
+          )
+        )
+        if not selection_result.ready:
+          _abort_program_row_execution()
+          break
 
     _set_program_stop_status(RUN['programStopState'])
 
@@ -14616,6 +14942,12 @@ def runProg():
       threadProg()
     except Exception:
       tab1.runTrue = 0
+      try:
+        stopProg()
+      except Exception:
+        logger.exception(
+          "Unable to dispatch the auxiliary stop after program failure"
+        )
       _abort_program_row_execution()
       logger.exception("Program execution worker failed")
       _queue_program_execution_status(
@@ -14647,16 +14979,27 @@ def stepFwd():
       _set_manual_auxiliary_status(message, "Warn.TLabel")
       return False
 
-    def threadProg():
-      if _program_execution_request_cancelled(execution_request):
-        _abort_program_row_execution()
-        return
+    return_program = None
+    try:
       _set_application_status("SYSTEM READY", "OK.TLabel")
-      try:
-        selRow = tab1.progView.curselection()[0]
-      except:
-        if(tab1.lastProg == ""):
-          selRow = 1
+      selected_rows = tuple(tab1.progView.curselection())
+      if len(selected_rows) > 1:
+        raise RuntimeError("Step Forward requires at most one selected row")
+      last_row = tab1.progView.index('end')
+      if (
+        isinstance(last_row, bool)
+        or not isinstance(last_row, int)
+        or last_row <= 0
+      ):
+        raise RuntimeError("robot program view has no executable rows")
+      if selected_rows and (
+        isinstance(selected_rows[0], bool)
+        or not isinstance(selected_rows[0], int)
+        or not 0 <= selected_rows[0] < last_row
+      ):
+        raise RuntimeError("Step Forward selection is out of range")
+      if not selected_rows:
+        if tab1.lastProg == "":
           try:
             index = _program_row_index(
               tab1.progView.get(0, "end"),
@@ -14664,20 +15007,50 @@ def stepFwd():
             )
             tab1.progView.selection_clear(0, END)
             tab1.progView.select_set(index)
-          except:
+            if tuple(tab1.progView.curselection()) != (index,):
+              raise RuntimeError(
+                "Step Forward could not select the program-loop entry"
+              )
+          except Exception:
             stopProg()
+            raise
         else:
-          lastRow = tab1.lastRow + 1
-          lastProg = tab1.lastProg
-          if not callProg(
-            lastProg,
-            execution_request,
-            lastRow,
-            clear_return_state=True,
-            update_current_row=True,
+          if (
+            not isinstance(tab1.lastProg, str)
+            or not tab1.lastProg
+            or "\r" in tab1.lastProg
+            or "\n" in tab1.lastProg
+            or isinstance(tab1.lastRow, bool)
+            or not isinstance(tab1.lastRow, int)
+            or tab1.lastRow < -1
           ):
-            _abort_program_row_execution()
-            return
+            raise RuntimeError(
+              "Step Forward caller return state is invalid"
+            )
+          return_program = (tab1.lastProg, tab1.lastRow + 1)
+    except Exception:
+      _abort_program_row_execution()
+      _finish_program_execution(execution_request)
+      logger.exception("Program step-forward setup failed")
+      _set_manual_auxiliary_status(
+        "PROGRAM STEP FORWARD SETUP FAILED",
+        "Alarm.TLabel",
+      )
+      return False
+
+    def threadProg():
+      if _program_execution_request_cancelled(execution_request):
+        _abort_program_row_execution()
+        return
+      if return_program is not None and not callProg(
+        return_program[0],
+        execution_request,
+        return_program[1],
+        clear_return_state=True,
+        update_current_row=True,
+      ):
+        _abort_program_row_execution()
+        return
       if _program_execution_request_cancelled(execution_request):
         _abort_program_row_execution()
         return
@@ -14688,33 +15061,27 @@ def stepFwd():
       if _program_execution_request_cancelled(execution_request):
         _abort_program_row_execution()
         return
-      try:
-        last = tab1.progView.index('end')
-        selRow = tab1.progView.curselection()[0]
-        for row in range (0,selRow):
-          tab1.progView.itemconfig(row, {'fg': "#1E90FF"})
-        tab1.progView.itemconfig(selRow, {'fg': "#0561BD"})
-        for row in range (selRow+1,last):
-          tab1.progView.itemconfig(row, {'fg': "#9E9E9E"})
-        try:
-          selRow = tab1.progView.curselection()[0]
-          selRow += 1
-          tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(selRow)
-          curRowEntryField.delete(0, 'end')
-          curRowEntryField.insert(0,selRow)
-        except:
-          curRow=1
-          tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(curRow)
-        time.sleep(.1)
-      except Exception:
-        pass
+      selection_result = _dispatch_program_selection(
+        ProgramSelectionEvent(
+          execution_request,
+          PROGRAM_SELECTION_ADVANCE,
+          style_rows=True,
+        )
+      )
+      if not selection_result.ready:
+        _abort_program_row_execution()
+        return
 
     def step_forward_worker():
       try:
         threadProg()
       except Exception:
+        try:
+          stopProg()
+        except Exception:
+          logger.exception(
+            "Unable to dispatch the auxiliary stop after Step Forward failure"
+          )
         _abort_program_row_execution()
         logger.exception("Program step-forward worker failed")
         _queue_program_execution_status(
@@ -16419,7 +16786,8 @@ def executeRow(motion_complete=None, execution_request=None):
       tab1.progView.selection_clear(0, END)
       tab1.progView.select_set(index)
     except Exception as exc:
-      message = f"Vision program row rejected: {exc}"
+      detail = str(exc).strip() or type(exc).__name__
+      message = f"Vision program row rejected: {detail}"
       logger.error(message)
       _set_application_status(text=message, style="Alarm.TLabel")
       _finish_execute_row()
@@ -27546,9 +27914,11 @@ def selectMask():
     if mask_pic() is not True:
       raise MotionInputError("vision mask capture failed")
 
-    image = cv2.imread('curImage.jpg')
-    if image is None:
-      raise MotionInputError("captured mask frame could not be reloaded")
+    image = load_bounded_vision_image(
+      'curImage.jpg',
+      cv2.IMREAD_COLOR,
+      "captured mask frame",
+    )
     RUN['oriImage'] = image.copy()
 
     cv2.namedWindow("image")
@@ -27615,16 +27985,26 @@ def mouse_crop(event, x, y, flags, param):
 
 
 def selectTemplate():
-  #global oriImage
-  # global RUN['button_down']
-  RUN['button_down'] = False
-  RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
-  image = cv2.imread('curImage.jpg')
-  RUN['oriImage'] = image.copy()
-  
-  cv2.namedWindow("image")
-  cv2.setMouseCallback("image", mouse_crop)
-  cv2.imshow("image", image)
+  try:
+    RUN['button_down'] = False
+    RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
+    image = load_bounded_vision_image(
+      'curImage.jpg',
+      cv2.IMREAD_COLOR,
+      "captured template frame",
+    )
+    RUN['oriImage'] = image.copy()
+    cv2.namedWindow("image")
+    cv2.setMouseCallback("image", mouse_crop)
+    cv2.imshow("image", image)
+  except Exception:
+    logger.exception("Vision template selection failed")
+    try:
+      cv2.destroyAllWindows()
+    except Exception:
+      logger.exception("Unable to close vision template windows")
+    return False
+  return True
 
 
 
@@ -27690,12 +28070,16 @@ def visFind(template,min_score,background):
         "vision minimum score must be between 0 and 1"
       )
     background = _average_vision_grayscale_samples((background,))
-    img1 = cv2.imread('curImage.jpg', cv2.IMREAD_GRAYSCALE)
-    if img1 is None:
-      raise MotionInputError("captured vision frame could not be loaded")
-    img2 = cv2.imread(template, cv2.IMREAD_GRAYSCALE)
-    if img2 is None:
-      raise MotionInputError("vision template could not be loaded")
+    img1 = load_bounded_vision_image(
+      'curImage.jpg',
+      cv2.IMREAD_GRAYSCALE,
+      "captured vision frame",
+    )
+    img2 = load_bounded_vision_image(
+      template,
+      cv2.IMREAD_GRAYSCALE,
+      "vision template",
+    )
     if img2.shape[0] > img1.shape[0] or img2.shape[1] > img1.shape[1]:
       raise MotionInputError(
         "vision template must not exceed the captured frame dimensions"
@@ -27894,106 +28278,6 @@ def visFind(template,min_score,background):
 
     return (status)    
     
-
-
-
-
-
-# initial vis attempt using sift with flann pattern match
-#def visFind(template):
-#  take_pic()
-#  MIN_MATCH_COUNT = 10
-#  img1 = cv2.imread(template)  # query Image
-#  img2 = cv2.imread('curImage.jpg')  # target Image
-#  # Initiate SIFT detector
-#  sift = cv2.SIFT_create()
-#  # find the keypoints and descriptors with SIFT
-#  kp1, des1 = sift.detectAndCompute(img1,None)
-#  kp2, des2 = sift.detectAndCompute(img2,None)
-#  FLANN_INDEX_KDTREE = 1
-#  index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
-#  search_params = dict(checks = 50)
-#  flann = cv2.FlannBasedMatcher(index_params, search_params)
-#  matches = flann.knnMatch(des1,des2,k=2)
-#  # store all the good matches as per Lowe's ratio test.
-#  good = []
-#  for m,n in matches:
-#      if m.distance < 1.1*n.distance:
-#          good.append(m)
-
-#  if len(good)>MIN_MATCH_COUNT:
-#      src_pts = np.float32([ kp1[m.queryIdx].pt for m in good ]).reshape(-1,1,2)
-#      dst_pts = np.float32([ kp2[m.trainIdx].pt for m in good ]).reshape(-1,1,2)
-#      M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC,5.0)
-#      matchesMask = mask.ravel().tolist()
-#      h,w,c = img1.shape
-#      pts = np.float32([ [0,0],[0,h-1],[w-1,h-1],[w-1,0] ]).reshape(-1,1,2)
-#      dst = cv2.perspectiveTransform(pts,M)
-#      #img2 = cv.polylines(img2,[np.int32(dst)],True,255,3, cv.LINE_AA)
-#
-#      pts = np.float32([ [0,0],[0,h-1],[w-1,h-1],[w-1,0] ]).reshape(-1,1,2)
-#      dst = cv2.perspectiveTransform(pts,M)
-#
-#      crosspts = np.float32([ [w/2,0],[w/2,h-1],[0,h/2],[w-1,h/2] ]).reshape(-1,1,2)
-#      crossCoord = cv2.perspectiveTransform(crosspts,M)
-#
-#      cenPt = np.float32([w/2,h/2]).reshape(-1,1,2)
-#      cenCoord = cv2.perspectiveTransform(cenPt,M)
-#
-#      cenResult = cenCoord[0].reshape(1,-1).flatten().tolist()
-#      theta = - math.atan2(M[0,1], M[0,0]) * 180 / math.pi
-#
-#      xPos = cenResult[0]
-#      yPos = cenResult[1]
-#
-#      cross1Result = crossCoord[0].reshape(2,-1).flatten().tolist()
-#      cross2Result = crossCoord[1].reshape(2,-1).flatten().tolist()
-#      cross3Result = crossCoord[2].reshape(2,-1).flatten().tolist()
-#      cross4Result = crossCoord[3].reshape(2,-1).flatten().tolist()
-#
-#      x1Pos = int(cross1Result[0])
-#      y1Pos = int(cross1Result[1])
-#      x2Pos = int(cross2Result[0])
-#      y2Pos = int(cross2Result[1])
-#      x3Pos = int(cross3Result[0])
-#      y3Pos = int(cross3Result[1])
-#      x4Pos = int(cross4Result[0])
-#      y4Pos = int(cross4Result[1])
-#
-#
-#      print(xPos)
-#      print(yPos)
-#      print(theta)
-#
-#
-#      #draw bounding box
-#      #img2 = cv2.polylines(img2, [np.int32(dst)], True, (0,255,0),3, cv2.LINE_AA)
-#
-#      #draw circle
-#      img2 = cv2.circle(img2, (int(xPos),int(yPos)), radius=30, color=(0, 255, 0), thickness=3)
-#
-#      #draw line 1
-#      cv2.line(img2, (x1Pos,y1Pos), (x2Pos,y2Pos), (0,255,0), 3) 
-#      #draw line 2
-#      cv2.line(img2, (x3Pos,y3Pos), (x4Pos,y4Pos), (0,255,0), 3)
-#
-#      #save image
-#      cv2.imwrite('curImage.jpg', img2)
-#      img = Image.fromarray(img2)
-#      imgtk = ImageTk.PhotoImage(image=img)        
-#      vid_lbl.imgtk = imgtk    
-#      vid_lbl.configure(image=imgtk) 
-#
-#
-#
-#
-#  else:
-#      print( "Not enough matches are found - {}/{}".format(len(good), MIN_MATCH_COUNT) )
-#      matchesMask = None 
-
-
-
-
 def updateVisOp(filelist=None):
   # global RUN['selectedTemplate']
   RUN['selectedTemplate'] = StringVar()
@@ -28020,39 +28304,25 @@ def updateVisOp(filelist=None):
 def VisOpUpdate(foo):
     file = RUN['selectedTemplate'].get()
     logger.info(file)
-
-    # Load image
-    img = cv2.imread(file, cv2.IMREAD_COLOR)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # --- Square preview settings ---
-    TARGET_SIZE = 150   # final image will be 150x150
-
-    h, w = img.shape[:2]
-
-    # Scale so the longest side fits TARGET_SIZE
-    scale = TARGET_SIZE / max(w, h)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-
-    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-    # Create square canvas (background color can be changed)
-    square = np.zeros((TARGET_SIZE, TARGET_SIZE, 3), dtype=np.uint8)
-    # Example gray background instead of black:
-    # square[:] = (40, 40, 40)
-
-    # Center the resized image
-    x = (TARGET_SIZE - new_w) // 2
-    y = (TARGET_SIZE - new_h) // 2
-    square[y:y+new_h, x:x+new_w] = img
-
-    # Convert to Tk image
-    img = Image.fromarray(square)
-    imgtk = ImageTk.PhotoImage(image=img)
-
-    template_lbl.imgtk = imgtk
-    template_lbl.configure(image=imgtk, anchor='center')
+    try:
+      img = load_bounded_vision_image(
+        file,
+        cv2.IMREAD_COLOR,
+        "vision template",
+      )
+      img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+      square = fit_vision_preview_square(img, 150)
+      img = Image.fromarray(square)
+      imgtk = ImageTk.PhotoImage(image=img)
+      template_lbl.imgtk = imgtk
+      template_lbl.configure(image=imgtk, anchor='center')
+    except Exception as exc:
+      detail = str(exc).strip() or type(exc).__name__
+      message = f"VISION TEMPLATE PREVIEW FAILED: {detail}"
+      logger.exception(message)
+      _set_application_status(message, "Alarm.TLabel")
+      return False
+    return True
 
 
 
@@ -30798,15 +31068,18 @@ def detect_ports():
   ports = list(list_ports.comports())
   choices = [p.device for p in ports]
   choices.insert(0, "None")
-  if globals().get('CAL', {}).get('comPort') not in ("", None, "None"):
-    port1_default = CAL['comPort']
-  else:
-    port1_default = "None"
-  
-  if globals().get('CAL', {}).get('com2Port') not in ("", None, "None"):
-    port2_default = CAL['com2Port']
-  else:
-    port2_default = "None"
+  saved_main_port = globals().get('CAL', {}).get('comPort')
+  saved_auxiliary_port = globals().get('CAL', {}).get('com2Port')
+  if isinstance(saved_main_port, str):
+    saved_main_port = saved_main_port.strip()
+  if isinstance(saved_auxiliary_port, str):
+    saved_auxiliary_port = saved_auxiliary_port.strip()
+  port1_default = (
+    saved_main_port if saved_main_port in choices else "None"
+  )
+  port2_default = (
+    saved_auxiliary_port if saved_auxiliary_port in choices else "None"
+  )
   
   return choices, port1_default, port2_default
 
@@ -34191,6 +34464,7 @@ _schedule_event_poll("auxiliary-serial")
 _schedule_event_poll("manual-auxiliary")
 _schedule_event_poll("gcode-storage")
 _schedule_event_poll("called-program")
+_schedule_event_poll("program-selection")
 _schedule_event_poll("xbox-auxiliary")
 _schedule_event_poll("virtual-motion")
 tab1.after(100, setCom)

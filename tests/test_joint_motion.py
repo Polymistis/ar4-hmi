@@ -5,6 +5,7 @@ import struct
 import threading
 import time
 import unittest
+from decimal import Decimal
 from unittest.mock import patch
 
 from ARrobots.HMI.joint_motion import (
@@ -4639,6 +4640,8 @@ class CommandResponseTimeoutTests(unittest.TestCase):
             ), controller_calibration())
 
     def test_rejects_values_outside_the_controller_float_range(self):
+        with self.assertRaisesRegex(MotionInputError, "host numeric range"):
+            finite_number(10**400, "test value")
         with self.assertRaisesRegex(MotionInputError, "finite float range"):
             controller_number("1e39", "test value")
         with self.assertRaisesRegex(MotionInputError, "finite float range"):
@@ -4652,6 +4655,54 @@ class CommandResponseTimeoutTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(MotionInputError, "represented by the controller"):
             controller_number("1e-50", "test value")
+
+    def test_rejects_exact_nonzero_values_lost_during_host_float_conversion(self):
+        values = (
+            Decimal("1e-10000"),
+            "1e-10000",
+            "0." + ("0" * 10000) + "1",
+        )
+        for value in values:
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "represented by the controller",
+                ):
+                    controller_number(value, "test value")
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "host numeric range",
+                ):
+                    finite_number(value, "test value")
+
+    def test_rejects_exact_finite_values_above_the_host_float_range(self):
+        values = (Decimal("1e10000"), "1e10000")
+        for value in values:
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "host numeric range",
+                ):
+                    finite_number(value, "test value")
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "host numeric range",
+                ):
+                    controller_number(value, "test value")
+
+    def test_rejects_nonfinite_decimal_values_as_nonfinite(self):
+        values = (
+            Decimal("NaN"),
+            Decimal("sNaN"),
+            Decimal("Infinity"),
+            "NaN",
+            "sNaN",
+            "-Infinity",
+        )
+        for value in values:
+            with self.subTest(value=str(value)):
+                with self.assertRaisesRegex(MotionInputError, "must be finite"):
+                    finite_number(value, "test value")
 
     def test_controller_decimal_format_cannot_collide_with_field_markers(self):
         values = ("1e-5", "-2.5e10", 3.4028234663852886e38)

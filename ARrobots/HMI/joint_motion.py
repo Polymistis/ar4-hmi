@@ -9,9 +9,11 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from collections import deque
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 import json
 import math
+from numbers import Integral, Real
 import re
 import struct
 import threading
@@ -2990,20 +2992,67 @@ def _exchange_serial_line_with_timeout(
             raise
 
 
-def finite_number(value, field_name):
+def _finite_number_state(value, field_name):
     if isinstance(value, bool):
         raise MotionInputError(f"{field_name} must be numeric")
     try:
-        number = float(value)
-    except (TypeError, ValueError) as exc:
+        if isinstance(value, Decimal):
+            exact_number = value
+            if not exact_number.is_finite():
+                raise MotionInputError(f"{field_name} must be finite")
+            number = float(value)
+            exact_nonzero = exact_number != 0
+        elif isinstance(value, str):
+            token = value.strip()
+            if not token:
+                raise InvalidOperation
+            exact_number = Decimal(token)
+            if not exact_number.is_finite():
+                raise MotionInputError(f"{field_name} must be finite")
+            number = float(value)
+            exact_nonzero = exact_number != 0
+        elif isinstance(value, Integral):
+            number = float(value)
+            exact_number = None
+            exact_nonzero = value != 0
+        elif isinstance(value, Real):
+            number = float(value)
+            exact_number = None
+            exact_nonzero = bool(value != 0)
+        else:
+            raise TypeError
+    except MotionInputError:
+        raise
+    except OverflowError as exc:
+        raise MotionInputError(
+            f"{field_name} is outside the host numeric range"
+        ) from exc
+    except (InvalidOperation, TypeError, ValueError) as exc:
         raise MotionInputError(f"{field_name} must be numeric") from exc
     if not math.isfinite(number):
+        if exact_number is not None and exact_number.is_finite():
+            raise MotionInputError(
+                f"{field_name} is outside the host numeric range"
+            )
         raise MotionInputError(f"{field_name} must be finite")
+    return number, exact_nonzero
+
+
+def finite_number(value, field_name):
+    number, exact_nonzero = _finite_number_state(value, field_name)
+    if exact_nonzero and number == 0:
+        raise MotionInputError(
+            f"{field_name} is outside the host numeric range"
+        )
     return number
 
 
 def controller_number(value, field_name):
-    number = finite_number(value, field_name)
+    number, exact_nonzero = _finite_number_state(value, field_name)
+    if exact_nonzero and number == 0:
+        raise MotionInputError(
+            f"{field_name} cannot be represented by the controller"
+        )
     if abs(number) > CONTROLLER_FLOAT_MAX:
         raise MotionInputError(
             f"{field_name} exceeds the controller's finite float range"
