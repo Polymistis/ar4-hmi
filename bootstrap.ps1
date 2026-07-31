@@ -693,13 +693,24 @@ function Invoke-BootstrapChild {
   param(
     [Parameter(Mandatory = $true)][string]$Repository,
     [switch]$ChildForce,
-    [switch]$OmitTargetRepo
+    [switch]$OmitTargetRepo,
+    [switch]$EmptyTargetRepo
   )
 
+  if ($OmitTargetRepo -and $EmptyTargetRepo) {
+    throw 'self-test child target mode is ambiguous'
+  }
   $childScriptPath = $PSCommandPath
   if ($OmitTargetRepo) {
     $childScriptPath = Join-Path $Repository 'bootstrap.ps1'
     [System.IO.File]::Copy($PSCommandPath, $childScriptPath)
+  } elseif ($EmptyTargetRepo) {
+    $childScriptPath = Join-Path $Repository 'bootstrap-empty-target-runner.ps1'
+    $quotedBootstrapPath = $PSCommandPath.Replace("'", "''")
+    $forceArgument = if ($ChildForce) { ' -Force' } else { '' }
+    Write-Utf8WithoutBom `
+      -Path $childScriptPath `
+      -Content "& '$quotedBootstrapPath' -TargetRepo ''$forceArgument`n"
   }
   $arguments = @(
     '-NoProfile',
@@ -708,10 +719,10 @@ function Invoke-BootstrapChild {
     '-File',
     $childScriptPath
   )
-  if (-not $OmitTargetRepo) {
+  if (-not $OmitTargetRepo -and -not $EmptyTargetRepo) {
     $arguments += @('-TargetRepo', $Repository)
   }
-  if ($ChildForce) {
+  if ($ChildForce -and -not $EmptyTargetRepo) {
     $arguments += '-Force'
   }
   $savedErrorActionPreference = $ErrorActionPreference
@@ -852,22 +863,6 @@ function Invoke-BootstrapSelfTest {
           'bootstrap.ps1: script root is unavailable for the default target'
       ) `
       -Detail $unresolvedTargetMessage
-    $emptyTargetRejected = $false
-    $emptyTargetMessage = ''
-    try {
-      Resolve-RepositoryRoot -Candidate '' | Out-Null
-    } catch {
-      $emptyTargetRejected = $true
-      $emptyTargetMessage = $_.Exception.Message
-    }
-    Assert-SelfTest `
-      -Name 'explicit empty TargetRepo reaches repository boundary validation' `
-      -Condition (
-        $emptyTargetRejected -and
-        $emptyTargetMessage -ceq 'bootstrap.ps1: TargetRepo must not be empty'
-      ) `
-      -Detail $emptyTargetMessage
-
     $environmentProbeName = 'GIT_CONFIG_GLOBAL'
     $environmentProbeValue = Join-Path $scratchRoot 'probe-global-config'
     try {
@@ -959,6 +954,23 @@ function Invoke-BootstrapSelfTest {
           -Second $defaultTargetHook)
       ) `
       -Detail $defaultTargetResult.Text
+
+    $emptyTarget = New-SelfTestRepository `
+      -Root $scratchRoot `
+      -Name 'explicit-empty-target'
+    $emptyTargetResult = Invoke-BootstrapChild `
+      -Repository $emptyTarget `
+      -EmptyTargetRepo
+    $emptyTargetHook = Join-Path $emptyTarget '.git/hooks/pre-commit'
+    Assert-SelfTest `
+      -Name 'explicit empty TargetRepo fails at repository validation' `
+      -Condition (
+        $emptyTargetResult.ExitCode -ne 0 -and
+        $emptyTargetResult.Text -match
+          'bootstrap\.ps1: TargetRepo must not be empty' -and
+        -not (Test-Path -LiteralPath $emptyTargetHook)
+      ) `
+      -Detail $emptyTargetResult.Text
 
     $normalResult = Invoke-BootstrapChild -Repository $normal
     $normalHook = Get-DispatcherPath -Repository $normal

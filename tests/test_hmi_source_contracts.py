@@ -29167,12 +29167,10 @@ class HmiSourceContractTests(unittest.TestCase):
         source = BOOTSTRAP_SOURCE.read_text(encoding="utf-8")
         parameter_end = source.index(")\n\nSet-StrictMode")
         main_try = source.rindex("\ntry {\n")
-        install_branch = source.index("    } else {\n", main_try)
         target_resolution = source.index(
-            "$effectiveTargetRepo = Resolve-TargetRepositoryCandidate",
-            install_branch,
+            "$effectiveTargetRepo = Resolve-TargetRepositoryCandidate"
         )
-        install_call = source.index("      Install-Dispatcher", target_resolution)
+        install_call = source.index("      Install-Dispatcher")
 
         self.assertNotIn("$PSScriptRoot", source[:parameter_end])
         self.assertIn(
@@ -29180,8 +29178,12 @@ class HmiSourceContractTests(unittest.TestCase):
             source,
         )
         self.assertIn("-ScriptPath $scriptInvocationPath", source)
+        self.assertIn(
+            "    } else {\n"
+            "      $effectiveTargetRepo = Resolve-TargetRepositoryCandidate",
+            source[main_try:],
+        )
         self.assertLess(main_try, target_resolution)
-        self.assertLess(install_branch, target_resolution)
         self.assertLess(target_resolution, install_call)
 
     def test_controller_identity_probe_matches_firmware_opcode(self):
