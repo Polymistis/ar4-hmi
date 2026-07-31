@@ -14218,19 +14218,17 @@ class HmiSourceContractTests(unittest.TestCase):
                 log_messages = []
                 status_calls = []
                 stop_attempts = []
-                status_reserved = {"value": False}
 
                 def present_status(message, style):
                     status_calls.append((message, style))
-                    if failure == "status" and not status_reserved["value"]:
+                    if failure == "status":
                         raise RuntimeError("status unavailable")
-                    return not status_reserved["value"]
+                    return True
 
                 def stop_program():
                     stop_attempts.append(True)
                     if failure == "stop":
                         raise RuntimeError("stop unavailable")
-                    status_reserved["value"] = True
 
                 namespace = {
                     "tab1": SimpleNamespace(
@@ -17984,11 +17982,19 @@ class HmiSourceContractTests(unittest.TestCase):
             "progRunning": False,
         }
         worker_stop_calls = []
+        authoritative_stop_event = (
+            "PROGRAM SCHEDULING HALTED; ACTIVE MAIN MOTION NOT PREEMPTED",
+            "Alarm.TLabel",
+            True,
+        )
 
         def stop_program():
             worker_stop_calls.append(True)
             runtime["programStopStatusLatched"] = True
             tab.runTrue = 0
+            namespace["program_stop_status_event_queue"].put(
+                authoritative_stop_event
+            )
 
         namespace.update(
             {
@@ -18069,8 +18075,36 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(execution_active())
         self.assertEqual(worker_stop_calls, [True])
         self.assertTrue(runtime["programStopStatusLatched"])
+        self.assertEqual(
+            namespace["program_stop_status_event_queue"].get_nowait(),
+            authoritative_stop_event,
+        )
         self.assertTrue(namespace["program_stop_status_event_queue"].empty())
         runtime["programStopStatusLatched"] = False
+
+        failed_stop_attempts = []
+
+        def fail_stop_program():
+            failed_stop_attempts.append(True)
+            tab.runTrue = 0
+            raise RuntimeError("stop unavailable")
+
+        namespace["stopProg"] = fail_stop_program
+        self.assertTrue(run_program())
+        runtime["progRunning"] = True
+        runtime["rowinproc"] = 1
+        CapturedThread.target()
+        self.assertFalse(runtime["progRunning"])
+        self.assertEqual(runtime["rowinproc"], 0)
+        self.assertFalse(execution_active())
+        self.assertEqual(failed_stop_attempts, [True])
+        self.assertFalse(runtime["programStopStatusLatched"])
+        self.assertEqual(
+            namespace["program_stop_status_event_queue"].get_nowait(),
+            ("PROGRAM EXECUTION FAILED", "Alarm.TLabel", False),
+        )
+        self.assertTrue(namespace["program_stop_status_event_queue"].empty())
+        namespace["stopProg"] = stop_program
 
         runtime["programStopRequestId"] = 7
         self.assertFalse(run_program())
@@ -18105,6 +18139,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(execution_active())
         self.assertEqual(worker_stop_calls, [True, True])
         self.assertTrue(runtime["programStopStatusLatched"])
+        self.assertEqual(
+            namespace["program_stop_status_event_queue"].get_nowait(),
+            authoritative_stop_event,
+        )
         self.assertTrue(namespace["program_stop_status_event_queue"].empty())
         runtime["programStopStatusLatched"] = False
 
