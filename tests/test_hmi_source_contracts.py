@@ -957,7 +957,11 @@ class HmiSourceContractTests(unittest.TestCase):
             )
         if name in ("_try_dispatch_auxiliary_stop", "_request_auxiliary_stop"):
             namespace.setdefault("_auxiliary_stop_not_required", lambda: False)
-        if name in ("setCom", "_set_com_admitted"):
+        if name in (
+            "setCom",
+            "_set_com_admitted",
+            "_startup_port_selector_values",
+        ):
             namespace.setdefault(
                 "port_choices",
                 ("None", "COM0", "COM1", "COM7", "COM9"),
@@ -13468,17 +13472,20 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(restored_ports, ["None"])
 
-    def test_detect_ports_uses_only_currently_available_saved_devices(self):
+    def test_detect_ports_returns_current_devices_and_neutral_defaults(self):
+        warnings = []
         namespace = {
-            "CAL": {
-                "comPort": " COM0 ",
-                "com2Port": " COM7 ",
-            },
+            "logger": SimpleNamespace(
+                warning=lambda *args: warnings.append(args),
+            ),
         }
         detect_ports = self.compile_function("detect_ports", namespace)
         available = [
             SimpleNamespace(device="COM7"),
+            SimpleNamespace(device="COM7"),
             SimpleNamespace(device="COM8"),
+            SimpleNamespace(device=" COM9 "),
+            SimpleNamespace(),
         ]
 
         with patch(
@@ -13489,7 +13496,38 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertEqual(choices, ["None", "COM7", "COM8"])
         self.assertEqual(main_default, "None")
-        self.assertEqual(auxiliary_default, "COM7")
+        self.assertEqual(auxiliary_default, "None")
+        self.assertEqual(len(warnings), 2)
+
+    def test_startup_port_selectors_normalize_only_available_devices(self):
+        namespace = {
+            "port_choices": ("None", "COM7", "COM8"),
+        }
+        selector_values = self.compile_function(
+            "_startup_port_selector_values",
+            namespace,
+        )
+
+        self.assertEqual(
+            selector_values(
+                {
+                    "comPort": " COM8 ",
+                    "com2Port": " COM7 ",
+                }
+            ),
+            ("COM8", "COM7"),
+        )
+        self.assertEqual(
+            selector_values(
+                {
+                    "comPort": " COM0 ",
+                    "com2Port": " COM9 ",
+                }
+            ),
+            ("None", "None"),
+        )
+        with self.assertRaises(TypeError):
+            selector_values(())
 
     def test_program_selection_events_run_on_tk_and_preserve_terminal_state(self):
         class Entry:
@@ -13798,7 +13836,16 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(failure, [])
         self.assertFalse(cancelled_result[0].ready)
 
-    def test_program_workers_delegate_selection_widget_access_to_tk(self):
+        interrupted_event = event_type(request, "advance")
+        namespace["_apply_program_selection_event"] = (
+            lambda event: (_ for _ in ()).throw(KeyboardInterrupt())
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            namespace["_settle_program_selection"](interrupted_event)
+        with self.assertRaisesRegex(RuntimeError, "KeyboardInterrupt"):
+            interrupted_event.wait()
+
+    def test_program_worker_selection_transitions_delegate_to_tk(self):
         expected_dispatch_calls = {"runProg": 3, "stepFwd": 1}
         for function_name, expected_count in expected_dispatch_calls.items():
             function = self.module_functions[function_name]
@@ -13938,6 +13985,9 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_begin_program_execution": lambda mode: request,
             "_program_execution_busy_message": lambda: "busy",
+            "_program_execution_request_cancelled": (
+                lambda active_request: False
+            ),
             "_set_application_status": lambda *args: None,
             "_set_manual_auxiliary_status": (
                 lambda message, style: step_statuses.append((message, style))
@@ -13965,6 +14015,118 @@ class HmiSourceContractTests(unittest.TestCase):
             step_statuses,
             [("PROGRAM STEP FORWARD SETUP FAILED", "Alarm.TLabel")],
         )
+
+    def test_step_forward_setup_failures_dispatch_stop(self):
+        class ProgramView:
+            def __init__(self, selection, row_count):
+                self.selection = selection
+                self.row_count = row_count
+
+            def curselection(self):
+                return self.selection
+
+            def index(self, value):
+                return self.row_count
+
+            @staticmethod
+            def get(*args):
+                return ("row",)
+
+        cases = (
+            ("multiple", (0, 1), 2, "", 0),
+            ("empty-view", (), 0, "", 0),
+            ("out-of-range", (3,), 2, "", 0),
+            ("invalid-return", (), 2, "caller.ar4", True),
+            ("missing-loop", (), 2, "", 0),
+        )
+        for name, selection, row_count, last_program, last_row in cases:
+            with self.subTest(name=name):
+                request = object()
+                stops = []
+                finishes = []
+                statuses = []
+                namespace = {
+                    "tab1": SimpleNamespace(
+                        lastProg=last_program,
+                        lastRow=last_row,
+                        progView=ProgramView(selection, row_count),
+                    ),
+                    "logger": SimpleNamespace(
+                        warning=lambda *args: None,
+                        exception=lambda *args: None,
+                    ),
+                    "_begin_program_execution": lambda mode: request,
+                    "_program_execution_busy_message": lambda: "busy",
+                    "_program_execution_request_cancelled": (
+                        lambda active_request: False
+                    ),
+                    "_set_application_status": lambda *args: None,
+                    "_set_manual_auxiliary_status": (
+                        lambda message, style: statuses.append(
+                            (message, style)
+                        )
+                    ),
+                    "_program_row_index": (
+                        lambda rows, expected: (_ for _ in ()).throw(
+                            MotionInputError(
+                                "program-loop entry does not exist"
+                            )
+                        )
+                    ),
+                    "_abort_program_row_execution": lambda: None,
+                    "_finish_program_execution": (
+                        lambda active: finishes.append(active) or True
+                    ),
+                    "stopProg": lambda: stops.append(True),
+                }
+                step_forward = self.compile_function(
+                    "stepFwd",
+                    namespace,
+                )
+
+                self.assertFalse(step_forward())
+                self.assertEqual(stops, [True])
+                self.assertEqual(finishes, [request])
+                self.assertEqual(
+                    statuses,
+                    [
+                        (
+                            "PROGRAM STEP FORWARD SETUP FAILED",
+                            "Alarm.TLabel",
+                        )
+                    ],
+                )
+
+    def test_cancelled_step_forward_setup_does_not_publish_ready(self):
+        request = object()
+        finishes = []
+        ready_statuses = []
+        stops = []
+        namespace = {
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+            ),
+            "_begin_program_execution": lambda mode: request,
+            "_program_execution_busy_message": lambda: "busy",
+            "_program_execution_request_cancelled": (
+                lambda active_request: True
+            ),
+            "_abort_program_row_execution": lambda: None,
+            "_finish_program_execution": (
+                lambda active: finishes.append(active) or True
+            ),
+            "_set_application_status": (
+                lambda *args, **kwargs: ready_statuses.append((args, kwargs))
+            ),
+            "_set_manual_auxiliary_status": lambda *args: None,
+            "stopProg": lambda: stops.append(True),
+        }
+        step_forward = self.compile_function("stepFwd", namespace)
+
+        self.assertFalse(step_forward())
+        self.assertEqual(finishes, [request])
+        self.assertEqual(ready_statuses, [])
+        self.assertEqual(stops, [])
 
     def test_step_forward_selection_failure_dispatches_stop(self):
         class SelectionEvent:
@@ -17193,6 +17355,24 @@ class HmiSourceContractTests(unittest.TestCase):
             ["called-program", "called-program", "called-program"],
         )
         self.assertEqual(logged, [])
+
+        interrupted_navigation = namespace["CalledProgramNavigation"](
+            ProgramRequest(Boundary()),
+            "child.ar4",
+            (b"row\n",),
+            0,
+        )
+        namespace["_commit_called_program_navigation"] = (
+            lambda navigation: (_ for _ in ()).throw(
+                KeyboardInterrupt()
+            )
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            namespace["_settle_called_program_navigation"](
+                interrupted_navigation
+            )
+        with self.assertRaisesRegex(RuntimeError, "KeyboardInterrupt"):
+            interrupted_navigation.wait()
 
     def test_robot_program_view_replacement_rolls_back_atomically(self):
         style_options = self.module_literal(

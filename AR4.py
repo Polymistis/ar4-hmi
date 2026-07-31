@@ -7724,6 +7724,26 @@ def _main_port_selector_value(port):
   return port if port in port_choices else "None"
 
 
+def _startup_port_selector_values(calibration):
+  if not isinstance(calibration, dict):
+    raise TypeError("startup calibration must be a dictionary")
+  main_port = calibration.get('comPort')
+  auxiliary_port = calibration.get('com2Port')
+  if isinstance(main_port, str):
+    main_port = main_port.strip()
+  else:
+    main_port = "None"
+  if isinstance(auxiliary_port, str):
+    auxiliary_port = auxiliary_port.strip()
+  else:
+    auxiliary_port = "None"
+  if not main_port:
+    main_port = "None"
+  if auxiliary_port not in port_choices:
+    auxiliary_port = "None"
+  return _main_port_selector_value(main_port), auxiliary_port
+
+
 def setCom(misc=None):
   previous_main_port = CAL.get('comPort', "None")
   if isinstance(previous_main_port, str):
@@ -7818,7 +7838,8 @@ def _set_com_admitted(
   except SerialActivityRejected as exc:
     serial_lock.release()
     restore_port_selection()
-    message = f"Controller connection change rejected: {exc}"
+    detail = str(exc).strip() or type(exc).__name__
+    message = f"Controller connection change rejected: {detail}"
     logger.warning(message)
     _set_application_status(message, "Warn.TLabel")
     return False
@@ -10944,6 +10965,14 @@ def _settle_program_selection(event):
     event.settle(error=exc)
     logger.exception("Unable to apply a program selection event")
     return False
+  except BaseException as exc:
+    event.settle(
+      error=RuntimeError(
+        "program selection event aborted by "
+        f"{type(exc).__name__}"
+      )
+    )
+    raise
   event.settle(result=result)
   return True
 
@@ -14979,9 +15008,13 @@ def stepFwd():
       _set_manual_auxiliary_status(message, "Warn.TLabel")
       return False
 
+    if _program_execution_request_cancelled(execution_request):
+      _abort_program_row_execution()
+      _finish_program_execution(execution_request)
+      return False
+
     return_program = None
     try:
-      _set_application_status("SYSTEM READY", "OK.TLabel")
       selected_rows = tuple(tab1.progView.curselection())
       if len(selected_rows) > 1:
         raise RuntimeError("Step Forward requires at most one selected row")
@@ -15000,20 +15033,16 @@ def stepFwd():
         raise RuntimeError("Step Forward selection is out of range")
       if not selected_rows:
         if tab1.lastProg == "":
-          try:
-            index = _program_row_index(
-              tab1.progView.get(0, "end"),
-              "## START PROGRAM LOOP ##",
+          index = _program_row_index(
+            tab1.progView.get(0, "end"),
+            "## START PROGRAM LOOP ##",
+          )
+          tab1.progView.selection_clear(0, END)
+          tab1.progView.select_set(index)
+          if tuple(tab1.progView.curselection()) != (index,):
+            raise RuntimeError(
+              "Step Forward could not select the program-loop entry"
             )
-            tab1.progView.selection_clear(0, END)
-            tab1.progView.select_set(index)
-            if tuple(tab1.progView.curselection()) != (index,):
-              raise RuntimeError(
-                "Step Forward could not select the program-loop entry"
-              )
-          except Exception:
-            stopProg()
-            raise
         else:
           if (
             not isinstance(tab1.lastProg, str)
@@ -15028,7 +15057,19 @@ def stepFwd():
               "Step Forward caller return state is invalid"
             )
           return_program = (tab1.lastProg, tab1.lastRow + 1)
+      if _program_execution_request_cancelled(execution_request):
+        _abort_program_row_execution()
+        _finish_program_execution(execution_request)
+        return False
+      _set_application_status("SYSTEM READY", "OK.TLabel")
     except Exception:
+      try:
+        stopProg()
+      except Exception:
+        logger.exception(
+          "Unable to dispatch the auxiliary stop after Step Forward setup "
+          "failure"
+        )
       _abort_program_row_execution()
       _finish_program_execution(execution_request)
       logger.exception("Program step-forward setup failed")
@@ -23481,6 +23522,15 @@ def _settle_called_program_navigation(navigation):
     navigation.settle(False, exc)
     logger.exception("Unable to apply called-program navigation")
     return False
+  except BaseException as exc:
+    navigation.settle(
+      False,
+      RuntimeError(
+        "called-program navigation aborted by "
+        f"{type(exc).__name__}"
+      ),
+    )
+    raise
   navigation.settle(succeeded)
   return succeeded
 
@@ -31066,22 +31116,22 @@ commFrame.grid_columnconfigure(0, weight=1)
 def detect_ports():
   from serial.tools import list_ports
   ports = list(list_ports.comports())
-  choices = [p.device for p in ports]
-  choices.insert(0, "None")
-  saved_main_port = globals().get('CAL', {}).get('comPort')
-  saved_auxiliary_port = globals().get('CAL', {}).get('com2Port')
-  if isinstance(saved_main_port, str):
-    saved_main_port = saved_main_port.strip()
-  if isinstance(saved_auxiliary_port, str):
-    saved_auxiliary_port = saved_auxiliary_port.strip()
-  port1_default = (
-    saved_main_port if saved_main_port in choices else "None"
-  )
-  port2_default = (
-    saved_auxiliary_port if saved_auxiliary_port in choices else "None"
-  )
-  
-  return choices, port1_default, port2_default
+  choices = ["None"]
+  for index, port in enumerate(ports):
+    device = getattr(port, "device", None)
+    if (
+      not isinstance(device, str)
+      or not device
+      or device != device.strip()
+    ):
+      logger.warning(
+        "Ignoring invalid serial-port enumeration entry at index %s",
+        index,
+      )
+      continue
+    if device not in choices:
+      choices.append(device)
+  return choices, "None", "None"
 
 port_choices, default_comport1, default_comport2 = detect_ports()
 logger.debug(f"Available Comm Ports: {port_choices}")
@@ -34045,11 +34095,9 @@ apply_calibration(loaded_calibration, CAL)
 logger.debug(f"Comport 1 restored value is: {CAL['comPort']}")
 logger.debug(f"Comport 1 restored value is: {CAL['com2Port']}")
 
-if CAL['comPort'] in port_choices:
-  com1SelectedValue.set(CAL['comPort'])
-
-if CAL['com2Port'] in port_choices:
-  com2SelectedValue.set(CAL['com2Port'])
+saved_main_port, saved_auxiliary_port = _startup_port_selector_values(CAL)
+com1SelectedValue.set(saved_main_port)
+com2SelectedValue.set(saved_auxiliary_port)
 
 try:
   restored_auxiliary_board = normalize_auxiliary_board_profile(

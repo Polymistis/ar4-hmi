@@ -3,7 +3,6 @@
 from io import BytesIO
 import os
 import stat
-import warnings
 
 import cv2
 import numpy as np
@@ -108,15 +107,13 @@ def load_bounded_vision_image(filename, decode_mode, field_name):
         raise MotionInputError("image decode mode is unsupported")
     payload = _read_regular_image_bytes(filename, field_name)
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(BytesIO(payload)) as header:
-                header_width, header_height = _validated_image_dimensions(
-                    header.width,
-                    header.height,
-                    field_name,
-                )
-                header.verify()
+        with Image.open(BytesIO(payload)) as header:
+            header_width, header_height = _validated_image_dimensions(
+                header.width,
+                header.height,
+                field_name,
+            )
+            header.verify()
     except MotionInputError:
         raise
     except (

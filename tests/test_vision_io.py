@@ -33,7 +33,7 @@ class VisionIoTests(unittest.TestCase):
             )
 
         self.assertEqual(loaded.shape, source.shape)
-        np.testing.assert_array_equal(loaded[2, 3], source[2, 3], strict=False)
+        np.testing.assert_array_equal(loaded[2, 3], source[2, 3])
 
     def test_bounded_loader_uses_stored_geometry_for_exif_rotated_jpeg(self):
         with BoundedTemporaryDirectory() as directory:
