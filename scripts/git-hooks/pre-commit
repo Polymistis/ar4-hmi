@@ -819,7 +819,7 @@ run_backend() {
     # No staged change to infra. Require the wrapper + prompt to be
     # TRACKED in HEAD before running the working-tree copy. Without this
     # check, an untracked working-tree wrapper/prompt (e.g. just dropped
-    # in by bootstrap.ps1, never committed) would run as the gate with
+    # into the working tree but never committed) would run as the gate with
     # NO trusted baseline -- the user could ship arbitrary wrapper code
     # in untracked form and the gate would approve any commit using it.
     UNTRACKED_INFRA=""
@@ -844,7 +844,7 @@ run_backend() {
       echo "[pre-commit:$BACKEND_NAME] If you just installed the cross-review-gate package, stage" >&2
       echo "[pre-commit:$BACKEND_NAME] the wrapper + prompt files and do an initial bootstrap" >&2
       echo "[pre-commit:$BACKEND_NAME] commit with CROSS_REVIEW_SKIP=1:" >&2
-      echo "[pre-commit:$BACKEND_NAME]   git add scripts/codex scripts/claude scripts/git-hooks docs/audit-protocol.md .gitignore" >&2
+      echo "[pre-commit:$BACKEND_NAME]   git add AGENTS.md INSTALL.md bootstrap.ps1 scripts/codex scripts/claude scripts/git-hooks docs/audit-protocol.md .gitignore" >&2
       echo "[pre-commit:$BACKEND_NAME]   PowerShell: \$env:CROSS_REVIEW_SKIP = '1'; git commit ...; Remove-Item Env:CROSS_REVIEW_SKIP" >&2
       echo "[pre-commit:$BACKEND_NAME]   bash:       CROSS_REVIEW_SKIP=1 git commit -m 'cross-review-gate: install'" >&2
       echo "[pre-commit:$BACKEND_NAME] Then retry the current commit normally. Aborting." >&2

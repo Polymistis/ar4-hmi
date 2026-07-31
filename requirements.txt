@@ -1,5 +1,7 @@
 ttkthemes
 matplotlib
+numpy
+Pillow
 vtk
 pyserial
 opencv-python

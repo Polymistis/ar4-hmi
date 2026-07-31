@@ -240,7 +240,7 @@ def load_calibration(
             legacy_file = os.path.join(calibration_directory, "ARbot.cal")
             backup_file = os.path.join(
                 calibration_directory,
-                "Arbot.cal.bak",
+                "ARbot.cal.bak",
             )
             if os.path.exists(legacy_file):
                 logger.debug(
@@ -359,7 +359,7 @@ def _migrate_legacy_calibration_nulls(calibration_data):
 def convert_calibration(
     legacy_file="ARbot.cal",
     calibration_file="ARconfig.json",
-    backup_file="Arbot.cal.bak",
+    backup_file="ARbot.cal.bak",
 ) -> dict | None:
     ''' Convert old ARbot.cal pickle file to new dictionary format and save as ARconfig.json '''
     CAL = {}

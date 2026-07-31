@@ -31,7 +31,8 @@ This repository contains:
 |------------|-------------|
 | **Operating System** | Windows 10/11 ×64; Linux with a current native source build |
 | **Python** | 3.12 on Windows; matching local CPython on Linux |
-| **Libraries** | `tkinter`, `ttkbootstrap`, `pyserial`, `vtk`, `numpy`, `pandas`, `pybind11` |
+| **Runtime libraries** | Python `tkinter` plus the packages in `requirements.txt` |
+| **Native source build** | CMake, a compatible C++ compiler, and `ARrobots/src/requirements-build.txt` |
 | **Hardware** | Teensy 4.1 controller + AR4-MK3 robot |
 | **Linux** | sudo apt-get install wmctrl |
 
@@ -43,8 +44,11 @@ The repository provides a supported native binary for Windows CPython 3.12 x64. 
 ## ⚙️ Setup & Running from Source
 ```bash
 # Clone the repository
-git clone https://github.com/Annin-Robotics/ar4-hmi.git
+git clone https://github.com/Polymistis/ar4-hmi.git
 cd ar4-hmi
+
+# Install the per-clone cross-review dispatcher
+powershell -NoProfile -ExecutionPolicy Bypass -File bootstrap.ps1
 
 # (Optional) Create a virtual environment
 python -m venv venv

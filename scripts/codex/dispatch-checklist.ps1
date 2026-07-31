@@ -77,10 +77,10 @@
 [CmdletBinding()]
 param(
   [string]$ReviewsDir = 'logs/codex/reviews',
-  # Default under logs/ -- the same gitignored tree the review wrappers write to
-  # (bootstrap.ps1 adds `logs/` to the target repo's .gitignore). Keeping the
-  # generated checklist there means a fresh install does not create a tracked
-  # operational artifact. Override with -OutPath for a different location.
+  # Default under logs/ -- the tracked root .gitignore exclusion used by the
+  # review wrappers and validated by bootstrap.ps1 before dispatcher install.
+  # The generated checklist therefore remains local operational state.
+  # Override with -OutPath for a different location.
   [string]$OutPath = 'logs/dispatch-checklist.md',
   # Default 14 days: a dispatch checklist should reflect the RECENT arc, not
   # the full history (the analyzer covers full history). Negative values are

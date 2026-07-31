@@ -45,6 +45,9 @@ Claude backend:
   Claude merge-gate script is not needed)
 
 Shared:
+- `INSTALL.md` (fresh-clone setup, author routes, and environment controls)
+- `bootstrap.ps1` (fail-closed per-clone dispatcher installer)
+- `scripts/git-hooks/dispatcher` (HEAD-trusted per-clone dispatch template)
 - `scripts/git-hooks/pre-commit` (the trigger; routes by `REVIEW_BACKEND`)
 - `scripts/codex/commit.ps1` (Codex-as-implementer wrapper; defaults to `REVIEW_BACKEND=claude`, while first-position `-NoClaude` selects audit-logged `REVIEW_BACKEND=codex` after confirmed Claude usage-capacity exhaustion without skipping review)
 - `scripts/claude/commit.ps1` (cross-review wrapper used by Claude-as-implementer; sets `REVIEW_BACKEND=codex`)
@@ -209,6 +212,17 @@ Each audit run consumes:
    only output, dropping agent-authored prose as untrusted input). Run its
    `-SelfTest`; confirm its AGENTS.md row and validation-surface assumptions
    are intact.
+5d. **`INSTALL.md`, `bootstrap.ps1`, and
+   `scripts/git-hooks/dispatcher`** — the fresh-clone installation surface.
+   Confirm the installer obtains the dispatcher from the exact trusted `HEAD`
+   blob, treats byte-different installed hooks as conflicts, rejects dirty
+   templates, rejects configured `core.hooksPath`, and requires a trusted root
+   `.gitignore` that excludes `logs/` before any target-repository write.
+   Confirm dispatcher execution selects the trusted `HEAD` gate rather than the
+   working candidate, rejects a missing gate by default, and records every
+   permitted bootstrap or repair skip with the shared review-audit schema.
+   Run `bootstrap.ps1 -SelfTest` and keep installation guidance synchronized
+   with the executable checks.
 6. **`scripts/git-hooks/pre-commit`** — the trigger hook. It is the
    `REVIEW_BACKEND` router and must keep both backends' trusted-copy
    bootstrap branches working (Codex backend's `REVIEW_INFRA` set and
@@ -337,12 +351,14 @@ re-derive coverage and any count from the suite itself on a fixture add. The
 per-suite notes below capture only the DURABLE contracts (cross-suite invariants,
 opt-in env behavior), not an enumeration:
 - `powershell -NoProfile -ExecutionPolicy Bypass -File bootstrap.ps1 -SelfTest`
-  (installer. Covers the shared `core.hooksPath` classifier, git-config masking
-  env fail-closed behavior, root normalization when a subdir target is passed,
-  normal dispatcher install, legacy `scripts/git-hooks` migration, custom
-  hook-path fail-closed behavior, `-Force` custom-path warning/install, and the
-  set-empty `core.hooksPath=` guard. Child-process installs use throwaway repos
-  under TEMP and no reviewer backend.)
+  (repository-local dispatcher installer. Durable checks cover the shared
+  `core.hooksPath` classifier, Git-config environment isolation, top-level
+  normalization, trusted-template and `logs/`-ignore enforcement,
+  byte-identical idempotency, collision refusal, atomic `-Force` backup and
+  replacement, pre-write rejection, executable trusted-gate dispatch,
+  missing-gate rejection, shared skip-audit records, skip-audit failure
+  closure, and cleanup postconditions. Child-process installs use throwaway
+  repositories under TEMP and no reviewer backend.)
 - `powershell scripts\codex\auto-review.ps1 -Scope SelfTest`
   (Codex wrapper. Consistency-doc fixtures run the helper in isolation with its
   default doc name; the runtime consistency check is opt-in via
@@ -479,11 +495,13 @@ from HEAD and the review runs with the HEAD-trusted copies. So staged
 edits to either backend's wrapper or the shared prompt are reviewed
 against HEAD rather than self-approving.
 
-**`AGENTS.md`, `scripts/codex/auto-merge.ps1`,
-`scripts/codex/analyze-blocker-trends.ps1`, `scripts/codex/dispatch-checklist.ps1`,
-and `scripts/codex/author-lint.ps1`** are reviewed by the normal gate path
-(no trusted-copy bootstrap, since no backend's `REVIEW_INFRA` list includes
-them). The selected backend's wrapper still runs from HEAD in this case
+**`AGENTS.md`, `INSTALL.md`, `bootstrap.ps1`,
+`scripts/git-hooks/dispatcher`, `scripts/codex/auto-merge.ps1`,
+`scripts/codex/analyze-blocker-trends.ps1`,
+`scripts/codex/dispatch-checklist.ps1`, and
+`scripts/codex/author-lint.ps1`** are reviewed by the normal gate path (no
+trusted-copy bootstrap, since no backend's `REVIEW_INFRA` list includes these
+paths). The selected backend's wrapper still runs from HEAD in this case
 because the wrapper itself was not staged; normal review applies.
 
 **`scripts/git-hooks/pre-commit` edits run under HEAD's logic, not
@@ -522,8 +540,6 @@ tree. Sweep, at minimum:
   appears (`<id>-0000`, worker/branch handles, etc.).
 
 The package cannot know a consumer's tokens, so this stays a maintainer step.
-Files under `examples/` are intentionally project-flavored and are exempt —
-they ship as illustrations, not as the gate surface.
 
 ## Out of scope (do not do these in the audit)
 

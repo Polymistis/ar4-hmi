@@ -2,6 +2,7 @@ import ast
 import copy
 import ctypes
 from decimal import Decimal
+import inspect
 import json
 import os
 from pathlib import Path
@@ -931,7 +932,7 @@ class LegacyCalibrationConversionTests(unittest.TestCase):
         with BoundedTemporaryDirectory(prefix="ar4-legacy-convert-") as directory:
             legacy_path = Path(directory) / "ARbot.cal"
             calibration_path = Path(directory) / "ARconfig.json"
-            backup_path = Path(directory) / "Arbot.cal.bak"
+            backup_path = Path(directory) / "ARbot.cal.bak"
             legacy_values = list(self.legacy_values)
             legacy_values[53] = None
             legacy_path.write_bytes(pickle.dumps(legacy_values))
@@ -963,7 +964,7 @@ class LegacyCalibrationConversionTests(unittest.TestCase):
         with BoundedTemporaryDirectory(prefix="ar4-legacy-null-") as directory:
             legacy_path = Path(directory) / "ARbot.cal"
             calibration_path = Path(directory) / "ARconfig.json"
-            backup_path = Path(directory) / "Arbot.cal.bak"
+            backup_path = Path(directory) / "ARbot.cal.bak"
             legacy_values = list(self.legacy_values)
             for index in (12, 53, 14, 15, 16, 17, 18, 19, 20, 21):
                 legacy_values[index] = None
@@ -998,7 +999,7 @@ class LegacyCalibrationConversionTests(unittest.TestCase):
         with BoundedTemporaryDirectory(prefix="ar4-legacy-null-") as directory:
             legacy_path = Path(directory) / "ARbot.cal"
             calibration_path = Path(directory) / "ARconfig.json"
-            backup_path = Path(directory) / "Arbot.cal.bak"
+            backup_path = Path(directory) / "ARbot.cal.bak"
             legacy_values = list(self.legacy_values)
             legacy_values[13] = None
             legacy_path.write_bytes(pickle.dumps(legacy_values))
@@ -1019,7 +1020,7 @@ class LegacyCalibrationConversionTests(unittest.TestCase):
         with BoundedTemporaryDirectory(prefix="ar4-legacy-board-") as directory:
             legacy_path = Path(directory) / "ARbot.cal"
             calibration_path = Path(directory) / "ARconfig.json"
-            backup_path = Path(directory) / "Arbot.cal.bak"
+            backup_path = Path(directory) / "ARbot.cal.bak"
             legacy_values = list(self.legacy_values)
             legacy_values[18] = "8"
             legacy_path.write_bytes(pickle.dumps(legacy_values))
@@ -1038,7 +1039,7 @@ class LegacyCalibrationConversionTests(unittest.TestCase):
         with BoundedTemporaryDirectory(prefix="ar4-custom-legacy-") as directory:
             legacy_path = Path(directory) / "ARbot.cal"
             calibration_path = Path(directory) / "custom-runtime.json"
-            backup_path = Path(directory) / "Arbot.cal.bak"
+            backup_path = Path(directory) / "ARbot.cal.bak"
             legacy_values = list(self.legacy_values)
             legacy_values[18] = "8"
             legacy_path.write_bytes(pickle.dumps(legacy_values))
@@ -1054,11 +1055,18 @@ class LegacyCalibrationConversionTests(unittest.TestCase):
             self.assertFalse(legacy_path.exists())
             self.assertTrue(backup_path.exists())
 
+    def test_legacy_conversion_default_backup_matches_source_name_case(self):
+        backup_default = inspect.signature(
+            convert_calibration
+        ).parameters["backup_file"].default
+
+        self.assertEqual(backup_default, "ARbot.cal.bak")
+
     def test_backup_failure_does_not_misreport_committed_conversion(self):
         with BoundedTemporaryDirectory(prefix="ar4-legacy-backup-") as directory:
             legacy_path = Path(directory) / "ARbot.cal"
             calibration_path = Path(directory) / "ARconfig.json"
-            backup_path = Path(directory) / "Arbot.cal.bak"
+            backup_path = Path(directory) / "ARbot.cal.bak"
             legacy_path.write_bytes(pickle.dumps(self.legacy_values))
 
             with (

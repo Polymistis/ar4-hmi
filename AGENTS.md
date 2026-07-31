@@ -96,6 +96,9 @@
 
 | Path | Contract |
 | --- | --- |
+| `INSTALL.md` | Fresh-clone dispatcher setup, reviewer routes, and optional environment controls. |
+| `bootstrap.ps1` | Repository-local, fail-closed per-clone dispatcher installer. |
+| `scripts/git-hooks/dispatcher` | Tracked template copied into `.git/hooks/pre-commit` only after matching the trusted `HEAD` object. |
 | `scripts/codex/auto-review.ps1` | Isolated Codex review wrapper. |
 | `scripts/claude/auto-review.ps1` | Isolated Claude review wrapper. |
 | `scripts/codex/commit.ps1` | Codex-author commit route to Claude review by default; first-position `-NoClaude` routes to audit-logged Codex review after confirmed Claude usage-capacity exhaustion without bypassing the gate. |

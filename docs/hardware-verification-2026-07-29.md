@@ -26,8 +26,10 @@ this drive-off procedure, and no powered emergency-stop behavior is inferred.
   `USB\VID_16C0&PID_0483&MI_00`.
 - Controller hardware identity reported by firmware: `1705B6`.
 - Tracked source:
-  `ArduinoSketches/AR4_teensy41_sketch_v6.7.1` at Git commit
-  `d845471ce4767c0ec75a7fdf253bd1073c658b7b`.
+  `ArduinoSketches/AR4_teensy41_sketch_v6.7.1` at Git tree
+  `05dca406d98c4c8e0d246cd3517e35bf2dc7cc07`. The tree is reachable from
+  the uniquely titled `test: bind shutdown firmware protocol routing` commit,
+  dated `2026-07-28`, in both the original and publication histories.
 - Self-reported firmware identity: `6.7.1-ar4hmi.5`.
 - Auxiliary controller: not connected or queried.
 - HMI configuration profile: not loaded.
@@ -92,7 +94,18 @@ The drive-off upload command completed successfully, and read-only
 communication passed with Teensy 4.1 hardware identity `1705B6`. After
 re-enumeration, the controller advertised expected version
 `6.7.1-ar4hmi.5` and the required protocol capabilities. Those observations do
-not cryptographically bind the running binary to the cited Git commit or a
+not cryptographically bind the running binary to the cited Git source tree or a
 particular local build artifact. No motor, telemetry-cadence, encoder-accuracy,
 USB-load, terminal-priority, pulse-timing, homing, or named-position behavior
 was exercised. M4A7 powered telemetry verification therefore remains pending.
+
+## Publication-history amendment — 2026-07-31
+
+The original record identified development-history commit
+`d845471ce4767c0ec75a7fdf253bd1073c658b7b`. Publication reparented the
+unchanged commit sequence onto the official upstream fork point, producing
+publication-history commit `07399f21e015859ca092cd8992132b4c965464d8` for
+the same uniquely titled change. Both commits contain firmware-directory tree
+`05dca406d98c4c8e0d246cd3517e35bf2dc7cc07`, now used above as the durable
+source identifier. No hardware observation or procedure was changed by this
+provenance amendment.
