@@ -42,13 +42,15 @@ The repository provides a supported native binary for Windows CPython 3.12 x64. 
 ---
 
 ## ⚙️ Setup & Running from Source
+
+Application runtime does not require the cross-review dispatcher. Contributors
+using the repository review workflow should complete
+[`INSTALL.md`](INSTALL.md).
+
 ```bash
 # Clone the repository
 git clone https://github.com/Polymistis/ar4-hmi.git
 cd ar4-hmi
-
-# Install the per-clone cross-review dispatcher
-powershell -NoProfile -ExecutionPolicy Bypass -File bootstrap.ps1
 
 # (Optional) Create a virtual environment
 python -m venv venv

@@ -652,21 +652,9 @@ if ($SelfTest) {
   # Review-log fixtures from the bootstrap/core.hooksPath audit. These
   # are review-system infrastructure even when the finding is reported
   # against INSTALL.md rather than a scripts/ path.
-  $bootstrapPath = [System.IO.Path]::GetFullPath(
-    (Join-Path $PSScriptRoot '..\..\bootstrap.ps1')
-  )
-  $bootstrapGuardMatches = @(
-    Select-String `
-      -LiteralPath $bootstrapPath `
-      -SimpleMatch `
-      -Pattern 'core.hooksPath is set to'
-  )
-  if ($bootstrapGuardMatches.Count -ne 1) {
-    throw 'A27 self-test could not resolve the bootstrap core.hooksPath guard'
-  }
+  # The citation below is synthetic classifier input, not a live source claim.
   Assert-Archetype 'A27: WORKFLOW-INFRA (bootstrap.ps1 path)' `
-    ("bootstrap.ps1:$($bootstrapGuardMatches[0].LineNumber) - Legacy " +
-      '`core.hooksPath` unset can reveal a lower-precedence hook path and still report install success') 'WORKFLOW-INFRA'
+    'bootstrap.ps1:1 - Synthetic installer workflow finding' 'WORKFLOW-INFRA'
   Assert-Archetype 'A28: WORKFLOW-INFRA (core.hooksPath doc drift)' `
     "INSTALL.md:54 - bootstrap's core.hooksPath handling is described as only legacy cleanup" 'WORKFLOW-INFRA'
   # A29-A34 pin the remaining WORKFLOW-INFRA keyword patterns so a future

@@ -103,6 +103,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\codex\author-lint.
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\codex\auto-review.ps1 -Scope SelfTest
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\claude\auto-review.ps1 -Scope SelfTest
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\codex\auto-merge.ps1 -SelfTest
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\codex\commit.ps1 --self-test
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\claude\commit.ps1 --self-test
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\codex\analyze-blocker-trends.ps1 -SelfTest
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\codex\dispatch-checklist.ps1 -SelfTest
 ```
