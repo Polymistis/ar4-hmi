@@ -690,27 +690,32 @@ function New-SelfTestRepository {
 }
 
 function Invoke-BootstrapChild {
+  [CmdletBinding(DefaultParameterSetName = 'ExplicitTarget')]
   param(
     [Parameter(Mandatory = $true)][string]$Repository,
+    [Parameter(ParameterSetName = 'ExplicitTarget')]
     [switch]$ChildForce,
+    [Parameter(Mandatory = $true, ParameterSetName = 'OmittedTarget')]
     [switch]$OmitTargetRepo,
+    [Parameter(Mandatory = $true, ParameterSetName = 'EmptyTarget')]
     [switch]$EmptyTargetRepo
   )
 
-  if ($OmitTargetRepo -and $EmptyTargetRepo) {
-    throw 'self-test child target mode is ambiguous'
-  }
   $childScriptPath = $PSCommandPath
+  if ($OmitTargetRepo -or $EmptyTargetRepo) {
+    $copiedBootstrapPath = Join-Path $Repository 'bootstrap.ps1'
+    [System.IO.File]::Copy($PSCommandPath, $copiedBootstrapPath)
+  }
   if ($OmitTargetRepo) {
-    $childScriptPath = Join-Path $Repository 'bootstrap.ps1'
-    [System.IO.File]::Copy($PSCommandPath, $childScriptPath)
+    $childScriptPath = $copiedBootstrapPath
   } elseif ($EmptyTargetRepo) {
     $childScriptPath = Join-Path $Repository 'bootstrap-empty-target-runner.ps1'
-    $quotedBootstrapPath = $PSCommandPath.Replace("'", "''")
-    $forceArgument = if ($ChildForce) { ' -Force' } else { '' }
+    $quotedBootstrapPath = $copiedBootstrapPath.Replace("'", "''")
+    # Windows PowerShell drops an empty native -File argument, so a scratch
+    # runner preserves the public empty-string binding without touching this clone.
     Write-Utf8WithoutBom `
       -Path $childScriptPath `
-      -Content "& '$quotedBootstrapPath' -TargetRepo ''$forceArgument`n"
+      -Content "& '$quotedBootstrapPath' -TargetRepo ''`n"
   }
   $arguments = @(
     '-NoProfile',
@@ -719,11 +724,11 @@ function Invoke-BootstrapChild {
     '-File',
     $childScriptPath
   )
-  if (-not $OmitTargetRepo -and -not $EmptyTargetRepo) {
+  if ($PSCmdlet.ParameterSetName -ceq 'ExplicitTarget') {
     $arguments += @('-TargetRepo', $Repository)
-  }
-  if ($ChildForce -and -not $EmptyTargetRepo) {
-    $arguments += '-Force'
+    if ($ChildForce) {
+      $arguments += '-Force'
+    }
   }
   $savedErrorActionPreference = $ErrorActionPreference
   try {
@@ -962,15 +967,18 @@ function Invoke-BootstrapSelfTest {
       -Repository $emptyTarget `
       -EmptyTargetRepo
     $emptyTargetHook = Join-Path $emptyTarget '.git/hooks/pre-commit'
+    $emptyTargetDiagnostic = (
+      $emptyTargetResult.Text -replace '\s+', ' '
+    ).Trim()
     Assert-SelfTest `
       -Name 'explicit empty TargetRepo fails at repository validation' `
       -Condition (
         $emptyTargetResult.ExitCode -ne 0 -and
-        $emptyTargetResult.Text -match
+        $emptyTargetDiagnostic -cmatch
           'bootstrap\.ps1: TargetRepo must not be empty' -and
         -not (Test-Path -LiteralPath $emptyTargetHook)
       ) `
-      -Detail $emptyTargetResult.Text
+      -Detail $emptyTargetDiagnostic
 
     $normalResult = Invoke-BootstrapChild -Repository $normal
     $normalHook = Get-DispatcherPath -Repository $normal
