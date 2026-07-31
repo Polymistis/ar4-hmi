@@ -14144,7 +14144,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 if self.failure == "selection":
                     raise RuntimeError("selection unavailable")
 
-        for failure in ("read", "selection"):
+        for failure in ("read", "selection", "mismatch"):
             with self.subTest(failure=failure):
                 request = object()
                 stops = []
@@ -14195,6 +14195,99 @@ class HmiSourceContractTests(unittest.TestCase):
                         )
                     ],
                 )
+
+    def test_step_forward_missing_loop_guard_failures_settle_request(self):
+        class ProgramView:
+            @staticmethod
+            def curselection():
+                return ()
+
+            @staticmethod
+            def index(value):
+                return 1
+
+            @staticmethod
+            def get(*args):
+                return ("row",)
+
+        for failure in ("status", "stop"):
+            with self.subTest(failure=failure):
+                request = object()
+                aborts = []
+                finishes = []
+                log_messages = []
+                status_calls = []
+                stop_attempts = []
+                status_reserved = {"value": False}
+
+                def present_status(message, style):
+                    status_calls.append((message, style))
+                    if failure == "status" and not status_reserved["value"]:
+                        raise RuntimeError("status unavailable")
+                    return not status_reserved["value"]
+
+                def stop_program():
+                    stop_attempts.append(True)
+                    if failure == "stop":
+                        raise RuntimeError("stop unavailable")
+                    status_reserved["value"] = True
+
+                namespace = {
+                    "tab1": SimpleNamespace(
+                        lastProg="",
+                        progView=ProgramView(),
+                    ),
+                    "logger": SimpleNamespace(
+                        warning=lambda *args: None,
+                        exception=lambda message, *args: log_messages.append(
+                            message
+                        ),
+                    ),
+                    "_begin_program_execution": lambda mode: request,
+                    "_program_execution_busy_message": lambda: "busy",
+                    "_program_execution_request_cancelled": (
+                        lambda active_request: False
+                    ),
+                    "_set_application_status": lambda *args: None,
+                    "_set_manual_auxiliary_status": present_status,
+                    "_program_row_index": (
+                        lambda rows, expected: (_ for _ in ()).throw(
+                            MotionInputError(
+                                "program-loop entry does not exist"
+                            )
+                        )
+                    ),
+                    "_abort_program_row_execution": (
+                        lambda: aborts.append(True)
+                    ),
+                    "_finish_program_execution": (
+                        lambda active: finishes.append(active) or True
+                    ),
+                    "stopProg": stop_program,
+                }
+                step_forward = self.compile_function(
+                    "stepFwd",
+                    namespace,
+                )
+
+                self.assertFalse(step_forward())
+                self.assertEqual(aborts, [True])
+                self.assertEqual(finishes, [request])
+                self.assertEqual(stop_attempts, [True])
+                self.assertEqual(len(status_calls), 1)
+                if failure == "status":
+                    self.assertIn(
+                        "Unable to publish the Step Forward setup failure",
+                        log_messages,
+                    )
+                else:
+                    self.assertIn(
+                        (
+                            "Unable to dispatch the auxiliary stop after "
+                            "Step Forward loop-marker lookup failure"
+                        ),
+                        log_messages,
+                    )
 
     def test_cancelled_step_forward_setup_does_not_publish_ready(self):
         for name, cancellation_states in (
@@ -17890,6 +17983,13 @@ class HmiSourceContractTests(unittest.TestCase):
             "posOutreach": False,
             "progRunning": False,
         }
+        worker_stop_calls = []
+
+        def stop_program():
+            worker_stop_calls.append(True)
+            runtime["programStopStatusLatched"] = True
+            tab.runTrue = 0
+
         namespace.update(
             {
                 "RUN": runtime,
@@ -17908,6 +18008,7 @@ class HmiSourceContractTests(unittest.TestCase):
                     Thread=CapturedThread,
                 ),
                 "_set_program_stop_status": lambda state: True,
+                "stopProg": stop_program,
             }
         )
         namespace["_manual_auxiliary_status_reserved"] = lambda: bool(
@@ -17966,10 +18067,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(runtime["progRunning"])
         self.assertEqual(runtime["rowinproc"], 0)
         self.assertFalse(execution_active())
-        self.assertEqual(
-            namespace["program_stop_status_event_queue"].get_nowait(),
-            ("PROGRAM EXECUTION FAILED", "Alarm.TLabel", False),
-        )
+        self.assertEqual(worker_stop_calls, [True])
+        self.assertTrue(runtime["programStopStatusLatched"])
+        self.assertTrue(namespace["program_stop_status_event_queue"].empty())
+        runtime["programStopStatusLatched"] = False
 
         runtime["programStopRequestId"] = 7
         self.assertFalse(run_program())
@@ -18002,10 +18103,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(runtime["progRunning"])
         self.assertEqual(runtime["rowinproc"], 0)
         self.assertFalse(execution_active())
-        self.assertEqual(
-            namespace["program_stop_status_event_queue"].get_nowait(),
-            ("PROGRAM STEP FORWARD FAILED", "Alarm.TLabel", False),
-        )
+        self.assertEqual(worker_stop_calls, [True, True])
+        self.assertTrue(runtime["programStopStatusLatched"])
+        self.assertTrue(namespace["program_stop_status_event_queue"].empty())
+        runtime["programStopStatusLatched"] = False
 
         callbacks = []
         completions = []

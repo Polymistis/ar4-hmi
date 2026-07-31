@@ -402,14 +402,15 @@ Implemented portion:
   state. Run initialization, pre-row selection preparation, and completed-row
   advancement use request-scoped worker-to-Tk events; shutdown or cancellation
   declines pending transitions without publishing a false program failure.
-  A Run selection-transition failure, a completed-row transition error, or a
-  missing Step Forward loop marker aborts row state, requests the program stop
-  path, and publishes a program alarm instead of silently replaying a completed
-  row. Other Step Forward pre-execution view and selection-validation errors
-  alarm without dispatching a transport stop. Step Forward clears the selection
-  at end of program so the existing loop or caller-return path handles the next
-  step. Styling and current-row display failures remain diagnostic-only after
-  the selection commits.
+  A Run selection-transition failure or completed-row transition error aborts
+  row state and requests the program stop path instead of silently replaying a
+  completed row; the authoritative stop message owns the status line. A missing
+  Step Forward loop marker publishes a setup alarm before requesting that stop
+  path. All other Step Forward pre-execution setup errors alarm without
+  dispatching a transport stop. Step Forward clears the selection at end of
+  program so the existing loop or caller-return path handles the next step.
+  Styling and current-row display failures remain diagnostic-only after the
+  selection commits.
 - Vision template matching and preview loading read one bounded regular-file
   image, validate encoded size and header dimensions before OpenCV decode, and
   verify decoded dimensions against the admitted header. Preview formatting

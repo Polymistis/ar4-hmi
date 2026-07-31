@@ -15008,6 +15008,24 @@ def stepFwd():
       _set_manual_auxiliary_status(message, "Warn.TLabel")
       return False
 
+    setup_failure_publish_attempted = False
+
+    def publish_setup_failure():
+      nonlocal setup_failure_publish_attempted
+      if setup_failure_publish_attempted:
+        return False
+      setup_failure_publish_attempted = True
+      try:
+        return _set_manual_auxiliary_status(
+          "PROGRAM STEP FORWARD SETUP FAILED",
+          "Alarm.TLabel",
+        )
+      except Exception:
+        logger.exception(
+          "Unable to publish the Step Forward setup failure"
+        )
+        return False
+
     if _program_execution_request_cancelled(execution_request):
       _abort_program_row_execution()
       _finish_program_execution(execution_request)
@@ -15040,15 +15058,7 @@ def stepFwd():
               "## START PROGRAM LOOP ##",
             )
           except Exception:
-            try:
-              _set_manual_auxiliary_status(
-                "PROGRAM STEP FORWARD SETUP FAILED",
-                "Alarm.TLabel",
-              )
-            except Exception:
-              logger.exception(
-                "Unable to publish the Step Forward setup failure"
-              )
+            publish_setup_failure()
             try:
               stopProg()
             except Exception:
@@ -15086,10 +15096,7 @@ def stepFwd():
       _abort_program_row_execution()
       _finish_program_execution(execution_request)
       logger.exception("Program step-forward setup failed")
-      _set_manual_auxiliary_status(
-        "PROGRAM STEP FORWARD SETUP FAILED",
-        "Alarm.TLabel",
-      )
+      publish_setup_failure()
       return False
 
     def threadProg():
