@@ -17,7 +17,7 @@
 [CmdletBinding(DefaultParameterSetName = 'Install')]
 param(
   [Parameter(ParameterSetName = 'Install')]
-  [string]$TargetRepo = $PSScriptRoot,
+  [string]$TargetRepo,
 
   [Parameter(ParameterSetName = 'Install')]
   [switch]$Force,
@@ -28,6 +28,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$targetRepoExplicit = $PSBoundParameters.ContainsKey('TargetRepo')
+$scriptInvocationPath = $MyInvocation.MyCommand.Path
 
 $script:GitConfigEnvironmentNames = @(
   'GIT_CONFIG',
@@ -46,6 +48,39 @@ function Resolve-HooksPathGuard {
   if ($ExitCode -eq 1) { return 'proceed' }
   if ($ExitCode -eq 0) { return 'abort-set' }
   return 'abort-indeterminate'
+}
+
+# Windows PowerShell can expose an empty script root during parameter-default
+# evaluation. Resolve after binding and recover from the invocation path before
+# failing, matching the established native-build script boundary.
+function Resolve-TargetRepositoryCandidate {
+  param(
+    [AllowNull()][AllowEmptyString()][string]$Candidate,
+    [Parameter(Mandatory = $true)][bool]$Explicit,
+    [Parameter(Mandatory = $true)]
+    [AllowNull()]
+    [AllowEmptyString()]
+    [string]$ScriptRoot,
+    [Parameter(Mandatory = $true)]
+    [AllowNull()]
+    [AllowEmptyString()]
+    [string]$ScriptPath
+  )
+
+  if ($Explicit) {
+    return $Candidate
+  }
+  $resolvedRoot = $ScriptRoot
+  if (
+    [string]::IsNullOrWhiteSpace($resolvedRoot) -and
+    -not [string]::IsNullOrWhiteSpace($ScriptPath)
+  ) {
+    $resolvedRoot = Split-Path -Parent $ScriptPath
+  }
+  if ([string]::IsNullOrWhiteSpace($resolvedRoot)) {
+    throw 'bootstrap.ps1: script root is unavailable for the default target'
+  }
+  return $resolvedRoot
 }
 
 function Invoke-WithGitConfigEnvironmentScrub {
@@ -219,7 +254,12 @@ function Get-GitSingleLine {
 }
 
 function Resolve-RepositoryRoot {
-  param([Parameter(Mandatory = $true)][string]$Candidate)
+  param(
+    [Parameter(Mandatory = $true)]
+    [AllowNull()]
+    [AllowEmptyString()]
+    [string]$Candidate
+  )
 
   if ([string]::IsNullOrWhiteSpace($Candidate)) {
     throw 'bootstrap.ps1: TargetRepo must not be empty'
@@ -413,7 +453,10 @@ function Export-TrustedHeadBlob {
 
 function Install-Dispatcher {
   param(
-    [Parameter(Mandatory = $true)][string]$RepositoryCandidate,
+    [Parameter(Mandatory = $true)]
+    [AllowNull()]
+    [AllowEmptyString()]
+    [string]$RepositoryCandidate,
     [Parameter(Mandatory = $true)][bool]$AllowReplacement
   )
 
@@ -649,18 +692,25 @@ function New-SelfTestRepository {
 function Invoke-BootstrapChild {
   param(
     [Parameter(Mandatory = $true)][string]$Repository,
-    [switch]$ChildForce
+    [switch]$ChildForce,
+    [switch]$OmitTargetRepo
   )
 
+  $childScriptPath = $PSCommandPath
+  if ($OmitTargetRepo) {
+    $childScriptPath = Join-Path $Repository 'bootstrap.ps1'
+    [System.IO.File]::Copy($PSCommandPath, $childScriptPath)
+  }
   $arguments = @(
     '-NoProfile',
     '-ExecutionPolicy',
     'Bypass',
     '-File',
-    $PSCommandPath,
-    '-TargetRepo',
-    $Repository
+    $childScriptPath
   )
+  if (-not $OmitTargetRepo) {
+    $arguments += @('-TargetRepo', $Repository)
+  }
   if ($ChildForce) {
     $arguments += '-Force'
   }
@@ -752,6 +802,71 @@ function Invoke-BootstrapSelfTest {
     Assert-SelfTest `
       -Name 'indeterminate core.hooksPath classification' `
       -Condition ((Resolve-HooksPathGuard -ExitCode 2) -eq 'abort-indeterminate')
+    Assert-SelfTest `
+      -Name 'default target uses an available script root' `
+      -Condition (
+        (Resolve-TargetRepositoryCandidate `
+          -Candidate '' `
+          -Explicit $false `
+          -ScriptRoot $PSScriptRoot `
+          -ScriptPath $PSCommandPath) -ceq $PSScriptRoot
+      )
+    $fallbackScriptPath = Join-Path $scratchRoot 'fallback/bootstrap.ps1'
+    $fallbackScriptRoot = Split-Path -Parent $fallbackScriptPath
+    Assert-SelfTest `
+      -Name 'default target recovers from the invocation path' `
+      -Condition (
+        (Resolve-TargetRepositoryCandidate `
+          -Candidate '' `
+          -Explicit $false `
+          -ScriptRoot '' `
+          -ScriptPath $fallbackScriptPath) -ceq $fallbackScriptRoot
+      )
+    Assert-SelfTest `
+      -Name 'explicit TargetRepo remains authoritative' `
+      -Condition (
+        (Resolve-TargetRepositoryCandidate `
+          -Candidate 'explicit-target' `
+          -Explicit $true `
+          -ScriptRoot '' `
+          -ScriptPath '') -ceq 'explicit-target'
+      )
+    $unresolvedTargetRejected = $false
+    $unresolvedTargetMessage = ''
+    try {
+      Resolve-TargetRepositoryCandidate `
+        -Candidate '' `
+        -Explicit $false `
+        -ScriptRoot '' `
+        -ScriptPath '' |
+        Out-Null
+    } catch {
+      $unresolvedTargetRejected = $true
+      $unresolvedTargetMessage = $_.Exception.Message
+    }
+    Assert-SelfTest `
+      -Name 'unavailable script location uses the authored diagnostic' `
+      -Condition (
+        $unresolvedTargetRejected -and
+        $unresolvedTargetMessage -ceq
+          'bootstrap.ps1: script root is unavailable for the default target'
+      ) `
+      -Detail $unresolvedTargetMessage
+    $emptyTargetRejected = $false
+    $emptyTargetMessage = ''
+    try {
+      Resolve-RepositoryRoot -Candidate '' | Out-Null
+    } catch {
+      $emptyTargetRejected = $true
+      $emptyTargetMessage = $_.Exception.Message
+    }
+    Assert-SelfTest `
+      -Name 'explicit empty TargetRepo reaches repository boundary validation' `
+      -Condition (
+        $emptyTargetRejected -and
+        $emptyTargetMessage -ceq 'bootstrap.ps1: TargetRepo must not be empty'
+      ) `
+      -Detail $emptyTargetMessage
 
     $environmentProbeName = 'GIT_CONFIG_GLOBAL'
     $environmentProbeValue = Join-Path $scratchRoot 'probe-global-config'
@@ -827,6 +942,23 @@ function Invoke-BootstrapSelfTest {
         $warningValue -ceq 'single-value'
       ) `
       -Detail $warningResult.DiagnosticText
+
+    $defaultTarget = New-SelfTestRepository `
+      -Root $scratchRoot `
+      -Name 'default-target'
+    $defaultTargetResult = Invoke-BootstrapChild `
+      -Repository $defaultTarget `
+      -OmitTargetRepo
+    $defaultTargetHook = Get-DispatcherPath -Repository $defaultTarget
+    Assert-SelfTest `
+      -Name 'primary install command resolves the copied script repository' `
+      -Condition (
+        $defaultTargetResult.ExitCode -eq 0 -and
+        (Test-FilesEqual `
+          -First (Join-Path $defaultTarget 'scripts/git-hooks/dispatcher') `
+          -Second $defaultTargetHook)
+      ) `
+      -Detail $defaultTargetResult.Text
 
     $normalResult = Invoke-BootstrapChild -Repository $normal
     $normalHook = Get-DispatcherPath -Repository $normal
@@ -1168,8 +1300,13 @@ try {
     if ($SelfTest) {
       Invoke-BootstrapSelfTest
     } else {
+      $effectiveTargetRepo = Resolve-TargetRepositoryCandidate `
+        -Candidate $TargetRepo `
+        -Explicit $targetRepoExplicit `
+        -ScriptRoot $PSScriptRoot `
+        -ScriptPath $scriptInvocationPath
       Install-Dispatcher `
-        -RepositoryCandidate $TargetRepo `
+        -RepositoryCandidate $effectiveTargetRepo `
         -AllowReplacement ([bool]$Force)
     }
   }

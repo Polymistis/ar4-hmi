@@ -141,6 +141,7 @@ from ARrobots.calibration_schema import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 AR4_SOURCE = PROJECT_ROOT / "AR4.py"
+BOOTSTRAP_SOURCE = PROJECT_ROOT / "bootstrap.ps1"
 HOME_PROGRAM_SOURCE = PROJECT_ROOT / "Home.ar4"
 CALIBRATION_SOURCE = PROJECT_ROOT / "ARrobots" / "Calibration.py"
 NATIVE_KINEMATICS_SOURCE = PROJECT_ROOT / "ARrobots" / "src" / "kinematics.cpp"
@@ -29161,6 +29162,27 @@ class HmiSourceContractTests(unittest.TestCase):
             '$BuildDirectory = Join-Path $sourceDirectory "build-windows-x64"'
         )
         self.assertLess(source_directory, default_directory)
+
+    def test_bootstrap_default_target_resolves_inside_install_boundary(self):
+        source = BOOTSTRAP_SOURCE.read_text(encoding="utf-8")
+        parameter_end = source.index(")\n\nSet-StrictMode")
+        main_try = source.rindex("\ntry {\n")
+        install_branch = source.index("    } else {\n", main_try)
+        target_resolution = source.index(
+            "$effectiveTargetRepo = Resolve-TargetRepositoryCandidate",
+            install_branch,
+        )
+        install_call = source.index("      Install-Dispatcher", target_resolution)
+
+        self.assertNotIn("$PSScriptRoot", source[:parameter_end])
+        self.assertIn(
+            "$scriptInvocationPath = $MyInvocation.MyCommand.Path",
+            source,
+        )
+        self.assertIn("-ScriptPath $scriptInvocationPath", source)
+        self.assertLess(main_try, target_resolution)
+        self.assertLess(install_branch, target_resolution)
+        self.assertLess(target_resolution, install_call)
 
     def test_controller_identity_probe_matches_firmware_opcode(self):
         firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
