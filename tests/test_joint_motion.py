@@ -12,7 +12,11 @@ from ARrobots.HMI.joint_motion import (
     AUXILIARY_BOARD_MEGA,
     AUXILIARY_BOARD_NANO,
     AUXILIARY_BOARD_NONE,
+    AUXILIARY_BOARD_INPUT_PINS,
     AUXILIARY_BOARD_OUTPUT_PINS,
+    AUXILIARY_BOARD_SERVO_CHANNELS,
+    AUXILIARY_CURRENT_MAXIMUM_AMPS,
+    AUXILIARY_WAIT_MAXIMUM_SECONDS,
     CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
@@ -75,7 +79,10 @@ from ARrobots.HMI.joint_motion import (
     motion_timing_response_timeout,
     normalize_auxiliary_board_profile,
     parse_auxiliary_output_command,
+    parse_auxiliary_gripper_current_response,
+    parse_auxiliary_input_command,
     parse_auxiliary_servo_command,
+    parse_auxiliary_wait_command,
     parse_command_speed,
     parse_command_timing,
     parse_controller_identity_response,
@@ -104,7 +111,10 @@ from ARrobots.HMI.joint_motion import (
     serial_transport_quarantined,
     validate_controller_filename,
     validate_auxiliary_output_command,
+    validate_auxiliary_gripper_current_command,
+    validate_auxiliary_input_command,
     validate_auxiliary_servo_command,
+    validate_auxiliary_wait_command,
     validate_controller_modbus_command,
     write_serial_control,
 )
@@ -387,25 +397,48 @@ class AuxiliaryBoardProfileTests(unittest.TestCase):
                         AUXILIARY_BOARD_NANO,
                     )
 
-    def test_servo_validation_accepts_supported_channels_and_positions(self):
-        for channel in range(7):
-            for position in (0, 1, 90, 179, 180):
-                command = f"SV{channel}P{position}\n"
-                with self.subTest(channel=channel, position=position):
-                    self.assertEqual(
-                        validate_auxiliary_servo_command(command),
-                        command,
-                    )
-                    self.assertEqual(
-                        parse_auxiliary_servo_command(command),
-                        (channel, position),
-                    )
+    def test_servo_validation_enforces_each_board_profile(self):
+        for profile, channels in AUXILIARY_BOARD_SERVO_CHANNELS.items():
+            for channel in channels:
+                for position in (0, 1, 90, 179, 180):
+                    command = f"SV{channel}P{position}\n"
+                    with self.subTest(
+                        profile=profile,
+                        channel=channel,
+                        position=position,
+                    ):
+                        self.assertEqual(
+                            validate_auxiliary_servo_command(
+                                command,
+                                profile,
+                            ),
+                            command,
+                        )
+                        self.assertEqual(
+                            parse_auxiliary_servo_command(command),
+                            (channel, position),
+                        )
+        self.assertEqual(
+            validate_auxiliary_servo_command(
+                "SV6P90\n",
+                AUXILIARY_BOARD_MEGA,
+            ),
+            "SV6P90\n",
+        )
+        with self.assertRaises(MotionInputError):
+            validate_auxiliary_servo_command(
+                "SV6P90\n",
+                AUXILIARY_BOARD_NANO,
+            )
         self.assertEqual(
             parse_auxiliary_servo_command("SV00P090\n"),
             (0, 90),
         )
         self.assertEqual(
-            validate_auxiliary_servo_command("SV00P090\n"),
+            validate_auxiliary_servo_command(
+                "SV00P090\n",
+                AUXILIARY_BOARD_NANO,
+            ),
             "SV00P090\n",
         )
 
@@ -427,7 +460,152 @@ class AuxiliaryBoardProfileTests(unittest.TestCase):
         for command in malformed_commands:
             with self.subTest(command=command):
                 with self.assertRaises(MotionInputError):
-                    validate_auxiliary_servo_command(command)
+                    validate_auxiliary_servo_command(
+                        command,
+                        AUXILIARY_BOARD_MEGA,
+                    )
+
+    def test_input_validation_enforces_each_board_profile(self):
+        for profile, pins in AUXILIARY_BOARD_INPUT_PINS.items():
+            for input_pin in pins:
+                command = f"JFX{input_pin}\n"
+                with self.subTest(profile=profile, input_pin=input_pin):
+                    self.assertEqual(
+                        validate_auxiliary_input_command(command, profile),
+                        command,
+                    )
+                    self.assertEqual(
+                        parse_auxiliary_input_command(command),
+                        input_pin,
+                    )
+        for input_pin in (0, 1, 8, 27):
+            with self.subTest(nano_rejected_pin=input_pin):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_input_command(
+                        f"JFX{input_pin}\n",
+                        AUXILIARY_BOARD_NANO,
+                    )
+        for input_pin in (0, 1, 28, 53):
+            with self.subTest(mega_rejected_pin=input_pin):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_input_command(
+                        f"JFX{input_pin}\n",
+                        AUXILIARY_BOARD_MEGA,
+                    )
+        for command in (
+            "JFX2",
+            "JFX2\r\n",
+            "JFX-1\n",
+            "JFX+2\n",
+            "JFX2\nJFX3\n",
+            "JFX\n",
+            "",
+            None,
+        ):
+            with self.subTest(command=command):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_input_command(
+                        command,
+                        AUXILIARY_BOARD_MEGA,
+                    )
+
+    def test_wait_validation_enforces_pin_state_and_timeout_domains(self):
+        for profile, input_pin in (
+            (AUXILIARY_BOARD_NANO, 2),
+            (AUXILIARY_BOARD_MEGA, 27),
+        ):
+            for state in (0, 1):
+                for timeout in (1, AUXILIARY_WAIT_MAXIMUM_SECONDS):
+                    command = f"WIA{input_pin}B{state}C{timeout}\n"
+                    with self.subTest(
+                        profile=profile,
+                        state=state,
+                        timeout=timeout,
+                    ):
+                        self.assertEqual(
+                            validate_auxiliary_wait_command(command, profile),
+                            command,
+                        )
+                        self.assertEqual(
+                            parse_auxiliary_wait_command(command),
+                            (input_pin, state, timeout),
+                        )
+        for command in (
+            "WIA2B1C0",
+            "WIA2B1C0\r\n",
+            "WIA2B1C0\n",
+            "WIA2B2C1\n",
+            "WIA2B-1C1\n",
+            "WIA2B1C-1\n",
+            f"WIA2B1C{AUXILIARY_WAIT_MAXIMUM_SECONDS + 1}\n",
+            "WIA2B1C1\nWIA2B1C1\n",
+            "",
+            None,
+        ):
+            with self.subTest(command=command):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_wait_command(
+                        command,
+                        AUXILIARY_BOARD_NANO,
+                    )
+        with self.assertRaises(MotionInputError):
+            validate_auxiliary_wait_command(
+                "WIA8B1C1\n",
+                AUXILIARY_BOARD_NANO,
+            )
+        for command in ("WIA1B1C1\n", "WIA28B1C1\n"):
+            with self.subTest(mega_rejected_wait=command):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_wait_command(
+                        command,
+                        AUXILIARY_BOARD_MEGA,
+                    )
+
+    def test_gripper_current_contract_requires_profile_and_numeric_response(self):
+        for profile in (AUXILIARY_BOARD_NANO, AUXILIARY_BOARD_MEGA):
+            self.assertEqual(
+                validate_auxiliary_gripper_current_command("TG\n", profile),
+                "TG\n",
+            )
+        for command in ("TG", "TG\r\n", " TG\n", "TG\nTG\n", "", None):
+            with self.subTest(command=command):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_gripper_current_command(
+                        command,
+                        AUXILIARY_BOARD_NANO,
+                    )
+        with self.assertRaises(MotionInputError):
+            validate_auxiliary_gripper_current_command(
+                "TG\n",
+                AUXILIARY_BOARD_NONE,
+            )
+
+        for response in ("0", "0.000", "1", "1.25", "27.999", "28.000"):
+            with self.subTest(response=response):
+                self.assertEqual(
+                    parse_auxiliary_gripper_current_response("TG\n", response),
+                    response,
+                )
+        for response in (
+            "-0.1",
+            "+1",
+            ".1",
+            "01.0",
+            "1.",
+            "1.0000",
+            str(AUXILIARY_CURRENT_MAXIMUM_AMPS + 0.001),
+            "nan",
+            "inf",
+            " 1.0",
+            "1.0 ",
+            "",
+            None,
+        ):
+            with self.subTest(response=response):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_auxiliary_gripper_current_response("TG\n", response)
+        with self.assertRaises(ProtocolResponseError):
+            parse_auxiliary_gripper_current_response("TM\n", "1.000")
 
     def test_pneumatic_mapping_uses_a_valid_pin_for_each_board(self):
         expected_pins = {

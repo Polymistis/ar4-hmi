@@ -638,6 +638,7 @@ Integration unit status:
 
 - Native inverse kinematics, safe configuration, and command-local wrist propagation: `Tested`.
 - Line-oriented strict numeric syntax and shared motion-command grammar: `Tested`.
+- Line-oriented auxiliary-controller compatibility hardening: `Tested`.
 - Line-oriented command-specific numeric and safety-domain coverage: `In progress`.
 - Typed configuration normalization and MK5 calibration-switch polarity: `In progress`.
 - Correlated host/Teensy JSON protocol and firmware safety corrections: `Proposed`.
@@ -755,6 +756,31 @@ Implemented portions of the active integration unit:
 - Controller-bound Cartesian orientation, vision rotation, and rotational tool-jog fields must remain representable after both binary32 degree encoding and binary32 radian conversion. The paired firmware conversion contract rejects nonzero values that collapse to zero before solver or tool-frame mutation. Vision rotation applies to the native Rx tool slot and restores that slot after inverse kinematics; `UP` validates tool and DH rotations before mutation and refreshes the active kinematic cache before acknowledging success.
 - The line-oriented Teensy strict parser accepts only complete delimiter-safe plain-decimal fields. Serial preprocessing removes one required line ending, SD preprocessing removes only the line ending already consumed by the SD reader, and neither path removes payload whitespace before command parsing. Shared `JT`, Cartesian, vision, joint, and live-jog grammars reject malformed text, junk prefixes, trailing data, marker collisions, invalid fixed-width fields, non-finite values, binary32 overflow, nonzero binary32 underflow, and integer overflow before parsed output mutation. Every sibling `String.toFloat()` and `String.toInt()` conversion has been replaced by shared strict parsing. Command-specific domain validation now covers motion timing with a shared `(0, 100]` ramp range, calibrated targets, stored step rows, waits, Modbus values, explicit main-controller `ON`/`OF` rejection because no safe GPIO profile exists, controller filenames with a shared 255-byte limit, and nondegenerate path geometry using the complete traversed arc angle. Ordered arc validation and execution share the same staged center, axis, radius, and traversal angle, including midpoint-selected major arcs. Host and firmware live-jog parsing accept only Percent mode and integral axis/direction vectors inside the applicable joint domain; validated speed, acceleration, deceleration, and ramp fields reach every controller and offline handler, and joint live jog accepts only the effective `WA` wrist suffix. All line-oriented serial readers share the host's 4096-byte command-frame ceiling, reject overflow once, discard through the next LF before accepting another frame, and never append an empty-read sentinel to a command buffer. Motion handlers pass the command-local wrist selector directly into inverse kinematics and stage wrist and encoder loop modes until the motor driver completes internal timing, direction, and emergency-stop preflight; rejected, zero-distance, and precompute-only frames preserve the preceding global mode state. Only `ML` accepts the required nonnegative `Rnd` field; other Cartesian motion and storage opcodes reject rounding instead of discarding the field. Unsupported `ML Q1` wrist suppression and nonzero `MA` or `MC Tr` values fail closed in both host and firmware parsing instead of becoming silent no-ops. Host Modbus rows classify command-specific success and response shapes before state advancement. Exhaustive firmware command-domain coverage remains `In progress`.
 - Rounded `ML` execution carries the originating command-local wrist selector and loop modes into the derived `MA` frame. Live `LC`, `LJ`, and `LT` control readers accept only exact `S` lines with LF or CRLF termination; overlength or other complete control frames receive one error from the live terminal-response owner, while ordinary command-ingress callers own their separate overflow responses. Host and firmware filename validation rejects the complete FAT-reserved character set, the comma-delimited controller-directory separator, outer spaces, and control or non-ASCII input. Controller-directory framing additionally rejects `.txt` entries without a reversible stem and caps the aggregate payload at 4096 bytes before emission. Controller Modbus polling waits require a positive timeout so every accepted wait performs at least one polling interval.
+- The paired line-oriented Nano and Mega compatibility sketches use
+  byte-identical self-contained fixed-buffer protocol contracts. Complete
+  command parsing validates board-specific servo, input, and output domains,
+  wait state and positive timeout, integer overflow, frame length, and
+  printable ASCII before any output mutation. Nano excludes unsupported servo
+  channel 6, and Mega excludes Serial0 pins 0 and 1 from its input domain.
+  Servos remain detached through startup; initial attachment keeps AVR
+  interrupts masked until the first admitted position replaces the library
+  default. Current telemetry is read-only and cannot trigger an autonomous
+  servo correction. `WI` uses a rollover-safe nonblocking state machine,
+  samples before classifying deadline expiry, and accepts only exact `STOP` or
+  `STOPWI` interruption while active.
+  `JF` samples once, and `TM` emits exactly one line delimiter.
+  Host legacy transport validates `SV`, `JF`, `WI`, `ON`, `OF`, and `TG`
+  against the handle-bound board profile before write. Dynamic gripper-current
+  responses require a matching `TG` command plus bounded unsigned
+  plain-decimal amperage. Malformed or out-of-range application payloads reject
+  the program row after a clean frame without treating the transport as
+  corrupt. Arduino CLI no-upload builds pass for Arduino AVR core 1.8.8 and
+  Servo 1.3.0, and the sanitized C++ harness exercises the actual parser, frame
+  recovery, atomic rejection, wait transitions, rollover behavior, and
+  active-wait command admission. These checks establish no live
+  auxiliary-controller behavior. Runtime firmware identity negotiation remains
+  required before this rewritten compatibility firmware can be distinguished
+  from the prior blocking firmware during connection.
 - SD-card identity is revalidated after directory and delete-lookup traversal before any successful listing or absence response. Deletion revalidates the admitted CID immediately before and after removal. `WC` and `WG` carry the admitted `Mi<CID>Fn<filename>` target, and firmware revalidates that CID before and after each write. A changed or unreadable card produces a detailed storage error without a success response.
 - Modbus `BA`, `BH`, and `BD` reads accept exactly one register because the
   firmware and host response contract carries one scalar value. Other read

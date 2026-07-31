@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "../../ARrobots/src/kinematics.cpp"
+#include "../../ArduinoSketches/AR4_nano_sketch_v1.5/auxiliary_protocol_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/cartesian_pose_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/command_queue_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/controller_domain_contract.h"
@@ -35,6 +36,427 @@ constexpr float kDegreesPerRadian = 57.295779513082320876f;
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+bool parse_auxiliary_command(
+    const std::string& text,
+    ar4_auxiliary::BoardProfile board,
+    ar4_auxiliary::ParsedCommand& command
+) {
+    return ar4_auxiliary::parseCommand(
+        text.data(),
+        text.size(),
+        board,
+        &command
+    );
+}
+
+void test_auxiliary_protocol_contract() {
+    ar4_auxiliary::ParsedCommand command = {};
+    require(
+        parse_auxiliary_command(
+            "SV5P180",
+            ar4_auxiliary::kNanoBoard,
+            command
+        )
+            && command.kind == ar4_auxiliary::kServoCommand
+            && command.channel == 5
+            && command.position == 180,
+        "Nano servo boundary was rejected"
+    );
+    require(
+        !parse_auxiliary_command(
+            "SV6P90",
+            ar4_auxiliary::kNanoBoard,
+            command
+        )
+            && parse_auxiliary_command(
+                "SV6P90",
+                ar4_auxiliary::kMegaBoard,
+                command
+            ),
+        "board-specific servo boundary was not enforced"
+    );
+    require(
+        parse_auxiliary_command(
+            "ONX8",
+            ar4_auxiliary::kNanoBoard,
+            command
+        )
+            && command.kind == ar4_auxiliary::kOutputOnCommand
+            && parse_auxiliary_command(
+                "OFX13",
+                ar4_auxiliary::kNanoBoard,
+                command
+            )
+            && command.kind == ar4_auxiliary::kOutputOffCommand,
+        "auxiliary output opcode classification failed"
+    );
+    require(
+        !parse_auxiliary_command(
+            "ONX28",
+            ar4_auxiliary::kNanoBoard,
+            command
+        )
+            && !parse_auxiliary_command(
+                "OFX8",
+                ar4_auxiliary::kMegaBoard,
+                command
+            ),
+        "opposing board output range was accepted"
+    );
+    require(
+        parse_auxiliary_command(
+            "ONX28",
+            ar4_auxiliary::kMegaBoard,
+            command
+        )
+            && command.kind == ar4_auxiliary::kOutputOnCommand
+            && command.pin == 28
+            && parse_auxiliary_command(
+                "OFX53",
+                ar4_auxiliary::kMegaBoard,
+                command
+            )
+            && command.kind == ar4_auxiliary::kOutputOffCommand
+            && command.pin == 53,
+        "Mega output boundary was rejected"
+    );
+    require(
+        parse_auxiliary_command(
+            "JFX2",
+            ar4_auxiliary::kNanoBoard,
+            command
+        )
+            && command.kind == ar4_auxiliary::kInputReadCommand
+            && command.pin == 2
+            && parse_auxiliary_command(
+                "JFX7",
+                ar4_auxiliary::kNanoBoard,
+                command
+            )
+            && command.pin == 7
+            && !parse_auxiliary_command(
+                "JFX1",
+                ar4_auxiliary::kNanoBoard,
+                command
+            )
+            && !parse_auxiliary_command(
+                "JFX8",
+                ar4_auxiliary::kNanoBoard,
+                command
+            ),
+        "Nano input range was not enforced"
+    );
+    require(
+        parse_auxiliary_command(
+            "JFX2",
+            ar4_auxiliary::kMegaBoard,
+            command
+        )
+            && command.pin == 2
+            && parse_auxiliary_command(
+                "JFX27",
+                ar4_auxiliary::kMegaBoard,
+                command
+            )
+            && command.pin == 27
+            && !parse_auxiliary_command(
+                "JFX1",
+                ar4_auxiliary::kMegaBoard,
+                command
+            )
+            && !parse_auxiliary_command(
+                "JFX28",
+                ar4_auxiliary::kMegaBoard,
+                command
+            ),
+        "Mega input range was not enforced"
+    );
+    require(
+        parse_auxiliary_command(
+            "WIA7B1C32767",
+            ar4_auxiliary::kNanoBoard,
+            command
+        )
+            && command.kind == ar4_auxiliary::kWaitInputCommand
+            && command.pin == 7
+            && command.state == 1
+            && command.timeoutSeconds == 32767
+            && !parse_auxiliary_command(
+                "WIA1B1C1",
+                ar4_auxiliary::kNanoBoard,
+                command
+            )
+            && !parse_auxiliary_command(
+                "WIA8B1C1",
+                ar4_auxiliary::kNanoBoard,
+                command
+            )
+            && parse_auxiliary_command(
+                "WIA2B0C1",
+                ar4_auxiliary::kMegaBoard,
+                command
+            )
+            && parse_auxiliary_command(
+                "WIA27B1C32767",
+                ar4_auxiliary::kMegaBoard,
+                command
+            )
+            && !parse_auxiliary_command(
+                "WIA1B1C1",
+                ar4_auxiliary::kMegaBoard,
+                command
+            )
+            && !parse_auxiliary_command(
+                "WIA28B1C1",
+                ar4_auxiliary::kMegaBoard,
+                command
+            ),
+        "auxiliary wait boundary was rejected"
+    );
+    for (
+        const std::string malformed : {
+            "WIA7B2C1",
+            "WIA7B1C0",
+            "WIA7B1C32768",
+            "WIA7B1C999999999999",
+            "WIA7B1C1junk",
+            "SV0P181",
+            "SV0P1P2",
+            "JFX2T3",
+            " TG",
+            "TG ",
+            "STOPX",
+        }
+    ) {
+        require(
+            !parse_auxiliary_command(
+                malformed,
+                ar4_auxiliary::kNanoBoard,
+                command
+            ),
+            "malformed auxiliary command was accepted: " + malformed
+        );
+    }
+
+    require(
+        parse_auxiliary_command(
+            "TG",
+            ar4_auxiliary::kMegaBoard,
+            command
+        )
+            && command.kind == ar4_auxiliary::kGripperCurrentCommand
+            && parse_auxiliary_command(
+                "STOPWI",
+                ar4_auxiliary::kMegaBoard,
+                command
+            )
+            && command.kind == ar4_auxiliary::kStopCommand
+            && parse_auxiliary_command(
+                "STOP",
+                ar4_auxiliary::kMegaBoard,
+                command
+            )
+            && command.kind == ar4_auxiliary::kStopCommand
+            && parse_auxiliary_command(
+                "TMpayload",
+                ar4_auxiliary::kMegaBoard,
+                command
+            )
+            && command.kind == ar4_auxiliary::kEchoCommand
+            && std::string(command.payload, command.payloadLength) == "payload",
+        "auxiliary telemetry, stop, or echo classification failed"
+    );
+
+    ar4_auxiliary::ParsedCommand unchanged = {};
+    unchanged.kind = ar4_auxiliary::kEchoCommand;
+    unchanged.channel = 91;
+    unchanged.pin = 92;
+    unchanged.state = 93;
+    unchanged.position = 94;
+    unchanged.timeoutSeconds = 95;
+    unchanged.payload = "sentinel";
+    unchanged.payloadLength = 8;
+    require(
+        !parse_auxiliary_command(
+            "SV0P999",
+            ar4_auxiliary::kNanoBoard,
+            unchanged
+        )
+            && unchanged.kind == ar4_auxiliary::kEchoCommand
+            && unchanged.channel == 91
+            && unchanged.pin == 92
+            && unchanged.state == 93
+            && unchanged.position == 94
+            && unchanged.timeoutSeconds == 95
+            && std::string(
+                unchanged.payload,
+                unchanged.payloadLength
+            ) == "sentinel",
+        "rejected auxiliary parse mutated caller state"
+    );
+
+    ar4_auxiliary::FrameBuffer frames;
+    ar4_auxiliary::Frame frame = {};
+    require(
+        frames.push('T', &frame) == ar4_auxiliary::kFramePending
+            && frames.push('G', &frame) == ar4_auxiliary::kFramePending
+            && frames.push('\n', &frame) == ar4_auxiliary::kFrameReady
+            && std::string(frame.data, frame.length) == "TG",
+        "valid auxiliary frame was not emitted"
+    );
+    require(
+        frames.push('\n', &frame) == ar4_auxiliary::kFrameRejected,
+        "blank auxiliary frame was accepted"
+    );
+    require(
+        frames.push('T', &frame) == ar4_auxiliary::kFramePending
+            && frames.push('\r', &frame) == ar4_auxiliary::kFramePending
+            && frames.push('\n', &frame) == ar4_auxiliary::kFrameRejected,
+        "control byte did not reject the complete auxiliary frame"
+    );
+    for (
+        std::size_t index = 0;
+        index < ar4_auxiliary::kMaximumCommandLength;
+        ++index
+    ) {
+        require(
+            frames.push('A', &frame) == ar4_auxiliary::kFramePending,
+            "maximum auxiliary input responded before LF"
+        );
+    }
+    require(
+        frames.push('\n', &frame) == ar4_auxiliary::kFrameReady
+            && frame.length == ar4_auxiliary::kMaximumCommandLength,
+        "maximum-length auxiliary frame was rejected"
+    );
+    for (
+        std::size_t index = 0;
+        index <= ar4_auxiliary::kMaximumCommandLength;
+        ++index
+    ) {
+        require(
+            frames.push('A', &frame) == ar4_auxiliary::kFramePending,
+            "overlength auxiliary input responded before LF"
+        );
+    }
+    require(
+        frames.push('\n', &frame) == ar4_auxiliary::kFrameRejected
+            && frames.push('T', &frame) == ar4_auxiliary::kFramePending
+            && frames.push('G', &frame) == ar4_auxiliary::kFramePending
+            && frames.push('\n', &frame) == ar4_auxiliary::kFrameReady
+            && std::string(frame.data, frame.length) == "TG",
+        "auxiliary frame parser did not recover after overflow"
+    );
+
+    require(
+        !ar4_auxiliary::waitExpired(
+            UINT32_C(0xfffffff0),
+            UINT32_C(32),
+            UINT32_C(0x0000000f)
+        )
+            && ar4_auxiliary::waitExpired(
+                UINT32_C(0xfffffff0),
+                UINT32_C(32),
+                UINT32_C(0x00000010)
+            )
+            && ar4_auxiliary::waitExpired(10, 0, 10),
+        "auxiliary wait expiry is not rollover-safe"
+    );
+
+    ar4_auxiliary::WaitState wait = {
+        false,
+        91,
+        92,
+        UINT32_C(93),
+        UINT32_C(94),
+    };
+    require(
+        !ar4_auxiliary::startWait(NULL, 2, 1, 1, 0)
+            && !ar4_auxiliary::startWait(&wait, 2, 2, 1, 0)
+            && !ar4_auxiliary::startWait(&wait, 2, 1, 0, 0)
+            && !ar4_auxiliary::startWait(&wait, 2, 1, 32768, 0)
+            && !wait.active
+            && wait.pin == 91
+            && wait.expectedState == 92
+            && wait.startedAtMilliseconds == 93
+            && wait.timeoutMilliseconds == 94,
+        "rejected auxiliary wait start mutated caller state"
+    );
+    require(
+        ar4_auxiliary::startWait(
+            &wait,
+            7,
+            1,
+            1,
+            UINT32_C(0xfffffff0)
+        )
+            && wait.active
+            && wait.pin == 7
+            && wait.expectedState == 1
+            && wait.startedAtMilliseconds == UINT32_C(0xfffffff0)
+            && wait.timeoutMilliseconds == 1000,
+        "valid auxiliary wait start was rejected"
+    );
+    require(
+        !ar4_auxiliary::startWait(&wait, 2, 0, 2, 0)
+            && wait.active
+            && wait.pin == 7
+            && wait.expectedState == 1
+            && wait.startedAtMilliseconds == UINT32_C(0xfffffff0)
+            && wait.timeoutMilliseconds == 1000,
+        "active auxiliary wait was replaced"
+    );
+    require(
+        ar4_auxiliary::updateWait(
+            &wait,
+            0,
+            UINT32_C(0x000003d7)
+        ) == ar4_auxiliary::kWaitPending
+            && wait.active,
+        "auxiliary wait did not remain pending before rollover deadline"
+    );
+    require(
+        ar4_auxiliary::updateWait(
+            &wait,
+            1,
+            UINT32_C(0x000003d8)
+        ) == ar4_auxiliary::kWaitMatched
+            && !wait.active,
+        "matching input did not win at the auxiliary wait deadline"
+    );
+    require(
+        ar4_auxiliary::startWait(&wait, 7, 1, 1, 10)
+            && ar4_auxiliary::updateWait(&wait, 0, 1010)
+                == ar4_auxiliary::kWaitTimedOut
+            && !wait.active,
+        "auxiliary wait timeout did not settle the active state"
+    );
+    require(
+        ar4_auxiliary::updateWait(&wait, 1, 1011)
+                == ar4_auxiliary::kWaitInactive
+            && !ar4_auxiliary::cancelWait(&wait)
+            && ar4_auxiliary::startWait(&wait, 7, 0, 1, 20)
+            && ar4_auxiliary::cancelWait(&wait)
+            && !wait.active,
+        "auxiliary wait inactive or cancellation state was inconsistent"
+    );
+    require(
+        ar4_auxiliary::commandDisposition(
+            false,
+            ar4_auxiliary::kServoCommand
+        ) == ar4_auxiliary::kExecuteCommand
+            && ar4_auxiliary::commandDisposition(
+                true,
+                ar4_auxiliary::kStopCommand
+            ) == ar4_auxiliary::kStopActiveWait
+            && ar4_auxiliary::commandDisposition(
+                true,
+                ar4_auxiliary::kServoCommand
+            ) == ar4_auxiliary::kRejectDuringWait,
+        "auxiliary active-wait command admission was inconsistent"
+    );
 }
 
 template <typename Result>
@@ -4392,6 +4814,7 @@ int main(int argc, char** argv) {
         return run_protocol_contract_probe(argv[2], argv[3]);
     }
     try {
+        test_auxiliary_protocol_contract();
         test_rejected_motion_mode_transaction_atomicity();
         test_bounded_serial_frame_accumulator();
         test_directory_entry_name_contract();

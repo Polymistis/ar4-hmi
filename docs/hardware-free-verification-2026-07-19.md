@@ -395,3 +395,35 @@ firmware upload, calibration action, or arm motion occurred.
 ```text
 No-upload Teensy compile and timeout tests: Ran 2 tests in 18.084s; OK
 ```
+
+## Nano and Mega auxiliary firmware
+
+Toolchain:
+
+- Arduino CLI 1.5.1
+- Arduino AVR platform 1.8.8
+- Servo 1.3.0
+
+The 2026-07-31 environment-gated no-upload regression compiled the tracked
+Nano sketch with `arduino:avr:nano:cpu=atmega328old` and the tracked Mega
+sketch with `arduino:avr:mega`. Both builds used external temporary
+directories and verified the selected platform and Servo release from verbose
+compiler output.
+
+Both compilers returned exit code 0 and reported substantial program-storage
+and dynamic-memory headroom.
+
+The paired firmware uses byte-identical fixed-buffer protocol headers because
+Arduino's sketch builder rejects the attempted parent-directory header include.
+Source-contract coverage rejects header drift, dynamic Arduino `String`
+parsing, setup-time servo attachment, autonomous current-driven servo writes,
+blocking wait loops, duplicate input sampling, and mismatched response framing.
+The Ubuntu 26.04 sanitized C++ harness directly exercised strict command
+parsing, board-specific pin and servo domains, integer overflow rejection,
+caller-state preservation, frame overflow recovery, positive wait admission,
+rollover-safe pending, match, timeout, cancellation, and active-wait command
+disposition. Strict compilation plus AddressSanitizer and
+UndefinedBehaviorSanitizer completed with exit code 0.
+
+No serial port, controller command, firmware upload, calibration action, or
+arm motion occurred.

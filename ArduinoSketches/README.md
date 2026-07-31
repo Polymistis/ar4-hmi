@@ -73,6 +73,28 @@ arduino-cli lib install ModbusMaster@2.0.1
 arduino-cli compile --fqbn teensy:avr:teensy41 --clean --build-path <temporary-build-directory> ArduinoSketches/AR4_teensy41_sketch_v6.7.1
 ```
 
+The tracked Nano and Mega compatibility sketches use Arduino AVR core 1.8.8
+and Servo 1.3.0. Both sketches enforce complete fixed-buffer commands before
+mutation. Nano permits servo channels 0-5, inputs 2-7, and outputs 8-13; Mega
+permits servo channels 0-6, inputs 2-27, and outputs 28-53. Servo output remains
+detached through startup. Initial attachment keeps AVR interrupts masked until
+the admitted `SV` target replaces the Servo library default. `TG` reports
+current without autonomous servo correction. `WI` remains nonblocking, and
+requires a positive timeout. Each polling pass samples the input before
+classifying deadline expiry, and only exact `STOP` or `STOPWI` frames interrupt
+an active wait.
+
+Arduino's sketch builder does not expose a header above the selected sketch
+directory. Each auxiliary sketch therefore carries a byte-identical
+`auxiliary_protocol_contract.h`; the source-contract test rejects divergence.
+
+```text
+arduino-cli core install arduino:avr@1.8.8
+arduino-cli lib install Servo@1.3.0
+arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328old --clean --build-path <temporary-nano-build-directory> ArduinoSketches/AR4_nano_sketch_v1.5
+arduino-cli compile --fqbn arduino:avr:mega --clean --build-path <temporary-mega-build-directory> ArduinoSketches/AR4_mega_sketch_v1.5
+```
+
 Arduino library discovery gives sketchbook libraries priority over platform libraries. An unrelated sketchbook `SPI` library can shadow the Teensy core implementation and cause missing `SPISettings` errors in `SdFat`. Preserve the sketchbook and select the platform library explicitly:
 
 ```text
@@ -95,6 +117,11 @@ and SdFat folders under the Teensy 1.62.0 platform, and verifies PJRC Teensy
 core 1.62.0 and ModbusMaster 2.0.1. A kill-on-close Windows Job Object or POSIX
 process group owns the compiler tree, and the timeout path waits for verified
 tree settlement before temporary build cleanup.
+
+`tests/test_auxiliary_firmware_compile.py` runs both AVR no-upload compilations
+when `AR4_ARDUINO_CLI` and `AR4_AUXILIARY_BUILD_DIRECTORY` identify the
+selected executable and an existing external temporary build parent. The test
+requires Arduino AVR core 1.8.8 and Servo 1.3.0 in compiler dependency output.
 
 The dated hardware-free build record, including the 2026-07-31
 `6.7.1-ar4hmi.8` result, is recorded in

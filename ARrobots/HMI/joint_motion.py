@@ -33,13 +33,23 @@ AUXILIARY_BOARD_OUTPUT_PINS = {
     AUXILIARY_BOARD_NANO: frozenset(range(8, 14)),
     AUXILIARY_BOARD_MEGA: frozenset(range(28, 54)),
 }
+AUXILIARY_BOARD_INPUT_PINS = {
+    AUXILIARY_BOARD_NANO: frozenset(range(2, 8)),
+    AUXILIARY_BOARD_MEGA: frozenset(range(2, 28)),
+}
 AUXILIARY_BOARD_PNEUMATIC_PINS = {
     AUXILIARY_BOARD_NANO: 8,
     AUXILIARY_BOARD_MEGA: 28,
 }
 AUXILIARY_SERVO_CHANNELS = frozenset(range(7))
+AUXILIARY_BOARD_SERVO_CHANNELS = {
+    AUXILIARY_BOARD_NANO: frozenset(range(6)),
+    AUXILIARY_BOARD_MEGA: AUXILIARY_SERVO_CHANNELS,
+}
 AUXILIARY_SERVO_MINIMUM_POSITION = 0
 AUXILIARY_SERVO_MAXIMUM_POSITION = 180
+AUXILIARY_WAIT_MAXIMUM_SECONDS = 32767
+AUXILIARY_CURRENT_MAXIMUM_AMPS = 28.0
 CONTROL_POLL_INTERVAL_SECONDS = 0.05
 PENDING_CONTROL_FRAME_TIMEOUT_SECONDS = 1.0
 RESPONSE_TIMEOUT_SAFETY_SCALE = 1.25
@@ -186,9 +196,109 @@ def parse_auxiliary_servo_command(command):
     return channel, position
 
 
-def validate_auxiliary_servo_command(command):
-    parse_auxiliary_servo_command(command)
+def validate_auxiliary_servo_command(command, board_profile):
+    profile = normalize_auxiliary_board_profile(board_profile)
+    channel, _ = parse_auxiliary_servo_command(command)
+    if channel not in AUXILIARY_BOARD_SERVO_CHANNELS[profile]:
+        raise MotionInputError(
+            f"auxiliary servo channel {channel} is not valid for {profile}"
+        )
     return command
+
+
+def parse_auxiliary_input_command(command):
+    if (
+        not isinstance(command, str)
+        or not command
+        or len(command) > MAX_COMMAND_LENGTH
+    ):
+        raise MotionInputError("auxiliary input command is invalid")
+    match = re.fullmatch(r"JFX([0-9]+)\n", command)
+    if match is None:
+        raise MotionInputError("auxiliary input command is malformed")
+    return int(match.group(1))
+
+
+def validate_auxiliary_input_command(command, board_profile):
+    profile = normalize_auxiliary_board_profile(board_profile)
+    input_pin = parse_auxiliary_input_command(command)
+    if input_pin not in AUXILIARY_BOARD_INPUT_PINS[profile]:
+        raise MotionInputError(
+            f"auxiliary input pin {input_pin} is not valid for {profile}"
+        )
+    return command
+
+
+def parse_auxiliary_wait_command(command):
+    if (
+        not isinstance(command, str)
+        or not command
+        or len(command) > MAX_COMMAND_LENGTH
+    ):
+        raise MotionInputError("auxiliary wait command is invalid")
+    match = re.fullmatch(
+        r"WIA([0-9]+)B([01])C([0-9]+)\n",
+        command,
+    )
+    if match is None:
+        raise MotionInputError("auxiliary wait command is malformed")
+    timeout = int(match.group(3))
+    if timeout == 0:
+        raise MotionInputError(
+            "auxiliary wait timeout must be positive"
+        )
+    if timeout > AUXILIARY_WAIT_MAXIMUM_SECONDS:
+        raise MotionInputError(
+            "auxiliary wait timeout exceeds the firmware range"
+        )
+    return int(match.group(1)), int(match.group(2)), timeout
+
+
+def validate_auxiliary_wait_command(command, board_profile):
+    profile = normalize_auxiliary_board_profile(board_profile)
+    input_pin, _, _ = parse_auxiliary_wait_command(command)
+    if input_pin not in AUXILIARY_BOARD_INPUT_PINS[profile]:
+        raise MotionInputError(
+            f"auxiliary input pin {input_pin} is not valid for {profile}"
+        )
+    return command
+
+
+def validate_auxiliary_gripper_current_command(command, board_profile):
+    normalize_auxiliary_board_profile(board_profile)
+    if command != "TG\n":
+        raise MotionInputError(
+            "auxiliary gripper-current command is malformed"
+        )
+    return command
+
+
+def parse_auxiliary_gripper_current_response(command, response):
+    if command != "TG\n":
+        raise ProtocolResponseError(
+            "auxiliary gripper-current response has no matching command"
+        )
+    if (
+        not isinstance(response, str)
+        or not response
+        or len(response) > 32
+        or response != response.strip()
+        or not response.isascii()
+        or re.fullmatch(
+            r"(?:0|[1-9][0-9]*)(?:\.[0-9]{1,3})?",
+            response,
+        )
+        is None
+    ):
+        raise ProtocolResponseError(
+            "auxiliary gripper-current response is malformed"
+        )
+    current = float(response)
+    if not math.isfinite(current) or current > AUXILIARY_CURRENT_MAXIMUM_AMPS:
+        raise ProtocolResponseError(
+            "auxiliary gripper-current response is outside the sensor range"
+        )
+    return response
 
 
 def auxiliary_pneumatic_output_pin(board_profile):

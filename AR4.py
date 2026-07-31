@@ -188,6 +188,7 @@ from ARrobots.HMI.joint_motion import (
   AUXILIARY_BOARD_MEGA,
   AUXILIARY_BOARD_NANO,
   AUXILIARY_BOARD_NONE,
+  AUXILIARY_WAIT_MAXIMUM_SECONDS,
   CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
   CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
   CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
@@ -248,6 +249,7 @@ from ARrobots.HMI.joint_motion import (
   motion_timing_response_timeout,
   normalize_auxiliary_board_profile,
   parse_auxiliary_output_command,
+  parse_auxiliary_gripper_current_response,
   parse_auxiliary_servo_command,
   parse_command_timing,
   parse_controller_identity_response,
@@ -272,7 +274,10 @@ from ARrobots.HMI.joint_motion import (
   request_joint_telemetry,
   serial_transport_quarantined,
   validate_auxiliary_output_command,
+  validate_auxiliary_gripper_current_command,
+  validate_auxiliary_input_command,
   validate_auxiliary_servo_command,
+  validate_auxiliary_wait_command,
   validate_controller_modbus_command,
   validate_controller_filename,
   validate_controller_hardware_id,
@@ -722,7 +727,6 @@ SERIAL_SHUTDOWN_ACTIVITY_GRACE_SECONDS = 1.0
 FIRMWARE_AXIS_COUNT = 9
 FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS = 30
 FIRMWARE_MAX_MILLIMETERS_PER_SECOND = 192
-AUXILIARY_FIRMWARE_SIGNED_INT_MAX = 32767
 AUXILIARY_WAIT_TERMINAL_RESPONSES = ("Done", "Timeout", "Nano Stopped")
 AUXILIARY_WAIT_NATURAL_RESPONSES = ("Done", "Timeout")
 AUXILIARY_INACTIVE_STOP_RESPONSE = "Nano Inactive Stopped"
@@ -1143,7 +1147,8 @@ class ManualAuxiliaryRequest:
       raise MotionInputError("manual auxiliary calibration value is invalid")
 
     if self.expected_response == b"Servo Done":
-      _connected_auxiliary_board_profile(self.serial_port)
+      board_profile = _connected_auxiliary_board_profile(self.serial_port)
+      validate_auxiliary_servo_command(self.command, board_profile)
       channel, position = parse_auxiliary_servo_command(self.command)
       if (
         self.calibration_key
@@ -2697,13 +2702,22 @@ def _write_legacy_auxiliary_command(command):
       )
     serial_port = RUN.get('ser2')
     try:
-      if isinstance(command, str) and command[:2] in ("ON", "OF", "SV"):
-        if command[:2] == "SV":
-          _connected_auxiliary_board_profile(serial_port)
-          validate_auxiliary_servo_command(command)
-        else:
-          board_profile = _connected_auxiliary_board_profile(serial_port)
-          validate_auxiliary_output_command(command, board_profile)
+      board_profile = _connected_auxiliary_board_profile(serial_port)
+      if isinstance(command, str) and command.startswith("SV"):
+        validate_auxiliary_servo_command(command, board_profile)
+      elif isinstance(command, str) and command[:2] in ("ON", "OF"):
+        validate_auxiliary_output_command(command, board_profile)
+      elif isinstance(command, str) and command.startswith("JF"):
+        validate_auxiliary_input_command(command, board_profile)
+      elif isinstance(command, str) and command.startswith("WI"):
+        validate_auxiliary_wait_command(command, board_profile)
+      elif command == "TG\n":
+        validate_auxiliary_gripper_current_command(
+          command,
+          board_profile,
+        )
+      else:
+        raise MotionInputError("unsupported auxiliary controller command")
       return write_serial_control(
         serial_port,
         command,
@@ -2721,8 +2735,8 @@ def _write_legacy_auxiliary_command(command):
 
 def _manual_auxiliary_expected_response(command, serial_port=None):
   if isinstance(command, str) and command.startswith("SV"):
-    _connected_auxiliary_board_profile(serial_port)
-    validate_auxiliary_servo_command(command)
+    board_profile = _connected_auxiliary_board_profile(serial_port)
+    validate_auxiliary_servo_command(command, board_profile)
     return b"Servo Done"
   profile = _connected_auxiliary_board_profile(serial_port)
   validate_auxiliary_output_command(command, profile)
@@ -10622,6 +10636,7 @@ def _execute_row_auxiliary_command(
   response_timeout=SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
   accepted_responses=None,
   expected_response=None,
+  response_parser=None,
 ):
   if not isinstance(read_line, bool):
     raise TypeError("read_line must be boolean")
@@ -10649,6 +10664,16 @@ def _execute_row_auxiliary_command(
   if not read_line and accepted_responses is not None:
     raise MotionInputError(
       "accepted auxiliary responses require line-response ownership"
+    )
+  if response_parser is not None and not callable(response_parser):
+    raise TypeError("auxiliary response parser must be callable")
+  if not read_line and response_parser is not None:
+    raise MotionInputError(
+      "auxiliary response parsers require line-response ownership"
+    )
+  if accepted_responses is not None and response_parser is not None:
+    raise MotionInputError(
+      "auxiliary line responses require one validation contract"
     )
   if expected_response is not None and (
     not isinstance(expected_response, bytes)
@@ -10704,6 +10729,8 @@ def _execute_row_auxiliary_command(
                 accepted_responses=accepted_responses,
               )
               stop_response = None
+            if response_parser is not None:
+              response = response_parser(command, response)
           except Exception as exc:
             if control_injectable:
               _publish_auxiliary_stop_owner_result(False, str(exc))
@@ -10739,6 +10766,12 @@ def _execute_row_auxiliary_command(
     logger.warning("Program auxiliary command rejected: %s", exc)
     _finish_execute_row()
     return ROW_EXECUTION_REJECTED, None
+  except ProtocolResponseError as exc:
+    message = f"Program auxiliary response rejected: {exc}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    _finish_execute_row()
+    return ROW_EXECUTION_REJECTED, None
   except Exception as exc:
     message = f"Program auxiliary command failed: {exc}"
     logger.exception(message)
@@ -10754,10 +10787,12 @@ def _auxiliary_wait_timeout_seconds(value):
   text = str(value).strip()
   if not re.fullmatch(r"[0-9]+", text):
     raise MotionInputError(
-      "auxiliary wait timeout must be a non-negative integer"
+      "auxiliary wait timeout must be a positive integer"
     )
   timeout = int(text)
-  if timeout > AUXILIARY_FIRMWARE_SIGNED_INT_MAX:
+  if timeout == 0:
+    raise MotionInputError("auxiliary wait timeout must be a positive integer")
+  if timeout > AUXILIARY_WAIT_MAXIMUM_SECONDS:
     raise MotionInputError("auxiliary wait timeout exceeds the firmware range")
   return timeout
 
@@ -15544,7 +15579,7 @@ def executeRow(motion_complete=None, execution_request=None):
     if _reject_cancelled_program_row(execution_request):
       return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      _set_application_status(text="Test limit switches not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="Gripper-current testing not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -15556,6 +15591,7 @@ def executeRow(motion_complete=None, execution_request=None):
       command,
       read_line=True,
       response_delay=.05,
+      response_parser=parse_auxiliary_gripper_current_response,
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
@@ -15635,7 +15671,7 @@ def executeRow(motion_complete=None, execution_request=None):
     inputIndex = command.find("# ")
     valIndex = command.find("= ")
     actionIndex = command.find(": ")
-    inputNum = str(command[inputIndex+2:valIndex])
+    inputNum = str(command[inputIndex+2:valIndex-1])
     valNum = int(command[valIndex+2:actionIndex-1])
     action = str(command[actionIndex+2:actionIndex+6])
     cmd = "JFX"+inputNum+"\n"
@@ -32711,9 +32747,9 @@ infoFrame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
 
 infoFrame.grid_columnconfigure(0, weight=1)
 
-Label(infoFrame, text="The following IO are available when using the default 5v Nano board for IO:   Inputs = 2-7  /  Outputs = 8-13  /  Servos = A0-A7").grid(row=0, column=0, sticky="w", padx=5, pady=2)
+Label(infoFrame, text="The following IO are available when using the default 5v Nano board for IO:   Inputs = 2-7  /  Outputs = 8-13  /  Servos = A0-A5").grid(row=0, column=0, sticky="w", padx=5, pady=2)
 
-Label(infoFrame, text="The following IO are available when using the default 5v Mega board for IO:   Inputs = 0-27  /  Outputs = 28-53  /  Servos = A0-A7").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+Label(infoFrame, text="The following IO are available when using the default 5v Mega board for IO:   Inputs = 2-27  /  Outputs = 28-53  /  Servos = A0-A6").grid(row=1, column=0, sticky="w", padx=5, pady=2)
 
 Label(infoFrame, text="Please review this tutorial video on using 5v IO boards:").grid(row=2, column=0, sticky="w", padx=5, pady=2)
 
@@ -32821,10 +32857,10 @@ Label(infoFrame, text="5v board inputs are high impedance and susceptable to flo
 # 
 # 
 # 
-# inoutavailLab = Label(tab4, text = "The following IO are available when using the default 5v Nano board for IO:   Inputs = 2-7  /  Outputs = 8-13  /  Servos = A0-A7")
+# inoutavailLab = Label(tab4, text = "The following IO are available when using the default 5v Nano board for IO:   Inputs = 2-7  /  Outputs = 8-13  /  Servos = A0-A5")
 # inoutavailLab.place(x=10, y=640)
 # 
-# inoutavailLab = Label(tab4, text = "The following IO are available when using the default 5v Mega board for IO:   Inputs = 0-27  /  Outputs = 28-53  /  Servos = A0-A7")
+# inoutavailLab = Label(tab4, text = "The following IO are available when using the default 5v Mega board for IO:   Inputs = 2-27  /  Outputs = 28-53  /  Servos = A0-A6")
 # inoutavailLab.place(x=10, y=655)
 # 
 # inoutavailLab = Label(tab4, text = "Please review this tutorial video on using 5v IO boards:")

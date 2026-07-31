@@ -94,6 +94,7 @@ from ARrobots.HMI.joint_motion import (
     joint_telemetry_response_budget,
     motion_timing_response_timeout,
     normalize_auxiliary_board_profile,
+    parse_auxiliary_gripper_current_response,
     parse_auxiliary_output_command,
     parse_auxiliary_servo_command,
     parse_command_timing,
@@ -122,7 +123,10 @@ from ARrobots.HMI.joint_motion import (
     request_joint_telemetry,
     serial_transport_quarantined,
     validate_auxiliary_output_command,
+    validate_auxiliary_gripper_current_command,
+    validate_auxiliary_input_command,
     validate_auxiliary_servo_command,
+    validate_auxiliary_wait_command,
     validate_controller_modbus_command,
     validate_controller_filename,
     validate_controller_hardware_id,
@@ -2681,6 +2685,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "motion_request_registry": registry,
             "logger": SimpleNamespace(
                 warning=lambda *args: None,
+                error=lambda *args: None,
                 exception=lambda *args: None,
             ),
             "wraps": wraps,
@@ -9247,8 +9252,17 @@ class HmiSourceContractTests(unittest.TestCase):
             "validate_auxiliary_output_command": (
                 validate_auxiliary_output_command
             ),
+            "validate_auxiliary_gripper_current_command": (
+                validate_auxiliary_gripper_current_command
+            ),
+            "validate_auxiliary_input_command": (
+                validate_auxiliary_input_command
+            ),
             "validate_auxiliary_servo_command": (
                 validate_auxiliary_servo_command
+            ),
+            "validate_auxiliary_wait_command": (
+                validate_auxiliary_wait_command
             ),
             "write_serial_control": write_control,
             "_clear_auxiliary_board_profile": lambda port=None: True,
@@ -10310,8 +10324,17 @@ class HmiSourceContractTests(unittest.TestCase):
             "validate_auxiliary_output_command": (
                 validate_auxiliary_output_command
             ),
+            "validate_auxiliary_gripper_current_command": (
+                validate_auxiliary_gripper_current_command
+            ),
+            "validate_auxiliary_input_command": (
+                validate_auxiliary_input_command
+            ),
             "validate_auxiliary_servo_command": (
                 validate_auxiliary_servo_command
+            ),
+            "validate_auxiliary_wait_command": (
+                validate_auxiliary_wait_command
             ),
             "write_serial_control": write_serial_control,
             "auxiliary_serial_write_lock": threading.Lock(),
@@ -10349,6 +10372,24 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(port.commands[-1], b"SV0P0\n")
         write_output("SV00P090\n")
         self.assertEqual(port.commands[-1], b"SV00P090\n")
+        with self.assertRaises(MotionInputError):
+            write_output("SV6P90\n")
+        write_output("JFX2\n")
+        self.assertEqual(port.commands[-1], b"JFX2\n")
+        write_output("WIA7B1C32767\n")
+        self.assertEqual(port.commands[-1], b"WIA7B1C32767\n")
+        write_output("TG\n")
+        self.assertEqual(port.commands[-1], b"TG\n")
+        for command in (
+            "JFX1\n",
+            "WIA8B1C1\n",
+            "WIA2B2C1\n",
+            "WIA2B1C32768\n",
+            "TMtest\n",
+        ):
+            with self.subTest(command=command):
+                with self.assertRaises(MotionInputError):
+                    write_output(command)
 
     def test_manual_modbus_buttons_are_nonblocking_thin_wrappers(self):
         callback_opcodes = {
@@ -16367,17 +16408,134 @@ class HmiSourceContractTests(unittest.TestCase):
             "_auxiliary_wait_timeout_seconds",
             {
                 "MotionInputError": MotionInputError,
-                "AUXILIARY_FIRMWARE_SIGNED_INT_MAX": 32767,
+                "AUXILIARY_WAIT_MAXIMUM_SECONDS": 32767,
                 "re": re,
             },
         )
 
-        self.assertEqual(validate_timeout("0"), 0)
+        self.assertEqual(validate_timeout("1"), 1)
         self.assertEqual(validate_timeout(32767), 32767)
-        for value in (True, -1, 1.5, "32768", "1e2"):
+        for value in (True, 0, -1, 1.5, "32768", "1e2"):
             with self.subTest(value=value):
                 with self.assertRaises(MotionInputError):
                     validate_timeout(value)
+
+    def test_if_input_row_builder_composes_with_auxiliary_validation(self):
+        class ProgramView:
+            def __init__(self):
+                self.rows = [b"Tab Number 1\n"]
+                self.selected = 0
+
+            def curselection(self):
+                return (self.selected,)
+
+            def index(self, value):
+                if value != "end":
+                    raise AssertionError("unexpected program-view index")
+                return len(self.rows)
+
+            def insert(self, index, row):
+                self.rows.insert(index, row)
+
+            def selection_clear(self, *args):
+                self.selected = None
+
+            def select_set(self, index):
+                self.selected = index
+
+            def see(self, *args):
+                pass
+
+            def get(self, first, last=None):
+                if last is not None:
+                    return tuple(self.rows)
+                return self.rows[first]
+
+        class Entry:
+            def __init__(self, value=""):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+        view = ProgramView()
+        builder_namespace = {
+            "tab1": SimpleNamespace(progView=view),
+            "iFoption": Entry("5v Input"),
+            "iFselection": Entry("Stop"),
+            "IfVarEntryField": Entry("2"),
+            "IfInputEntryField": Entry("1"),
+            "IfDestEntryField": Entry(""),
+            "ProgEntryField": Entry("ignored.ar4"),
+            "END": "end",
+            "path": SimpleNamespace(relpath=lambda value: value),
+            "open": lambda *args, **kwargs: io.StringIO(),
+            "_set_application_status": lambda **kwargs: True,
+        }
+        insert_if = self.compile_function("IfCMDInsert", builder_namespace)
+
+        insert_if()
+
+        self.assertEqual(view.rows[1], b"If Input # 2 = 1 : Stop \n")
+        transmitted = []
+        sent_field = Entry()
+
+        def execute_auxiliary(command, **contract):
+            validate_auxiliary_input_command(command, AUXILIARY_BOARD_NANO)
+            transmitted.append((command, contract))
+            return "complete", "F"
+
+        runtime = {
+            "estopActive": False,
+            "posOutreach": False,
+            "programStopRequestId": None,
+            "programStopStatusLatched": False,
+            "progRunning": False,
+            "rowinproc": 0,
+            "offlineMode": False,
+            "moveInProc": 0,
+        }
+        execute_namespace = {
+            "RUN": runtime,
+            "tab1": SimpleNamespace(progView=view),
+            "program_stop_state_lock": threading.RLock(),
+            "cmdSentEntryField": sent_field,
+            "_execute_row_auxiliary_command": execute_auxiliary,
+            "_finish_execute_row": lambda: None,
+            "_set_application_status": lambda *args, **kwargs: True,
+            "stopProg": lambda: self.fail("mismatched input must not stop"),
+            "ROW_EXECUTION_COMPLETE": "complete",
+            "ROW_EXECUTION_PENDING": "pending",
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "END": "end",
+        }
+        execute_row = self.compile_function("executeRow", execute_namespace)
+
+        self.assertEqual(execute_row(), "complete")
+        self.assertEqual(sent_field.value, "JFX2\n")
+        self.assertEqual(
+            transmitted,
+            [
+                (
+                    "JFX2\n",
+                    {
+                        "read_line": True,
+                        "accepted_responses": ("T", "F"),
+                    },
+                ),
+            ],
+        )
 
     def test_main_wait_contract_matches_teensy_numeric_and_response_types(self):
         namespace = {
@@ -16789,7 +16947,33 @@ class HmiSourceContractTests(unittest.TestCase):
             MotionInputError,
             "validated line responses",
         ):
-            execute_auxiliary("WIA1B1C30\n", control_injectable=True)
+            execute_auxiliary("WIA2B1C30\n", control_injectable=True)
+
+        with self.assertRaisesRegex(TypeError, "parser must be callable"):
+            execute_auxiliary(
+                "TG\n",
+                read_line=True,
+                response_parser="not-callable",
+            )
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "line-response ownership",
+        ):
+            execute_auxiliary(
+                "TG\n",
+                expected_response=b"Done",
+                response_parser=lambda command, response: response,
+            )
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "one validation contract",
+        ):
+            execute_auxiliary(
+                "TG\n",
+                read_line=True,
+                accepted_responses=("0.000",),
+                response_parser=lambda command, response: response,
+            )
 
     def test_servo_and_output_rows_require_exact_unframed_acknowledgements(self):
         exact_responses = []
@@ -16808,6 +16992,33 @@ class HmiSourceContractTests(unittest.TestCase):
                         exact_responses.append(keyword.value.value)
 
         self.assertCountEqual(exact_responses, (b"Servo Done", b"Done"))
+
+    def test_gripper_current_row_uses_command_specific_response_validation(self):
+        gripper_current_calls = []
+        for node in ast.walk(self.module_functions["executeRow"]):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_execute_row_auxiliary_command"
+            ):
+                keyword_values = {
+                    keyword.arg: keyword.value
+                    for keyword in node.keywords
+                }
+                parser = keyword_values.get("response_parser")
+                if (
+                    isinstance(parser, ast.Name)
+                    and parser.id == "parse_auxiliary_gripper_current_response"
+                ):
+                    gripper_current_calls.append(keyword_values)
+
+        self.assertEqual(len(gripper_current_calls), 1)
+        self.assertIsInstance(
+            gripper_current_calls[0].get("read_line"),
+            ast.Constant,
+        )
+        self.assertIs(gripper_current_calls[0]["read_line"].value, True)
+        self.assertNotIn("accepted_responses", gripper_current_calls[0])
 
     def test_program_entry_points_reserve_request_scoped_execution(self):
         expected_modes = {
@@ -36657,7 +36868,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
             def write(self, command):
                 self.commands.append(command)
-                if command == b"WIA1B1C30\n":
+                if command == b"WIA2B1C30\n":
                     legacy_write_started.set()
                     if not release_legacy_write.wait(2):
                         raise TimeoutError("legacy write release timed out")
@@ -36714,6 +36925,24 @@ class HmiSourceContractTests(unittest.TestCase):
             "RUN": {"ser2": serial_port, "offlineMode": False},
             "write_serial_control": write_serial_control,
             "serial_transport_quarantined": lambda serial_port: False,
+            "_connected_auxiliary_board_profile": (
+                lambda port: AUXILIARY_BOARD_MEGA
+            ),
+            "validate_auxiliary_gripper_current_command": (
+                validate_auxiliary_gripper_current_command
+            ),
+            "validate_auxiliary_input_command": (
+                validate_auxiliary_input_command
+            ),
+            "validate_auxiliary_output_command": (
+                validate_auxiliary_output_command
+            ),
+            "validate_auxiliary_servo_command": (
+                validate_auxiliary_servo_command
+            ),
+            "validate_auxiliary_wait_command": (
+                validate_auxiliary_wait_command
+            ),
             "_exchange_auxiliary_line": lambda command: (_ for _ in ()).throw(
                 AssertionError("interruptible wait owner must remain the sole reader")
             ),
@@ -36743,7 +36972,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         def run_legacy_write():
             try:
-                write_legacy("WIA1B1C30\n")
+                write_legacy("WIA2B1C30\n")
             except BaseException as exc:
                 legacy_errors.append(exc)
 
@@ -36757,7 +36986,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(event_queue.get(timeout=2), ("started", 31, "STOP\n"))
         with self.assertRaises(Empty):
             event_queue.get(timeout=0.05)
-        self.assertEqual(serial_port.commands, [b"WIA1B1C30\n"])
+        self.assertEqual(serial_port.commands, [b"WIA2B1C30\n"])
 
         release_legacy_write.set()
         legacy_worker.join(2)
@@ -36766,7 +36995,7 @@ class HmiSourceContractTests(unittest.TestCase):
         deadline = time.monotonic() + 2
         while len(serial_port.commands) < 2 and time.monotonic() < deadline:
             time.sleep(0.005)
-        self.assertEqual(serial_port.commands, [b"WIA1B1C30\n", b"STOP\n"])
+        self.assertEqual(serial_port.commands, [b"WIA2B1C30\n", b"STOP\n"])
         with self.assertRaises(Empty):
             event_queue.get(timeout=0.05)
         self.assertTrue(publish_owner_result(True, "Nano Stopped"))
@@ -36974,7 +37203,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 owner_thread = threading.Thread(
                     target=lambda: owner_results.append(
                         execute_auxiliary(
-                            "WIA1B1C30\n",
+                            "WIA2B1C30\n",
                             read_line=True,
                             control_injectable=True,
                             response_delay=0,
@@ -37033,7 +37262,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     serial_port.commands,
-                    [b"WIA1B1C30\n", b"STOP\n"],
+                    [b"WIA2B1C30\n", b"STOP\n"],
                 )
                 self.assertEqual(serial_port.read_threads, {owner_thread.ident})
                 self.assertEqual(serial_port.reset_count, 1)
@@ -37095,6 +37324,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "ROW_EXECUTION_COMPLETE": "complete",
             "logger": SimpleNamespace(
                 warning=lambda *args: None,
+                error=lambda *args: None,
                 exception=lambda *args: None,
             ),
             "almStatusLab": labels,
@@ -37107,7 +37337,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         result = execute_auxiliary(
-            "WIA1B1C30\n",
+            "WIA2B1C30\n",
             read_line=True,
             control_injectable=True,
             response_delay=0,
@@ -37119,6 +37349,109 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIsNone(namespace["RUN"]["ser2"])
         self.assertFalse(serial_port.is_open)
         self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_invalid_gripper_current_response_rejects_without_quarantine(self):
+        class SerialPort:
+            def __init__(self):
+                self.is_open = True
+                self.timeout = 5.0
+                self.response = bytearray(b"-0.250\n")
+
+            def read(self, size=1):
+                value = bytes(self.response[:size])
+                del self.response[:size]
+                return value
+
+            def read_until(self, terminator, size):
+                limit = min(size, len(self.response))
+                index = self.response.find(terminator, 0, limit)
+                count = limit if index < 0 else index + len(terminator)
+                value = bytes(self.response[:count])
+                del self.response[:count]
+                return value
+
+            def close(self):
+                self.is_open = False
+
+        @contextmanager
+        def tracked_auxiliary_operation(control_injectable=False):
+            yield
+
+        serial_port = SerialPort()
+        cleared_profiles = []
+        statuses = []
+        namespace = {
+            "RUN": {"ser2": serial_port},
+            "SerialActivityRejected": SerialActivityRejected,
+            "ProtocolResponseError": ProtocolResponseError,
+            "MotionInputError": MotionInputError,
+            "MAX_RESPONSE_PAYLOAD_LENGTH": MAX_RESPONSE_PAYLOAD_LENGTH,
+            "SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS": 0.5,
+            "AUXILIARY_WAIT_NATURAL_RESPONSES": ("Done", "Timeout"),
+            "AUXILIARY_INACTIVE_STOP_RESPONSE": "Nano Inactive Stopped",
+            "auxiliary_stop_injected_event": threading.Event(),
+            "_active_program_execution_cancelled": lambda: False,
+            "_tracked_auxiliary_operation": tracked_auxiliary_operation,
+            "_write_legacy_auxiliary_command": lambda command: True,
+            "read_serial_line_response": read_serial_line_response,
+            "quarantine_serial_transport": quarantine_serial_transport,
+            "_clear_auxiliary_board_profile": (
+                lambda port: cleared_profiles.append(port)
+            ),
+            "finite_number": finite_number,
+            "_finish_execute_row": lambda: None,
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "ROW_EXECUTION_COMPLETE": "complete",
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "time": time,
+        }
+        execute_auxiliary = self.compile_function(
+            "_execute_row_auxiliary_command",
+            namespace,
+        )
+
+        result = execute_auxiliary(
+            "TG\n",
+            read_line=True,
+            response_delay=0,
+            response_timeout=0.5,
+            response_parser=parse_auxiliary_gripper_current_response,
+        )
+
+        self.assertEqual(result, ("rejected", None))
+        self.assertIs(namespace["RUN"]["ser2"], serial_port)
+        self.assertTrue(serial_port.is_open)
+        self.assertFalse(serial_transport_quarantined(serial_port))
+        self.assertEqual(cleared_profiles, [])
+        self.assertEqual(len(statuses), 1)
+        self.assertIn("Program auxiliary response rejected", statuses[0][0])
+
+        def broken_parser(command, response):
+            raise TypeError("broken auxiliary parser")
+
+        serial_port.response = bytearray(b"1.000\n")
+        result = execute_auxiliary(
+            "TG\n",
+            read_line=True,
+            response_delay=0,
+            response_timeout=0.5,
+            response_parser=broken_parser,
+        )
+
+        self.assertEqual(result, ("rejected", None))
+        self.assertIs(namespace["RUN"]["ser2"], serial_port)
+        self.assertTrue(serial_port.is_open)
+        self.assertFalse(serial_transport_quarantined(serial_port))
+        self.assertEqual(cleared_profiles, [])
+        self.assertEqual(len(statuses), 2)
+        self.assertIn("Program auxiliary command failed", statuses[1][0])
 
     def test_event_poll_supervisor_retries_failed_sibling_schedulers(self):
         class TclError(Exception):
