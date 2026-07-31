@@ -81,13 +81,15 @@ success.
   and are unsupported for motion; Linux requires a matching build from current
   tracked source. The supported packaged Windows native extension targets CPython
   3.12 x64. Python package requirements remain unpinned, so framework versions
-  are unverified. Host source identifies version 6.7; active Teensy firmware
-  identifies version `6.7.1-ar4hmi.5` and advertises
+  are unverified. Host source identifies version 6.7. The tracked Teensy
+  source identifies version `6.7.1-ar4hmi.8` and advertises
   `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`,
-  `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, and
+  `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`,
+  `ESTOP_ADMISSION_V1`, and
   legacy `HOME_REFERENCE_V1`, preferred `HOME_REFERENCE_V2`, and optional
-  request-scoped
-  `JOINT_TELEMETRY_V1`.
+  request-scoped `JOINT_TELEMETRY_V1`. The latest dated deployment record
+  identifies controller version `6.7.1-ar4hmi.5`; no tracked record establishes
+  deployment of the `.8` source.
 - **Boundary direction**: `AR4.py` calls `ARrobots` Python modules and the
   `robot_kinematics` native extension. `ARrobots/src/bindings.cpp` exposes
   `ARrobots/src/kinematics.cpp`. Host serial commands are consumed by Teensy,

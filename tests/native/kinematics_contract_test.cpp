@@ -1390,7 +1390,7 @@ void test_controller_domain_contract() {
             ModbusOperation::kReadHoldingRegisters,
             1,
             0,
-            64
+            1
         )
             && ar4_protocol::validate_modbus_request(
                 ModbusOperation::kReadHoldingRegisters,
@@ -1421,7 +1421,13 @@ void test_controller_domain_contract() {
                 ModbusOperation::kReadHoldingRegisters,
                 1,
                 0,
-                65
+                2
+            )
+            && !ar4_protocol::validate_modbus_request(
+                ModbusOperation::kReadInputRegisters,
+                1,
+                0,
+                64
             )
             && !ar4_protocol::validate_modbus_request(
                 ModbusOperation::kReadHoldingRegisters,
@@ -2379,6 +2385,55 @@ void test_primary_home_reference_contract() {
 }
 
 void test_joint_telemetry_contract() {
+    volatile ar4_protocol::ControllerResponseOwnership response_ownership = {
+        false,
+        false,
+    };
+    require(
+        ar4_protocol::begin_controller_response_ownership(
+            response_ownership
+        )
+            && response_ownership.active
+            && !response_ownership.estop_response_pending,
+        "ordinary controller response ownership was not acquired"
+    );
+    require(
+        !ar4_protocol::begin_controller_response_ownership(
+            response_ownership
+        ),
+        "nested ordinary controller response ownership was admitted"
+    );
+    ar4_protocol::record_controller_estop_response(response_ownership);
+    require(
+        response_ownership.active
+            && response_ownership.estop_response_pending,
+        "E-stop interrupt was not deferred during an ordinary response"
+    );
+    require(
+        ar4_protocol::complete_controller_response_ownership(
+            response_ownership
+        )
+            && !response_ownership.active
+            && response_ownership.estop_response_pending,
+        "ordinary response completion did not preserve deferred E-stop output"
+    );
+    require(
+        ar4_protocol::acknowledge_controller_estop_response(
+            response_ownership
+        )
+            && !response_ownership.estop_response_pending,
+        "deferred ordinary-response E-stop output was not acknowledged"
+    );
+    require(
+        !ar4_protocol::complete_controller_response_ownership(
+            response_ownership
+        )
+            && !ar4_protocol::acknowledge_controller_estop_response(
+                response_ownership
+            ),
+        "settled ordinary response ownership emitted a duplicate E-stop"
+    );
+
     const int32_t encoder_counts[
         ar4_protocol::kJointTelemetryAxisCount
     ] = {750, -1500, 2750, -3500, 200, -5500};
@@ -2671,12 +2726,168 @@ void test_joint_telemetry_contract() {
             && ar4_protocol::joint_telemetry_estop_admission_blocked(
                 ownership
             ),
-        "post-selection E-stop did not become a durable admission block"
+        "post-selection E-stop did not request publication and admission block"
     );
     ar4_protocol::clear_joint_telemetry_estop_admission_block(ownership);
     require(
         !ar4_protocol::joint_telemetry_estop_admission_blocked(ownership),
         "reported telemetry E-stop admission block did not clear"
+    );
+
+    volatile ar4_protocol::EstopAdmissionOwnership admission = {
+        0,
+        false,
+    };
+    volatile ar4_protocol::ControllerResponseOwnership
+        admission_controller = {
+            false,
+            false,
+        };
+    volatile ar4_protocol::JointTelemetryResponseOwnership
+        admission_telemetry = {
+            false,
+            false,
+            false,
+        };
+    volatile bool admission_estop_active = false;
+    const ar4_protocol::EstopAdmissionDecision clear_admission =
+        ar4_protocol::begin_estop_admission(
+            false,
+            false,
+            false,
+            admission
+        );
+    require(
+        !clear_admission.blocked
+            && clear_admission.assertion_generation == 0
+            && !admission.response_active,
+        "clear E-stop state did not admit a command atomically"
+    );
+
+    require(
+        ar4_protocol::begin_controller_response_ownership(
+            admission_controller
+        ),
+        "admission response owner was not acquired"
+    );
+    require(
+        ar4_protocol::record_estop_interrupt(
+            admission,
+            admission_estop_active,
+            admission_controller,
+            admission_telemetry
+        )
+            && admission_estop_active,
+        "first production E-stop interrupt was not latched"
+    );
+    const ar4_protocol::EstopAdmissionDecision blocked_admission =
+        ar4_protocol::begin_estop_admission(
+            false,
+            true,
+            false,
+            admission
+        );
+    require(
+        blocked_admission.blocked
+            && blocked_admission.assertion_generation == 1
+            && admission.response_active
+            && admission_controller.active
+            && admission_controller.estop_response_pending,
+        "latched E-stop did not reserve the correlated admission response"
+    );
+    require(
+        !ar4_protocol::record_estop_interrupt(
+            admission,
+            admission_estop_active,
+            admission_controller,
+            admission_telemetry
+        ),
+        "reasserted production E-stop interrupt replaced the active latch"
+    );
+    const bool cleared_reasserted_latch =
+        ar4_protocol::complete_estop_admission_response(
+            blocked_admission,
+            false,
+            admission,
+            admission_controller
+        );
+    if (cleared_reasserted_latch) admission_estop_active = false;
+    require(
+        !cleared_reasserted_latch
+            && admission_estop_active
+            && !admission.response_active
+            && !admission_controller.active
+            && !admission_controller.estop_response_pending,
+        "newer E-stop latch was lost or response ownership survived EA teardown"
+    );
+
+    require(
+        ar4_protocol::begin_controller_response_ownership(
+            admission_controller
+        ),
+        "released admission response owner was not acquired"
+    );
+    const ar4_protocol::EstopAdmissionDecision released_admission =
+        ar4_protocol::begin_estop_admission(
+            false,
+            admission_estop_active,
+            false,
+            admission
+        );
+    const bool cleared_released_latch =
+        ar4_protocol::complete_estop_admission_response(
+            released_admission,
+            false,
+            admission,
+            admission_controller
+        );
+    if (cleared_released_latch) admission_estop_active = false;
+    require(
+        cleared_released_latch
+            && !admission_estop_active
+            && !admission.response_active
+            && !admission_controller.active,
+        "released E-stop latch or response owner did not retire"
+    );
+
+    require(
+        ar4_protocol::begin_controller_response_ownership(
+            admission_controller
+        ),
+        "asserted-input admission response owner was not acquired"
+    );
+    require(
+        ar4_protocol::record_estop_interrupt(
+            admission,
+            admission_estop_active,
+            admission_controller,
+            admission_telemetry
+        )
+            && admission_estop_active,
+        "asserted-input production E-stop interrupt was not latched"
+    );
+    const ar4_protocol::EstopAdmissionDecision asserted_input =
+        ar4_protocol::begin_estop_admission(
+            false,
+            admission_estop_active,
+            true,
+            admission
+        );
+    const bool cleared_asserted_input =
+        ar4_protocol::complete_estop_admission_response(
+            asserted_input,
+            true,
+            admission,
+            admission_controller
+        );
+    if (cleared_asserted_input) admission_estop_active = false;
+    require(
+        asserted_input.blocked
+            && !cleared_asserted_input
+            && admission_estop_active
+            && !admission.response_active
+            && !admission_controller.active,
+        "asserted-input E-stop latch was lost or response owner survived teardown"
     );
 }
 

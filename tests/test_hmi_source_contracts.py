@@ -2,6 +2,7 @@ import ast
 import copy
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from datetime import datetime
 from functools import wraps
 import importlib
 import io
@@ -36,15 +37,22 @@ from ARrobots.HMI.joint_motion import (
     CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+    CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
     CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
     CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
     CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
     CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+    CONTROLLER_ESTOP_ADMISSION_FLAG,
+    CONTROLLER_ESTOP_EVENT_FLAG,
     CONTROLLER_MAXIMUM_PULSE_DELAY_MICROSECONDS,
     FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS,
     JOINT_TELEMETRY_PERIOD_SECONDS,
     ControllerIdentity,
     ControllerJointCalibration,
+    ControllerLineExchangeResponse,
+    ControllerModbusExchangeResponse,
+    DeferredJointAdjustments,
+    DeferredJointDispatchOutcome,
     MotionInputError,
     LiveMotionScheduleResult,
     MAX_COMMAND_LENGTH,
@@ -67,10 +75,13 @@ from ARrobots.HMI.joint_motion import (
     SerialTransportTimeout,
     VirtualMotionOperation,
     auxiliary_pneumatic_output_pin,
+    build_controller_modbus_command,
     build_virtual_joint_command,
     canonicalize_serial_command,
     canonicalize_virtual_command,
+    classify_controller_modbus_terminal_response,
     command_response_timeout,
+    controller_modbus_command_is_write,
     controller_degree_to_native_radians,
     controller_number,
     controller_protocol_decimal,
@@ -86,11 +97,13 @@ from ARrobots.HMI.joint_motion import (
     parse_auxiliary_servo_command,
     parse_command_timing,
     parse_controller_identity_response,
+    parse_controller_modbus_exchange_frames,
     parse_controller_modbus_response,
     parse_joint_motion_exchange_response,
     parse_joint_telemetry_response,
     parse_motion_wrist_config,
     parse_position_response,
+    position_response_is_physical_estop,
     parse_primary_home_reference_capability_response,
     parse_primary_home_reference_response,
     parse_primary_home_reference_v2_response,
@@ -98,6 +111,10 @@ from ARrobots.HMI.joint_motion import (
     primary_home_reference_command,
     primary_shutdown_position,
     quarantine_serial_transport,
+    read_controller_exact_exchange_response,
+    read_controller_line_exchange_response,
+    read_controller_modbus_exchange_response,
+    read_pending_controller_estop_response,
     read_serial_exact_response,
     read_serial_line_response,
     read_serial_line_response_with_optional_followup,
@@ -105,6 +122,7 @@ from ARrobots.HMI.joint_motion import (
     serial_transport_quarantined,
     validate_auxiliary_output_command,
     validate_auxiliary_servo_command,
+    validate_controller_modbus_command,
     validate_controller_filename,
     validate_controller_hardware_id,
     validate_controller_media_id,
@@ -197,6 +215,7 @@ VALID_CONTROLLER_IDENTITY_RESPONSE = json.dumps(
             CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
             CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
             CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+            CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
         ],
     },
     separators=(",", ":"),
@@ -360,16 +379,32 @@ class HmiSourceContractTests(unittest.TestCase):
 
     def compile_function(self, name, namespace, *, preserve_decorators=False):
         self.add_motion_request_dependencies(namespace)
+        namespace.setdefault(
+            "RUN",
+            {
+                "estopActive": False,
+                "posOutreach": False,
+                "programStopRequestId": None,
+                "programStopStatusLatched": False,
+            },
+        )
         namespace.setdefault("gcode_storage_state_lock", threading.Lock())
         namespace.setdefault(
             "controller_identity_state_lock",
             threading.Lock(),
         )
         namespace.setdefault(
+            "manual_controller_cleanup_lock",
+            threading.Lock(),
+        )
+        namespace.setdefault("manual_controller_cleanup_pending", None)
+        namespace.setdefault(
             "MainControllerIdentityBinding",
             SimpleNamespace,
         )
         namespace.setdefault("main_controller_identity_binding", None)
+        namespace.setdefault("main_controller_connection_epoch", 0)
+        namespace.setdefault("confirmed_position_generation", 0)
         namespace.setdefault("joint_actual_position_source_snapshot", None)
         resynchronization_helper = (
             "_require_controller_position_resynchronization"
@@ -384,6 +419,109 @@ class HmiSourceContractTests(unittest.TestCase):
             )
         ):
             self.compile_function(resynchronization_helper, namespace)
+        function_dependencies = {
+            "_set_application_status": (
+                "_manual_auxiliary_status_reserved",
+            ),
+            "_manual_auxiliary_status_reserved": (
+                "_manual_auxiliary_stop_in_progress",
+            ),
+            "_program_execution_stop_admission_reason_locked": (
+                "_stop_admission_reason_locked",
+            ),
+            "_program_execution_request_cancelled": (
+                "_program_execution_request_active",
+            ),
+            "_reject_cancelled_program_row": (
+                "_abort_program_row_execution",
+            ),
+            "_latch_main_controller_stop_state": (
+                "_reserve_auxiliary_stop_request_locked",
+                "_cancel_active_program_execution",
+            ),
+            "stopProg": ("_cancel_active_program_execution",),
+            "_apply_main_controller_stop_events": (
+                "_clear_manual_auxiliary_stop_barrier_if_settled",
+            ),
+            "_apply_pending_manual_controller_stop_event": (
+                "_clear_manual_auxiliary_stop_barrier_if_settled",
+            ),
+            "_request_auxiliary_stop": (
+                "_reserve_auxiliary_stop_request_locked",
+            ),
+            "_run_auxiliary_stop_safe": (
+                "_settle_main_controller_auxiliary_stop_request_locked",
+            ),
+            "_settle_main_controller_auxiliary_stop_request": (
+                "_settle_main_controller_auxiliary_stop_request_locked",
+            ),
+            "_try_dispatch_auxiliary_stop": (
+                "_settle_main_controller_auxiliary_stop_request_locked",
+            ),
+            "_poll_application_close": (
+                "_serial_shutdown_ready_for_close",
+            ),
+            "_begin_program_execution": (
+                "_program_execution_stop_admission_reason_locked",
+            ),
+            "_program_execution_busy_message": (
+                "_program_execution_stop_admission_reason_locked",
+            ),
+            "_start_manual_controller_request": (
+                "_stop_admission_reason_locked",
+            ),
+            "_apply_auxiliary_configuration_snapshot": (
+                "_stop_admission_reason_locked",
+                "_apply_auxiliary_configuration_snapshot_contents",
+            ),
+            "setCom2": (
+                "_stop_admission_reason_locked",
+            ),
+            "_clear_controller_fault_latches_after_confirmed_startup": (
+                "_program_execution_stop_admission_reason_locked",
+            ),
+            "_apply_controller_startup_result": (
+                "_clear_controller_fault_latches_after_confirmed_startup",
+            ),
+            "_prepare_startup_main_controller_stop_exchange": (
+                "_capture_startup_main_controller_stop_context",
+            ),
+            "_startup_controller_exchange": (
+                "_prepare_startup_main_controller_stop_exchange",
+            ),
+            "_startup_exchange_response": (
+                "_startup_controller_exchange",
+            ),
+            "_startup_controller_identity": (
+                "_startup_controller_exchange",
+            ),
+            "_write_legacy_auxiliary_command": (
+                "_manual_auxiliary_stop_in_progress",
+            ),
+            "executeRow": (
+                "_reject_cancelled_program_row",
+            ),
+        }
+        for dependency in function_dependencies.get(name, ()):
+            if dependency not in namespace:
+                self.compile_function(dependency, namespace)
+        for dependency in (
+            "_set_application_status",
+            "_active_program_execution_cancelled",
+            "_active_program_execution_request",
+            "_cancel_active_program_execution",
+            "_program_execution_request_cancelled",
+        ):
+            if (
+                name != dependency
+                and dependency not in namespace
+                and any(
+                    isinstance(node, ast.Name)
+                    and node.id == dependency
+                    for node in ast.walk(self.module_functions[name])
+                )
+            ):
+                self.compile_function(dependency, namespace)
         main_identity_cleanup_callers = (
             "_apply_gcode_storage_result",
             "_close_failed_controller_startup",
@@ -391,6 +529,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_exchange_controller_calibration_acknowledgement",
             "_exchange_gcode_row",
             "_exchange_legacy_main_command",
+            "_exchange_joint_motion",
             "_exchange_position_acknowledgement",
             "_exchange_serial_line",
             "_invalidate_uncertain_controller_calibration",
@@ -400,6 +539,11 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace.setdefault(
                 "_clear_main_controller_identity",
                 lambda serial_port=None: True,
+            )
+        if name == "_exchange_joint_motion":
+            namespace.setdefault(
+                "quarantine_serial_transport",
+                quarantine_serial_transport,
             )
         namespace.setdefault(
             "EVENT_POLL_INTERVAL_MS",
@@ -429,6 +573,14 @@ class HmiSourceContractTests(unittest.TestCase):
             reschedule_event_poll,
         )
         namespace.setdefault(
+            "_apply_main_controller_idle_stop_results",
+            lambda: False,
+        )
+        namespace.setdefault(
+            "_try_start_main_controller_idle_stop_reader",
+            lambda: False,
+        )
+        namespace.setdefault(
             "_set_joint_motion_target_display",
             lambda target_positions: tuple(target_positions),
         )
@@ -450,16 +602,52 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         namespace.setdefault("dataclass", dataclass)
         namespace.setdefault("threading", threading)
+        namespace.setdefault(
+            "PROGRAM_EXECUTION_MODES",
+            frozenset(("run", "step-forward", "step-reverse")),
+        )
+        namespace.setdefault(
+            "program_execution_cancelled",
+            threading.Event(),
+        )
         namespace.setdefault("contextmanager", contextmanager)
         namespace.setdefault(
             "manual_auxiliary_stop_barrier",
             threading.Event(),
         )
         namespace.setdefault(
+            "manual_auxiliary_state_lock",
+            threading.Lock(),
+        )
+        namespace.setdefault(
+            "auxiliary_serial_lock",
+            threading.Lock(),
+        )
+        namespace.setdefault("manual_auxiliary_request_queue", [])
+        namespace.setdefault(
+            "auxiliary_stop_state_lock",
+            threading.Lock(),
+        )
+        namespace.setdefault(
+            "auxiliary_stop_requested",
+            threading.Event(),
+        )
+        namespace.setdefault("auxiliary_stop_next_request_id", 0)
+        namespace.setdefault("auxiliary_stop_pending_request_id", None)
+        namespace.setdefault("auxiliary_stop_active_request_id", None)
+        namespace.setdefault(
+            "main_controller_auxiliary_stop_request_id",
+            None,
+        )
+        namespace.setdefault("manual_controller_pending_stop_event", None)
+        namespace.setdefault(
             "program_stop_state_lock",
             threading.RLock(),
         )
         namespace.setdefault("program_stop_status_event_queue", Queue())
+        namespace.setdefault("program_stop_status_pending_event", None)
+        namespace.setdefault("main_controller_stop_event_queue", Queue())
+        namespace.setdefault("main_controller_stop_pending_event", None)
         namespace.setdefault("Empty", Empty)
         namespace.setdefault("application_lifecycle_lock", threading.Lock())
         namespace.setdefault("calibration_terminal_owner_lock", threading.Lock())
@@ -638,6 +826,10 @@ class HmiSourceContractTests(unittest.TestCase):
             CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
         )
         namespace.setdefault(
+            "CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1",
+            CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
+        )
+        namespace.setdefault(
             "CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1",
             CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
         )
@@ -649,6 +841,10 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault(
             "parse_controller_identity_response",
             parse_controller_identity_response,
+        )
+        namespace.setdefault(
+            "parse_position_response",
+            parse_position_response,
         )
         namespace.setdefault(
             "parse_virtual_command_timing",
@@ -673,6 +869,78 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace["kinematics_configuration_ready"] = kinematics_ready
         namespace.setdefault("VirtualMotionOperation", VirtualMotionOperation)
         namespace.setdefault("PositionResponse", PositionResponse)
+        if (
+            "SerialWriteCancellationBoundary" not in namespace
+            and any(
+                isinstance(node, ast.Name)
+                and node.id == "SerialWriteCancellationBoundary"
+                for node in ast.walk(self.module_functions[name])
+            )
+        ):
+            namespace["SerialWriteCancellationBoundary"] = self.compile_class(
+                "SerialWriteCancellationBoundary",
+                namespace,
+            )
+        if (
+            name != "_active_program_execution_cancelled"
+            and "ProgramExecutionRequest" not in namespace
+            and any(
+                isinstance(node, ast.Name)
+                and node.id == "ProgramExecutionRequest"
+                for node in ast.walk(self.module_functions[name])
+            )
+        ):
+            namespace["ProgramExecutionRequest"] = self.compile_class(
+                "ProgramExecutionRequest",
+                namespace,
+            )
+        if (
+            name == "executeRow"
+            and namespace.get("program_execution_active_request") is None
+        ):
+            namespace["program_execution_active_request"] = (
+                namespace["ProgramExecutionRequest"](
+                    1,
+                    "run",
+                    namespace["SerialWriteCancellationBoundary"](
+                        "test program execution"
+                    ),
+                )
+            )
+        if (
+            namespace.get("program_execution_active_request") is None
+            and "ProgramExecutionRequest" in namespace
+            and any(
+                isinstance(node, ast.Name)
+                and node.id == "_active_program_execution_request"
+                for node in ast.walk(self.module_functions[name])
+            )
+        ):
+            namespace["program_execution_active_request"] = (
+                namespace["ProgramExecutionRequest"](
+                    1,
+                    "run",
+                    namespace["SerialWriteCancellationBoundary"](
+                        "test program execution"
+                    ),
+                )
+            )
+        namespace.setdefault(
+            "DeferredJointDispatchOutcome",
+            DeferredJointDispatchOutcome,
+        )
+        namespace.setdefault(
+            "CONTROLLER_ESTOP_ADMISSION_FLAG",
+            CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        namespace.setdefault(
+            "CONTROLLER_ESTOP_EVENT_FLAG",
+            CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        namespace.setdefault(
+            "position_response_is_physical_estop",
+            position_response_is_physical_estop,
+        )
         namespace.setdefault("time", time)
         if name in (
             "_read_auxiliary_inactive_stop_response",
@@ -707,6 +975,11 @@ class HmiSourceContractTests(unittest.TestCase):
                 lambda calibration_snapshot=None: True,
             )
         if name == "setCom2":
+            runtime = namespace.get("RUN")
+            if isinstance(runtime, dict):
+                runtime.setdefault("estopActive", False)
+                runtime.setdefault("posOutreach", False)
+                runtime.setdefault("programStopRequestId", None)
             namespace.setdefault(
                 "root",
                 SimpleNamespace(after_cancel=lambda job: None),
@@ -720,6 +993,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_begin_auxiliary_calibration_persistence_fence",
                 "_finish_auxiliary_calibration_persistence_fence",
                 "_reconcile_auxiliary_calibration_persistence_after_settle_failure",
+                "_apply_auxiliary_configuration_snapshot_contents",
                 "_apply_auxiliary_configuration_snapshot",
                 "_verify_auxiliary_configuration_snapshot",
             ):
@@ -788,6 +1062,9 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_prepare_controller_startup": (
                 "_prepare_cpp_kinematics_configuration",
+            ),
+            "startup": (
+                "_startup_controller_identity",
             ),
             "_prepare_cpp_kinematics_configuration": (
                 "_validated_native_kinematics_rotations",
@@ -948,6 +1225,19 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_calibration_result_failure_details",
             ),
         }
+        if (
+            name == "startup"
+            and "_startup_controller_identity" not in namespace
+            and "_startup_exchange_response" in namespace
+        ):
+            exchange_startup = namespace["_startup_exchange_response"]
+
+            def startup_identity(cancellation_boundary):
+                return parse_controller_identity_response(
+                    exchange_startup("HO\n", cancellation_boundary)
+                )
+
+            namespace["_startup_controller_identity"] = startup_identity
         for dependency in dependencies.get(name, ()):
             if dependency not in namespace or name == "GCconvertProg":
                 self.compile_function(
@@ -981,7 +1271,15 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         namespace.setdefault("program_execution_active_request", None)
         namespace.setdefault(
+            "program_execution_cancelled",
+            threading.Event(),
+        )
+        namespace.setdefault(
             "gcode_storage_program_admission_active",
+            False,
+        )
+        namespace.setdefault(
+            "manual_controller_program_admission_active",
             False,
         )
         namespace.setdefault(
@@ -1015,7 +1313,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         namespace.setdefault(
             "_try_dispatch_deferred_joint_adjustments",
-            lambda **kwargs: False,
+            lambda **kwargs: DeferredJointDispatchOutcome.IDLE,
         )
         namespace.setdefault("_capture_program_motion_pose", lambda: object())
         namespace.setdefault(
@@ -1107,11 +1405,29 @@ class HmiSourceContractTests(unittest.TestCase):
     @staticmethod
     def add_shutdown_dependencies(namespace):
         namespace.setdefault("_calibration_shutdown_pending", lambda: False)
+        namespace.setdefault(
+            "_auxiliary_stop_shutdown_pending",
+            lambda: False,
+        )
         namespace.setdefault("_poll_calibration_events", lambda: None)
+        namespace.setdefault("_poll_manual_controller_events", lambda: None)
         namespace.setdefault("_poll_manual_auxiliary_events", lambda: None)
         namespace.setdefault("_poll_gcode_storage_events", lambda: None)
+        namespace.setdefault(
+            "_poll_called_program_navigation_events",
+            lambda: None,
+        )
         namespace.setdefault("_poll_virtual_motion_events", lambda: None)
         namespace.setdefault("_poll_xbox_auxiliary_events", lambda: None)
+        namespace.setdefault(
+            "manual_controller_cleanup_lock",
+            threading.Lock(),
+        )
+        namespace.setdefault("manual_controller_cleanup_pending", None)
+        namespace.setdefault(
+            "_retry_manual_controller_cleanup",
+            lambda: True,
+        )
         namespace.setdefault("startup_controller_cleanup_lock", threading.Lock())
         namespace.setdefault("startup_controller_cleanup_pending", {})
         namespace.setdefault("_ensure_startup_controller_cleanup", lambda: True)
@@ -1152,7 +1468,27 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
     def compile_class(self, name, namespace):
+        if (
+            name == "ProgramExecutionRequest"
+            and "SerialWriteCancellationBoundary" not in namespace
+        ):
+            namespace["SerialWriteCancellationBoundary"] = self.compile_class(
+                "SerialWriteCancellationBoundary",
+                namespace,
+            )
         namespace.setdefault("PrimaryHomeReference", PrimaryHomeReference)
+        namespace.setdefault(
+            "CONTROLLER_ESTOP_ADMISSION_FLAG",
+            CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        namespace.setdefault(
+            "CONTROLLER_ESTOP_EVENT_FLAG",
+            CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        namespace.setdefault(
+            "position_response_is_physical_estop",
+            position_response_is_physical_estop,
+        )
         namespace.setdefault(
             "CONTROLLER_CAPABILITY_HOME_REFERENCE_V1",
             CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
@@ -1180,6 +1516,15 @@ class HmiSourceContractTests(unittest.TestCase):
         ]
         self.assertEqual(len(matches), 1, name)
         function = copy.deepcopy(matches[0])
+        if (
+            "_set_application_status" not in namespace
+            and any(
+                isinstance(node, ast.Name)
+                and node.id == "_set_application_status"
+                for node in ast.walk(function)
+            )
+        ):
+            self.compile_function("_set_application_status", namespace)
         function.decorator_list = []
         module = ast.Module(body=[function], type_ignores=[])
         compiled = compile(ast.fix_missing_locations(module), str(AR4_SOURCE), "exec")
@@ -1316,7 +1661,17 @@ class HmiSourceContractTests(unittest.TestCase):
             "_capture_calibration_pose_snapshot": capture_pose_snapshot,
             "_restore_calibration_pose_snapshot": restore_pose_snapshot,
             "setStepMonitorsVR": lambda: state["monitor_updates"].append(True),
-            "exchange_serial_line_until_cancelled": exchange,
+            "_exchange_main_controller_line_until_cancelled": (
+                lambda serial_port, command, cancellation_event, **options: (
+                    exchange(
+                        serial_port,
+                        command,
+                        cancellation_event,
+                        write_lock=namespace["serial_write_lock"],
+                        **options,
+                    )
+                )
+            ),
             "serial_transport_quarantined": lambda serial_port: False,
             "threading": threading,
             "Empty": Empty,
@@ -1446,26 +1801,22 @@ class HmiSourceContractTests(unittest.TestCase):
         query_calls = []
 
         def exchange_home_reference(
-            candidate_port,
             command,
-            timeout,
             *,
-            write_lock,
-            reset_input,
+            response_timeout,
+            expected_serial_port,
         ):
+            self.assertIs(expected_serial_port, serial_port)
             query_calls.append(
                 (
-                    candidate_port,
                     command,
-                    timeout,
-                    write_lock,
-                    reset_input,
+                    response_timeout,
                 )
             )
             return response() if callable(response) else response
 
         namespace.update({
-            "exchange_serial_line": exchange_home_reference,
+            "_exchange_legacy_main_command": exchange_home_reference,
             "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 1.0,
             "parse_primary_home_reference_response": (
                 parse_primary_home_reference_response
@@ -2346,8 +2697,28 @@ class HmiSourceContractTests(unittest.TestCase):
             ("complete", b"Done\n"),
         )
         self.assertEqual(
-            exchanges,
-            [("TLX1\n", {"accepted_responses": (b"Done",)})],
+            len(exchanges),
+            1,
+        )
+        exchanged_command, exchange_contract = exchanges[0]
+        self.assertEqual(exchanged_command, "TLX1\n")
+        self.assertEqual(
+            exchange_contract["accepted_responses"],
+            (b"Done",),
+        )
+        self.assertIsInstance(
+            exchange_contract["write_started_event"],
+            threading.Event,
+        )
+        self.assertIs(
+            exchange_contract["cancellation_event"],
+            exchange_contract["write_boundary_lock"],
+        )
+        self.assertIs(
+            exchange_contract["cancellation_event"],
+            namespace[
+                "program_execution_active_request"
+            ].cancellation_boundary,
         )
         self.assertFalse(registry.active)
 
@@ -2838,21 +3209,12 @@ class HmiSourceContractTests(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 invalidations = []
 
-                def write_control(
-                    serial_port,
-                    command,
-                    *,
-                    write_lock,
-                    reset_input,
-                    write_started_event,
-                ):
-                    self.assertIs(serial_port, port)
+                def exchange_legacy(command, **options):
                     self.assertEqual(command, "UPA1\n")
-                    self.assertTrue(reset_input)
-                    write_started_event.set()
-                    return True
-
-                def read_response(serial_port, expected, timeout):
+                    self.assertFalse(options["read_line"])
+                    self.assertEqual(options["expected_response"], b"Done")
+                    self.assertEqual(options["response_timeout"], 1.0)
+                    options["write_started_event"].set()
                     if isinstance(outcome, Exception):
                         raise outcome
                     return "Done"
@@ -2860,10 +3222,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 namespace = {
                     "RUN": {"ser": port},
                     "threading": threading,
-                    "serial_write_lock": threading.Lock(),
                     "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 1.0,
-                    "write_serial_control": write_control,
-                    "read_serial_exact_response": read_response,
+                    "_exchange_legacy_main_command": exchange_legacy,
                     "_invalidate_bound_primary_home_reference": (
                         lambda serial_port: (
                             invalidations.append(serial_port)
@@ -3036,6 +3396,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
     def test_vision_samples_validate_current_frame_bounds(self):
         namespace = {
+            "dataclass": dataclass,
             "MotionInputError": MotionInputError,
             "finite_number": finite_number,
             "re": re,
@@ -4630,43 +4991,17 @@ class HmiSourceContractTests(unittest.TestCase):
         port = SimpleNamespace(is_open=True)
         exchange_calls = []
         home_reference_invalidations = []
-        write_lock = object()
 
-        def write_control(
-            serial_port,
-            command,
-            write_lock=None,
-            reset_input=False,
-            write_started_event=None,
-        ):
-            exchange_calls.append(
-                (
-                    "write",
-                    serial_port,
-                    command,
-                    write_lock,
-                    reset_input,
-                    write_started_event,
-                )
-            )
-            if write_started_event is not None:
-                write_started_event.set()
-            return True
+        def exchange_legacy(command, **options):
+            exchange_calls.append((command, options))
+            options["write_started_event"].set()
+            return "Done"
 
         helper_namespace = {
             "RUN": {"ser": port},
-            "serial_write_lock": write_lock,
+            "threading": threading,
             "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 10,
-            "write_serial_control": write_control,
-            "read_serial_exact_response": (
-                lambda serial_port, expected, timeout: (
-                    exchange_calls.append(
-                        ("read", serial_port, expected, timeout)
-                    )
-                    or "Done"
-                )
-            ),
-            "serial_transport_quarantined": lambda serial_port: False,
+            "_exchange_legacy_main_command": exchange_legacy,
             "_invalidate_bound_primary_home_reference": (
                 lambda serial_port: (
                     home_reference_invalidations.append(serial_port)
@@ -4680,13 +5015,23 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         self.assertTrue(exchange_acknowledgement("UPA1\n"))
+        self.assertEqual(exchange_calls[0][0], "UPA1\n")
         self.assertEqual(
-            exchange_calls[0][:-1],
-            ("write", port, "UPA1\n", write_lock, True),
+            {
+                key: value
+                for key, value in exchange_calls[0][1].items()
+                if key != "write_started_event"
+            },
+            {
+                "read_line": False,
+                "expected_response": b"Done",
+                "response_timeout": 10,
+            },
         )
-        self.assertTrue(exchange_calls[0][-1].is_set())
-        self.assertEqual(exchange_calls[1], ("read", port, b"Done", 10))
-        self.assertEqual(len(exchange_calls), 2)
+        self.assertTrue(
+            exchange_calls[0][1]["write_started_event"].is_set()
+        )
+        self.assertEqual(len(exchange_calls), 1)
         self.assertEqual(home_reference_invalidations, [port])
 
         calls = []
@@ -5298,6 +5643,73 @@ class HmiSourceContractTests(unittest.TestCase):
             {"com2Port": "old", "sentinel": "unchanged"},
         )
 
+    def test_confirmed_startup_is_the_fault_latch_reset_boundary(self):
+        serial_port = object()
+        runtime = {
+            "estopActive": True,
+            "posOutreach": True,
+            "programStopRequestId": None,
+            "programStopStatusLatched": True,
+            "programStopState": "faulted",
+        }
+        identity = {"bound": True}
+        namespace = {
+            "RUN": runtime,
+            "ProtocolResponseError": ProtocolResponseError,
+            "_current_main_controller_identity": (
+                lambda candidate: (
+                    identity if candidate is serial_port else None
+                )
+            ),
+        }
+        clear_faults = self.compile_function(
+            "_clear_controller_fault_latches_after_confirmed_startup",
+            namespace,
+        )
+
+        self.assertTrue(clear_faults(serial_port, VALID_CONTROLLER_POSITION))
+        self.assertFalse(runtime["estopActive"])
+        self.assertFalse(runtime["posOutreach"])
+        self.assertFalse(runtime["programStopStatusLatched"])
+        self.assertEqual(runtime["programStopState"], "completed")
+
+        runtime.update(
+            {
+                "estopActive": True,
+                "posOutreach": True,
+                "programStopRequestId": 7,
+                "programStopStatusLatched": True,
+                "programStopState": "pending",
+            }
+        )
+        self.assertTrue(clear_faults(serial_port, VALID_CONTROLLER_POSITION))
+        self.assertFalse(runtime["estopActive"])
+        self.assertFalse(runtime["posOutreach"])
+        self.assertTrue(runtime["programStopStatusLatched"])
+        self.assertEqual(runtime["programStopState"], "pending")
+
+        runtime_before = dict(runtime)
+        with self.assertRaisesRegex(
+            ProtocolResponseError,
+            "bound fault-free startup position",
+        ):
+            clear_faults(object(), VALID_CONTROLLER_POSITION)
+        self.assertEqual(runtime, runtime_before)
+
+        faulted_position = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                "NOEC000001",
+                1,
+            )
+        )
+        with self.assertRaisesRegex(
+            ProtocolResponseError,
+            "bound fault-free startup position",
+        ):
+            clear_faults(serial_port, faulted_position)
+        self.assertEqual(runtime, runtime_before)
+
     def test_controller_startup_rejects_returned_pose_before_local_mutation(self):
         calibration = {"com2Port": "old", "sentinel": "unchanged"}
         apply_calls = []
@@ -5416,6 +5828,11 @@ class HmiSourceContractTests(unittest.TestCase):
                     ("bind", serial_port, identity, home_reference)
                 )
             ),
+            "_clear_controller_fault_latches_after_confirmed_startup": (
+                lambda serial_port, position: calls.append(
+                    ("clear-faults", serial_port, position)
+                ) or True
+            ),
             "logger": SimpleNamespace(exception=lambda *args: None),
         }
         apply_startup_result = self.compile_function(
@@ -5453,6 +5870,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(any(call[0] == "invalidate" for call in calls))
         self.assertIn(
             ("bind", startup_serial, controller_identity, None),
+            calls,
+        )
+        self.assertIn(
+            ("clear-faults", startup_serial, position),
             calls,
         )
         self.assertLess(
@@ -6085,18 +6506,63 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(close_application())
         self.assertEqual(poll_calls, [True])
 
+    def test_shutdown_waits_for_retained_manual_controller_cleanup(self):
+        class Root:
+            def __init__(self):
+                self.jobs = []
+
+            def after(self, delay, callback):
+                self.jobs.append((delay, callback))
+
+        root = Root()
+        cleanup = object()
+        cleanup_attempts = []
+        namespace = {
+            "manual_controller_cleanup_lock": threading.Lock(),
+            "manual_controller_cleanup_pending": cleanup,
+            "_retry_manual_controller_cleanup": (
+                lambda: cleanup_attempts.append(True) or False
+            ),
+            "SERIAL_SHUTDOWN_POLL_MS": 25,
+            "root": root,
+            "_poll_serial_events": lambda: None,
+            "_poll_auxiliary_serial_events": lambda: None,
+            "_poll_joint_motion_events": lambda: None,
+        }
+        poll_close = self.compile_function(
+            "_poll_application_close",
+            namespace,
+        )
+
+        self.assertFalse(poll_close())
+        self.assertEqual(cleanup_attempts, [True])
+        self.assertIs(
+            namespace["manual_controller_cleanup_pending"],
+            cleanup,
+        )
+        self.assertEqual(len(root.jobs), 1)
+        self.assertEqual(root.jobs[0][0], 25)
+
     def test_shutdown_waits_for_transport_ownership_before_closing_ports(self):
         class Lock:
             def __init__(self):
                 self.results = [False, True, True]
                 self.release_count = 0
+                self.held = False
 
             def acquire(self, blocking=True):
                 self.asserted_nonblocking = blocking is False
-                return self.results.pop(0)
+                acquired = self.results.pop(0)
+                if acquired:
+                    self.held = True
+                return acquired
 
             def release(self):
                 self.release_count += 1
+                self.held = False
+
+            def locked(self):
+                return self.held
 
         class Root:
             def __init__(self):
@@ -6180,6 +6646,196 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(lock.release_count, 2)
         self.assertEqual(destroyed_windows, [True])
         self.assertEqual(root.quit_count, 1)
+        self.assertEqual(root.destroy_count, 1)
+
+    def test_shutdown_waits_for_auxiliary_stop_settlement_before_serial_close(self):
+        class Root:
+            def __init__(self):
+                self.jobs = []
+                self.quit_count = 0
+                self.destroy_count = 0
+
+            def after(self, delay, callback):
+                self.jobs.append((delay, callback))
+
+            def quit(self):
+                self.quit_count += 1
+
+            def destroy(self):
+                self.destroy_count += 1
+
+        root = Root()
+        stop_requested = threading.Event()
+        stop_requested.set()
+        labels = [
+            {
+                "text": "PHYSICAL E-STOP ACTIVE",
+                "style": "Alarm.TLabel",
+            },
+            {
+                "text": "PHYSICAL E-STOP ACTIVE",
+                "style": "Alarm.TLabel",
+            },
+        ]
+        closed_ports = []
+        namespace = {
+            "serial_lock": threading.Lock(),
+            "auxiliary_serial_lock": threading.Lock(),
+            "serial_activity_registry": SerialActivityRegistry(("ser", "ser2")),
+            "application_shutdown_started_at": None,
+            "SERIAL_SHUTDOWN_ACTIVITY_GRACE_SECONDS": 1.0,
+            "SERIAL_SHUTDOWN_POLL_MS": 25,
+            "SERIAL_SHUTDOWN_RETRY_MS": 1000,
+            "root": root,
+            "_close_serial_port": (
+                lambda name: closed_ports.append(name) or True
+            ),
+            "_poll_serial_events": lambda: None,
+            "_poll_auxiliary_serial_events": lambda: None,
+            "_poll_joint_motion_events": lambda: None,
+            "joint_motion_dispatcher": SimpleNamespace(close=lambda: None),
+            "_flush_calibration_save": lambda: True,
+            "logger": SimpleNamespace(exception=lambda *args: None),
+            "almStatusLab": SimpleNamespace(
+                config=lambda **kwargs: labels.append(kwargs)
+            ),
+            "almStatusLab2": SimpleNamespace(
+                config=lambda **kwargs: labels.append(kwargs)
+            ),
+            "cv2": SimpleNamespace(destroyAllWindows=lambda: None),
+            "auxiliary_stop_state_lock": threading.Lock(),
+            "auxiliary_stop_requested": stop_requested,
+            "auxiliary_stop_pending_request_id": 41,
+            "auxiliary_stop_active_request_id": None,
+            "main_controller_auxiliary_stop_request_id": 41,
+        }
+        namespace["_auxiliary_stop_shutdown_pending"] = self.compile_function(
+            "_auxiliary_stop_shutdown_pending",
+            namespace,
+        )
+        poll_close = self.compile_function("_poll_application_close", namespace)
+
+        self.assertFalse(poll_close())
+        self.assertEqual(closed_ports, [])
+        self.assertEqual(root.destroy_count, 0)
+        self.assertEqual(
+            labels,
+            [
+                {
+                    "text": "PHYSICAL E-STOP ACTIVE",
+                    "style": "Alarm.TLabel",
+                },
+                {
+                    "text": "PHYSICAL E-STOP ACTIVE",
+                    "style": "Alarm.TLabel",
+                },
+            ],
+        )
+        self.assertEqual(len(root.jobs), 1)
+        self.assertEqual(root.jobs[0][0], 25)
+
+        with namespace["auxiliary_stop_state_lock"]:
+            namespace["auxiliary_stop_pending_request_id"] = None
+            namespace["main_controller_auxiliary_stop_request_id"] = None
+            stop_requested.clear()
+
+        self.assertTrue(root.jobs.pop(0)[1]())
+        self.assertEqual(closed_ports, ["ser", "ser2"])
+        self.assertEqual(root.quit_count, 1)
+        self.assertEqual(root.destroy_count, 1)
+
+    def test_shutdown_rechecks_auxiliary_stop_after_transport_lock_acquisition(self):
+        class Root:
+            def __init__(self):
+                self.jobs = []
+                self.destroy_count = 0
+
+            def after(self, delay, callback):
+                self.jobs.append((delay, callback))
+
+            def quit(self):
+                pass
+
+            def destroy(self):
+                self.destroy_count += 1
+
+        class TransitionLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.on_first_acquire = None
+
+            def acquire(self, blocking=True):
+                acquired = self.lock.acquire(blocking=blocking)
+                if acquired and self.on_first_acquire is not None:
+                    callback = self.on_first_acquire
+                    self.on_first_acquire = None
+                    callback()
+                return acquired
+
+            def release(self):
+                self.lock.release()
+
+            def locked(self):
+                return self.lock.locked()
+
+        root = Root()
+        auxiliary_transport_lock = TransitionLock()
+        stop_requested = threading.Event()
+        stop_state_lock = threading.Lock()
+        closed_ports = []
+        namespace = {
+            "serial_lock": threading.Lock(),
+            "auxiliary_serial_lock": auxiliary_transport_lock,
+            "serial_activity_registry": SerialActivityRegistry(("ser", "ser2")),
+            "application_shutdown_started_at": None,
+            "SERIAL_SHUTDOWN_ACTIVITY_GRACE_SECONDS": 1.0,
+            "SERIAL_SHUTDOWN_POLL_MS": 25,
+            "SERIAL_SHUTDOWN_RETRY_MS": 1000,
+            "root": root,
+            "_close_serial_port": (
+                lambda name: closed_ports.append(name) or True
+            ),
+            "_poll_serial_events": lambda: None,
+            "_poll_auxiliary_serial_events": lambda: None,
+            "_poll_joint_motion_events": lambda: None,
+            "joint_motion_dispatcher": SimpleNamespace(close=lambda: None),
+            "_flush_calibration_save": lambda: True,
+            "logger": SimpleNamespace(exception=lambda *args: None),
+            "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
+            "almStatusLab2": SimpleNamespace(config=lambda **kwargs: None),
+            "cv2": SimpleNamespace(destroyAllWindows=lambda: None),
+            "auxiliary_stop_state_lock": stop_state_lock,
+            "auxiliary_stop_requested": stop_requested,
+            "auxiliary_stop_pending_request_id": None,
+            "auxiliary_stop_active_request_id": None,
+            "main_controller_auxiliary_stop_request_id": None,
+        }
+
+        def reserve_late_stop():
+            with stop_state_lock:
+                namespace["auxiliary_stop_pending_request_id"] = 43
+                namespace["main_controller_auxiliary_stop_request_id"] = 43
+                stop_requested.set()
+
+        auxiliary_transport_lock.on_first_acquire = reserve_late_stop
+        namespace["_auxiliary_stop_shutdown_pending"] = self.compile_function(
+            "_auxiliary_stop_shutdown_pending",
+            namespace,
+        )
+        poll_close = self.compile_function("_poll_application_close", namespace)
+
+        self.assertFalse(poll_close())
+        self.assertEqual(closed_ports, [])
+        self.assertEqual(root.destroy_count, 0)
+        self.assertEqual(len(root.jobs), 1)
+
+        with stop_state_lock:
+            namespace["auxiliary_stop_pending_request_id"] = None
+            namespace["main_controller_auxiliary_stop_request_id"] = None
+            stop_requested.clear()
+
+        self.assertTrue(root.jobs.pop(0)[1]())
+        self.assertEqual(closed_ports, ["ser", "ser2"])
         self.assertEqual(root.destroy_count, 1)
 
     def test_shutdown_waits_for_retained_cleanup_and_virtual_owners(self):
@@ -6337,7 +6993,15 @@ class HmiSourceContractTests(unittest.TestCase):
         completions = []
         dispatcher = Dispatcher(sequence)
 
-        def exchange(command, control_event=None, write_started_event=None):
+        def exchange(
+            command,
+            control_event=None,
+            write_started_event=None,
+            write_cancellation_event=None,
+            write_boundary_lock=None,
+        ):
+            self.assertIsNone(write_cancellation_event)
+            self.assertIsNone(write_boundary_lock)
             if not exchange_release.wait(2):
                 raise TimeoutError("test worker release timed out")
             return "position"
@@ -6384,7 +7048,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "_apply_legacy_serial_response": apply_result,
             "_invalidate_joint_motion_state": lambda reason: None,
             "RUN": {"liveJog": False, "VR_angles": [0.0] * 6},
-            "_try_dispatch_deferred_joint_adjustments": lambda **kwargs: False,
+            "_try_dispatch_deferred_joint_adjustments": (
+                lambda **kwargs: DeferredJointDispatchOutcome.IDLE
+            ),
             "joint_motion_dispatcher": dispatcher,
             "root": root,
             "_poll_auxiliary_serial_events": lambda: sequence.append(
@@ -6585,13 +7251,18 @@ class HmiSourceContractTests(unittest.TestCase):
         class Lock:
             def __init__(self):
                 self.release_count = 0
+                self.held = False
 
-            @staticmethod
-            def acquire(blocking=True):
+            def acquire(self, blocking=True):
+                self.held = True
                 return True
 
             def release(self):
                 self.release_count += 1
+                self.held = False
+
+            def locked(self):
+                return self.held
 
         class Root:
             def __init__(self):
@@ -6809,13 +7480,18 @@ class HmiSourceContractTests(unittest.TestCase):
         class Lock:
             def __init__(self):
                 self.release_count = 0
+                self.held = False
 
-            @staticmethod
-            def acquire(blocking=True):
+            def acquire(self, blocking=True):
+                self.held = True
                 return True
 
             def release(self):
                 self.release_count += 1
+                self.held = False
+
+            def locked(self):
+                return self.held
 
         class Root:
             def __init__(self):
@@ -7205,12 +7881,13 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(activity.idle())
         self.assertTrue(warnings)
 
-    def test_legacy_main_exchange_resets_before_fast_controller_response(self):
+    def test_legacy_main_exchange_preserves_input_before_fast_response(self):
         class SerialPort:
-            def __init__(self):
+            def __init__(self, response_after_write=b"fast\n"):
                 self.is_open = True
-                self.timeout = None
-                self.response = bytearray(b"stale\n")
+                self.timeout = 7.5
+                self.response = bytearray()
+                self.response_after_write = response_after_write
                 self.events = []
 
             def reset_input_buffer(self):
@@ -7219,11 +7896,15 @@ class HmiSourceContractTests(unittest.TestCase):
 
             def write(self, command):
                 self.events.append(("write", command))
-                self.response.extend(b"fast\n")
+                self.response.extend(self.response_after_write)
                 return len(command)
 
             def flush(self):
                 self.events.append("flush")
+
+            def close(self):
+                self.events.append("close")
+                self.is_open = False
 
             def read(self, size=1):
                 value = bytes(self.response[:size])
@@ -7245,21 +7926,1503 @@ class HmiSourceContractTests(unittest.TestCase):
             "RUN": {"ser": serial_port},
             "serial_write_lock": threading.Lock(),
             "write_serial_control": write_serial_control,
-            "read_serial_line_response": read_serial_line_response,
-            "read_serial_exact_response": read_serial_exact_response,
+            "read_pending_controller_estop_response": (
+                read_pending_controller_estop_response
+            ),
+            "read_controller_line_exchange_response": (
+                read_controller_line_exchange_response
+            ),
+            "read_controller_exact_exchange_response": (
+                read_controller_exact_exchange_response
+            ),
+            "ControllerLineExchangeResponse": (
+                ControllerLineExchangeResponse
+            ),
+            "CONTROLLER_ESTOP_ADMISSION_FLAG": (
+                CONTROLLER_ESTOP_ADMISSION_FLAG
+            ),
+            "position_response_is_physical_estop": (
+                position_response_is_physical_estop
+            ),
+            "ProtocolResponseError": ProtocolResponseError,
             "finite_number": finite_number,
             "MotionInputError": MotionInputError,
+            "quarantine_serial_transport": quarantine_serial_transport,
+            "_capture_main_controller_stop_context": (
+                lambda candidate_port: ("context", candidate_port)
+            ),
+            "_publish_main_controller_stop": (
+                lambda context, position: True
+            ),
+            "_require_main_controller_identity_cleanup": (
+                lambda serial_port, context: True
+            ),
             "SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS": 1.0,
         }
+        namespace["LegacyControllerPhysicalStop"] = self.compile_class(
+            "LegacyControllerPhysicalStop",
+            namespace,
+        )
+        namespace["_raise_legacy_controller_stop"] = self.compile_function(
+            "_raise_legacy_controller_stop",
+            namespace,
+        )
+        namespace["_prepare_main_controller_stop_exchange"] = (
+            self.compile_function(
+                "_prepare_main_controller_stop_exchange",
+                namespace,
+            )
+        )
         exchange = self.compile_function(
             "_exchange_legacy_main_command",
             namespace,
         )
 
+        with self.assertRaisesRegex(
+            ConnectionError,
+            "connection changed",
+        ):
+            exchange(
+                "TL\n",
+                response_timeout=1.0,
+                expected_serial_port=object(),
+            )
+        self.assertEqual(serial_port.events, [])
+
         self.assertEqual(exchange("TL\n", response_timeout=1.0), "fast")
-        self.assertEqual(serial_port.events[:2], ["reset", ("write", b"TL\n")])
-        self.assertEqual(serial_port.events.count("reset"), 1)
+        self.assertEqual(
+            serial_port.events,
+            [("write", b"TL\n"), "flush"],
+        )
+        self.assertEqual(serial_port.events.count("reset"), 0)
         self.assertEqual(serial_port.response, b"")
+
+        estop = VALID_CONTROLLER_POSITION.raw.replace(
+            "NO",
+            f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+            1,
+        )
+        admission = VALID_CONTROLLER_POSITION.raw.replace(
+            "NO",
+            f"NO{CONTROLLER_ESTOP_ADMISSION_FLAG}",
+            1,
+        )
+        stop_port = SerialPort(
+            f"{estop}\n{admission}\n".encode("ascii")
+        )
+        published = []
+        namespace["RUN"]["ser"] = stop_port
+        namespace["_publish_main_controller_stop"] = (
+            lambda context, position: published.append(
+                (context, position)
+            ) or True
+        )
+        with self.assertRaises(
+            namespace["LegacyControllerPhysicalStop"]
+        ) as stopped:
+            exchange("TL\n", response_timeout=1.0)
+        self.assertEqual(
+            stopped.exception.position.flag,
+            CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        self.assertEqual(
+            tuple(position.flag for _, position in published),
+            (CONTROLLER_ESTOP_EVENT_FLAG,),
+        )
+        self.assertFalse(stop_port.is_open)
+        self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertTrue(serial_transport_quarantined(stop_port))
+
+        admission_port = SerialPort(f"{admission}\n".encode("ascii"))
+        published.clear()
+        namespace["RUN"]["ser"] = admission_port
+        with self.assertRaises(
+            namespace["LegacyControllerPhysicalStop"]
+        ) as admission_stopped:
+            exchange("TL\n", response_timeout=1.0)
+        self.assertEqual(
+            admission_stopped.exception.position.flag,
+            CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        self.assertEqual(
+            tuple(position.flag for _, position in published),
+            (CONTROLLER_ESTOP_ADMISSION_FLAG,),
+        )
+        self.assertEqual(
+            admission_port.events,
+            [("write", b"TL\n"), "flush", "close"],
+        )
+        self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertTrue(serial_transport_quarantined(admission_port))
+
+    def test_main_controller_response_owners_use_stop_aware_boundaries(self):
+        def called_names(function_name):
+            return {
+                node.func.id
+                for node in ast.walk(self.module_functions[function_name])
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                )
+            }
+
+        legacy_routes = (
+            "_query_primary_home_reference",
+            "_exchange_controller_calibration_acknowledgement",
+            "_exchange_position_acknowledgement",
+            "_exchange_gcode_row",
+        )
+        cancellation_routes = (
+            "_run_calibration_stage_safe",
+            "_execute_calibration_command",
+        )
+        raw_single_response_calls = {
+            "read_serial_line_response",
+            "read_serial_exact_response",
+            "exchange_serial_line_until_cancelled",
+        }
+
+        for function_name in legacy_routes:
+            with self.subTest(legacy_route=function_name):
+                calls = called_names(function_name)
+                self.assertIn("_exchange_legacy_main_command", calls)
+                self.assertFalse(raw_single_response_calls & calls)
+
+        for function_name in cancellation_routes:
+            with self.subTest(cancellation_route=function_name):
+                calls = called_names(function_name)
+                self.assertIn(
+                    "_exchange_main_controller_line_until_cancelled",
+                    calls,
+                )
+                self.assertFalse(raw_single_response_calls & calls)
+
+        for function_name in (
+            "_exchange_legacy_main_command",
+            "_exchange_main_controller_line_until_cancelled",
+            "_exchange_serial_line",
+            "_run_gcode_storage_request",
+        ):
+            with self.subTest(stop_boundary=function_name):
+                self.assertIn(
+                    "_prepare_main_controller_stop_exchange",
+                    called_names(function_name),
+                )
+
+        joint_calls = called_names("_exchange_joint_motion")
+        self.assertIn("_capture_main_controller_stop_context", joint_calls)
+        self.assertIn("_publish_main_controller_stop", joint_calls)
+        self.assertIn(
+            "read_controller_line_exchange_response",
+            joint_calls,
+        )
+
+        storage_calls = called_names("_run_gcode_storage_request")
+        self.assertIn(
+            "read_controller_line_exchange_response",
+            storage_calls,
+        )
+        self.assertNotIn("read_serial_line_response", storage_calls)
+
+        serial_poll_calls = called_names("_poll_serial_events")
+        self.assertIn(
+            "_apply_main_controller_idle_stop_results",
+            serial_poll_calls,
+        )
+        self.assertIn(
+            "_try_start_main_controller_idle_stop_reader",
+            serial_poll_calls,
+        )
+
+    def test_main_controller_stop_publication_has_one_tk_presenter(self):
+        estop = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+                1,
+            )
+        )
+        old_port = SimpleNamespace(is_open=True)
+        new_port = SimpleNamespace(is_open=True)
+        event_queue = Queue()
+        invalidations = []
+        errors = []
+        warnings = []
+
+        class Label:
+            def __init__(self):
+                self.text = None
+                self.style = None
+
+            def config(self, **options):
+                self.text = options.get("text")
+                self.style = options.get("style")
+
+        first_label = Label()
+        second_label = Label()
+        namespace = {
+            "dataclass": dataclass,
+            "PositionResponse": PositionResponse,
+            "MotionInputError": MotionInputError,
+            "MainControllerIdentityBinding": SimpleNamespace,
+            "RUN": {
+                "ser": old_port,
+                "estopActive": False,
+                "programStopRequestId": None,
+            },
+            "TRUE": True,
+            "program_stop_state_lock": threading.Lock(),
+            "controller_identity_state_lock": threading.Lock(),
+            "main_controller_identity_binding": SimpleNamespace(
+                serial_port=old_port
+            ),
+            "main_controller_connection_epoch": 3,
+            "confirmed_position_generation": 7,
+            "manual_auxiliary_stop_barrier": threading.Event(),
+            "_auxiliary_stop_not_required": lambda: True,
+            "_set_program_stop_status": lambda state: True,
+            "_try_dispatch_auxiliary_stop": lambda: False,
+            "_invalidate_joint_motion_state": invalidations.append,
+            "main_controller_stop_event_queue": event_queue,
+            "displayPosition": lambda *args, **kwargs: estop,
+            "ErrorHandler": errors.append,
+            "logger": SimpleNamespace(
+                warning=lambda message, *args: warnings.append(
+                    message % args if args else message
+                ),
+                exception=lambda *args: None,
+            ),
+            "almStatusLab": first_label,
+            "almStatusLab2": second_label,
+        }
+        namespace["MainControllerStopContext"] = self.compile_class(
+            "MainControllerStopContext",
+            namespace,
+        )
+        namespace["MainControllerStopEvent"] = self.compile_class(
+            "MainControllerStopEvent",
+            namespace,
+        )
+        capture_context = self.compile_function(
+            "_capture_main_controller_stop_context",
+            namespace,
+        )
+        namespace["_latch_main_controller_stop_state"] = (
+            self.compile_function(
+                "_latch_main_controller_stop_state",
+                namespace,
+            )
+        )
+        publish = self.compile_function(
+            "_publish_main_controller_stop",
+            namespace,
+        )
+        namespace["_main_controller_stop_event_stale_reason"] = (
+            self.compile_function(
+                "_main_controller_stop_event_stale_reason",
+                namespace,
+            )
+        )
+        apply_events = self.compile_function(
+            "_apply_main_controller_stop_events",
+            namespace,
+        )
+        presentations = []
+
+        def display_position(response, parsed=None, **options):
+            presentations.append((response, parsed, options))
+            return parsed
+
+        namespace["displayPosition"] = display_position
+
+        context = capture_context(old_port)
+        self.assertEqual(context.serial_port, old_port)
+        self.assertEqual(context.connection_epoch, 3)
+        self.assertEqual(context.confirmed_position_generation, 7)
+        self.assertTrue(publish(context, estop))
+        self.assertTrue(namespace["RUN"]["estopActive"])
+        self.assertTrue(namespace["manual_auxiliary_stop_barrier"].is_set())
+        self.assertEqual(
+            invalidations,
+            ["controller reported physical E-stop: EB"],
+        )
+        self.assertEqual(event_queue.qsize(), 1)
+        self.assertTrue(apply_events())
+        self.assertEqual(
+            presentations,
+            [(estop.raw, estop, {})],
+        )
+        self.assertFalse(
+            namespace["manual_auxiliary_stop_barrier"].is_set()
+        )
+        self.assertTrue(event_queue.empty())
+        self.assertFalse(apply_events())
+
+        self.assertTrue(publish(context, estop))
+        namespace["RUN"]["ser"] = new_port
+        namespace["main_controller_identity_binding"] = SimpleNamespace(
+            serial_port=new_port
+        )
+        namespace["main_controller_connection_epoch"] = 4
+        namespace["confirmed_position_generation"] = 8
+        self.assertTrue(apply_events())
+        self.assertEqual(
+            presentations,
+            [(estop.raw, estop, {})],
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(
+            "controller connection epoch changed",
+            warnings[0],
+        )
+        self.assertIsNone(first_label.text)
+        self.assertIsNone(second_label.text)
+        self.assertIsNone(first_label.style)
+        self.assertIsNone(second_label.style)
+        self.assertTrue(event_queue.empty())
+
+        generation_context = capture_context(new_port)
+        self.assertTrue(publish(generation_context, estop))
+        namespace["confirmed_position_generation"] = 9
+        self.assertTrue(apply_events())
+        self.assertEqual(
+            presentations,
+            [(estop.raw, estop, {})],
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(warnings), 2)
+        self.assertIn(
+            "confirmed position generation changed",
+            warnings[1],
+        )
+        self.assertIsNone(first_label.text)
+        self.assertIsNone(second_label.text)
+        self.assertTrue(event_queue.empty())
+
+        retained_context = capture_context(new_port)
+        retained_attempts = []
+
+        def fail_stop_render_once(response, parsed=None, **options):
+            retained_attempts.append((response, parsed, options))
+            if len(retained_attempts) == 1:
+                raise RuntimeError("stop renderer unavailable")
+            return parsed
+
+        namespace["displayPosition"] = fail_stop_render_once
+        self.assertTrue(publish(retained_context, estop))
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "stop renderer unavailable",
+        ):
+            apply_events()
+        self.assertIsNotNone(
+            namespace["main_controller_stop_pending_event"]
+        )
+        self.assertTrue(event_queue.empty())
+        self.assertTrue(apply_events())
+        self.assertIsNone(
+            namespace["main_controller_stop_pending_event"]
+        )
+        self.assertTrue(event_queue.empty())
+        self.assertEqual(len(retained_attempts), 2)
+
+        reconnect_context = capture_context(new_port)
+        reconnect_attempts = []
+
+        def fail_stop_render(response, parsed=None, **options):
+            reconnect_attempts.append((response, parsed, options))
+            raise RuntimeError("stop renderer unavailable during reconnect")
+
+        namespace["displayPosition"] = fail_stop_render
+        self.assertTrue(publish(reconnect_context, estop))
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "stop renderer unavailable during reconnect",
+        ):
+            apply_events()
+        replacement_port = SimpleNamespace(is_open=True)
+        namespace["RUN"]["ser"] = replacement_port
+        namespace["RUN"]["estopActive"] = False
+        namespace["main_controller_identity_binding"] = SimpleNamespace(
+            serial_port=replacement_port
+        )
+        namespace["main_controller_connection_epoch"] = 5
+        namespace["confirmed_position_generation"] = 10
+
+        self.assertTrue(apply_events())
+
+        self.assertFalse(namespace["RUN"]["estopActive"])
+        self.assertEqual(errors, [])
+        self.assertEqual(len(reconnect_attempts), 1)
+        self.assertIsNone(
+            namespace["main_controller_stop_pending_event"]
+        )
+        self.assertTrue(event_queue.empty())
+        self.assertIn(
+            "controller connection epoch changed",
+            warnings[-1],
+        )
+        self.assertIn(
+            "current controller fault state unchanged",
+            warnings[-1],
+        )
+
+    def test_shutdown_readiness_retains_failed_main_stop_presentation(self):
+        estop = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+                1,
+            )
+        )
+        serial_port = SimpleNamespace(is_open=True)
+        event_queue = Queue()
+        serial_lock = threading.Lock()
+        auxiliary_lock = threading.Lock()
+        serial_lock.acquire()
+        auxiliary_lock.acquire()
+        render_attempts = []
+
+        def display_position(response, parsed=None, **options):
+            render_attempts.append((response, parsed, options))
+            if len(render_attempts) <= 2:
+                raise RuntimeError("stop renderer remains unavailable")
+            return parsed
+
+        namespace = {
+            "dataclass": dataclass,
+            "PositionResponse": PositionResponse,
+            "MotionInputError": MotionInputError,
+            "MainControllerIdentityBinding": SimpleNamespace,
+            "RUN": {"ser": serial_port},
+            "controller_identity_state_lock": threading.Lock(),
+            "main_controller_identity_binding": None,
+            "main_controller_connection_epoch": 4,
+            "confirmed_position_generation": 9,
+            "main_controller_stop_event_queue": event_queue,
+            "main_controller_stop_pending_event": None,
+            "serial_lock": serial_lock,
+            "auxiliary_serial_lock": auxiliary_lock,
+            "auxiliary_stop_state_lock": threading.Lock(),
+            "auxiliary_stop_requested": threading.Event(),
+            "auxiliary_stop_pending_request_id": None,
+            "auxiliary_stop_active_request_id": None,
+            "main_controller_auxiliary_stop_request_id": None,
+            "serial_activity_registry": SerialActivityRegistry(
+                ("ser", "ser2")
+            ),
+            "displayPosition": display_position,
+            "ErrorHandler": lambda flag: True,
+            "_clear_manual_auxiliary_stop_barrier_if_settled": lambda: True,
+            "logger": SimpleNamespace(warning=lambda *args: None),
+            "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
+            "almStatusLab2": SimpleNamespace(config=lambda **kwargs: None),
+        }
+        namespace["MainControllerStopContext"] = self.compile_class(
+            "MainControllerStopContext",
+            namespace,
+        )
+        namespace["MainControllerStopEvent"] = self.compile_class(
+            "MainControllerStopEvent",
+            namespace,
+        )
+        namespace["_main_controller_stop_event_stale_reason"] = (
+            self.compile_function(
+                "_main_controller_stop_event_stale_reason",
+                namespace,
+            )
+        )
+        apply_events = self.compile_function(
+            "_apply_main_controller_stop_events",
+            namespace,
+        )
+        ready_for_close = self.compile_function(
+            "_serial_shutdown_ready_for_close",
+            namespace,
+        )
+        event_queue.put(
+            namespace["MainControllerStopEvent"](
+                namespace["MainControllerStopContext"](
+                    serial_port,
+                    4,
+                    9,
+                ),
+                estop,
+            )
+        )
+
+        try:
+            self.assertFalse(ready_for_close())
+            for _ in range(2):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "stop renderer remains unavailable",
+                ):
+                    apply_events()
+                self.assertFalse(ready_for_close())
+                self.assertIsNotNone(
+                    namespace["main_controller_stop_pending_event"]
+                )
+            self.assertTrue(apply_events())
+            self.assertTrue(ready_for_close())
+            self.assertIsNone(
+                namespace["main_controller_stop_pending_event"]
+            )
+            self.assertTrue(event_queue.empty())
+            self.assertEqual(len(render_attempts), 3)
+        finally:
+            auxiliary_lock.release()
+            serial_lock.release()
+
+    def test_idle_main_controller_stop_monitor_is_zero_write_and_shutdown_safe(self):
+        estop = VALID_CONTROLLER_POSITION.raw.replace(
+            "NO",
+            f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+            1,
+        )
+        admission = VALID_CONTROLLER_POSITION.raw.replace(
+            "NO",
+            f"NO{CONTROLLER_ESTOP_ADMISSION_FLAG}",
+            1,
+        )
+        transport_events = []
+
+        class IdleSerialPort:
+            def __init__(self, response=b""):
+                self.is_open = True
+                self.timeout = 7.5
+                self.response = bytearray(response)
+                self.write_count = 0
+
+            @property
+            def in_waiting(self):
+                return len(self.response)
+
+            def read(self, size=1):
+                value = bytes(self.response[:size])
+                del self.response[:size]
+                return value
+
+            def read_until(self, delimiter=b"\n", size=None):
+                limit = len(self.response)
+                if size is not None:
+                    limit = min(limit, size)
+                available = bytes(self.response[:limit])
+                delimiter_index = available.find(delimiter)
+                count = (
+                    limit
+                    if delimiter_index < 0
+                    else delimiter_index + len(delimiter)
+                )
+                return self.read(count)
+
+            def write(self, _payload):
+                self.write_count += 1
+                raise AssertionError(
+                    "idle stop monitoring must not write controller data"
+                )
+
+            def close(self):
+                transport_events.append(("close", self))
+                self.is_open = False
+
+        class ResultQueue(Queue):
+            def __init__(self):
+                super().__init__()
+                self.available = threading.Event()
+
+            def put(self, item, *args, **kwargs):
+                super().put(item, *args, **kwargs)
+                self.available.set()
+
+        class Label:
+            def __init__(self):
+                self.values = []
+
+            def config(self, **kwargs):
+                self.values.append(kwargs)
+
+        activity = SerialActivityRegistry(("ser",))
+        transport_lock = threading.Lock()
+        result_queue = ResultQueue()
+        first_label = Label()
+        second_label = Label()
+        published = []
+        identity_cleanup = []
+        invalidations = []
+        logged_errors = []
+        runtime = {"ser": None}
+        namespace = {
+            "dataclass": dataclass,
+            "Optional": Optional,
+            "threading": threading,
+            "Empty": Empty,
+            "Queue": Queue,
+            "PositionResponse": PositionResponse,
+            "MotionInputError": MotionInputError,
+            "ProtocolResponseError": ProtocolResponseError,
+            "SerialActivityRegistry": SerialActivityRegistry,
+            "serial_activity_registry": activity,
+            "serial_lock": transport_lock,
+            "serial_transport_quarantined": serial_transport_quarantined,
+            "quarantine_serial_transport": quarantine_serial_transport,
+            "read_pending_controller_estop_response": (
+                read_pending_controller_estop_response
+            ),
+            "position_response_is_physical_estop": (
+                position_response_is_physical_estop
+            ),
+            "CONTROLLER_ESTOP_EVENT_FLAG": CONTROLLER_ESTOP_EVENT_FLAG,
+            "RUN": runtime,
+            "main_controller_idle_stop_result_queue": result_queue,
+            "main_controller_idle_stop_pending_result": None,
+            "_capture_main_controller_stop_context": (
+                lambda serial_port: ("context", serial_port)
+            ),
+            "_publish_main_controller_stop": (
+                lambda context, position: (
+                    transport_events.append(("publish", context[1]))
+                    or published.append(position)
+                    or True
+                )
+            ),
+            "_require_main_controller_identity_cleanup": (
+                lambda serial_port, context: (
+                    identity_cleanup.append((serial_port, context)) or True
+                )
+            ),
+            "_invalidate_joint_motion_state": invalidations.append,
+            "logger": SimpleNamespace(
+                error=lambda message, *args: logged_errors.append(
+                    message % args if args else message
+                )
+            ),
+            "almStatusLab": first_label,
+            "almStatusLab2": second_label,
+        }
+        namespace["MainControllerIdleStopOwnership"] = self.compile_class(
+            "MainControllerIdleStopOwnership",
+            namespace,
+        )
+        namespace["MainControllerIdleStopReadResult"] = self.compile_class(
+            "MainControllerIdleStopReadResult",
+            namespace,
+        )
+        result_activity = SerialActivityRegistry(("ser",))
+        result_lock = threading.Lock()
+        result_lock.acquire()
+        result_mode = result_activity.reserve_emergency_control("ser")
+        result_ownership = namespace["MainControllerIdleStopOwnership"](
+            result_activity,
+            result_lock,
+            result_mode,
+        )
+        try:
+            with self.assertRaisesRegex(
+                MotionInputError,
+                "idle main-controller stop result position is invalid",
+            ):
+                namespace["MainControllerIdleStopReadResult"](
+                    IdleSerialPort(),
+                    result_ownership,
+                    position=parse_position_response(admission),
+                )
+        finally:
+            result_ownership.release()
+        for function_name in (
+            "_main_controller_idle_stop_error_detail",
+            "_queue_main_controller_idle_stop_result",
+            "_quarantine_main_controller_idle_stop_failure",
+            "_consume_main_controller_idle_stop",
+            "_run_main_controller_idle_stop_reader",
+            "_try_start_main_controller_idle_stop_reader",
+            "_apply_main_controller_idle_stop_results",
+        ):
+            namespace[function_name] = self.compile_function(
+                function_name,
+                namespace,
+            )
+
+        empty_port = IdleSerialPort()
+        runtime["ser"] = empty_port
+        self.assertFalse(
+            namespace["_try_start_main_controller_idle_stop_reader"]()
+        )
+        self.assertEqual(empty_port.write_count, 0)
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(activity.idle())
+        self.assertTrue(result_queue.empty())
+
+        busy_port = IdleSerialPort(f"{estop}\n".encode("ascii"))
+        runtime["ser"] = busy_port
+        transport_lock.acquire()
+        try:
+            self.assertFalse(
+                namespace["_try_start_main_controller_idle_stop_reader"]()
+            )
+        finally:
+            transport_lock.release()
+        self.assertEqual(
+            bytes(busy_port.response),
+            f"{estop}\n".encode("ascii"),
+        )
+        self.assertEqual(busy_port.write_count, 0)
+        self.assertTrue(activity.idle())
+
+        self.assertTrue(activity.begin_shutdown())
+        stop_port = IdleSerialPort(f"{estop}\n".encode("ascii"))
+        runtime["ser"] = stop_port
+        result_queue.available.clear()
+        self.assertTrue(
+            namespace["_try_start_main_controller_idle_stop_reader"]()
+        )
+        self.assertTrue(result_queue.available.wait(2))
+        self.assertTrue(transport_lock.locked())
+        self.assertFalse(activity.idle())
+        self.assertTrue(
+            namespace["_apply_main_controller_idle_stop_results"]()
+        )
+
+        self.assertIsNone(runtime["ser"])
+        self.assertFalse(stop_port.is_open)
+        self.assertTrue(serial_transport_quarantined(stop_port))
+        self.assertEqual(stop_port.write_count, 0)
+        self.assertEqual(
+            tuple(position.flag for position in published),
+            (CONTROLLER_ESTOP_EVENT_FLAG,),
+        )
+        self.assertLess(
+            transport_events.index(("publish", stop_port)),
+            transport_events.index(("close", stop_port)),
+        )
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(activity.idle())
+        self.assertTrue(result_queue.empty())
+        self.assertIsNone(
+            namespace["main_controller_idle_stop_pending_result"]
+        )
+        self.assertEqual(invalidations, [])
+        self.assertEqual(first_label.values, [])
+        self.assertEqual(second_label.values, [])
+
+        invalid_port = IdleSerialPort(b"Done\n")
+        runtime["ser"] = invalid_port
+        result_queue.available.clear()
+        self.assertTrue(
+            namespace["_try_start_main_controller_idle_stop_reader"]()
+        )
+        self.assertTrue(result_queue.available.wait(2))
+        self.assertTrue(transport_lock.locked())
+        self.assertFalse(activity.idle())
+        self.assertTrue(
+            namespace["_apply_main_controller_idle_stop_results"]()
+        )
+
+        self.assertIsNone(runtime["ser"])
+        self.assertFalse(invalid_port.is_open)
+        self.assertTrue(serial_transport_quarantined(invalid_port))
+        self.assertEqual(invalid_port.write_count, 0)
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(activity.idle())
+        self.assertEqual(len(invalidations), 1)
+        self.assertIn(
+            "IDLE MAIN-CONTROLLER EVENT MONITOR FAILED",
+            invalidations[0],
+        )
+        self.assertEqual(first_label.values[-1]["style"], "Alarm.TLabel")
+        self.assertEqual(second_label.values[-1], first_label.values[-1])
+        self.assertEqual(logged_errors, [invalidations[0]])
+
+        admission_port = IdleSerialPort(
+            f"{admission}\n".encode("ascii")
+        )
+        runtime["ser"] = admission_port
+        result_queue.available.clear()
+        self.assertTrue(
+            namespace["_try_start_main_controller_idle_stop_reader"]()
+        )
+        self.assertTrue(result_queue.available.wait(2))
+        self.assertTrue(transport_lock.locked())
+        self.assertFalse(activity.idle())
+        self.assertTrue(
+            namespace["_apply_main_controller_idle_stop_results"]()
+        )
+
+        self.assertIsNone(runtime["ser"])
+        self.assertFalse(admission_port.is_open)
+        self.assertTrue(serial_transport_quarantined(admission_port))
+        self.assertEqual(admission_port.write_count, 0)
+        self.assertEqual(
+            tuple(position.flag for position in published),
+            (CONTROLLER_ESTOP_EVENT_FLAG,),
+        )
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(activity.idle())
+        self.assertEqual(len(invalidations), 2)
+        self.assertIn(
+            "IDLE MAIN-CONTROLLER EVENT MONITOR FAILED",
+            invalidations[-1],
+        )
+        self.assertIn(
+            "standalone physical E-stop event",
+            invalidations[-1],
+        )
+        self.assertEqual(first_label.values[-1]["style"], "Alarm.TLabel")
+        self.assertEqual(second_label.values[-1], first_label.values[-1])
+        self.assertEqual(logged_errors[-1], invalidations[-1])
+        self.assertEqual(
+            tuple(serial_port for serial_port, _ in identity_cleanup),
+            (stop_port, invalid_port, admission_port),
+        )
+
+    def test_main_controller_stop_reservation_is_atomic_and_retryable(self):
+        estop = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+                1,
+            )
+        )
+        clear_entered = threading.Event()
+        release_clear = threading.Event()
+
+        class BlockingRequestQueue(list):
+            def clear(self):
+                clear_entered.set()
+                if not release_clear.wait(2):
+                    raise RuntimeError(
+                        "test did not release stop queue cancellation"
+                    )
+                super().clear()
+
+        class ImmediateThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def start(self):
+                self.target(*self.args)
+
+        manual_state_lock = threading.Lock()
+        auxiliary_state_lock = threading.Lock()
+        stop_barrier = threading.Event()
+        stop_requested = threading.Event()
+        queued_requests = BlockingRequestQueue(["queued-command"])
+        stop_events = Queue()
+        statuses = []
+        logs = []
+        runtime = {
+            "estopActive": False,
+            "programStopRequestId": None,
+            "offlineMode": False,
+        }
+        closing = threading.Event()
+        namespace = {
+            "dataclass": dataclass,
+            "PositionResponse": PositionResponse,
+            "MotionInputError": MotionInputError,
+            "position_response_is_physical_estop": (
+                position_response_is_physical_estop
+            ),
+            "manual_auxiliary_state_lock": manual_state_lock,
+            "manual_auxiliary_stop_barrier": stop_barrier,
+            "manual_auxiliary_request_queue": queued_requests,
+            "auxiliary_stop_state_lock": auxiliary_state_lock,
+            "auxiliary_stop_requested": stop_requested,
+            "auxiliary_stop_next_request_id": 0,
+            "auxiliary_stop_pending_request_id": None,
+            "auxiliary_stop_active_request_id": None,
+            "main_controller_auxiliary_stop_request_id": None,
+            "program_stop_state_lock": threading.RLock(),
+            "RUN": runtime,
+            "CAL": {
+                "com2Port": "COM14",
+                "auxiliaryBoard": AUXILIARY_BOARD_NANO,
+            },
+            "AUXILIARY_BOARD_NONE": AUXILIARY_BOARD_NONE,
+            "application_closing": closing,
+            "_set_program_stop_status": statuses.append,
+            "_try_dispatch_auxiliary_stop": lambda: False,
+            "_invalidate_joint_motion_state": (
+                lambda reason: (_ for _ in ()).throw(
+                    RuntimeError("invalidation unavailable")
+                )
+            ),
+            "main_controller_stop_event_queue": stop_events,
+            "logger": SimpleNamespace(
+                warning=lambda *args: logs.append(("warning", args)),
+                exception=lambda *args: logs.append(("exception", args)),
+            ),
+        }
+        namespace["_auxiliary_stop_not_required"] = self.compile_function(
+            "_auxiliary_stop_not_required",
+            namespace,
+        )
+        namespace["MainControllerStopContext"] = self.compile_class(
+            "MainControllerStopContext",
+            namespace,
+        )
+        namespace["MainControllerStopEvent"] = self.compile_class(
+            "MainControllerStopEvent",
+            namespace,
+        )
+        namespace["_latch_main_controller_stop_state"] = (
+            self.compile_function(
+                "_latch_main_controller_stop_state",
+                namespace,
+            )
+        )
+        publish = self.compile_function(
+            "_publish_main_controller_stop",
+            namespace,
+        )
+        serial_port = SimpleNamespace(is_open=True)
+        context = namespace["MainControllerStopContext"](
+            serial_port,
+            1,
+            1,
+        )
+        publication_results = []
+
+        def publish_stop():
+            try:
+                publication_results.append(publish(context, estop))
+            except Exception as exc:
+                publication_results.append(exc)
+
+        publication_thread = threading.Thread(target=publish_stop)
+        publication_thread.start()
+        self.assertTrue(clear_entered.wait(2))
+        self.assertTrue(stop_barrier.is_set())
+
+        admission_started = threading.Event()
+        admission_finished = threading.Event()
+
+        def attempt_late_admission():
+            admission_started.set()
+            with manual_state_lock:
+                if not stop_barrier.is_set():
+                    queued_requests.append("late-command")
+            admission_finished.set()
+
+        admission_thread = threading.Thread(target=attempt_late_admission)
+        admission_thread.start()
+        self.assertTrue(admission_started.wait(2))
+        self.assertFalse(admission_finished.wait(0.05))
+        release_clear.set()
+        publication_thread.join(2)
+        admission_thread.join(2)
+
+        self.assertFalse(publication_thread.is_alive())
+        self.assertFalse(admission_thread.is_alive())
+        self.assertEqual(publication_results, [True])
+        self.assertEqual(queued_requests, [])
+        self.assertTrue(runtime["estopActive"])
+        self.assertEqual(runtime["programStopRequestId"], 1)
+        self.assertEqual(
+            namespace["auxiliary_stop_pending_request_id"],
+            1,
+        )
+        self.assertEqual(
+            namespace["main_controller_auxiliary_stop_request_id"],
+            1,
+        )
+        self.assertTrue(stop_requested.is_set())
+        self.assertEqual(statuses, ["pending"])
+        self.assertEqual(stop_events.qsize(), 1)
+        self.assertTrue(
+            any(
+                entry[0] == "exception"
+                and "invalidate joint motion" in entry[1][0]
+                for entry in logs
+            )
+        )
+
+        dispatched = []
+        activity = SerialActivityRegistry(("ser2",))
+        activity.begin_shutdown()
+        closing.set()
+
+        def run_reserved_stop(request_id, control_mode):
+            dispatched.append((request_id, control_mode, "STOP\n"))
+
+        namespace.update(
+            auxiliary_stop_acknowledgement_deadline=None,
+            auxiliary_stop_owner_waiting=False,
+            auxiliary_stop_owner_result=None,
+            auxiliary_stop_owner_result_event=threading.Event(),
+            auxiliary_stop_injected_event=threading.Event(),
+            auxiliary_serial_event_queue=Queue(),
+            serial_activity_registry=activity,
+            SerialActivityRegistry=SerialActivityRegistry,
+            _run_auxiliary_stop_safe=run_reserved_stop,
+            threading=SimpleNamespace(Thread=ImmediateThread),
+        )
+        dispatch_stop = self.compile_function(
+            "_try_dispatch_auxiliary_stop",
+            namespace,
+        )
+        self.assertTrue(dispatch_stop())
+        self.assertEqual(
+            dispatched,
+            [
+                (
+                    1,
+                    SerialActivityRegistry.CONTROL_EXCLUSIVE,
+                    "STOP\n",
+                )
+            ],
+        )
+        self.assertFalse(namespace["_auxiliary_stop_not_required"]())
+        self.assertIsNone(namespace["auxiliary_stop_pending_request_id"])
+        self.assertEqual(namespace["auxiliary_stop_active_request_id"], 1)
+        settle_stop = self.compile_function(
+            "_settle_main_controller_auxiliary_stop_request",
+            namespace,
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "preceded request release",
+        ):
+            settle_stop(1, True)
+        self.assertEqual(
+            namespace["main_controller_auxiliary_stop_request_id"],
+            1,
+        )
+
+        activity.finish_control(
+            "ser2",
+            SerialActivityRegistry.CONTROL_EXCLUSIVE,
+        )
+        namespace["auxiliary_stop_active_request_id"] = None
+        self.assertTrue(settle_stop(1, False))
+        self.assertEqual(namespace["auxiliary_stop_pending_request_id"], 1)
+        self.assertEqual(
+            namespace["main_controller_auxiliary_stop_request_id"],
+            1,
+        )
+        self.assertTrue(stop_requested.is_set())
+
+        namespace["auxiliary_stop_pending_request_id"] = None
+        stop_requested.clear()
+        self.assertTrue(settle_stop(1, True))
+        self.assertIsNone(
+            namespace["main_controller_auxiliary_stop_request_id"]
+        )
+
+    def test_physical_stop_barrier_orders_with_auxiliary_write_commitment(self):
+        class Port:
+            is_open = True
+
+        estop = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+                1,
+            )
+        )
+        serial_port = Port()
+        manual_state_lock = threading.Lock()
+        stop_barrier = threading.Event()
+        write_started = threading.Event()
+        release_write = threading.Event()
+        cancellation_started = threading.Event()
+        events = []
+        writer_results = []
+        stop_results = []
+        runtime = {
+            "ser2": serial_port,
+            "ser2BoardProfile": (
+                serial_port,
+                AUXILIARY_BOARD_NANO,
+            ),
+            "estopActive": False,
+            "posOutreach": False,
+            "programStopRequestId": None,
+            "offlineMode": False,
+        }
+
+        def write_control(port, command, **options):
+            events.append("write-started")
+            write_started.set()
+            if not release_write.wait(2):
+                raise RuntimeError("test did not release auxiliary write")
+            events.append("write-committed")
+            return True
+
+        def cancel_program():
+            self.assertTrue(stop_barrier.is_set())
+            events.append("cancellation-started")
+            cancellation_started.set()
+            return False
+
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "SerialActivityRejected": SerialActivityRejected,
+            "position_response_is_physical_estop": (
+                position_response_is_physical_estop
+            ),
+            "RUN": runtime,
+            "CAL": {
+                "com2Port": "None",
+                "auxiliaryBoard": AUXILIARY_BOARD_NONE,
+            },
+            "AUXILIARY_BOARD_NONE": AUXILIARY_BOARD_NONE,
+            "manual_auxiliary_state_lock": manual_state_lock,
+            "manual_auxiliary_stop_barrier": stop_barrier,
+            "manual_auxiliary_request_queue": [],
+            "auxiliary_stop_state_lock": threading.Lock(),
+            "auxiliary_stop_requested": threading.Event(),
+            "auxiliary_stop_next_request_id": 0,
+            "auxiliary_stop_pending_request_id": None,
+            "auxiliary_stop_active_request_id": None,
+            "main_controller_auxiliary_stop_request_id": None,
+            "program_stop_state_lock": threading.RLock(),
+            "auxiliary_serial_write_lock": threading.Lock(),
+            "_connected_auxiliary_board_profile": (
+                lambda port: AUXILIARY_BOARD_NANO
+            ),
+            "validate_auxiliary_output_command": (
+                validate_auxiliary_output_command
+            ),
+            "validate_auxiliary_servo_command": (
+                validate_auxiliary_servo_command
+            ),
+            "write_serial_control": write_control,
+            "_clear_auxiliary_board_profile": lambda port=None: True,
+            "_auxiliary_stop_not_required": lambda: True,
+            "_cancel_active_program_execution": cancel_program,
+            "_set_program_stop_status": lambda state: True,
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+        }
+        namespace["_manual_auxiliary_stop_in_progress"] = (
+            self.compile_function(
+                "_manual_auxiliary_stop_in_progress",
+                namespace,
+            )
+        )
+        write_auxiliary = self.compile_function(
+            "_write_legacy_auxiliary_command",
+            namespace,
+        )
+        latch_stop = self.compile_function(
+            "_latch_main_controller_stop_state",
+            namespace,
+        )
+
+        def run_writer():
+            try:
+                writer_results.append(write_auxiliary("ONX8\n"))
+            except Exception as exc:
+                writer_results.append(exc)
+
+        def run_stop():
+            try:
+                stop_results.append(latch_stop(estop))
+            except Exception as exc:
+                stop_results.append(exc)
+
+        writer_thread = threading.Thread(target=run_writer)
+        stop_thread = threading.Thread(target=run_stop)
+        writer_thread.start()
+        self.assertTrue(write_started.wait(2))
+        stop_thread.start()
+        self.assertFalse(cancellation_started.wait(0.05))
+        self.assertFalse(stop_barrier.is_set())
+
+        release_write.set()
+        writer_thread.join(2)
+        stop_thread.join(2)
+
+        self.assertFalse(writer_thread.is_alive())
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(writer_results, [True])
+        self.assertEqual(stop_results, [True])
+        self.assertEqual(
+            events,
+            [
+                "write-started",
+                "write-committed",
+                "cancellation-started",
+            ],
+        )
+        self.assertTrue(stop_barrier.is_set())
+        self.assertTrue(runtime["estopActive"])
+
+    def test_main_controller_stop_serializes_full_auxiliary_replacement(self):
+        estop = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+                1,
+            )
+        )
+        replacement_started = threading.Event()
+        finish_replacement = threading.Event()
+        old_serial = SimpleNamespace(is_open=True)
+        new_serial = SimpleNamespace(is_open=True)
+        runtime = {
+            "estopActive": False,
+            "posOutreach": False,
+            "programStopRequestId": None,
+            "offlineMode": False,
+            "ser2": old_serial,
+            "ser2BoardProfile": (
+                old_serial,
+                AUXILIARY_BOARD_MEGA,
+            ),
+        }
+        calibration = self._valid_runtime_calibration()
+        calibration["com2Port"] = "COM2"
+        calibration["auxiliaryBoard"] = AUXILIARY_BOARD_MEGA
+        output_values = self._auxiliary_output_values(calibration)
+        replacement_calls = []
+
+        class Selection:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        def replace_output_values(values):
+            previous = dict(output_values)
+            output_values.update({
+                key: str(values[key])
+                for key in output_values
+            })
+            return previous
+
+        def replace_serial(port, board):
+            replacement_calls.append((port, board))
+            self.assertEqual((port, board), ("COM14", AUXILIARY_BOARD_NANO))
+            self.assertIs(runtime["ser2"], old_serial)
+            self.assertEqual(calibration["com2Port"], "COM2")
+            self.assertEqual(
+                calibration["auxiliaryBoard"],
+                AUXILIARY_BOARD_MEGA,
+            )
+            replacement_started.set()
+            if not finish_replacement.wait(2):
+                raise RuntimeError(
+                    "auxiliary replacement was not released"
+                )
+            old_serial.is_open = False
+            runtime["ser2"] = new_serial
+            runtime["ser2BoardProfile"] = (
+                new_serial,
+                AUXILIARY_BOARD_NANO,
+            )
+            return new_serial
+
+        namespace = {
+            "dataclass": dataclass,
+            "PositionResponse": PositionResponse,
+            "MotionInputError": MotionInputError,
+            "position_response_is_physical_estop": (
+                position_response_is_physical_estop
+            ),
+            "application_closing": threading.Event(),
+            "auxiliary_serial_lock": threading.Lock(),
+            "manual_auxiliary_state_lock": threading.Lock(),
+            "manual_auxiliary_stop_barrier": threading.Event(),
+            "manual_auxiliary_request_queue": [],
+            "auxiliary_stop_state_lock": threading.Lock(),
+            "auxiliary_stop_requested": threading.Event(),
+            "auxiliary_stop_next_request_id": 0,
+            "auxiliary_stop_pending_request_id": None,
+            "auxiliary_stop_active_request_id": None,
+            "main_controller_auxiliary_stop_request_id": None,
+            "program_stop_state_lock": threading.RLock(),
+            "RUN": runtime,
+            "CAL": calibration,
+            "AUXILIARY_BOARD_NONE": AUXILIARY_BOARD_NONE,
+            "com2SelectedValue": Selection("COM14"),
+            "auxiliaryBoardSelectedValue": Selection(
+                AUXILIARY_BOARD_NANO
+            ),
+            "_read_auxiliary_output_field_values": (
+                lambda: dict(output_values)
+            ),
+            "_replace_auxiliary_output_field_values": replace_output_values,
+            "_replace_auxiliary_serial": replace_serial,
+            "_close_serial_port": lambda *args: True,
+            "_set_program_stop_status": lambda state: True,
+            "_try_dispatch_auxiliary_stop": lambda: False,
+            "_invalidate_joint_motion_state": lambda reason: True,
+            "main_controller_stop_event_queue": Queue(),
+            "logger": SimpleNamespace(
+                info=lambda *args: None,
+                warning=lambda *args: None,
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "tab8": SimpleNamespace(
+                ElogView=SimpleNamespace(get=lambda *args: ())
+            ),
+            "pickle": SimpleNamespace(dump=lambda *args: None),
+            "open": lambda *args, **kwargs: object(),
+            "END": "end",
+        }
+        namespace["_auxiliary_stop_not_required"] = self.compile_function(
+            "_auxiliary_stop_not_required",
+            namespace,
+        )
+        namespace["MainControllerStopContext"] = self.compile_class(
+            "MainControllerStopContext",
+            namespace,
+        )
+        namespace["MainControllerStopEvent"] = self.compile_class(
+            "MainControllerStopEvent",
+            namespace,
+        )
+        namespace["_latch_main_controller_stop_state"] = (
+            self.compile_function(
+                "_latch_main_controller_stop_state",
+                namespace,
+            )
+        )
+        publish = self.compile_function(
+            "_publish_main_controller_stop",
+            namespace,
+        )
+        replace_configuration = self.compile_function(
+            "setCom2",
+            namespace,
+        )
+        context = namespace["MainControllerStopContext"](
+            SimpleNamespace(is_open=True),
+            1,
+            1,
+        )
+        configuration_result = []
+        stop_result = []
+
+        configuration_thread = threading.Thread(
+            target=lambda: configuration_result.append(
+                replace_configuration()
+            )
+        )
+        configuration_thread.start()
+        self.assertTrue(replacement_started.wait(2))
+        publication_thread = threading.Thread(
+            target=lambda: stop_result.append(publish(context, estop))
+        )
+        publication_thread.start()
+        self.assertTrue(publication_thread.is_alive())
+        self.assertFalse(runtime["estopActive"])
+        self.assertIs(runtime["ser2"], old_serial)
+        self.assertTrue(old_serial.is_open)
+        self.assertEqual(calibration["com2Port"], "COM2")
+        self.assertEqual(
+            calibration["auxiliaryBoard"],
+            AUXILIARY_BOARD_MEGA,
+        )
+
+        finish_replacement.set()
+        configuration_thread.join(2)
+        publication_thread.join(2)
+
+        self.assertFalse(configuration_thread.is_alive())
+        self.assertFalse(publication_thread.is_alive())
+        self.assertEqual(configuration_result, [True])
+        self.assertEqual(stop_result, [True])
+        self.assertIs(runtime["ser2"], new_serial)
+        self.assertFalse(old_serial.is_open)
+        self.assertEqual(calibration["com2Port"], "COM14")
+        self.assertEqual(
+            calibration["auxiliaryBoard"],
+            AUXILIARY_BOARD_NANO,
+        )
+        self.assertTrue(runtime["estopActive"])
+        self.assertEqual(runtime["programStopRequestId"], 1)
+        self.assertEqual(
+            namespace["main_controller_auxiliary_stop_request_id"],
+            1,
+        )
+        self.assertEqual(
+            namespace["auxiliary_stop_pending_request_id"],
+            1,
+        )
+        self.assertTrue(namespace["auxiliary_stop_requested"].is_set())
+        self.assertEqual(
+            replacement_calls,
+            [("COM14", AUXILIARY_BOARD_NANO)],
+        )
+
+        prior_serial = SimpleNamespace(is_open=True)
+        runtime.update({
+            "estopActive": False,
+            "programStopRequestId": None,
+            "ser2": prior_serial,
+            "ser2BoardProfile": (
+                prior_serial,
+                AUXILIARY_BOARD_MEGA,
+            ),
+        })
+        calibration["com2Port"] = "COM2"
+        calibration["auxiliaryBoard"] = AUXILIARY_BOARD_MEGA
+        namespace["manual_auxiliary_stop_barrier"].clear()
+        namespace["auxiliary_stop_requested"].clear()
+        namespace["auxiliary_stop_pending_request_id"] = None
+        namespace["auxiliary_stop_active_request_id"] = None
+        namespace["main_controller_auxiliary_stop_request_id"] = None
+        namespace["program_execution_cancelled"].clear()
+        replacement_calls.clear()
+        stop_snapshot_started = threading.Event()
+        finish_stop_snapshot = threading.Event()
+
+        def stop_required_from_prior_binding():
+            stop_snapshot_started.set()
+            if not finish_stop_snapshot.wait(2):
+                raise RuntimeError(
+                    "physical-stop binding snapshot was not released"
+                )
+            return False
+
+        namespace["_auxiliary_stop_not_required"] = (
+            stop_required_from_prior_binding
+        )
+        prior_stop_result = []
+        rejected_configuration_result = []
+        prior_publication_thread = threading.Thread(
+            target=lambda: prior_stop_result.append(publish(context, estop))
+        )
+        prior_publication_thread.start()
+        self.assertTrue(stop_snapshot_started.wait(2))
+        rejected_configuration_thread = threading.Thread(
+            target=lambda: rejected_configuration_result.append(
+                replace_configuration()
+            )
+        )
+        rejected_configuration_thread.start()
+        self.assertTrue(rejected_configuration_thread.is_alive())
+        self.assertEqual(replacement_calls, [])
+
+        finish_stop_snapshot.set()
+        prior_publication_thread.join(2)
+        rejected_configuration_thread.join(2)
+
+        self.assertFalse(prior_publication_thread.is_alive())
+        self.assertFalse(rejected_configuration_thread.is_alive())
+        self.assertEqual(prior_stop_result, [True])
+        self.assertEqual(rejected_configuration_result, [False])
+        self.assertEqual(replacement_calls, [])
+        self.assertIs(runtime["ser2"], prior_serial)
+        self.assertTrue(prior_serial.is_open)
+        self.assertEqual(calibration["com2Port"], "COM2")
+        self.assertEqual(
+            calibration["auxiliaryBoard"],
+            AUXILIARY_BOARD_MEGA,
+        )
 
     def test_position_calibration_and_port_mutators_reject_logical_motion(self):
         callback_names = (
@@ -8027,6 +10190,1452 @@ class HmiSourceContractTests(unittest.TestCase):
         write_output("SV00P090\n")
         self.assertEqual(port.commands[-1], b"SV00P090\n")
 
+    def test_manual_modbus_buttons_are_nonblocking_thin_wrappers(self):
+        callback_opcodes = {
+            "MBreadHoldReg": "BA",
+            "MBreadCoil": "BB",
+            "MBreadInput": "BC",
+            "MBreadInputReg": "BD",
+            "MBwriteCoil": "BE",
+            "MBwriteReg": "BF",
+        }
+        for callback_name, opcode in callback_opcodes.items():
+            function = self.module_functions[callback_name]
+            self.assertEqual(function.decorator_list, [], callback_name)
+            calls = [
+                node
+                for node in ast.walk(function)
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                )
+            ]
+            self.assertEqual(len(calls), 1, callback_name)
+            self.assertEqual(calls[0].func.id, "_request_manual_modbus")
+            self.assertEqual(len(calls[0].args), 1)
+            self.assertIsInstance(calls[0].args[0], ast.Constant)
+            self.assertEqual(calls[0].args[0].value, opcode)
+
+        worker_names = {
+            node.id
+            for node in ast.walk(
+                self.module_functions["_run_manual_controller_request"]
+            )
+            if isinstance(node, ast.Name)
+        }
+        self.assertFalse(
+            worker_names
+            & {
+                "root",
+                "MBslaveEntryField",
+                "MBaddressEntryField",
+                "MBoperValEntryField",
+                "MBoutputEntryField",
+                "cmdSentEntryField",
+                "almStatusLab",
+                "almStatusLab2",
+                "logger",
+            }
+        )
+        status_wrapper = self.module_functions[
+            "_set_manual_controller_status"
+        ]
+        status_calls = [
+            node
+            for node in ast.walk(status_wrapper)
+            if isinstance(node, ast.Call)
+        ]
+        self.assertEqual(len(status_calls), 1)
+        self.assertIsInstance(status_calls[0].func, ast.Name)
+        self.assertEqual(
+            status_calls[0].func.id,
+            "_set_manual_auxiliary_status",
+        )
+        for function_name in (
+            "_render_manual_controller_rejection",
+            "_start_manual_controller_request",
+            "_poll_manual_controller_events",
+        ):
+            direct_shared_status_calls = [
+                node
+                for node in ast.walk(self.module_functions[function_name])
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "config"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in {
+                        "almStatusLab",
+                        "almStatusLab2",
+                    }
+                )
+            ]
+            self.assertEqual(
+                direct_shared_status_calls,
+                [],
+                function_name,
+            )
+        starter = self.module_functions["_start_manual_controller_request"]
+        starter_calls = [
+            node
+            for node in ast.walk(starter)
+            if isinstance(node, ast.Call)
+        ]
+        self.assertTrue(
+            any(
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "threading"
+                and node.func.attr == "Thread"
+                for node in starter_calls
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "start"
+                for node in starter_calls
+            )
+        )
+        self.assertFalse(
+            any(
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "join"
+                for node in starter_calls
+            )
+        )
+        self.assertFalse(
+            any(
+                isinstance(node.func, ast.Name)
+                and node.func.id in {
+                    "_exchange_legacy_main_command",
+                    "_exchange_manual_controller_request",
+                }
+                for node in starter_calls
+            )
+        )
+
+    def test_manual_modbus_request_lifecycle_is_owned_and_tk_applied(self):
+        class Port:
+            def __init__(self):
+                self.is_open = True
+
+            def close(self):
+                self.is_open = False
+
+        class CloseFailingOncePort(Port):
+            def __init__(self):
+                super().__init__()
+                self.close_attempts = 0
+
+            def close(self):
+                self.close_attempts += 1
+                if self.close_attempts == 1:
+                    return
+                super().close()
+
+        class Entry:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class Widget:
+            def __init__(self):
+                self.value = None
+                self.configurations = []
+
+            def delete(self, *args):
+                self.value = None
+
+            def insert(self, index, value):
+                self.value = value
+
+            def config(self, **kwargs):
+                self.configurations.append(kwargs)
+
+        class ImmediateThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def start(self):
+                self.target(*self.args)
+
+        class StartFailingThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def start(self):
+                raise RuntimeError(" thread start failed\n")
+
+        class FailingOnceLease:
+            def __init__(self, delegate):
+                self.delegate = delegate
+                self.failed = False
+
+            def close(self):
+                if not self.failed:
+                    self.failed = True
+                    raise RuntimeError("temporary lease failure")
+                return self.delegate.close()
+
+        port = Port()
+        runtime = {
+            "ser": port,
+            "offlineMode": False,
+            "estopActive": False,
+            "posOutreach": False,
+            "programStopRequestId": None,
+        }
+        activity = SerialActivityRegistry(("ser",))
+        transport_lock = threading.Lock()
+        pending = threading.Event()
+        stop_barrier = threading.Event()
+        event_queue = Queue()
+        sent = Widget()
+        output = Widget()
+        first_label = Widget()
+        second_label = Widget()
+        slave = Entry("1")
+        address = Entry("0")
+        operation_value = Entry("1")
+        exchanges = []
+        invalidations = []
+        deferred_calls = []
+        applied_positions = []
+        physical_stop_fallbacks = []
+        scheduled = []
+        logged = []
+        status_reservation = {"kind": None}
+        deferred_behavior = {
+            "outcome": DeferredJointDispatchOutcome.IDLE,
+        }
+        exchange_behavior = {
+            "handler": lambda serial_port, command: (
+                ControllerModbusExchangeResponse(
+                    "42",
+                    None,
+                    "terminal-only",
+                )
+            ),
+        }
+        pending_estop_behavior = {
+            "handler": lambda serial_port: None,
+        }
+
+        def write_control(
+            serial_port,
+            command,
+            write_lock=None,
+            reset_input=False,
+            write_started_event=None,
+        ):
+            self.assertIs(serial_port, runtime["ser"])
+            self.assertFalse(reset_input)
+            self.assertIsNotNone(write_started_event)
+            write_started_event.set()
+            exchanges.append(command)
+            return True
+
+        def read_controller_exchange(
+            serial_port,
+            command,
+            timeout,
+            estop_callback,
+        ):
+            response = exchange_behavior["handler"](serial_port, command)
+            if (
+                isinstance(response, ControllerModbusExchangeResponse)
+                and response.estop_position is not None
+            ):
+                self.assertTrue(
+                    estop_callback(response.estop_position)
+                )
+            return response
+
+        def read_pending_estop(serial_port, estop_callback):
+            position = pending_estop_behavior["handler"](serial_port)
+            if isinstance(position, PositionResponse):
+                self.assertTrue(estop_callback(position))
+            return position
+
+        def set_shared_status(message, style):
+            if status_reservation["kind"] is not None:
+                return False
+            first_label.config(text=message, style=style)
+            second_label.config(text=message, style=style)
+            return True
+
+        def display_position(response, parsed):
+            self.assertEqual(response, parsed.raw)
+            applied_positions.append(parsed)
+            if position_response_is_physical_estop(parsed):
+                status_reservation["kind"] = "estop"
+                first_label.config(
+                    text="Estop Button was Pressed",
+                    style="Alarm.TLabel",
+                )
+                second_label.config(
+                    text="Estop Button was Pressed",
+                    style="Alarm.TLabel",
+                )
+            return parsed
+
+        def dispatch_deferred(**kwargs):
+            deferred_calls.append(kwargs)
+            outcome = deferred_behavior["outcome"]
+            if outcome is DeferredJointDispatchOutcome.REJECTED:
+                first_label.config(
+                    text="Deferred joint jog rejected: invalid target",
+                    style="Alarm.TLabel",
+                )
+                second_label.config(
+                    text="Deferred joint jog rejected: invalid target",
+                    style="Alarm.TLabel",
+                )
+            return outcome
+
+        namespace = {
+            "dataclass": dataclass,
+            "Optional": Optional,
+            "MotionInputError": MotionInputError,
+            "MAX_RESPONSE_PAYLOAD_LENGTH": MAX_RESPONSE_PAYLOAD_LENGTH,
+            "PositionResponse": PositionResponse,
+            "CONTROLLER_ESTOP_ADMISSION_FLAG": (
+                CONTROLLER_ESTOP_ADMISSION_FLAG
+            ),
+            "CONTROLLER_ESTOP_EVENT_FLAG": CONTROLLER_ESTOP_EVENT_FLAG,
+            "position_response_is_physical_estop": (
+                position_response_is_physical_estop
+            ),
+            "DeferredJointDispatchOutcome": (
+                DeferredJointDispatchOutcome
+            ),
+            "ControllerModbusExchangeResponse": (
+                ControllerModbusExchangeResponse
+            ),
+            "ProtocolResponseError": ProtocolResponseError,
+            "SerialTransportQuarantinedError": (
+                SerialTransportQuarantinedError
+            ),
+            "SerialTransportTimeout": SerialTransportTimeout,
+            "ManualControllerRequest": None,
+            "ManualControllerStopEvent": None,
+            "ManualControllerResult": None,
+            "ManualControllerPresentation": None,
+            "ManualControllerCleanup": None,
+            "validate_controller_modbus_command": (
+                validate_controller_modbus_command
+            ),
+            "build_controller_modbus_command": (
+                build_controller_modbus_command
+            ),
+            "parse_controller_modbus_response": (
+                parse_controller_modbus_response
+            ),
+            "classify_controller_modbus_terminal_response": (
+                classify_controller_modbus_terminal_response
+            ),
+            "controller_modbus_command_is_write": (
+                controller_modbus_command_is_write
+            ),
+            "parse_controller_modbus_exchange_frames": (
+                parse_controller_modbus_exchange_frames
+            ),
+            "parse_position_response": parse_position_response,
+            "quarantine_serial_transport": quarantine_serial_transport,
+            "read_controller_modbus_exchange_response": (
+                read_controller_exchange
+            ),
+            "read_pending_controller_estop_response": (
+                read_pending_estop
+            ),
+            "serial_transport_quarantined": (
+                serial_transport_quarantined
+            ),
+            "write_serial_control": write_control,
+            "serial_write_lock": threading.Lock(),
+            "SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS": 120,
+            "RUN": runtime,
+            "application_closing": threading.Event(),
+            "serial_activity_registry": activity,
+            "serial_lock": transport_lock,
+            "legacy_serial_result_pending": pending,
+            "manual_auxiliary_stop_barrier": stop_barrier,
+            "manual_controller_event_queue": event_queue,
+            "manual_controller_active_request": None,
+            "manual_controller_activity_lease": None,
+            "manual_controller_next_request_id": 0,
+            "manual_controller_state_lock": threading.Lock(),
+            "manual_controller_estop_applied_request_id": None,
+            "manual_controller_estop_applied_position": None,
+            "manual_controller_cleanup_lock": threading.Lock(),
+            "manual_controller_cleanup_pending": None,
+            "program_execution_state_lock": threading.Lock(),
+            "program_execution_active_request": None,
+            "gcode_conversion_active": threading.Event(),
+            "gcode_storage_program_admission_active": False,
+            "manual_controller_program_admission_active": False,
+            "_program_execution_active": lambda: False,
+            "threading": SimpleNamespace(
+                Thread=ImmediateThread,
+                Lock=threading.Lock,
+                Event=threading.Event,
+            ),
+            "Empty": Empty,
+            "MBslaveEntryField": slave,
+            "MBaddressEntryField": address,
+            "MBoperValEntryField": operation_value,
+            "MBoutputEntryField": output,
+            "cmdSentEntryField": sent,
+            "almStatusLab": first_label,
+            "almStatusLab2": second_label,
+            "joint_motion_dispatcher": SimpleNamespace(active=False),
+            "motion_request_registry": MotionRequestRegistry(),
+            "_set_manual_auxiliary_status": set_shared_status,
+            "_auxiliary_stop_not_required": lambda: True,
+            "_set_program_stop_status": lambda state: True,
+            "_try_dispatch_auxiliary_stop": lambda: False,
+            "displayPosition": display_position,
+            "ErrorHandler": physical_stop_fallbacks.append,
+            "_try_dispatch_deferred_joint_adjustments": dispatch_deferred,
+            "_invalidate_joint_motion_state": invalidations.append,
+            "_require_main_controller_identity_cleanup": (
+                lambda serial_port, context: True
+            ),
+            "_reschedule_event_poll": scheduled.append,
+            "logger": SimpleNamespace(
+                error=lambda *args, **kwargs: logged.append(("error", args)),
+                warning=lambda *args, **kwargs: logged.append(
+                    ("warning", args)
+                ),
+                exception=lambda *args, **kwargs: logged.append(
+                    ("exception", args)
+                ),
+            ),
+        }
+        namespace["ManualControllerRequest"] = self.compile_class(
+            "ManualControllerRequest",
+            namespace,
+        )
+        namespace["ManualControllerStopEvent"] = self.compile_class(
+            "ManualControllerStopEvent",
+            namespace,
+        )
+        namespace["ManualControllerResult"] = self.compile_class(
+            "ManualControllerResult",
+            namespace,
+        )
+        namespace["ManualControllerPresentation"] = self.compile_class(
+            "ManualControllerPresentation",
+            namespace,
+        )
+        namespace["ManualControllerCleanup"] = self.compile_class(
+            "ManualControllerCleanup",
+            namespace,
+        )
+        request_type = namespace["ManualControllerRequest"]
+        stop_event_type = namespace["ManualControllerStopEvent"]
+        result_type = namespace["ManualControllerResult"]
+        presentation_type = namespace["ManualControllerPresentation"]
+
+        self.assertEqual(
+            request_type(1, port, "BAA1B0C1\n").command,
+            "BAA1B0C1\n",
+        )
+        with self.assertRaisesRegex(MotionInputError, "request ID"):
+            request_type(0, port, "BAA1B0C1\n")
+        with self.assertRaisesRegex(MotionInputError, "canonical"):
+            request_type(1, port, "BAA01B0C1\n")
+        self.assertEqual(
+            result_type(1, "completed", "42", True).value,
+            "42",
+        )
+        estop_position = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace("NO", "NOEB", 1)
+        )
+        admission_estop_position = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace("NO", "NOEA", 1)
+        )
+        self.assertIs(
+            stop_event_type(1, estop_position).position,
+            estop_position,
+        )
+        self.assertIs(
+            stop_event_type(1, admission_estop_position).position,
+            admission_estop_position,
+        )
+        with self.assertRaisesRegex(MotionInputError, "event ID"):
+            stop_event_type(0, estop_position)
+        with self.assertRaisesRegex(MotionInputError, "event position"):
+            stop_event_type(1, VALID_CONTROLLER_POSITION)
+        with self.assertRaisesRegex(MotionInputError, "do not match"):
+            stop_event_type(
+                1,
+                replace(
+                    estop_position,
+                    joints=(99.0,) + estop_position.joints[1:],
+                ),
+            )
+        self.assertIs(
+            result_type(
+                1,
+                "estop",
+                "42",
+                True,
+                estop_position,
+                "estop-terminal",
+            ).position,
+            estop_position,
+        )
+        self.assertIs(
+            result_type(
+                1,
+                "estop",
+                "PHYSICAL E-STOP BLOCKED COMMAND ADMISSION",
+                True,
+                admission_estop_position,
+                "admission-estop",
+            ).position,
+            admission_estop_position,
+        )
+        self.assertIs(
+            result_type(
+                1,
+                "estop",
+                "PHYSICAL E-STOP BLOCKED COMMAND ADMISSION",
+                True,
+                estop_position,
+                "estop-admission",
+                admission_estop_position,
+            ).admission_position,
+            admission_estop_position,
+        )
+        with self.assertRaisesRegex(MotionInputError, "outcome"):
+            result_type(1, "unknown", "42", False)
+        with self.assertRaisesRegex(MotionInputError, "value"):
+            result_type(1, "failed", "bad\nvalue", False)
+        with self.assertRaisesRegex(MotionInputError, "value"):
+            result_type(
+                1,
+                "failed",
+                "x" * (MAX_RESPONSE_PAYLOAD_LENGTH + 1),
+                False,
+            )
+        with self.assertRaisesRegex(MotionInputError, "E-stop result"):
+            result_type(
+                1,
+                "estop",
+                "42",
+                True,
+                VALID_CONTROLLER_POSITION,
+                "estop-terminal",
+            )
+        with self.assertRaisesRegex(MotionInputError, "contains a position"):
+            result_type(
+                1,
+                "completed",
+                "42",
+                True,
+                VALID_CONTROLLER_POSITION,
+            )
+        with self.assertRaisesRegex(MotionInputError, "lacks a serial write"):
+            result_type(1, "completed", "42", False)
+        with self.assertRaisesRegex(MotionInputError, "write state"):
+            result_type(
+                1,
+                "estop",
+                "42",
+                False,
+                estop_position,
+                "estop-terminal",
+            )
+        self.assertEqual(
+            result_type(
+                1,
+                "estop",
+                "PHYSICAL E-STOP RECEIVED BEFORE COMMAND TRANSMISSION",
+                False,
+                estop_position,
+                "estop-only",
+            ).frame_order,
+            "estop-only",
+        )
+
+        helper_names = (
+            "_manual_controller_error_detail",
+            "_set_manual_controller_feedback",
+            "_set_manual_controller_status",
+            "_render_manual_controller_rejection",
+            "_manual_controller_operation",
+            "_close_manual_controller_cleanup_transport",
+            "_retain_manual_controller_cleanup",
+            "_manual_controller_connection_trusted",
+            "_finalize_manual_controller_cleanup",
+            "_retry_manual_controller_cleanup",
+            "_release_manual_controller_operation",
+            "_latch_main_controller_stop_state",
+            "_publish_manual_controller_estop",
+            "_apply_pending_manual_controller_stop_event",
+            "_exchange_manual_controller_request",
+            "_run_manual_controller_request",
+            "_start_manual_controller_request",
+            "_request_manual_modbus",
+            "_poll_manual_controller_events",
+        )
+        for helper_name in helper_names:
+            namespace[helper_name] = self.compile_function(
+                helper_name,
+                namespace,
+            )
+
+        request_modbus = namespace["_request_manual_modbus"]
+        poll_results = namespace["_poll_manual_controller_events"]
+        self.assertEqual(
+            namespace["_manual_controller_error_detail"](
+                RuntimeError("x" * (MAX_RESPONSE_PAYLOAD_LENGTH + 1)),
+                "manual controller failure",
+            ),
+            "manual controller failure",
+        )
+
+        cleanup_request = request_type(99, port, "BAA1B0C1\n")
+        cleanup_lease = FailingOnceLease(activity.lease("ser"))
+        namespace["manual_controller_active_request"] = cleanup_request
+        namespace["manual_controller_activity_lease"] = cleanup_lease
+        namespace["manual_controller_program_admission_active"] = True
+        transport_lock.acquire()
+        pending.set()
+        with self.assertRaisesRegex(RuntimeError, "temporary lease failure"):
+            namespace["_release_manual_controller_operation"](
+                settlement_action="dispatch-ready",
+            )
+        self.assertIs(
+            namespace["manual_controller_active_request"],
+            cleanup_request,
+        )
+        self.assertIs(
+            namespace["manual_controller_activity_lease"],
+            cleanup_lease,
+        )
+        self.assertTrue(transport_lock.locked())
+        self.assertTrue(activity.active("ser"))
+        self.assertTrue(pending.is_set())
+        self.assertIsNotNone(
+            namespace["manual_controller_cleanup_pending"]
+        )
+        self.assertIn(
+            "temporary lease failure",
+            namespace["manual_controller_cleanup_pending"].last_error,
+        )
+        poll_results()
+        self.assertIsNone(namespace["manual_controller_active_request"])
+        self.assertIsNone(
+            namespace["manual_controller_cleanup_pending"]
+        )
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(activity.idle())
+        self.assertFalse(pending.is_set())
+        self.assertFalse(
+            namespace["manual_controller_program_admission_active"]
+        )
+        self.assertEqual(
+            deferred_calls,
+            [{"allow_current_generation": True}],
+        )
+        self.assertEqual(
+            first_label.configurations[-1]["text"],
+            "SYSTEM READY",
+        )
+        scheduled.clear()
+        deferred_calls.clear()
+
+        rejected_presentation = presentation_type(
+            "Controller request rejected: ER",
+            "Controller request rejected: ER",
+            "Alarm.TLabel",
+        )
+        cleanup_request = request_type(100, port, "BAA1B0C1\n")
+        cleanup_lease = FailingOnceLease(activity.lease("ser"))
+        namespace["manual_controller_active_request"] = cleanup_request
+        namespace["manual_controller_activity_lease"] = cleanup_lease
+        namespace["manual_controller_program_admission_active"] = True
+        transport_lock.acquire()
+        pending.set()
+        with self.assertRaisesRegex(RuntimeError, "temporary lease failure"):
+            namespace["_release_manual_controller_operation"](
+                settlement_action="dispatch",
+                settlement_presentation=rejected_presentation,
+            )
+        namespace["_set_manual_controller_feedback"](
+            "CONTROLLER I/O CLEANUP PENDING"
+        )
+        namespace["_set_manual_controller_status"](
+            "CONTROLLER I/O CLEANUP PENDING",
+            "Alarm.TLabel",
+        )
+        original_output_insert = output.insert
+        settlement_render_failed = {"value": False}
+
+        def fail_settlement_render_once(index, value):
+            if not settlement_render_failed["value"]:
+                settlement_render_failed["value"] = True
+                raise RuntimeError("settlement widget unavailable")
+            return original_output_insert(index, value)
+
+        output.insert = fail_settlement_render_once
+        poll_results()
+        self.assertIsNone(namespace["manual_controller_active_request"])
+        self.assertIsNotNone(
+            namespace["manual_controller_cleanup_pending"]
+        )
+        self.assertTrue(activity.idle())
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(pending.is_set())
+        self.assertTrue(
+            namespace["manual_controller_program_admission_active"]
+        )
+        self.assertIn(
+            "settlement widget unavailable",
+            namespace["manual_controller_cleanup_pending"].last_error,
+        )
+        replacement_attempts = []
+        namespace["serial"] = SimpleNamespace(
+            Serial=lambda **options: replacement_attempts.append(options)
+        )
+        namespace["com1SelectedValue"] = SimpleNamespace(get=lambda: "COM9")
+        set_connection = self.compile_function(
+            "_set_com_admitted",
+            namespace,
+        )
+        self.assertFalse(
+            set_connection(
+                object(),
+                {"transferred": False},
+            )
+        )
+        self.assertEqual(replacement_attempts, [])
+        self.assertIs(runtime["ser"], port)
+        self.assertTrue(port.is_open)
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(activity.idle())
+        self.assertEqual(
+            first_label.configurations[-1]["text"],
+            (
+                "Controller connection change rejected while controller "
+                "I/O cleanup is pending"
+            ),
+        )
+        output.insert = original_output_insert
+        poll_results()
+        self.assertEqual(output.value, rejected_presentation.feedback)
+        self.assertEqual(
+            first_label.configurations[-1],
+            {
+                "text": rejected_presentation.status,
+                "style": rejected_presentation.style,
+            },
+        )
+        self.assertEqual(
+            deferred_calls,
+            [{"allow_current_generation": True}],
+        )
+        self.assertTrue(activity.idle())
+        self.assertFalse(transport_lock.locked())
+        self.assertFalse(pending.is_set())
+        self.assertFalse(
+            namespace["manual_controller_program_admission_active"]
+        )
+        scheduled.clear()
+        deferred_calls.clear()
+
+        write_fault_cases = (
+            (
+                "estop",
+                "CONTROLLER WRITE REJECTED WHILE E-STOP LATCH IS ACTIVE",
+            ),
+            (
+                "position-fault",
+                "CONTROLLER WRITE REJECTED WHILE "
+                "POSITION-FAULT LATCH IS ACTIVE",
+            ),
+            (
+                "stop-settlement",
+                "CONTROLLER WRITE REJECTED WHILE "
+                "STOP SETTLEMENT IS ACTIVE",
+            ),
+        )
+        for opcode in ("BE", "BF"):
+            for fault_kind, expected_message in write_fault_cases:
+                with self.subTest(
+                    opcode=opcode,
+                    fault_kind=fault_kind,
+                ):
+                    runtime["estopActive"] = fault_kind == "estop"
+                    runtime["posOutreach"] = (
+                        fault_kind == "position-fault"
+                    )
+                    if fault_kind == "stop-settlement":
+                        stop_barrier.set()
+                    exchange_count = len(exchanges)
+                    request_id = namespace[
+                        "manual_controller_next_request_id"
+                    ]
+
+                    self.assertFalse(request_modbus(opcode))
+
+                    self.assertEqual(len(exchanges), exchange_count)
+                    self.assertEqual(
+                        namespace["manual_controller_next_request_id"],
+                        request_id,
+                    )
+                    self.assertIn(expected_message, output.value)
+                    self.assertIsNone(
+                        namespace["manual_controller_active_request"]
+                    )
+                    self.assertFalse(
+                        namespace[
+                            "manual_controller_program_admission_active"
+                        ]
+                    )
+                    self.assertFalse(transport_lock.locked())
+                    self.assertTrue(activity.idle())
+                    self.assertTrue(port.is_open)
+                    runtime["estopActive"] = False
+                    runtime["posOutreach"] = False
+                    stop_barrier.clear()
+
+        self.assertTrue(request_modbus("BA"))
+        self.assertEqual(exchanges, ["BAA1B0C1\n"])
+        self.assertEqual(sent.value, "BAA1B0C1\n")
+        self.assertTrue(transport_lock.locked())
+        self.assertTrue(activity.active("ser"))
+        self.assertTrue(pending.is_set())
+        self.assertIsNotNone(namespace["manual_controller_active_request"])
+        poll_results()
+        self.assertEqual(output.value, "42")
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(activity.idle())
+        self.assertFalse(pending.is_set())
+        self.assertIsNone(namespace["manual_controller_active_request"])
+        self.assertEqual(
+            deferred_calls,
+            [{"allow_current_generation": True}],
+        )
+        self.assertEqual(scheduled, ["manual-controller"])
+        self.assertEqual(
+            first_label.configurations[-1]["text"],
+            "SYSTEM READY",
+        )
+
+        deferred_behavior["outcome"] = (
+            DeferredJointDispatchOutcome.REJECTED
+        )
+        self.assertTrue(request_modbus("BA"))
+        poll_results()
+        self.assertEqual(
+            first_label.configurations[-1],
+            {
+                "text": "Deferred joint jog rejected: invalid target",
+                "style": "Alarm.TLabel",
+            },
+        )
+        deferred_behavior["outcome"] = DeferredJointDispatchOutcome.IDLE
+
+        for reservation_kind, safety_message in (
+            ("program-stop", "PROGRAM SCHEDULING HALTED"),
+            ("position-fault", "Position Out of Reach"),
+        ):
+            with self.subTest(reservation=reservation_kind):
+                self.assertTrue(request_modbus("BA"))
+                first_label.config(
+                    text=safety_message,
+                    style="Alarm.TLabel",
+                )
+                second_label.config(
+                    text=safety_message,
+                    style="Alarm.TLabel",
+                )
+                status_reservation["kind"] = reservation_kind
+                poll_results()
+                self.assertEqual(
+                    first_label.configurations[-1]["text"],
+                    safety_message,
+                )
+                self.assertTrue(activity.idle())
+                self.assertFalse(transport_lock.locked())
+                status_reservation["kind"] = None
+
+        operation_value.value = "0"
+        exchange_count = len(exchanges)
+        self.assertFalse(request_modbus("BA"))
+        self.assertEqual(len(exchanges), exchange_count)
+        self.assertIn("quantity", output.value)
+
+        operation_value.value = "1"
+        transport_lock.acquire()
+        self.assertFalse(request_modbus("BA"))
+        self.assertEqual(
+            output.value,
+            "CONTROLLER I/O REJECTED WHILE TRANSPORT IS BUSY",
+        )
+        transport_lock.release()
+
+        exchange_behavior["handler"] = (
+            lambda serial_port, command: ControllerModbusExchangeResponse(
+                "Modbus Error",
+                None,
+                "terminal-only",
+            )
+        )
+        self.assertTrue(request_modbus("BA"))
+        poll_results()
+        self.assertEqual(
+            output.value,
+            "Controller request rejected: Modbus Error",
+        )
+        self.assertTrue(port.is_open)
+        self.assertTrue(activity.idle())
+        self.assertFalse(transport_lock.locked())
+        self.assertEqual(
+            deferred_calls[-1],
+            {"allow_current_generation": True},
+        )
+        self.assertEqual(
+            first_label.configurations[-1]["style"],
+            "Alarm.TLabel",
+        )
+
+        invalid_exchange_port = Port()
+        runtime["ser"] = invalid_exchange_port
+        exchange_behavior["handler"] = (
+            lambda serial_port, command: object()
+        )
+        self.assertTrue(request_modbus("BA"))
+        invalid_exchange_result = event_queue.get_nowait()
+        event_queue.put(invalid_exchange_result)
+        self.assertIn(
+            "exchange response is invalid",
+            invalid_exchange_result.value,
+        )
+        self.assertFalse(invalid_exchange_port.is_open)
+        poll_results()
+        self.assertFalse(invalid_exchange_port.is_open)
+        self.assertIsNone(runtime["ser"])
+        self.assertTrue(
+            serial_transport_quarantined(invalid_exchange_port)
+        )
+        self.assertTrue(activity.idle())
+        self.assertFalse(transport_lock.locked())
+
+        exchange_behavior["handler"] = (
+            lambda serial_port, command: ControllerModbusExchangeResponse(
+                "42",
+                None,
+                "terminal-only",
+            )
+        )
+        cleanup_port = CloseFailingOncePort()
+        runtime["ser"] = cleanup_port
+        self.assertTrue(request_modbus("BA"))
+        event_queue.get_nowait()
+        event_queue.put(object())
+        poll_results()
+        self.assertTrue(cleanup_port.is_open)
+        self.assertIs(runtime["ser"], cleanup_port)
+        self.assertTrue(serial_transport_quarantined(cleanup_port))
+        self.assertFalse(activity.idle())
+        self.assertTrue(transport_lock.locked())
+        self.assertTrue(pending.is_set())
+        self.assertIsNotNone(
+            namespace["manual_controller_cleanup_pending"]
+        )
+        self.assertIn(
+            "serial connection remained open",
+            namespace["manual_controller_cleanup_pending"].last_error,
+        )
+        poll_results()
+        self.assertFalse(cleanup_port.is_open)
+        self.assertIsNone(runtime["ser"])
+        self.assertTrue(activity.idle())
+        self.assertFalse(transport_lock.locked())
+        self.assertFalse(pending.is_set())
+        self.assertIsNone(
+            namespace["manual_controller_cleanup_pending"]
+        )
+        self.assertIn(
+            "manual controller worker result ownership became invalid",
+            invalidations,
+        )
+
+        replacement = Port()
+        runtime["ser"] = replacement
+        namespace["threading"] = SimpleNamespace(
+            Thread=StartFailingThread,
+            Lock=threading.Lock,
+            Event=threading.Event,
+        )
+        self.assertFalse(request_modbus("BA"))
+        self.assertTrue(replacement.is_open)
+        self.assertTrue(activity.idle())
+        self.assertFalse(transport_lock.locked())
+        self.assertIsNone(namespace["manual_controller_active_request"])
+        self.assertIn("thread start failed", output.value)
+        self.assertTrue(
+            any(
+                arguments
+                and "Unable to start controller I/O worker"
+                in str(arguments[0])
+                for level, arguments in logged
+                if level == "exception"
+            )
+        )
+
+        namespace["threading"] = SimpleNamespace(
+            Thread=ImmediateThread,
+            Lock=threading.Lock,
+            Event=threading.Event,
+        )
+
+        completed_disconnected_port = Port()
+        runtime["ser"] = completed_disconnected_port
+        exchange_behavior["handler"] = (
+            lambda serial_port, command: ControllerModbusExchangeResponse(
+                "42",
+                None,
+                "terminal-only",
+            )
+        )
+        deferred_count = len(deferred_calls)
+        self.assertTrue(request_modbus("BA"))
+        completed_disconnected_port.close()
+        poll_results()
+        self.assertEqual(
+            output.value,
+            "Controller connection lost during result settlement "
+            "(42); reconnect required",
+        )
+        self.assertEqual(
+            first_label.configurations[-1],
+            {
+                "text": (
+                    "CONTROLLER CONNECTION LOST; "
+                    "RECONNECTION REQUIRED"
+                ),
+                "style": "Alarm.TLabel",
+            },
+        )
+        self.assertIsNone(runtime["ser"])
+        self.assertEqual(len(deferred_calls), deferred_count)
+
+        settlement_disconnect_port = Port()
+        runtime["ser"] = settlement_disconnect_port
+        deferred_count = len(deferred_calls)
+        self.assertTrue(request_modbus("BA"))
+        original_output_insert = output.insert
+        settlement_render_count = {"value": 0}
+
+        def disconnect_during_finalizer(index, value):
+            settlement_render_count["value"] += 1
+            result = original_output_insert(index, value)
+            if settlement_render_count["value"] == 3:
+                settlement_disconnect_port.close()
+            return result
+
+        output.insert = disconnect_during_finalizer
+        poll_results()
+        output.insert = original_output_insert
+        self.assertEqual(settlement_render_count["value"], 4)
+        self.assertEqual(
+            output.value,
+            "Controller connection lost during result settlement; "
+            "reconnect required",
+        )
+        self.assertEqual(
+            first_label.configurations[-1],
+            {
+                "text": (
+                    "CONTROLLER CONNECTION LOST; "
+                    "RECONNECTION REQUIRED"
+                ),
+                "style": "Alarm.TLabel",
+            },
+        )
+        self.assertIsNone(runtime["ser"])
+        self.assertFalse(pending.is_set())
+        self.assertFalse(
+            namespace["manual_controller_program_admission_active"]
+        )
+        self.assertEqual(len(deferred_calls), deferred_count)
+
+        application_error_port = CloseFailingOncePort()
+        runtime["ser"] = application_error_port
+        original_output_insert = output.insert
+        fail_feedback = {"pending": True}
+
+        def fail_feedback_once(index, value):
+            if fail_feedback["pending"]:
+                fail_feedback["pending"] = False
+                raise RuntimeError("feedback unavailable")
+            return original_output_insert(index, value)
+
+        output.insert = fail_feedback_once
+        deferred_count = len(deferred_calls)
+        self.assertTrue(request_modbus("BA"))
+        poll_results()
+        self.assertIsNotNone(
+            namespace["manual_controller_cleanup_pending"]
+        )
+        self.assertIn(
+            "Unable to apply manual controller result: "
+            "feedback unavailable",
+            output.value,
+        )
+        poll_results()
+        self.assertIsNone(
+            namespace["manual_controller_cleanup_pending"]
+        )
+        self.assertEqual(
+            output.value,
+            "Unable to apply manual controller result: "
+            "feedback unavailable",
+        )
+        self.assertEqual(
+            first_label.configurations[-1]["style"],
+            "Alarm.TLabel",
+        )
+        self.assertFalse(application_error_port.is_open)
+        self.assertIsNone(runtime["ser"])
+        self.assertEqual(len(deferred_calls), deferred_count)
+        output.insert = original_output_insert
+
+        runtime["ser"] = replacement
+
+        def lose_connection(serial_port, command):
+            replacement.close()
+            runtime["ser"] = None
+            raise ConnectionError("controller disconnected")
+
+        exchange_behavior["handler"] = lose_connection
+        self.assertTrue(request_modbus("BA"))
+        poll_results()
+        self.assertTrue(activity.idle())
+        self.assertFalse(transport_lock.locked())
+        self.assertFalse(pending.is_set())
+        self.assertIn(
+            "manual controller exchange ended without a trusted connection",
+            invalidations,
+        )
+
+        indeterminate_port = CloseFailingOncePort()
+        runtime["ser"] = indeterminate_port
+        exchange_behavior["handler"] = (
+            lambda serial_port, command: ControllerModbusExchangeResponse(
+                "Modbus Error",
+                None,
+                "terminal-only",
+            )
+        )
+        deferred_count = len(deferred_calls)
+        self.assertTrue(request_modbus("BE"))
+        poll_results()
+        self.assertTrue(indeterminate_port.is_open)
+        self.assertIs(runtime["ser"], indeterminate_port)
+        self.assertIsNotNone(
+            namespace["manual_controller_cleanup_pending"]
+        )
+        self.assertIn("cleanup pending", output.value.lower())
+        poll_results()
+        self.assertIn("write outcome unknown", output.value)
+        self.assertIn("verify external device state", output.value)
+        self.assertFalse(indeterminate_port.is_open)
+        self.assertIsNone(runtime["ser"])
+        self.assertTrue(serial_transport_quarantined(indeterminate_port))
+        self.assertEqual(len(deferred_calls), deferred_count)
+
+        rejected_port = Port()
+        runtime["ser"] = rejected_port
+        exchange_behavior["handler"] = (
+            lambda serial_port, command: ControllerModbusExchangeResponse(
+                "ER",
+                None,
+                "terminal-only",
+            )
+        )
+        deferred_count = len(deferred_calls)
+        self.assertTrue(request_modbus("BE"))
+        poll_results()
+        self.assertEqual(output.value, "Controller request rejected: ER")
+        self.assertTrue(rejected_port.is_open)
+        self.assertIs(runtime["ser"], rejected_port)
+        self.assertFalse(serial_transport_quarantined(rejected_port))
+        self.assertEqual(len(deferred_calls), deferred_count + 1)
+
+        def fail_after_write(serial_port, command):
+            quarantine_serial_transport(
+                serial_port,
+                "simulated post-write response timeout",
+            )
+
+        exchange_behavior["handler"] = fail_after_write
+        deferred_count = len(deferred_calls)
+        self.assertTrue(request_modbus("BF"))
+        poll_results()
+        self.assertIn("write outcome unknown", output.value)
+        self.assertFalse(rejected_port.is_open)
+        self.assertIsNone(runtime["ser"])
+        self.assertEqual(len(deferred_calls), deferred_count)
+
+        invalid_pending_port = Port()
+        runtime["ser"] = invalid_pending_port
+        pending_estop_behavior["handler"] = lambda serial_port: object()
+        exchange_count = len(exchanges)
+        deferred_count = len(deferred_calls)
+        self.assertTrue(request_modbus("BA"))
+        self.assertEqual(len(exchanges), exchange_count)
+        poll_results()
+        self.assertIn(
+            "pending manual controller E-stop response is invalid",
+            output.value,
+        )
+        self.assertFalse(invalid_pending_port.is_open)
+        self.assertIsNone(runtime["ser"])
+        self.assertEqual(len(deferred_calls), deferred_count)
+
+        queued_estop_port = Port()
+        runtime["ser"] = queued_estop_port
+        pending_estop_behavior["handler"] = (
+            lambda serial_port: estop_position
+        )
+        exchange_count = len(exchanges)
+        deferred_count = len(deferred_calls)
+        self.assertTrue(request_modbus("BA"))
+        self.assertEqual(len(exchanges), exchange_count)
+        self.assertTrue(runtime["estopActive"])
+        self.assertTrue(stop_barrier.is_set())
+        self.assertEqual(
+            invalidations[-1],
+            "controller reported physical E-stop: EB",
+        )
+        poll_results()
+        self.assertEqual(applied_positions[-1], estop_position)
+        self.assertEqual(
+            output.value,
+            "Physical E-stop received before command transmission; "
+            "command not sent",
+        )
+        self.assertFalse(queued_estop_port.is_open)
+        self.assertIsNone(runtime["ser"])
+        self.assertEqual(len(deferred_calls), deferred_count)
+        pending_estop_behavior["handler"] = lambda serial_port: None
+        status_reservation["kind"] = None
+        runtime["estopActive"] = False
+        stop_barrier.clear()
+
+        admission_estop_port = Port()
+        runtime["ser"] = admission_estop_port
+        exchange_behavior["handler"] = (
+            lambda serial_port, command: ControllerModbusExchangeResponse(
+                None,
+                admission_estop_position,
+                "admission-estop",
+            )
+        )
+        deferred_count = len(deferred_calls)
+        self.assertTrue(request_modbus("BA"))
+        self.assertTrue(runtime["estopActive"])
+        self.assertTrue(stop_barrier.is_set())
+        self.assertEqual(
+            invalidations[-1],
+            "controller reported physical E-stop: EA",
+        )
+        poll_results()
+        self.assertEqual(
+            applied_positions[-1],
+            admission_estop_position,
+        )
+        self.assertEqual(
+            output.value,
+            "Physical E-stop blocked command admission; command not "
+            "executed; reconnect before further commands",
+        )
+        self.assertFalse(admission_estop_port.is_open)
+        self.assertIsNone(runtime["ser"])
+        self.assertEqual(len(deferred_calls), deferred_count)
+        status_reservation["kind"] = None
+        runtime["estopActive"] = False
+        stop_barrier.clear()
+
+        raced_admission_port = Port()
+        runtime["ser"] = raced_admission_port
+        exchange_behavior["handler"] = (
+            lambda serial_port, command: ControllerModbusExchangeResponse(
+                None,
+                estop_position,
+                "estop-admission",
+                admission_estop_position,
+            )
+        )
+        deferred_count = len(deferred_calls)
+        self.assertTrue(request_modbus("BA"))
+        self.assertTrue(runtime["estopActive"])
+        self.assertTrue(stop_barrier.is_set())
+        self.assertEqual(
+            invalidations[-1],
+            "controller reported physical E-stop: EB",
+        )
+        poll_results()
+        self.assertEqual(
+            output.value,
+            "Physical E-stop blocked command admission; command not "
+            "executed; reconnect before further commands",
+        )
+        self.assertFalse(raced_admission_port.is_open)
+        self.assertIsNone(runtime["ser"])
+        self.assertEqual(len(deferred_calls), deferred_count)
+        status_reservation["kind"] = None
+        runtime["estopActive"] = False
+        stop_barrier.clear()
+
+        estop_port = Port()
+        runtime["ser"] = estop_port
+        exchange_behavior["handler"] = (
+            lambda serial_port, command: ControllerModbusExchangeResponse(
+                "Modbus Error",
+                estop_position,
+                "estop-terminal",
+            )
+        )
+        deferred_count = len(deferred_calls)
+        self.assertTrue(request_modbus("BA"))
+        self.assertTrue(runtime["estopActive"])
+        self.assertTrue(stop_barrier.is_set())
+        self.assertEqual(
+            invalidations[-1],
+            "controller reported physical E-stop: EB",
+        )
+        poll_results()
+        self.assertEqual(applied_positions[-1], estop_position)
+        self.assertEqual(
+            output.value,
+            "Physical E-stop received; controller request rejected: "
+            "Modbus Error; "
+            "reconnect before further commands",
+        )
+        self.assertFalse(estop_port.is_open)
+        self.assertIsNone(runtime["ser"])
+        self.assertTrue(serial_transport_quarantined(estop_port))
+        self.assertEqual(len(deferred_calls), deferred_count)
+        self.assertEqual(
+            first_label.configurations[-1]["text"],
+            "Estop Button was Pressed",
+        )
+        self.assertIn(
+            "manual controller exchange ended without a trusted connection",
+            invalidations,
+        )
+
+        invalid_pose_port = Port()
+        runtime["ser"] = invalid_pose_port
+        runtime["estopActive"] = False
+        stop_barrier.clear()
+        status_reservation["kind"] = None
+        exchange_behavior["handler"] = (
+            lambda serial_port, command: ControllerModbusExchangeResponse(
+                "Modbus Error",
+                estop_position,
+                "estop-terminal",
+            )
+        )
+        namespace["displayPosition"] = lambda response, parsed: None
+        fallback_count = len(physical_stop_fallbacks)
+
+        self.assertTrue(request_modbus("BA"))
+        poll_results()
+
+        self.assertEqual(
+            physical_stop_fallbacks[fallback_count:],
+            [CONTROLLER_ESTOP_EVENT_FLAG],
+        )
+        self.assertFalse(invalid_pose_port.is_open)
+        self.assertIsNone(runtime["ser"])
+        self.assertEqual(
+            output.value,
+            "Physical E-stop received; controller request rejected: "
+            "Modbus Error; reconnect before further commands",
+        )
+
+        retained_stop_port = Port()
+        runtime["ser"] = retained_stop_port
+        runtime["estopActive"] = False
+        stop_barrier.clear()
+        status_reservation["kind"] = None
+        exchange_behavior["handler"] = (
+            lambda serial_port, command: ControllerModbusExchangeResponse(
+                "Modbus Error",
+                estop_position,
+                "estop-terminal",
+            )
+        )
+        render_failure = {"pending": True}
+        invalidation_failure = {"pending": True}
+
+        def render_retained_stop(response, parsed):
+            if render_failure["pending"]:
+                render_failure["pending"] = False
+                raise RuntimeError("stop renderer unavailable")
+            return display_position(response, parsed)
+
+        def invalidate_retained_stop(reason):
+            if (
+                reason == "manual controller physical E-stop received"
+                and invalidation_failure["pending"]
+            ):
+                invalidation_failure["pending"] = False
+                raise RuntimeError("stop invalidation unavailable")
+            invalidations.append(reason)
+
+        namespace["displayPosition"] = render_retained_stop
+        namespace["_invalidate_joint_motion_state"] = (
+            invalidate_retained_stop
+        )
+        self.assertTrue(request_modbus("BA"))
+        self.assertIsNotNone(
+            namespace["manual_controller_pending_stop_event"]
+        )
+        self.assertEqual(event_queue.qsize(), 1)
+
+        poll_results()
+        self.assertIsNotNone(namespace["manual_controller_active_request"])
+        self.assertIsNotNone(
+            namespace["manual_controller_pending_stop_event"]
+        )
+        self.assertTrue(transport_lock.locked())
+        self.assertEqual(event_queue.qsize(), 1)
+
+        poll_results()
+        self.assertIsNotNone(namespace["manual_controller_active_request"])
+        self.assertIsNotNone(
+            namespace["manual_controller_pending_stop_event"]
+        )
+        self.assertTrue(transport_lock.locked())
+        self.assertEqual(event_queue.qsize(), 1)
+
+        poll_results()
+        self.assertIsNone(namespace["manual_controller_active_request"])
+        self.assertIsNone(
+            namespace["manual_controller_pending_stop_event"]
+        )
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(event_queue.empty())
+        self.assertFalse(retained_stop_port.is_open)
+        self.assertIsNone(runtime["ser"])
+
     def test_manual_auxiliary_buttons_are_nonblocking_thin_wrappers(self):
         for channel in range(4):
             for state_name, expected_state in (("on", True), ("off", False)):
@@ -8730,6 +12339,22 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace["manual_auxiliary_stop_barrier"].clear()
         namespace["_manual_auxiliary_expected_response"] = expected_response
 
+        def estop_during_validation(command, serial_port):
+            runtime["estopActive"] = True
+            return expected_response(command, serial_port)
+
+        namespace["_manual_auxiliary_expected_response"] = (
+            estop_during_validation
+        )
+        self.assertFalse(request_output(1, True, Entry("8")))
+        self.assertEqual(
+            namespace["manual_auxiliary_next_request_id"],
+            request_count,
+        )
+        self.assertEqual(namespace["manual_auxiliary_request_queue"], [])
+        runtime["estopActive"] = False
+        namespace["_manual_auxiliary_expected_response"] = expected_response
+
         namespace["_exchange_manual_auxiliary_command"] = exchange
         self.assertTrue(request_output(1, True, Entry("8")))
         self.assertTrue(request_output(2, True, Entry("9")))
@@ -8856,7 +12481,11 @@ class HmiSourceContractTests(unittest.TestCase):
             def __init__(self, *args, **kwargs):
                 raise RuntimeError(" thread construction failed\n")
 
-        namespace["threading"] = SimpleNamespace(Thread=FailingThread)
+        namespace["threading"] = SimpleNamespace(
+            Event=threading.Event,
+            Lock=threading.Lock,
+            Thread=FailingThread,
+        )
         namespace["_try_dispatch_manual_auxiliary_request"] = (
             self.compile_function(
                 "_try_dispatch_manual_auxiliary_request",
@@ -8985,6 +12614,93 @@ class HmiSourceContractTests(unittest.TestCase):
             closes[-1],
             ("ser2", "manual auxiliary response failure"),
         )
+
+    def test_all_ordinary_auxiliary_writes_recheck_stop_admission(self):
+        class Port:
+            is_open = True
+
+        port = Port()
+        runtime = {
+            "ser2": port,
+            "ser2BoardProfile": (port, AUXILIARY_BOARD_NANO),
+            "programStopRequestId": None,
+            "estopActive": False,
+            "posOutreach": False,
+        }
+        writes = []
+        namespace = {
+            "RUN": runtime,
+            "MotionInputError": MotionInputError,
+            "SerialActivityRejected": SerialActivityRejected,
+            "normalize_auxiliary_board_profile": (
+                normalize_auxiliary_board_profile
+            ),
+            "validate_auxiliary_output_command": (
+                validate_auxiliary_output_command
+            ),
+            "validate_auxiliary_servo_command": (
+                validate_auxiliary_servo_command
+            ),
+            "write_serial_control": (
+                lambda serial_port, command, **options: (
+                    writes.append((serial_port, command, options)) or True
+                )
+            ),
+            "auxiliary_serial_write_lock": threading.Lock(),
+            "_clear_auxiliary_board_profile": lambda serial_port=None: True,
+        }
+        namespace["_connected_auxiliary_board_profile"] = (
+            self.compile_function(
+                "_connected_auxiliary_board_profile",
+                namespace,
+            )
+        )
+        write_auxiliary = self.compile_function(
+            "_write_legacy_auxiliary_command",
+            namespace,
+        )
+
+        self.assertTrue(write_auxiliary("ONX8\n"))
+        self.assertEqual(len(writes), 1)
+
+        stop_cases = (
+            (
+                "manual barrier",
+                lambda: namespace[
+                    "manual_auxiliary_stop_barrier"
+                ].set(),
+                lambda: namespace[
+                    "manual_auxiliary_stop_barrier"
+                ].clear(),
+            ),
+            (
+                "auxiliary stop request",
+                lambda: namespace["auxiliary_stop_requested"].set(),
+                lambda: namespace["auxiliary_stop_requested"].clear(),
+            ),
+            (
+                "program stop request",
+                lambda: runtime.__setitem__("programStopRequestId", 7),
+                lambda: runtime.__setitem__("programStopRequestId", None),
+            ),
+            (
+                "physical stop",
+                lambda: runtime.__setitem__("estopActive", True),
+                lambda: runtime.__setitem__("estopActive", False),
+            ),
+        )
+        for label, activate, clear in stop_cases:
+            with self.subTest(stop_case=label):
+                activate()
+                try:
+                    with self.assertRaisesRegex(
+                        SerialActivityRejected,
+                        "cancelled by stop admission",
+                    ):
+                        write_auxiliary("ONX8\n")
+                finally:
+                    clear()
+        self.assertEqual(len(writes), 1)
 
     def test_auxiliary_connection_binds_and_clears_one_board_profile(self):
         class Port:
@@ -9775,10 +13491,10 @@ class HmiSourceContractTests(unittest.TestCase):
             open_failure[1]["auxiliaryBoard"],
             AUXILIARY_BOARD_MEGA,
         )
-        self.assertEqual(open_failure[2].set_calls, ["COM9", "COM2"])
+        self.assertEqual(open_failure[2].set_calls, ["COM2"])
         self.assertEqual(
             open_failure[3].set_calls,
-            [AUXILIARY_BOARD_NANO, AUXILIARY_BOARD_MEGA],
+            [AUXILIARY_BOARD_MEGA],
         )
         self.assertEqual(open_failure[5], [])
 
@@ -9786,10 +13502,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(close_failure[0])
         self.assertEqual(close_failure[1]["com2Port"], "COM2")
         self.assertEqual(close_failure[1]["auxiliaryBoard"], AUXILIARY_BOARD_MEGA)
-        self.assertEqual(close_failure[2].set_calls, ["None", "COM2"])
+        self.assertEqual(close_failure[2].set_calls, ["COM2"])
         self.assertEqual(
             close_failure[3].set_calls,
-            [AUXILIARY_BOARD_NONE, AUXILIARY_BOARD_MEGA],
+            [AUXILIARY_BOARD_MEGA],
         )
         self.assertEqual(close_failure[5], [])
 
@@ -10017,10 +13733,10 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(calibration["DO1on"], "28")
         self.assertEqual(output_values["DO1on"], "28")
-        self.assertEqual(port_selection.set_calls, ["COM9", "COM2"])
+        self.assertEqual(port_selection.set_calls, ["COM2"])
         self.assertEqual(
             board_selection.set_calls,
-            [AUXILIARY_BOARD_NANO, AUXILIARY_BOARD_MEGA],
+            [AUXILIARY_BOARD_MEGA],
         )
         self.assertEqual(persistence_calls, [])
         self.assertFalse(namespace["auxiliary_serial_lock"].locked())
@@ -10054,6 +13770,7 @@ class HmiSourceContractTests(unittest.TestCase):
             for key in output_values:
                 output_values[key] = str(values[key])
             if len(replacement_attempts) == 1:
+                output_values["DO1on"] = "BROKEN"
                 raise RuntimeError("field update and rollback failed")
             return {}
 
@@ -10121,7 +13838,10 @@ class HmiSourceContractTests(unittest.TestCase):
             board_selection.set_calls,
             [AUXILIARY_BOARD_NANO, AUXILIARY_BOARD_MEGA],
         )
-        self.assertEqual(replacement_calls, [])
+        self.assertEqual(
+            replacement_calls,
+            [("COM9", AUXILIARY_BOARD_NANO)],
+        )
         self.assertFalse(namespace["auxiliary_serial_lock"].locked())
         self.assertFalse(namespace["motion_request_registry"].active)
 
@@ -10325,7 +14045,7 @@ class HmiSourceContractTests(unittest.TestCase):
                     namespace["motion_request_registry"].active
                 )
 
-    def test_auxiliary_connection_validates_and_reconciles_before_replacement(self):
+    def test_auxiliary_connection_validates_before_atomic_publication(self):
         class Selection:
             def __init__(self, value):
                 self.value = value
@@ -10355,6 +14075,7 @@ class HmiSourceContractTests(unittest.TestCase):
             fail_binding=False,
             omit_optional_outputs=False,
             fail_replacement=False,
+            stop_kind=None,
         ):
             events = []
             calibration = self._valid_runtime_calibration()
@@ -10372,6 +14093,15 @@ class HmiSourceContractTests(unittest.TestCase):
                     calibration.pop(f"DO{output}off")
             output_fields = self._auxiliary_output_values(calibration)
             output_fields["DO2on"] = "8"
+            stop_requested = threading.Event()
+            if stop_kind == "settlement":
+                stop_requested.set()
+            runtime = {
+                "ser2": None,
+                "estopActive": stop_kind == "estop",
+                "posOutreach": stop_kind == "position-fault",
+                "programStopRequestId": None,
+            }
 
             def validate(values):
                 events.append(("validate", dict(values)))
@@ -10393,7 +14123,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 "application_closing": threading.Event(),
                 "auxiliary_serial_lock": threading.Lock(),
                 "CAL": calibration,
-                "RUN": {"ser2": None},
+                "RUN": runtime,
+                "auxiliary_stop_requested": stop_requested,
                 "com2SelectedValue": Selection("COM9"),
                 "auxiliaryBoardSelectedValue": Selection(
                     AUXILIARY_BOARD_NANO
@@ -10437,8 +14168,8 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(result, events)
         event_kinds = [event[0] for event in events]
         self.assertLess(
-            event_kinds.index("fields"),
             event_kinds.index("replace"),
+            event_kinds.index("fields"),
         )
         self.assertEqual(calibration["auxiliaryBoard"], AUXILIARY_BOARD_NANO)
         self.assertEqual(calibration["DO1on"], "")
@@ -10455,9 +14186,9 @@ class HmiSourceContractTests(unittest.TestCase):
 
         result, calibration, events, binding, _ = run_case(85, True)
         self.assertFalse(result)
-        self.assertNotIn("replace", [event[0] for event in events])
-        self.assertEqual(calibration["auxiliaryBoard"], AUXILIARY_BOARD_MEGA)
-        self.assertEqual(calibration["DO1on"], "28")
+        self.assertIn("replace", [event[0] for event in events])
+        self.assertEqual(calibration["auxiliaryBoard"], AUXILIARY_BOARD_NANO)
+        self.assertEqual(calibration["DO1on"], "")
         self.assertIs(calibration["J1CalStatVal"], binding)
         self.assertEqual(binding.get(), 0)
 
@@ -10472,6 +14203,22 @@ class HmiSourceContractTests(unittest.TestCase):
             self.assertNotIn(f"DO{output}off", calibration)
             self.assertEqual(output_fields[f"DO{output}on"], "")
             self.assertEqual(output_fields[f"DO{output}off"], "")
+
+        for stop_kind in ("estop", "position-fault", "settlement"):
+            with self.subTest(stop_kind=stop_kind):
+                result, calibration, events, binding, _ = run_case(
+                    85,
+                    stop_kind=stop_kind,
+                )
+                self.assertFalse(result)
+                self.assertEqual(events, [])
+                self.assertEqual(calibration["com2Port"], "COM2")
+                self.assertEqual(
+                    calibration["auxiliaryBoard"],
+                    AUXILIARY_BOARD_MEGA,
+                )
+                self.assertEqual(calibration["DO1on"], "28")
+                self.assertIs(calibration["J1CalStatVal"], binding)
 
     def test_auxiliary_connection_persistence_retries_and_restores_on_restart(self):
         class Root:
@@ -11028,14 +14775,17 @@ class HmiSourceContractTests(unittest.TestCase):
             # transport I/O; callers own or delegate the associated operation.
             "_bind_auxiliary_board_profile": {"ser2"},
             "_connected_auxiliary_board_profile": {"ser2"},
+            "_auxiliary_stop_not_required": {"ser2"},
             # Controller identity helpers only bind or inspect the active handle;
             # callers retain transport ownership for any associated exchange.
             "_bind_main_controller_identity": {"ser"},
             "_bind_gcode_storage_media": {"ser"},
+            "_capture_main_controller_stop_context": {"ser"},
             "_current_main_controller_identity": {"ser"},
             "_current_gcode_storage_media": {"ser"},
             "_current_joint_actual_position_source": {"ser"},
             "_invalidate_bound_primary_home_reference": {"ser"},
+            "_main_controller_stop_event_stale_reason": {"ser"},
             # The failed-start activity lease and serial lock remain reserved
             # until close and cleanup release both ownership layers.
             "_close_failed_controller_startup": {"ser"},
@@ -11053,6 +14803,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "_run_auxiliary_stop_safe": {"ser2"},
             "_replace_auxiliary_serial": {"ser2"},
             "_startup_exchange_response": {"ser"},
+            "_startup_controller_exchange": {"ser"},
+            "_startup_controller_identity": {"ser"},
+            "_capture_startup_main_controller_stop_context": {"ser"},
             "_exchange_legacy_main_command": {"ser"},
             "_write_legacy_auxiliary_command": {"ser2"},
             # Admission helpers capture connection identity before dispatching
@@ -11082,6 +14835,21 @@ class HmiSourceContractTests(unittest.TestCase):
             # handle access and transfers ownership to asynchronous startup.
             "setCom": {"ser"},
             "_set_com_admitted": {"ser"},
+            # Manual controller I/O retains activity ownership from Tk
+            # admission through result validation and widget application.
+            "_start_manual_controller_request": {"ser"},
+            "_exchange_manual_controller_request": {"ser"},
+            "_close_manual_controller_cleanup_transport": {"ser"},
+            "_manual_controller_connection_trusted": {"ser"},
+            "replace_connection_loss": {"ser"},
+            "_poll_manual_controller_events": {"ser"},
+            # The dispatcher owns the main transport and shutdown activity
+            # across the complete joint response and Tk acknowledgement.
+            "_exchange_joint_motion": {"ser"},
+            # Idle event supervision reserves emergency control and keeps the
+            # transport lock until the bounded reader publishes a result.
+            "_try_start_main_controller_idle_stop_reader": {"ser"},
+            "_apply_main_controller_idle_stop_results": {"ser"},
         }
         missing = []
 
@@ -11211,6 +14979,10 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertEqual(len(lease_calls("_set_com_admitted")), 1)
         self.assertEqual(len(lease_calls("start_send_serial_thread")), 1)
+        self.assertEqual(
+            len(lease_calls("_start_manual_controller_request")),
+            1,
+        )
         self.assertEqual(len(lease_calls("_start_calibration_sequence")), 1)
         self.assertEqual(len(lease_calls("_start_gcode_storage_request")), 1)
 
@@ -11422,7 +15194,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertEqual(
             execute(
-                "SCA1B0C1\n",
+                "BAA1B0C1\n",
                 response_parser=parse_controller_modbus_response,
             ),
             ("complete", "1"),
@@ -11434,7 +15206,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 response["value"] = rejected
                 self.assertEqual(
                     execute(
-                        "SCA1B0C1\n",
+                        "BAA1B0C1\n",
                         response_parser=parse_controller_modbus_response,
                     ),
                     ("rejected", None),
@@ -11453,8 +15225,292 @@ class HmiSourceContractTests(unittest.TestCase):
             execute_row_source.count(
                 "response_parser=parse_controller_modbus_response"
             ),
-            8,
+            6,
         )
+        self.assertGreaterEqual(
+            execute_row_source.count(
+                "_execute_row_main_modbus_write_response"
+            ),
+            2,
+        )
+
+    def test_program_modbus_writes_preserve_indeterminate_external_state(self):
+        class Port:
+            def __init__(self):
+                self.is_open = True
+
+            def close(self):
+                self.is_open = False
+
+        response = {"value": "1"}
+        runtime = {"ser": None}
+        finishes = []
+        statuses = []
+        invalidations = []
+        identity_cleanup = []
+        command_calls = []
+        namespace = {
+            "ROW_EXECUTION_COMPLETE": "complete",
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "MotionInputError": MotionInputError,
+            "ProtocolResponseError": ProtocolResponseError,
+            "MAX_RESPONSE_PAYLOAD_LENGTH": MAX_RESPONSE_PAYLOAD_LENGTH,
+            "controller_modbus_command_is_write": (
+                controller_modbus_command_is_write
+            ),
+            "classify_controller_modbus_terminal_response": (
+                classify_controller_modbus_terminal_response
+            ),
+            "quarantine_serial_transport": quarantine_serial_transport,
+            "RUN": runtime,
+            "_execute_row_main_command": (
+                lambda command: (
+                    command_calls.append(command)
+                    or ("complete", response["value"])
+                )
+            ),
+            "_require_main_controller_identity_cleanup": (
+                lambda port, context: (
+                    identity_cleanup.append((port, context)) or True
+                )
+            ),
+            "_clear_auxiliary_board_profile": lambda port=None: True,
+            "_invalidate_joint_motion_state": invalidations.append,
+            "_set_application_status": (
+                lambda message, style: (
+                    statuses.append((message, style)) or True
+                )
+            ),
+            "_finish_execute_row": lambda: finishes.append(True),
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+        }
+        namespace["_close_serial_port"] = self.compile_function(
+            "_close_serial_port",
+            namespace,
+        )
+        namespace["_reject_indeterminate_program_modbus_write"] = (
+            self.compile_function(
+                "_reject_indeterminate_program_modbus_write",
+                namespace,
+            )
+        )
+        execute_write = self.compile_function(
+            "_execute_row_main_modbus_write_response",
+            namespace,
+        )
+
+        for opcode in ("SC", "SO"):
+            with self.subTest(indeterminate_opcode=opcode):
+                port = Port()
+                runtime["ser"] = port
+                response["value"] = "-1"
+                result = execute_write(f"{opcode}A1B0C1\n")
+
+                self.assertEqual(result, ("rejected", None))
+                self.assertFalse(port.is_open)
+                self.assertIsNone(runtime["ser"])
+                self.assertTrue(serial_transport_quarantined(port))
+                self.assertIs(identity_cleanup[-1][0], port)
+                self.assertIn(
+                    f"program Modbus {opcode} external write outcome is unknown",
+                    invalidations[-1],
+                )
+                self.assertIn("write outcome unknown", statuses[-1][0])
+                self.assertIn(
+                    "verify external device state",
+                    statuses[-1][0],
+                )
+
+        completed_port = Port()
+        runtime["ser"] = completed_port
+        response["value"] = "1"
+        finish_count = len(finishes)
+        self.assertEqual(
+            execute_write("SCA1B0C1\n"),
+            ("complete", "1"),
+        )
+        self.assertTrue(completed_port.is_open)
+        self.assertEqual(len(finishes), finish_count)
+
+        response["value"] = "-2"
+        self.assertEqual(
+            execute_write("SOA1B0C1\n"),
+            ("rejected", None),
+        )
+        self.assertTrue(completed_port.is_open)
+        self.assertEqual(len(finishes), finish_count + 1)
+        self.assertIn("write rejected: -2", statuses[-1][0])
+
+        unexpected_port = Port()
+        runtime["ser"] = unexpected_port
+        response["value"] = "unexpected"
+        self.assertEqual(
+            execute_write("SCA1B0C1\n"),
+            ("rejected", None),
+        )
+        self.assertFalse(unexpected_port.is_open)
+        self.assertIsNone(runtime["ser"])
+        self.assertIn("write outcome unknown", statuses[-1][0])
+
+        command_count = len(command_calls)
+        with self.assertRaisesRegex(MotionInputError, "SC or SO"):
+            execute_write("BAA1B0C1\n")
+        self.assertEqual(len(command_calls), command_count)
+
+    def test_program_modbus_register_rows_canonicalize_or_reject_before_exchange(self):
+        builder_namespace = {
+            "MotionInputError": MotionInputError,
+            "build_controller_modbus_command": build_controller_modbus_command,
+            "re": re,
+        }
+        build_program_read = self.compile_function(
+            "_build_program_modbus_register_read",
+            builder_namespace,
+        )
+        self.assertEqual(
+            build_program_read("BH", "3", "42", "1"),
+            "BHA3B42C1\n",
+        )
+        self.assertEqual(
+            build_program_read("BD", "4", "43", "1"),
+            "BDA4B43C1\n",
+        )
+        for opcode in ("BH", "BD"):
+            with self.subTest(migration_opcode=opcode):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "legacy multi-register read requires migration",
+                ):
+                    build_program_read(opcode, "1", "42", "2")
+
+        class ProgramView:
+            def __init__(self):
+                self.row = b""
+
+            @staticmethod
+            def curselection():
+                return (0,)
+
+            @staticmethod
+            def see(*args):
+                pass
+
+            def get(self, *args):
+                return self.row
+
+        view = ProgramView()
+        transmissions = []
+        finishes = []
+        statuses = []
+        runtime = {
+            "estopActive": False,
+            "posOutreach": False,
+            "programStopRequestId": None,
+            "programStopStatusLatched": False,
+            "progRunning": False,
+            "rowinproc": 0,
+            "offlineMode": False,
+            "moveInProc": 0,
+        }
+        namespace = {
+            "RUN": runtime,
+            "tab1": SimpleNamespace(progView=view),
+            "ROW_EXECUTION_COMPLETE": "complete",
+            "ROW_EXECUTION_PENDING": "pending",
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "MotionInputError": MotionInputError,
+            "parse_controller_modbus_response": (
+                parse_controller_modbus_response
+            ),
+            "_build_program_modbus_register_read": build_program_read,
+            "_execute_row_main_response": (
+                lambda command, **contract: (
+                    transmissions.append((command, contract))
+                    or ("complete", "0")
+                )
+            ),
+            "_finish_execute_row": lambda: finishes.append(True),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+                or True
+            ),
+            "logger": SimpleNamespace(error=lambda *args: None),
+        }
+        execute_row = self.compile_function("executeRow", namespace)
+        row_templates = {
+            "BH": (
+                "If MBhold reg - SlaveID (3) Num Reg's ({quantity}) "
+                "- Reg # 42 = 99 :"
+            ),
+            "BD": (
+                "If MBInput Reg - SlaveID (4) Num Reg's ({quantity}) "
+                "- Input Reg # 43 = 99 :"
+            ),
+        }
+        expected_commands = {
+            "BH": "BHA3B42C1\n",
+            "BD": "BDA4B43C1\n",
+        }
+
+        for opcode, row_template in row_templates.items():
+            with self.subTest(opcode=opcode, quantity=1):
+                view.row = row_template.format(quantity=1).encode("utf-8")
+                transmissions.clear()
+                statuses.clear()
+                self.assertEqual(execute_row(), "complete")
+                self.assertEqual(
+                    transmissions,
+                    [
+                        (
+                            expected_commands[opcode],
+                            {
+                                "response_parser": (
+                                    parse_controller_modbus_response
+                                ),
+                            },
+                        ),
+                    ],
+                )
+                self.assertEqual(statuses, [])
+
+            with self.subTest(opcode=opcode, quantity=2):
+                view.row = row_template.format(quantity=2).encode("utf-8")
+                transmissions.clear()
+                statuses.clear()
+                self.assertEqual(execute_row(), "rejected")
+                self.assertEqual(transmissions, [])
+                self.assertEqual(len(statuses), 1)
+                self.assertIn(
+                    "legacy multi-register read requires migration",
+                    statuses[0][0],
+                )
+
+        def cancel_during_exchange(command, **contract):
+            transmissions.append((command, contract))
+            namespace["program_execution_cancelled"].set()
+            return "complete", "99"
+
+        namespace["_execute_row_main_response"] = cancel_during_exchange
+        view.row = (
+            "If MBhold reg - SlaveID (3) Num Reg's (1) "
+            "- Reg # 42 = 99 : Jump Tab 2"
+        ).encode("utf-8")
+        transmissions.clear()
+        statuses.clear()
+        runtime["progRunning"] = True
+        runtime["rowinproc"] = 1
+        self.assertEqual(execute_row(), "rejected")
+        self.assertEqual(
+            [command for command, _ in transmissions],
+            ["BHA3B42C1\n"],
+        )
+        self.assertEqual(statuses, [])
+        self.assertEqual(len(finishes), 4)
+        self.assertFalse(runtime["progRunning"])
+        self.assertEqual(runtime["rowinproc"], 0)
 
     def test_injectable_auxiliary_command_requires_validated_line_ownership(self):
         execute_auxiliary = self.compile_function(
@@ -11520,6 +15576,922 @@ class HmiSourceContractTests(unittest.TestCase):
             self.assertIsInstance(begin_calls[0].args[0], ast.Constant)
             self.assertEqual(begin_calls[0].args[0].value, expected_mode)
             self.assertTrue(finish_calls)
+            assigned_runtime_keys = {
+                target.slice.value
+                for node in ast.walk(function)
+                if isinstance(node, ast.Assign)
+                for target in node.targets
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "RUN"
+                    and isinstance(target.slice, ast.Constant)
+                    and isinstance(target.slice.value, str)
+                )
+            }
+            self.assertFalse(
+                {"estopActive", "posOutreach"} & assigned_runtime_keys
+            )
+
+    def test_program_execution_rejects_fault_latches_without_mutation(self):
+        namespace = {
+            "dataclass": dataclass,
+            "frozenset": frozenset,
+            "MotionInputError": MotionInputError,
+            "program_execution_state_lock": threading.Lock(),
+            "program_execution_next_request_id": 12,
+            "program_execution_active_request": None,
+            "gcode_storage_program_admission_active": False,
+            "manual_controller_program_admission_active": False,
+            "RUN": {
+                "programStopRequestId": None,
+                "programStopStatusLatched": True,
+                "programStopState": "faulted",
+                "estopActive": False,
+                "posOutreach": False,
+            },
+        }
+        self.compile_assignment("PROGRAM_EXECUTION_MODES", namespace)
+        namespace["ProgramExecutionRequest"] = self.compile_class(
+            "ProgramExecutionRequest",
+            namespace,
+        )
+        begin_execution = self.compile_function(
+            "_begin_program_execution",
+            namespace,
+        )
+        busy_message = self.compile_function(
+            "_program_execution_busy_message",
+            namespace,
+        )
+        runtime = namespace["RUN"]
+
+        fault_cases = (
+            (
+                "estopActive",
+                "PROGRAM EXECUTION REJECTED WHILE E-STOP LATCH IS ACTIVE",
+            ),
+            (
+                "posOutreach",
+                "PROGRAM EXECUTION REJECTED WHILE POSITION-FAULT LATCH IS ACTIVE",
+            ),
+        )
+        for mode in ("run", "step-forward", "step-reverse"):
+            for fault_key, expected_message in fault_cases:
+                with self.subTest(mode=mode, fault_key=fault_key):
+                    runtime["estopActive"] = False
+                    runtime["posOutreach"] = False
+                    runtime[fault_key] = True
+                    runtime_before = dict(runtime)
+                    request_id_before = namespace[
+                        "program_execution_next_request_id"
+                    ]
+
+                    self.assertIsNone(begin_execution(mode))
+                    self.assertIsNone(
+                        namespace["program_execution_active_request"]
+                    )
+                    self.assertEqual(
+                        namespace["program_execution_next_request_id"],
+                        request_id_before,
+                    )
+                    self.assertEqual(runtime, runtime_before)
+                    self.assertEqual(busy_message(), expected_message)
+
+        for fault_key in ("estopActive", "posOutreach"):
+            with self.subTest(invalid_fault_key=fault_key):
+                runtime["estopActive"] = False
+                runtime["posOutreach"] = False
+                runtime[fault_key] = 1
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "latch state is invalid",
+                ):
+                    begin_execution("run")
+                self.assertIsNone(
+                    namespace["program_execution_active_request"]
+                )
+
+        runtime["estopActive"] = False
+        runtime["posOutreach"] = False
+        request = begin_execution("run")
+        self.assertIsNotNone(request)
+        self.assertFalse(runtime["programStopStatusLatched"])
+        self.assertEqual(runtime["programStopState"], "completed")
+
+    def test_physical_stop_latch_cancels_active_programs_before_row_side_effects(self):
+        estop = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+                1,
+            )
+        )
+
+        for mode in ("run", "step-forward", "step-reverse"):
+            with self.subTest(mode=mode):
+                writes = []
+                row_reads = []
+                runtime = {
+                    "programStopRequestId": None,
+                    "programStopStatusLatched": False,
+                    "programStopState": "completed",
+                    "estopActive": False,
+                    "posOutreach": False,
+                    "progRunning": False,
+                    "rowinproc": 0,
+                }
+                namespace = {
+                    "dataclass": dataclass,
+                    "frozenset": frozenset,
+                    "MotionInputError": MotionInputError,
+                    "SerialActivityRejected": SerialActivityRejected,
+                    "finite_number": finite_number,
+                    "SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS": 5,
+                    "MAX_RESPONSE_PAYLOAD_LENGTH": (
+                        MAX_RESPONSE_PAYLOAD_LENGTH
+                    ),
+                    "RUN": runtime,
+                    "program_execution_state_lock": threading.Lock(),
+                    "program_execution_next_request_id": 0,
+                    "program_execution_active_request": None,
+                    "program_execution_cancelled": threading.Event(),
+                    "gcode_storage_program_admission_active": False,
+                    "manual_controller_program_admission_active": False,
+                    "gcode_conversion_active": threading.Event(),
+                    "manual_auxiliary_state_lock": threading.Lock(),
+                    "auxiliary_stop_state_lock": threading.Lock(),
+                    "program_stop_state_lock": threading.RLock(),
+                    "manual_auxiliary_stop_barrier": threading.Event(),
+                    "auxiliary_stop_requested": threading.Event(),
+                    "auxiliary_stop_next_request_id": 0,
+                    "auxiliary_stop_pending_request_id": None,
+                    "auxiliary_stop_active_request_id": None,
+                    "main_controller_auxiliary_stop_request_id": None,
+                    "manual_auxiliary_request_queue": [],
+                    "_auxiliary_stop_not_required": lambda: True,
+                    "_set_program_stop_status": lambda state: True,
+                    "logger": SimpleNamespace(
+                        warning=lambda *args: None,
+                        error=lambda *args: None,
+                        exception=lambda *args: None,
+                    ),
+                    "ROW_EXECUTION_COMPLETE": "complete",
+                    "ROW_EXECUTION_PENDING": "pending",
+                    "ROW_EXECUTION_REJECTED": "rejected",
+                }
+                namespace["ProgramExecutionRequest"] = self.compile_class(
+                    "ProgramExecutionRequest",
+                    namespace,
+                )
+                begin_execution = self.compile_function(
+                    "_begin_program_execution",
+                    namespace,
+                )
+                request_cancelled = self.compile_function(
+                    "_program_execution_request_cancelled",
+                    namespace,
+                )
+                active_cancelled = self.compile_function(
+                    "_active_program_execution_cancelled",
+                    namespace,
+                )
+                latch_stop = self.compile_function(
+                    "_latch_main_controller_stop_state",
+                    namespace,
+                )
+                namespace["_abort_program_row_execution"] = (
+                    self.compile_function(
+                        "_abort_program_row_execution",
+                        namespace,
+                    )
+                )
+                namespace["_finish_execute_row"] = (
+                    namespace["_abort_program_row_execution"]
+                )
+
+                request = begin_execution(mode)
+                self.assertIsNotNone(request)
+                self.assertFalse(request_cancelled(request))
+                latch_stop(estop)
+
+                self.assertTrue(runtime["estopActive"])
+                self.assertTrue(
+                    namespace["program_execution_cancelled"].is_set()
+                )
+                self.assertTrue(request_cancelled(request))
+                self.assertTrue(active_cancelled())
+
+                class ProgramView:
+                    @staticmethod
+                    def curselection():
+                        row_reads.append(True)
+                        raise AssertionError(
+                            "cancelled program attempted to read another row"
+                        )
+
+                namespace["tab1"] = SimpleNamespace(progView=ProgramView())
+                execute_row = self.compile_function("executeRow", namespace)
+                runtime["progRunning"] = True
+                runtime["rowinproc"] = 1
+                self.assertEqual(
+                    execute_row(execution_request=request),
+                    "rejected",
+                )
+                self.assertEqual(row_reads, [])
+                self.assertFalse(runtime["progRunning"])
+                self.assertEqual(runtime["rowinproc"], 0)
+
+                namespace["_exchange_legacy_main_command"] = (
+                    lambda command, **contract: writes.append(
+                        ("main", command)
+                    )
+                )
+                execute_main = self.compile_function(
+                    "_execute_row_main_command",
+                    namespace,
+                )
+                self.assertEqual(
+                    execute_main("TL\n"),
+                    ("rejected", None),
+                )
+                self.assertEqual(writes, [])
+
+                @contextmanager
+                def tracked_auxiliary_operation(**options):
+                    yield
+
+                namespace["_tracked_auxiliary_operation"] = (
+                    tracked_auxiliary_operation
+                )
+                namespace["_write_legacy_auxiliary_command"] = (
+                    lambda command: writes.append(("auxiliary", command))
+                )
+                execute_auxiliary = self.compile_function(
+                    "_execute_row_auxiliary_command",
+                    namespace,
+                )
+                self.assertEqual(
+                    execute_auxiliary(
+                        "SV0P100\n",
+                        expected_response=b"Servo Done",
+                    ),
+                    ("rejected", None),
+                )
+                self.assertEqual(writes, [])
+
+    def test_program_stop_is_atomic_with_direct_main_write_commitment(self):
+        class SerialPort:
+            def __init__(self):
+                self.is_open = True
+                self.commands = []
+
+            def write(self, command):
+                self.commands.append(command)
+                return len(command)
+
+            def flush(self):
+                pass
+
+        serial_port = SerialPort()
+        exchange_contracts = []
+        aborts = []
+        statuses = []
+
+        def exchange(command, **contract):
+            exchange_contracts.append(contract)
+            write_serial_control(
+                serial_port,
+                command,
+                write_lock=threading.Lock(),
+                reset_input=False,
+                **contract,
+            )
+            return "Done"
+
+        namespace = {
+            "_exchange_legacy_main_command": exchange,
+            "_abort_program_row_execution": lambda: aborts.append(True),
+            "_set_application_status": (
+                lambda *args, **kwargs: statuses.append((args, kwargs)) or True
+            ),
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "LegacyControllerPhysicalStop": type(
+                "LegacyControllerPhysicalStop",
+                (Exception,),
+                {},
+            ),
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "ROW_EXECUTION_COMPLETE": "complete",
+        }
+        execute = self.compile_function(
+            "_execute_row_main_command",
+            namespace,
+        )
+        boundary_type = namespace["SerialWriteCancellationBoundary"]
+
+        class CancelAtWriteBoundary(boundary_type):
+            def acquire(self):
+                if not self.is_set():
+                    self.cancel()
+                return super().acquire()
+
+        boundary = CancelAtWriteBoundary(
+            "direct program write cancellation"
+        )
+        request = namespace["ProgramExecutionRequest"](
+            1,
+            "run",
+            boundary,
+        )
+        namespace["program_execution_active_request"] = request
+
+        self.assertEqual(execute("TL\n"), ("rejected", None))
+        self.assertTrue(boundary.is_set())
+        self.assertEqual(serial_port.commands, [])
+        self.assertEqual(len(exchange_contracts), 1)
+        self.assertFalse(
+            exchange_contracts[0]["write_started_event"].is_set()
+        )
+        self.assertIs(
+            exchange_contracts[0]["cancellation_event"],
+            boundary,
+        )
+        self.assertIs(
+            exchange_contracts[0]["write_boundary_lock"],
+            boundary,
+        )
+        self.assertEqual(aborts, [])
+        self.assertEqual(len(statuses), 1)
+
+    def test_program_command_branches_and_navigation_recheck_cancellation(self):
+        execute_row = self.module_functions["executeRow"]
+        command_branches = []
+        for statement in execute_row.body:
+            if not isinstance(statement, ast.If):
+                continue
+            runtime_keys = {
+                node.slice.value
+                for node in ast.walk(statement.test)
+                if (
+                    isinstance(node, ast.Subscript)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "RUN"
+                    and isinstance(node.slice, ast.Constant)
+                    and node.slice.value in ("cmdType", "cmdTypeLong")
+                )
+            }
+            if runtime_keys:
+                command_branches.append(statement)
+
+        self.assertGreaterEqual(len(command_branches), 30)
+        for branch in command_branches:
+            with self.subTest(branch=ast.unparse(branch.test)):
+                self.assertTrue(branch.body)
+                guard = branch.body[0]
+                self.assertIsInstance(guard, ast.If)
+                self.assertIsInstance(guard.test, ast.Call)
+                self.assertIsInstance(guard.test.func, ast.Name)
+                self.assertEqual(
+                    guard.test.func.id,
+                    "_reject_cancelled_program_row",
+                )
+                self.assertEqual(len(guard.test.args), 1)
+                self.assertIsInstance(guard.test.args[0], ast.Name)
+                self.assertEqual(
+                    guard.test.args[0].id,
+                    "execution_request",
+                )
+                self.assertEqual(len(guard.body), 1)
+                self.assertIsInstance(guard.body[0], ast.Return)
+                self.assertIsInstance(guard.body[0].value, ast.Name)
+                self.assertEqual(
+                    guard.body[0].value.id,
+                    "ROW_EXECUTION_REJECTED",
+                )
+
+        minimum_checks = {
+            "runProg": 4,
+            "stepFwd": 3,
+            "stepRev": 3,
+        }
+        for function_name, minimum in minimum_checks.items():
+            checks = [
+                node
+                for node in ast.walk(self.module_functions[function_name])
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id
+                    == "_program_execution_request_cancelled"
+                )
+            ]
+            with self.subTest(navigation=function_name):
+                self.assertGreaterEqual(len(checks), minimum)
+
+        self.assertNotIn(
+            "time.sleep(.4)",
+            AR4_SOURCE.read_text(encoding="utf-8"),
+        )
+
+    def test_called_program_commit_is_ordered_against_cancellation(self):
+        class Boundary:
+            def __init__(self, cancel_on_acquire=False):
+                self.event = threading.Event()
+                self.lock = threading.Lock()
+                self.cancel_on_acquire = cancel_on_acquire
+
+            def acquire(self):
+                if self.cancel_on_acquire:
+                    self.cancel_on_acquire = False
+                    self.event.set()
+                return self.lock.acquire()
+
+            def release(self):
+                return self.lock.release()
+
+            def is_set(self):
+                return self.event.is_set()
+
+            def cancel(self):
+                with self.lock:
+                    self.event.set()
+
+        class ProgramRequest:
+            def __init__(self, boundary):
+                self.cancellation_boundary = boundary
+
+        class ProgramFile:
+            def __init__(self):
+                self.rows = [
+                    f"row {index}\n".encode("utf-8")
+                    for index in range(8)
+                ]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def readline(self, limit):
+                if not self.rows:
+                    return b""
+                row = self.rows.pop(0)
+                if len(row) <= limit:
+                    return row
+                self.rows.insert(0, row[limit:])
+                return row[:limit]
+
+        application_thread = threading.get_ident()
+        navigation_queue = Queue()
+        applications = []
+        opened_paths = []
+        cancellation_during_apply = []
+        reschedules = []
+        logged = []
+
+        def replace_program_view(program_name, program_rows, **options):
+            applications.append(
+                (
+                    threading.get_ident(),
+                    program_name,
+                    program_rows,
+                    options,
+                )
+            )
+            if cancellation_during_apply:
+                boundary = cancellation_during_apply.pop(0)
+                canceller = threading.Thread(target=boundary.cancel)
+                canceller.start()
+                canceller.join(0.5)
+                if canceller.is_alive():
+                    raise AssertionError(
+                        "called-program view mutation retained the "
+                        "cancellation boundary"
+                    )
+            return True
+
+        namespace = {
+            "ProgramExecutionRequest": ProgramRequest,
+            "MotionInputError": MotionInputError,
+            "_program_execution_request_cancelled": (
+                lambda request: (
+                    namespace["program_execution_cancelled"].is_set()
+                    or request.cancellation_boundary.is_set()
+                )
+            ),
+            "program_execution_cancelled": threading.Event(),
+            "application_closing": threading.Event(),
+            "application_lifecycle_lock": threading.Lock(),
+            "application_tk_thread_id": application_thread,
+            "called_program_navigation_event_queue": navigation_queue,
+            "Empty": Empty,
+            "threading": threading,
+            "logger": SimpleNamespace(
+                exception=lambda *args: logged.append(args),
+            ),
+            "_reschedule_event_poll": reschedules.append,
+            "_replace_robot_program_view": replace_program_view,
+            "_open_local_robot_program": lambda name: (
+                opened_paths.append(name) or ProgramFile()
+            ),
+            "MAX_LOCAL_ROBOT_PROGRAM_BYTES": 1024,
+            "MAX_LOCAL_ROBOT_PROGRAM_ROWS": 20,
+            "MAX_LOCAL_ROBOT_SOURCE_LINE_BYTES": 128,
+            "os": os,
+        }
+        self.compile_function(
+            "_validate_called_program_filename",
+            namespace,
+        )
+        self.compile_function(
+            "_validate_robot_program_source_path",
+            namespace,
+        )
+        self.compile_function(
+            "_resolve_called_program_source_path",
+            namespace,
+        )
+        namespace["CalledProgramNavigation"] = self.compile_class(
+            "CalledProgramNavigation",
+            namespace,
+        )
+        self.compile_function("_decode_program_row_content", namespace)
+        self.compile_function("_parse_local_robot_program", namespace)
+        self.compile_function(
+            "_commit_called_program_navigation",
+            namespace,
+        )
+        self.compile_function(
+            "_settle_called_program_navigation",
+            namespace,
+        )
+        poll_navigation = self.compile_function(
+            "_poll_called_program_navigation_events",
+            namespace,
+        )
+        self.compile_function(
+            "_dispatch_called_program_navigation",
+            namespace,
+        )
+        call_program = self.compile_function("callProg", namespace)
+
+        def dispatch_from_worker(
+            request,
+            selected_row=0,
+            program_name="child.ar4",
+            **options,
+        ):
+            outcome = []
+            errors = []
+
+            def invoke():
+                try:
+                    outcome.append(
+                        call_program(
+                            program_name,
+                            request,
+                            selected_row,
+                            **options,
+                        )
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            worker = threading.Thread(target=invoke)
+            worker.start()
+            deadline = time.monotonic() + 1.0
+            while navigation_queue.empty() and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertFalse(navigation_queue.empty())
+            self.assertTrue(worker.is_alive())
+            return worker, outcome, errors
+
+        for invalid_name in (
+            "../child.ar4",
+            r"..\child.ar4",
+            "C:child.ar4",
+            "child.txt",
+        ):
+            with self.subTest(invalid_name=invalid_name):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "filename",
+                ):
+                    call_program(
+                        invalid_name,
+                        ProgramRequest(Boundary()),
+                        0,
+                    )
+
+        invalid_caller_cases = (
+            {
+                "caller_row": 1,
+                "caller_program": None,
+            },
+            {
+                "caller_row": None,
+                "caller_program": os.path.abspath("parent.ar4"),
+            },
+            {
+                "caller_row": 1,
+                "caller_program": os.path.abspath("parent.txt"),
+            },
+        )
+        opened_before_invalid_callers = len(opened_paths)
+        for options in invalid_caller_cases:
+            with self.subTest(invalid_caller_state=options):
+                with self.assertRaises(MotionInputError):
+                    call_program(
+                        "child.ar4",
+                        ProgramRequest(Boundary()),
+                        0,
+                        **options,
+                    )
+        self.assertEqual(
+            len(opened_paths),
+            opened_before_invalid_callers,
+        )
+
+        for invalid_return_path in (
+            os.path.abspath("parent.txt"),
+            "bad\nparent.ar4",
+        ):
+            with self.subTest(invalid_return_path=invalid_return_path):
+                with self.assertRaises(MotionInputError):
+                    call_program(
+                        invalid_return_path,
+                        ProgramRequest(Boundary()),
+                        0,
+                        clear_return_state=True,
+                    )
+        self.assertEqual(
+            len(opened_paths),
+            opened_before_invalid_callers,
+        )
+
+        cancelled_request = ProgramRequest(Boundary(cancel_on_acquire=True))
+        worker, outcome, errors = dispatch_from_worker(cancelled_request)
+        self.assertEqual(applications, [])
+        poll_navigation()
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(outcome, [False])
+        self.assertEqual(applications, [])
+
+        active_boundary = Boundary()
+        active_request = ProgramRequest(active_boundary)
+        absolute_parent = os.path.join(
+            os.path.abspath("external-programs"),
+            "parent.ar4",
+        )
+        expected_child = os.path.join(
+            os.path.dirname(absolute_parent),
+            "child.ar4",
+        )
+        cancellation_during_apply.append(active_boundary)
+        worker, outcome, errors = dispatch_from_worker(
+            active_request,
+            caller_row=4,
+            caller_program=absolute_parent,
+        )
+        self.assertEqual(applications, [])
+        poll_navigation()
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(outcome, [True])
+        self.assertEqual(len(applications), 1)
+        application = applications[0]
+        self.assertEqual(application[0], application_thread)
+        self.assertEqual(application[1], expected_child)
+        self.assertEqual(application[2][0], b"row 0\n")
+        self.assertEqual(application[3]["caller_row"], 4)
+        self.assertEqual(
+            application[3]["caller_program"],
+            absolute_parent,
+        )
+        self.assertEqual(opened_paths[-1], expected_child)
+        self.assertTrue(active_boundary.is_set())
+        self.assertTrue(active_boundary.lock.acquire(blocking=False))
+        active_boundary.lock.release()
+
+        return_request = ProgramRequest(Boundary())
+        worker, outcome, errors = dispatch_from_worker(
+            return_request,
+            selected_row=5,
+            program_name=absolute_parent,
+            clear_return_state=True,
+            update_current_row=True,
+        )
+        poll_navigation()
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(outcome, [True])
+        application = applications[-1]
+        self.assertEqual(application[1], absolute_parent)
+        self.assertEqual(application[3]["selected_row"], 5)
+        self.assertTrue(application[3]["clear_return_state"])
+        self.assertTrue(application[3]["update_current_row"])
+        self.assertEqual(opened_paths[-1], absolute_parent)
+        self.assertEqual(
+            reschedules,
+            ["called-program", "called-program", "called-program"],
+        )
+        self.assertEqual(logged, [])
+
+    def test_robot_program_view_replacement_rolls_back_atomically(self):
+        style_options = self.module_literal(
+            "GCODE_LISTBOX_STYLE_OPTIONS"
+        )
+
+        class Entry:
+            def __init__(self, value):
+                self.value = value
+
+            def delete(self, start, end):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = str(value)
+
+            def get(self):
+                return self.value
+
+        class ProgramView:
+            def __init__(self):
+                self.rows = [b"parent zero\n", b"parent one\n"]
+                self.styles = [
+                    {
+                        option: f"{option}-{index}"
+                        for option in style_options
+                    }
+                    for index in range(2)
+                ]
+                self.selected = [1]
+                self.active = 1
+                self.anchor = 1
+                self.x_fraction = (0.0, 1.0)
+                self.y_fraction = (0.25, 0.75)
+                self.fail_value = None
+                self.failed = False
+
+            def get(self, start, end):
+                return tuple(self.rows)
+
+            def itemcget(self, index, option):
+                return self.styles[index][option]
+
+            def curselection(self):
+                return tuple(self.selected)
+
+            def index(self, value):
+                if value == "active":
+                    return self.active
+                if value == "anchor":
+                    return self.anchor
+                return int(value)
+
+            def xview(self):
+                return self.x_fraction
+
+            def yview(self):
+                return self.y_fraction
+
+            def delete(self, start, end):
+                self.rows = []
+                self.styles = []
+                self.selected = []
+
+            def insert(self, index, value):
+                if value == self.fail_value and not self.failed:
+                    self.failed = True
+                    raise RuntimeError("injected row insertion failure")
+                self.rows.append(value)
+                self.styles.append(
+                    {
+                        option: ""
+                        for option in style_options
+                    }
+                )
+
+            def itemconfig(self, index, style):
+                self.styles[index] = dict(style)
+
+            def selection_clear(self, start, end):
+                self.selected = []
+
+            def select_set(self, index):
+                self.selected = [index]
+
+            def selection_set(self, index):
+                self.selected.append(index)
+
+            def selection_anchor(self, index):
+                self.anchor = index
+
+            def activate(self, index):
+                self.active = index
+
+            def xview_moveto(self, value):
+                width = self.x_fraction[1] - self.x_fraction[0]
+                self.x_fraction = (value, min(1.0, value + width))
+
+            def yview_moveto(self, value):
+                height = self.y_fraction[1] - self.y_fraction[0]
+                self.y_fraction = (value, min(1.0, value + height))
+
+        view = ProgramView()
+        program_entry = Entry("parent.ar4")
+        row_entry = Entry("1")
+        tab = SimpleNamespace(
+            progView=view,
+            lastRow=3,
+            lastProg="caller.ar4",
+        )
+        namespace = {
+            "ACTIVE": "active",
+            "ANCHOR": "anchor",
+            "END": "end",
+            "GCODE_LISTBOX_STYLE_OPTIONS": style_options,
+            "MotionInputError": MotionInputError,
+            "Optional": Optional,
+            "dataclass": dataclass,
+            "math": math,
+            "os": os,
+            "tab1": tab,
+            "ProgEntryField": program_entry,
+            "curRowEntryField": row_entry,
+        }
+        self.compile_function(
+            "_validate_robot_program_source_path",
+            namespace,
+        )
+        namespace["RobotProgramViewSnapshot"] = self.compile_class(
+            "RobotProgramViewSnapshot",
+            namespace,
+        )
+        for function_name in (
+            "_robot_program_view_index",
+            "_robot_program_view_fractions",
+            "_capture_robot_program_view",
+            "_robot_program_view_error_detail",
+            "_restore_robot_program_view",
+            "_replace_robot_program_view",
+        ):
+            self.compile_function(function_name, namespace)
+        replace_view = namespace["_replace_robot_program_view"]
+
+        self.assertTrue(
+            replace_view(
+                "child.ar4",
+                (b"child zero\n", b"child one\n"),
+                selected_row=1,
+                caller_row=1,
+                caller_program="parent.ar4",
+                update_current_row=True,
+            )
+        )
+        self.assertEqual(
+            view.rows,
+            [b"child zero\n", b"child one\n"],
+        )
+        self.assertEqual(view.selected, [1])
+        self.assertEqual(program_entry.value, "child.ar4")
+        self.assertEqual(row_entry.value, "1")
+        self.assertEqual(tab.lastRow, 1)
+        self.assertEqual(tab.lastProg, "parent.ar4")
+
+        expected_rows = list(view.rows)
+        expected_styles = copy.deepcopy(view.styles)
+        expected_selection = list(view.selected)
+        expected_path = program_entry.value
+        expected_row = row_entry.value
+        expected_return = (tab.lastRow, tab.lastProg)
+        view.fail_value = b"broken child\n"
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "injected row insertion failure",
+        ):
+            replace_view(
+                "broken.ar4",
+                (b"new first\n", b"broken child\n"),
+                selected_row=0,
+                clear_return_state=True,
+                update_current_row=True,
+            )
+        self.assertEqual(view.rows, expected_rows)
+        self.assertEqual(view.styles, expected_styles)
+        self.assertEqual(view.selected, expected_selection)
+        self.assertEqual(program_entry.value, expected_path)
+        self.assertEqual(row_entry.value, expected_row)
+        self.assertEqual((tab.lastRow, tab.lastProg), expected_return)
 
     def test_program_execution_owner_covers_start_and_reverse_completion(self):
         constant_node = next(
@@ -11540,6 +16512,14 @@ class HmiSourceContractTests(unittest.TestCase):
             "program_execution_next_request_id": 0,
             "program_execution_active_request": None,
             "gcode_storage_program_admission_active": False,
+            "manual_controller_program_admission_active": False,
+            "RUN": {
+                "programStopRequestId": None,
+                "programStopStatusLatched": False,
+                "programStopState": "completed",
+                "estopActive": False,
+                "posOutreach": False,
+            },
         }
         exec(
             compile(
@@ -11593,7 +16573,13 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         with self.assertRaises(MotionInputError):
-            namespace["ProgramExecutionRequest"](0, "run")
+            namespace["ProgramExecutionRequest"](
+                0,
+                "run",
+                namespace["SerialWriteCancellationBoundary"](
+                    "invalid program request test"
+                ),
+            )
         with self.assertRaises(MotionInputError):
             begin_execution("invalid")
         with self.assertRaises(MotionInputError):
@@ -11638,7 +16624,13 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(begin_storage(False), "program-active")
         self.assertFalse(namespace["gcode_conversion_active"].is_set())
         self.assertIsNone(begin_execution("step-forward"))
-        stale_request = namespace["ProgramExecutionRequest"](99, "run")
+        stale_request = namespace["ProgramExecutionRequest"](
+            99,
+            "run",
+            namespace["SerialWriteCancellationBoundary"](
+                "stale program execution"
+            ),
+        )
         self.assertFalse(finish_execution(stale_request))
         self.assertTrue(request_active(first_request))
         self.assertTrue(finish_execution(first_request))
@@ -11652,6 +16644,22 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace["_program_execution_busy_message"](),
             "PROGRAM EXECUTION STATE CHANGED; RETRY",
         )
+
+        namespace["manual_controller_program_admission_active"] = True
+        self.assertIsNone(begin_execution("run"))
+        self.assertEqual(
+            namespace["_program_execution_busy_message"](),
+            "PROGRAM EXECUTION REJECTED DURING MANUAL CONTROLLER I/O",
+        )
+        self.assertEqual(
+            begin_conversion(),
+            "manual-controller-active",
+        )
+        self.assertEqual(
+            begin_storage(False),
+            "manual-controller-active",
+        )
+        namespace["manual_controller_program_admission_active"] = False
 
         class Widget:
             def __init__(self):
@@ -11693,7 +16701,11 @@ class HmiSourceContractTests(unittest.TestCase):
                     error=lambda *args: logged.append(("error", args)),
                     exception=lambda *args: logged.append(("exception", args)),
                 ),
-                "threading": SimpleNamespace(Thread=CapturedThread),
+                "threading": SimpleNamespace(
+                    Event=threading.Event,
+                    Lock=threading.Lock,
+                    Thread=CapturedThread,
+                ),
                 "_set_program_stop_status": lambda state: True,
             }
         )
@@ -11755,7 +16767,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(execution_active())
         self.assertEqual(
             namespace["program_stop_status_event_queue"].get_nowait(),
-            ("PROGRAM EXECUTION FAILED", "Alarm.TLabel"),
+            ("PROGRAM EXECUTION FAILED", "Alarm.TLabel", False),
         )
 
         runtime["programStopRequestId"] = 7
@@ -11767,12 +16779,20 @@ class HmiSourceContractTests(unittest.TestCase):
             def __init__(self, target):
                 raise RuntimeError("thread unavailable")
 
-        namespace["threading"] = SimpleNamespace(Thread=FailingThread)
+        namespace["threading"] = SimpleNamespace(
+            Event=threading.Event,
+            Lock=threading.Lock,
+            Thread=FailingThread,
+        )
         self.assertFalse(run_program())
         self.assertEqual(tab.runTrue, 0)
         self.assertFalse(execution_active())
 
-        namespace["threading"] = SimpleNamespace(Thread=CapturedThread)
+        namespace["threading"] = SimpleNamespace(
+            Event=threading.Event,
+            Lock=threading.Lock,
+            Thread=CapturedThread,
+        )
         step_forward = self.compile_function("stepFwd", namespace)
         self.assertTrue(step_forward())
         runtime["progRunning"] = True
@@ -11783,7 +16803,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(execution_active())
         self.assertEqual(
             namespace["program_stop_status_event_queue"].get_nowait(),
-            ("PROGRAM STEP FORWARD FAILED", "Alarm.TLabel"),
+            ("PROGRAM STEP FORWARD FAILED", "Alarm.TLabel", False),
         )
 
         callbacks = []
@@ -11809,7 +16829,7 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace["ROW_EXECUTION_PENDING"] = "pending"
         namespace["ROW_EXECUTION_REJECTED"] = "rejected"
         namespace["executeRow"] = (
-            lambda motion_complete=None: (
+            lambda motion_complete=None, **kwargs: (
                 callbacks.append(motion_complete) or "pending"
             )
         )
@@ -11836,12 +16856,33 @@ class HmiSourceContractTests(unittest.TestCase):
             )
         )
 
-        namespace["executeRow"] = lambda motion_complete=None: "complete"
+        runtime["progRunning"] = True
+        runtime["rowinproc"] = 1
+        self.assertTrue(step_reverse())
+        cancelled_callback = callbacks[-1]
+        cancel_active_execution = self.compile_function(
+            "_cancel_active_program_execution",
+            namespace,
+        )
+        self.assertTrue(cancel_active_execution())
+        cancelled_callback(True)
+        self.assertEqual(completions, [(4, True)])
+        self.assertFalse(runtime["progRunning"])
+        self.assertEqual(runtime["rowinproc"], 0)
+        self.assertFalse(execution_active())
+        cancelled_callback(True)
+        self.assertEqual(completions, [(4, True)])
+
+        namespace["executeRow"] = (
+            lambda motion_complete=None, **kwargs: "complete"
+        )
         self.assertTrue(step_reverse())
         self.assertEqual(selections, [4])
         self.assertFalse(execution_active())
 
-        namespace["executeRow"] = lambda motion_complete=None: "rejected"
+        namespace["executeRow"] = (
+            lambda motion_complete=None, **kwargs: "rejected"
+        )
         self.assertFalse(step_reverse())
         self.assertEqual(selections, [4])
         self.assertFalse(execution_active())
@@ -11852,7 +16893,10 @@ class HmiSourceContractTests(unittest.TestCase):
             for level, args in logged
         )
 
-        def reject_after_synchronous_completion(motion_complete=None):
+        def reject_after_synchronous_completion(
+            motion_complete=None,
+            **kwargs,
+        ):
             motion_complete(False)
             return "rejected"
 
@@ -11927,7 +16971,11 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(step_reverse())
         self.assertTrue(finish_execution(busy_request))
 
-        namespace["threading"] = SimpleNamespace(Thread=FailingThread)
+        namespace["threading"] = SimpleNamespace(
+            Event=threading.Event,
+            Lock=threading.Lock,
+            Thread=FailingThread,
+        )
         self.assertFalse(step_forward())
         self.assertFalse(execution_active())
         namespace["threading"] = threading
@@ -12018,6 +17066,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "AUXILIARY_STOP_NOT_REQUIRED": "not-required",
             "manual_auxiliary_stop_barrier": stop_barrier,
             "_begin_manual_auxiliary_stop": begin_stop,
+            "_clear_manual_auxiliary_stop_barrier_if_settled": (
+                lambda: stop_barrier.clear() or True
+            ),
         }
         namespace["_set_program_stop_status"] = self.compile_function(
             "_set_program_stop_status",
@@ -12100,6 +17151,428 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(apply_status())
         self.assertEqual(len(rendered), 2)
         self.assertFalse(apply_status())
+
+        class FailOnceLabel(Label):
+            def __init__(self):
+                self.pending_failure = True
+
+            def config(self, **kwargs):
+                self.assert_unlocked()
+                if self.pending_failure:
+                    self.pending_failure = False
+                    raise RuntimeError("program-stop status unavailable")
+                rendered.append(kwargs)
+
+        namespace["almStatusLab2"] = FailOnceLabel()
+        self.assertTrue(set_status("failed"))
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "program-stop status unavailable",
+        ):
+            apply_status()
+        self.assertTrue(set_status("completed"))
+        self.assertIsNotNone(
+            namespace["program_stop_status_pending_event"]
+        )
+        self.assertEqual(
+            namespace["program_stop_status_event_queue"].qsize(),
+            1,
+        )
+        self.assertTrue(apply_status())
+        self.assertIsNone(
+            namespace["program_stop_status_pending_event"]
+        )
+        self.assertTrue(
+            namespace["program_stop_status_event_queue"].empty()
+        )
+        self.assertEqual(
+            rendered[-1]["text"],
+            "PROGRAM SCHEDULING HALTED; "
+            "ACTIVE MAIN MOTION NOT PREEMPTED",
+        )
+
+    def test_physical_stop_status_survives_adverse_result_poll_order(self):
+        class Widget:
+            def __init__(self):
+                self.value = None
+                self.style = None
+
+            def delete(self, *args):
+                self.value = None
+
+            def insert(self, index, value):
+                self.value = value
+
+            def config(self, **kwargs):
+                self.value = kwargs.get("text")
+                self.style = kwargs.get("style")
+
+        class Logger:
+            @staticmethod
+            def warning(*args):
+                pass
+
+            @staticmethod
+            def error(*args):
+                pass
+
+            @staticmethod
+            def exception(*args):
+                pass
+
+        stop_message = "PHYSICAL E-STOP ACTIVE"
+        stop_style = "Alarm.TLabel"
+
+        serial_labels = (Widget(), Widget())
+        serial_events = Queue()
+        serial_events.put(
+            ("started", "LJV10\n", None, None, True, None, None)
+        )
+        serial_events.put(
+            (
+                "completed",
+                "LJV10\n",
+                VALID_CONTROLLER_POSITION.raw,
+                None,
+                True,
+                None,
+                None,
+            )
+        )
+        serial_lock = threading.Lock()
+        serial_lock.acquire()
+        serial_namespace = {
+            "serial_event_queue": serial_events,
+            "Empty": Empty,
+            "cmdSentEntryField": Widget(),
+            "almStatusLab": serial_labels[0],
+            "almStatusLab2": serial_labels[1],
+            "logger": Logger(),
+            "_apply_legacy_serial_response": (
+                lambda response: VALID_CONTROLLER_POSITION
+            ),
+            "_invalidate_joint_motion_state": lambda reason: None,
+            "RUN": {
+                "liveJog": True,
+                "estopActive": True,
+                "posOutreach": False,
+                "programStopRequestId": None,
+                "programStopStatusLatched": True,
+            },
+            "CAL": {
+                f"J{axis}AngCur": str(axis)
+                for axis in range(1, 7)
+            },
+            "finite_number": finite_number,
+            "setStepMonitorsVR": lambda: None,
+            "legacy_serial_result_pending": threading.Event(),
+            "live_serial_result_pending": threading.Event(),
+            "live_jog_stop_requested": threading.Event(),
+            "_try_dispatch_deferred_joint_adjustments": (
+                lambda **kwargs: DeferredJointDispatchOutcome.IDLE
+            ),
+            "serial_lock": serial_lock,
+            "joint_motion_dispatcher": SimpleNamespace(active=False),
+            "application_closing": SimpleNamespace(is_set=lambda: True),
+        }
+        for flag_name in (
+            "legacy_serial_result_pending",
+            "live_serial_result_pending",
+            "live_jog_stop_requested",
+        ):
+            serial_namespace[flag_name].set()
+        poll_serial = self.compile_function(
+            "_poll_serial_events",
+            serial_namespace,
+        )
+        self.assertTrue(
+            serial_namespace["_set_application_status"](
+                stop_message,
+                stop_style,
+                stop_authoritative=True,
+            )
+        )
+        poll_serial()
+        for label in serial_labels:
+            self.assertEqual(label.value, stop_message)
+            self.assertEqual(label.style, stop_style)
+
+        class JointEvent:
+            kind = "failed"
+            response = None
+            position = None
+            error = "telemetry framing failed"
+            pending_discarded = False
+
+            def __init__(self):
+                self.acknowledged = False
+
+            def acknowledge(self):
+                self.acknowledged = True
+
+        class JointDispatcher:
+            pending = False
+            active = False
+            desired_target = None
+
+            def __init__(self, event):
+                self.events = [event]
+
+            def drain_events(self):
+                events = self.events
+                self.events = []
+                return events
+
+        joint_event = JointEvent()
+        joint_labels = (Widget(), Widget())
+        joint_namespace = {
+            "RUN": {
+                "estopActive": True,
+                "posOutreach": False,
+                "programStopRequestId": None,
+                "programStopStatusLatched": True,
+            },
+            "joint_motion_dispatcher": JointDispatcher(joint_event),
+            "almStatusLab": joint_labels[0],
+            "almStatusLab2": joint_labels[1],
+            "_current_joint_positions": lambda: (0.0,) * 9,
+            "_try_set_virtual_joint_target": lambda positions: True,
+            "_invalidate_joint_motion_state": lambda reason: None,
+            "_finish_joint_motion_request_if_idle": lambda: True,
+            "_refresh_joint_motion_visualization": lambda: None,
+            "_finish_joint_motion_visualization": (
+                lambda preserve_actual=False: True
+            ),
+            "logger": Logger(),
+            "application_closing": SimpleNamespace(is_set=lambda: True),
+        }
+        poll_joint = self.compile_function(
+            "_poll_joint_motion_events",
+            joint_namespace,
+        )
+        self.assertTrue(
+            joint_namespace["_set_application_status"](
+                stop_message,
+                stop_style,
+                stop_authoritative=True,
+            )
+        )
+        poll_joint()
+        self.assertTrue(joint_event.acknowledged)
+        for label in joint_labels:
+            self.assertEqual(label.value, stop_message)
+            self.assertEqual(label.style, stop_style)
+
+        xbox_labels = (Widget(), Widget())
+        xbox_namespace = {
+            "xbox_auxiliary_event_queue": Queue(),
+            "Empty": Empty,
+            "XBOX_AUXILIARY_PENDING_KEYS": {
+                "_grip_closed": "_grip_pending_request_id",
+            },
+            "XBOX_AUXILIARY_TOGGLE_RESPONSES": {
+                "_grip_closed": b"Servo Done",
+            },
+            "RUN": {
+                "_grip_closed": False,
+                "_grip_pending_request_id": 7,
+                "estopActive": True,
+                "posOutreach": False,
+                "programStopRequestId": None,
+                "programStopStatusLatched": True,
+            },
+            "almStatusLab": xbox_labels[0],
+            "almStatusLab2": xbox_labels[1],
+            "logger": Logger(),
+            "application_closing": SimpleNamespace(is_set=lambda: True),
+        }
+        xbox_namespace["xbox_auxiliary_event_queue"].put(
+            (
+                "failed",
+                7,
+                "_grip_closed",
+                True,
+                "auxiliary transport failed",
+            )
+        )
+        poll_xbox = self.compile_function(
+            "_poll_xbox_auxiliary_events",
+            xbox_namespace,
+        )
+        self.assertTrue(
+            xbox_namespace["_set_application_status"](
+                stop_message,
+                stop_style,
+                stop_authoritative=True,
+            )
+        )
+        poll_xbox()
+        for label in xbox_labels:
+            self.assertEqual(label.value, stop_message)
+            self.assertEqual(label.style, stop_style)
+
+    def test_global_application_status_boundary_covers_legacy_writers(self):
+        direct_writers = []
+        for call in (
+            node
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.Call)
+        ):
+            if (
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id in {"almStatusLab", "almStatusLab2"}
+                and call.func.attr in {"config", "configure"}
+            ):
+                direct_writers.append(
+                    (
+                        call.func.value.id,
+                        call.func.attr,
+                        call.lineno,
+                    )
+                )
+        self.assertEqual(direct_writers, [])
+
+        class Widget:
+            def __init__(self):
+                self.value = None
+                self.style = None
+
+            def config(self, **kwargs):
+                self.value = kwargs.get("text")
+                self.style = kwargs.get("style")
+
+        class Logger:
+            @staticmethod
+            def warning(*args):
+                pass
+
+            @staticmethod
+            def error(*args):
+                pass
+
+            @staticmethod
+            def exception(*args):
+                pass
+
+        stop_message = "PHYSICAL E-STOP ACTIVE"
+        stop_style = "Alarm.TLabel"
+
+        def reserved_namespace():
+            labels = (Widget(), Widget())
+            namespace = {
+                "RUN": {
+                    "estopActive": True,
+                    "posOutreach": False,
+                    "programStopRequestId": None,
+                    "programStopStatusLatched": True,
+                    "offlineMode": False,
+                },
+                "almStatusLab": labels[0],
+                "almStatusLab2": labels[1],
+                "logger": Logger(),
+                "application_closing": threading.Event(),
+            }
+            set_status = self.compile_function(
+                "_set_application_status",
+                namespace,
+            )
+            self.assertTrue(
+                set_status(
+                    stop_message,
+                    stop_style,
+                    stop_authoritative=True,
+                )
+            )
+            return namespace, labels
+
+        startup_namespace, startup_labels = reserved_namespace()
+        startup_jobs = []
+        startup_namespace.update(
+            {
+                "_close_failed_controller_startup": (
+                    lambda *args: False
+                ),
+                "_retain_failed_controller_startup": (
+                    lambda *args: self.fail(
+                        "scheduled cleanup retry was unexpectedly retained"
+                    )
+                ),
+                "SERIAL_SHUTDOWN_RETRY_MS": 100,
+                "root": SimpleNamespace(
+                    after=lambda delay, callback: startup_jobs.append(
+                        (delay, callback)
+                    )
+                ),
+            }
+        )
+        poll_failed_close = self.compile_function(
+            "_poll_failed_controller_close",
+            startup_namespace,
+        )
+        self.assertFalse(
+            poll_failed_close(object(), object(), object())
+        )
+        self.assertEqual(len(startup_jobs), 1)
+        for label in startup_labels:
+            self.assertEqual(label.value, stop_message)
+            self.assertEqual(label.style, stop_style)
+
+        program_namespace, program_labels = reserved_namespace()
+        program_namespace.update(
+            {
+                "Optional": Optional,
+                "controller_position_resynchronization_required": (
+                    threading.Event()
+                ),
+                "_apply_program_motion_pose": (
+                    lambda *args: self.fail(
+                        "committed failed motion cannot restore a saved pose"
+                    )
+                ),
+                "_invalidate_joint_motion_state": lambda reason: None,
+            }
+        )
+        program_namespace["ProgramMotionPoseSnapshot"] = self.compile_class(
+            "ProgramMotionPoseSnapshot",
+            program_namespace,
+        )
+        reconcile = self.compile_function(
+            "_reconcile_program_motion_pose",
+            program_namespace,
+        )
+        write_started = threading.Event()
+        write_started.set()
+        self.assertFalse(
+            reconcile(
+                program_namespace["ProgramMotionPoseSnapshot"](
+                    (0.0,) * 9,
+                    (0.0,) * 6,
+                ),
+                None,
+                write_started,
+                False,
+            )
+        )
+        for label in program_labels:
+            self.assertEqual(label.value, stop_message)
+            self.assertEqual(label.style, stop_style)
+
+        named_namespace, named_labels = reserved_namespace()
+        named_namespace.update(
+            {
+                "controller_correction_requested": threading.Event(),
+                "MotionQueueFault": MotionQueueFault,
+            }
+        )
+        queue_named_position = self.compile_function(
+            "_queue_primary_joint_position",
+            named_namespace,
+        )
+        self.assertFalse(queue_named_position("invalid"))
+        for label in named_labels:
+            self.assertEqual(label.value, stop_message)
+            self.assertEqual(label.style, stop_style)
 
     def test_program_shared_state_is_written_under_stop_state_lock(self):
         writes = []
@@ -12193,6 +17666,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
             "almStatusLab2": SimpleNamespace(config=lambda **kwargs: None),
             "AUXILIARY_STOP_NOT_REQUIRED": "not-required",
+            "_clear_manual_auxiliary_stop_barrier_if_settled": (
+                lambda: stop_barrier.clear() or True
+            ),
         }
         namespace["_set_program_stop_status"] = self.compile_function(
             "_set_program_stop_status",
@@ -12236,6 +17712,9 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_begin_manual_auxiliary_stop": begin_stop,
             "manual_auxiliary_stop_barrier": stop_barrier,
+            "_clear_manual_auxiliary_stop_barrier_if_settled": (
+                lambda: stop_barrier.clear() or True
+            ),
             "tab1": SimpleNamespace(runTrue=1),
             "RUN": runtime,
             "logger": SimpleNamespace(exception=lambda *args: None),
@@ -12263,23 +17742,30 @@ class HmiSourceContractTests(unittest.TestCase):
 
     def test_program_launch_rejects_unacknowledged_stop_request(self):
         statuses = []
-        execution_request = object()
-        released = []
+        warnings = []
+        message = (
+            "PROGRAM EXECUTION REJECTED WHILE STOP SETTLEMENT IS ACTIVE"
+        )
         namespace = {
-            "RUN": {"programStopRequestId": 12},
-            "_set_program_stop_status": statuses.append,
-            "_begin_program_execution": (
-                lambda mode: execution_request if mode == "run" else None
+            "RUN": {
+                "programStopRequestId": 12,
+                "estopActive": False,
+                "posOutreach": False,
+            },
+            "_begin_program_execution": lambda mode: None,
+            "_program_execution_busy_message": lambda: message,
+            "_set_manual_auxiliary_status": (
+                lambda text, style: statuses.append((text, style))
             ),
-            "_finish_program_execution": (
-                lambda request: released.append(request) or True
+            "logger": SimpleNamespace(
+                warning=lambda text: warnings.append(text)
             ),
         }
         run_program = self.compile_function("runProg", namespace)
 
         self.assertFalse(run_program())
-        self.assertEqual(statuses, ["pending"])
-        self.assertEqual(released, [execution_request])
+        self.assertEqual(statuses, [(message, "Warn.TLabel")])
+        self.assertEqual(warnings, [message])
 
     def test_program_halt_status_never_claims_unconfirmed_motion_stop(self):
         stopped_claim_owners = []
@@ -12326,6 +17812,12 @@ class HmiSourceContractTests(unittest.TestCase):
             "_auxiliary_stop_not_required",
             namespace,
         )
+        namespace["_reserve_auxiliary_stop_request_locked"] = (
+            self.compile_function(
+                "_reserve_auxiliary_stop_request_locked",
+                namespace,
+            )
+        )
         request_stop = self.compile_function(
             "_request_auxiliary_stop",
             namespace,
@@ -12334,6 +17826,12 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(request_stop(), ("not-required", None))
         self.assertFalse(namespace["auxiliary_stop_requested"].is_set())
         self.assertIsNone(namespace["auxiliary_stop_pending_request_id"])
+
+        namespace["RUN"]["offlineMode"] = True
+        namespace["RUN"]["ser2"] = SimpleNamespace(is_open=False)
+        self.assertFalse(namespace["_auxiliary_stop_not_required"]())
+        namespace["RUN"]["offlineMode"] = False
+        namespace["RUN"]["ser2"] = None
 
         namespace["CAL"].update(
             com2Port="COM2",
@@ -12385,6 +17883,12 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace["_try_dispatch_auxiliary_stop"] = self.compile_function(
             "_try_dispatch_auxiliary_stop",
             namespace,
+        )
+        namespace["_reserve_auxiliary_stop_request_locked"] = (
+            self.compile_function(
+                "_reserve_auxiliary_stop_request_locked",
+                namespace,
+            )
         )
         request_stop = self.compile_function(
             "_request_auxiliary_stop",
@@ -12463,6 +17967,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "_begin_manual_auxiliary_stop": (
                 lambda reason: stop_barrier.set() or 0
             ),
+            "_clear_manual_auxiliary_stop_barrier_if_settled": (
+                lambda: stop_barrier.clear() or True
+            ),
         }
         namespace["_set_program_stop_status"] = self.compile_function(
             "_set_program_stop_status",
@@ -12498,8 +18005,16 @@ class HmiSourceContractTests(unittest.TestCase):
             "exchange_serial_line": exchange,
             "RUN": {"ser": SimpleNamespace(is_open=True)},
             "_controller_response_timeout": lambda command: 250000,
+            "_prepare_main_controller_stop_exchange": (
+                lambda serial_port: lambda position: True
+            ),
             "serial_write_lock": object(),
             "SERIAL_LIVE_ACK_TIMEOUT_SECONDS": 5,
+            "parse_position_response": parse_position_response,
+            "position_response_is_physical_estop": (
+                position_response_is_physical_estop
+            ),
+            "ProtocolResponseError": ProtocolResponseError,
             "serial_transport_quarantined": lambda serial_port: False,
             "SerialTransportQuarantinedError": ConnectionError,
             "SerialTransportTimeout": TimeoutError,
@@ -12531,8 +18046,16 @@ class HmiSourceContractTests(unittest.TestCase):
             "exchange_serial_line": exchange,
             "RUN": runtime,
             "_controller_response_timeout": lambda command: 120,
+            "_prepare_main_controller_stop_exchange": (
+                lambda candidate_port: lambda position: True
+            ),
             "serial_write_lock": object(),
             "SERIAL_LIVE_ACK_TIMEOUT_SECONDS": 5,
+            "parse_position_response": parse_position_response,
+            "position_response_is_physical_estop": (
+                position_response_is_physical_estop
+            ),
+            "ProtocolResponseError": ProtocolResponseError,
             "serial_transport_quarantined": lambda value: value is serial_port,
             "SerialTransportQuarantinedError": ConnectionError,
             "SerialTransportTimeout": TimeoutError,
@@ -12560,8 +18083,16 @@ class HmiSourceContractTests(unittest.TestCase):
             "exchange_serial_line": exchange,
             "RUN": runtime,
             "_controller_response_timeout": lambda command: 120,
+            "_prepare_main_controller_stop_exchange": (
+                lambda candidate_port: lambda position: True
+            ),
             "serial_write_lock": object(),
             "SERIAL_LIVE_ACK_TIMEOUT_SECONDS": 5,
+            "parse_position_response": parse_position_response,
+            "position_response_is_physical_estop": (
+                position_response_is_physical_estop
+            ),
+            "ProtocolResponseError": ProtocolResponseError,
             "serial_transport_quarantined": lambda value: False,
             "SerialTransportQuarantinedError": QuarantinedError,
             "SerialTransportTimeout": QuarantinedTimeout,
@@ -13418,6 +18949,82 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(completions, [False])
         self.assertFalse(namespace["motion_request_registry"].active)
 
+    def test_program_stop_between_sequence_commands_blocks_the_next_write(self):
+        callbacks = []
+        starts = []
+        completions = []
+        reconciliations = []
+        namespace = {
+            "RUN": {"offlineMode": False},
+            "threading": threading,
+            "SERIAL_EVENT_APPLICATION_MARGIN_SECONDS": 0.1,
+            "_controller_response_timeout": lambda command: 1.0,
+            "_capture_program_motion_pose": lambda: "saved pose",
+            "_start_legacy_motion": (
+                lambda command, name, **kwargs: starts.append(
+                    (
+                        command,
+                        kwargs["write_cancellation_boundary"],
+                    )
+                )
+                or callbacks.append(kwargs["completion_callback"])
+                or True
+            ),
+            "_reconcile_program_motion_pose": (
+                lambda snapshot, position, write_started, succeeded: (
+                    reconciliations.append(
+                        (snapshot, position, succeeded)
+                    )
+                    or succeeded
+                )
+            ),
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                warning=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
+            "almStatusLab2": SimpleNamespace(config=lambda **kwargs: None),
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "ROW_EXECUTION_PENDING": "pending",
+            "ROW_EXECUTION_COMPLETE": "complete",
+        }
+
+        def finish_settled(callback, lease, succeeded, settlement_callback):
+            succeeded = settlement_callback(succeeded)
+            lease.close()
+            callback(succeeded)
+            return True
+
+        namespace["_finish_settled_motion_request"] = finish_settled
+        dispatch = self.compile_function(
+            "_dispatch_program_controller_sequence",
+            namespace,
+        )
+        request = namespace["program_execution_active_request"]
+
+        result = dispatch(
+            (
+                CONTROLLER_CARTESIAN_TEST_COMMAND,
+                CONTROLLER_CARTESIAN_TEST_COMMAND,
+            ),
+            completions.append,
+        )
+        self.assertEqual(result, "pending")
+        self.assertEqual(len(starts), 1)
+        self.assertIs(starts[0][1], request.cancellation_boundary)
+
+        request.cancellation_boundary.cancel()
+        callbacks[0](VALID_CONTROLLER_POSITION)
+
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(completions, [False])
+        self.assertEqual(
+            reconciliations,
+            [("saved pose", VALID_CONTROLLER_POSITION, False)],
+        )
+        self.assertFalse(namespace["motion_request_registry"].active)
+
     def test_execute_row_rejects_raw_joint_limit_before_worker_start(self):
         class Entry:
             def delete(self, *args):
@@ -13726,8 +19333,17 @@ class HmiSourceContractTests(unittest.TestCase):
             "finite_number": finite_number,
             "parse_position_response": parse_position_response,
             "threading": threading,
-            "exchange_serial_line_until_cancelled": (
-                exchange_serial_line_until_cancelled
+            "_exchange_main_controller_line_until_cancelled": (
+                lambda serial_port, command, cancellation_event, **options: (
+                    exchange_serial_line_until_cancelled(
+                        serial_port,
+                        command,
+                        cancellation_event,
+                        write_lock=namespace["serial_write_lock"],
+                        reset_input=False,
+                        **options,
+                    )
+                )
             ),
             "application_closing": threading.Event(),
             "serial_write_lock": threading.Lock(),
@@ -13914,8 +19530,17 @@ class HmiSourceContractTests(unittest.TestCase):
             "finite_number": finite_number,
             "parse_position_response": parse_position_response,
             "threading": threading,
-            "exchange_serial_line_until_cancelled": (
-                exchange_serial_line_until_cancelled
+            "_exchange_main_controller_line_until_cancelled": (
+                lambda serial_port, command, cancellation_event, **options: (
+                    exchange_serial_line_until_cancelled(
+                        serial_port,
+                        command,
+                        cancellation_event,
+                        write_lock=namespace["serial_write_lock"],
+                        reset_input=False,
+                        **options,
+                    )
+                )
             ),
             "application_closing": threading.Event(),
             "serial_write_lock": threading.Lock(),
@@ -14107,7 +19732,10 @@ class HmiSourceContractTests(unittest.TestCase):
                 "almStatusLab2",
             }
         )
-        self.assertIn("exchange_serial_line_until_cancelled", referenced_names)
+        self.assertIn(
+            "_exchange_main_controller_line_until_cancelled",
+            referenced_names,
+        )
 
         for callback_name in expected_commands.values():
             callback_names = {
@@ -14129,7 +19757,6 @@ class HmiSourceContractTests(unittest.TestCase):
             command,
             control_event,
             *,
-            write_lock,
             write_boundary_lock,
             write_started_event,
         ):
@@ -14139,7 +19766,7 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace = {
             "dataclass": dataclass,
             "threading": threading,
-            "exchange_serial_line_until_cancelled": fail_exchange,
+            "_exchange_main_controller_line_until_cancelled": fail_exchange,
             "application_closing": threading.Event(),
             "serial_write_lock": threading.Lock(),
             "calibration_serial_event_queue": events,
@@ -14596,11 +20223,8 @@ class HmiSourceContractTests(unittest.TestCase):
             query_calls,
             [
                 (
-                    serial_port,
                     "H2\n",
                     1.0,
-                    namespace["serial_write_lock"],
-                    False,
                 )
             ],
         )
@@ -15535,20 +21159,37 @@ class HmiSourceContractTests(unittest.TestCase):
         def position_namespace(port):
             invalidations = []
             home_reference_invalidations = []
+            write_lock = threading.Lock()
+
+            def exchange_legacy(command, **options):
+                self.assertEqual(options["accepted_responses"], ("Done",))
+                return exchange_serial_line(
+                    port,
+                    command,
+                    options["response_timeout"],
+                    write_lock=write_lock,
+                    reset_input=False,
+                    write_started_event=options["write_started_event"],
+                )
+
             namespace = {
                 "RUN": {"ser": port},
                 "threading": threading,
-                "serial_write_lock": threading.Lock(),
+                "serial_write_lock": write_lock,
                 "write_serial_control": write_serial_control,
                 "read_serial_line_response": read_serial_line_response,
                 "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 1.0,
                 "ProtocolResponseError": ProtocolResponseError,
+                "_exchange_legacy_main_command": exchange_legacy,
                 "_invalidate_joint_motion_state": invalidations.append,
                 "_invalidate_bound_primary_home_reference": (
                     lambda serial_port: (
                         home_reference_invalidations.append(serial_port)
                         or True
                     )
+                ),
+                "_require_main_controller_identity_cleanup": (
+                    lambda serial_port, context: True
                 ),
                 "logger": SimpleNamespace(exception=lambda *args: None),
             }
@@ -16538,22 +22179,19 @@ class HmiSourceContractTests(unittest.TestCase):
         responses = ["A1B163800C1D-38200E1F-88900"]
 
         def exchange(
-            serial_port,
             command,
-            timeout,
             *,
-            write_lock,
-            reset_input,
+            response_timeout,
+            expected_serial_port,
         ):
-            self.assertIs(serial_port, port)
             self.assertEqual(command, "H2\n")
-            self.assertFalse(reset_input)
+            self.assertEqual(response_timeout, 1.0)
+            self.assertIs(expected_serial_port, port)
             return responses.pop(0)
 
         namespace.update({
-            "exchange_serial_line": exchange,
+            "_exchange_legacy_main_command": exchange,
             "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 1.0,
-            "serial_write_lock": threading.Lock(),
             "parse_primary_home_reference_response": (
                 parse_primary_home_reference_response
             ),
@@ -16783,11 +22421,23 @@ class HmiSourceContractTests(unittest.TestCase):
             )
         ]
         self.assertEqual(len(guarded_limit_searches), 2)
+        self.assertNotIn(
+            'if (!estopActive) Serial.println("ER");',
+            calibration_handler,
+        )
         self.assertEqual(
             calibration_handler.count(
-                'if (!estopActive) Serial.println("ER");'
+                "finish_calibration_failure_response();"
             ),
-            4,
+            5,
+        )
+        self.assertRegex(
+            firmware_source,
+            (
+                r"void\s+finish_calibration_failure_response\(\)\s*\{\s*"
+                r'Serial\.println\("ER"\);\s*'
+                r"consume_current_command\(\);\s*\}"
+            ),
         )
         self.assertRegex(
             calibration_handler,
@@ -18516,7 +24166,14 @@ class HmiSourceContractTests(unittest.TestCase):
             completion_callback=None,
             request_lease=None,
             write_started_event=None,
+            write_cancellation_boundary=None,
         ):
+            self.assertIs(
+                write_cancellation_boundary,
+                namespace[
+                    "program_execution_active_request"
+                ].cancellation_boundary,
+            )
             controller_callbacks.append(completion_callback)
             return True
 
@@ -18563,6 +24220,61 @@ class HmiSourceContractTests(unittest.TestCase):
         controller_callbacks[0](VALID_CONTROLLER_POSITION)
         self.assertEqual(completion_results, [True])
 
+    def test_program_stop_during_virtual_preview_blocks_physical_start(self):
+        physical_starts = []
+        completion_results = []
+        namespace = {
+            "RUN": {"offlineMode": False},
+            "_start_legacy_motion": (
+                lambda *args, **kwargs: physical_starts.append(
+                    (args, kwargs)
+                )
+                or True
+            ),
+            "_controller_response_timeout": lambda command: 1.0,
+            "_virtual_completion_timeout": lambda command: 1.0,
+            "SERIAL_EVENT_APPLICATION_MARGIN_SECONDS": 0.1,
+            "_complete_program_motion_when_virtual_idle": (
+                complete_virtual_callback
+            ),
+            "_wait_for_virtual_motion_operation": (
+                lambda operation, timeout, **kwargs: True
+            ),
+            "drive_lock": threading.Lock(),
+            "threading": threading,
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                warning=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
+            "almStatusLab2": SimpleNamespace(config=lambda **kwargs: None),
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "ROW_EXECUTION_PENDING": "pending",
+            "ROW_EXECUTION_COMPLETE": "complete",
+        }
+        dispatch = self.compile_function(
+            "_dispatch_program_motion",
+            namespace,
+        )
+        request = namespace["program_execution_active_request"]
+
+        def stop_during_preview(command):
+            request.cancellation_boundary.cancel()
+            return completed_virtual_operation()
+
+        result = dispatch(
+            CONTROLLER_CARTESIAN_TEST_COMMAND,
+            stop_during_preview,
+            VIRTUAL_CARTESIAN_TEST_COMMAND,
+            completion_results.append,
+        )
+
+        self.assertEqual(result, "rejected")
+        self.assertEqual(physical_starts, [])
+        self.assertEqual(completion_results, [])
+        self.assertFalse(namespace["motion_request_registry"].active)
+
     def test_controller_first_program_result_retains_virtual_owner(self):
         order = []
         jobs = []
@@ -18602,9 +24314,16 @@ class HmiSourceContractTests(unittest.TestCase):
             completion_callback=None,
             request_lease=None,
             write_started_event=None,
+            write_cancellation_boundary=None,
         ):
             self.assertTrue(
                 namespace["motion_request_registry"].owns(request_lease)
+            )
+            self.assertIs(
+                write_cancellation_boundary,
+                namespace[
+                    "program_execution_active_request"
+                ].cancellation_boundary,
             )
             order.append("physical")
             controller_callbacks.append(completion_callback)
@@ -18802,7 +24521,14 @@ class HmiSourceContractTests(unittest.TestCase):
                 completion_callback=None,
                 request_lease=None,
                 write_started_event=None,
+                write_cancellation_boundary=None,
             ):
+                self.assertIs(
+                    write_cancellation_boundary,
+                    namespace[
+                        "program_execution_active_request"
+                    ].cancellation_boundary,
+                )
                 if controller_succeeded == "late":
                     pending_completion.append(completion_callback)
                 elif controller_succeeded is not None:
@@ -18824,6 +24550,10 @@ class HmiSourceContractTests(unittest.TestCase):
                 "SERIAL_EVENT_APPLICATION_MARGIN_SECONDS": 0.01,
                 "drive_lock": threading.Lock(),
                 "threading": SimpleNamespace(Event=DeterministicControllerEvent),
+                "SerialWriteCancellationBoundary": self.compile_class(
+                    "SerialWriteCancellationBoundary",
+                    {"threading": threading},
+                ),
                 "logger": SimpleNamespace(
                     error=lambda *args: None,
                     exception=lambda *args: None,
@@ -19579,6 +25309,114 @@ class HmiSourceContractTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 with self.assertRaises(MotionInputError):
                     build_command(filename)
+
+    def test_program_gcode_stop_is_atomic_with_playback_write_commitment(self):
+        class Label:
+            def __init__(self):
+                self.text = None
+
+            def config(self, **kwargs):
+                self.text = kwargs.get("text")
+
+        class SerialPort:
+            def __init__(self):
+                self.is_open = True
+                self.commands = []
+
+            def write(self, command):
+                self.commands.append(command)
+                return len(command)
+
+            def flush(self):
+                pass
+
+        serial_port = SerialPort()
+        label = Label()
+        starts = []
+        completion_results = []
+
+        def start_serial(
+            command,
+            *,
+            completion_callback=None,
+            write_started_event=None,
+            write_cancellation_boundary=None,
+        ):
+            starts.append(
+                (
+                    command,
+                    write_started_event,
+                    write_cancellation_boundary,
+                )
+            )
+            try:
+                write_serial_control(
+                    serial_port,
+                    command,
+                    write_lock=threading.Lock(),
+                    reset_input=False,
+                    write_started_event=write_started_event,
+                    cancellation_event=write_cancellation_boundary,
+                    write_boundary_lock=write_cancellation_boundary,
+                )
+            except SerialActivityRejected:
+                completion_callback(None)
+            return True
+
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "GCalmStatusLab": label,
+            "RUN": {
+                "estopActive": False,
+                "offlineMode": False,
+            },
+            "start_send_serial_thread": start_serial,
+            "MAX_COMMAND_LENGTH": 4096,
+            "threading": threading,
+        }
+        namespace["_gcode_playback_command"] = self.compile_function(
+            "_gcode_playback_command",
+            namespace,
+        )
+        play = self.compile_function("GCplayProg", namespace)
+        boundary_type = namespace["SerialWriteCancellationBoundary"]
+
+        class CancelAtWriteBoundary(boundary_type):
+            def acquire(self):
+                if not self.is_set():
+                    self.cancel()
+                return super().acquire()
+
+        boundary = CancelAtWriteBoundary(
+            "program G-code write cancellation"
+        )
+        request = namespace["ProgramExecutionRequest"](
+            1,
+            "run",
+            boundary,
+        )
+        namespace["program_execution_active_request"] = request
+
+        self.assertTrue(
+            play(
+                "demo",
+                completion_results.append,
+                execution_request=request,
+            )
+        )
+        self.assertTrue(boundary.is_set())
+        self.assertEqual(serial_port.commands, [])
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][0], "PGFndemo.txt\n")
+        self.assertFalse(starts[0][1].is_set())
+        self.assertIs(starts[0][2], boundary)
+        self.assertEqual(completion_results, [False])
+        self.assertEqual(label.text, "GCODE FILE FAILED")
+        self.assertFalse(namespace["motion_request_registry"].active)
 
     def test_gcode_storage_and_feed_boundaries_enforce_controller_units(self):
         namespace = {
@@ -20501,6 +26339,245 @@ class HmiSourceContractTests(unittest.TestCase):
                 result.stdout + result.stderr,
             )
 
+    def test_local_robot_program_loader_is_bounded_and_cancellable(self):
+        class ProgramRequest:
+            def __init__(self):
+                self.cancelled = threading.Event()
+
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "ProgramExecutionRequest": ProgramRequest,
+            "MAX_COMMAND_LENGTH": MAX_COMMAND_LENGTH,
+            "_program_execution_request_cancelled": (
+                lambda request: request.cancelled.is_set()
+            ),
+            "os": os,
+        }
+        for assignment_name in (
+            "MAX_LOCAL_ROBOT_PROGRAM_BYTES",
+            "MAX_LOCAL_ROBOT_PROGRAM_ROWS",
+            "MAX_LOCAL_ROBOT_SOURCE_LINE_BYTES",
+        ):
+            self.compile_assignment(assignment_name, namespace)
+        self.compile_function("_decode_program_row_content", namespace)
+        parse_program = self.compile_function(
+            "_parse_local_robot_program",
+            namespace,
+        )
+        open_program = self.compile_function(
+            "_open_local_robot_program",
+            namespace,
+        )
+
+        class RepeatingProgram:
+            def __init__(self, row, count):
+                self.row = row
+                self.remaining = count
+                self.requested_sizes = []
+
+            def readline(self, size):
+                self.requested_sizes.append(size)
+                if self.remaining <= 0:
+                    return b""
+                self.remaining -= 1
+                return self.row
+
+        oversized_line = RepeatingProgram(
+            b"G" * (
+                namespace["MAX_LOCAL_ROBOT_SOURCE_LINE_BYTES"] + 1
+            ),
+            1,
+        )
+        with self.assertRaisesRegex(MotionInputError, "source length"):
+            parse_program(oversized_line)
+        self.assertEqual(
+            set(oversized_line.requested_sizes),
+            {namespace["MAX_LOCAL_ROBOT_SOURCE_LINE_BYTES"] + 1},
+        )
+
+        excessive_rows = RepeatingProgram(
+            b"Wait Time = 0.1\n",
+            namespace["MAX_LOCAL_ROBOT_PROGRAM_ROWS"] + 1,
+        )
+        with self.assertRaisesRegex(MotionInputError, "row count"):
+            parse_program(excessive_rows)
+
+        maximum_source_row = (
+            b"G"
+            + b"x" * (
+                namespace["MAX_LOCAL_ROBOT_SOURCE_LINE_BYTES"] - 2
+            )
+            + b"\n"
+        )
+        rows_before_file_limit = (
+            namespace["MAX_LOCAL_ROBOT_PROGRAM_BYTES"]
+            // len(maximum_source_row)
+        )
+        excessive_file = RepeatingProgram(
+            maximum_source_row,
+            rows_before_file_limit + 1,
+        )
+        with self.assertRaisesRegex(MotionInputError, "file size"):
+            parse_program(excessive_file)
+
+        for invalid_row in (
+            b"bad\x00row\n",
+            b"bad\x1frow\n",
+            b"bad\x7frow\n",
+            b"bad\xffrow\n",
+            b"bad\rrow\n",
+        ):
+            with self.subTest(invalid_row=invalid_row):
+                with self.assertRaises(MotionInputError):
+                    parse_program(io.BytesIO(invalid_row))
+
+        request = ProgramRequest()
+
+        class CancellingProgram:
+            def __init__(self):
+                self.read_count = 0
+
+            def readline(self, size):
+                self.read_count += 1
+                request.cancelled.set()
+                return b"Wait Time = 0.1\n"
+
+        cancelling_program = CancellingProgram()
+        with self.assertRaisesRegex(MotionInputError, "cancelled"):
+            parse_program(cancelling_program, request)
+        self.assertEqual(cancelling_program.read_count, 1)
+
+        state_directory = BoundedTemporaryDirectory(
+            dir="/tmp" if os.name == "posix" else None
+        )
+        self.addCleanup(state_directory.cleanup)
+        source_path = Path(state_directory.name) / "program.ar4"
+        source_path.write_bytes(b"## RUN ONCE ##\nWait Time = 0.1\n")
+        with open_program(str(source_path)) as source:
+            self.assertEqual(
+                parse_program(source),
+                (b"## RUN ONCE ##\n", b"Wait Time = 0.1\n"),
+            )
+
+        for invalid_path in (
+            "",
+            "bad\x00path.ar4",
+            "bad\npath.ar4",
+            str(Path(state_directory.name) / "program.txt"),
+        ):
+            with self.subTest(invalid_path=invalid_path):
+                with self.assertRaisesRegex(MotionInputError, "path"):
+                    open_program(invalid_path)
+
+        oversized_path = Path(state_directory.name) / "oversized.ar4"
+        with open(oversized_path, "wb") as oversized:
+            oversized.truncate(
+                namespace["MAX_LOCAL_ROBOT_PROGRAM_BYTES"] + 1
+            )
+        with self.assertRaisesRegex(MotionInputError, "file size"):
+            open_program(str(oversized_path))
+
+        directory_path = Path(state_directory.name) / "directory.ar4"
+        directory_path.mkdir()
+        with self.assertRaises((MotionInputError, OSError)):
+            open_program(str(directory_path))
+
+        view_replacements = []
+        saved_calibrations = []
+        load_namespace = dict(namespace)
+        load_namespace.update({
+            "__file__": str(AR4_SOURCE),
+            "sys": sys,
+            "fd": SimpleNamespace(
+                askopenfilename=lambda **kwargs: str(source_path)
+            ),
+            "CAL": {"comPort": "None"},
+            "_open_local_robot_program": open_program,
+            "_parse_local_robot_program": parse_program,
+            "_replace_robot_program_view": (
+                lambda program_name, rows: (
+                    view_replacements.append((program_name, rows)) or True
+                )
+            ),
+            "save_calibration": (
+                lambda values: saved_calibrations.append(dict(values)) or True
+            ),
+            "logger": SimpleNamespace(exception=lambda *args: None),
+        })
+        load_program = self.compile_function("loadProg", load_namespace)
+        self.assertTrue(load_program())
+        self.assertEqual(
+            view_replacements,
+            [(
+                str(source_path),
+                (b"## RUN ONCE ##\n", b"Wait Time = 0.1\n"),
+            )],
+        )
+        self.assertEqual(saved_calibrations, [{"comPort": "None"}])
+
+        child_path = source_path.with_name("child.ar4")
+        child_path.write_bytes(
+            b"## RUN ONCE ##\nWait Time = 0.2\n"
+        )
+        navigations = []
+        load_namespace["_dispatch_called_program_navigation"] = (
+            lambda navigation: navigations.append(navigation) or True
+        )
+        self.compile_function(
+            "_validate_called_program_filename",
+            load_namespace,
+        )
+        self.compile_function(
+            "_validate_robot_program_source_path",
+            load_namespace,
+        )
+        self.compile_function(
+            "_resolve_called_program_source_path",
+            load_namespace,
+        )
+        load_namespace["CalledProgramNavigation"] = self.compile_class(
+            "CalledProgramNavigation",
+            load_namespace,
+        )
+        call_program = self.compile_function("callProg", load_namespace)
+
+        request = ProgramRequest()
+        loaded_parent_path = view_replacements[0][0]
+        self.assertTrue(
+            call_program(
+                "child.ar4",
+                request,
+                0,
+                caller_row=1,
+                caller_program=loaded_parent_path,
+            )
+        )
+        called_navigation = navigations[-1]
+        self.assertEqual(
+            called_navigation.program_name,
+            str(child_path),
+        )
+        self.assertEqual(
+            called_navigation.caller_program,
+            loaded_parent_path,
+        )
+
+        self.assertTrue(
+            call_program(
+                called_navigation.caller_program,
+                request,
+                1,
+                clear_return_state=True,
+                update_current_row=True,
+            )
+        )
+        return_navigation = navigations[-1]
+        self.assertEqual(
+            return_navigation.program_name,
+            loaded_parent_path,
+        )
+        self.assertIsNone(return_navigation.caller_program)
+
     def test_gcode_storage_state_lock_excludes_competing_process(self):
         namespace = {
             "MotionInputError": MotionInputError,
@@ -20703,6 +26780,50 @@ class HmiSourceContractTests(unittest.TestCase):
         class Port:
             def __init__(self):
                 self.is_open = True
+                self.timeout = None
+                self.response = bytearray()
+
+            def queue_frames(self, scripted_response):
+                if self.response:
+                    raise AssertionError(
+                        "test controller retained unread response bytes"
+                    )
+                frames = (
+                    scripted_response
+                    if isinstance(scripted_response, (tuple, list))
+                    else (scripted_response,)
+                )
+                for frame in frames:
+                    if not isinstance(frame, str):
+                        raise TypeError(
+                            "test controller frames must be text"
+                        )
+                    self.response.extend(frame.encode("ascii") + b"\n")
+
+            def read(self, size=1):
+                value = bytes(self.response[:size])
+                del self.response[:size]
+                return value
+
+            def read_until(self, delimiter=b"\n", size=None):
+                limit = len(self.response) if size is None else min(
+                    size,
+                    len(self.response),
+                )
+                available = bytes(self.response[:limit])
+                delimiter_index = available.find(delimiter)
+                count = (
+                    limit
+                    if delimiter_index < 0
+                    else delimiter_index + len(delimiter)
+                )
+                return self.read(count)
+
+            def readline(self):
+                return self.read_until()
+
+            def close(self):
+                self.is_open = False
 
         class Entry:
             def __init__(self, value="", state="normal"):
@@ -20903,6 +27024,7 @@ class HmiSourceContractTests(unittest.TestCase):
         logs = []
         schedules = []
         applied_positions = []
+        stop_invalidations = []
         operation_lease_phases = []
         serial_lock = threading.Lock()
         serial_registry = SerialActivityRegistry(("ser",))
@@ -20912,9 +27034,7 @@ class HmiSourceContractTests(unittest.TestCase):
             quarantines.append((serial_port, reason))
             quarantined_port_ids.add(id(serial_port))
             serial_port.is_open = False
-            raise SerialTransportQuarantinedError(
-                f"{reason}; serial connection closed; reconnect required"
-            )
+            return True
 
         def assert_operation_lease(phase):
             if phase in operation_lease_phases:
@@ -20991,6 +27111,10 @@ class HmiSourceContractTests(unittest.TestCase):
 
         def write_storage_control(serial_port, command, **kwargs):
             assert_operation_lease("write")
+            if kwargs.get("reset_input") is not False:
+                raise AssertionError(
+                    "G-code storage must preserve pending controller input"
+                )
             write_started = kwargs.get("write_started_event")
             cancellation_event = kwargs.get("cancellation_event")
             cancellation_lock = kwargs.get("write_boundary_lock")
@@ -21012,13 +27136,18 @@ class HmiSourceContractTests(unittest.TestCase):
                 write_started.set()
             writes.append((serial_port, command, kwargs))
 
-        def read_storage_line(serial_port, timeout, **kwargs):
+        def read_storage_exchange(serial_port, timeout, **kwargs):
             assert_operation_lease("read")
             reads.append((serial_port, timeout, kwargs))
-            response = responses.pop(0)
-            if isinstance(response, BaseException):
-                raise response
-            return response
+            scripted_response = responses.pop(0)
+            if isinstance(scripted_response, BaseException):
+                raise scripted_response
+            serial_port.queue_frames(scripted_response)
+            return read_controller_line_exchange_response(
+                serial_port,
+                timeout,
+                **kwargs,
+            )
 
         namespace = {
             "Optional": Optional,
@@ -21040,11 +27169,20 @@ class HmiSourceContractTests(unittest.TestCase):
             "SERIAL_SHUTDOWN_RETRY_MS": 1,
             "ProtocolResponseError": ProtocolResponseError,
             "PositionResponse": PositionResponse,
+            "ControllerLineExchangeResponse": (
+                ControllerLineExchangeResponse
+            ),
+            "CONTROLLER_ESTOP_ADMISSION_FLAG": (
+                CONTROLLER_ESTOP_ADMISSION_FLAG
+            ),
             "SerialActivityRejected": SerialActivityRejected,
             "SerialTransportQuarantinedError": (
                 SerialTransportQuarantinedError
             ),
             "parse_position_response": parse_position_response,
+            "position_response_is_physical_estop": (
+                position_response_is_physical_estop
+            ),
             "validate_controller_filename": validate_controller_filename,
             "validate_controller_hardware_id": validate_controller_hardware_id,
             "validate_controller_media_id": validate_controller_media_id,
@@ -21053,13 +27191,19 @@ class HmiSourceContractTests(unittest.TestCase):
                 lambda serial_port: id(serial_port) in quarantined_port_ids
             ),
             "write_serial_control": write_storage_control,
-            "read_serial_line_response": read_storage_line,
+            "read_controller_line_exchange_response": (
+                read_storage_exchange
+            ),
+            "read_pending_controller_estop_response": (
+                read_pending_controller_estop_response
+            ),
             "SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS": 120,
             "serial_write_lock": threading.Lock(),
             "serial_lock": serial_lock,
             "serial_activity_registry": serial_registry,
             "motion_request_registry": motion_registry,
             "gcode_storage_event_queue": Queue(),
+            "main_controller_stop_event_queue": Queue(),
             "gcode_storage_state_lock": threading.Lock(),
             "gcode_storage_active_request": None,
             "gcode_storage_next_request_id": 0,
@@ -21068,6 +27212,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "gcode_storage_persistent_state_error": None,
             "gcode_storage_state_path_override": str(state_path),
             "main_controller_identity_binding": None,
+            "confirmed_position_generation": 0,
             "gcode_storage_media_binding": None,
             "gcode_view_generation": 0,
             "gcode_conversion_active": threading.Event(),
@@ -21075,13 +27220,22 @@ class HmiSourceContractTests(unittest.TestCase):
             "program_execution_next_request_id": 0,
             "program_execution_active_request": None,
             "gcode_storage_program_admission_active": False,
+            "manual_controller_program_admission_active": False,
             "application_closing": threading.Event(),
             "threading": SimpleNamespace(
                 Thread=DeferredThread,
                 Event=threading.Event,
                 Lock=threading.Lock,
             ),
-            "RUN": {"offlineMode": False, "ser": port},
+            "RUN": {
+                "offlineMode": False,
+                "ser": port,
+                "estopActive": False,
+                "posOutreach": False,
+                "programStopRequestId": None,
+                "programStopStatusLatched": False,
+                "programStopState": "completed",
+            },
             "cmdSentEntryField": sent,
             "cmdRecEntryField": received,
             "GcodeProgEntryField": program,
@@ -21102,6 +27256,10 @@ class HmiSourceContractTests(unittest.TestCase):
                 applied_positions.append((response, parsed))
                 or parsed
             ),
+            "_invalidate_joint_motion_state": stop_invalidations.append,
+            "_auxiliary_stop_not_required": lambda: True,
+            "_set_program_stop_status": lambda state: True,
+            "_try_dispatch_auxiliary_stop": lambda: False,
             "logger": SimpleNamespace(
                 error=lambda *args: logs.append(("error", args)),
                 warning=lambda *args: logs.append(("warning", args)),
@@ -21141,12 +27299,28 @@ class HmiSourceContractTests(unittest.TestCase):
             "MainControllerIdentityBinding",
             namespace,
         )
+        namespace["MainControllerStopContext"] = self.compile_class(
+            "MainControllerStopContext",
+            namespace,
+        )
+        namespace["MainControllerStopEvent"] = self.compile_class(
+            "MainControllerStopEvent",
+            namespace,
+        )
+        namespace["LegacyControllerPhysicalStop"] = self.compile_class(
+            "LegacyControllerPhysicalStop",
+            namespace,
+        )
         namespace["GCodeStorageMediaBinding"] = self.compile_class(
             "GCodeStorageMediaBinding",
             namespace,
         )
         namespace["GCodeStorageRequest"] = self.compile_class(
             "GCodeStorageRequest",
+            namespace,
+        )
+        namespace["GCodeStorageAdmissionRejected"] = self.compile_class(
+            "GCodeStorageAdmissionRejected",
             namespace,
         )
         namespace["GCodeStorageCleanupRetainedError"] = self.compile_class(
@@ -21195,6 +27369,11 @@ class HmiSourceContractTests(unittest.TestCase):
             "_clear_main_controller_identity",
             "_require_main_controller_identity_cleanup",
             "_current_main_controller_identity",
+            "_capture_main_controller_stop_context",
+            "_latch_main_controller_stop_state",
+            "_publish_main_controller_stop",
+            "_raise_legacy_controller_stop",
+            "_prepare_main_controller_stop_exchange",
             "_bind_gcode_storage_media",
             "_current_gcode_storage_media",
             "_current_gcode_view_generation",
@@ -21353,6 +27532,23 @@ class HmiSourceContractTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(
             MotionInputError,
+            "definitive G-code non-execution",
+        ):
+            namespace["GCodeStorageResult"](
+                1,
+                "failed",
+                "command not executed",
+                (),
+                False,
+                admission_position=parse_position_response(
+                    VALID_CONTROLLER_POSITION.raw.replace(
+                        "NOP",
+                        "NOEAP",
+                    )
+                ),
+            )
+        with self.assertRaisesRegex(
+            MotionInputError,
             "pending reconciliation",
         ):
             namespace["GCodeStorageResult"](
@@ -21434,6 +27630,14 @@ class HmiSourceContractTests(unittest.TestCase):
             generation_before_user_edit,
         )
 
+        namespace["manual_controller_program_admission_active"] = True
+        self.assertFalse(read_files("yes"))
+        self.assertEqual(
+            status.text,
+            "G-CODE STORAGE REJECTED DURING MANUAL CONTROLLER I/O",
+        )
+        namespace["manual_controller_program_admission_active"] = False
+
         active_program_request = namespace["_begin_program_execution"](
             "run"
         )
@@ -21514,9 +27718,10 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(operation_lease_phases, ["write", "read"])
         self.assertEqual(
-            reads[0][2],
-            {"allow_empty_terminal_response": False},
+            reads[0][2]["context"],
+            "G-code storage controller response",
         )
+        self.assertTrue(callable(reads[0][2]["estop_callback"]))
 
         cancelled_conversion = []
         cancellation_event = threading.Event()
@@ -21561,9 +27766,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(len(deferred_threads), 1)
         self.assertEqual(sent.value, "RG\n")
         self.assertEqual(
-            reads[-1][2],
-            {"allow_empty_terminal_response": False},
+            reads[-1][2]["context"],
+            "G-code storage controller response",
         )
+        self.assertTrue(callable(reads[-1][2]["estop_callback"]))
 
         responses.append(directory_response("second.nc,"))
         deferred_threads.pop(0).run()
@@ -21586,10 +27792,10 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(
             [
-                read_options["allow_empty_terminal_response"]
+                read_options["context"]
                 for _, _, read_options in reads
             ],
-            [False, False, False],
+            ["G-code storage controller response"] * 3,
         )
         self.assertEqual(quarantines, [])
 
@@ -21733,24 +27939,213 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(serial_registry.active("ser"))
         self.assertFalse(motion_registry.active)
 
+        admission_response = VALID_CONTROLLER_POSITION.raw.replace(
+            "NOP",
+            "NOEAP",
+        )
+        admission_completion = []
+        admission_cancel = threading.Event()
+        admission_cancel_lock = threading.Lock()
+        namespace["gcode_conversion_active"].set()
+
+        def record_admission_completion(succeeded):
+            admission_completion.append(succeeded)
+            namespace["gcode_conversion_active"].clear()
+
+        quarantine_count = len(quarantines)
+        responses.append(admission_response)
+        self.assertTrue(
+            namespace["_start_gcode_storage_request"](
+                "delete",
+                filename="demo.txt",
+                completion_callback=record_admission_completion,
+                cancellation_event=admission_cancel,
+                cancellation_lock=admission_cancel_lock,
+            )
+        )
+        deferred_threads.pop(0).run()
+        self.assertTrue(namespace["RUN"]["estopActive"])
+        self.assertTrue(
+            namespace["manual_auxiliary_stop_barrier"].is_set()
+        )
+        self.assertEqual(
+            stop_invalidations[-1],
+            "controller reported physical E-stop: EA",
+        )
+        admission_event = namespace[
+            "main_controller_stop_event_queue"
+        ].get_nowait()
+        self.assertIsInstance(
+            admission_event,
+            namespace["MainControllerStopEvent"],
+        )
+        self.assertEqual(
+            admission_event.position.flag,
+            CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        self.assertIsNone(
+            namespace["_current_gcode_delete_reconciliation"]()
+        )
+        self.assertEqual(len(quarantines), quarantine_count + 1)
+        self.assertFalse(port.is_open)
+        poll_results()
+        self.assertEqual(admission_completion, [False])
+        self.assertFalse(namespace["gcode_conversion_active"].is_set())
+        self.assertIn("command not executed", status.text)
+        self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertFalse(serial_lock.locked())
+        self.assertFalse(serial_registry.active("ser"))
+        self.assertFalse(motion_registry.active)
+        namespace["RUN"]["estopActive"] = False
+        namespace["manual_auxiliary_stop_barrier"].clear()
+
+        failed_close_port = Port()
+        namespace["RUN"]["ser"] = failed_close_port
+        namespace["_bind_main_controller_identity"](
+            failed_close_port,
+            controller_identity,
+        )
+        namespace["_bind_gcode_storage_media"](
+            failed_close_port,
+            controller_identity.controller_hardware_id,
+            media_id,
+        )
+        failed_close_completion = []
+        namespace["gcode_conversion_active"].set()
+
+        def quarantine_with_failed_close(serial_port, reason):
+            quarantines.append((serial_port, reason))
+            quarantined_port_ids.add(id(serial_port))
+            raise SerialTransportQuarantinedError(
+                f"{reason}; serial close failed; reconnect required"
+            )
+
+        namespace["quarantine_serial_transport"] = (
+            quarantine_with_failed_close
+        )
+        responses.append(admission_response)
+        self.assertTrue(
+            namespace["_start_gcode_storage_request"](
+                "delete",
+                filename="demo.txt",
+                completion_callback=lambda succeeded: (
+                    failed_close_completion.append(succeeded),
+                    namespace["gcode_conversion_active"].clear(),
+                ),
+                cancellation_event=threading.Event(),
+                cancellation_lock=threading.Lock(),
+            )
+        )
+        try:
+            deferred_threads.pop(0).run()
+            self.assertIsNone(
+                namespace["_current_gcode_delete_reconciliation"]()
+            )
+            failed_close_event = namespace[
+                "main_controller_stop_event_queue"
+            ].get_nowait()
+            self.assertEqual(
+                failed_close_event.position.flag,
+                CONTROLLER_ESTOP_ADMISSION_FLAG,
+            )
+            poll_results()
+        finally:
+            namespace["quarantine_serial_transport"] = (
+                quarantine_storage_transport
+            )
+        self.assertEqual(failed_close_completion, [False])
+        self.assertTrue(failed_close_port.is_open)
+        self.assertIs(namespace["RUN"]["ser"], failed_close_port)
+        self.assertTrue(
+            namespace["serial_transport_quarantined"](
+                failed_close_port
+            )
+        )
+        self.assertIn("command not executed", status.text)
+        failed_close_port.is_open = False
+        namespace["RUN"]["ser"] = None
+        namespace["_require_main_controller_identity_cleanup"](
+            failed_close_port,
+            "failed-close test cleanup",
+        )
+        namespace["RUN"]["estopActive"] = False
+        namespace["manual_auxiliary_stop_barrier"].clear()
+        quarantine_count = len(quarantines)
+
+        estop_port = Port()
+        namespace["RUN"]["ser"] = estop_port
+        namespace["_bind_main_controller_identity"](
+            estop_port,
+            controller_identity,
+        )
         estop_response = VALID_CONTROLLER_POSITION.raw.replace(
             "NOP",
             "NOEBP",
         )
-        quarantine_count = len(quarantines)
-        responses.append(estop_response)
+        responses.append(
+            (
+                estop_response,
+                directory_response("ignored.txt,"),
+            )
+        )
         self.assertTrue(read_files("yes"))
         deferred_threads.pop(0).run()
+        self.assertTrue(namespace["RUN"]["estopActive"])
+        self.assertTrue(
+            namespace["manual_auxiliary_stop_barrier"].is_set()
+        )
+        self.assertEqual(
+            stop_invalidations[-1],
+            "controller reported physical E-stop: EB",
+        )
+        estop_event = namespace[
+            "main_controller_stop_event_queue"
+        ].get_nowait()
+        self.assertIsInstance(
+            estop_event,
+            namespace["MainControllerStopEvent"],
+        )
+        self.assertEqual(
+            estop_event.position.flag,
+            CONTROLLER_ESTOP_EVENT_FLAG,
+        )
         poll_results()
         self.assertEqual(applied_positions, [])
-        self.assertFalse(port.is_open)
+        self.assertFalse(estop_port.is_open)
         self.assertIsNone(namespace["RUN"]["ser"])
         self.assertEqual(len(quarantines), quarantine_count + 1)
         self.assertIn("physical E-stop", quarantines[-1][1])
-        self.assertIn("additional controller output", status.text)
+        self.assertIn("physical E-stop", status.text)
         self.assertFalse(serial_lock.locked())
         self.assertFalse(serial_registry.active("ser"))
         self.assertFalse(motion_registry.active)
+        namespace["RUN"]["estopActive"] = False
+        namespace["manual_auxiliary_stop_barrier"].clear()
+
+        paired_admission_port = Port()
+        namespace["RUN"]["ser"] = paired_admission_port
+        namespace["_bind_main_controller_identity"](
+            paired_admission_port,
+            controller_identity,
+        )
+        responses.append((estop_response, admission_response))
+        self.assertTrue(read_files("yes"))
+        deferred_threads.pop(0).run()
+        self.assertTrue(namespace["RUN"]["estopActive"])
+        paired_event = namespace[
+            "main_controller_stop_event_queue"
+        ].get_nowait()
+        self.assertEqual(
+            paired_event.position.flag,
+            CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        poll_results()
+        self.assertFalse(paired_admission_port.is_open)
+        self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertEqual(len(quarantines), quarantine_count + 2)
+        self.assertIn("command not executed", status.text)
+        namespace["RUN"]["estopActive"] = False
+        namespace["manual_auxiliary_stop_barrier"].clear()
 
         malformed_port = Port()
         namespace["RUN"]["ser"] = malformed_port
@@ -21763,7 +28158,7 @@ class HmiSourceContractTests(unittest.TestCase):
         deferred_threads.pop(0).run()
         self.assertTrue(serial_lock.locked())
         poll_results()
-        self.assertEqual(len(quarantines), quarantine_count + 2)
+        self.assertEqual(len(quarantines), quarantine_count + 3)
         self.assertIs(quarantines[-1][0], malformed_port)
         self.assertFalse(malformed_port.is_open)
         self.assertIsNone(namespace["RUN"]["ser"])
@@ -22408,14 +28803,18 @@ class HmiSourceContractTests(unittest.TestCase):
             required_cleanup_callers,
             {
                 "_apply_gcode_storage_result",
+                "_close_manual_controller_cleanup_transport",
                 "_close_failed_controller_startup",
                 "_close_serial_port",
                 "_exchange_controller_calibration_acknowledgement",
                 "_exchange_gcode_row",
+                "_exchange_joint_motion",
                 "_exchange_legacy_main_command",
                 "_exchange_position_acknowledgement",
                 "_exchange_serial_line",
+                "_finalize_manual_controller_cleanup",
                 "_invalidate_uncertain_controller_calibration",
+                "_apply_main_controller_idle_stop_results",
                 "_set_com_admitted",
             },
         )
@@ -22517,7 +28916,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "application_closing": cancellation,
             "serial_write_lock": threading.Lock(),
             "parse_command_timing": validations.append,
-            "exchange_serial_line_until_cancelled": (
+            "_exchange_main_controller_line_until_cancelled": (
                 lambda port, command, event, **kwargs: exchanges.append(
                     (port, command, event, kwargs)
                 ) or "position"
@@ -22528,6 +28927,11 @@ class HmiSourceContractTests(unittest.TestCase):
             "exchange_serial_line": lambda *args, **kwargs: self.fail(
                 "PG must not use the fixed-deadline exchange"
             ),
+            "parse_position_response": parse_position_response,
+            "position_response_is_physical_estop": (
+                position_response_is_physical_estop
+            ),
+            "ProtocolResponseError": ProtocolResponseError,
             "serial_transport_quarantined": lambda port: False,
         }
         exchange = self.compile_function("_exchange_serial_line", namespace)
@@ -22537,7 +28941,14 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(len(exchanges), 1)
         self.assertIs(exchanges[0][0], serial_port)
         self.assertIs(exchanges[0][2], cancellation)
-        self.assertIs(exchanges[0][3]["write_lock"], namespace["serial_write_lock"])
+        self.assertEqual(
+            exchanges[0][3],
+            {
+                "write_started_event": None,
+                "write_cancellation_event": None,
+                "write_boundary_lock": None,
+            },
+        )
 
     def test_firmware_source_contract_missing_gcode_file_recovers_loop(self):
         source = TEENSY_SOURCE.read_text(encoding="utf-8")
@@ -22725,7 +29136,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertNotIn("fall back to unfiltered best", solver)
 
         self.assertIn(
-            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.5";',
+            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.8";',
             firmware,
         )
         self.assertIn('"JT_WRIST_CONFIG_V1"', firmware)
@@ -22872,10 +29283,134 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIn("IdentityRecordStatus::kCorrupt", persistence_failure)
         self.assertIn("clear_robot_identity()", persistence_failure)
         self.assertIn(
-            '_startup_exchange_response("HO\\n", cancel_event)',
+            '_startup_controller_exchange(\n    "HO\\n",\n    cancellation_boundary,',
+            host,
+        )
+        self.assertIn(
+            'released_latch_retry = response.frame_order == "admission-estop"',
             host,
         )
         self.assertNotIn('_startup_exchange_response("HELLO', host)
+
+    def test_startup_identity_retries_released_admission_once(self):
+        admission = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_ADMISSION_FLAG}",
+                1,
+            )
+        )
+        estop = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+                1,
+            )
+        )
+        admission_response = ControllerLineExchangeResponse(
+            None,
+            admission,
+            "admission-estop",
+        )
+        estop_response = ControllerLineExchangeResponse(
+            None,
+            estop,
+            "estop-only",
+        )
+        identity_response = ControllerLineExchangeResponse(
+            VALID_CONTROLLER_IDENTITY_RESPONSE,
+            None,
+            "terminal-only",
+        )
+
+        class StartupPhysicalStop(Exception):
+            pass
+
+        serial_port = object()
+        boundary = object()
+        calls = []
+        quarantines = []
+        stops = []
+        responses = []
+
+        def exchange(command, cancellation_boundary):
+            self.assertEqual(command, "HO\n")
+            self.assertIs(cancellation_boundary, boundary)
+            calls.append((command, cancellation_boundary))
+            return responses.pop(0)
+
+        def raise_stop(candidate_port, response):
+            self.assertIs(candidate_port, serial_port)
+            stops.append(response)
+            raise StartupPhysicalStop(response.frame_order)
+
+        namespace = {
+            "RUN": {"ser": serial_port},
+            "_startup_controller_exchange": exchange,
+            "_raise_legacy_controller_stop": raise_stop,
+            "parse_controller_identity_response": (
+                parse_controller_identity_response
+            ),
+            "quarantine_serial_transport": (
+                lambda candidate_port, reason: quarantines.append(
+                    (candidate_port, reason)
+                )
+            ),
+        }
+        startup_identity = self.compile_function(
+            "_startup_controller_identity",
+            namespace,
+        )
+
+        responses.extend((admission_response, identity_response))
+        identity = startup_identity(boundary)
+        self.assertEqual(identity.controller_hardware_id, "12ABEF")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(responses, [])
+        self.assertEqual(stops, [])
+        self.assertEqual(quarantines, [])
+
+        calls.clear()
+        responses.extend((admission_response, admission_response))
+        with self.assertRaisesRegex(StartupPhysicalStop, "admission-estop"):
+            startup_identity(boundary)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(responses, [])
+        self.assertEqual(stops, [admission_response])
+
+        calls.clear()
+        stops.clear()
+        responses.extend(
+            (
+                admission_response,
+                ControllerLineExchangeResponse(
+                    "not-json",
+                    None,
+                    "terminal-only",
+                ),
+            )
+        )
+        with self.assertRaises(ProtocolResponseError):
+            startup_identity(boundary)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(responses, [])
+        self.assertEqual(
+            quarantines,
+            [
+                (
+                    serial_port,
+                    "controller identity retry returned a non-identity response",
+                )
+            ],
+        )
+
+        calls.clear()
+        quarantines.clear()
+        responses.append(estop_response)
+        with self.assertRaisesRegex(StartupPhysicalStop, "estop-only"):
+            startup_identity(boundary)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(responses, [])
 
     def test_control_queries_bypass_the_spline_position_preface(self):
         firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
@@ -22896,11 +29431,53 @@ class HmiSourceContractTests(unittest.TestCase):
     def test_firmware_early_exits_consume_and_advance_the_shared_queue(self):
         firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
         queue_contract = TEENSY_QUEUE_CONTRACT.read_text(encoding="utf-8")
+        calibration_failure_start = firmware.index(
+            "void finish_calibration_failure_response()"
+        )
+        calibration_failure_end = firmware.index(
+            "ar4_protocol::LiveControlFrameStatus",
+            calibration_failure_start,
+        )
+        calibration_failure = firmware[
+            calibration_failure_start:calibration_failure_end
+        ]
+        self.assertIn("consume_current_command();", calibration_failure)
         loop_start = firmware.index("void loop()")
         loop_source = firmware[loop_start:]
+        interruptible_delay_start = firmware.index(
+            "bool interruptible_command_delay("
+        )
+        interruptible_delay_end = firmware.index(
+            "bool reject_current_command_for_estop()",
+            interruptible_delay_start,
+        )
+        interruptible_delay = firmware[
+            interruptible_delay_start:interruptible_delay_end
+        ]
+        self.assertIn(
+            "consume_current_command();",
+            interruptible_delay,
+        )
         for match in re.finditer(r"\breturn;", loop_source):
             preceding = loop_source[max(0, match.start() - 180):match.start()]
+            if (
+                "reject_current_command_for_estop()" in preceding
+                or "finish_calibration_failure_response()" in preceding
+                or "interruptible_command_delay(" in preceding
+            ):
+                continue
             self.assertIn("consume_current_command();", preceding)
+        rejection_start = firmware.index(
+            "bool reject_current_command_for_estop()"
+        )
+        rejection_end = firmware.index(
+            "void complete_controller_response_scope()",
+            rejection_start,
+        )
+        rejection = firmware[rejection_start:rejection_end]
+        consume = rejection.rindex("consume_current_command();")
+        successful_return = rejection.rindex("return true;")
+        self.assertLess(consume, successful_return)
         self.assertIn("first = second;", queue_contract)
         self.assertIn("second = third;", queue_contract)
         self.assertIn("if (first.length() == 0)", queue_contract)
@@ -23558,6 +30135,14 @@ class HmiSourceContractTests(unittest.TestCase):
             "JOINT_TELEMETRY_CAPABILITY",
             advertised_capabilities,
         )
+        self.assertEqual(
+            CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
+            "ESTOP_ADMISSION_V1",
+        )
+        self.assertIn(
+            "ESTOP_ADMISSION_CAPABILITY",
+            advertised_capabilities,
+        )
         self.assertIn('#include "joint_telemetry_contract.h"', firmware)
         telemetry_period_match = re.search(
             r"kJointTelemetryPeriodMicroseconds\s*=\s*([0-9]+)",
@@ -23812,47 +30397,223 @@ class HmiSourceContractTests(unittest.TestCase):
         ownership_commit = completion.index(
             "commit_joint_telemetry_terminal("
         )
+        late_stop_block = cpp_braced_statement(
+            completion,
+            r"if\s*\(\s*publishLateEstop\s*\)\s*\{",
+            start=ownership_commit,
+        )
+        late_stop_response = completion.index(
+            "sendRobotPos();",
+            ownership_commit,
+        )
         self.assertLess(reconcile_position, terminal_decision)
         self.assertLess(terminal_decision, position_response)
         self.assertLess(position_response, ownership_commit)
+        self.assertLess(ownership_commit, late_stop_response)
         self.assertIn(
             "telemetryResponseOwnership",
             completion[ownership_commit:],
         )
+        self.assertIn('flag = "EB";', late_stop_block)
+        self.assertEqual(late_stop_block.count("sendRobotPos();"), 1)
 
         estop_start = firmware.index("void EstopProg()")
         estop_end = firmware.index(
-            "////////////////////////////////////////////////////////////////",
+            "bool interruptible_command_delay(",
             estop_start,
         )
         estop_handler = firmware[estop_start:estop_end]
-        deferred_estop_block = cpp_braced_statement(
+        self.assertIn(
+            "record_estop_interrupt(",
             estop_handler,
-            r"if\s*\(\s*"
-            r"ar4_protocol::defer_joint_telemetry_estop_response\(\s*"
-            r"telemetryResponseOwnership\s*\)\s*\)\s*\{",
         )
-        active_guard = estop_handler.index("if (estopActive) return;")
-        active_latch = estop_handler.index("estopActive = true;")
-        deferred_estop_start = estop_handler.index(deferred_estop_block)
-        terminal_response = estop_handler.index(
-            "sendRobotPos();",
-            deferred_estop_start + len(deferred_estop_block),
+        for argument in (
+            "estopAdmissionOwnership",
+            "estopActive",
+            "controllerResponseOwnership",
+            "telemetryResponseOwnership",
+        ):
+            self.assertIn(argument, estop_handler)
+        self.assertNotIn("Serial.", estop_handler)
+        self.assertNotIn("sendRobotPos();", estop_handler)
+
+        self.assertIn(
+            "struct ControllerResponseOwnership",
+            telemetry_contract,
         )
-        self.assertEqual(
-            deferred_estop_block.count(
-                "defer_joint_telemetry_estop_response("
-            ),
-            1,
+        self.assertIn(
+            "begin_controller_response_ownership(",
+            telemetry_contract,
         )
-        self.assertEqual(deferred_estop_block.count("return;"), 1)
-        self.assertNotIn("sendRobotPos();", deferred_estop_block)
+        self.assertIn(
+            "record_controller_estop_response(",
+            telemetry_contract,
+        )
+        self.assertIn(
+            "acknowledge_controller_estop_response(",
+            telemetry_contract,
+        )
+        self.assertIn(
+            "complete_controller_response_ownership(",
+            telemetry_contract,
+        )
+        interrupt_start = telemetry_contract.index(
+            "inline bool record_estop_interrupt("
+        )
+        interrupt_end = telemetry_contract.index(
+            "inline JointTelemetryTerminalDecision "
+            "decide_joint_telemetry_terminal(",
+            interrupt_start,
+        )
+        interrupt_contract = telemetry_contract[
+            interrupt_start:interrupt_end
+        ]
+        assertion_record = interrupt_contract.index(
+            "record_estop_assertion(admission_ownership);"
+        )
+        active_guard = interrupt_contract.index(
+            "if (estop_active) return false;"
+        )
+        active_latch = interrupt_contract.index("estop_active = true;")
+        global_pending = interrupt_contract.index(
+            "record_controller_estop_response("
+        )
+        telemetry_pending = interrupt_contract.index(
+            "defer_joint_telemetry_estop_response("
+        )
+        self.assertLess(assertion_record, active_guard)
         self.assertLess(active_guard, active_latch)
-        self.assertLess(active_latch, deferred_estop_start)
-        self.assertLess(
-            deferred_estop_start + len(deferred_estop_block),
+        self.assertLess(active_latch, global_pending)
+        self.assertLess(global_pending, telemetry_pending)
+
+        self.assertIn(
+            "++ownership.assertion_generation;",
+            telemetry_contract,
+        )
+        self.assertIn(
+            "if (blocked) ownership.response_active = true;",
+            telemetry_contract,
+        )
+        self.assertIn(
+            "admission_ownership.assertion_generation",
+            telemetry_contract,
+        )
+        self.assertIn(
+            "admission_ownership.response_active = false;",
+            telemetry_contract,
+        )
+        admission_completion_start = telemetry_contract.index(
+            "inline bool complete_estop_admission_response("
+        )
+        admission_completion_end = telemetry_contract.index(
+            "inline void begin_joint_telemetry_response_ownership(",
+            admission_completion_start,
+        )
+        admission_completion = telemetry_contract[
+            admission_completion_start:admission_completion_end
+        ]
+        admission_release = admission_completion.index(
+            "admission_ownership.response_active = false;"
+        )
+        pending_retirement = admission_completion.index(
+            "acknowledge_controller_estop_response("
+        )
+        response_scope_retirement = admission_completion.index(
+            "complete_controller_response_ownership("
+        )
+        self.assertLess(admission_release, pending_retirement)
+        self.assertLess(pending_retirement, response_scope_retirement)
+
+        rejection_start = firmware.index(
+            "bool reject_current_command_for_estop()"
+        )
+        rejection_end = firmware.index(
+            "void complete_controller_response_scope()",
+            rejection_start,
+        )
+        rejection = firmware[rejection_start:rejection_end]
+        first_interrupt_disable = rejection.index("noInterrupts();")
+        first_interrupt_enable = rejection.index(
+            "interrupts();",
+            first_interrupt_disable,
+        )
+        telemetry_snapshot = rejection.index(
+            "joint_telemetry_estop_admission_blocked(",
+            first_interrupt_disable,
+        )
+        input_snapshot = rejection.index(
+            "digitalRead(EstopPin) == LOW",
+            telemetry_snapshot,
+        )
+        admission_begin = rejection.index(
+            "begin_estop_admission(",
+            input_snapshot,
+        )
+        blocked_branch = rejection.index(
+            "if (!decision.blocked) return false;",
+            first_interrupt_enable,
+        )
+        admission_response = rejection.index(
+            'flag = "EA";',
+            blocked_branch,
+        )
+        terminal_response = rejection.index(
+            "sendRobotPos();",
+            admission_response,
+        )
+        second_interrupt_disable = rejection.index(
+            "noInterrupts();",
             terminal_response,
         )
+        admission_complete = rejection.index(
+            "complete_estop_admission_response(",
+            second_interrupt_disable,
+        )
+        live_input_check = rejection.index(
+            "digitalRead(EstopPin) == LOW",
+            admission_complete,
+        )
+        correlated_clear = rejection.index(
+            "if (clearEstopLatch) estopActive = false;",
+            live_input_check,
+        )
+        response_scope_argument = rejection.index(
+            "controllerResponseOwnership",
+            live_input_check,
+        )
+        second_interrupt_enable = rejection.index(
+            "interrupts();",
+            correlated_clear,
+        )
+        command_consume = rejection.index(
+            "consume_current_command();",
+            second_interrupt_enable,
+        )
+        successful_return = rejection.index(
+            "return true;",
+            command_consume,
+        )
+        self.assertLess(
+            first_interrupt_disable,
+            telemetry_snapshot,
+        )
+        self.assertLess(telemetry_snapshot, input_snapshot)
+        self.assertLess(input_snapshot, admission_begin)
+        self.assertLess(admission_begin, first_interrupt_enable)
+        self.assertLess(first_interrupt_enable, blocked_branch)
+        self.assertLess(blocked_branch, admission_response)
+        self.assertLess(admission_response, terminal_response)
+        self.assertLess(terminal_response, second_interrupt_disable)
+        self.assertLess(second_interrupt_disable, admission_complete)
+        self.assertLess(admission_complete, live_input_check)
+        self.assertLess(live_input_check, response_scope_argument)
+        self.assertLess(response_scope_argument, correlated_clear)
+        self.assertLess(live_input_check, correlated_clear)
+        self.assertLess(correlated_clear, second_interrupt_enable)
+        self.assertLess(second_interrupt_enable, command_consume)
+        self.assertLess(command_consume, successful_return)
+        self.assertEqual(rejection.count("noInterrupts();"), 2)
+        self.assertEqual(rejection.count("interrupts();"), 2)
 
         command_start = firmware.index('if (cmdBuffer1 != "")')
         command_block = cpp_braced_statement(
@@ -23860,52 +30621,86 @@ class HmiSourceContractTests(unittest.TestCase):
             r'if\s*\(\s*cmdBuffer1\s*!=\s*""\s*\)\s*\{',
             start=command_start,
         )
-        deferred_admission_block = cpp_braced_statement(
-            command_block,
-            r"if\s*\(\s*deferredTelemetryEstop\s*\)\s*\{",
-        )
-        deferred_guard = command_block.index(
-            "joint_telemetry_estop_admission_blocked(",
-        )
-        deferred_branch = command_block.index(deferred_admission_block)
-        deferred_response = deferred_admission_block.index(
-            'flag = "EB";',
-        )
-        deferred_terminal = deferred_admission_block.index(
-            "sendRobotPos();",
-            deferred_response,
-        )
-        deferred_clear = deferred_admission_block.index(
-            "clear_joint_telemetry_estop_admission_block(",
-            deferred_terminal,
-        )
-        deferred_consume = deferred_admission_block.index(
-            "consume_current_command();",
-            deferred_clear,
-        )
-        deferred_return = deferred_admission_block.index(
-            "return;",
-            deferred_consume,
-        )
-        legacy_estop_clear = command_block.index(
-            "estopActive = false;",
-            deferred_branch + len(deferred_admission_block),
+        first_gate = command_block.index(
+            "reject_current_command_for_estop()"
         )
         command_extract = command_block.index(
             "extract_serial_command_payload(",
-            legacy_estop_clear,
         )
-        self.assertLess(deferred_guard, deferred_branch)
-        self.assertLess(deferred_response, deferred_terminal)
-        self.assertLess(deferred_terminal, deferred_clear)
-        self.assertLess(deferred_clear, deferred_consume)
-        self.assertLess(deferred_consume, deferred_return)
-        self.assertEqual(deferred_admission_block.count("return;"), 1)
+        function_parse = command_block.index(
+            "String function = inData.substring(0, 2);",
+            command_extract,
+        )
+        payload_strip = command_block.index(
+            "inData = inData.substring(2);",
+            function_parse,
+        )
+        second_gate = command_block.index(
+            "reject_current_command_for_estop()",
+            first_gate + 1,
+        )
+        first_handler = command_block.index(
+            'if (function == "HO")',
+            second_gate,
+        )
+        self.assertEqual(
+            command_block.count("reject_current_command_for_estop()"),
+            2,
+        )
+        self.assertLess(first_gate, command_extract)
+        self.assertLess(command_extract, function_parse)
+        self.assertLess(function_parse, payload_strip)
+        self.assertLess(payload_strip, second_gate)
+        self.assertLess(second_gate, first_handler)
+        self.assertNotIn(
+            "Serial.",
+            command_block[payload_strip:second_gate],
+        )
+
+        loop_start = firmware.index("void loop()")
+        loop_scope = firmware[
+            loop_start:firmware.index("if (splineEndReceived", loop_start)
+        ]
+        self.assertIn(
+            "ControllerResponseScope responseScope;",
+            loop_scope,
+        )
+        scope_start = firmware.index("class ControllerResponseScope")
+        scope_end = firmware.index(
+            "////////////////////////////////////////////////////////////////",
+            scope_start,
+        )
+        scope = firmware[scope_start:scope_end]
+        self.assertIn(
+            "complete_controller_response_scope();",
+            scope,
+        )
+        completion_scope_start = firmware.index(
+            "void complete_controller_response_scope()"
+        )
+        completion_scope_end = firmware.index(
+            "class ControllerResponseScope",
+            completion_scope_start,
+        )
+        completion_scope = firmware[
+            completion_scope_start:completion_scope_end
+        ]
         self.assertLess(
-            deferred_branch + len(deferred_admission_block),
-            legacy_estop_clear,
+            completion_scope.index(
+                "complete_controller_response_ownership("
+            ),
+            completion_scope.index("sendRobotPos();"),
         )
-        self.assertLess(legacy_estop_clear, command_extract)
+
+        spline_start = firmware.index('if (function == "SL")')
+        spline_end = firmware.index(
+            'if (function == "SS")',
+            spline_start,
+        )
+        self.assertIn(
+            'Serial.print("SL");',
+            firmware[spline_start:spline_end],
+        )
 
         self.assertEqual(
             request_joint_telemetry(
@@ -23921,27 +30716,242 @@ class HmiSourceContractTests(unittest.TestCase):
             (0.001, 0.002, 0.003, 0.004, 0.005, 0.006),
         )
 
+    def test_vision_insertion_failure_uses_stop_aware_status_presenter(self):
+        function = self.module_functions["insertvisFind"]
+        presenter_calls = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_set_application_status"
+        ]
+        direct_status_calls = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("config", "configure")
+        ]
+
+        self.assertEqual(len(presenter_calls), 1)
+        self.assertEqual(direct_status_calls, [])
+
+    def test_firmware_blocking_handlers_release_estop_response_scope(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        helper_start = firmware.index("bool interruptible_command_delay(")
+        helper_end = firmware.index(
+            "bool reject_current_command_for_estop()",
+            helper_start,
+        )
+        helper = firmware[helper_start:helper_end]
+        self.assertIn(
+            "while (millis() - started_at < duration_ms)",
+            helper,
+        )
+        self.assertIn("if (estopActive) break;", helper)
+        self.assertIn("delay(1);", helper)
+        self.assertIn(
+            'external_write_started ? "Modbus Error" : "ER"',
+            helper,
+        )
+        self.assertIn("consume_current_command();", helper)
+
+        def handler(opcode):
+            return cpp_braced_statement(
+                firmware,
+                (
+                    r'if\s*\(\s*function\s*==\s*"'
+                    + re.escape(opcode)
+                    + r'"\s*\)\s*\{'
+                ),
+            )
+
+        for opcode in ("BA", "BB", "BC", "BH", "BD"):
+            block = handler(opcode)
+            query = block.index("modbusQuerry(")
+            stop_check = block.index(
+                "interruptible_command_delay(0, false)",
+                query,
+            )
+            terminal = block.index("Serial.println(", stop_check)
+            with self.subTest(modbus_opcode=opcode):
+                self.assertLess(query, stop_check)
+                self.assertLess(stop_check, terminal)
+
+        for opcode in ("BE", "BF"):
+            block = handler(opcode)
+            query = block.index("modbusQuerry(")
+            terminal = block.index("Serial.println(", query)
+            stop_check = block.index(
+                "interruptible_command_delay(0, true)",
+                terminal,
+            )
+            with self.subTest(modbus_write_opcode=opcode):
+                self.assertLess(query, terminal)
+                self.assertLess(terminal, stop_check)
+                self.assertNotIn(
+                    "interruptible_command_delay(0, false)",
+                    block,
+                )
+
+        mq_handler = handler("MQ")
+        self.assertNotIn("delay(1000);", mq_handler)
+        self.assertIn(
+            "interruptible_command_delay(0, false)",
+            mq_handler,
+        )
+        self.assertIn(
+            "interruptible_command_delay(1000, true)",
+            mq_handler,
+        )
+
+        for opcode in ("HD", "RR", "FR"):
+            block = handler(opcode)
+            with self.subTest(drive_opcode=opcode):
+                self.assertNotIn("delay(50);", block)
+                self.assertIn(
+                    "interruptible_command_delay(50, false, true)",
+                    block,
+                )
+                self.assertIn(
+                    "interruptible_command_delay(50, true)",
+                    block,
+                )
+                write_count = block.count("node.writeSingleRegister(")
+                self.assertGreater(write_count, 0)
+                self.assertEqual(
+                    block.count(
+                        "writeFailed = writeFailed || "
+                        "result != node.ku8MBSuccess"
+                    ),
+                    write_count,
+                )
+                self.assertIn("if (!writeFailed)", block)
+                self.assertIn('Serial.println("Modbus Error")', block)
+
+        wait_handler = handler("WT")
+        self.assertNotIn("delay(WaitTimeMS);", wait_handler)
+        self.assertIn(
+            "interruptible_command_delay(WaitTimeMS, false)",
+            wait_handler,
+        )
+
+        for opcode in ("WJ", "WK"):
+            block = handler(opcode)
+            with self.subTest(wait_opcode=opcode):
+                self.assertIn("&& !estopActive", block)
+                self.assertNotIn("delay(100);", block)
+                self.assertIn(
+                    "interruptible_command_delay(100, false)",
+                    block,
+                )
+                self.assertIn(
+                    "interruptible_command_delay(5, false)",
+                    block,
+                )
+
+        for opcode in ("SC", "SO"):
+            block = handler(opcode)
+            with self.subTest(write_opcode=opcode):
+                self.assertNotIn("delay(5);", block)
+                terminal = block.index("Serial.println(result);")
+                stop_check = block.index(
+                    "interruptible_command_delay(5, true)"
+                )
+                self.assertLess(terminal, stop_check)
+                self.assertIn(
+                    "interruptible_command_delay(5, true)",
+                    block,
+                )
+
     def test_joint_telemetry_exchange_uses_the_production_classifier(self):
         command = (
             "RJA1B2C3D4E5F6J70J80J90"
             "Sp50Ac10Dc20Rm25WNLm000000\n"
         )
+
+        class SerialPort:
+            def __init__(self):
+                self.is_open = True
+                self.timeout = 7.5
+                self.response = bytearray()
+
+            def read(self, size=1):
+                value = bytes(self.response[:size])
+                del self.response[:size]
+                return value
+
+            def read_until(self, delimiter=b"\n", size=None):
+                limit = len(self.response) if size is None else min(
+                    size,
+                    len(self.response),
+                )
+                available = bytes(self.response[:limit])
+                delimiter_index = available.find(delimiter)
+                count = limit if delimiter_index < 0 else delimiter_index + 1
+                return self.read(count)
+
+            def close(self):
+                self.is_open = False
+
+        serial_port = SerialPort()
+        stop_context = ("main-session", serial_port)
         binding = {"value": None}
         exchanges = []
+        writes = []
+        wire_responses = []
         published = []
+        published_stops = []
+        identity_cleanups = []
 
-        def exchange(candidate, **options):
-            exchanges.append((candidate, options))
-            return "terminal"
+        def write_control(
+            candidate_port,
+            candidate,
+            *,
+            write_lock,
+            reset_input,
+        ):
+            writes.append(
+                (
+                    candidate_port,
+                    candidate,
+                    write_lock,
+                    reset_input,
+                )
+            )
+            candidate_port.response.extend(wire_responses.pop(0))
+            return True
+
+        def exchange(candidate_port, timeout, **options):
+            exchanges.append((candidate_port, timeout, options))
+            return read_controller_line_exchange_response(
+                candidate_port,
+                timeout,
+                **options,
+            )
 
         namespace = {
+            "RUN": {"ser": serial_port},
             "_current_main_controller_identity": (
-                lambda: binding["value"]
+                lambda candidate_port=None: binding["value"]
+            ),
+            "_capture_main_controller_stop_context": (
+                lambda candidate_port: ("main-session", candidate_port)
             ),
             "CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1": (
                 CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1
             ),
-            "_exchange_serial_line": exchange,
+            "_canonicalize_main_serial_command": (
+                canonicalize_main_test_command
+            ),
+            "write_serial_control": write_control,
+            "serial_write_lock": threading.Lock(),
+            "read_controller_line_exchange_response": exchange,
+            "_publish_main_controller_stop": (
+                lambda context, position: published_stops.append(
+                    (context, position)
+                ) or True
+            ),
             "request_joint_telemetry": request_joint_telemetry,
             "parse_joint_motion_exchange_response": (
                 parse_joint_motion_exchange_response
@@ -23953,14 +30963,42 @@ class HmiSourceContractTests(unittest.TestCase):
             "joint_motion_dispatcher": SimpleNamespace(
                 publish_telemetry=published.append
             ),
+            "_require_main_controller_identity_cleanup": (
+                lambda candidate_port, context: identity_cleanups.append(
+                    (candidate_port, context)
+                ) or True
+            ),
         }
         exchange_joint_motion = self.compile_function(
             "_exchange_joint_motion",
             namespace,
         )
 
-        self.assertEqual(exchange_joint_motion(command), "terminal")
-        self.assertEqual(exchanges.pop(), (command, {}))
+        wire_responses.append(
+            f"{VALID_CONTROLLER_POSITION.raw}\n".encode("ascii")
+        )
+        self.assertEqual(
+            exchange_joint_motion(command),
+            VALID_CONTROLLER_POSITION.raw,
+        )
+        self.assertEqual(
+            writes.pop(),
+            (
+                serial_port,
+                command,
+                namespace["serial_write_lock"],
+                False,
+            ),
+        )
+        candidate_port, timeout, options = exchanges.pop()
+        self.assertIs(candidate_port, serial_port)
+        self.assertEqual(timeout, 12.0)
+        self.assertIsNone(options["interim_response_handler"])
+        self.assertIsNone(options["interim_response_limit"])
+        self.assertEqual(
+            options["context"],
+            "joint-motion controller response",
+        )
 
         binding["value"] = SimpleNamespace(
             identity=SimpleNamespace(
@@ -23969,28 +31007,88 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
             )
         )
-        self.assertEqual(exchange_joint_motion(command), "terminal")
-        requested, options = exchanges.pop()
+        telemetry = "TMA1B2C3D4E5F6"
+        wire_responses.append(
+            (
+                f"{telemetry}\n"
+                f"{VALID_CONTROLLER_POSITION.raw}\n"
+            ).encode("ascii")
+        )
+        self.assertEqual(
+            exchange_joint_motion(command),
+            VALID_CONTROLLER_POSITION.raw,
+        )
+        _, requested, _, reset_input = writes.pop()
         self.assertEqual(requested, command[:-1] + "T1\n")
+        self.assertFalse(reset_input)
+        _, _, options = exchanges.pop()
         self.assertEqual(
             options["interim_response_limit"],
             joint_telemetry_response_budget(12.0),
         )
-        handler = options["interim_response_handler"]
-        self.assertTrue(handler("TMA1B2C3D4E5F6"))
         self.assertEqual(
             published,
             [
-                parse_joint_telemetry_response(
-                    "TMA1B2C3D4E5F6"
+                parse_joint_telemetry_response(telemetry)
+            ],
+        )
+
+        estop = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+                1,
+            )
+        )
+        admission = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_ADMISSION_FLAG}",
+                1,
+            )
+        )
+        wire_responses.append(
+            f"{estop.raw}\n{admission.raw}\n".encode("ascii")
+        )
+        self.assertEqual(exchange_joint_motion(command), admission.raw)
+        self.assertEqual(
+            published_stops,
+            [(stop_context, estop)],
+        )
+        self.assertEqual(serial_port.response, b"")
+        self.assertFalse(serial_port.is_open)
+        self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertTrue(serial_transport_quarantined(serial_port))
+        self.assertEqual(
+            identity_cleanups,
+            [
+                (
+                    serial_port,
+                    "joint-motion physical-stop quarantine",
                 )
             ],
         )
-        self.assertFalse(
-            handler("A1B2C3D4E5F6G1H2I3J4K5L6M0NOP7Q8R9")
+
+        fault_port = SerialPort()
+        namespace["RUN"]["ser"] = fault_port
+        wire_responses.append(b"\xff\n")
+        with self.assertRaises(SerialTransportQuarantinedError):
+            exchange_joint_motion(command)
+        self.assertFalse(fault_port.is_open)
+        self.assertIsNone(namespace["RUN"]["ser"])
+        self.assertEqual(
+            identity_cleanups,
+            [
+                (
+                    serial_port,
+                    "joint-motion physical-stop quarantine",
+                ),
+                (
+                    fault_port,
+                    "joint-motion controller exchange cleanup",
+                )
+            ],
         )
-        with self.assertRaises(ProtocolResponseError):
-            handler("unexpected")
 
     def test_tool_jog_directions_match_the_firmware_contract(self):
         discrete_commands = {
@@ -24136,7 +31234,12 @@ class HmiSourceContractTests(unittest.TestCase):
 
         captured = []
 
-        def asynchronous_playback(filename, completion_callback=None):
+        def asynchronous_playback(
+            filename,
+            completion_callback=None,
+            execution_request=None,
+        ):
+            self.assertIsNotNone(execution_request)
             captured.append((filename, completion_callback))
             return True
 
@@ -24150,14 +31253,14 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(callback_results, [False])
 
         dispatch, _, _ = build_dispatch(
-            lambda filename, completion_callback=None: (
+            lambda filename, completion_callback=None, **kwargs: (
                 completion_callback(True) or True
             )
         )
         self.assertEqual(dispatch("demo", None), "complete")
 
         dispatch, first_label, second_label = build_dispatch(
-            lambda filename, completion_callback=None: False
+            lambda filename, completion_callback=None, **kwargs: False
         )
         self.assertEqual(dispatch("demo", None), "rejected")
         self.assertIn("not started", first_label.text)
@@ -24290,10 +31393,18 @@ class HmiSourceContractTests(unittest.TestCase):
                 "legacy_serial_result_pending": threading.Event(),
                 "serial_lock": threading.Lock(),
                 "joint_motion_dispatcher": Dispatcher(error),
+                "motion_request_registry": MotionRequestRegistry(),
                 "confirmed_position_generation": 1,
                 "_current_joint_positions": lambda: (0.0,) * 9,
                 "_clear_deferred_joint_adjustments": deferred.clear,
                 "_try_set_virtual_joint_target": lambda target: True,
+                "_manual_auxiliary_status_reserved": lambda: False,
+                "_set_manual_auxiliary_status": (
+                    lambda message, style: True
+                ),
+                "DeferredJointDispatchOutcome": (
+                    DeferredJointDispatchOutcome
+                ),
                 "MotionTransportBusy": MotionTransportBusy,
                 "MotionInputError": MotionInputError,
                 "MotionQueueFault": MotionQueueFault,
@@ -24305,16 +31416,117 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_try_dispatch_deferred_joint_adjustments",
                 namespace,
             )
-            self.assertFalse(dispatch())
-            return deferred
+            return deferred, dispatch()
 
-        invalid = run_rejection(MotionInputError("outside configured limits"))
+        invalid, invalid_outcome = run_rejection(
+            MotionInputError("outside configured limits")
+        )
+        self.assertIs(
+            invalid_outcome,
+            DeferredJointDispatchOutcome.REJECTED,
+        )
         self.assertFalse(invalid.pending)
         self.assertEqual(invalid.clear_count, 1)
 
-        busy = run_rejection(MotionTransportBusy("transport busy"))
+        busy, busy_outcome = run_rejection(
+            MotionTransportBusy("transport busy")
+        )
+        self.assertIs(
+            busy_outcome,
+            DeferredJointDispatchOutcome.BLOCKED,
+        )
         self.assertTrue(busy.pending)
         self.assertEqual(busy.clear_count, 0)
+
+    def test_deferred_dispatch_preserves_pending_target_during_stop_reservation(self):
+        class Dispatcher:
+            active = False
+
+            def __init__(self):
+                self.submissions = []
+
+            def submit_positions(self, *args):
+                self.submissions.append(args)
+                raise AssertionError(
+                    "reserved deferred target reached the dispatcher"
+                )
+
+        deferred = DeferredJointAdjustments()
+        profile = MotionProfile(
+            "Sp",
+            50,
+            10,
+            20,
+            25,
+            "N",
+            "000000",
+        )
+        deferred.set_target(0, 5, profile, 0)
+        dispatcher = Dispatcher()
+        runtime = {
+            "programStopRequestId": None,
+            "programStopStatusLatched": False,
+            "estopActive": False,
+            "posOutreach": False,
+        }
+        namespace = {
+            "RUN": runtime,
+            "manual_auxiliary_stop_barrier": threading.Event(),
+            "auxiliary_stop_requested": threading.Event(),
+            "auxiliary_stop_state_lock": threading.Lock(),
+            "auxiliary_stop_pending_request_id": None,
+            "auxiliary_stop_active_request_id": None,
+            "program_stop_state_lock": threading.RLock(),
+            "application_closing": threading.Event(),
+            "deferred_joint_adjustments": deferred,
+            "controller_correction_requested": threading.Event(),
+            "legacy_serial_result_pending": threading.Event(),
+            "serial_lock": threading.Lock(),
+            "joint_motion_dispatcher": dispatcher,
+            "motion_request_registry": MotionRequestRegistry(),
+            "confirmed_position_generation": 0,
+            "DeferredJointDispatchOutcome": (
+                DeferredJointDispatchOutcome
+            ),
+        }
+        namespace["_manual_auxiliary_stop_in_progress"] = (
+            self.compile_function(
+                "_manual_auxiliary_stop_in_progress",
+                namespace,
+            )
+        )
+        namespace["_manual_auxiliary_status_reserved"] = (
+            self.compile_function(
+                "_manual_auxiliary_status_reserved",
+                namespace,
+            )
+        )
+        dispatch = self.compile_function(
+            "_try_dispatch_deferred_joint_adjustments",
+            namespace,
+        )
+
+        reservations = (
+            ("programStopRequestId", 1),
+            ("programStopStatusLatched", True),
+            ("estopActive", True),
+            ("posOutreach", True),
+        )
+        for state_name, state_value in reservations:
+            with self.subTest(state_name=state_name):
+                for key in runtime:
+                    runtime[key] = (
+                        False
+                        if key != "programStopRequestId"
+                        else None
+                    )
+                runtime[state_name] = state_value
+                self.assertIs(
+                    dispatch(allow_current_generation=True),
+                    DeferredJointDispatchOutcome.BLOCKED,
+                )
+                self.assertTrue(deferred.pending)
+                self.assertEqual(dispatcher.submissions, [])
 
     def test_gcode_stop_halts_local_scheduling_before_serial_admission(self):
         class Label:
@@ -24630,6 +31842,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 "gcode_conversion_cancel_requested": delayed_cancel,
                 "gcode_conversion_cancel_lock": delayed_cancel_lock,
                 "gcode_storage_program_admission_active": False,
+                "manual_controller_program_admission_active": False,
                 "program_execution_state_lock": threading.Lock(),
                 "program_execution_active_request": None,
                 "application_closing": delayed_closing,
@@ -25415,26 +32628,9 @@ class HmiSourceContractTests(unittest.TestCase):
         class SerialPort:
             def __init__(self):
                 self.is_open = True
-                self.stop_on_reset = False
+                self.stop_on_boundary = False
                 self.writes = []
                 self.flushes = 0
-
-            def reset_input_buffer(self):
-                if not self.stop_on_reset:
-                    return
-                acquired = cancellation_lock.acquire()
-                self.assert_lock_acquired(acquired)
-                try:
-                    tab.GCrunTrue = 0
-                finally:
-                    cancellation_lock.release()
-
-            @staticmethod
-            def assert_lock_acquired(acquired):
-                if acquired is False:
-                    raise AssertionError(
-                        "cancellation lock acquisition failed"
-                    )
 
             def write(self, payload):
                 self.writes.append(payload)
@@ -25447,11 +32643,42 @@ class HmiSourceContractTests(unittest.TestCase):
         runtime = {"ser": serial_port}
         tab = SimpleNamespace(GCrunTrue=0)
         write_lock = threading.Lock()
-        cancellation_lock = threading.Lock()
+
+        class CancellationLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+
+            def acquire(self):
+                acquired = self.lock.acquire()
+                if acquired and serial_port.stop_on_boundary:
+                    tab.GCrunTrue = 0
+                return acquired
+
+            def release(self):
+                self.lock.release()
+
+            def locked(self):
+                return self.lock.locked()
+
+        cancellation_lock = CancellationLock()
         conversion_active = threading.Event()
         conversion_cancelled = threading.Event()
         application_closing = threading.Event()
         reads = []
+
+        def exchange_legacy(command, **options):
+            write_serial_control(
+                serial_port,
+                command,
+                write_lock=write_lock,
+                reset_input=False,
+                write_started_event=options["write_started_event"],
+                cancellation_event=options["cancellation_event"],
+                write_boundary_lock=options["write_boundary_lock"],
+            )
+            reads.append(options["response_timeout"])
+            return "position"
+
         namespace = {
             "_controller_response_timeout": lambda command: 12.0,
             "RUN": runtime,
@@ -25464,11 +32691,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "threading": threading,
             "MotionInputError": MotionInputError,
             "SerialActivityRejected": SerialActivityRejected,
-            "write_serial_control": write_serial_control,
-            "read_serial_line_response": (
-                lambda port, timeout: reads.append(timeout) or "position"
-            ),
-            "serial_transport_quarantined": lambda port: False,
+            "_exchange_legacy_main_command": exchange_legacy,
         }
         exchange = self.compile_function("_exchange_gcode_row", namespace)
         command = (
@@ -25491,7 +32714,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(write_lock.locked())
         self.assertFalse(cancellation_lock.locked())
 
-        serial_port.stop_on_reset = True
+        serial_port.stop_on_boundary = True
         tab.GCrunTrue = 1
         self.assertIsNone(exchange(command))
         self.assertEqual(tab.GCrunTrue, 0)
@@ -26222,6 +33445,65 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertEqual(len(acknowledgement_calls), 1)
 
+    def test_joint_physical_stop_result_uses_the_published_stop_event(self):
+        estop = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+                1,
+            )
+        )
+        display_calls = []
+        finish_calls = []
+
+        class Event:
+            kind = "failed"
+            response = estop.raw
+            position = estop
+            error = "controller reported motion fault: EB"
+            pending_discarded = False
+
+            def __init__(self):
+                self.acknowledged = False
+
+            def acknowledge(self):
+                self.acknowledged = True
+
+        class Dispatcher:
+            pending = False
+
+            def __init__(self, event):
+                self.events = [event]
+
+            def drain_events(self):
+                events = self.events
+                self.events = []
+                return events
+
+        event = Event()
+        namespace = {
+            "RUN": {"estopActive": True},
+            "joint_motion_dispatcher": Dispatcher(event),
+            "displayPosition": (
+                lambda *args, **kwargs: display_calls.append((args, kwargs))
+            ),
+            "_finish_joint_motion_visualization": (
+                lambda preserve_actual: finish_calls.append(
+                    preserve_actual
+                )
+            ),
+            "_finish_joint_motion_request_if_idle": lambda: True,
+            "_refresh_joint_motion_visualization": lambda: None,
+            "application_closing": SimpleNamespace(is_set=lambda: True),
+        }
+        poll = self.compile_function("_poll_joint_motion_events", namespace)
+
+        poll()
+
+        self.assertTrue(event.acknowledged)
+        self.assertEqual(display_calls, [])
+        self.assertEqual(finish_calls, [False])
+
     def test_joint_completion_reports_ready_or_retained_pending_target(self):
         class Event:
             kind = "completed"
@@ -26277,7 +33559,9 @@ class HmiSourceContractTests(unittest.TestCase):
                     preserve_actual
                 )
             ),
-            "_try_dispatch_deferred_joint_adjustments": lambda: False,
+            "_try_dispatch_deferred_joint_adjustments": (
+                lambda: DeferredJointDispatchOutcome.IDLE
+            ),
             "application_closing": Closing(),
             "almStatusLab": first_label,
             "almStatusLab2": second_label,
@@ -26372,7 +33656,9 @@ class HmiSourceContractTests(unittest.TestCase):
                     preserve_actual
                 )
             ),
-            "_try_dispatch_deferred_joint_adjustments": lambda: False,
+            "_try_dispatch_deferred_joint_adjustments": (
+                lambda: DeferredJointDispatchOutcome.IDLE
+            ),
             "application_closing": Closing(),
         }
         poll = self.compile_function("_poll_joint_motion_events", namespace)
@@ -26580,7 +33866,10 @@ class HmiSourceContractTests(unittest.TestCase):
             "displayPosition": display_position,
             "_clear_deferred_joint_adjustments": clear_deferred,
             "_try_dispatch_deferred_joint_adjustments": (
-                lambda: deferred_attempts.append(deferred.pending) or False
+                lambda: (
+                    deferred_attempts.append(deferred.pending)
+                    or DeferredJointDispatchOutcome.BLOCKED
+                )
             ),
             "application_closing": SimpleNamespace(is_set=lambda: True),
             "almStatusLab": first_label,
@@ -26718,7 +34007,12 @@ class HmiSourceContractTests(unittest.TestCase):
             "legacy_serial_result_pending": legacy_pending,
             "live_serial_result_pending": live_pending,
             "live_jog_stop_requested": live_stop,
-            "_try_dispatch_deferred_joint_adjustments": lambda **kwargs: deferred_attempts.append(kwargs),
+            "_try_dispatch_deferred_joint_adjustments": (
+                lambda **kwargs: (
+                    deferred_attempts.append(kwargs)
+                    or DeferredJointDispatchOutcome.IDLE
+                )
+            ),
             "serial_lock": serial_lock,
             "joint_motion_dispatcher": SimpleNamespace(active=False),
             "application_closing": Closing(),
@@ -26820,7 +34114,10 @@ class HmiSourceContractTests(unittest.TestCase):
                     "deferred_joint_adjustments": deferred,
                     "_clear_deferred_joint_adjustments": clear_deferred,
                     "_try_dispatch_deferred_joint_adjustments": (
-                        lambda **kwargs: deferred_attempts.append(kwargs)
+                        lambda **kwargs: (
+                            deferred_attempts.append(kwargs)
+                            or DeferredJointDispatchOutcome.BLOCKED
+                        )
                     ),
                     "joint_motion_dispatcher": SimpleNamespace(active=False),
                     "application_closing": SimpleNamespace(is_set=lambda: True),
@@ -26877,7 +34174,8 @@ class HmiSourceContractTests(unittest.TestCase):
             "threading": threading,
             "serial_event_queue": event_queue,
             "_exchange_serial_line": (
-                lambda command, control_event=None, write_started_event=None: "position"
+                lambda command, control_event=None, write_started_event=None,
+                write_cancellation_event=None, write_boundary_lock=None: "position"
             ),
             "live_jog_stop_requested": threading.Event(),
             "live_serial_result_pending": threading.Event(),
@@ -26897,7 +34195,12 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_invalidate_joint_motion_state": lambda reason: None,
             "RUN": {"liveJog": False},
-            "_try_dispatch_deferred_joint_adjustments": lambda **kwargs: deferred_attempts.append(kwargs),
+            "_try_dispatch_deferred_joint_adjustments": (
+                lambda **kwargs: (
+                    deferred_attempts.append(kwargs)
+                    or DeferredJointDispatchOutcome.IDLE
+                )
+            ),
             "joint_motion_dispatcher": SimpleNamespace(active=False),
             "root": SimpleNamespace(after=lambda *args: None),
         }
@@ -26978,7 +34281,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "live_serial_result_pending": threading.Event(),
             "live_jog_stop_requested": threading.Event(),
             "serial_lock": transport_lock,
-            "_try_dispatch_deferred_joint_adjustments": lambda **kwargs: False,
+            "_try_dispatch_deferred_joint_adjustments": (
+                lambda **kwargs: DeferredJointDispatchOutcome.BLOCKED
+            ),
             "joint_motion_dispatcher": dispatcher,
             "deferred_joint_adjustments": SimpleNamespace(pending=False),
             "_clear_deferred_joint_adjustments": lambda: None,
@@ -27117,7 +34422,9 @@ class HmiSourceContractTests(unittest.TestCase):
                 warning=lambda *args: None,
                 exception=lambda *args: None,
             ),
-            "_try_dispatch_deferred_joint_adjustments": lambda **kwargs: False,
+            "_try_dispatch_deferred_joint_adjustments": (
+                lambda **kwargs: DeferredJointDispatchOutcome.BLOCKED
+            ),
             "root": SimpleNamespace(after=lambda *args: None),
         }
         namespace["_invalidate_joint_motion_state"] = self.compile_function(
@@ -27325,7 +34632,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "_try_set_virtual_joint_target": lambda target: True,
             "_current_joint_positions": lambda: (0.0,) * 9,
             "_set_virtual_from_joint_result": lambda position: True,
-            "_try_dispatch_deferred_joint_adjustments": lambda: False,
+            "_try_dispatch_deferred_joint_adjustments": (
+                lambda: DeferredJointDispatchOutcome.IDLE
+            ),
             "root": SimpleNamespace(after=lambda *args: scheduled.append(args)),
             "parse_position_response": parse_position_response,
             "ProtocolResponseError": ProtocolResponseError,
@@ -27419,17 +34728,32 @@ class HmiSourceContractTests(unittest.TestCase):
             def release(self):
                 self.release_count += 1
 
-        for exchange, expected in (
+        for exchange, expected, physical_stop_owned in (
             (
                 lambda command: "Nano Inactive Stopped",
                 ("completed", 17, "Nano Inactive Stopped"),
+                False,
             ),
             (
                 lambda command: (_ for _ in ()).throw(OSError("auxiliary offline")),
                 ("failed", 17, "auxiliary offline"),
+                False,
+            ),
+            (
+                lambda command: "Nano Inactive Stopped",
+                ("completed", 17, "Nano Inactive Stopped"),
+                True,
+            ),
+            (
+                lambda command: (_ for _ in ()).throw(OSError("auxiliary offline")),
+                ("failed", 17, "auxiliary offline"),
+                True,
             ),
         ):
-            with self.subTest(expected=expected[0]):
+            with self.subTest(
+                expected=expected[0],
+                physical_stop_owned=physical_stop_owned,
+            ):
                 event_queue = Queue()
                 lock = Lock()
                 activity = SerialActivityRegistry(("ser2",))
@@ -27441,6 +34765,9 @@ class HmiSourceContractTests(unittest.TestCase):
                     "auxiliary_serial_write_lock": threading.Lock(),
                     "auxiliary_stop_state_lock": threading.Lock(),
                     "auxiliary_stop_active_request_id": 17,
+                    "main_controller_auxiliary_stop_request_id": (
+                        17 if physical_stop_owned else None
+                    ),
                     "auxiliary_stop_owner_result": None,
                     "auxiliary_stop_owner_result_event": result_event,
                     "auxiliary_stop_injected_event": threading.Event(),
@@ -27465,6 +34792,26 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.assertEqual(lock.release_count, 1)
                 self.assertTrue(activity.idle())
                 self.assertIsNone(namespace["auxiliary_stop_active_request_id"])
+                if physical_stop_owned and expected[0] == "failed":
+                    self.assertEqual(
+                        namespace["auxiliary_stop_pending_request_id"],
+                        17,
+                    )
+                    self.assertEqual(
+                        namespace[
+                            "main_controller_auxiliary_stop_request_id"
+                        ],
+                        17,
+                    )
+                    self.assertTrue(
+                        namespace["auxiliary_stop_requested"].is_set()
+                    )
+                elif physical_stop_owned:
+                    self.assertIsNone(
+                        namespace[
+                            "main_controller_auxiliary_stop_request_id"
+                        ]
+                    )
 
         event_queue = Queue()
         activity = SerialActivityRegistry(("ser2",))
@@ -27506,6 +34853,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 "Nano Inactive Stopped"
             ),
         }
+        namespace["application_closing"].set()
+        activity.begin_shutdown()
         worker = self.compile_function("_run_auxiliary_stop_safe", namespace)
 
         worker_thread = threading.Thread(target=worker, args=(23, control_mode))
@@ -27905,7 +35254,6 @@ class HmiSourceContractTests(unittest.TestCase):
 
         event_queue = Queue()
         requested = threading.Event()
-        requested.set()
         result_event = threading.Event()
         activity = SerialActivityRegistry(("ser2",))
         activity.begin("ser2", control_injectable=True)
@@ -27916,7 +35264,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "auxiliary_serial_write_lock": threading.Lock(),
             "auxiliary_stop_requested": requested,
             "auxiliary_stop_state_lock": threading.Lock(),
-            "auxiliary_stop_pending_request_id": 31,
+            "auxiliary_stop_pending_request_id": None,
             "auxiliary_stop_active_request_id": None,
             "auxiliary_stop_owner_waiting": True,
             "auxiliary_stop_owner_result": None,
@@ -27985,6 +35333,9 @@ class HmiSourceContractTests(unittest.TestCase):
         legacy_worker = threading.Thread(target=run_legacy_write)
         legacy_worker.start()
         self.assertTrue(legacy_write_started.wait(2))
+        with namespace["auxiliary_stop_state_lock"]:
+            namespace["auxiliary_stop_pending_request_id"] = 31
+            namespace["auxiliary_stop_requested"].set()
         self.assertTrue(dispatch())
         self.assertEqual(event_queue.get(timeout=2), ("started", 31, "STOP\n"))
         with self.assertRaises(Empty):
@@ -28085,7 +35436,6 @@ class HmiSourceContractTests(unittest.TestCase):
                 owner_lock = threading.Lock()
                 result_event = threading.Event()
                 requested = threading.Event()
-                requested.set()
                 activity = SerialActivityRegistry(("ser2",))
                 serial_port = SerialPort(natural_response)
                 logged_errors = []
@@ -28112,7 +35462,7 @@ class HmiSourceContractTests(unittest.TestCase):
                     "auxiliary_serial_write_lock": write_lock,
                     "auxiliary_stop_requested": requested,
                     "auxiliary_stop_state_lock": threading.Lock(),
-                    "auxiliary_stop_pending_request_id": request_id,
+                    "auxiliary_stop_pending_request_id": None,
                     "auxiliary_stop_active_request_id": None,
                     "auxiliary_stop_owner_waiting": False,
                     "auxiliary_stop_owner_result": None,
@@ -28222,6 +35572,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
                 owner_thread.start()
                 self.assertTrue(serial_port.wi_written.wait(2))
+                namespace["auxiliary_stop_pending_request_id"] = request_id
+                requested.set()
                 deadline = time.monotonic() + 2
                 while (
                     not namespace["auxiliary_stop_owner_waiting"]
@@ -28520,13 +35872,23 @@ class HmiSourceContractTests(unittest.TestCase):
             self.assertEqual(len(outer_tries), 1, function_name)
             self.assertTrue(outer_tries[0].finalbody, function_name)
             first_finally_statement = outer_tries[0].finalbody[0]
+            if isinstance(first_finally_statement, ast.Try):
+                self.assertTrue(
+                    first_finally_statement.finalbody,
+                    function_name,
+                )
+                reschedule_statement = (
+                    first_finally_statement.finalbody[0]
+                )
+            else:
+                reschedule_statement = first_finally_statement
             self.assertIsInstance(
-                first_finally_statement,
+                reschedule_statement,
                 ast.Expr,
                 function_name,
             )
             self.assertIs(
-                first_finally_statement.value,
+                reschedule_statement.value,
                 supervisor_calls[0],
                 function_name,
             )
@@ -28652,7 +36014,10 @@ class HmiSourceContractTests(unittest.TestCase):
         stop_statuses = []
         stop_barrier = threading.Event()
         stop_barrier.set()
-        runtime = {"programStopRequestId": 41}
+        runtime = {
+            "programStopRequestId": 41,
+            "estopActive": False,
+        }
         namespace = {
             "auxiliary_serial_event_queue": event_queue,
             "Empty": Empty,
@@ -28667,6 +36032,10 @@ class HmiSourceContractTests(unittest.TestCase):
             "RUN": runtime,
             "manual_auxiliary_stop_barrier": stop_barrier,
             "_set_program_stop_status": stop_statuses.append,
+            "_clear_manual_auxiliary_stop_barrier_if_settled": (
+                lambda: stop_barrier.clear() or True
+            ),
+            "_apply_main_controller_stop_events": lambda: True,
             "_try_dispatch_controller_correction": lambda: recovery_attempts.append(
                 "controller"
             ),
@@ -28719,6 +36088,7 @@ class HmiSourceContractTests(unittest.TestCase):
         original_cleanup_functions = {
             name: namespace[name]
             for name in (
+                "_apply_main_controller_stop_events",
                 "_apply_program_stop_status_events",
                 "_try_dispatch_controller_correction",
                 "_try_dispatch_auxiliary_stop",
@@ -28734,6 +36104,9 @@ class HmiSourceContractTests(unittest.TestCase):
 
             return cleanup
 
+        namespace["_apply_main_controller_stop_events"] = failed_cleanup(
+            "main-controller-stop"
+        )
         namespace["_apply_program_stop_status_events"] = failed_cleanup(
             "program-status"
         )
@@ -28756,6 +36129,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(
             cleanup_calls,
             [
+                "main-controller-stop",
                 "program-status",
                 "controller-correction",
                 "auxiliary-stop",
@@ -28765,6 +36139,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(
             cleanup_logs,
             [
+                (
+                    "Unable to apply a main-controller stop "
+                    "on the Tk event thread",
+                ),
                 (
                     "Unable to apply a program-stop status "
                     "on the Tk event thread",
@@ -29151,10 +36529,13 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
         }
         startup = self.compile_function("startup", namespace)
+        cancellation_boundary = namespace[
+            "SerialWriteCancellationBoundary"
+        ]("startup worker test")
 
         def run_startup():
             try:
-                results.append(startup(request, threading.Event()))
+                results.append(startup(request, cancellation_boundary))
             except BaseException as exc:
                 errors.append(exc)
 
@@ -29251,7 +36632,12 @@ class HmiSourceContractTests(unittest.TestCase):
         }
         startup = self.compile_function("startup", namespace)
 
-        result = startup(Request(), threading.Event())
+        result = startup(
+            Request(),
+            namespace["SerialWriteCancellationBoundary"](
+                "startup home-reference test"
+            ),
+        )
 
         self.assertEqual(
             result.home_reference,
@@ -29382,7 +36768,9 @@ class HmiSourceContractTests(unittest.TestCase):
 
                 result = startup(
                     Request(auxiliary_port, auxiliary_board),
-                    threading.Event(),
+                    namespace["SerialWriteCancellationBoundary"](
+                        "optional auxiliary startup test"
+                    ),
                 )
 
                 self.assertIsNone(result.auxiliary_serial)
@@ -29508,7 +36896,9 @@ class HmiSourceContractTests(unittest.TestCase):
 
                 result = startup(
                     Request(auxiliary_port, board),
-                    threading.Event(),
+                    namespace["SerialWriteCancellationBoundary"](
+                        "existing auxiliary startup test"
+                    ),
                 )
 
                 self.assertIsNone(result.auxiliary_serial)
@@ -29568,7 +36958,12 @@ class HmiSourceContractTests(unittest.TestCase):
             MotionTransportBusy,
             "could not be closed before startup commit",
         ):
-            retained_startup(Request(None), threading.Event())
+            retained_startup(
+                Request(None),
+                retained_namespace["SerialWriteCancellationBoundary"](
+                    "retained startup test"
+                ),
+            )
 
         self.assertEqual(exchanges, ["HO\n"])
         self.assertIs(retained_runtime["ser2"], retained_serial)
@@ -29701,11 +37096,15 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
     def test_startup_exchange_consumes_exact_and_line_firmware_responses(self):
+        class StartupPhysicalStop(Exception):
+            pass
+
         class SerialPort:
-            def __init__(self, response):
+            def __init__(self, responses=(), *, pending=b""):
                 self.is_open = True
                 self.timeout = 7.5
-                self.response = bytearray(response)
+                self.response = bytearray(pending)
+                self.responses = list(responses)
                 self.commands = []
                 self.reset_count = 0
 
@@ -29714,66 +37113,94 @@ class HmiSourceContractTests(unittest.TestCase):
 
             def write(self, command):
                 self.commands.append(command)
+                if self.responses:
+                    self.response.extend(self.responses.pop(0))
                 return len(command)
 
             def flush(self):
                 pass
+
+            def close(self):
+                self.is_open = False
 
             def read(self, size):
                 chunk = bytes(self.response[:size])
                 del self.response[:size]
                 return chunk
 
+            def read_until(self, delimiter=b"\n", size=None):
+                limit = len(self.response) if size is None else size
+                delimiter_index = self.response.find(delimiter)
+                if delimiter_index >= 0:
+                    limit = min(limit, delimiter_index + len(delimiter))
+                return self.read(limit)
+
+        published_stops = []
+
+        def publish_stop(context, position):
+            published_stops.append((context, position))
+            return True
+
+        def raise_stop(serial_port, response):
+            position = response.admission_position or response.estop_position
+            raise StartupPhysicalStop(position.flag)
+
         namespace = {
+            "dataclass": dataclass,
             "MotionInputError": MotionInputError,
             "ProtocolResponseError": ProtocolResponseError,
-            "SerialTransportQuarantinedError": ConnectionError,
-            "SerialTransportTimeout": TimeoutError,
             "MAX_COMMAND_LENGTH": 4096,
-            "MAX_RESPONSE_FRAME_LENGTH": MAX_RESPONSE_FRAME_LENGTH,
             "MAX_RESPONSE_PAYLOAD_LENGTH": MAX_RESPONSE_PAYLOAD_LENGTH,
             "SERIAL_STARTUP_READ_TIMEOUT_SECONDS": 0.1,
-            "CONTROL_POLL_INTERVAL_SECONDS": 0.005,
             "decode_serial_response_line": decode_serial_response_line,
             "serial_transport_quarantined": lambda serial_port: False,
             "serial_write_lock": threading.Lock(),
-            "time": time,
+            "write_serial_control": write_serial_control,
+            "read_pending_controller_estop_response": (
+                read_pending_controller_estop_response
+            ),
+            "read_controller_exact_exchange_response": (
+                read_controller_exact_exchange_response
+            ),
+            "read_controller_line_exchange_response": (
+                read_controller_line_exchange_response
+            ),
+            "ControllerLineExchangeResponse": (
+                ControllerLineExchangeResponse
+            ),
+            "_publish_main_controller_stop": publish_stop,
+            "_raise_legacy_controller_stop": raise_stop,
         }
+        namespace["MainControllerStopContext"] = self.compile_class(
+            "MainControllerStopContext",
+            namespace,
+        )
         namespace["_validated_startup_command"] = self.compile_function(
             "_validated_startup_command",
             namespace,
         )
         exchange = self.compile_function("_startup_exchange_response", namespace)
-        cancel_event = threading.Event()
+        cancel_event = namespace["SerialWriteCancellationBoundary"](
+            "startup exchange test"
+        )
 
-        exact_serial = SerialPort(b"Done")
+        exact_serial = SerialPort((b"Done",))
         namespace["RUN"] = {"ser": exact_serial}
         self.assertEqual(
             exchange("CEA1\n", cancel_event, expected_response=b"Done"),
             "Done",
         )
         self.assertEqual(exact_serial.commands, [b"CEA1\n"])
+        self.assertEqual(exact_serial.reset_count, 0)
         self.assertEqual(exact_serial.timeout, 7.5)
 
-        update_serial = SerialPort(b"Done")
-        namespace["RUN"] = {"ser": update_serial}
-        self.assertEqual(
-            exchange("UPA1\n", cancel_event, expected_response=b"Done"),
-            "Done",
-        )
-        self.assertEqual(update_serial.commands, [b"UPA1\n"])
-        self.assertEqual(update_serial.timeout, 7.5)
-
-        trailing_serial = SerialPort(b"Donejunk")
+        trailing_serial = SerialPort((b"Donejunk",))
         namespace["RUN"] = {"ser": trailing_serial}
-        with self.assertRaisesRegex(
-            ProtocolResponseError,
-            "trailing unframed data",
-        ):
+        with self.assertRaises(SerialTransportQuarantinedError):
             exchange("CEA1\n", cancel_event, expected_response=b"Done")
         self.assertEqual(trailing_serial.timeout, 7.5)
 
-        framed_serial = SerialPort(b"Done\r\n")
+        framed_serial = SerialPort((b"Done\r\n",))
         namespace["RUN"] = {"ser": framed_serial}
         self.assertEqual(
             exchange("SPA1\n", cancel_event, expected_response=b"Done\n"),
@@ -29782,33 +37209,133 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(framed_serial.commands, [b"SPA1\n"])
         self.assertEqual(framed_serial.timeout, 7.5)
 
-        line_serial = SerialPort(b"A1B2C3\n")
+        line_serial = SerialPort((b"A1B2C3\n",))
         namespace["RUN"] = {"ser": line_serial}
         self.assertEqual(exchange("RP\n", cancel_event), "A1B2C3")
         self.assertEqual(line_serial.commands, [b"RP\n"])
         self.assertEqual(line_serial.timeout, 7.5)
 
-        class CancelDuringResetSerialPort(SerialPort):
-            def reset_input_buffer(self):
-                super().reset_input_buffer()
-                cancel_event.set()
+        estop_event = VALID_CONTROLLER_POSITION.raw.replace(
+            "NO",
+            f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+            1,
+        )
+        queued_stop_serial = SerialPort(
+            (f"{VALID_CONTROLLER_IDENTITY_RESPONSE}\n".encode("ascii"),),
+            pending=f"{estop_event}\n".encode("ascii"),
+        )
+        namespace["RUN"] = {"ser": queued_stop_serial}
+        with self.assertRaisesRegex(StartupPhysicalStop, "EB"):
+            exchange("HO\n", cancel_event)
+        self.assertEqual(queued_stop_serial.commands, [])
+        self.assertEqual(queued_stop_serial.reset_count, 0)
 
-        cancellation_serial = CancelDuringResetSerialPort(b"Done")
+        exact_stop_serial = SerialPort(
+            (b"Done" + f"{estop_event}\n".encode("ascii"),)
+        )
+        namespace["RUN"] = {"ser": exact_stop_serial}
+        with self.assertRaisesRegex(StartupPhysicalStop, "EB"):
+            exchange(
+                "CEA1\n",
+                cancel_event,
+                expected_response=b"Done",
+            )
+        self.assertEqual(exact_stop_serial.commands, [b"CEA1\n"])
+
+        leading_exact_stop_serial = SerialPort(
+            (f"{estop_event}\n".encode("ascii") + b"Done",)
+        )
+        namespace["RUN"] = {"ser": leading_exact_stop_serial}
+        with self.assertRaisesRegex(StartupPhysicalStop, "EB"):
+            exchange(
+                "CEA1\n",
+                cancel_event,
+                expected_response=b"Done",
+            )
+        self.assertEqual(
+            leading_exact_stop_serial.commands,
+            [b"CEA1\n"],
+        )
+
+        line_stop_serial = SerialPort(
+            (
+                b"Done\n"
+                + f"{estop_event}\n".encode("ascii"),
+            )
+        )
+        namespace["RUN"] = {"ser": line_stop_serial}
+        with self.assertRaisesRegex(StartupPhysicalStop, "EB"):
+            exchange(
+                "SPA1\n",
+                cancel_event,
+                expected_response=b"Done\n",
+            )
+        self.assertEqual(line_stop_serial.commands, [b"SPA1\n"])
+
+        leading_line_stop_serial = SerialPort(
+            (
+                f"{estop_event}\n".encode("ascii")
+                + b"Done\n",
+            )
+        )
+        namespace["RUN"] = {"ser": leading_line_stop_serial}
+        with self.assertRaisesRegex(StartupPhysicalStop, "EB"):
+            exchange(
+                "SPA1\n",
+                cancel_event,
+                expected_response=b"Done\n",
+            )
+        self.assertEqual(
+            leading_line_stop_serial.commands,
+            [b"SPA1\n"],
+        )
+
+        cancellation_serial = SerialPort((b"Done",))
         namespace["RUN"] = {"ser": cancellation_serial}
+        cancel_event.set()
         with self.assertRaisesRegex(
             TimeoutError,
             "controller startup cancelled",
         ):
             exchange("CEA1\n", cancel_event, expected_response=b"Done")
-        self.assertEqual(cancellation_serial.reset_count, 1)
+        self.assertEqual(cancellation_serial.reset_count, 0)
         self.assertEqual(cancellation_serial.commands, [])
         self.assertEqual(cancellation_serial.timeout, 7.5)
         cancel_event.clear()
 
+        class CancelAtWriteBoundary(
+            namespace["SerialWriteCancellationBoundary"]
+        ):
+            def acquire(self):
+                if not self.is_set():
+                    self.cancel()
+                return super().acquire()
+
+        interleaved_cancellation = CancelAtWriteBoundary(
+            "interleaved startup cancellation"
+        )
+        interleaved_serial = SerialPort((b"Done",))
+        namespace["RUN"] = {"ser": interleaved_serial}
+        with self.assertRaisesRegex(
+            SerialActivityRejected,
+            "cancelled before transmission",
+        ):
+            exchange(
+                "CEA1\n",
+                interleaved_cancellation,
+                expected_response=b"Done",
+            )
+        self.assertTrue(interleaved_cancellation.is_set())
+        self.assertEqual(interleaved_serial.commands, [])
+        self.assertEqual(interleaved_serial.responses, [b"Done"])
+        self.assertEqual(interleaved_serial.timeout, 7.5)
+
         maximum_payload = b"x" * MAX_RESPONSE_PAYLOAD_LENGTH
         for delimiter in (b"\n", b"\r\n"):
             with self.subTest(maximum_startup_delimiter=delimiter):
-                maximum_serial = SerialPort(maximum_payload + delimiter)
+                maximum_serial = SerialPort(
+                    (maximum_payload + delimiter,)
+                )
                 namespace["RUN"] = {"ser": maximum_serial}
                 self.assertEqual(
                     exchange(
@@ -29824,36 +37351,17 @@ class HmiSourceContractTests(unittest.TestCase):
         oversized_payload = b"x" * (MAX_RESPONSE_PAYLOAD_LENGTH + 1)
         for delimiter in (b"\n", b"\r\n"):
             with self.subTest(oversized_startup_delimiter=delimiter):
-                oversized_serial = SerialPort(oversized_payload + delimiter)
+                oversized_serial = SerialPort(
+                    (oversized_payload + delimiter,)
+                )
                 namespace["RUN"] = {"ser": oversized_serial}
-                with self.assertRaisesRegex(
-                    ProtocolResponseError,
-                    "exceeds the size limit",
-                ):
+                with self.assertRaises(SerialTransportQuarantinedError):
                     exchange("RP\n", cancel_event)
                 self.assertEqual(oversized_serial.timeout, 7.5)
-
-        for response, expected_response in (
-            (b"Done", b"Done"),
-            (b"Done\n", b"Done\n"),
-        ):
-            with self.subTest(expired_quiet_response=response):
-                deadline_serial = SerialPort(response)
-                exchange.__globals__["RUN"] = {"ser": deadline_serial}
-                monotonic_values = iter((100.0, 100.0, 100.099))
-                exchange.__globals__["time"] = SimpleNamespace(
-                    monotonic=lambda: next(monotonic_values)
-                )
-                with self.assertRaisesRegex(
-                    TimeoutError,
-                    "quiet-boundary deadline expired",
-                ):
-                    exchange(
-                        "CEA1\n",
-                        cancel_event,
-                        expected_response=expected_response,
-                    )
-                self.assertEqual(deadline_serial.timeout, 7.5)
+        self.assertEqual(
+            [position.flag for _, position in published_stops],
+            ["EB", "EB", "EB", "EB", "EB"],
+        )
 
     def test_startup_numeric_builder_preserves_delimiters_without_exponents(self):
         namespace = {
@@ -29917,7 +37425,12 @@ class HmiSourceContractTests(unittest.TestCase):
         startup = self.compile_function("startup", namespace)
 
         with self.assertRaisesRegex(TimeoutError, "controller startup cancelled"):
-            startup(Request(), threading.Event())
+            startup(
+                Request(),
+                namespace["SerialWriteCancellationBoundary"](
+                    "startup cleanup test"
+                ),
+            )
         self.assertEqual(exchanges, ["HO\n", "UPA1\n"])
         self.assertEqual(closed, [auxiliary_serial])
 
@@ -29934,6 +37447,7 @@ class HmiSourceContractTests(unittest.TestCase):
             CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
             CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
             CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+            CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
         ):
             with self.subTest(missing_capability=missing_capability):
                 unsupported_identity = json.loads(
@@ -29977,7 +37491,12 @@ class HmiSourceContractTests(unittest.TestCase):
                     ProtocolResponseError,
                     re.escape(missing_capability),
                 ):
-                    startup(Request(), threading.Event())
+                    startup(
+                        Request(),
+                        namespace["SerialWriteCancellationBoundary"](
+                            "unsupported startup test"
+                        ),
+                    )
 
                 self.assertEqual(exchanges, ["HO\n"])
                 self.assertEqual(connections, [])

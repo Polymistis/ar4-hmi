@@ -27,7 +27,7 @@ constexpr int kModbusMinimumSlaveId = 1;
 constexpr int kModbusMaximumSlaveId = 247;
 constexpr int kModbusMaximumAddress = 65535;
 constexpr int kModbusMaximumRegisterValue = 65535;
-constexpr int kModbusMaximumRegisterReadQuantity = 64;
+constexpr int kModbusMaximumRegisterReadQuantity = 1;
 constexpr double kMaximumPulseDelayMicroseconds = 4294967295.0;
 
 enum class ModbusOperation {
@@ -389,9 +389,7 @@ inline bool validate_modbus_request(
       return value == 1;
     case ModbusOperation::kReadHoldingRegisters:
     case ModbusOperation::kReadInputRegisters:
-      return value >= 1
-        && value <= kModbusMaximumRegisterReadQuantity
-        && value - 1 <= kModbusMaximumAddress - address;
+      return value == kModbusMaximumRegisterReadQuantity;
     case ModbusOperation::kWriteCoil:
       return value == 0 || value == 1;
     case ModbusOperation::kWriteRegister:

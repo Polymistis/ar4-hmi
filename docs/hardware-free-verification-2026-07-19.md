@@ -383,3 +383,15 @@ Upstream ModbusMaster warnings remained; no tracked-source warning was emitted.
 ```text
 No-upload Teensy compile and timeout tests: Ran 2 tests in 21.416s; OK
 ```
+
+The 2026-07-31 environment-gated rerun compiled the tracked
+`6.7.1-ar4hmi.8` Teensy source. Arduino CLI 1.5.1 selected PJRC Teensy core
+1.62.0, the platform `SPI` library, bundled SdFat 2.1.2, and ModbusMaster
+2.0.1. The bounded test runner used an external build directory, compiled
+without `--upload`, verified the selected dependency paths, and exercised
+forced-timeout process-tree cleanup. No serial port, controller command,
+firmware upload, calibration action, or arm motion occurred.
+
+```text
+No-upload Teensy compile and timeout tests: Ran 2 tests in 18.084s; OK
+```
