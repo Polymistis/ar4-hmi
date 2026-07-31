@@ -1060,6 +1060,7 @@ class LegacyCalibrationConversionTests(unittest.TestCase):
         legacy_default = parameters["legacy_file"].default
         backup_default = parameters["backup_file"].default
 
+        self.assertEqual(legacy_default, "ARbot.cal")
         self.assertEqual(backup_default, f"{legacy_default}.bak")
 
     def test_backup_failure_does_not_misreport_committed_conversion(self):

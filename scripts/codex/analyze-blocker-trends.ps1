@@ -649,10 +649,9 @@ if ($SelfTest) {
   # another WORKFLOW-INFRA keyword.
   Assert-Archetype 'A26: WORKFLOW-INFRA (scripts/claude/ path)' `
     'scripts/claude/commit.ps1:142 - Bypass-flag parser rejects --no-verbose alongside --no-verify' 'WORKFLOW-INFRA'
-  # Review-log fixtures from the bootstrap/core.hooksPath audit. These
-  # are review-system infrastructure even when the finding is reported
-  # against INSTALL.md rather than a scripts/ path.
-  # The citation below is synthetic classifier input, not a live source claim.
+  # Synthetic fixtures model the bootstrap/core.hooksPath review-finding class.
+  # The path-shaped citations exercise classification without claiming live
+  # source locations.
   Assert-Archetype 'A27: WORKFLOW-INFRA (bootstrap.ps1 path)' `
     'bootstrap.ps1:1 - Synthetic installer workflow finding' 'WORKFLOW-INFRA'
   Assert-Archetype 'A28: WORKFLOW-INFRA (core.hooksPath doc drift)' `

@@ -323,7 +323,7 @@ function Test-FilesEqual {
 # then the root. Without -Force on the enumeration, a hidden `.git` is skipped and
 # the non-empty root removal throws. Best-effort (SilentlyContinue): scratch cleanup
 # must never abort the run. Safe on $null / nonexistent paths. The function body
-# remains byte-identical to the three wrapper copies.
+# remains byte-identical to every canonical wrapper copy.
 function Remove-TreeNoRecurse {
   param([string]$Path)
   if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return }
