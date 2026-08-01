@@ -6157,6 +6157,36 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(namespace["program_vision_operations"], {})
         self.assertEqual(ProgramView.selected, [1])
 
+        rejected_completions = []
+        rejected = operation_type(
+            request,
+            command,
+            rejected_completions.append,
+        )
+        rejected.bind_worker_request(11)
+        namespace["program_vision_operations"][11] = rejected
+        events[:] = [
+            VisionOperationEvent(
+                3,
+                11,
+                error_detail=(
+                    "vision matching was cancelled during shutdown"
+                ),
+            )
+        ]
+        self.assertTrue(drain_events())
+        self.assertFalse(rejected.wait())
+        self.assertEqual(rejected_completions, [False])
+        self.assertEqual(namespace["program_vision_operations"], {})
+        self.assertEqual(
+            statuses[-1],
+            (
+                "Vision program row rejected: vision matching was "
+                "cancelled during shutdown",
+                "Alarm.TLabel",
+            ),
+        )
+
         changed = operation_type(request, command)
         changed.bind_program_rows(ProgramView.rows)
         changed.bind_worker_request(9)
@@ -6168,7 +6198,7 @@ class HmiSourceContractTests(unittest.TestCase):
         ):
             apply_event(
                 changed,
-                VisionOperationEvent(3, 9, result=operation_result(True)),
+                VisionOperationEvent(4, 9, result=operation_result(True)),
             )
         ProgramView.rows = original_rows
         self.assertEqual(
@@ -6183,7 +6213,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 apply_event(
                     failed,
                     VisionOperationEvent(
-                        4,
+                        5,
                         8,
                         result=operation_result(False),
                     ),
@@ -6247,6 +6277,9 @@ class HmiSourceContractTests(unittest.TestCase):
                 normalize_camera_exception_detail
             ),
             "logger": SimpleNamespace(error=lambda *args: None),
+            "_publish_program_vision_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
             "_set_application_status": (
                 lambda *args, **kwargs: statuses.append((args, kwargs))
             ),
@@ -6284,6 +6317,25 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(execute(), "rejected")
         self.assertEqual(finishes, [True])
 
+        dispatch_result[0] = RuntimeError("vision worker unavailable")
+        finishes.clear()
+        statuses.clear()
+
+        def rejected_dispatch(command, request, callback):
+            raise dispatch_result[0]
+
+        namespace["_dispatch_program_vision_operation"] = rejected_dispatch
+        execute = self.compile_function("executeRow", namespace)
+        self.assertEqual(execute(), "rejected")
+        self.assertEqual(finishes, [True])
+        self.assertEqual(
+            statuses,
+            [(
+                "Vision program row rejected: vision worker unavailable",
+                "Alarm.TLabel",
+            )],
+        )
+
         branch = self.module_functions["executeRow"]
         calls = {
             node.func.id
@@ -6292,6 +6344,73 @@ class HmiSourceContractTests(unittest.TestCase):
         }
         self.assertNotIn("take_pic", calls)
         self.assertNotIn("visFind", calls)
+
+    def test_execute_row_rejects_move_vision_without_completed_match(self):
+        class ProgramView:
+            command = (
+                "Move V [ PR: 1 ] [*] X 1 Y 2 Z 3 Rz 4 Ry 5 Rx 6 "
+                "J7 7 J8 8 J9 9 Sp 25 Ac 10 Dc 10 Rm 100 $ N"
+            ).encode("ascii")
+
+            @staticmethod
+            def curselection():
+                return (0,)
+
+            @staticmethod
+            def size():
+                return 1
+
+            @staticmethod
+            def see(row):
+                pass
+
+            @classmethod
+            def get(cls, *args):
+                return cls.command
+
+        finishes = []
+        statuses = []
+        dispatches = []
+
+        def rejected_match():
+            raise MotionInputError(
+                "Move Vision requires a valid completed vision match"
+            )
+
+        namespace = {
+            "RUN": {
+                "progRunning": False,
+                "cmdType": None,
+                "cmdTypeLong": None,
+                "moveInProc": 0,
+            },
+            "tab1": SimpleNamespace(progView=ProgramView()),
+            "_validated_current_vision_match_result": rejected_match,
+            "_publish_program_vision_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+            "_dispatch_program_command": (
+                lambda *args: dispatches.append(args) or "complete"
+            ),
+            "logger": SimpleNamespace(error=lambda *args: None),
+            "_finish_execute_row": lambda: finishes.append(True),
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "ROW_EXECUTION_PENDING": "pending",
+            "ROW_EXECUTION_COMPLETE": "complete",
+        }
+        execute = self.compile_function("executeRow", namespace)
+
+        self.assertEqual(execute(), "rejected")
+        self.assertEqual(finishes, [True])
+        self.assertEqual(dispatches, [])
+        self.assertEqual(
+            statuses,
+            [(
+                "Move Vision program row rejected: Move Vision requires a "
+                "valid completed vision match",
+                "Alarm.TLabel",
+            )],
+        )
 
     def test_vision_selection_bounds_normalize_clamp_and_reject_tiny_drags(self):
         namespace = {

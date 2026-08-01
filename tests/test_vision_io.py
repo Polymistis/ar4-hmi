@@ -264,6 +264,42 @@ class VisionIoTests(unittest.TestCase):
         self.assertIsNone(event.result)
         self.assertIn("cancelled for shutdown", event.error_detail)
 
+    def test_vision_operation_close_settles_request_pending_worker_pickup(self):
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        operation_calls = []
+
+        class DelayedThread(threading.Thread):
+            def run(self):
+                worker_started.set()
+                if not release_worker.wait(1):
+                    return
+                super().run()
+
+        worker = self.vision_capture_worker(
+            lambda *args: operation_calls.append(args),
+            thread_factory=DelayedThread,
+        )
+        submission = worker.submit(self.vision_capture_settings())
+        self.assertTrue(worker_started.wait(1))
+        self.assertEqual(worker.pending_request_id, submission.request_id)
+
+        self.assertFalse(worker.close())
+        events = worker.drain_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].request_id, submission.request_id)
+        self.assertIsNone(events[0].result)
+        self.assertEqual(
+            events[0].error_detail,
+            "vision capture was cancelled during shutdown",
+        )
+        self.assertIsNone(worker.pending_request_id)
+
+        release_worker.set()
+        self.assertTrue(worker.wait_stopped(1))
+        self.assertEqual(operation_calls, [])
+        self.assertTrue(worker.close())
+
     def test_vision_capture_worker_rolls_back_startup_failures(self):
         settings = self.vision_capture_settings()
         with self.assertRaisesRegex(MotionInputError, "operation"):

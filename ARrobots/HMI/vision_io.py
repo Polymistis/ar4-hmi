@@ -1301,8 +1301,16 @@ class VisionOperationWorker:
     def close(self):
         with self._lock:
             self._closed = True
-            self._pending = None
             self._close_requested.set()
+            pending = self._pending
+            self._pending = None
+            if pending is not None:
+                self._append_event_locked(
+                    pending.request_id,
+                    error_detail=(
+                        f"{self._operation_name} was cancelled during shutdown"
+                    ),
+                )
             return self._worker is None
 
     def wait_stopped(self, timeout=None):
