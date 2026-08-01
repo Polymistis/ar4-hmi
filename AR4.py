@@ -29094,6 +29094,8 @@ def _capture_mask_selection_image():
 
 
 def _normalized_vision_selection_bounds(image, start_x, start_y, end_x, end_y):
+  """Return clamped bounds, None for an undersized area, or raise on bad input."""
+
   shape = getattr(image, "shape", None)
   if not isinstance(shape, (tuple, list)) or len(shape) < 2:
     raise MotionInputError("vision selection image has invalid dimensions")
@@ -29140,10 +29142,20 @@ def _normalized_vision_selection_bounds(image, start_x, start_y, end_x, end_y):
     min(height, max(y_start, y_end) - VISION_SELECTION_INSET_PIXELS),
   )
   if x_minimum + 1 >= x_maximum or y_minimum + 1 >= y_maximum:
-    raise MotionInputError(
-      "vision selection must enclose an area after applying the inset"
-    )
+    return None
   return x_minimum, y_minimum, x_maximum, y_maximum
+
+
+def _reject_undersized_vision_selection(context):
+  if context not in ("MASK", "TEMPLATE"):
+    raise MotionInputError("vision selection context is invalid")
+  message = f"VISION {context} SELECTION TOO SMALL"
+  logger.warning(message)
+  try:
+    _set_application_status(message, "Warn.TLabel")
+  except Exception:
+    logger.exception("Unable to present an undersized vision selection")
+  return False
 
 
 def _mask_crop(event, x, y, flags, param):
@@ -29153,7 +29165,6 @@ def _mask_crop(event, x, y, flags, param):
         RUN['button_down'] = True
         RUN['box_points'] = [(x, y)]
         
-    # Mouse is Moving
     elif (RUN['button_down']) and (event == cv2.EVENT_MOUSEMOVE):
         if RUN['cropping']:
             image_copy = RUN['oriImage'].copy()
@@ -29162,28 +29173,34 @@ def _mask_crop(event, x, y, flags, param):
             cv2.rectangle(image_copy, RUN['box_points'][0], point, (0, 255, 0), 2)
             cv2.imshow("image", image_copy)
 
-    # if the left mouse button was released
-    elif event == cv2.EVENT_LBUTTONUP:
+    elif event == cv2.EVENT_LBUTTONUP and RUN['button_down']:
         RUN['button_down'] = False
-        RUN['box_points'].append((x, y))
-        cv2.rectangle(RUN['oriImage'], RUN['box_points'][0], RUN['box_points'][1], (0, 255, 0), 2)
-        cv2.imshow("image", RUN['oriImage'])
-        # record the ending (x, y) coordinates
         RUN['x_end'], RUN['y_end'] = x, y
-        RUN['cropping'] = False # cropping is finished
+        RUN['cropping'] = False
 
-        (
-          RUN['mX1'],
-          RUN['mY1'],
-          RUN['mX2'],
-          RUN['mY2'],
-        ) = _normalized_vision_selection_bounds(
+        bounds = _normalized_vision_selection_bounds(
           RUN['oriImage'],
           RUN['x_start'],
           RUN['y_start'],
           RUN['x_end'],
           RUN['y_end'],
         )
+        if bounds is None:
+          if (
+            RUN['x_start'] == RUN['x_end']
+            and RUN['y_start'] == RUN['y_end']
+          ):
+            return False
+          return _reject_undersized_vision_selection("MASK")
+        RUN['box_points'].append((x, y))
+        cv2.rectangle(RUN['oriImage'], RUN['box_points'][0], RUN['box_points'][1], (0, 255, 0), 2)
+        cv2.imshow("image", RUN['oriImage'])
+        (
+          RUN['mX1'],
+          RUN['mY1'],
+          RUN['mX2'],
+          RUN['mY2'],
+        ) = bounds
 
         CAL['autoBGVal'] = int(RUN['autoBG'].get())
         if(CAL['autoBGVal']==1):
@@ -29278,7 +29295,6 @@ def _mouse_crop(event, x, y, flags, param):
         RUN['button_down'] = True
         RUN['box_points'] = [(x, y)]
         
-    # Mouse is Moving
     elif (RUN['button_down']) and (event == cv2.EVENT_MOUSEMOVE):
         if RUN['cropping']:
             image_copy = RUN['oriImage'].copy()
@@ -29287,25 +29303,29 @@ def _mouse_crop(event, x, y, flags, param):
             cv2.rectangle(image_copy, RUN['box_points'][0], point, (0, 255, 0), 2)
             cv2.imshow("image", image_copy)
 
-    # if the left mouse button was released
-    elif event == cv2.EVENT_LBUTTONUP:
+    elif event == cv2.EVENT_LBUTTONUP and RUN['button_down']:
         RUN['button_down'] = False
+        RUN['x_end'], RUN['y_end'] = x, y
+        RUN['cropping'] = False
+
+        bounds = _normalized_vision_selection_bounds(
+          RUN['oriImage'],
+          RUN['x_start'],
+          RUN['y_start'],
+          RUN['x_end'],
+          RUN['y_end'],
+        )
+        if bounds is None:
+          if (
+            RUN['x_start'] == RUN['x_end']
+            and RUN['y_start'] == RUN['y_end']
+          ):
+            return False
+          return _reject_undersized_vision_selection("TEMPLATE")
+        x_minimum, y_minimum, x_maximum, y_maximum = bounds
         RUN['box_points'].append((x, y))
         cv2.rectangle(RUN['oriImage'], RUN['box_points'][0], RUN['box_points'][1], (0, 255, 0), 2)
         cv2.imshow("image", RUN['oriImage'])
-        # record the ending (x, y) coordinates
-        RUN['x_end'], RUN['y_end'] = x, y
-        RUN['cropping'] = False # cropping is finished
-
-        x_minimum, y_minimum, x_maximum, y_maximum = (
-          _normalized_vision_selection_bounds(
-            RUN['oriImage'],
-            RUN['x_start'],
-            RUN['y_start'],
-            RUN['x_end'],
-            RUN['y_end'],
-          )
-        )
         roi = RUN['oriImage'][
           y_minimum:y_maximum,
           x_minimum:x_maximum,
@@ -29315,6 +29335,9 @@ def _mouse_crop(event, x, y, flags, param):
           title="Teach Vision Object",
           prompt="Save Object As:",
         )
+        if template_name is None:
+          cv2.destroyAllWindows()
+          return False
         if (
           not isinstance(template_name, str)
           or not template_name
@@ -29329,6 +29352,7 @@ def _mouse_crop(event, x, y, flags, param):
             raise OSError("vision template could not be persisted")
         cv2.destroyAllWindows()
         updateVisOp()
+    return True
 
 
 def mouse_crop(event, x, y, flags, param):

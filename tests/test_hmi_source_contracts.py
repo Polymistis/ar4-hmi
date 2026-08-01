@@ -588,8 +588,14 @@ class HmiSourceContractTests(unittest.TestCase):
             "_normalized_vision_selection_bounds": (
                 "_vision_sample_coordinate",
             ),
-            "_mask_crop": ("_normalized_vision_selection_bounds",),
-            "_mouse_crop": ("_normalized_vision_selection_bounds",),
+            "_mask_crop": (
+                "_normalized_vision_selection_bounds",
+                "_reject_undersized_vision_selection",
+            ),
+            "_mouse_crop": (
+                "_normalized_vision_selection_bounds",
+                "_reject_undersized_vision_selection",
+            ),
             "_commit_called_program_navigation": (
                 "_clear_robot_program_return_state",
             ),
@@ -4919,6 +4925,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(manual.auto_background)
         self.assertTrue(manual.persist_auto_background)
         self.assertEqual(manual.mask_bounds, (0, 0, 6, 4))
+        self.assertEqual(
+            manual.background_grayscale,
+            namespace["_vision_background_grayscale"]([255, 1, 2]),
+        )
 
         runtime["autoBG"].value = "1"
         automatic = snapshot()
@@ -5592,10 +5602,12 @@ class HmiSourceContractTests(unittest.TestCase):
             normalize(image, -20, -30, 700, 520),
             (0, 0, 640, 480),
         )
-        with self.assertRaisesRegex(MotionInputError, "enclose an area"):
-            normalize(image, 10, 10, 15, 15)
-        with self.assertRaisesRegex(MotionInputError, "enclose an area"):
-            normalize(image, 10, 10, 17, 17)
+        self.assertIsNone(normalize(image, 10, 10, 15, 15))
+        self.assertIsNone(normalize(image, 10, 10, 17, 17))
+        with self.assertRaisesRegex(MotionInputError, "invalid dimensions"):
+            normalize(object(), 0, 0, 10, 10)
+        with self.assertRaisesRegex(MotionInputError, "must be an integer"):
+            normalize(image, 0.5, 0, 10, 10)
 
     def test_mask_crop_writes_manual_rgb_as_bgr(self):
         class Entry:
@@ -5618,6 +5630,7 @@ class HmiSourceContractTests(unittest.TestCase):
         displays = []
         write_succeeds = [True]
         errors = []
+        warnings = []
         vision_cv2 = SimpleNamespace(
             EVENT_LBUTTONDOWN=1,
             EVENT_MOUSEMOVE=2,
@@ -5641,6 +5654,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "cv2": vision_cv2,
             "logger": SimpleNamespace(
                 exception=lambda *args: errors.append(args),
+                warning=lambda *args: warnings.append(args),
             ),
             "normalize_camera_exception_detail": (
                 normalize_camera_exception_detail
@@ -5705,6 +5719,57 @@ class HmiSourceContractTests(unittest.TestCase):
             displays[0][0, 0],
             np.asarray([255, 1, 2], dtype=np.uint8),
         )
+        self.assertEqual(
+            (
+                namespace["RUN"]["mX1"],
+                namespace["RUN"]["mY1"],
+                namespace["RUN"]["mX2"],
+                namespace["RUN"]["mY2"],
+            ),
+            (3, 3, 9, 9),
+        )
+
+        namespace["RUN"].update({
+            "button_down": True,
+            "box_points": [(0, 0)],
+            "oriImage": np.zeros((12, 12, 3), dtype=np.uint8),
+            "x_start": 0,
+            "y_start": 0,
+            "cropping": True,
+        })
+        self.assertFalse(
+            mask_crop(vision_cv2.EVENT_LBUTTONUP, 0, 0, None, None)
+        )
+        self.assertEqual(warnings, [])
+        self.assertEqual(statuses, [])
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(displays), 1)
+        self.assertTrue(
+            mask_crop(vision_cv2.EVENT_LBUTTONUP, 12, 12, None, None)
+        )
+        self.assertEqual(namespace["RUN"]["x_end"], 0)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(displays), 1)
+
+        namespace["RUN"].update({
+            "button_down": True,
+            "box_points": [(0, 0)],
+            "oriImage": np.zeros((12, 12, 3), dtype=np.uint8),
+            "x_start": 0,
+            "y_start": 0,
+            "cropping": True,
+        })
+        self.assertFalse(
+            mask_crop(vision_cv2.EVENT_LBUTTONUP, 5, 5, None, None)
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(
+            statuses,
+            [("VISION MASK SELECTION TOO SMALL", "Warn.TLabel")],
+        )
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(displays), 1)
         self.assertEqual(
             (
                 namespace["RUN"]["mX1"],
@@ -5883,6 +5948,129 @@ class HmiSourceContractTests(unittest.TestCase):
                 "VISION TEMPLATE PROCESSING FAILED: template write failed",
                 "Alarm.TLabel",
             ),
+        )
+
+    def test_template_mouse_callback_handles_cancel_and_real_success(self):
+        dialog_values = [None, "object"]
+        writes = []
+        updates = []
+        destroy_calls = []
+        errors = []
+        warnings = []
+        statuses = []
+        vision_cv2 = SimpleNamespace(
+            EVENT_LBUTTONDOWN=1,
+            EVENT_MOUSEMOVE=2,
+            EVENT_LBUTTONUP=3,
+            rectangle=lambda *args, **kwargs: None,
+            imshow=lambda *args, **kwargs: None,
+            imwrite=lambda filename, image: (
+                writes.append((filename, image.copy())) or True
+            ),
+            destroyAllWindows=lambda: destroy_calls.append(True),
+        )
+        namespace = {
+            "RUN": {
+                "button_down": True,
+                "box_points": [(0, 0)],
+                "oriImage": np.zeros((12, 12, 3), dtype=np.uint8),
+                "x_start": 0,
+                "y_start": 0,
+                "x_end": 0,
+                "y_end": 0,
+                "cropping": True,
+            },
+            "cv2": vision_cv2,
+            "simpledialog": SimpleNamespace(
+                askstring=lambda **kwargs: dialog_values.pop(0),
+            ),
+            "os": os,
+            "MotionInputError": MotionInputError,
+            "finite_number": finite_number,
+            "VISION_SELECTION_INSET_PIXELS": 3,
+            "updateVisOp": lambda: updates.append(True),
+            "normalize_camera_exception_detail": (
+                normalize_camera_exception_detail
+            ),
+            "logger": SimpleNamespace(
+                exception=lambda *args: errors.append(args),
+                warning=lambda *args: warnings.append(args),
+            ),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+        }
+        namespace["_mouse_crop"] = self.compile_function(
+            "_mouse_crop",
+            namespace,
+        )
+        callback = self.compile_function("mouse_crop", namespace)
+
+        self.assertFalse(
+            callback(vision_cv2.EVENT_LBUTTONUP, 12, 12, None, None)
+        )
+        self.assertEqual(destroy_calls, [True])
+        self.assertEqual(writes, [])
+        self.assertEqual(errors, [])
+        self.assertEqual(statuses, [])
+
+        namespace["RUN"].update({
+            "button_down": True,
+            "box_points": [(0, 0)],
+            "oriImage": np.zeros((12, 12, 3), dtype=np.uint8),
+            "x_start": 0,
+            "y_start": 0,
+            "cropping": True,
+        })
+        self.assertTrue(
+            callback(vision_cv2.EVENT_LBUTTONUP, 12, 12, None, None)
+        )
+        self.assertEqual(writes[0][0], "object.jpg")
+        self.assertEqual(writes[0][1].shape, (6, 6, 3))
+        self.assertEqual(updates, [True])
+        self.assertEqual(destroy_calls, [True, True])
+
+        namespace["RUN"].update({
+            "button_down": True,
+            "box_points": [(0, 0)],
+            "oriImage": np.zeros((12, 12, 3), dtype=np.uint8),
+            "x_start": 0,
+            "y_start": 0,
+            "cropping": True,
+        })
+        self.assertFalse(
+            callback(vision_cv2.EVENT_LBUTTONUP, 0, 0, None, None)
+        )
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(warnings, [])
+        self.assertEqual(statuses, [])
+        self.assertTrue(
+            callback(vision_cv2.EVENT_LBUTTONUP, 12, 12, None, None)
+        )
+        self.assertEqual(namespace["RUN"]["x_end"], 0)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(updates, [True])
+        self.assertEqual(destroy_calls, [True, True])
+
+        namespace["RUN"].update({
+            "button_down": True,
+            "box_points": [(0, 0)],
+            "oriImage": np.zeros((12, 12, 3), dtype=np.uint8),
+            "x_start": 0,
+            "y_start": 0,
+            "cropping": True,
+        })
+        self.assertFalse(
+            callback(vision_cv2.EVENT_LBUTTONUP, 5, 5, None, None)
+        )
+        self.assertEqual(destroy_calls, [True, True])
+        self.assertEqual(errors, [])
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(updates, [True])
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(
+            statuses,
+            [("VISION TEMPLATE SELECTION TOO SMALL", "Warn.TLabel")],
         )
 
     def test_program_item_writer_replaces_only_complete_utf8_documents(self):
@@ -8549,6 +8737,23 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(namespace["camera_preview_shutdown_timeout_reported"])
         self.assertEqual(len(errors), 1)
         self.assertIn("shutdown grace period", errors[0][0])
+        self.assertEqual(len(root.jobs), 1)
+
+        namespace["camera_preview_worker"].active = True
+        namespace["vision_capture_worker"].active = False
+        namespace["camera_preview_shutdown_started_at"] = 20.0
+        namespace["camera_preview_shutdown_timeout_reported"] = False
+        namespace["time"] = SimpleNamespace(monotonic=lambda: 20.5)
+        root.jobs.clear()
+        statuses.clear()
+        serial_lock.attempts = 0
+
+        self.assertFalse(poll_close())
+        self.assertEqual(serial_lock.attempts, 0)
+        self.assertEqual(
+            statuses[-1],
+            ("SHUTDOWN WAITING FOR CAMERA WORKERS", "Warn.TLabel"),
+        )
         self.assertEqual(len(root.jobs), 1)
 
     def test_shutdown_waits_for_auxiliary_stop_settlement_before_serial_close(self):
