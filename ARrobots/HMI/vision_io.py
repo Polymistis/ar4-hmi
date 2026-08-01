@@ -30,7 +30,9 @@ CAMERA_PREVIEW_RELEASE_ATTEMPTS = 3
 MAX_CAMERA_PREVIEW_RELEASE_ATTEMPTS = 10
 MAX_CAMERA_PREVIEW_EVENT_DETAIL = 512
 MAX_CAMERA_PREVIEW_EVENTS = 64
-MAX_RETAINED_CAMERA_FAILURE_EVENTS = 32
+MAX_RETAINED_CAMERA_TERMINAL_EVENTS = 32
+MAX_CAMERA_SOURCE_TEXT = 512
+CAMERA_PREVIEW_CANCELLATION_POLL_SECONDS = 0.05
 CAMERA_PREVIEW_EVENT_KINDS = frozenset(
     ("starting", "started", "stopping", "stopped", "failed")
 )
@@ -73,9 +75,44 @@ class CameraPreviewFrame:
 
 
 @dataclass(frozen=True)
+class CameraPreviewLifecycleState:
+    active: bool
+    stopped: bool
+    closed: bool
+    fault_reason: str | None
+
+    def __post_init__(self):
+        if not all(
+            isinstance(value, bool)
+            for value in (self.active, self.stopped, self.closed)
+        ):
+            raise MotionInputError("camera lifecycle state is invalid")
+        if self.active == self.stopped:
+            raise MotionInputError("camera lifecycle activity state is invalid")
+        if self.fault_reason is not None and (
+            not isinstance(self.fault_reason, str)
+            or not self.fault_reason
+            or self.fault_reason != self.fault_reason.strip()
+            or " ".join(self.fault_reason.split()) != self.fault_reason
+            or "\r" in self.fault_reason
+            or "\n" in self.fault_reason
+            or len(self.fault_reason) > MAX_CAMERA_PREVIEW_EVENT_DETAIL
+        ):
+            raise MotionInputError("camera lifecycle fault state is invalid")
+
+    @property
+    def clean(self):
+        return self.stopped and self.fault_reason is None
+
+
+@dataclass(frozen=True)
 class _CameraPreviewRequest:
     request_id: int
-    camera_index: int
+    camera_source: int | str
+
+    def __post_init__(self):
+        _validate_nonnegative_integer(self.request_id, "camera request id")
+        _validate_camera_source(self.camera_source)
 
 
 def _validate_nonnegative_integer(value, field_name):
@@ -84,7 +121,59 @@ def _validate_nonnegative_integer(value, field_name):
     return value
 
 
-def _normalized_exception_detail(error, prefix=""):
+def _validate_camera_source(value):
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value < 0:
+            raise MotionInputError(
+                "camera source index must be a non-negative integer"
+            )
+        return value
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\r" in value
+        or "\n" in value
+        or "\x00" in value
+        or len(value) > MAX_CAMERA_SOURCE_TEXT
+    ):
+        raise MotionInputError(
+            "camera source must be a normalized device index or name"
+        )
+    return value
+
+
+def _validate_camera_wait_timeout(value):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not np.isfinite(value)
+        or value < 0
+        or value > threading.TIMEOUT_MAX
+    ):
+        raise MotionInputError(
+            "camera wait timeout must be a finite non-negative number"
+        )
+    return float(value)
+
+
+def _camera_cancellation_requested(cancellation_event):
+    if cancellation_event is None:
+        return False
+    is_set = getattr(cancellation_event, "is_set", None)
+    if not callable(is_set):
+        raise MotionInputError(
+            "camera cancellation event does not satisfy the event contract"
+        )
+    cancelled = is_set()
+    if not isinstance(cancelled, bool):
+        raise MotionInputError("camera cancellation state must be boolean")
+    return cancelled
+
+
+def normalize_camera_exception_detail(error, prefix=""):
+    """Return bounded, single-line diagnostic text for camera failures."""
+
     if (
         not isinstance(prefix, str)
         or prefix != prefix.lstrip()
@@ -220,6 +309,7 @@ class CameraPreviewWorker:
         self._release_attempts = release_attempts
         self._thread_factory = thread_factory
         self._lock = threading.Lock()
+        self._state_changed = threading.Condition(self._lock)
         self._request_changed = threading.Event()
         self._worker_stopped = threading.Event()
         self._worker_stopped.set()
@@ -260,8 +350,10 @@ class CameraPreviewWorker:
         with self._lock:
             return self._active_request_id
 
-    def request_start(self, camera_index):
-        _validate_nonnegative_integer(camera_index, "camera index")
+    def request_start(self, camera_source, *, replace=True):
+        camera_source = _validate_camera_source(camera_source)
+        if not isinstance(replace, bool):
+            raise MotionInputError("camera replacement option must be boolean")
         with self._lock:
             if self._closed:
                 raise MotionInputError("camera preview worker is closed")
@@ -270,17 +362,20 @@ class CameraPreviewWorker:
                     "camera preview worker requires an application restart: "
                     + self._fault_reason
                 )
+            if not replace and self._worker is not None:
+                raise MotionInputError("camera capture worker is busy")
             self._next_request_id += 1
             request = _CameraPreviewRequest(
                 request_id=self._next_request_id,
-                camera_index=camera_index,
+                camera_source=camera_source,
             )
             self._desired = request
             self._latest_preview = None
             self._latest_raw_frame = None
-            self._retain_failure_events_locked()
+            self._retain_terminal_events_locked()
             self._append_event_locked("starting", request)
             self._request_changed.set()
+            self._state_changed.notify_all()
             if self._worker is not None:
                 return request.request_id
 
@@ -294,17 +389,19 @@ class CameraPreviewWorker:
             except Exception as exc:
                 self._desired = None
                 self._worker_stopped.set()
-                detail = _normalized_exception_detail(
+                detail = normalize_camera_exception_detail(
                     exc,
                     "camera thread creation failed: ",
                 )
                 self._append_event_locked("failed", request, detail)
+                self._state_changed.notify_all()
                 raise RuntimeError(detail) from exc
             if not isinstance(worker, threading.Thread):
                 self._desired = None
                 self._worker_stopped.set()
                 detail = "camera thread factory returned an invalid worker"
                 self._append_event_locked("failed", request, detail)
+                self._state_changed.notify_all()
                 raise MotionInputError(detail)
             self._worker = worker
             try:
@@ -313,52 +410,218 @@ class CameraPreviewWorker:
                 self._worker = None
                 self._desired = None
                 self._worker_stopped.set()
-                detail = _normalized_exception_detail(
+                detail = normalize_camera_exception_detail(
                     exc,
                     "camera preview worker startup failed: ",
                 )
                 self._append_event_locked("failed", request, detail)
+                self._state_changed.notify_all()
                 raise RuntimeError(detail) from exc
             return request.request_id
 
-    def request_stop(self):
+    def request_stop(self, request_id=None):
+        if request_id is not None:
+            _validate_nonnegative_integer(request_id, "camera request id")
         with self._lock:
             request = self._desired
-            if request is None:
+            if (
+                request is None
+                or (
+                    request_id is not None
+                    and request.request_id != request_id
+                )
+            ):
                 return False
             self._desired = None
             self._latest_preview = None
             self._latest_raw_frame = None
             self._append_event_locked("stopping", request)
+            if self._active_request_id != request.request_id:
+                self._append_event_locked("stopped", request)
             self._request_changed.set()
+            self._state_changed.notify_all()
             return True
 
-    def close(self):
+    def _close_locked(self):
+        self._closed = True
+        request = self._desired
+        self._desired = None
+        self._latest_preview = None
+        self._latest_raw_frame = None
+        if request is not None:
+            self._append_event_locked("stopping", request)
+            if self._active_request_id != request.request_id:
+                self._append_event_locked("stopped", request)
+        self._request_changed.set()
+        self._state_changed.notify_all()
+
+    def _lifecycle_state_locked(self):
+        return CameraPreviewLifecycleState(
+            active=self._worker is not None,
+            stopped=self._worker_stopped.is_set(),
+            closed=self._closed,
+            fault_reason=self._fault_reason,
+        )
+
+    def close_state(self):
+        """Close acquisition and return one atomic lifecycle snapshot."""
+
         with self._lock:
-            self._closed = True
-            request = self._desired
-            self._desired = None
-            self._latest_preview = None
-            self._latest_raw_frame = None
-            if request is not None:
-                self._append_event_locked("stopping", request)
-            self._request_changed.set()
-            return self._worker is None and self._fault_reason is None
+            self._close_locked()
+            return self._lifecycle_state_locked()
+
+    def close(self):
+        return self.close_state().clean
 
     def wait_stopped(self, timeout=None):
         """Wait for worker retirement from a non-Tk lifecycle owner."""
 
-        if timeout is not None and (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or not np.isfinite(timeout)
-            or timeout < 0
-            or timeout > threading.TIMEOUT_MAX
-        ):
-            raise MotionInputError(
-                "camera stop timeout must be a finite non-negative number or None"
-            )
+        if timeout is not None:
+            timeout = _validate_camera_wait_timeout(timeout)
         return self._worker_stopped.wait(timeout)
+
+    def wait_ready(self, request_id, timeout, cancellation_event=None):
+        """Wait off Tk until a request owns a validated raw frame."""
+
+        _validate_nonnegative_integer(request_id, "camera request id")
+        timeout = _validate_camera_wait_timeout(timeout)
+        deadline = time.monotonic() + timeout
+        with self._state_changed:
+            while True:
+                if _camera_cancellation_requested(cancellation_event):
+                    return False
+                if (
+                    self._latest_raw_frame is not None
+                    and self._latest_raw_frame[0] == request_id
+                ):
+                    return True
+                if self._fault_reason is not None:
+                    raise MotionInputError(
+                        "camera preview cleanup requires an application "
+                        "restart: " + self._fault_reason
+                    )
+                desired_request_id = (
+                    None
+                    if self._desired is None
+                    else self._desired.request_id
+                )
+                if (
+                    desired_request_id != request_id
+                    and self._active_request_id != request_id
+                ):
+                    raise MotionInputError(
+                        "camera preview request ended before readiness"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                if cancellation_event is not None:
+                    remaining = min(
+                        remaining,
+                        CAMERA_PREVIEW_CANCELLATION_POLL_SECONDS,
+                    )
+                self._state_changed.wait(remaining)
+
+    def wait_request_stopped(
+        self,
+        request_id,
+        timeout,
+        cancellation_event=None,
+        *,
+        require_idle=False,
+    ):
+        """Wait off Tk for request cleanup without joining the worker."""
+
+        _validate_nonnegative_integer(request_id, "camera request id")
+        timeout = _validate_camera_wait_timeout(timeout)
+        if not isinstance(require_idle, bool):
+            raise MotionInputError("camera idle requirement must be boolean")
+        deadline = time.monotonic() + timeout
+        with self._state_changed:
+            while True:
+                if _camera_cancellation_requested(cancellation_event):
+                    return False
+                if self._fault_reason is not None:
+                    raise MotionInputError(
+                        "camera preview cleanup requires an application "
+                        "restart: " + self._fault_reason
+                    )
+                desired_request_id = (
+                    None
+                    if self._desired is None
+                    else self._desired.request_id
+                )
+                if (
+                    require_idle
+                    and desired_request_id is not None
+                    and desired_request_id != request_id
+                ):
+                    raise MotionInputError(
+                        "camera request ownership changed before idle"
+                    )
+                if (
+                    desired_request_id != request_id
+                    and self._active_request_id != request_id
+                ):
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                if cancellation_event is not None:
+                    remaining = min(
+                        remaining,
+                        CAMERA_PREVIEW_CANCELLATION_POLL_SECONDS,
+                    )
+                self._state_changed.wait(remaining)
+
+    def capture_once(self, camera_source, timeout, cancellation_event=None):
+        """Acquire one validated frame through the owned worker lifecycle."""
+
+        timeout = _validate_camera_wait_timeout(timeout)
+        if _camera_cancellation_requested(cancellation_event):
+            raise MotionInputError("camera capture was cancelled")
+        request_id = self.request_start(camera_source, replace=False)
+        try:
+            ready = self.wait_ready(
+                request_id,
+                timeout,
+                cancellation_event,
+            )
+            if not isinstance(ready, bool):
+                raise RuntimeError(
+                    "camera worker returned an invalid readiness result"
+                )
+            if not ready:
+                if _camera_cancellation_requested(cancellation_event):
+                    raise MotionInputError("camera capture was cancelled")
+                raise MotionInputError(
+                    "camera capture did not become ready before timeout"
+                )
+            frame = self.snapshot_raw_frame(request_id)
+            if frame is None:
+                raise MotionInputError(
+                    "camera capture lost request ownership before snapshot"
+                )
+            return frame
+        finally:
+            cleanup_error = None
+            try:
+                self.request_stop(request_id)
+                settled = self.wait_request_stopped(request_id, timeout)
+                if not isinstance(settled, bool):
+                    raise RuntimeError(
+                        "camera worker returned an invalid cleanup result"
+                    )
+                if not settled:
+                    cleanup_error = "camera capture cleanup timed out"
+            except Exception as exc:
+                cleanup_error = normalize_camera_exception_detail(
+                    exc,
+                    "camera capture cleanup failed: ",
+                )
+            if cleanup_error is not None:
+                self.close()
+                raise MotionInputError(cleanup_error)
 
     def drain_events(self):
         with self._lock:
@@ -386,10 +649,12 @@ class CameraPreviewWorker:
             frame = self._latest_raw_frame[1]
         return np.array(frame, dtype=np.uint8, copy=True, order="C")
 
-    def _retain_failure_events_locked(self):
+    def _retain_terminal_events_locked(self):
         retained = tuple(
-            event for event in self._events if event.kind == "failed"
-        )[-MAX_RETAINED_CAMERA_FAILURE_EVENTS:]
+            event
+            for event in self._events
+            if event.kind in ("failed", "stopped")
+        )[-MAX_RETAINED_CAMERA_TERMINAL_EVENTS:]
         self._events.clear()
         self._events.extend(retained)
 
@@ -462,7 +727,7 @@ class CameraPreviewWorker:
                 last_error = exc
                 if attempt + 1 < self._release_attempts:
                     time.sleep(self._retry_seconds)
-        return _normalized_exception_detail(
+        return normalize_camera_exception_detail(
             last_error,
             "camera release failed: ",
         )
@@ -491,10 +756,11 @@ class CameraPreviewWorker:
             self._latest_preview = frame
             if first_frame:
                 self._append_event_locked("started", request)
+            self._state_changed.notify_all()
             return True
 
     def _publish_request_failure(self, request, error):
-        detail = _normalized_exception_detail(
+        detail = normalize_camera_exception_detail(
             error,
             "camera preview failed: ",
         )
@@ -505,12 +771,13 @@ class CameraPreviewWorker:
                 self._latest_raw_frame = None
             self._append_event_locked("failed", request, detail)
             self._request_changed.set()
+            self._state_changed.notify_all()
         return detail
 
     def _run_session(self, request):
         capture = None
         try:
-            capture = self._capture_factory(request.camera_index)
+            capture = self._capture_factory(request.camera_source)
             self._validated_capture(capture)
             warmup_remaining = self._warmup_frames
             consecutive_failures = 0
@@ -551,6 +818,7 @@ class CameraPreviewWorker:
                 if self._active_request_id == request.request_id:
                     self._active_request_id = None
                 self._request_changed.set()
+                self._state_changed.notify_all()
 
     def _run(self):
         current_thread = threading.current_thread()
@@ -564,11 +832,13 @@ class CameraPreviewWorker:
                             self._worker_stopped.set()
                             self._active_request_id = None
                         self._request_changed.set()
+                        self._state_changed.notify_all()
                         break
                     self._active_request_id = request.request_id
+                    self._state_changed.notify_all()
                 self._run_session(request)
         except BaseException as exc:
-            detail = _normalized_exception_detail(
+            detail = normalize_camera_exception_detail(
                 exc,
                 "camera preview worker terminated: ",
             )
@@ -582,6 +852,7 @@ class CameraPreviewWorker:
                     self._fault_reason = detail
                     if request is not None:
                         self._append_event_locked("failed", request, detail)
+                    self._state_changed.notify_all()
         finally:
             with self._lock:
                 if self._worker is current_thread:
@@ -589,6 +860,7 @@ class CameraPreviewWorker:
                     self._worker_stopped.set()
                     self._active_request_id = None
                 self._request_changed.set()
+                self._state_changed.notify_all()
 
 
 def _validated_image_dimensions(width, height, field_name):

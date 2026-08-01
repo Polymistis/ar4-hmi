@@ -134,6 +134,13 @@ from ARrobots.HMI.joint_motion import (
     write_serial_control,
 )
 from ARrobots.HMI.joint_visualization import set_joint_slider_positions
+from ARrobots.HMI.vision_io import (
+    MAX_CAMERA_PREVIEW_EVENT_DETAIL,
+    CameraPreviewEvent,
+    CameraPreviewFrame,
+    CameraPreviewLifecycleState,
+    normalize_camera_exception_detail,
+)
 from ARrobots.HMI.Calibration import apply_calibration
 from ARrobots.Calibration import snapshot_calibration_values
 from ARrobots.calibration_schema import (
@@ -616,6 +623,10 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault(
             "EVENT_POLL_INTERVAL_MS",
             self.module_literal("EVENT_POLL_INTERVAL_MS"),
+        )
+        namespace.setdefault(
+            "CAMERA_PREVIEW_SHUTDOWN_GRACE_SECONDS",
+            self.module_literal("CAMERA_PREVIEW_SHUTDOWN_GRACE_SECONDS"),
         )
         namespace.setdefault(
             "EVENT_POLL_CALLBACK_NAMES",
@@ -1498,6 +1509,7 @@ class HmiSourceContractTests(unittest.TestCase):
             lambda: False,
         )
         namespace.setdefault("_poll_calibration_events", lambda: None)
+        namespace.setdefault("_poll_camera_preview_events", lambda: None)
         namespace.setdefault("_poll_manual_controller_events", lambda: None)
         namespace.setdefault("_poll_manual_auxiliary_events", lambda: None)
         namespace.setdefault("_poll_gcode_storage_events", lambda: None)
@@ -3808,6 +3820,918 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(configured[-1]["anchor"], "center")
         self.assertEqual(label.imgtk.shape, (150, 150, 3))
 
+    def test_camera_preview_callbacks_submit_without_device_io(self):
+        class Worker:
+            def __init__(self):
+                self.starts = []
+                self.stops = 0
+
+            def request_start(self, camera_source):
+                self.starts.append(camera_source)
+                return 12
+
+            def request_stop(self, request_id=None):
+                self.stops += 1
+                return True
+
+        worker = Worker()
+        closing = threading.Event()
+        statuses = []
+        namespace = {
+            "RUN": {
+                "cam_on": True,
+                "cameraPreviewRequestId": None,
+            },
+            "application_closing": closing,
+            "camera_preview_worker": worker,
+            "camera_preview_request_lock": threading.Lock(),
+            "visoptions": SimpleNamespace(get=lambda: "Camera 4"),
+            "_cache_vision_camera_selection": (
+                lambda selection: "/dev/video4"
+            ),
+            "normalize_camera_exception_detail": (
+                normalize_camera_exception_detail
+            ),
+            "MotionInputError": MotionInputError,
+            "logger": SimpleNamespace(error=lambda *args: None),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+        }
+        namespace["_submit_camera_preview_start"] = self.compile_function(
+            "_submit_camera_preview_start",
+            namespace,
+        )
+        namespace["_request_camera_preview_stop"] = self.compile_function(
+            "_request_camera_preview_stop",
+            namespace,
+        )
+        start = self.compile_function("start_vid", namespace)
+        stop = self.compile_function("stop_vid", namespace)
+
+        self.assertTrue(start())
+        self.assertEqual(worker.starts, ["/dev/video4"])
+        self.assertEqual(namespace["RUN"]["cameraPreviewRequestId"], 12)
+        self.assertFalse(namespace["RUN"]["cam_on"])
+        self.assertTrue(stop())
+        self.assertEqual(worker.stops, 1)
+        self.assertEqual(statuses, [])
+
+        closing.set()
+        self.assertFalse(start())
+        self.assertEqual(worker.starts, ["/dev/video4"])
+        self.assertIn("shutdown is active", statuses[-1][0])
+
+        forbidden_attributes = {"read", "release", "sleep", "VideoCapture"}
+        for function_name in (
+            "start_vid",
+            "stop_vid",
+            "show_frame",
+            "_apply_camera_preview_event",
+            "_poll_camera_preview_events",
+        ):
+            function = self.module_functions[function_name]
+            self.assertEqual(
+                [
+                    node.func.attr
+                    for node in ast.walk(function)
+                    if (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in forbidden_attributes
+                    )
+                ],
+                [],
+                function_name,
+            )
+
+        button_commands = {}
+        for assignment in (
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.Assign)
+        ):
+            if (
+                len(assignment.targets) != 1
+                or not isinstance(assignment.targets[0], ast.Name)
+                or assignment.targets[0].id not in {"StartCamBut", "StopCamBut"}
+                or not isinstance(assignment.value, ast.Call)
+            ):
+                continue
+            command = next(
+                (
+                    keyword.value
+                    for keyword in assignment.value.keywords
+                    if keyword.arg == "command"
+                ),
+                None,
+            )
+            button_commands[assignment.targets[0].id] = command
+        self.assertEqual(set(button_commands), {"StartCamBut", "StopCamBut"})
+        self.assertEqual(button_commands["StartCamBut"].id, "start_vid")
+        self.assertEqual(button_commands["StopCamBut"].id, "stop_vid")
+
+        camera_menus = [
+            node
+            for node in ast.walk(self.tree)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "OptionMenu"
+                and any(
+                    isinstance(argument, ast.Name)
+                    and argument.id == "visoptions"
+                    for argument in node.args
+                )
+            )
+        ]
+        self.assertTrue(camera_menus)
+        for menu in camera_menus:
+            command = next(
+                (
+                    keyword.value
+                    for keyword in menu.keywords
+                    if keyword.arg == "command"
+                ),
+                None,
+            )
+            self.assertIsInstance(command, ast.Name)
+            self.assertEqual(command.id, "_on_vision_camera_select")
+
+    def test_camera_selection_preserves_platform_device_identity(self):
+        label_namespace = {
+            "MotionInputError": MotionInputError,
+            "MAX_CAMERA_PREVIEW_EVENT_DETAIL": (
+                MAX_CAMERA_PREVIEW_EVENT_DETAIL
+            ),
+        }
+        camera_labels = self.compile_function(
+            "_camera_labels_for_sources",
+            label_namespace,
+        )
+        labels, sources = camera_labels(
+            [(0, "Shared Camera"), (3, "Shared Camera"), (4, "Unique")]
+        )
+        self.assertEqual(
+            labels,
+            [
+                "index 0: Shared Camera",
+                "index 3: Shared Camera",
+                "Unique",
+            ],
+        )
+        self.assertEqual(
+            sources,
+            {
+                "index 0: Shared Camera": 0,
+                "index 3: Shared Camera": 3,
+                "Unique": 4,
+            },
+        )
+        linux_labels, linux_sources = camera_labels(
+            [
+                ("/dev/video2", "Shared USB"),
+                ("/dev/video5", "Shared USB"),
+            ]
+        )
+        self.assertEqual(
+            linux_labels,
+            [
+                "source /dev/video2: Shared USB",
+                "source /dev/video5: Shared USB",
+            ],
+        )
+        self.assertEqual(
+            linux_sources,
+            {
+                "source /dev/video2: Shared USB": "/dev/video2",
+                "source /dev/video5: Shared USB": "/dev/video5",
+            },
+        )
+
+        windows_namespace = {
+            "camList": ["Camera A", "Camera B"],
+            "label_to_id": {"Camera A": 2, "Camera B": 4},
+            "CE": {"Platform": {"OS": "Windows"}},
+            "MotionInputError": MotionInputError,
+            "re": re,
+        }
+        select_windows = self.compile_function(
+            "_vision_camera_source_for_selection",
+            windows_namespace,
+        )
+        self.assertEqual(select_windows("Camera B"), 4)
+        windows_namespace["camera_selection_lock"] = threading.Lock()
+        windows_namespace["selected_vision_camera_source"] = None
+        windows_namespace["_vision_camera_source_for_selection"] = (
+            select_windows
+        )
+        cache_windows = self.compile_function(
+            "_cache_vision_camera_selection",
+            windows_namespace,
+        )
+        cached_windows = self.compile_function(
+            "_cached_vision_camera_source",
+            windows_namespace,
+        )
+        self.assertEqual(cache_windows("Camera A"), 2)
+        windows_namespace["label_to_id"]["Camera A"] = None
+        with self.assertRaisesRegex(MotionInputError, "unavailable"):
+            cache_windows("Camera A")
+        with self.assertRaisesRegex(MotionInputError, "not been configured"):
+            cached_windows()
+
+        statuses = []
+        windows_namespace.update({
+            "_cache_vision_camera_selection": cache_windows,
+            "normalize_camera_exception_detail": (
+                normalize_camera_exception_detail
+            ),
+            "logger": SimpleNamespace(
+                debug=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+        })
+        apply_selection = self.compile_function(
+            "_on_vision_camera_select",
+            windows_namespace,
+        )
+        self.assertFalse(apply_selection("Camera A"))
+        self.assertIn("CAMERA SELECTION REJECTED", statuses[-1][0])
+
+        linux_namespace = {
+            "camList": ["USB Camera", "CSI Camera"],
+            "label_to_id": {
+                "USB Camera": "/dev/video6",
+                "CSI Camera": "rpicam:2",
+            },
+            "CE": {"Platform": {"OS": "Linux"}},
+            "MotionInputError": MotionInputError,
+            "re": re,
+        }
+        select_linux = self.compile_function(
+            "_vision_camera_source_for_selection",
+            linux_namespace,
+        )
+        self.assertEqual(select_linux("USB Camera"), "/dev/video6")
+        self.assertEqual(select_linux("CSI Camera"), "rpicam:2")
+        linux_namespace["label_to_id"]["CSI Camera"] = "rpicam:invalid"
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "CSI camera source identity",
+        ):
+            select_linux("CSI Camera")
+
+        linux_namespace["label_to_id"]["CSI Camera"] = "rpicam:2"
+        linux_namespace["camera_selection_lock"] = threading.Lock()
+        linux_namespace["selected_vision_camera_source"] = None
+        linux_namespace["_vision_camera_source_for_selection"] = select_linux
+        cache_selection = self.compile_function(
+            "_cache_vision_camera_selection",
+            linux_namespace,
+        )
+        cached_source = self.compile_function(
+            "_cached_vision_camera_source",
+            linux_namespace,
+        )
+        self.assertEqual(cache_selection("USB Camera"), "/dev/video6")
+        self.assertEqual(cached_source(), "/dev/video6")
+
+        capture_calls = []
+        open_namespace = {
+            "CE": {"Platform": {"OS": "Linux"}},
+            "MotionInputError": MotionInputError,
+            "cv2": SimpleNamespace(
+                CAP_DSHOW=700,
+                VideoCapture=lambda *args: capture_calls.append(args),
+            ),
+        }
+        open_capture = self.compile_function(
+            "_open_camera_preview_capture",
+            open_namespace,
+        )
+        with self.assertRaisesRegex(MotionInputError, "Picamera2"):
+            open_capture("rpicam:2")
+        self.assertEqual(capture_calls, [])
+
+    def test_program_camera_waits_for_readiness_and_quiescence(self):
+        class Worker:
+            def __init__(self):
+                self.ready = True
+                self.settled = True
+                self.active = False
+                self.fault_reason = None
+                self.ready_calls = []
+                self.stop_calls = []
+                self.settle_calls = []
+                self.close_calls = 0
+
+            def wait_ready(self, request_id, timeout, cancellation):
+                self.ready_calls.append(
+                    (request_id, timeout, cancellation)
+                )
+                return self.ready
+
+            def request_stop(self, request_id):
+                self.stop_calls.append(request_id)
+                return True
+
+            def wait_request_stopped(
+                self,
+                request_id,
+                timeout,
+                cancellation=None,
+                *,
+                require_idle=False,
+            ):
+                self.settle_calls.append(
+                    (
+                        request_id,
+                        timeout,
+                        cancellation,
+                        require_idle,
+                    )
+                )
+                return self.settled
+
+            def close(self):
+                self.close_calls += 1
+                return False
+
+        worker = Worker()
+        submitted_sources = []
+        cancellation = threading.Event()
+        execution_request = SimpleNamespace(
+            cancellation_boundary=cancellation,
+        )
+        runtime = {"cam_on": True, "cameraPreviewRequestId": 7}
+
+        def submit_camera(source):
+            submitted_sources.append(source)
+            runtime["cameraPreviewRequestId"] = 7
+            return 7
+
+        namespace = {
+            "RUN": runtime,
+            "camera_preview_worker": worker,
+            "camera_preview_request_lock": threading.Lock(),
+            "CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS": 10.0,
+            "MotionInputError": MotionInputError,
+            "_cached_vision_camera_source": lambda: "/dev/video7",
+            "_submit_camera_preview_start": submit_camera,
+            "_program_execution_request_cancelled": (
+                lambda request: request.cancellation_boundary.is_set()
+            ),
+        }
+        namespace["_request_camera_preview_stop"] = self.compile_function(
+            "_request_camera_preview_stop",
+            namespace,
+        )
+        wait_start = self.compile_function(
+            "_wait_for_program_camera_start",
+            namespace,
+        )
+        wait_stop = self.compile_function(
+            "_wait_for_program_camera_stop",
+            namespace,
+        )
+
+        self.assertTrue(wait_start(execution_request))
+        self.assertEqual(
+            worker.ready_calls,
+            [(7, 10.0, cancellation)],
+        )
+        self.assertEqual(submitted_sources, ["/dev/video7"])
+
+        worker.ready = False
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "did not become ready before timeout",
+        ):
+            wait_start(execution_request)
+        self.assertEqual(worker.stop_calls, [7])
+        self.assertEqual(worker.settle_calls[-1], (7, 10.0, None, False))
+        self.assertIsNone(runtime["cameraPreviewRequestId"])
+
+        cancellation.set()
+        stop_count = len(worker.stop_calls)
+        self.assertFalse(wait_start(execution_request))
+        self.assertEqual(len(worker.stop_calls), stop_count + 1)
+        self.assertEqual(worker.stop_calls[-1], 7)
+        self.assertEqual(worker.settle_calls[-1], (7, 10.0, None, False))
+        self.assertIsNone(runtime["cameraPreviewRequestId"])
+
+        cancellation.clear()
+        namespace["RUN"]["cameraPreviewRequestId"] = 8
+        self.assertTrue(wait_stop(execution_request))
+        self.assertIsNone(namespace["RUN"]["cameraPreviewRequestId"])
+        self.assertEqual(
+            worker.settle_calls[-1],
+            (8, 10.0, cancellation, True),
+        )
+        program_start = self.module_functions[
+            "_wait_for_program_camera_start"
+        ]
+        self.assertNotIn(
+            "visoptions",
+            {
+                node.id
+                for node in ast.walk(program_start)
+                if isinstance(node, ast.Name)
+            },
+        )
+
+    def test_step_reverse_camera_operation_returns_through_tk_poll(self):
+        operation_release = threading.Event()
+        operation_threads = []
+        completion_queue = Queue()
+        callbacks = []
+        statuses = []
+        errors = []
+        request_namespace = {
+            "dataclass": dataclass,
+            "threading": threading,
+            "MotionInputError": MotionInputError,
+            "PROGRAM_EXECUTION_MODES": frozenset(
+                ("run", "step-forward", "step-reverse")
+            ),
+        }
+        request_class = self.compile_class(
+            "ProgramExecutionRequest",
+            request_namespace,
+        )
+        execution_request = request_class(
+            1,
+            "step-reverse",
+            request_namespace["SerialWriteCancellationBoundary"](
+                "camera step-reverse test"
+            ),
+        )
+        namespace = {
+            **request_namespace,
+            "Optional": Optional,
+            "MAX_CAMERA_PREVIEW_EVENT_DETAIL": (
+                MAX_CAMERA_PREVIEW_EVENT_DETAIL
+            ),
+            "PROGRAM_CAMERA_OPERATIONS": frozenset(("on", "off")),
+            "program_camera_completion_queue": completion_queue,
+            "Empty": Empty,
+            "normalize_camera_exception_detail": (
+                normalize_camera_exception_detail
+            ),
+            "ROW_EXECUTION_PENDING": "pending",
+            "_program_execution_request_cancelled": lambda request: False,
+            "_program_execution_request_active": lambda request: True,
+            "_wait_for_program_camera_start": lambda request: (
+                operation_threads.append(threading.get_ident()),
+                operation_release.wait(1.0),
+                True,
+            )[-1],
+            "_wait_for_program_camera_stop": lambda request: True,
+            "logger": SimpleNamespace(
+                error=lambda *args: errors.append(args),
+                exception=lambda *args: errors.append(args),
+                warning=lambda *args: errors.append(args),
+            ),
+            "_set_application_status": (
+                lambda *args, **kwargs: statuses.append((args, kwargs))
+            ),
+        }
+        namespace["ProgramCameraCompletionEvent"] = self.compile_class(
+            "ProgramCameraCompletionEvent",
+            namespace,
+        )
+        namespace["_perform_program_camera_operation"] = (
+            self.compile_function(
+                "_perform_program_camera_operation",
+                namespace,
+            )
+        )
+        namespace["_run_program_camera_operation"] = self.compile_function(
+            "_run_program_camera_operation",
+            namespace,
+        )
+        dispatch = self.compile_function(
+            "_dispatch_program_camera_operation",
+            namespace,
+        )
+        apply_completion = self.compile_function(
+            "_apply_program_camera_completion_event",
+            namespace,
+        )
+        namespace["_apply_program_camera_completion_event"] = (
+            apply_completion
+        )
+        drain_completions = self.compile_function(
+            "_drain_program_camera_completion_events",
+            namespace,
+        )
+
+        self.assertTrue(dispatch("off", execution_request, None))
+        namespace["_wait_for_program_camera_stop"] = lambda request: False
+        with self.assertRaisesRegex(RuntimeError, "stop result is invalid"):
+            dispatch("off", execution_request, None)
+        namespace["_program_execution_request_cancelled"] = (
+            lambda request: True
+        )
+        self.assertFalse(dispatch("off", execution_request, None))
+        namespace["_program_execution_request_cancelled"] = (
+            lambda request: False
+        )
+        namespace["_wait_for_program_camera_stop"] = lambda request: True
+
+        callback = lambda succeeded: callbacks.append(
+            (succeeded, threading.get_ident())
+        )
+        caller_thread = threading.get_ident()
+        self.assertEqual(
+            dispatch("on", execution_request, callback),
+            "pending",
+        )
+        operation_release.set()
+        event = completion_queue.get(timeout=2.0)
+        self.assertEqual(len(operation_threads), 1)
+        self.assertNotEqual(operation_threads[0], caller_thread)
+        completion_queue.put(event)
+        self.assertTrue(drain_completions())
+        self.assertEqual(callbacks, [(True, caller_thread)])
+        self.assertEqual(statuses, [])
+        self.assertEqual(errors, [])
+
+        namespace["_program_execution_request_active"] = (
+            lambda request: False
+        )
+        self.assertFalse(apply_completion(event))
+        self.assertEqual(callbacks, [(True, caller_thread)])
+        namespace["_program_execution_request_active"] = (
+            lambda request: True
+        )
+
+        namespace["_wait_for_program_camera_start"] = (
+            lambda request: (_ for _ in ()).throw(
+                MotionInputError("camera unavailable")
+            )
+        )
+        self.assertEqual(
+            dispatch("on", execution_request, callback),
+            "pending",
+        )
+        failed_event = completion_queue.get(timeout=2.0)
+        completion_queue.put(failed_event)
+        self.assertTrue(drain_completions())
+        self.assertEqual(callbacks[-1], (False, caller_thread))
+        self.assertIn("camera unavailable", statuses[-1][1]["text"])
+
+    def test_execute_row_camera_commands_use_settled_worker_contract(self):
+        class ProgramView:
+            command = b"Cam On\n"
+
+            @staticmethod
+            def curselection():
+                return (0,)
+
+            @staticmethod
+            def size():
+                return 1
+
+            @staticmethod
+            def see(row):
+                pass
+
+            @classmethod
+            def get(cls, *args):
+                return cls.command
+
+        runtime = {
+            "progRunning": False,
+            "rowinproc": 1,
+            "cmdType": None,
+            "cmdTypeLong": None,
+            "moveInProc": 0,
+        }
+        starts = []
+        stops = []
+        finishes = []
+        statuses = []
+        namespace = {
+            "RUN": runtime,
+            "tab1": SimpleNamespace(progView=ProgramView()),
+            "END": "end",
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "ROW_EXECUTION_PENDING": "pending",
+            "ROW_EXECUTION_COMPLETE": "complete",
+            "_reject_cancelled_program_row": lambda request: False,
+            "_dispatch_program_camera_operation": (
+                lambda operation, request, callback: (
+                    starts.append((request, callback))
+                    if operation == "on"
+                    else stops.append((request, callback))
+                )
+                or True
+            ),
+            "normalize_camera_exception_detail": (
+                normalize_camera_exception_detail
+            ),
+            "_finish_execute_row": lambda: finishes.append(True),
+            "_set_application_status": (
+                lambda *args, **kwargs: statuses.append((args, kwargs))
+            ),
+            "logger": SimpleNamespace(error=lambda *args: None),
+        }
+        execute = self.compile_function("executeRow", namespace)
+        execution_request = namespace["program_execution_active_request"]
+
+        self.assertEqual(
+            execute(execution_request=execution_request),
+            "complete",
+        )
+        self.assertEqual(starts, [(execution_request, None)])
+        self.assertEqual(finishes, [True])
+
+        ProgramView.command = b"Cam Off\n"
+        finishes.clear()
+        self.assertEqual(
+            execute(execution_request=execution_request),
+            "complete",
+        )
+        self.assertEqual(stops, [(execution_request, None)])
+        self.assertEqual(finishes, [True])
+
+        completion = lambda succeeded: None
+        pending_calls = []
+        namespace["_dispatch_program_camera_operation"] = (
+            lambda operation, request, callback: (
+                pending_calls.append((operation, request, callback))
+                or "pending"
+            )
+        )
+        ProgramView.command = b"Cam On\n"
+        finishes.clear()
+        self.assertEqual(
+            execute(
+                motion_complete=completion,
+                execution_request=execution_request,
+            ),
+            "pending",
+        )
+        self.assertEqual(
+            pending_calls,
+            [("on", execution_request, completion)],
+        )
+        self.assertEqual(finishes, [])
+
+        ProgramView.command = b"Cam On\n"
+        namespace["_dispatch_program_camera_operation"] = (
+            lambda operation, request, callback: (_ for _ in ()).throw(
+                MotionInputError("camera unavailable")
+            )
+        )
+        finishes.clear()
+        self.assertEqual(
+            execute(execution_request=execution_request),
+            "rejected",
+        )
+        self.assertEqual(finishes, [True])
+        self.assertIn("Camera-on program row rejected", statuses[-1][1]["text"])
+
+    def test_camera_preview_poll_applies_only_tk_presentation(self):
+        request_id = 9
+        preview = CameraPreviewFrame(
+            sequence=3,
+            request_id=request_id,
+            image=np.zeros((2, 3, 3), dtype=np.uint8),
+        )
+        events = [
+            CameraPreviewEvent(0, "starting", request_id),
+            CameraPreviewEvent(1, "started", request_id),
+        ]
+        frames = [preview]
+
+        class Worker:
+            @staticmethod
+            def drain_events():
+                drained = tuple(events)
+                events.clear()
+                return drained
+
+            @staticmethod
+            def take_latest_frame(owner):
+                self.assertEqual(owner, request_id)
+                return frames.pop(0) if frames else None
+
+        configured = []
+        errors = []
+        statuses = []
+        rescheduled = []
+        label = SimpleNamespace(
+            imgtk=None,
+            configure=lambda **kwargs: configured.append(kwargs),
+        )
+        namespace = {
+            "RUN": {
+                "cam_on": False,
+                "cameraPreviewRequestId": request_id,
+            },
+            "CameraPreviewEvent": CameraPreviewEvent,
+            "CameraPreviewFrame": CameraPreviewFrame,
+            "MotionInputError": MotionInputError,
+            "camera_preview_worker": Worker(),
+            "camera_preview_request_lock": threading.Lock(),
+            "Image": SimpleNamespace(fromarray=lambda image: image),
+            "ImageTk": SimpleNamespace(PhotoImage=lambda image: image),
+            "live_lbl": label,
+            "logger": SimpleNamespace(
+                error=lambda *args: errors.append(args),
+                exception=lambda *args: None,
+            ),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+            "_drain_program_camera_completion_events": lambda: True,
+            "_reschedule_event_poll": rescheduled.append,
+        }
+        namespace["show_frame"] = self.compile_function(
+            "show_frame",
+            namespace,
+        )
+        namespace["_apply_camera_preview_event"] = self.compile_function(
+            "_apply_camera_preview_event",
+            namespace,
+        )
+        poll = self.compile_function(
+            "_poll_camera_preview_events",
+            namespace,
+        )
+
+        poll()
+        self.assertTrue(namespace["RUN"]["cam_on"])
+        self.assertIs(label.imgtk, preview.image)
+        self.assertIs(configured[-1]["image"], preview.image)
+        self.assertEqual(statuses, [])
+        self.assertEqual(rescheduled, ["camera-preview"])
+
+        events.append(
+            CameraPreviewEvent(
+                2,
+                "failed",
+                request_id - 1,
+                "replaced request failed",
+            )
+        )
+        poll()
+        self.assertTrue(namespace["RUN"]["cam_on"])
+        self.assertEqual(
+            namespace["RUN"]["cameraPreviewRequestId"],
+            request_id,
+        )
+        self.assertEqual(statuses, [])
+        self.assertIn(
+            "FAILED AFTER REQUEST OWNERSHIP CHANGED",
+            errors[-1][0],
+        )
+        self.assertEqual(
+            rescheduled,
+            ["camera-preview", "camera-preview"],
+        )
+
+        events.append(
+            CameraPreviewEvent(
+                3,
+                "failed",
+                request_id,
+                "camera read failed",
+            )
+        )
+        poll()
+        self.assertFalse(namespace["RUN"]["cam_on"])
+        self.assertIsNone(namespace["RUN"]["cameraPreviewRequestId"])
+        self.assertEqual(
+            statuses[-1],
+            (
+                "CAMERA PREVIEW FAILED: camera read failed",
+                "Alarm.TLabel",
+            ),
+        )
+        self.assertEqual(
+            rescheduled,
+            [
+                "camera-preview",
+                "camera-preview",
+                "camera-preview",
+            ],
+        )
+
+    def test_vision_capture_uses_preview_snapshot_or_owned_one_shot(self):
+        preview_frame = np.full((2, 3, 3), 8, dtype=np.uint8)
+
+        class PreviewWorker:
+            active = True
+            fault_reason = None
+            one_shot_calls = []
+
+            @staticmethod
+            def snapshot_raw_frame(request_id):
+                self.assertEqual(request_id, 6)
+                return preview_frame.copy()
+
+            @classmethod
+            def capture_once(cls, camera_source, timeout):
+                cls.one_shot_calls.append((camera_source, timeout))
+                return np.ones((2, 3, 3), dtype=np.uint8)
+
+        namespace = {
+            "RUN": {
+                "cam_on": True,
+                "cameraPreviewRequestId": 6,
+            },
+            "camera_preview_worker": PreviewWorker(),
+            "camera_preview_request_lock": threading.Lock(),
+            "MotionInputError": MotionInputError,
+            "CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS": 10.0,
+            "_cached_vision_camera_source": lambda: "/dev/video3",
+        }
+        capture_frame = self.compile_function(
+            "_capture_current_vision_frame",
+            namespace,
+        )
+        captured = capture_frame()
+        np.testing.assert_array_equal(captured, preview_frame)
+        self.assertIsNot(captured, preview_frame)
+
+        namespace["RUN"]["cam_on"] = False
+        namespace["RUN"]["cameraPreviewRequestId"] = None
+        namespace["camera_preview_worker"].active = False
+        captured = capture_frame()
+        self.assertTrue(np.all(captured == 1))
+        self.assertEqual(
+            PreviewWorker.one_shot_calls,
+            [("/dev/video3", 10.0)],
+        )
+
+        namespace["camera_preview_worker"].active = True
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "transition is still active",
+        ):
+            capture_frame()
+
+        namespace["camera_preview_worker"].active = False
+        namespace["camera_preview_worker"].fault_reason = "release failed"
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "requires an application restart",
+        ):
+            capture_frame()
+
+        namespace["camera_preview_worker"].fault_reason = None
+        namespace["RUN"]["cam_on"] = True
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "no valid request owner",
+        ):
+            capture_frame()
+
+    def test_mask_capture_uses_owned_frame_source(self):
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        captures = []
+        writes = []
+        frame = np.full((4, 6, 3), 40, dtype=np.uint8)
+        namespace = {
+            "CAL": {"zoom": 50},
+            "VisBrightSlide": Value(0),
+            "VisContrastSlide": Value(0),
+            "VisZoomSlide": Value(50),
+            "_capture_current_vision_frame": (
+                lambda: captures.append(True) or frame.copy()
+            ),
+            "np": np,
+            "cv2": SimpleNamespace(
+                COLOR_BGR2GRAY=cv2.COLOR_BGR2GRAY,
+                cvtColor=cv2.cvtColor,
+                resize=cv2.resize,
+                imwrite=(
+                    lambda filename, image: (
+                        writes.append((filename, image.copy())) or True
+                    )
+                ),
+            ),
+        }
+        mask_pic = self.compile_function("mask_pic", namespace)
+
+        self.assertTrue(mask_pic())
+        self.assertEqual(captures, [True])
+        self.assertEqual(writes[0][0], "curImage.jpg")
+        self.assertEqual(writes[0][1].shape, (4, 6))
+
     def test_take_pic_propagates_failure_and_uses_rgb_grayscale(self):
         class Entry:
             def __init__(self, value="0"):
@@ -3886,6 +4810,15 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "ImageTk": SimpleNamespace(
                 PhotoImage=lambda image: object(),
+            ),
+            "_capture_current_vision_frame": (
+                lambda: Capture.read()[1]
+                if Capture.succeeds
+                else (_ for _ in ()).throw(
+                    MotionInputError(
+                        "camera did not return a captured frame"
+                    )
+                )
             ),
             "vid_lbl": SimpleNamespace(
                 imgtk=None,
@@ -6801,6 +7734,7 @@ class HmiSourceContractTests(unittest.TestCase):
         root = Root()
         activity = SerialActivityRegistry(("ser", "ser2"))
         poll_calls = []
+        camera_closes = []
         namespace = {
             "application_closing": closing,
             "serial_activity_registry": activity,
@@ -6815,6 +7749,18 @@ class HmiSourceContractTests(unittest.TestCase):
             "gcode_conversion_cancel_lock": threading.Lock(),
             "tab7": conversion_tab,
             "joint_motion_dispatcher": dispatcher,
+            "camera_preview_worker": SimpleNamespace(
+                close_state=lambda: (
+                    camera_closes.append(True)
+                    or CameraPreviewLifecycleState(
+                        active=True,
+                        stopped=False,
+                        closed=True,
+                        fault_reason=None,
+                    )
+                ),
+            ),
+            "CameraPreviewLifecycleState": CameraPreviewLifecycleState,
             "logger": logger,
             "_poll_application_close": lambda: poll_calls.append(True),
             "almStatusLab": first_label,
@@ -6829,9 +7775,12 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(offline_stop.is_set())
         self.assertTrue(conversion_cancel_requested.is_set())
         self.assertEqual(conversion_tab.GCrunTrue, 0)
+        self.assertEqual(camera_closes, [True])
+        self.assertFalse(namespace["RUN"]["cam_on"])
         self.assertTrue(dispatcher.closed)
         self.assertEqual(len(logger.errors), 1)
         self.assertIn("active worker", logger.errors[0][0])
+        self.assertEqual(logger.exceptions, [])
         with self.assertRaises(SerialActivityRejected):
             activity.begin("ser")
         self.assertEqual(poll_calls, [True])
@@ -6981,6 +7930,72 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(destroyed_windows, [True])
         self.assertEqual(root.quit_count, 1)
         self.assertEqual(root.destroy_count, 1)
+
+    def test_shutdown_supervises_camera_without_unbounded_wait(self):
+        class Root:
+            def __init__(self):
+                self.jobs = []
+
+            def after(self, delay, callback):
+                self.jobs.append((delay, callback))
+
+        class UnavailableLock:
+            def __init__(self):
+                self.attempts = 0
+
+            def acquire(self, blocking=True):
+                self.attempts += 1
+                return False
+
+        clock = iter((10.5, 12.1))
+        root = Root()
+        serial_lock = UnavailableLock()
+        errors = []
+        statuses = []
+        namespace = {
+            "camera_preview_worker": SimpleNamespace(active=True),
+            "camera_preview_shutdown_started_at": 10.0,
+            "camera_preview_shutdown_timeout_reported": False,
+            "time": SimpleNamespace(monotonic=lambda: next(clock)),
+            "serial_activity_registry": SerialActivityRegistry(
+                ("ser", "ser2")
+            ),
+            "calibration_serial_write_committed": threading.Event(),
+            "application_shutdown_started_at": None,
+            "SERIAL_SHUTDOWN_ACTIVITY_GRACE_SECONDS": 1.0,
+            "SERIAL_SHUTDOWN_POLL_MS": 25,
+            "root": root,
+            "serial_lock": serial_lock,
+            "_poll_serial_events": lambda: None,
+            "_poll_auxiliary_serial_events": lambda: None,
+            "_poll_joint_motion_events": lambda: None,
+            "logger": SimpleNamespace(
+                error=lambda *args: errors.append(args),
+                exception=lambda *args: None,
+            ),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+        }
+        poll_close = self.compile_function(
+            "_poll_application_close",
+            namespace,
+        )
+
+        self.assertFalse(poll_close())
+        self.assertEqual(serial_lock.attempts, 0)
+        self.assertEqual(
+            statuses[-1],
+            ("SHUTDOWN WAITING FOR CAMERA PREVIEW", "Warn.TLabel"),
+        )
+        self.assertEqual(len(root.jobs), 1)
+
+        self.assertFalse(root.jobs.pop(0)[1]())
+        self.assertEqual(serial_lock.attempts, 1)
+        self.assertTrue(namespace["camera_preview_shutdown_timeout_reported"])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("shutdown grace period", errors[0][0])
+        self.assertEqual(len(root.jobs), 1)
 
     def test_shutdown_waits_for_auxiliary_stop_settlement_before_serial_close(self):
         class Root:

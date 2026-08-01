@@ -602,9 +602,28 @@ Implemented portion:
 - Automatic and single-axis calibration buttons prepare validated commands on Tk, launch worker-owned serial exchanges, and apply terminal results on Tk without serial reads or controller waits.
 - Multi-stage automatic calibration retains shared motion ownership, main transport reservation, and a shutdown-activity lease until the final successful stage or first failure settles.
 - Calibration shutdown cannot cancel an active `LL` read because current Teensy firmware exposes no paired abort command. Pre-write shutdown rejects transmission at the shared lifecycle boundary and interrupts stalled pre-write activity after the normal drain interval. Post-write shutdown remains supervised until an applied terminal controller frame or explicit quarantine and verified-close handling settles the operation, while unrelated auxiliary activity continues through normal shutdown interruption. A later protocol pass must define preemption before claiming immediate calibration cancellation.
+- Live camera preview opening, warm-up, capture reads, frame conversion, and
+  release run under a request-scoped daemon worker. Tk start and stop callbacks
+  only submit replacement or cancellation intent, while shared event polling
+  applies the latest coalesced validated frame. Existing vision commands can
+  snapshot the latest owned raw preview frame without performing a concurrent
+  device read. Replacement discards stale transitional lifecycle chatter while
+  terminal stop and failure events remain available, camera cleanup failure
+  blocks reuse, and application shutdown supervises worker cleanup for a
+  bounded grace period without joining on Tk. Windows and USB source identities
+  remain explicit; CSI identities fail closed until a Picamera2 or libcamera
+  adapter exists. Hardware camera behavior and timing remain unverified.
+  Program `Cam On` and `Cam Off` rows use bounded,
+  cancellation-aware waits away from Tk so the next row observes a ready frame
+  or a quiescent device. Step Reverse returns camera settlement through the Tk
+  event poll, and cancellation retires an unready start request before row
+  ownership is released. Preview-off still capture reuses the same validated
+  worker lifecycle and backend instead of opening an independent capture path,
+  but the calling Tk workflow still waits for that result.
 
 Remaining scope includes broader program and G-code row-execution admission,
-camera, Modbus, auxiliary connection and device paths,
+asynchronous still-capture presentation and image processing, matching, mask,
+and template workflows, Modbus, auxiliary connection and device paths,
 request-scoped program-owner watchdog and recovery semantics for a lost worker
 or completion callback, durable event-poll failure handling when the Tk
 scheduler or interpreter is unavailable, application-lifecycle, timing, and

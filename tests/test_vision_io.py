@@ -17,9 +17,11 @@ else:
 from ARrobots.HMI.joint_motion import MotionInputError
 from ARrobots.HMI.vision_io import (
     CameraPreviewFrame,
+    CameraPreviewLifecycleState,
     CameraPreviewWorker,
     fit_vision_preview_square,
     load_bounded_vision_image,
+    normalize_camera_exception_detail,
     prepare_camera_preview_frame,
 )
 
@@ -151,6 +153,175 @@ class VisionIoTests(unittest.TestCase):
                     expected_detail,
                 ):
                     constructor()
+
+    def test_camera_preview_request_and_diagnostic_boundaries(self):
+        worker = CameraPreviewWorker(
+            lambda camera_source: self.fail(
+                "invalid camera source must not reach the factory"
+            )
+        )
+        for source in (
+            True,
+            -1,
+            "",
+            " /dev/video0",
+            "/dev/video0\n",
+            "camera\x00source",
+            "x" * 513,
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "camera source",
+                ):
+                    worker.request_start(source)
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "replacement option",
+        ):
+            worker.request_start(0, replace="yes")
+
+        detail = normalize_camera_exception_detail(
+            RuntimeError("a" * 511 + " " + "tail")
+        )
+        self.assertEqual(detail, "a" * 511)
+        self.assertEqual(detail, detail.strip())
+
+    def test_camera_capture_once_uses_owned_worker_lifecycle(self):
+        capture = QueuedCapture()
+        factory_calls = []
+
+        def factory(camera_source):
+            factory_calls.append(camera_source)
+            return capture
+
+        worker = CameraPreviewWorker(
+            factory,
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0.05,
+        )
+        expected = np.full((2, 3, 3), 19, dtype=np.uint8)
+        capture.responses.put((True, expected))
+        capture.responses.put((False, None))
+        captured = worker.capture_once("/dev/video6", 1)
+
+        np.testing.assert_array_equal(captured, expected)
+        self.assertIsNot(captured, expected)
+        self.assertEqual(factory_calls, ["/dev/video6"])
+        self.assertEqual(capture.release_count, 1)
+        self.assertFalse(worker.active)
+        self.assertEqual(
+            [event.kind for event in worker.drain_events()],
+            ["starting", "started", "stopping", "stopped"],
+        )
+
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(MotionInputError, "was cancelled"):
+            worker.capture_once(0, 1, cancelled)
+        self.assertEqual(factory_calls, ["/dev/video6"])
+
+    def test_camera_readiness_wait_honors_cancellation(self):
+        capture = QueuedCapture()
+        worker = CameraPreviewWorker(
+            lambda camera_source: capture,
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0,
+        )
+        request_id = worker.request_start(0)
+        cancelled = threading.Event()
+        cancelled.set()
+
+        self.assertFalse(worker.wait_ready(request_id, 1, cancelled))
+        self.assertTrue(worker.request_stop(request_id))
+        capture.responses.put((False, None))
+        self.assertTrue(worker.wait_request_stopped(request_id, 1))
+
+    def test_camera_stop_before_worker_entry_has_terminal_lifecycle(self):
+        worker_entry = threading.Event()
+
+        def thread_factory(target, name, daemon):
+            def delayed_target():
+                worker_entry.wait(1)
+                target()
+
+            return threading.Thread(
+                target=delayed_target,
+                name=name,
+                daemon=daemon,
+            )
+
+        worker = CameraPreviewWorker(
+            lambda camera_source: self.fail(
+                "cancelled request must not open a capture"
+            ),
+            thread_factory=thread_factory,
+        )
+        request_id = worker.request_start(0)
+        self.assertTrue(worker.request_stop(request_id))
+        self.assertEqual(
+            [event.kind for event in worker.drain_events()],
+            ["starting", "stopping", "stopped"],
+        )
+        worker_entry.set()
+        self.assertTrue(worker.wait_stopped(1))
+
+    def test_camera_replacement_retains_undrained_stop_event(self):
+        worker_entry = threading.Event()
+        capture = QueuedCapture()
+        factory_sources = []
+
+        def thread_factory(target, name, daemon):
+            def delayed_target():
+                worker_entry.wait(1)
+                target()
+
+            return threading.Thread(
+                target=delayed_target,
+                name=name,
+                daemon=daemon,
+            )
+
+        def capture_factory(camera_source):
+            factory_sources.append(camera_source)
+            return capture
+
+        worker = CameraPreviewWorker(
+            capture_factory,
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0,
+            thread_factory=thread_factory,
+        )
+        stopped_request = worker.request_start(0)
+        self.assertTrue(worker.request_stop(stopped_request))
+        replacement_request = worker.request_start(1)
+        self.assertEqual(
+            [
+                (event.kind, event.request_id)
+                for event in worker.drain_events()
+            ],
+            [
+                ("stopped", stopped_request),
+                ("starting", replacement_request),
+            ],
+        )
+
+        worker_entry.set()
+        self.assertTrue(
+            wait_for(
+                lambda: (
+                    worker.active_request_id == replacement_request
+                    and factory_sources == [1]
+                )
+            )
+        )
+        self.assertEqual(factory_sources, [1])
+        self.assertTrue(worker.request_stop(replacement_request))
+        capture.responses.put((False, None))
+        self.assertTrue(worker.wait_stopped(1))
 
     def test_camera_preview_worker_moves_io_off_caller_and_coalesces_frames(self):
         capture = QueuedCapture()
@@ -292,6 +463,7 @@ class VisionIoTests(unittest.TestCase):
 
         boundary_lock = ExitBoundaryLock(worker)
         worker._lock = boundary_lock
+        worker._state_changed = threading.Condition(boundary_lock)
         first_request = worker.request_start(0)
         first.responses.put(
             (True, np.full((2, 2, 3), 1, dtype=np.uint8))
@@ -344,17 +516,26 @@ class VisionIoTests(unittest.TestCase):
             )
         )
 
-        self.assertFalse(worker.close())
-        self.assertTrue(worker.closed)
-        self.assertFalse(worker.wait_stopped(0))
+        close_state = worker.close_state()
+        self.assertIsInstance(close_state, CameraPreviewLifecycleState)
+        self.assertTrue(close_state.active)
+        self.assertFalse(close_state.stopped)
+        self.assertTrue(close_state.closed)
+        self.assertIsNone(close_state.fault_reason)
+        self.assertFalse(close_state.clean)
         capture.responses.put((False, None))
         self.assertTrue(worker.wait_stopped(1))
         self.assertFalse(worker.active)
+        retired_state = worker.close_state()
+        self.assertFalse(retired_state.active)
+        self.assertTrue(retired_state.stopped)
+        self.assertTrue(retired_state.clean)
+        self.assertTrue(worker.close())
         with self.assertRaisesRegex(MotionInputError, "worker is closed"):
             worker.request_start(1)
-        with self.assertRaisesRegex(MotionInputError, "stop timeout"):
+        with self.assertRaisesRegex(MotionInputError, "wait timeout"):
             worker.wait_stopped(float("nan"))
-        with self.assertRaisesRegex(MotionInputError, "stop timeout"):
+        with self.assertRaisesRegex(MotionInputError, "wait timeout"):
             worker.wait_stopped(threading.TIMEOUT_MAX + 1)
 
     def test_camera_preview_worker_replaces_active_request_without_tk_wait(self):
@@ -386,6 +567,15 @@ class VisionIoTests(unittest.TestCase):
         second_request = worker.request_start(7)
         self.assertNotEqual(first_request, second_request)
         self.assertEqual(worker.desired_request_id, second_request)
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "ownership changed before idle",
+        ):
+            worker.wait_request_stopped(
+                first_request,
+                0,
+                require_idle=True,
+            )
         first.responses.put((False, None))
         second.responses.put(
             (True, np.full((2, 2, 3), 7, dtype=np.uint8))

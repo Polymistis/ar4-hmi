@@ -373,6 +373,23 @@ Tk serializes event callbacks on the interpreter thread. Long event handlers blo
 - Program-motion completion preserves the original virtual deadline across Tk-scheduler fallback. A missed deadline remains a failed result, but row ownership continues until the matching request-scoped virtual operation settles. If fallback-thread construction fails, the same settlement completes synchronously instead of releasing the row early.
 - VTK renders at motion cadence only while virtual joint angles change, then returns to a low-rate idle check. Topmost configuration uses bounded discovery instead of a permanent polling thread.
 - Verified shadowed `set_vtk_topmost_delayed` and `create_tool_control` definitions were consolidated.
+- Live camera preview now has a request-scoped acquisition owner. Camera open,
+  warm-up, reads, conversion, and release occur on a daemon worker; Tk submits
+  start, replacement, and stop intent and applies only validated lifecycle
+  events plus the latest coalesced RGB frame. Replaced-request failures remain
+  diagnostic without mutating the current request state, and terminal stop
+  events survive replacement until Tk can retire stale ownership. The worker
+  retains a validated raw-frame snapshot for existing vision commands, rejects
+  reuse after uncertain device cleanup, and participates in bounded shutdown
+  supervision. Windows and USB source identities remain explicit; CSI
+  identities fail closed until a Picamera2 or libcamera adapter exists. Program
+  camera-on and camera-off rows wait for request-scoped
+  readiness or quiescence away from Tk, preserving row ordering without
+  blocking Tk. Step Reverse receives camera settlement through the Tk event
+  poll, and cancellation retires an unready start request before row ownership
+  is released. Preview-off capture uses the same validated worker lifecycle and
+  platform backend. Still-capture presentation and image processing, matching,
+  mask, and template workflows remain blocking surfaces.
 
 Automated coverage is hardware-free and never imports `AR4.py`.
 
@@ -424,7 +441,8 @@ Cartesian adjustments still use raw commands that can be rejected while serial w
 ### Remaining performance surfaces
 
 - Large optional packages, including VTK, OpenCV, and Matplotlib, load during module startup even when corresponding tabs are unused.
-- Camera, program, and remaining auxiliary-board paths retain synchronous
+- Camera still-capture presentation and image processing, matching, mask,
+  template, program, and remaining auxiliary-board paths retain synchronous
   work. Program-row Modbus operations remain coupled to the broader program
   state machine, while the visible manual Modbus panel no longer waits for
   controller completion on Tk. Legacy main-controller exchanges still wait

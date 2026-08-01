@@ -293,8 +293,15 @@ from ARrobots.HMI.joint_visualization import (
   set_joint_slider_positions,
 )
 from ARrobots.HMI.vision_io import (
+  MAX_CAMERA_PREVIEW_EVENT_DETAIL,
+  CameraPreviewEvent,
+  CameraPreviewFrame,
+  CameraPreviewLifecycleState,
+  CameraPreviewWorker,
   fit_vision_preview_square,
   load_bounded_vision_image,
+  normalize_camera_exception_detail,
+  prepare_camera_preview_frame,
 )
 
 #####################################################################################
@@ -532,6 +539,9 @@ def _close_joint_motion_dispatcher_for_shutdown():
 
 
 def on_closing():
+  global camera_preview_shutdown_started_at
+  global camera_preview_shutdown_timeout_reported
+
   closing_event = globals().get('application_closing')
   with application_lifecycle_lock:
     if closing_event is not None and closing_event.is_set():
@@ -576,6 +586,27 @@ def on_closing():
     with offline_state_lock:
       offline_stop.set()
 
+  camera_worker = globals().get('camera_preview_worker')
+  if camera_worker is not None:
+    try:
+      camera_state = camera_worker.close_state()
+      if not isinstance(camera_state, CameraPreviewLifecycleState):
+        raise RuntimeError("camera preview returned an invalid close state")
+      if not camera_state.closed:
+        raise RuntimeError("camera preview did not enter the closed state")
+      if camera_state.fault_reason is not None:
+        logger.error(
+          "Camera preview shutdown retained a cleanup fault: %s",
+          camera_state.fault_reason,
+        )
+      if camera_state.active:
+        camera_preview_shutdown_started_at = time.monotonic()
+    except Exception:
+      logger.exception("Unable to stop camera preview during shutdown")
+  camera_preview_shutdown_timeout_reported = False
+  if isinstance(runtime_state, dict):
+    runtime_state['cam_on'] = False
+
   _close_joint_motion_dispatcher_for_shutdown()
 
   _set_application_status(text="SHUTDOWN WAITING FOR CONTROLLER", style="Warn.TLabel")
@@ -595,6 +626,10 @@ live_jog_lock = threading.Lock()
 live_cartesian_lock = threading.Lock()
 live_tool_lock = threading.Lock()
 application_lifecycle_lock = threading.Lock()
+camera_selection_lock = threading.Lock()
+camera_preview_request_lock = threading.Lock()
+selected_vision_camera_source = None
+program_camera_completion_queue = Queue()
 offline_live_jog_lock = threading.Lock()
 offline_live_jog_state_lock = threading.Lock()
 offline_live_jog_stop_event = threading.Event()
@@ -706,6 +741,8 @@ live_serial_result_pending = threading.Event()
 live_jog_stop_requested = threading.Event()
 application_closing = threading.Event()
 application_shutdown_started_at = None
+camera_preview_shutdown_started_at = None
+camera_preview_shutdown_timeout_reported = False
 shutdown_serial_cancel_requested = set()
 serial_activity_registry = SerialActivityRegistry(
   ("ser", "ser2"),
@@ -872,6 +909,7 @@ XBOX_AUXILIARY_FIXED_EXCHANGES = frozenset(
 )
 MANUAL_AUXILIARY_QUEUE_LIMIT = 64
 PROGRAM_EXECUTION_MODES = frozenset(("run", "step-forward", "step-reverse"))
+PROGRAM_CAMERA_OPERATIONS = frozenset(("on", "off"))
 PROGRAM_SELECTION_INITIALIZE_RUN = "initialize-run"
 PROGRAM_SELECTION_PREPARE_RUN = "prepare-run"
 PROGRAM_SELECTION_ADVANCE = "advance"
@@ -915,7 +953,10 @@ CONTROLLER_STARTUP_REQUIRED_CAPABILITIES = (
   CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
 )
 EVENT_POLL_INTERVAL_MS = 25
+CAMERA_PREVIEW_SHUTDOWN_GRACE_SECONDS = 2.0
+CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS = 10.0
 EVENT_POLL_CALLBACK_NAMES = {
+  "camera-preview": "_poll_camera_preview_events",
   "serial": "_poll_serial_events",
   "manual-controller": "_poll_manual_controller_events",
   "auxiliary-serial": "_poll_auxiliary_serial_events",
@@ -1025,6 +1066,39 @@ class ProgramExecutionRequest:
     ):
       raise MotionInputError(
         "program execution cancellation boundary is invalid"
+      )
+
+
+@dataclass(frozen=True)
+class ProgramCameraCompletionEvent:
+  execution_request: ProgramExecutionRequest
+  operation: str
+  completion_callback: object
+  succeeded: bool
+  error_detail: Optional[str] = None
+
+  def __post_init__(self):
+    if not isinstance(self.execution_request, ProgramExecutionRequest):
+      raise MotionInputError("program camera execution request is invalid")
+    if self.operation not in PROGRAM_CAMERA_OPERATIONS:
+      raise MotionInputError("program camera operation is invalid")
+    if not callable(self.completion_callback):
+      raise MotionInputError("program camera completion callback is invalid")
+    if not isinstance(self.succeeded, bool):
+      raise MotionInputError("program camera completion state is invalid")
+    if self.error_detail is not None and (
+      not isinstance(self.error_detail, str)
+      or not self.error_detail
+      or self.error_detail != self.error_detail.strip()
+      or " ".join(self.error_detail.split()) != self.error_detail
+      or "\r" in self.error_detail
+      or "\n" in self.error_detail
+      or len(self.error_detail) > MAX_CAMERA_PREVIEW_EVENT_DETAIL
+    ):
+      raise MotionInputError("program camera error detail is invalid")
+    if self.succeeded and self.error_detail is not None:
+      raise MotionInputError(
+        "successful program camera completion cannot contain an error"
       )
 
 
@@ -4522,7 +4596,10 @@ def _abandon_failed_controller_startup(
 
 def _poll_application_close():
   global application_shutdown_started_at
+  global camera_preview_shutdown_started_at
+  global camera_preview_shutdown_timeout_reported
 
+  _poll_camera_preview_events()
   _poll_serial_events()
   _poll_manual_controller_events()
   _poll_calibration_events()
@@ -4608,6 +4685,37 @@ def _poll_application_close():
   if conversion_active is not None and conversion_active.is_set():
     root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
     return False
+
+  camera_worker = globals().get('camera_preview_worker')
+  camera_worker_active = False
+  if camera_worker is not None:
+    try:
+      camera_worker_active = camera_worker.active
+      if not isinstance(camera_worker_active, bool):
+        raise RuntimeError("camera preview returned an invalid active state")
+    except Exception:
+      logger.exception("Unable to inspect camera preview shutdown state")
+      camera_worker_active = False
+  if camera_worker_active:
+    now = time.monotonic()
+    if camera_preview_shutdown_started_at is None:
+      camera_preview_shutdown_started_at = now
+    if (
+      now - camera_preview_shutdown_started_at
+      < CAMERA_PREVIEW_SHUTDOWN_GRACE_SECONDS
+    ):
+      _set_application_status(
+        "SHUTDOWN WAITING FOR CAMERA PREVIEW",
+        "Warn.TLabel",
+      )
+      root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+      return False
+    if not camera_preview_shutdown_timeout_reported:
+      camera_preview_shutdown_timeout_reported = True
+      logger.error(
+        "Camera preview did not stop before the shutdown grace period; "
+        "process exit will retire the daemon worker"
+      )
 
   if not serial_lock.acquire(blocking=False):
     root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
@@ -4715,7 +4823,7 @@ RUN['xyzuvw_In'] = np.zeros(6)
 RUN['KinematicError'] = 0
 
 RUN['cam_on'] = False
-RUN['cap'] = None
+RUN['cameraPreviewRequestId'] = None
 
 # Migrated global variables to RUN dictionary
 # Robot State & Control
@@ -4802,7 +4910,6 @@ RUN['render_window'] = None
 # Input Devices
 RUN['xboxUse'] = None
 RUN['selectedTemplate'] = None
-RUN['selectedCam'] = None
 
 
 #declare axis limit vars
@@ -17066,14 +17173,50 @@ def executeRow(motion_complete=None, execution_request=None):
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
-    start_vid()
+    try:
+      camera_result = _dispatch_program_camera_operation(
+        "on",
+        execution_request,
+        motion_complete,
+      )
+      if camera_result == ROW_EXECUTION_PENDING:
+        return ROW_EXECUTION_PENDING
+      if camera_result is not True:
+        if _reject_cancelled_program_row(execution_request):
+          return ROW_EXECUTION_REJECTED
+        raise RuntimeError("camera preview readiness result is invalid")
+    except Exception as exc:
+      detail = normalize_camera_exception_detail(exc)
+      message = f"Camera-on program row rejected: {detail}"
+      logger.error(message)
+      _set_application_status(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
 
   if(RUN['cmdType'] == "Cam Of"):
     if _reject_cancelled_program_row(execution_request):
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
-    stop_vid()  
+    try:
+      camera_result = _dispatch_program_camera_operation(
+        "off",
+        execution_request,
+        motion_complete,
+      )
+      if camera_result == ROW_EXECUTION_PENDING:
+        return ROW_EXECUTION_PENDING
+      if camera_result is not True:
+        if _reject_cancelled_program_row(execution_request):
+          return ROW_EXECUTION_REJECTED
+        raise RuntimeError("camera preview stop result is invalid")
+    except Exception as exc:
+      detail = normalize_camera_exception_detail(exc)
+      message = f"Camera-off program row rejected: {detail}"
+      logger.error(message)
+      _set_application_status(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
 
   if(RUN['cmdType'] == "Vis Fi"):
     if _reject_cancelled_program_row(execution_request):
@@ -27904,14 +28047,10 @@ def ErrorHandler(response):
 #################################################################################	
  
 def viscalc():
-  # global RUN['xMMpos']
-  # global RUN['yMMpos']
-  #origin x1 y1
   CAL['VisOrigXpix'] = float(VisX1PixEntryField.get())
   CAL['VisOrigXmm'] = float(VisX1RobEntryField.get()) 
   CAL['VisOrigYpix'] = float(VisY1PixEntryField.get()) 
   CAL['VisOrigYmm'] = float(VisY1RobEntryField.get()) 
-  # x2 y2
   CAL['VisEndXpix'] = float(VisX2PixEntryField.get())
   CAL['VisEndXmm'] = float(VisX2RobEntryField.get()) 
   CAL['VisEndYpix'] = float(VisY2PixEntryField.get()) 
@@ -27925,7 +28064,6 @@ def viscalc():
   XMrange = float(CAL['VisEndXmm']) - float(CAL['VisOrigXmm'])
   XMpos = float(XMrange) * float(XPratio)
   RUN['xMMpos'] = float(CAL['VisOrigXmm']) + XMpos
-  ##
   YPrange = float(CAL['VisEndYpix']) - float(CAL['VisOrigYpix'])
   YPratio = (y-float(CAL['VisOrigYpix'])) / YPrange
   YMrange = float(CAL['VisEndYmm']) - float(CAL['VisOrigYmm'])
@@ -27937,47 +28075,511 @@ def viscalc():
 
 
 
-# Define function to show frame
-def show_frame():
+def _vision_camera_source_for_selection(selection):
+  if not isinstance(selection, str) or not selection.strip():
+    raise MotionInputError("camera selection must be non-empty text")
+  platform_config = CE.get('Platform')
+  if not isinstance(platform_config, dict):
+    raise MotionInputError("camera platform configuration is invalid")
+  platform_name = platform_config.get('OS')
+  if not isinstance(platform_name, str) or not platform_name:
+    raise MotionInputError("camera platform identity is invalid")
+  camera_sources = globals().get('label_to_id')
+  if not isinstance(camera_sources, dict):
+    raise MotionInputError("camera source mapping is unavailable")
+  camera_source = camera_sources.get(selection)
+  if platform_name == "Windows":
+    if (
+      isinstance(camera_source, bool)
+      or not isinstance(camera_source, int)
+      or camera_source < 0
+    ):
+      raise MotionInputError("selected camera is unavailable")
+    return camera_source
+  if platform_name == "Linux":
+    if not isinstance(camera_source, str) or not camera_source:
+      raise MotionInputError("selected camera is unavailable")
+    if camera_source.startswith("rpicam:"):
+      camera_index = camera_source.removeprefix("rpicam:")
+      if re.fullmatch(r"[0-9]+", camera_index) is None:
+        raise MotionInputError("CSI camera source identity is invalid")
+      return camera_source
+    return camera_source
+  raise MotionInputError("camera platform is unsupported")
 
-    if RUN['cam_on']:
 
-        ret, frame = RUN['cap'].read()    
+def _camera_labels_for_sources(camera_entries):
+  if not isinstance(camera_entries, (tuple, list)):
+    raise MotionInputError("camera entries are invalid")
+  normalized = []
+  source_identities = set()
+  name_counts = {}
+  for entry in camera_entries:
+    if not isinstance(entry, (tuple, list)) or len(entry) != 2:
+      raise MotionInputError("camera entry is invalid")
+    camera_source, name = entry
+    valid_integer_source = (
+      isinstance(camera_source, int)
+      and not isinstance(camera_source, bool)
+      and camera_source >= 0
+    )
+    valid_text_source = (
+      isinstance(camera_source, str)
+      and bool(camera_source)
+      and camera_source == camera_source.strip()
+      and "\r" not in camera_source
+      and "\n" not in camera_source
+      and "\x00" not in camera_source
+      and len(camera_source) <= MAX_CAMERA_PREVIEW_EVENT_DETAIL
+    )
+    if (
+      not (valid_integer_source or valid_text_source)
+      or camera_source in source_identities
+    ):
+      raise MotionInputError("camera source identity is invalid")
+    if (
+      not isinstance(name, str)
+      or not name
+      or name != name.strip()
+      or "\r" in name
+      or "\n" in name
+      or "\x00" in name
+      or len(name) > MAX_CAMERA_PREVIEW_EVENT_DETAIL
+    ):
+      raise MotionInputError("camera name is invalid")
+    source_identities.add(camera_source)
+    name_counts[name] = name_counts.get(name, 0) + 1
+    normalized.append((camera_source, name))
 
-        if ret:
-            cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)    
-            img = Image.fromarray(cv2image).resize((480,320))
-            imgtk = ImageTk.PhotoImage(image=img)        
-            live_lbl.imgtk = imgtk    
-            live_lbl.configure(image=imgtk)    
-        
-        live_lbl.after(10, show_frame)
+  def source_label(camera_source):
+    prefix = "index" if isinstance(camera_source, int) else "source"
+    return f"{prefix} {camera_source}"
+
+  labels = [
+    name
+    if name_counts[name] == 1
+    else f"{source_label(camera_source)}: {name}"
+    for camera_source, name in normalized
+  ]
+  if len(set(labels)) != len(labels):
+    labels = [
+      f"{source_label(camera_source)}: {name}"
+      for camera_source, name in normalized
+    ]
+  return labels, {
+    label: normalized[index][0]
+    for index, label in enumerate(labels)
+  }
+
+
+def _cache_vision_camera_selection(selection):
+  global selected_vision_camera_source
+
+  with camera_selection_lock:
+    selected_vision_camera_source = None
+    camera_source = _vision_camera_source_for_selection(selection)
+    selected_vision_camera_source = camera_source
+  return camera_source
+
+
+def _cached_vision_camera_source():
+  with camera_selection_lock:
+    camera_source = selected_vision_camera_source
+  if isinstance(camera_source, int) and not isinstance(camera_source, bool):
+    if camera_source < 0:
+      raise MotionInputError("cached camera device index is invalid")
+    return camera_source
+  if (
+    not isinstance(camera_source, str)
+    or not camera_source
+    or camera_source != camera_source.strip()
+    or "\r" in camera_source
+    or "\n" in camera_source
+    or "\x00" in camera_source
+  ):
+    raise MotionInputError("camera selection has not been configured")
+  return camera_source
+
+
+def _on_vision_camera_select(selection):
+  try:
+    camera_source = _cache_vision_camera_selection(selection)
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"CAMERA SELECTION REJECTED: {detail}"
+    logger.exception("Unable to apply the selected camera")
+    try:
+      _set_application_status(message, "Alarm.TLabel")
+    except Exception:
+      logger.exception("Unable to present the rejected camera selection")
+    return False
+  logger.debug(
+    "Selected camera %r with source %r",
+    selection,
+    camera_source,
+  )
+  return True
+
+
+def _open_camera_preview_capture(camera_source):
+  if CE['Platform']['OS'] == "Windows":
+    if isinstance(camera_source, bool) or not isinstance(camera_source, int):
+      raise MotionInputError("Windows camera source must be a device index")
+    return cv2.VideoCapture(camera_source, cv2.CAP_DSHOW)
+  if isinstance(camera_source, str) and camera_source.startswith("rpicam:"):
+    raise MotionInputError(
+      "CSI camera capture requires a Picamera2 or libcamera adapter"
+    )
+  return cv2.VideoCapture(camera_source)
+
+
+camera_preview_worker = CameraPreviewWorker(
+  _open_camera_preview_capture,
+  prepare_camera_preview_frame,
+)
+
+
+def show_frame(preview_frame):
+  if not isinstance(preview_frame, CameraPreviewFrame):
+    raise MotionInputError("camera preview supplied an invalid frame record")
+  image = Image.fromarray(preview_frame.image)
+  imgtk = ImageTk.PhotoImage(image=image)
+  live_lbl.imgtk = imgtk
+  live_lbl.configure(image=imgtk)
+  return True
+
+
+def _apply_camera_preview_event(event):
+  if not isinstance(event, CameraPreviewEvent):
+    raise RuntimeError("camera preview worker emitted an invalid event")
+  stale_failure = False
+  current_failure = False
+  with camera_preview_request_lock:
+    request_id = RUN.get('cameraPreviewRequestId')
+    if event.request_id != request_id:
+      stale_failure = event.kind == "failed"
+    elif event.kind == "started":
+      RUN['cam_on'] = True
+      return True
+    elif event.kind in ("starting", "stopping"):
+      RUN['cam_on'] = False
+      return True
+    elif event.kind == "stopped":
+      RUN['cam_on'] = False
+      RUN['cameraPreviewRequestId'] = None
+      return True
+    elif event.kind == "failed":
+      RUN['cam_on'] = False
+      RUN['cameraPreviewRequestId'] = None
+      current_failure = True
+    else:
+      raise RuntimeError("camera preview worker emitted an unknown event")
+  if stale_failure:
+    message = (
+      f"CAMERA PREVIEW REQUEST {event.request_id} FAILED AFTER "
+      "REQUEST OWNERSHIP CHANGED"
+    )
+    if event.detail:
+      message += f": {event.detail}"
+    logger.error(message)
+    return True
+  if current_failure:
+    message = "CAMERA PREVIEW FAILED"
+    if event.detail:
+      message += f": {event.detail}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return True
+  return False
+
+
+def _apply_program_camera_completion_event(event):
+  if not isinstance(event, ProgramCameraCompletionEvent):
+    raise RuntimeError("program camera worker emitted an invalid event")
+  if not _program_execution_request_active(event.execution_request):
+    logger.warning("Ignoring a stale program camera completion")
+    return False
+  succeeded = event.succeeded
+  if event.error_detail is not None:
+    message = (
+      f"Camera-{event.operation} program row rejected: "
+      f"{event.error_detail}"
+    )
+    logger.error(message)
+    try:
+      _set_application_status(text=message, style="Alarm.TLabel")
+    except Exception:
+      logger.exception("Unable to present a program camera failure")
+  event.completion_callback(succeeded)
+  return True
+
+
+def _drain_program_camera_completion_events():
+  while True:
+    try:
+      event = program_camera_completion_queue.get_nowait()
+    except Empty:
+      return True
+    try:
+      _apply_program_camera_completion_event(event)
+    except Exception:
+      logger.exception("Unable to apply a program camera completion")
+
+
+def _poll_camera_preview_events():
+  try:
+    _drain_program_camera_completion_events()
+    for event in camera_preview_worker.drain_events():
+      _apply_camera_preview_event(event)
+    with camera_preview_request_lock:
+      request_id = RUN.get('cameraPreviewRequestId')
+      if (
+        isinstance(request_id, int)
+        and not isinstance(request_id, bool)
+        and request_id >= 0
+      ):
+        preview_frame = camera_preview_worker.take_latest_frame(request_id)
+      else:
+        preview_frame = None
+      if (
+        preview_frame is not None
+        and RUN.get('cameraPreviewRequestId') == preview_frame.request_id
+      ):
+        show_frame(preview_frame)
+        RUN['cam_on'] = True
+  except Exception:
+    RUN['cam_on'] = False
+    logger.exception("Unable to apply camera preview worker results")
+    _set_application_status(
+      "CAMERA PREVIEW RESULT FAILED",
+      "Alarm.TLabel",
+    )
+  finally:
+    _reschedule_event_poll("camera-preview")
+
 
 def start_vid():
-    #global cam_on, cap
-    #global cap
-    stop_vid()
-    RUN['cam_on'] = True
-    curVisStringSel = visoptions.get()
-    for i in range(len(camList)):
-      if curVisStringSel == camList[i]:
-          RUN['selectedCam'] = i
-          break
-    #RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
-    RUN['cap'] = cv2.VideoCapture(RUN['selectedCam'], cv2.CAP_DSHOW)
-    for _ in range(5):
-      RUN['cap'].read()
-    show_frame()
-
-
+  try:
+    camera_source = _cache_vision_camera_selection(visoptions.get())
+    _submit_camera_preview_start(camera_source)
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"CAMERA PREVIEW START REJECTED: {detail}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  return True
 
 
 def stop_vid():
-    #global cam_on
+  try:
+    _, stopped = _request_camera_preview_stop()
+    if not isinstance(stopped, bool):
+      raise RuntimeError("camera preview returned an invalid stop result")
+    return stopped
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"CAMERA PREVIEW STOP FAILED: {detail}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+  return False
+
+
+def _request_camera_preview_stop():
+  with camera_preview_request_lock:
+    request_id = RUN.get('cameraPreviewRequestId')
+    if request_id is not None and (
+      isinstance(request_id, bool)
+      or not isinstance(request_id, int)
+      or request_id < 0
+    ):
+      raise MotionInputError("camera preview has no valid request owner")
     RUN['cam_on'] = False
-    
-    if RUN['cap']:
-        RUN['cap'].release()
+    stopped = camera_preview_worker.request_stop(request_id)
+  return request_id, stopped
+
+
+def _submit_camera_preview_start(camera_source):
+  if application_closing.is_set():
+    raise MotionInputError("application shutdown is active")
+  with camera_preview_request_lock:
+    request_id = camera_preview_worker.request_start(camera_source)
+    RUN['cameraPreviewRequestId'] = request_id
+    RUN['cam_on'] = False
+  return request_id
+
+
+def _wait_for_program_camera_start(execution_request):
+  camera_source = _cached_vision_camera_source()
+  request_id = _submit_camera_preview_start(camera_source)
+  ready = camera_preview_worker.wait_ready(
+    request_id,
+    CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+    execution_request.cancellation_boundary,
+  )
+  if not isinstance(ready, bool):
+    raise RuntimeError("camera preview returned an invalid readiness result")
+  if ready:
+    return True
+  cancelled = _program_execution_request_cancelled(execution_request)
+  with camera_preview_request_lock:
+    stop_requested = camera_preview_worker.request_stop(request_id)
+  if not isinstance(stop_requested, bool):
+    raise RuntimeError("camera preview returned an invalid stop result")
+  cleanup_settled = camera_preview_worker.wait_request_stopped(
+    request_id,
+    CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+  )
+  if not isinstance(cleanup_settled, bool):
+    raise RuntimeError("camera preview returned an invalid cleanup result")
+  if not cleanup_settled:
+    close_result = camera_preview_worker.close()
+    if not isinstance(close_result, bool):
+      raise RuntimeError("camera preview returned an invalid close result")
+    with camera_preview_request_lock:
+      if RUN.get('cameraPreviewRequestId') == request_id:
+        RUN['cameraPreviewRequestId'] = None
+    raise MotionInputError(
+      "camera preview cleanup timed out after readiness timeout"
+    )
+  with camera_preview_request_lock:
+    if RUN.get('cameraPreviewRequestId') == request_id:
+      RUN['cameraPreviewRequestId'] = None
+  if cancelled:
+    return False
+  raise MotionInputError(
+    "camera preview did not become ready before timeout"
+  )
+
+
+def _wait_for_program_camera_stop(execution_request):
+  request_id, stopped = _request_camera_preview_stop()
+  if not isinstance(stopped, bool):
+    raise RuntimeError("camera preview returned an invalid stop result")
+  if request_id is None:
+    camera_active = camera_preview_worker.active
+    if not isinstance(camera_active, bool):
+      raise RuntimeError("camera preview returned an invalid active state")
+    if camera_active:
+      raise MotionInputError("camera preview has no valid request owner")
+    camera_fault = camera_preview_worker.fault_reason
+    if camera_fault is not None:
+      if (
+        not isinstance(camera_fault, str)
+        or not camera_fault
+        or camera_fault != camera_fault.strip()
+      ):
+        raise RuntimeError("camera preview returned an invalid fault state")
+      raise MotionInputError(
+        "camera preview cleanup requires an application restart: "
+        + camera_fault
+      )
+    return True
+  if (
+    isinstance(request_id, bool)
+    or not isinstance(request_id, int)
+    or request_id < 0
+  ):
+    raise MotionInputError("camera preview has no valid request owner")
+  settled = camera_preview_worker.wait_request_stopped(
+    request_id,
+    CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+    execution_request.cancellation_boundary,
+    require_idle=True,
+  )
+  if not isinstance(settled, bool):
+    raise RuntimeError("camera preview returned an invalid stop result")
+  if settled:
+    with camera_preview_request_lock:
+      if RUN.get('cameraPreviewRequestId') == request_id:
+        RUN['cameraPreviewRequestId'] = None
+    return True
+  if _program_execution_request_cancelled(execution_request):
+    return False
+  close_result = camera_preview_worker.close()
+  if not isinstance(close_result, bool):
+    raise RuntimeError("camera preview returned an invalid close result")
+  with camera_preview_request_lock:
+    if RUN.get('cameraPreviewRequestId') == request_id:
+      RUN['cameraPreviewRequestId'] = None
+  raise MotionInputError("camera preview did not stop before timeout")
+
+
+def _perform_program_camera_operation(operation, execution_request):
+  if operation not in PROGRAM_CAMERA_OPERATIONS:
+    raise MotionInputError("program camera operation is invalid")
+  if not isinstance(execution_request, ProgramExecutionRequest):
+    raise MotionInputError("program camera execution request is invalid")
+  if operation == "on":
+    result = _wait_for_program_camera_start(execution_request)
+    failure_message = "camera preview readiness result is invalid"
+  else:
+    result = _wait_for_program_camera_stop(execution_request)
+    failure_message = "camera preview stop result is invalid"
+  if not isinstance(result, bool):
+    raise RuntimeError(failure_message)
+  if not result and not _program_execution_request_cancelled(
+    execution_request
+  ):
+    raise RuntimeError(failure_message)
+  return result
+
+
+def _run_program_camera_operation(
+  operation,
+  execution_request,
+  completion_callback,
+):
+  succeeded = False
+  error_detail = None
+  try:
+    succeeded = _perform_program_camera_operation(
+      operation,
+      execution_request,
+    )
+  except BaseException as exc:
+    error_detail = normalize_camera_exception_detail(exc)
+  event = ProgramCameraCompletionEvent(
+    execution_request=execution_request,
+    operation=operation,
+    completion_callback=completion_callback,
+    succeeded=succeeded,
+    error_detail=error_detail,
+  )
+  program_camera_completion_queue.put(event)
+
+
+def _dispatch_program_camera_operation(
+  operation,
+  execution_request,
+  completion_callback,
+):
+  if operation not in PROGRAM_CAMERA_OPERATIONS:
+    raise MotionInputError("program camera operation is invalid")
+  if not isinstance(execution_request, ProgramExecutionRequest):
+    raise MotionInputError("program camera execution request is invalid")
+  if completion_callback is None:
+    return _perform_program_camera_operation(
+      operation,
+      execution_request,
+    )
+  if not callable(completion_callback):
+    raise MotionInputError("program camera completion callback is invalid")
+  try:
+    worker = threading.Thread(
+      target=_run_program_camera_operation,
+      args=(operation, execution_request, completion_callback),
+      name=f"ar4-program-camera-{operation}",
+      daemon=True,
+    )
+    worker.start()
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(
+      exc,
+      "program camera worker startup failed: ",
+    )
+    raise RuntimeError(detail) from exc
+  return ROW_EXECUTION_PENDING
 
 #vismenu.size
 
@@ -28101,28 +28703,54 @@ def _validated_vision_sample_pixels(image, points):
   return tuple(samples)
 
 
-def take_pic(background_override=None):
-  # global RUN['selectedCam']
-  #global cap
-  # global RUN['BGavg']
-  # global RUN['mX1']
-  # global RUN['mY1']
-  # global RUN['mX2']
-  # global RUN['mY2']
+def _capture_current_vision_frame():
+  with camera_preview_request_lock:
+    request_id = RUN.get('cameraPreviewRequestId')
+    valid_request_id = (
+      isinstance(request_id, int)
+      and not isinstance(request_id, bool)
+      and request_id >= 0
+    )
+    frame = (
+      camera_preview_worker.snapshot_raw_frame(request_id)
+      if valid_request_id
+      else None
+    )
+    camera_on = RUN.get('cam_on') is True
+  if frame is not None:
+    return frame
+  if camera_on:
+    if not valid_request_id:
+      raise MotionInputError("camera preview has no valid request owner")
+    raise MotionInputError("camera preview has no captured frame")
+  camera_active = camera_preview_worker.active
+  if not isinstance(camera_active, bool):
+    raise RuntimeError("camera preview returned an invalid active state")
+  if camera_active:
+    raise MotionInputError("camera preview transition is still active")
+  camera_fault = camera_preview_worker.fault_reason
+  if camera_fault is not None:
+    if (
+      not isinstance(camera_fault, str)
+      or not camera_fault
+      or camera_fault != camera_fault.strip()
+    ):
+      raise RuntimeError("camera preview returned an invalid fault state")
+    raise MotionInputError(
+      "camera preview cleanup requires an application restart: "
+      + camera_fault
+    )
 
+  camera_source = _cached_vision_camera_source()
+  return camera_preview_worker.capture_once(
+    camera_source,
+    CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+  )
+
+
+def take_pic(background_override=None):
   try:
-    if(RUN['cam_on']):
-      ret, frame = RUN['cap'].read()
-    else:
-      curVisStingSel = visoptions.get()
-      l = len(camList)
-      for i in range(l):
-        if (visoptions.get() == camList[i]):
-          RUN['selectedCam'] = i
-      RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
-      ret, frame = RUN['cap'].read()
-    if not ret or frame is None:
-      raise MotionInputError("camera did not return a captured frame")
+    frame = _capture_current_vision_frame()
 
     brightness = int(VisBrightSlide.get())
     contrast = int(VisContrastSlide.get())
@@ -28135,10 +28763,8 @@ def take_pic(background_override=None):
     cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
     
 
-    #get the webcam size
     height, width = cv2image.shape
 
-    #prepare the crop
     centerX,centerY=int(height/2),int(width/2)
     radiusX,radiusY= int(CAL['zoom']*height/100),int(CAL['zoom']*width/100)
 
@@ -28183,10 +28809,8 @@ def take_pic(background_override=None):
 
     h = cv2image.shape[0]
     w = cv2image.shape[1]
-    # loop over the image
     for y in range(0, h):
       for x in range(0, w):
-        # change the pixel
         cv2image[y, x] = background if x >= RUN['mX2'] or x <= RUN['mX1'] or y <= RUN['mY1'] or y >= RUN['mY2'] else cv2image[y, x]  
 
     img = Image.fromarray(cv2image).resize((640,480))
@@ -28205,26 +28829,7 @@ def take_pic(background_override=None):
     return False
 
 def mask_pic():
-  # global RUN['selectedCam']
-  #global cap
-  # global RUN['BGavg']
-  # global RUN['mX1']
-  # global RUN['mY1']
-  # global RUN['mX2']
-  # global RUN['mY2']
-
-  if(RUN['cam_on']):
-    ret, frame = RUN['cap'].read()
-  else:
-    curVisStingSel = visoptions.get()
-    l = len(camList)
-    for i in range(l):
-      if (visoptions.get() == camList[i]):
-        RUN['selectedCam'] = i
-    RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
-    ret, frame = RUN['cap'].read()
-  if not ret or frame is None:
-    raise MotionInputError("camera did not return a mask frame")
+  frame = _capture_current_vision_frame()
   brightness = int(VisBrightSlide.get())
   contrast = int(VisContrastSlide.get())
   CAL['zoom'] = int(VisZoomSlide.get())
@@ -28233,19 +28838,13 @@ def mask_pic():
   frame = np.clip(frame, 0, 255)
   frame = np.uint8(frame) 
   cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
-  #get the webcam size
   height, width = cv2image.shape
-  #prepare the crop
   centerX,centerY=int(height/2),int(width/2)
   radiusX,radiusY= int(CAL['zoom']*height/100),int(CAL['zoom']*width/100)
   minX,maxX=centerX-radiusX,centerX+radiusX
   minY,maxY=centerY-radiusY,centerY+radiusY
   cropped = cv2image[minX:maxX, minY:maxY]
   cv2image = cv2.resize(cropped, (width, height))
-  #img = Image.fromarray(cv2image).resize((640,480))
-  #imgtk = ImageTk.PhotoImage(image=img) 
-  #vid_lbl.imgtk = imgtk    
-  #vid_lbl.configure(image=imgtk) 
   filename = 'curImage.jpg'
   if not cv2.imwrite(filename, cv2image):
     raise OSError("captured mask frame could not be persisted")
@@ -28256,16 +28855,6 @@ def mask_pic():
 
 
 def _mask_crop(event, x, y, flags, param):
-    # global RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'], RUN['cropping']
-    #global oriImage
-    # global RUN['box_points']
-    # global RUN['button_down']
-    # global RUN['mX1']
-    # global RUN['mY1']
-    # global RUN['mX2']
-    # global RUN['mY2']
-
-
     cropDone = False
     
 
@@ -28386,11 +28975,6 @@ def selectMask():
 
 
 def mouse_crop(event, x, y, flags, param):
-    # global RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'], RUN['cropping']
-    #global oriImage
-    # global RUN['box_points']
-    # global RUN['button_down']
-
     cropDone = False
     
 
@@ -28460,8 +29044,6 @@ def selectTemplate():
 
 
 def snapFind():
-  # global RUN['selectedTemplate']
-  # global RUN['BGavg']
   try:
     if take_pic() is not True:
       return False
@@ -28504,10 +29086,6 @@ def _vision_match_maximum(result):
 
 
 def visFind(template,min_score,background):
-    # global RUN['xMMpos']
-    # global RUN['yMMpos']
-    #global autoBG
-
     green = (0,255,0)
     red = (0,0,255)
     blue = (0,0,255)
@@ -28729,7 +29307,6 @@ def visFind(template,min_score,background):
     return (status)    
     
 def updateVisOp(filelist=None):
-  # global RUN['selectedTemplate']
   RUN['selectedTemplate'] = StringVar()
   if filelist is None:
     filelist = _startup_visual_options()
@@ -28777,17 +29354,12 @@ def VisOpUpdate(foo):
 
 
 def zeroBrCn():
-  # global RUN['mX1']
-  # global RUN['mY1']
-  # global RUN['mX2']
-  # global RUN['mY2']
   RUN['mX1'] = 0
   RUN['mY1'] = 0
   RUN['mX2'] = 640
   RUN['mY2'] = 480
   VisBrightSlide.set(0)
   VisContrastSlide.set(0)
-  #VisZoomSlide.set(50)
   return take_pic()
 
 def VisUpdateBriCon(foo):
@@ -34027,17 +34599,39 @@ CalValuesLab.place(x=900, y=30)
 match CE['Platform']['OS']:
 
   case "Windows":
-    graph = FilterGraph()
     try:
+      graph = FilterGraph()
       allcams = graph.get_input_devices()
     except Exception:
-      allcams = ["Select a Camera"]
+      logger.exception("Unable to enumerate Windows cameras")
+      allcams = []
+    if not isinstance(allcams, (tuple, list)) or any(
+      not isinstance(camera_name, str)
+      or not camera_name
+      or camera_name != camera_name.strip()
+      or "\r" in camera_name
+      or "\n" in camera_name
+      or "\x00" in camera_name
+      or len(camera_name) > MAX_CAMERA_PREVIEW_EVENT_DETAIL
+      for camera_name in allcams
+    ):
+      logger.error("Windows camera enumeration returned invalid data")
+      allcams = []
 
     # --- filter out virtual/fake cameras (case-insensitive) ---
     _ban = ("iriun", "droidcam", "obs", "virtual", "manycam", "snap camera", "ndi", "xsplit", "mmhmm")
-    camList = [n for n in allcams if not any(b in n.lower() for b in _ban)]
+    indexed_cameras = [
+      (index, name)
+      for index, name in enumerate(allcams)
+      if not any(blocked in name.lower() for blocked in _ban)
+    ]
+    if not indexed_cameras:
+      indexed_cameras = list(enumerate(allcams))
+    camList, label_to_id = _camera_labels_for_sources(
+      indexed_cameras
+    )
     if not camList:
-      camList = allcams[:]  # fallback if everything got filtered
+      camList = ["Select a Camera"]
     # ----------------------------------------------------------
 
     visoptions = StringVar(tab6)
@@ -34046,31 +34640,51 @@ match CE['Platform']['OS']:
     try:
       # If we have real cams, preselect the first real one; otherwise keep the placeholder
       if camList and camList[0] != "Select a Camera":
-        vismenu = OptionMenu(tab6, visoptions, camList[0], *camList)
+        vismenu = OptionMenu(
+          tab6,
+          visoptions,
+          camList[0],
+          *camList,
+          command=_on_vision_camera_select,
+        )
         visoptions.set(camList[0])  # ensures the real cam (e.g., Logi C270) is selected
       else:
-        vismenu = OptionMenu(tab6, visoptions, "Select a Camera")
+        vismenu = OptionMenu(
+          tab6,
+          visoptions,
+          "Select a Camera",
+          command=_on_vision_camera_select,
+        )
       vismenu.config(width=20)
       vismenu.place(x=10, y=10)
     except Exception:
       logger.error("no camera")
 
   case "Linux":
-    # Build label->id map
-    label_to_id = {c.label: c.id for c in CE['Cameras']['Enum']}
-    camList = list(label_to_id.keys())
+    try:
+      camera_entries = [
+        (camera.id, camera.label)
+        for camera in CE['Cameras']['Enum']
+      ]
+      camList, label_to_id = _camera_labels_for_sources(camera_entries)
+    except Exception:
+      logger.exception("Unable to enumerate Linux cameras")
+      camList = []
+      label_to_id = {}
 
     selected_label = tk.StringVar(value=(camList[0] if camList else "Select a Camera"))
 
     visoptions = StringVar(tab6)
     visoptions.set("Select a Camera")
 
-    def on_camera_select(chosen_label):
-      cam_id = label_to_id.get(chosen_label, "None")
-      logger.debug("Debug - User picked:", chosen_label, " -> using id:", cam_id)
-
     try:
-      vismenu = OptionMenu(tab6, visoptions, selected_label.get(), *camList, command=on_camera_select)
+      vismenu = OptionMenu(
+        tab6,
+        visoptions,
+        selected_label.get(),
+        *camList,
+        command=_on_vision_camera_select,
+      )
       vismenu.config(width=20)
       vismenu.place(x=10, y=10)
     except Exception:
@@ -34732,6 +35346,13 @@ if (CAL['pickClosestVal'] == 1):
 if (CAL['pick180Val'] == 1):
   RUN['pick180'].set(True)  
 visoptions.set(CAL['curCam'])
+try:
+  _cache_vision_camera_selection(visoptions.get())
+except MotionInputError:
+  logger.warning(
+    "Configured camera selection is unavailable: %r",
+    visoptions.get(),
+  )
 if (CAL['fullRotVal'] == 1):
   RUN['fullRot'].set(True)
 if (CAL['autoBGVal'] == 1):
@@ -34903,6 +35524,7 @@ Copyright © 2022 by Annin Robotics. All Rights Reserved"
 RUN['xboxUse'] = 0
 
 tab1.lastProg = ""
+_schedule_event_poll("camera-preview")
 _schedule_event_poll("joint-motion")
 _schedule_event_poll("serial")
 _schedule_event_poll("manual-controller")
