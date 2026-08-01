@@ -3696,6 +3696,8 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertNotEqual(queued[0][2], tk_thread)
 
     def test_template_preview_reports_decode_failure_and_applies_square_image(self):
+        self.assertEqual(VISION_TEMPLATE_PREVIEW_SIZE, 150)
+
         statuses = []
         logged = []
         configured = []
@@ -5315,6 +5317,12 @@ class HmiSourceContractTests(unittest.TestCase):
         cancel_after_selection[0] = True
         write_count = len(writes)
         with self.assertRaisesRegex(MotionInputError, "was cancelled"):
+            perform(mask_settings, cancellation)
+        self.assertEqual(len(writes), write_count)
+        self.assertFalse(artifact_active[0])
+
+        cancellation.clear()
+        with self.assertRaisesRegex(MotionInputError, "was cancelled"):
             perform(template_settings, cancellation)
         self.assertEqual(len(writes), write_count)
         self.assertFalse(artifact_active[0])
@@ -6867,8 +6875,14 @@ class HmiSourceContractTests(unittest.TestCase):
 
         namespace["RUN"]["visionSelectionRequestId"] = None
         namespace["RUN"]["visionSelectionKind"] = None
-        status_failure[0] = False
         closing.set()
+        self.assertFalse(request_selection(mask_settings))
+        self.assertIn(
+            "Unable to present a vision selection rejection",
+            errors[-1][0],
+        )
+
+        status_failure[0] = False
         self.assertFalse(request_selection(mask_settings))
         self.assertIn("shutdown is active", statuses[-1][0])
         closing.clear()
@@ -7104,6 +7118,20 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertTrue(drain_events())
         self.assertEqual(len(applied_captures), application_count + 1)
+
+        events[:] = [VisionOperationEvent(7, 7, result=mask_result)]
+        runtime["visionSelectionRequestId"] = 7
+        runtime["visionSelectionKind"] = "mask"
+
+        def reject_event(event):
+            raise RuntimeError(f"request {event.request_id} apply failed")
+
+        namespace["_apply_vision_selection_event"] = reject_event
+        self.assertTrue(drain_events())
+        self.assertEqual(
+            statuses[-1],
+            ("VISION SELECTION RESULT FAILED", "Alarm.TLabel"),
+        )
 
         for removed_name in (
             "_prepare_mask_selection_image",

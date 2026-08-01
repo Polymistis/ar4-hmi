@@ -29033,6 +29033,7 @@ def _dispatch_program_vision_operation(
       program_vision_start_queue.put(operation)
   return operation.wait()
 
+
 def _vision_background_grayscale(value):
   rgb_pixel = np.asarray(
     [[normalize_vision_background_color(value)]],
