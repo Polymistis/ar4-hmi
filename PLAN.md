@@ -649,9 +649,10 @@ Implemented portion:
   retains the best sub-threshold result, and applies symmetric J6 fallback
   limits. Failed matches clear stale pixel and robot-coordinate outputs.
   Application shutdown cancels and supervises the matching worker under the
-  existing bounded camera-worker grace period. An accepted match still pending
-  worker pickup receives a terminal cancellation event before the pending slot
-  is cleared, allowing a waiting program-row owner to settle during shutdown.
+  existing bounded camera-worker grace period. The shared capture-and-match
+  worker contract removes an accepted request still pending worker pickup and
+  appends a terminal cancellation event during the same locked close
+  transition, allowing a waiting program-row owner to settle during shutdown.
   Program `Vis Find` rows parse
   into validated immutable commands, snapshot capture, matching, and exact
   program-view inputs on Tk, and reuse the same non-coalescing worker for one
