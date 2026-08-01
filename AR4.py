@@ -664,9 +664,12 @@ camera_selection_lock = threading.Lock()
 camera_preview_request_lock = threading.Lock()
 vision_capture_request_lock = threading.Lock()
 vision_match_request_lock = threading.Lock()
+program_vision_operation_lock = threading.Lock()
 vision_artifact_lock = threading.Lock()
 selected_vision_camera_source = None
 program_camera_completion_queue = Queue()
+program_vision_start_queue = Queue()
+program_vision_operations = {}
 offline_live_jog_lock = threading.Lock()
 offline_live_jog_state_lock = threading.Lock()
 offline_live_jog_stop_event = threading.Event()
@@ -1138,6 +1141,148 @@ class ProgramCameraCompletionEvent:
       raise MotionInputError(
         "successful program camera completion cannot contain an error"
       )
+
+
+@dataclass(frozen=True)
+class ProgramVisionCommand:
+  template_filename: str
+  background_override: object
+  minimum_score: float
+  pass_tab: str
+  fail_tab: str
+
+  def __post_init__(self):
+    if (
+      not isinstance(self.template_filename, str)
+      or not self.template_filename
+      or self.template_filename != self.template_filename.strip()
+    ):
+      raise MotionInputError("vision program template is invalid")
+    background = self.background_override
+    automatic_background = (
+      isinstance(background, str) and background == "Auto"
+    )
+    if not automatic_background and (
+      not isinstance(background, tuple)
+      or len(background) != 3
+      or any(
+        isinstance(component, bool)
+        or not isinstance(component, int)
+        or component < 0
+        or component > 255
+        for component in background
+      )
+    ):
+      raise MotionInputError("vision program background is invalid")
+    if (
+      isinstance(self.minimum_score, bool)
+      or not isinstance(self.minimum_score, (int, float))
+      or not math.isfinite(self.minimum_score)
+      or self.minimum_score < 0
+      or self.minimum_score > 1
+    ):
+      raise MotionInputError(
+        "vision program minimum score must be between zero and one"
+      )
+    for label, tab_number in (
+      ("vision pass tab", self.pass_tab),
+      ("vision fail tab", self.fail_tab),
+    ):
+      if (
+        not isinstance(tab_number, str)
+        or not tab_number
+        or not tab_number.isdecimal()
+      ):
+        raise MotionInputError(f"{label} is invalid")
+
+
+class ProgramVisionOperation:
+  """Carry one program vision row through worker and Tk settlement."""
+
+  def __init__(
+    self,
+    execution_request,
+    command,
+    completion_callback=None,
+  ):
+    if not isinstance(execution_request, ProgramExecutionRequest):
+      raise TypeError("program vision execution request is invalid")
+    if not isinstance(command, ProgramVisionCommand):
+      raise TypeError("program vision command is invalid")
+    if completion_callback is not None and not callable(completion_callback):
+      raise TypeError("program vision completion callback is invalid")
+    self.execution_request = execution_request
+    self.command = command
+    self.completion_callback = completion_callback
+    self._completion = threading.Event()
+    self._settlement_lock = threading.Lock()
+    self._settled = False
+    self._succeeded = None
+    self._worker_request_id = None
+    self._program_rows = None
+
+  @property
+  def worker_request_id(self):
+    with self._settlement_lock:
+      return self._worker_request_id
+
+  @property
+  def program_rows(self):
+    with self._settlement_lock:
+      return self._program_rows
+
+  def bind_program_rows(self, rows):
+    if (
+      not isinstance(rows, tuple)
+      or not rows
+      or any(not isinstance(row, (str, bytes, bytearray)) for row in rows)
+    ):
+      raise TypeError("program vision row snapshot is invalid")
+    with self._settlement_lock:
+      if self._settled:
+        raise RuntimeError("settled program vision operation cannot start")
+      if self._program_rows is not None:
+        raise RuntimeError("program vision row snapshot was bound twice")
+      self._program_rows = tuple(
+        bytes(row) if isinstance(row, bytearray) else row
+        for row in rows
+      )
+    return True
+
+  def bind_worker_request(self, request_id):
+    if (
+      isinstance(request_id, bool)
+      or not isinstance(request_id, int)
+      or request_id < 0
+    ):
+      raise TypeError("program vision worker request ID is invalid")
+    with self._settlement_lock:
+      if self._settled:
+        raise RuntimeError("settled program vision operation cannot start")
+      if self._worker_request_id is not None:
+        raise RuntimeError("program vision operation started more than once")
+      self._worker_request_id = request_id
+    return True
+
+  def settle(self, succeeded):
+    if not isinstance(succeeded, bool):
+      raise TypeError("program vision settlement state is invalid")
+    with self._settlement_lock:
+      if self._settled:
+        raise RuntimeError("program vision operation settled more than once")
+      self._settled = True
+      self._succeeded = succeeded
+      self._completion.set()
+    return True
+
+  def wait(self):
+    self._completion.wait()
+    with self._settlement_lock:
+      if not self._settled or not isinstance(self._succeeded, bool):
+        raise RuntimeError(
+          "program vision completion was signaled before settlement"
+        )
+      return self._succeeded
 
 
 class ProgramSelectionResult:
@@ -4889,6 +5034,7 @@ RUN['cam_on'] = False
 RUN['cameraPreviewRequestId'] = None
 RUN['visionCaptureRequestId'] = None
 RUN['visionMatchRequestId'] = None
+RUN['visionMatchResult'] = None
 
 # Migrated global variables to RUN dictionary
 # Robot State & Control
@@ -16943,6 +17089,14 @@ def executeRow(motion_complete=None, execution_request=None):
   if (RUN['cmdType'] == "Move V"): 
     if _reject_cancelled_program_row(execution_request):
       return ROW_EXECUTION_REJECTED
+    try:
+      vision_result = _validated_current_vision_match_result()
+    except MotionInputError as exc:
+      message = f"Move Vision program row rejected: {exc}"
+      logger.error(message)
+      _publish_program_vision_status(message, "Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
     SPnewInex = command.find("[ PR: ")  
@@ -16963,8 +17117,9 @@ def executeRow(motion_complete=None, execution_request=None):
     WristConfIndex = command.find(" $")
     SP = str(command[SPnewInex+6:SPendInex])
     cx, cy, cz, crz, cry, crx = _program_position_register_values(SP)
-    RUN['xVal'] = str(float(cx) + float(VisRetXrobEntryField.get()))
-    RUN['yVal'] = str(float(cy) + float(VisRetYrobEntryField.get()))
+    vision_first, vision_second = vision_result.robot_position
+    RUN['xVal'] = str(float(cx) + vision_first)
+    RUN['yVal'] = str(float(cy) + vision_second)
     RUN['zVal'] = str(float(cz) + float(command[zIndex+3:rzIndex]))
     rzVal = str(float(crz) + float(command[rzIndex+4:ryIndex]))
     ryVal = str(float(cry) + float(command[ryIndex+4:rxIndex]))
@@ -16978,7 +17133,7 @@ def executeRow(motion_complete=None, execution_request=None):
     DECspd = command[DECspdIndex+4:ACCrampIndex]
     ACCramp = command[ACCrampIndex+4:WristConfIndex]
     RUN['WC'] = command[WristConfIndex+3:]
-    visRot = VisRetAngleEntryField.get()
+    visRot = str(vision_result.angle_degrees)
     LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
     command = "MV"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Vr"+visRot+"Lm"+LoopMode+"\n"
     commandVR = "MV"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Vr"+visRot+"Lm"+LoopMode+"\n"
@@ -17286,86 +17441,25 @@ def executeRow(motion_complete=None, execution_request=None):
   if(RUN['cmdType'] == "Vis Fi"):
     if _reject_cancelled_program_row(execution_request):
       return ROW_EXECUTION_REJECTED
-    #if (RUN['moveInProc'] == 1):
-      #RUN['moveInProc'] = 2
     try:
-      templateIndex = command.find("Vis Find - ")
-      bgColorIndex = command.find(" - BGcolor ")
-      scoreIndex = command.find(" Score ")
-      passIndex = command.find(" Pass ")
-      failIndex = command.find(" Fail ")
-      if (
-        templateIndex != 0
-        or not (
-          templateIndex < bgColorIndex < scoreIndex < passIndex < failIndex
-        )
-      ):
-        raise MotionInputError("vision program row delimiters are invalid")
-      template = command[templateIndex+11:bgColorIndex]
-      if not template:
-        raise MotionInputError("vision program template must not be empty")
-      checkBG = command[bgColorIndex+11:scoreIndex]
-      if(checkBG == "(Auto)"):
-        background = None
-        capture_background = "Auto"
-      else:
-        capture_background = normalize_vision_background_color(checkBG)
-        background = _vision_background_grayscale(capture_background)
-      score = finite_number(
-        command[scoreIndex+7:passIndex],
-        "vision program score",
+      vision_command = _parse_program_vision_command(command)
+      vision_result = _dispatch_program_vision_operation(
+        vision_command,
+        execution_request,
+        motion_complete,
       )
-      if score < 0 or score > 100:
-        raise MotionInputError(
-          "vision program score must be between 0 and 100"
-        )
-      pass_tab = command[passIndex+6:failIndex].strip()
-      fail_tab = command[failIndex+6:].strip()
-      for label, value in (
-        ("vision pass tab", pass_tab),
-        ("vision fail tab", fail_tab),
-      ):
-        if re.fullmatch(r"\d+", value) is None:
-          raise MotionInputError(
-            f"{label} must be a non-negative integer"
-          )
-      min_score = score*.01
-      if take_pic(
-        capture_background,
-        execution_request.cancellation_boundary,
-      ) is not True:
+      if vision_result == ROW_EXECUTION_PENDING:
+        return ROW_EXECUTION_PENDING
+      if vision_result is not True:
         if _reject_cancelled_program_row(execution_request):
           return ROW_EXECUTION_REJECTED
-        raise MotionInputError("vision capture failed")
-      if background is None:
-        background = _vision_background_grayscale(RUN['BGavg'])
-      status = visFind(template,min_score,background)
-      if status == "pass":
-        selected_tab = pass_tab
-      elif status == "fail":
-        selected_tab = fail_tab
-      else:
-        raise MotionInputError(
-          "vision matching returned an invalid result"
-        )
-      try:
-        index = _program_tab_row_index(
-          tab1.progView.get(0, "end"),
-          selected_tab,
-        )
-      except MotionInputError as exc:
-        raise MotionInputError(
-          f"vision result tab {selected_tab} does not exist"
-        ) from exc
-      if _reject_cancelled_program_row(execution_request):
+        _finish_execute_row()
         return ROW_EXECUTION_REJECTED
-      tab1.progView.selection_clear(0, END)
-      tab1.progView.select_set(index)
     except Exception as exc:
-      detail = str(exc).strip() or type(exc).__name__
+      detail = normalize_camera_exception_detail(exc)
       message = f"Vision program row rejected: {detail}"
       logger.error(message)
-      _set_application_status(text=message, style="Alarm.TLabel")
+      _publish_program_vision_status(message, "Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
   
@@ -28115,35 +28209,6 @@ def ErrorHandler(response):
 
 ###VISION DEFS###################################################################
 #################################################################################	
- 
-def viscalc():
-  CAL['VisOrigXpix'] = float(VisX1PixEntryField.get())
-  CAL['VisOrigXmm'] = float(VisX1RobEntryField.get()) 
-  CAL['VisOrigYpix'] = float(VisY1PixEntryField.get()) 
-  CAL['VisOrigYmm'] = float(VisY1RobEntryField.get()) 
-  CAL['VisEndXpix'] = float(VisX2PixEntryField.get())
-  CAL['VisEndXmm'] = float(VisX2RobEntryField.get()) 
-  CAL['VisEndYpix'] = float(VisY2PixEntryField.get()) 
-  CAL['VisEndYmm'] = float(VisY2RobEntryField.get())
-
-  x = float(VisRetXpixEntryField.get()) 
-  y = float(VisRetYpixEntryField.get()) 
-
-  XPrange = float(CAL['VisEndXpix']) - float(CAL['VisOrigXpix'])
-  XPratio = (x-float(CAL['VisOrigXpix'])) / XPrange
-  XMrange = float(CAL['VisEndXmm']) - float(CAL['VisOrigXmm'])
-  XMpos = float(XMrange) * float(XPratio)
-  RUN['xMMpos'] = float(CAL['VisOrigXmm']) + XMpos
-  YPrange = float(CAL['VisEndYpix']) - float(CAL['VisOrigYpix'])
-  YPratio = (y-float(CAL['VisOrigYpix'])) / YPrange
-  YMrange = float(CAL['VisEndYmm']) - float(CAL['VisOrigYmm'])
-  YMpos = float(YMrange) * float(YPratio)
-  RUN['yMMpos'] = float(CAL['VisOrigYmm']) + YMpos
-  return (RUN['xMMpos'],RUN['yMMpos'])
-
-
-
-
 
 def _vision_camera_source_for_selection(selection):
   if not isinstance(selection, str) or not selection.strip():
@@ -28400,6 +28465,7 @@ def _poll_camera_preview_events():
     _drain_program_camera_completion_events()
     _drain_vision_capture_events()
     _drain_vision_match_events()
+    _drain_program_vision_start_events()
     for event in camera_preview_worker.drain_events():
       _apply_camera_preview_event(event)
     with camera_preview_request_lock:
@@ -28673,6 +28739,221 @@ def _dispatch_program_camera_operation(
     raise RuntimeError(detail) from exc
   return ROW_EXECUTION_PENDING
 
+
+def _parse_program_vision_command(command):
+  if not isinstance(command, str):
+    raise MotionInputError("vision program row must be text")
+  template_index = command.find("Vis Find - ")
+  background_index = command.find(" - BGcolor ")
+  score_index = command.find(" Score ")
+  pass_index = command.find(" Pass ")
+  fail_index = command.find(" Fail ")
+  if (
+    template_index != 0
+    or not (
+      template_index
+      < background_index
+      < score_index
+      < pass_index
+      < fail_index
+    )
+  ):
+    raise MotionInputError("vision program row delimiters are invalid")
+
+  template = command[template_index + 11:background_index]
+  if not template:
+    raise MotionInputError("vision program template must not be empty")
+  background_text = command[background_index + 11:score_index]
+  background_override = (
+    "Auto"
+    if background_text == "(Auto)"
+    else tuple(normalize_vision_background_color(background_text))
+  )
+  score = finite_number(
+    command[score_index + 7:pass_index],
+    "vision program score",
+  )
+  if score < 0 or score > 100:
+    raise MotionInputError(
+      "vision program score must be between 0 and 100"
+    )
+  return ProgramVisionCommand(
+    template_filename=template,
+    background_override=background_override,
+    minimum_score=score * 0.01,
+    pass_tab=_normalize_program_tab_number(
+      command[pass_index + 6:fail_index]
+    ),
+    fail_tab=_normalize_program_tab_number(command[fail_index + 6:]),
+  )
+
+
+def _validated_current_vision_match_result():
+  result = RUN.get('visionMatchResult')
+  if (
+    not isinstance(result, VisionMatchResult)
+    or not result.matched
+    or result.robot_position is None
+    or result.angle_degrees is None
+  ):
+    raise MotionInputError(
+      "Move Vision requires a valid completed vision match"
+    )
+  return result
+
+
+def _publish_program_vision_status(message, style):
+  if threading.get_ident() == application_tk_thread_id:
+    return _set_application_status(message, style)
+  return _queue_program_execution_status(message, style)
+
+
+def _snapshot_program_vision_match_settings(command):
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "program vision settings must be captured on the Tk event thread"
+    )
+  if not isinstance(command, ProgramVisionCommand):
+    raise TypeError("program vision settings command is invalid")
+  return VisionMatchSettings(
+    capture_settings=_snapshot_vision_capture_settings(
+      command.background_override
+    ),
+    match_options=_snapshot_vision_match_options(
+      command.template_filename,
+      command.minimum_score,
+    ),
+  )
+
+
+def _settle_program_vision_operation(
+  operation,
+  succeeded,
+  error_detail=None,
+):
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "program vision settlement must run on the Tk event thread"
+    )
+  if not isinstance(operation, ProgramVisionOperation):
+    raise TypeError("program vision settlement is invalid")
+  if not isinstance(succeeded, bool):
+    raise TypeError("program vision settlement state is invalid")
+  if error_detail is not None:
+    detail = normalize_camera_exception_detail(error_detail)
+    if (
+      _program_execution_request_active(operation.execution_request)
+      and not _program_execution_request_cancelled(
+        operation.execution_request
+      )
+    ):
+      message = f"Vision program row rejected: {detail}"
+      logger.error(message)
+      try:
+        _set_application_status(message, "Alarm.TLabel")
+      except Exception:
+        logger.exception("Unable to present a program vision failure")
+  operation.settle(succeeded)
+  if operation.completion_callback is not None:
+    operation.completion_callback(succeeded)
+  return succeeded
+
+
+def _start_program_vision_operation(operation):
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "program vision startup must run on the Tk event thread"
+    )
+  if not isinstance(operation, ProgramVisionOperation):
+    raise TypeError("program vision startup operation is invalid")
+  if _program_execution_request_cancelled(operation.execution_request):
+    _settle_program_vision_operation(operation, False)
+    return False
+
+  with vision_match_request_lock:
+    manual_request_id = RUN.get('visionMatchRequestId')
+    if manual_request_id is not None:
+      if (
+        isinstance(manual_request_id, bool)
+        or not isinstance(manual_request_id, int)
+        or manual_request_id < 0
+      ):
+        raise MotionInputError("manual vision matching owner is invalid")
+      raise MotionInputError(
+        "manual vision matching result settlement is pending"
+      )
+  settings = _snapshot_program_vision_match_settings(operation.command)
+  operation.bind_program_rows(tuple(tab1.progView.get(0, "end")))
+  submission = vision_match_worker.submit(
+    settings,
+    operation.execution_request.cancellation_boundary,
+  )
+  if not isinstance(submission, VisionOperationSubmission):
+    raise RuntimeError("program vision returned an invalid submission")
+  if submission.coalesced:
+    raise RuntimeError("program vision unexpectedly coalesced a request")
+  operation.bind_worker_request(submission.request_id)
+  with program_vision_operation_lock:
+    if submission.request_id in program_vision_operations:
+      raise RuntimeError("program vision worker request ID was reused")
+    program_vision_operations[submission.request_id] = operation
+  RUN['visionMatchResult'] = None
+  try:
+    _set_application_status(
+      "VISION PROGRAM MATCHING IN PROGRESS",
+      "Warn.TLabel",
+    )
+  except Exception:
+    logger.exception("Unable to present program vision progress")
+  return True
+
+
+def _drain_program_vision_start_events():
+  while True:
+    try:
+      operation = program_vision_start_queue.get_nowait()
+    except Empty:
+      return True
+    try:
+      _start_program_vision_operation(operation)
+    except Exception as exc:
+      logger.exception("Unable to start a program vision operation")
+      _settle_program_vision_operation(
+        operation,
+        False,
+        normalize_camera_exception_detail(exc),
+      )
+
+
+def _dispatch_program_vision_operation(
+  command,
+  execution_request,
+  completion_callback,
+):
+  operation = ProgramVisionOperation(
+    execution_request,
+    command,
+    completion_callback,
+  )
+  on_tk_thread = threading.get_ident() == application_tk_thread_id
+  if on_tk_thread:
+    if completion_callback is None:
+      raise MotionInputError(
+        "program vision requires asynchronous Tk completion"
+      )
+    started = _start_program_vision_operation(operation)
+    return ROW_EXECUTION_PENDING if started else False
+  if completion_callback is not None:
+    raise MotionInputError(
+      "program vision callback dispatch must originate on Tk"
+    )
+  with application_lifecycle_lock:
+    if application_closing.is_set():
+      operation.settle(False)
+    else:
+      program_vision_start_queue.put(operation)
+  return operation.wait()
+
 #vismenu.size
 
 def _vision_background_bgr(value):
@@ -28687,26 +28968,6 @@ def _vision_background_grayscale(value):
   )
   grayscale = cv2.cvtColor(rgb_pixel, cv2.COLOR_RGB2GRAY)
   return int(grayscale[0][0])
-
-
-def _average_vision_grayscale_samples(samples):
-  try:
-    sample_values = np.asarray(samples, dtype=np.float64)
-  except (TypeError, ValueError, OverflowError) as exc:
-    raise MotionInputError(
-      "vision grayscale samples must be numeric"
-    ) from exc
-  if (
-    sample_values.ndim != 1
-    or sample_values.size == 0
-    or not np.all(np.isfinite(sample_values))
-    or np.any(sample_values < 0)
-    or np.any(sample_values > 255)
-  ):
-    raise MotionInputError(
-      "vision grayscale samples must contain finite byte values"
-    )
-  return int(np.rint(np.mean(sample_values)))
 
 
 def _average_vision_bgr_samples(samples):
@@ -29127,6 +29388,7 @@ def _apply_vision_match_presentation(result, options):
       _replace_vision_result_field(field, "NA")
     RUN['xMMpos'] = None
     RUN['yMMpos'] = None
+    RUN['visionMatchResult'] = None
     return "fail"
 
   first_pixel, second_pixel = result.pixel_position
@@ -29141,6 +29403,7 @@ def _apply_vision_match_presentation(result, options):
     (VisRetYrobEntryField, round(second_robot, 2)),
   ):
     _replace_vision_result_field(field, str(value))
+  RUN['visionMatchResult'] = result
   return "pass"
 
 
@@ -29176,6 +29439,7 @@ def _apply_vision_match_event(event):
       )
     return False
   if event.error_detail is not None:
+    RUN['visionMatchResult'] = None
     message = f"VISION MATCHING FAILED: {event.error_detail}"
     logger.error(message)
     _set_application_status(message, "Alarm.TLabel")
@@ -29190,16 +29454,119 @@ def _apply_vision_match_event(event):
   return True
 
 
+def _apply_program_vision_match_event(operation, event):
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "program vision commitment must run on the Tk event thread"
+    )
+  if not isinstance(operation, ProgramVisionOperation):
+    raise RuntimeError("program vision worker has no valid operation owner")
+  if not isinstance(event, VisionOperationEvent):
+    raise RuntimeError("program vision worker emitted an invalid event")
+  if operation.worker_request_id != event.request_id:
+    raise RuntimeError("program vision worker request ownership changed")
+  if (
+    not _program_execution_request_active(operation.execution_request)
+    or _program_execution_request_cancelled(operation.execution_request)
+  ):
+    return False
+  if event.error_detail is not None:
+    raise MotionInputError(event.error_detail)
+  if not isinstance(event.result, VisionMatchOperationResult):
+    raise MotionInputError("program vision returned an invalid result")
+
+  expected_status = "pass" if event.result.match_result.matched else "fail"
+  selected_tab = (
+    operation.command.pass_tab
+    if expected_status == "pass"
+    else operation.command.fail_tab
+  )
+  program_rows = operation.program_rows
+  if program_rows is None:
+    raise RuntimeError("program vision has no program-row snapshot")
+  try:
+    index = _program_tab_row_index(
+      program_rows,
+      selected_tab,
+    )
+  except MotionInputError as exc:
+    raise MotionInputError(
+      f"vision result tab {selected_tab} does not exist"
+    ) from exc
+  if _program_execution_request_cancelled(operation.execution_request):
+    return False
+  if tuple(tab1.progView.get(0, "end")) != program_rows:
+    raise MotionInputError(
+      "robot program changed during the vision operation"
+    )
+
+  status = _apply_vision_match_operation_result(event.result)
+  if status != expected_status:
+    raise RuntimeError("program vision returned an inconsistent result")
+  tab1.progView.selection_clear(0, END)
+  tab1.progView.select_set(index)
+  if tuple(tab1.progView.curselection()) != (index,):
+    raise RuntimeError("program vision could not select the result tab")
+  if status == "pass":
+    _set_application_status("VISION PROGRAM MATCH PASSED", "OK.TLabel")
+  else:
+    _set_application_status("VISION PROGRAM MATCH FAILED", "Warn.TLabel")
+  return True
+
+
 def _drain_vision_match_events():
   for event in vision_match_worker.drain_events():
+    if not isinstance(event, VisionOperationEvent):
+      with program_vision_operation_lock:
+        orphaned_operations = tuple(program_vision_operations.values())
+        program_vision_operations.clear()
+      with vision_match_request_lock:
+        manual_request_pending = RUN.get('visionMatchRequestId') is not None
+        RUN['visionMatchRequestId'] = None
+      for operation in orphaned_operations:
+        _settle_program_vision_operation(
+          operation,
+          False,
+          "vision matching worker emitted an invalid event",
+        )
+      logger.error("Vision matching worker emitted an invalid event")
+      RUN['visionMatchResult'] = None
+      if manual_request_pending:
+        _set_application_status(
+          "VISION MATCH RESULT FAILED",
+          "Alarm.TLabel",
+        )
+      continue
+    with program_vision_operation_lock:
+      operation = program_vision_operations.pop(event.request_id, None)
+    if operation is None:
+      try:
+        _apply_vision_match_event(event)
+      except Exception:
+        RUN['visionMatchResult'] = None
+        logger.exception("Unable to apply a vision match result")
+        _set_application_status(
+          "VISION MATCH RESULT FAILED",
+          "Alarm.TLabel",
+        )
+      continue
+
+    succeeded = False
+    error_detail = None
     try:
-      _apply_vision_match_event(event)
-    except Exception:
-      logger.exception("Unable to apply a vision match result")
-      _set_application_status(
-        "VISION MATCH RESULT FAILED",
-        "Alarm.TLabel",
+      succeeded = _apply_program_vision_match_event(operation, event)
+    except Exception as exc:
+      RUN['visionMatchResult'] = None
+      error_detail = normalize_camera_exception_detail(exc)
+      logger.exception("Unable to apply a program vision result")
+    try:
+      _settle_program_vision_operation(
+        operation,
+        succeeded,
+        error_detail,
       )
+    except Exception:
+      logger.exception("Unable to settle a program vision result")
   return True
 
 
@@ -29293,6 +29660,7 @@ def request_vision_match():
       if submission.coalesced:
         raise RuntimeError("vision matching unexpectedly coalesced a request")
       RUN['visionMatchRequestId'] = submission.request_id
+      RUN['visionMatchResult'] = None
     _set_application_status(
       "VISION MATCHING IN PROGRESS",
       "Warn.TLabel",
@@ -29377,15 +29745,6 @@ def _capture_current_vision_frame(cancellation_event=None):
     cancellation_event,
   )
 
-
-def take_pic(background_override=None, cancellation_event=None):
-  try:
-    settings = _snapshot_vision_capture_settings(background_override)
-    result = _perform_vision_capture(settings, cancellation_event)
-    return _apply_vision_capture_result(result)
-  except Exception:
-    logger.exception("Vision capture failed")
-    return False
 
 def _prepare_mask_selection_image():
   frame = _capture_current_vision_frame()
@@ -29730,32 +30089,6 @@ def selectTemplate():
 
 def snapFind():
   return request_vision_match()
-
-
-def visFind(template, min_score, background):
-  options = _snapshot_vision_match_options(template, min_score)
-  background = _average_vision_grayscale_samples((background,))
-  with _vision_artifact_operation("vision matching"):
-    image = load_bounded_vision_image(
-      'curImage.jpg',
-      cv2.IMREAD_GRAYSCALE,
-      "captured vision frame",
-    )
-    candidate = load_bounded_vision_image(
-      options.template_filename,
-      cv2.IMREAD_GRAYSCALE,
-      "vision template",
-    )
-    result = prepare_vision_match_result(
-      image,
-      candidate,
-      background,
-      options,
-      application_closing,
-    )
-    if not cv2.imwrite('temp.jpg', result.annotated_image):
-      raise OSError("vision result frame could not be persisted")
-  return _apply_vision_match_presentation(result, options)
 
 
 def updateVisOp(filelist=None):

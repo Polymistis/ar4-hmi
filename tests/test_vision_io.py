@@ -27,6 +27,7 @@ from ARrobots.HMI.vision_io import (
     VisionMatchResult,
     VisionMatchSettings,
     VisionOperationWorker,
+    _rotate_vision_template,
     fit_vision_preview_square,
     load_bounded_vision_image,
     normalize_camera_exception_detail,
@@ -471,6 +472,23 @@ class VisionIoTests(unittest.TestCase):
         self.assertFalse(result.matched)
         self.assertEqual(result.score, 0.5)
         self.assertEqual(angles, list(range(360)))
+        np.testing.assert_array_equal(
+            result.annotated_image[5, 5],
+            np.asarray((0, 0, 255), dtype=np.uint8),
+        )
+
+    def test_vision_rotation_uses_selected_background_for_new_border_pixels(self):
+        template = np.arange(80, dtype=np.uint8).reshape((8, 10))
+        with patch(
+            "ARrobots.HMI.vision_io.cv2.warpAffine",
+            wraps=cv2.warpAffine,
+        ) as warp:
+            rotated = _rotate_vision_template(template, 45, 173)
+
+        self.assertEqual(rotated.shape, template.shape)
+        self.assertEqual(warp.call_count, 1)
+        self.assertEqual(warp.call_args.kwargs["borderMode"], cv2.BORDER_CONSTANT)
+        self.assertEqual(warp.call_args.kwargs["borderValue"], 173)
 
     def test_vision_match_worker_rejects_overlap_and_honors_cancellation(self):
         capture_settings = self.vision_capture_settings()

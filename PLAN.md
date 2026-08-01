@@ -649,15 +649,25 @@ Implemented portion:
   retains the best sub-threshold result, and applies symmetric J6 fallback
   limits. Failed matches clear stale pixel and robot-coordinate outputs.
   Application shutdown cancels and supervises the matching worker under the
-  existing bounded camera-worker grace period. The legacy program-row vision
-  path now reuses the same pure matcher but still performs capture and matching
-  as separate synchronous operations; request-scoped program integration
-  remains pending.
+  existing bounded camera-worker grace period. Program `Vis Find` rows parse
+  into validated immutable commands, snapshot capture, matching, and exact
+  program-view inputs on Tk, and reuse the same non-coalescing worker for one
+  artifact-owned capture-and-match operation. Run and Step Forward wait only on
+  their program workers; Step Reverse returns pending and settles through the
+  Tk event poll. Result presentation and pass/fail tab selection occur on Tk
+  only after request identity, cancellation state, worker ownership, and the
+  unchanged program-row snapshot are verified. Failed capture, matching,
+  presentation, missing-tab, stale-request, and edited-program paths reject the
+  row without selecting a stale destination. `Move V` consumes an immutable
+  successful match result instead of parsing Tk result fields, so absent,
+  failed, pending, or unsuccessfully presented matches cannot become motion
+  commands. The superseded synchronous program capture and matching helpers
+  have been removed.
   Hardware camera behavior and timing remain unverified.
 
 Remaining scope includes broader program and G-code row-execution admission,
-asynchronous program-row capture and matching, interactive mask and template
-workflows, Modbus, auxiliary connection and device paths,
+interactive mask and template workflows, Modbus, auxiliary connection and
+device paths,
 request-scoped program-owner watchdog and recovery semantics for a lost worker
 or completion callback, durable event-poll failure handling when the Tk
 scheduler or interpreter is unavailable, application-lifecycle, timing, and
