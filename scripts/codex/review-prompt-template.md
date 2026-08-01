@@ -82,7 +82,7 @@ success.
   tracked source. The supported packaged Windows native extension targets CPython
   3.12 x64. Python package requirements remain unpinned, so framework versions
   are unverified. Host source identifies version 6.7. The tracked Teensy
-  source identifies version `6.7.1-ar4hmi.8` and advertises
+  source identifies version `6.7.1-ar4hmi.9` and advertises
   `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`,
   `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`,
   `ESTOP_ADMISSION_V1`, and

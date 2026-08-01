@@ -667,6 +667,7 @@ program_execution_state_lock = threading.Lock()
 program_execution_next_request_id = 0
 program_execution_active_request = None
 program_execution_cancelled = threading.Event()
+program_return_state_clear_requested = threading.Event()
 gcode_storage_program_admission_active = False
 manual_controller_program_admission_active = False
 event_poll_retry_lock = threading.Lock()
@@ -3146,6 +3147,8 @@ def _begin_program_execution(mode):
   if mode not in PROGRAM_EXECUTION_MODES:
     raise MotionInputError("program execution mode is invalid")
   with program_execution_state_lock:
+    if program_return_state_clear_requested.is_set():
+      return None
     if not isinstance(gcode_storage_program_admission_active, bool):
       raise RuntimeError("G-code storage program admission state is invalid")
     if not isinstance(manual_controller_program_admission_active, bool):
@@ -3258,9 +3261,30 @@ def _active_program_execution_request():
     return request
 
 
-def _cancel_active_program_execution():
-  program_execution_cancelled.set()
+def _clear_robot_program_return_state():
+  tab1.lastProg = ""
+  if hasattr(tab1, "lastRow"):
+    delattr(tab1, "lastRow")
+  return True
+
+
+def _apply_requested_robot_program_return_state_clear():
   with program_execution_state_lock:
+    if not program_return_state_clear_requested.is_set():
+      return False
+    program_return_state_clear_requested.clear()
+    try:
+      _clear_robot_program_return_state()
+    except Exception:
+      program_return_state_clear_requested.set()
+      raise
+  return True
+
+
+def _cancel_active_program_execution():
+  with program_execution_state_lock:
+    program_execution_cancelled.set()
+    program_return_state_clear_requested.set()
     request = program_execution_active_request
     if request is None:
       return False
@@ -11145,6 +11169,7 @@ def _settle_program_selection(event):
 
 def _poll_program_selection_events():
   try:
+    _apply_requested_robot_program_return_state_clear()
     while True:
       try:
         event = program_selection_event_queue.get_nowait()
@@ -23644,6 +23669,10 @@ def _replace_robot_program_view(
     raise MotionInputError(
       "robot program navigation cannot save and clear return state"
     )
+  if caller_state_supplied and tab1.lastProg != "":
+    raise MotionInputError(
+      "nested robot program calls are not supported"
+    )
 
   snapshot = _capture_robot_program_view()
   try:
@@ -23659,7 +23688,7 @@ def _replace_robot_program_view(
       tab1.lastRow = caller_row
       tab1.lastProg = caller_program
     if clear_return_state:
-      tab1.lastProg = ""
+      _clear_robot_program_return_state()
     if update_current_row:
       curRowEntryField.delete(0, 'end')
       curRowEntryField.insert(0, selected_row)
@@ -23798,6 +23827,7 @@ def loadProg():
     _replace_robot_program_view(
       filename,
       program_rows,
+      clear_return_state=True,
     )
     save_calibration(CAL)
   except Exception as exc:
@@ -23816,30 +23846,43 @@ def _commit_called_program_navigation(navigation):
   cancellation_boundary = (
     navigation.execution_request.cancellation_boundary
   )
-  acquired = cancellation_boundary.acquire()
-  if acquired is False:
-    raise RuntimeError(
-      "called-program cancellation boundary acquisition failed"
-    )
-  try:
-    cancelled = (
-      application_closing.is_set()
-      or program_execution_cancelled.is_set()
-      or cancellation_boundary.is_set()
-    )
-  finally:
-    cancellation_boundary.release()
+  def cancellation_requested():
+    acquired = cancellation_boundary.acquire()
+    if acquired is False:
+      raise RuntimeError(
+        "called-program cancellation boundary acquisition failed"
+      )
+    try:
+      return (
+        application_closing.is_set()
+        or program_execution_cancelled.is_set()
+        or cancellation_boundary.is_set()
+      )
+    finally:
+      cancellation_boundary.release()
+
+  cancelled = cancellation_requested()
   if cancelled:
     return False
-  return _replace_robot_program_view(
-    navigation.program_name,
-    navigation.program_rows,
-    selected_row=navigation.selected_row,
-    caller_row=navigation.caller_row,
-    caller_program=navigation.caller_program,
-    clear_return_state=navigation.clear_return_state,
-    update_current_row=navigation.update_current_row,
-  )
+  try:
+    replaced = _replace_robot_program_view(
+      navigation.program_name,
+      navigation.program_rows,
+      selected_row=navigation.selected_row,
+      caller_row=navigation.caller_row,
+      caller_program=navigation.caller_program,
+      clear_return_state=navigation.clear_return_state,
+      update_current_row=navigation.update_current_row,
+    )
+  except Exception:
+    if cancellation_requested():
+      _clear_robot_program_return_state()
+    raise
+  cancelled = cancellation_requested()
+  if cancelled:
+    _clear_robot_program_return_state()
+    return False
+  return replaced
 
 
 def _settle_called_program_navigation(navigation):
@@ -23978,10 +24021,11 @@ def CreateProg():
   ProgEntryField.delete(0, 'end')
   ProgEntryField.insert(0,file_path)
   tab1.progView.delete(0,END)
-  Prog = open(file_path,"rb")
-  time.sleep(.1)
-  for item in Prog:
-    tab1.progView.insert(END,item)
+  with open(file_path,"rb") as program_file:
+    time.sleep(.1)
+    for item in program_file:
+      tab1.progView.insert(END,item)
+  _clear_robot_program_return_state()
   tab1.progView.pack()
   scrollbar.config(command=tab1.progView.yview)
   save_calibration(CAL) 
@@ -24074,10 +24118,11 @@ def reloadProg():
   ProgEntryField.delete(0, 'end')
   ProgEntryField.insert(0,file_path)
   tab1.progView.delete(0,END)
-  Prog = open(file_path,"rb")
-  time.sleep(.1)
-  for item in Prog:
-    tab1.progView.insert(END,item)
+  with open(file_path,"rb") as program_file:
+    time.sleep(.1)
+    for item in program_file:
+      tab1.progView.insert(END,item)
+  _clear_robot_program_return_state()
   tab1.progView.pack()
   scrollbar.config(command=tab1.progView.yview)
   save_calibration(CAL)      

@@ -396,6 +396,13 @@ firmware upload, calibration action, or arm motion occurred.
 No-upload Teensy compile and timeout tests: Ran 2 tests in 18.084s; OK
 ```
 
+The 2026-08-01 environment-gated no-upload rerun compiled the tracked
+`6.7.1-ar4hmi.9` Teensy source after `RB` became a target-defined reset with no
+pre-reset terminal frame. Arduino CLI 1.5.1 selected PJRC Teensy core 1.62.0,
+the platform `SPI` library, bundled SdFat 2.1.2, and ModbusMaster 2.0.1. The
+compiler returned exit code `0`; no upload, serial connection, controller
+command, calibration action, or arm motion occurred.
+
 ## Nano and Mega auxiliary firmware
 
 Toolchain:

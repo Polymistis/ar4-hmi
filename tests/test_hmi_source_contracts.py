@@ -456,6 +456,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "_program_execution_request_cancelled": (
                 "_program_execution_request_active",
             ),
+            "_apply_requested_robot_program_return_state_clear": (
+                "_clear_robot_program_return_state",
+            ),
             "_reject_cancelled_program_row": (
                 "_abort_program_row_execution",
             ),
@@ -556,6 +559,15 @@ class HmiSourceContractTests(unittest.TestCase):
             "stepRev": (
                 "_selected_program_row",
                 "_program_row_error_detail",
+            ),
+            "_commit_called_program_navigation": (
+                "_clear_robot_program_return_state",
+            ),
+            "_poll_program_selection_events": (
+                "_apply_requested_robot_program_return_state_clear",
+            ),
+            "_replace_robot_program_view": (
+                "_clear_robot_program_return_state",
             ),
         }
         for dependency in function_dependencies.get(name, ()):
@@ -1344,6 +1356,10 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault("program_execution_active_request", None)
         namespace.setdefault(
             "program_execution_cancelled",
+            threading.Event(),
+        )
+        namespace.setdefault(
+            "program_return_state_clear_requested",
             threading.Event(),
         )
         namespace.setdefault(
@@ -13857,6 +13873,7 @@ class HmiSourceContractTests(unittest.TestCase):
             last_program="",
             last_row=0,
             cancelled=False,
+            clear_requested=False,
         ):
             queue = Queue()
             logged = []
@@ -13912,6 +13929,10 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_poll_program_selection_events",
                 namespace,
             )
+            if clear_requested:
+                namespace[
+                    "program_return_state_clear_requested"
+                ].set()
             dispatch_selection = self.compile_function(
                 "_dispatch_program_selection",
                 namespace,
@@ -14019,6 +14040,25 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(result[0].ready)
         self.assertEqual(initialized.selection, (1,))
         self.assertEqual(len(initialized.styles), 5)
+
+        cleared_view = ProgramView((1,), 3)
+        result, failure, _, _, _, _, cleared_namespace = run_case(
+            cleared_view,
+            Entry(),
+            "advance",
+            last_program="caller.ar4",
+            last_row=4,
+            clear_requested=True,
+        )
+        self.assertEqual(failure, [])
+        self.assertTrue(result[0].ready)
+        self.assertEqual(cleared_namespace["tab1"].lastProg, "")
+        self.assertFalse(hasattr(cleared_namespace["tab1"], "lastRow"))
+        self.assertFalse(
+            cleared_namespace[
+                "program_return_state_clear_requested"
+            ].is_set()
+        )
 
         loop_rows = ("first", "## START PROGRAM LOOP ##", "last")
         loop_view = ProgramView((), len(loop_rows), rows=loop_rows)
@@ -18090,6 +18130,8 @@ class HmiSourceContractTests(unittest.TestCase):
         applications = []
         opened_paths = []
         cancellation_during_apply = []
+        replacement_failures = []
+        return_state_clears = []
         reschedules = []
         logged = []
 
@@ -18112,6 +18154,8 @@ class HmiSourceContractTests(unittest.TestCase):
                         "called-program view mutation retained the "
                         "cancellation boundary"
                     )
+            if replacement_failures:
+                raise replacement_failures.pop(0)
             return True
 
         namespace = {
@@ -18135,6 +18179,9 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_reschedule_event_poll": reschedules.append,
             "_replace_robot_program_view": replace_program_view,
+            "_clear_robot_program_return_state": (
+                lambda: return_state_clears.append(True) or True
+            ),
             "_open_local_robot_program": lambda name: (
                 opened_paths.append(name) or ProgramFile()
             ),
@@ -18304,8 +18351,9 @@ class HmiSourceContractTests(unittest.TestCase):
         worker.join(1.0)
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
-        self.assertEqual(outcome, [True])
+        self.assertEqual(outcome, [False])
         self.assertEqual(len(applications), 1)
+        self.assertEqual(return_state_clears, [True])
         application = applications[0]
         self.assertEqual(application[0], application_thread)
         self.assertEqual(application[1], expected_child)
@@ -18319,6 +18367,24 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(active_boundary.is_set())
         self.assertTrue(active_boundary.lock.acquire(blocking=False))
         active_boundary.lock.release()
+
+        failed_boundary = Boundary()
+        cancellation_during_apply.append(failed_boundary)
+        replacement_failures.append(
+            RuntimeError("injected replacement rollback")
+        )
+        worker, outcome, errors = dispatch_from_worker(
+            ProgramRequest(failed_boundary),
+            caller_row=6,
+            caller_program=absolute_parent,
+        )
+        poll_navigation()
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outcome, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("injected replacement rollback", str(errors[0]))
+        self.assertEqual(return_state_clears, [True, True])
 
         return_request = ProgramRequest(Boundary())
         worker, outcome, errors = dispatch_from_worker(
@@ -18339,11 +18405,20 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(application[3]["clear_return_state"])
         self.assertTrue(application[3]["update_current_row"])
         self.assertEqual(opened_paths[-1], absolute_parent)
+        self.assertEqual(return_state_clears, [True, True])
         self.assertEqual(
             reschedules,
-            ["called-program", "called-program", "called-program"],
+            [
+                "called-program",
+                "called-program",
+                "called-program",
+                "called-program",
+            ],
         )
-        self.assertEqual(logged, [])
+        self.assertEqual(
+            logged,
+            [("Unable to apply called-program navigation",)],
+        )
 
         interrupted_navigation = namespace["CalledProgramNavigation"](
             ProgramRequest(Boundary()),
@@ -18470,7 +18545,7 @@ class HmiSourceContractTests(unittest.TestCase):
         tab = SimpleNamespace(
             progView=view,
             lastRow=3,
-            lastProg="caller.ar4",
+            lastProg="",
         )
         namespace = {
             "ACTIVE": "active",
@@ -18531,6 +18606,22 @@ class HmiSourceContractTests(unittest.TestCase):
         expected_path = program_entry.value
         expected_row = row_entry.value
         expected_return = (tab.lastRow, tab.lastProg)
+        with self.assertRaisesRegex(MotionInputError, "nested"):
+            replace_view(
+                "grandchild.ar4",
+                (b"grandchild zero\n",),
+                selected_row=0,
+                caller_row=0,
+                caller_program="child.ar4",
+                update_current_row=True,
+            )
+        self.assertEqual(view.rows, expected_rows)
+        self.assertEqual(view.styles, expected_styles)
+        self.assertEqual(view.selected, expected_selection)
+        self.assertEqual(program_entry.value, expected_path)
+        self.assertEqual(row_entry.value, expected_row)
+        self.assertEqual((tab.lastRow, tab.lastProg), expected_return)
+
         view.fail_value = b"broken child\n"
         with self.assertRaisesRegex(
             RuntimeError,
@@ -18745,6 +18836,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         tab = SimpleNamespace(
             runTrue=0,
+            lastProg="",
             progView=SimpleNamespace(
                 curselection=lambda: (0,),
                 index=lambda value: 1,
@@ -19092,7 +19184,13 @@ class HmiSourceContractTests(unittest.TestCase):
             "_cancel_active_program_execution",
             namespace,
         )
+        tab.lastProg = "caller.ar4"
+        tab.lastRow = 3
         self.assertTrue(cancel_active_execution())
+        self.assertEqual((tab.lastProg, tab.lastRow), ("caller.ar4", 3))
+        self.assertTrue(
+            namespace["program_return_state_clear_requested"].is_set()
+        )
         cancelled_callback(True)
         self.assertEqual(completions, [(4, True)])
         self.assertFalse(runtime["progRunning"])
@@ -19100,6 +19198,25 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(execution_active())
         cancelled_callback(True)
         self.assertEqual(completions, [(4, True)])
+        tab.lastProg = "stale-caller.ar4"
+        tab.lastRow = 7
+        self.assertFalse(cancel_active_execution())
+        self.assertEqual(
+            (tab.lastProg, tab.lastRow),
+            ("stale-caller.ar4", 7),
+        )
+        self.assertIsNone(begin_execution("run"))
+        apply_return_state_clear = self.compile_function(
+            "_apply_requested_robot_program_return_state_clear",
+            namespace,
+        )
+        self.assertTrue(apply_return_state_clear())
+        self.assertEqual(tab.lastProg, "")
+        self.assertFalse(hasattr(tab, "lastRow"))
+        self.assertFalse(apply_return_state_clear())
+        self.assertFalse(
+            namespace["program_return_state_clear_requested"].is_set()
+        )
 
         namespace["executeRow"] = (
             lambda motion_complete=None, **kwargs: "complete"
@@ -28793,8 +28910,10 @@ class HmiSourceContractTests(unittest.TestCase):
             "_open_local_robot_program": open_program,
             "_parse_local_robot_program": parse_program,
             "_replace_robot_program_view": (
-                lambda program_name, rows: (
-                    view_replacements.append((program_name, rows)) or True
+                lambda program_name, rows, **options: (
+                    view_replacements.append(
+                        (program_name, rows, options)
+                    ) or True
                 )
             ),
             "save_calibration": (
@@ -28809,9 +28928,104 @@ class HmiSourceContractTests(unittest.TestCase):
             [(
                 str(source_path),
                 (b"## RUN ONCE ##\n", b"Wait Time = 0.1\n"),
+                {"clear_return_state": True},
             )],
         )
         self.assertEqual(saved_calibrations, [{"comPort": "None"}])
+        class ProgramEntry:
+            def __init__(self, value=""):
+                self.value = value
+
+            def delete(self, start, end):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = str(value)
+
+            def get(self):
+                return self.value
+
+        class ProgramView:
+            def __init__(self):
+                self.rows = []
+                self.pack_count = 0
+
+            def delete(self, start, end):
+                self.rows.clear()
+
+            def insert(self, index, value):
+                self.rows.append(value)
+
+            def pack(self):
+                self.pack_count += 1
+
+            def yview(self, *args):
+                return None
+
+        created_base = Path(state_directory.name) / "created-program"
+        created_path = created_base.with_suffix(".ar4")
+        program_entry = ProgramEntry()
+        program_view = ProgramView()
+        created_tab = SimpleNamespace(
+            lastProg="caller.ar4",
+            lastRow=4,
+            progView=program_view,
+        )
+        create_namespace = dict(namespace)
+        create_namespace.update({
+            "simpledialog": SimpleNamespace(
+                askstring=lambda **kwargs: str(created_base)
+            ),
+            "ProgEntryField": program_entry,
+            "tab1": created_tab,
+            "END": "end",
+            "time": SimpleNamespace(sleep=lambda seconds: None),
+            "scrollbar": SimpleNamespace(config=lambda **kwargs: None),
+            "CAL": {"comPort": "None"},
+            "save_calibration": lambda values: True,
+        })
+        create_namespace["_clear_robot_program_return_state"] = (
+            self.compile_function(
+                "_clear_robot_program_return_state",
+                create_namespace,
+            )
+        )
+        create_program = self.compile_function(
+            "CreateProg",
+            create_namespace,
+        )
+        create_program()
+        self.assertEqual(
+            created_path.read_text(encoding="utf-8"),
+            "## RUN ONCE ##\n\n## START PROGRAM LOOP ##\n",
+        )
+        self.assertEqual(program_entry.get(), str(created_path))
+        native_newline = os.linesep.encode("ascii")
+        self.assertEqual(
+            program_view.rows,
+            [
+                b"## RUN ONCE ##" + native_newline,
+                native_newline,
+                b"## START PROGRAM LOOP ##" + native_newline,
+            ],
+        )
+        self.assertEqual(created_tab.lastProg, "")
+        self.assertFalse(hasattr(created_tab, "lastRow"))
+
+        created_tab.lastProg = "caller.ar4"
+        created_tab.lastRow = 5
+        reload_namespace = dict(create_namespace)
+        reload_namespace.update({
+            "path": SimpleNamespace(relpath=lambda value: value),
+            "ProgEntryField": program_entry,
+        })
+        reload_program = self.compile_function(
+            "reloadProg",
+            reload_namespace,
+        )
+        reload_program()
+        self.assertEqual(created_tab.lastProg, "")
+        self.assertFalse(hasattr(created_tab, "lastRow"))
 
         child_path = source_path.with_name("child.ar4")
         child_path.write_bytes(
@@ -31434,7 +31648,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertNotIn("fall back to unfiltered best", solver)
 
         self.assertIn(
-            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.8";',
+            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.9";',
             firmware,
         )
         self.assertIn('"JT_WRIST_CONFIG_V1"', firmware)
@@ -31482,6 +31696,23 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertLess(main_try, target_resolution)
         self.assertLess(target_resolution, install_call)
+
+    def test_teensy_reboot_is_target_defined(self):
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        reboot = cpp_braced_statement(
+            firmware,
+            r"void\s+reboot\s*\(\s*\)\s*\{",
+        )
+        reset_handler = cpp_braced_statement(
+            firmware,
+            r'if\s*\(\s*function\s*==\s*"RB"\s*\)\s*\{',
+        )
+
+        self.assertIn("SCB_AIRCR = 0x05FA0004;", reboot)
+        self.assertNotIn("driver_board", reboot)
+        self.assertNotIn("Unknown board type", reboot)
+        self.assertNotIn("Serial.", reset_handler)
+        self.assertIn("reboot();", reset_handler)
 
     def test_controller_identity_probe_matches_firmware_opcode(self):
         firmware = TEENSY_SOURCE.read_text(encoding="utf-8")

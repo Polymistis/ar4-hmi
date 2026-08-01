@@ -66,7 +66,7 @@
 // 6.6 - 2/22/26 - update kinematic solver to reduce J4/6 wrap | reimplement wrist N/F config
 // 6.7 - 3/11/26 MB holding reg bug fix
 // 6.7.1 - 3/11/26 bug fix calibration debounce
-const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.8";
+const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.9";
 const char *JT_WRIST_CONFIG_CAPABILITY = "JT_WRIST_CONFIG_V1";
 const char *GCODE_DIRECTORY_CAPABILITY = "GCODE_DIRECTORY_FRAMING_V1";
 const char *GCODE_DELETE_IDENTITY_CAPABILITY = "GCODE_DELETE_IDENTITY_V1";
@@ -1057,17 +1057,9 @@ bool save_robot_id_to_eeprom(const String robot_model, const String robot_versio
 }
 
 void reboot() {
-  DEBUG_PRINT("Rebooting Driver Board: ");
-  DEBUG_PRINTLN(driver_board);
-  if (driver_board.indexOf("Teensy") >= 0) {
-    DEBUG_PRINTLN("Teensy 3.x / 4.x: ARM system reset");
-    SCB_AIRCR = 0x05FA0004;
-    while (true)
-      ;
-  } else {
-    // Unknown type — fallback or safe no-op
-    Serial.println("Unknown board type, no reboot performed.");
-  }
+  SCB_AIRCR = 0x05FA0004;
+  while (true)
+    ;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -4043,7 +4035,6 @@ void loop() {
     }
 
     if (function == "RB") {
-      Serial.println("System Restarting");
       reboot();
     }
 

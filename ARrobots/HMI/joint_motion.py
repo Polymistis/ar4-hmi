@@ -6248,6 +6248,7 @@ class CoalescingJointDispatcher:
                 )
                 if not self._transport_lock.acquire(blocking=False):
                     raise MotionTransportBusy("controller transport is busy")
+                self._transport_reserved = True
                 try:
                     activity_lease = (
                         self._activity_factory()
@@ -6260,10 +6261,30 @@ class CoalescingJointDispatcher:
                         raise MotionInputError(
                             "activity_factory must return a closeable lease or None"
                         )
-                except Exception:
-                    self._transport_lock.release()
+                except Exception as admission_error:
+                    try:
+                        self._release_transport_locked()
+                    except Exception as release_error:
+                        try:
+                            admission_detail = " ".join(
+                                str(admission_error).split()
+                            )
+                        except Exception:
+                            admission_detail = type(admission_error).__name__
+                        admission_detail = (
+                            admission_detail
+                            or type(admission_error).__name__
+                        )
+                        combined_error = MotionQueueFault(
+                            "joint-motion admission failed: "
+                            f"{admission_detail}; admission rollback failed: "
+                            f"{release_error}"
+                        )
+                        self._publish_transport_release_fault_locked(
+                            combined_error
+                        )
+                        raise combined_error from release_error
                     raise
-                self._transport_reserved = True
                 self._activity_lease = activity_lease
 
             self._desired = target

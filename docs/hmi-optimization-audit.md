@@ -25,7 +25,7 @@ Tk serializes event callbacks on the interpreter thread. Long event handlers blo
   transport instead of treating a shortened read as proof of framing silence.
   Host parsing distinguishes controller-initiated `EB` physical-stop events
   from correlated `EA` command-admission rejections. The tracked Teensy
-  `6.7.1-ar4hmi.8` derivative atomically checks the stop latch and input at the
+  `6.7.1-ar4hmi.9` derivative atomically checks the stop latch and input at the
   queue boundary and after side-effect-free opcode extraction. A blocked
   loop-scoped response owner brackets every ordinary, admission, and telemetry
   terminal writer. The E-stop interrupt records assertion state and pending
@@ -256,7 +256,7 @@ Tk serializes event callbacks on the interpreter thread. Long event handlers blo
   and authorized hardware validation cover the broader algorithms. Spline rows
   remain disabled until speculative acknowledgements are replaced by owned
   terminal-response handling. `Tool Set` rows also reject because the tracked
-  Teensy `6.7.1-ar4hmi.8` parser has no `TF` command. Rejection leaves the
+  Teensy `6.7.1-ar4hmi.9` parser has no `TF` command. Rejection leaves the
   originating program selection unchanged. `.ar4` G-code playback transfers
   the row reservation to the serial worker and returns terminal completion or
   rejection to the row state machine without changing navigation before

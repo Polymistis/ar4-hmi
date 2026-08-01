@@ -3,7 +3,7 @@
 Firmware compilation is hardware-free. Do not add `--upload` without the explicit operator authorization, emergency-stop check, cleared work envelope, firmware identity, configuration profile, and procedure required by `AGENTS.md`.
 
 The tracked line-oriented Teensy compatibility source identifies version
-`6.7.1-ar4hmi.8`, advertises the required `JT_WRIST_CONFIG_V1`,
+`6.7.1-ar4hmi.9`, advertises the required `JT_WRIST_CONFIG_V1`,
 `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`,
 `GCODE_WRITE_IDENTITY_V1`, and `ESTOP_ADMISSION_V1` host capabilities plus the
 optional legacy `HOME_REFERENCE_V1`, preferred `HOME_REFERENCE_V2`
@@ -11,7 +11,8 @@ parking-reference, and `JOINT_TELEMETRY_V1` request-scoped J1-J6 encoder
 telemetry contracts, and compiles with Arduino CLI,
 PJRC Teensy core 1.62.0, bundled SdFat 2.1.2, and ModbusMaster 2.0.1. `HO`
 includes the fixed-width controller hardware identity used to bind storage
-requests to the connected Teensy. Compilation
+requests to the connected Teensy. `RB` performs the Teensy 4.1 target reset
+without consulting mutable controller identity fields. Compilation
 establishes source and toolchain compatibility only; hardware-free fixtures
 cover selected protocol behavior, while correlated JSON parsing and
 Cartesian-bound work remain later integration units.
@@ -123,6 +124,6 @@ when `AR4_ARDUINO_CLI` and `AR4_AUXILIARY_BUILD_DIRECTORY` identify the
 selected executable and an existing external temporary build parent. The test
 requires Arduino AVR core 1.8.8 and Servo 1.3.0 in compiler dependency output.
 
-The dated hardware-free build record, including the 2026-07-31
-`6.7.1-ar4hmi.8` result, is recorded in
+The dated hardware-free build record, including the current
+`6.7.1-ar4hmi.9` result, is recorded in
 [`docs/hardware-free-verification-2026-07-19.md`](../docs/hardware-free-verification-2026-07-19.md).

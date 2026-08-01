@@ -6512,6 +6512,85 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         wait_until(lambda: not dispatcher.active)
         self.assertTrue(registry.idle())
 
+    def test_admission_failure_retains_failed_transport_rollback(self):
+        class FailOnceReleaseLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.release_attempts = 0
+
+            def acquire(self, blocking=True):
+                return self.lock.acquire(blocking)
+
+            def release(self):
+                self.release_attempts += 1
+                if self.release_attempts == 1:
+                    raise RuntimeError("injected transport release failure")
+                self.lock.release()
+
+            def locked(self):
+                return self.lock.locked()
+
+        def reject_activity_admission():
+            raise MotionInputError("injected activity admission failure")
+
+        def return_invalid_activity_lease():
+            return object()
+
+        admission_cases = (
+            (
+                reject_activity_admission,
+                "injected activity admission failure",
+            ),
+            (
+                return_invalid_activity_lease,
+                "activity_factory must return a closeable lease or None",
+            ),
+        )
+        for activity_factory, admission_detail in admission_cases:
+            with self.subTest(admission_detail=admission_detail):
+                transport_lock = FailOnceReleaseLock()
+                dispatcher = self.make_dispatcher(
+                    lambda command: position_response((1, 0, 0, 0, 0, 0)),
+                    transport_lock=transport_lock,
+                    activity_factory=activity_factory,
+                )
+
+                with self.assertRaises(MotionQueueFault) as raised:
+                    dispatcher.submit_delta(0, 1, self.actual, self.profile)
+                self.assertIn(admission_detail, str(raised.exception))
+                self.assertIn(
+                    "injected transport release failure",
+                    str(raised.exception),
+                )
+                self.assertTrue(transport_lock.locked())
+                self.assertTrue(dispatcher._transport_reserved)
+                self.assertIsNone(dispatcher._activity_lease)
+                self.assertIn(
+                    "ownership release failed",
+                    dispatcher.fault_reason,
+                )
+                events = dispatcher.drain_events()
+                self.assertEqual(
+                    [event.kind for event in events],
+                    ["transport-failed"],
+                )
+                self.assertIn(admission_detail, events[0].error)
+                self.assertIn(
+                    "injected transport release failure",
+                    events[0].error,
+                )
+
+                with self.assertRaisesRegex(
+                    MotionQueueFault,
+                    "ownership release failed",
+                ):
+                    dispatcher.submit_delta(0, 1, self.actual, self.profile)
+
+                self.assertTrue(dispatcher.synchronize(self.actual))
+                self.assertFalse(transport_lock.locked())
+                self.assertFalse(dispatcher._transport_reserved)
+                self.assertIsNone(dispatcher.fault_reason)
+
     def test_activity_release_failure_releases_mutex_and_retries_lease(self):
         class FailOnceRegistry(SerialActivityRegistry):
             def __init__(self):
