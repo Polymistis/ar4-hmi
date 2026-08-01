@@ -505,6 +505,9 @@ class VisionSelectionResult:
 
     Template images retain OpenCV BGR channel order for persistence and
     matching. Template previews use RGB channel order for PIL/Tk rendering.
+    ``settings`` echoes the immutable request verbatim. For mask results,
+    ``settings.capture_settings.mask_bounds`` is the pre-selection value;
+    ``mask_bounds`` is the selected replacement applied to ``capture_result``.
     """
 
     kind: str
@@ -871,6 +874,16 @@ def normalize_camera_exception_detail(error, prefix=""):
     except Exception:
         detail = type(error).__name__
     detail = detail or type(error).__name__
+    try:
+        notes = getattr(error, "__notes__", ())
+    except Exception:
+        notes = ()
+    if isinstance(notes, (list, tuple)):
+        for note in notes:
+            if isinstance(note, str):
+                normalized_note = " ".join(note.split())
+                if normalized_note:
+                    detail += "; " + normalized_note
     bounded = (prefix + detail)[:MAX_CAMERA_PREVIEW_EVENT_DETAIL].rstrip()
     return bounded or type(error).__name__[:MAX_CAMERA_PREVIEW_EVENT_DETAIL]
 
@@ -1265,15 +1278,20 @@ def select_vision_region(image, window_name, cancellation_event=None):
                     )
                 )
             raise operation_error
-        detail = normalize_camera_exception_detail(operation_error)
-        if not isinstance(operation_error, MotionInputError):
-            detail = f"vision selection window failed: {detail}"
+        detail = normalize_camera_exception_detail(
+            operation_error,
+            (
+                ""
+                if isinstance(operation_error, MotionInputError)
+                else "vision selection window failed: "
+            ),
+        )
         if cleanup_error is not None:
             cleanup_detail = normalize_camera_exception_detail(cleanup_error)
             separator = "; vision selection window cleanup failed: "
             available = MAX_CAMERA_PREVIEW_EVENT_DETAIL - len(separator)
-            operation_limit = available // 2
-            cleanup_limit = available - operation_limit
+            cleanup_limit = min(len(cleanup_detail), available // 2)
+            operation_limit = available - cleanup_limit
             detail = (
                 detail[:operation_limit].rstrip()
                 + separator

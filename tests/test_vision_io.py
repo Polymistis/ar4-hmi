@@ -373,6 +373,13 @@ class VisionIoTests(unittest.TestCase):
                 capture_result=mask_result.capture_result,
                 mask_bounds=mask_result.mask_bounds,
             )
+        with self.assertRaisesRegex(MotionInputError, "result settings"):
+            VisionSelectionResult(
+                kind="mask",
+                settings=object(),
+                capture_result=mask_result.capture_result,
+                mask_bounds=mask_result.mask_bounds,
+            )
         with self.assertRaisesRegex(MotionInputError, "filename does not match"):
             VisionSelectionResult(
                 kind="template",
@@ -485,7 +492,7 @@ class VisionIoTests(unittest.TestCase):
         with self.assertRaisesRegex(MotionInputError, "window name"):
             select_vision_region(image, " invalid")
 
-    def test_interactive_vision_selection_normalizes_runtime_failures(self):
+    def test_interactive_vision_selection_handles_failures_and_interrupts(self):
         image = np.zeros((12, 16, 3), dtype=np.uint8)
         destroyed = []
 
@@ -498,6 +505,17 @@ class VisionIoTests(unittest.TestCase):
                 "window failed: window unavailable",
             ):
                 select_vision_region(image, "AR4 Vision Test")
+
+        with patch(
+            "ARrobots.HMI.vision_io.cv2.namedWindow",
+            side_effect=RuntimeError("n" * 600),
+        ):
+            with self.assertRaises(MotionInputError) as bounded_window_error:
+                select_vision_region(image, "AR4 Vision Test")
+        self.assertLessEqual(
+            len(str(bounded_window_error.exception)),
+            MAX_CAMERA_PREVIEW_EVENT_DETAIL,
+        )
 
         callbacks = []
 
@@ -567,10 +585,10 @@ class VisionIoTests(unittest.TestCase):
             "ARrobots.HMI.vision_io.cv2.setMouseCallback"
         ), patch("ARrobots.HMI.vision_io.cv2.imshow"), patch(
             "ARrobots.HMI.vision_io.cv2.waitKey",
-            side_effect=RuntimeError("w" * 600),
+            side_effect=RuntimeError("w" * 400),
         ), patch(
             "ARrobots.HMI.vision_io.cv2.destroyWindow",
-            side_effect=RuntimeError("d" * 600),
+            side_effect=RuntimeError("destroy unavailable"),
         ):
             with self.assertRaises(MotionInputError) as bounded_error:
                 select_vision_region(image, "AR4 Vision Test")
@@ -579,9 +597,15 @@ class VisionIoTests(unittest.TestCase):
             len(bounded_detail),
             MAX_CAMERA_PREVIEW_EVENT_DETAIL,
         )
+        self.assertIn("w" * 400, bounded_detail)
         self.assertIn("vision selection window cleanup failed", bounded_detail)
 
         interrupted_cleanup = []
+
+        def fail_interrupted_cleanup(name):
+            interrupted_cleanup.append(name)
+            raise RuntimeError("interrupt destroy unavailable")
+
         with patch("ARrobots.HMI.vision_io.cv2.namedWindow"), patch(
             "ARrobots.HMI.vision_io.cv2.setMouseCallback"
         ), patch("ARrobots.HMI.vision_io.cv2.imshow"), patch(
@@ -589,11 +613,16 @@ class VisionIoTests(unittest.TestCase):
             side_effect=KeyboardInterrupt(),
         ), patch(
             "ARrobots.HMI.vision_io.cv2.destroyWindow",
-            side_effect=lambda name: interrupted_cleanup.append(name),
+            side_effect=fail_interrupted_cleanup,
         ):
-            with self.assertRaises(KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt) as interrupted_error:
                 select_vision_region(image, "AR4 Vision Test")
         self.assertEqual(interrupted_cleanup, ["AR4 Vision Test"])
+        self.assertIn(
+            "vision selection window cleanup failed: interrupt destroy "
+            "unavailable",
+            normalize_camera_exception_detail(interrupted_error.exception),
+        )
 
         with patch("ARrobots.HMI.vision_io.cv2.namedWindow"), patch(
             "ARrobots.HMI.vision_io.cv2.setMouseCallback"
@@ -679,7 +708,7 @@ class VisionIoTests(unittest.TestCase):
             VisionSelectionSettings,
             VisionSelectionResult,
             "vision selection",
-            "ar4-vision-selection-kind-test",
+            "ar4-vision-selection-settings-test",
             coalesce=False,
         )
         mismatched = mismatched_worker.submit(settings)
