@@ -5900,7 +5900,7 @@ class MotionSubmission:
 @dataclass(frozen=True)
 class MotionEvent:
     kind: str
-    move: JointMove
+    move: Optional[JointMove]
     started_at_seconds: Optional[float] = None
     response: Optional[str] = None
     position: Optional[PositionResponse] = None
@@ -6272,26 +6272,86 @@ class CoalescingJointDispatcher:
                     self._pending = None
                     self._desired = None
                     self._fault_reason = f"worker startup failed: {exc}"
-                    try:
-                        self._release_transport_locked()
-                    finally:
-                        self._worker = None
+                    release_error = self._finish_worker_locked()
+                    if release_error is not None:
+                        raise MotionQueueFault(self._fault_reason) from release_error
                     raise
 
         return MotionSubmission(target=target, coalesced=coalesced)
 
     def _release_transport_locked(self):
-        if not self._transport_reserved:
+        if not self._transport_reserved and self._activity_lease is None:
             return False
-        self._transport_reserved = False
+
+        release_errors = []
         activity_lease = self._activity_lease
-        self._activity_lease = None
-        try:
-            self._transport_lock.release()
-        finally:
-            if activity_lease is not None:
+        if activity_lease is not None:
+            try:
                 activity_lease.close()
+            except Exception as exc:
+                release_errors.append(("serial activity lease", exc))
+            else:
+                self._activity_lease = None
+        if self._transport_reserved:
+            try:
+                self._transport_lock.release()
+            except Exception as exc:
+                release_errors.append(("controller transport lock", exc))
+            else:
+                self._transport_reserved = False
+        if release_errors:
+            details = []
+            for owner, error in release_errors:
+                try:
+                    detail = " ".join(str(error).split())
+                except Exception:
+                    detail = type(error).__name__
+                details.append(f"{owner}: {detail or type(error).__name__}")
+            raise MotionQueueFault("; ".join(details)) from release_errors[0][1]
         return True
+
+    def _latch_transport_release_fault_locked(self, error):
+        try:
+            detail = " ".join(str(error).split())
+        except Exception:
+            detail = type(error).__name__
+        detail = detail or type(error).__name__
+        release_reason = f"controller ownership release failed: {detail}"
+        pending_discarded = self._pending is not None
+        self._pending = None
+        self._desired = None
+        self._latest_telemetry_event = None
+        if self._fault_reason is None:
+            self._fault_reason = release_reason
+        elif release_reason not in self._fault_reason:
+            self._fault_reason = f"{self._fault_reason}; {release_reason}"
+        return release_reason, pending_discarded
+
+    def _publish_transport_release_fault_locked(self, error, move=None):
+        release_reason, pending_discarded = (
+            self._latch_transport_release_fault_locked(error)
+        )
+        self._events.append(
+            self._next_event_record_locked(
+                MotionEvent(
+                    kind="transport-failed",
+                    move=move,
+                    error=release_reason,
+                    pending_discarded=pending_discarded,
+                )
+            )
+        )
+        return release_reason
+
+    def _finish_worker_locked(self, move=None):
+        release_error = None
+        try:
+            self._release_transport_locked()
+        except Exception as exc:
+            release_error = exc
+            self._publish_transport_release_fault_locked(exc, move)
+        self._worker = None
+        return release_error
 
     def synchronize(self, positions):
         calibration = self._calibration_provider()
@@ -6303,6 +6363,12 @@ class CoalescingJointDispatcher:
         with self._lock:
             if self._closed or self._worker is not None:
                 return False
+            if self._transport_reserved or self._activity_lease is not None:
+                try:
+                    self._release_transport_locked()
+                except Exception as exc:
+                    self._publish_transport_release_fault_locked(exc)
+                    return False
             self._desired = normalized
             self._fault_reason = None
             return True
@@ -6345,16 +6411,21 @@ class CoalescingJointDispatcher:
 
     def close(self):
         acknowledgement = None
+        cleanup_complete = False
         with self._lock:
             self._closed = True
             self._pending = None
             self._desired = None
             self._latest_telemetry_event = None
             acknowledgement = self._result_acknowledgement
-            if self._worker is None and self._transport_reserved:
-                self._release_transport_locked()
+            cleanup_complete = self._worker is None
+            if cleanup_complete and (
+                self._transport_reserved or self._activity_lease is not None
+            ):
+                cleanup_complete = self._finish_worker_locked() is None
         if acknowledgement is not None:
             acknowledgement.set()
+        return cleanup_complete
 
     def drain_events(self, limit=None):
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
@@ -6427,8 +6498,7 @@ class CoalescingJointDispatcher:
             with self._lock:
                 if self._closed or self._pending is None:
                     self._inflight = None
-                    self._release_transport_locked()
-                    self._worker = None
+                    self._finish_worker_locked()
                 else:
                     move = self._pending
                     self._pending = None
@@ -6489,8 +6559,7 @@ class CoalescingJointDispatcher:
                 with self._lock:
                     if self._result_acknowledgement is acknowledgement:
                         self._result_acknowledgement = None
-                    self._release_transport_locked()
-                    self._worker = None
+                    self._finish_worker_locked(move)
                 return
 
             acknowledgement = threading.Event()
@@ -6518,7 +6587,6 @@ class CoalescingJointDispatcher:
                     self._result_acknowledgement = None
                 should_continue = not self._closed and self._pending is not None
                 if not should_continue:
-                    self._release_transport_locked()
-                    self._worker = None
+                    self._finish_worker_locked(move)
             if not should_continue:
                 return

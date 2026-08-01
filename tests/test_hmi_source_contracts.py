@@ -385,6 +385,13 @@ class HmiSourceContractTests(unittest.TestCase):
 
     def compile_function(self, name, namespace, *, preserve_decorators=False):
         self.add_motion_request_dependencies(namespace)
+        if name in {"executeRow", "_program_row_is_supported"}:
+            for constant_name in (
+                "PROGRAM_ROW_COMMAND_PREFIXES",
+                "PROGRAM_ROW_LONG_COMMAND_PREFIXES",
+            ):
+                if constant_name not in namespace:
+                    self.compile_assignment(constant_name, namespace)
         namespace.setdefault(
             "RUN",
             {
@@ -466,6 +473,10 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_poll_application_close": (
                 "_serial_shutdown_ready_for_close",
+                "_close_joint_motion_dispatcher_for_shutdown",
+            ),
+            "on_closing": (
+                "_close_joint_motion_dispatcher_for_shutdown",
             ),
             "_begin_program_execution": (
                 "_program_execution_stop_admission_reason_locked",
@@ -505,7 +516,17 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_manual_auxiliary_stop_in_progress",
             ),
             "executeRow": (
+                "_decode_program_row_content",
+                "_selected_program_row",
+                "_read_selected_program_command",
+                "_program_row_is_supported",
+                "_program_row_error_detail",
+                "_reject_program_row_before_execution",
                 "_reject_cancelled_program_row",
+            ),
+            "stepRev": (
+                "_selected_program_row",
+                "_program_row_error_detail",
             ),
         }
         for dependency in function_dependencies.get(name, ()):
@@ -1460,6 +1481,14 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault("offline_live_jog_state_lock", threading.Lock())
         namespace.setdefault("offline_live_jog_operation", None)
         namespace.setdefault("_virtual_motion_active", lambda: False)
+        namespace.setdefault(
+            "joint_motion_dispatcher",
+            SimpleNamespace(
+                close=lambda: True,
+                active=False,
+                fault_reason=None,
+            ),
+        )
 
     def add_save_and_apply_dependencies(self, namespace):
         namespace.setdefault(
@@ -3950,6 +3979,10 @@ class HmiSourceContractTests(unittest.TestCase):
             @staticmethod
             def curselection():
                 return (0,)
+
+            @classmethod
+            def size(cls):
+                return len(cls.rows)
 
             @staticmethod
             def see(row):
@@ -6582,6 +6615,43 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(len(exceptions), 1)
 
+    def test_shutdown_dispatcher_cleanup_reports_failure_without_raising(self):
+        class Dispatcher:
+            def __init__(self):
+                self.results = [
+                    RuntimeError("injected close failure"),
+                    False,
+                    True,
+                ]
+                self.active = False
+                self.fault_reason = "retained ownership"
+
+            def close(self):
+                result = self.results.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+        logs = []
+        namespace = {
+            "joint_motion_dispatcher": Dispatcher(),
+            "logger": SimpleNamespace(
+                error=lambda *args: logs.append(("error", args)),
+                exception=lambda *args: logs.append(("exception", args)),
+            ),
+        }
+        close_dispatcher = self.compile_function(
+            "_close_joint_motion_dispatcher_for_shutdown",
+            namespace,
+        )
+
+        self.assertFalse(close_dispatcher())
+        self.assertEqual(logs[-1][0], "exception")
+        self.assertFalse(close_dispatcher())
+        self.assertEqual(logs[-1][0], "error")
+        self.assertIn("retained ownership", logs[-1][1])
+        self.assertTrue(close_dispatcher())
+
     def test_shutdown_requests_online_and_offline_stop_before_final_flush(self):
         class Flag:
             def __init__(self, initial=False):
@@ -6600,6 +6670,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
             def close(self):
                 self.closed = True
+                return False
 
         class Label:
             def __init__(self):
@@ -6772,7 +6843,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_poll_serial_events": lambda: drained_events.append("serial"),
             "_poll_auxiliary_serial_events": lambda: drained_events.append("auxiliary"),
             "_poll_joint_motion_events": lambda: drained_events.append("joint"),
-            "joint_motion_dispatcher": SimpleNamespace(close=lambda: None),
+            "joint_motion_dispatcher": SimpleNamespace(close=lambda: True),
             "_flush_calibration_save": lambda: True,
             "logger": SimpleNamespace(exception=lambda *args: None),
             "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
@@ -6858,7 +6929,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_poll_serial_events": lambda: None,
             "_poll_auxiliary_serial_events": lambda: None,
             "_poll_joint_motion_events": lambda: None,
-            "joint_motion_dispatcher": SimpleNamespace(close=lambda: None),
+            "joint_motion_dispatcher": SimpleNamespace(close=lambda: True),
             "_flush_calibration_save": lambda: True,
             "logger": SimpleNamespace(exception=lambda *args: None),
             "almStatusLab": SimpleNamespace(
@@ -6963,7 +7034,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_poll_serial_events": lambda: None,
             "_poll_auxiliary_serial_events": lambda: None,
             "_poll_joint_motion_events": lambda: None,
-            "joint_motion_dispatcher": SimpleNamespace(close=lambda: None),
+            "joint_motion_dispatcher": SimpleNamespace(close=lambda: True),
             "_flush_calibration_save": lambda: True,
             "logger": SimpleNamespace(exception=lambda *args: None),
             "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
@@ -7056,7 +7127,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_poll_auxiliary_serial_events": lambda: None,
             "_poll_joint_motion_events": lambda: None,
             "_poll_virtual_motion_events": lambda: None,
-            "joint_motion_dispatcher": SimpleNamespace(close=lambda: None),
+            "joint_motion_dispatcher": SimpleNamespace(close=lambda: True),
             "_flush_calibration_save": lambda: flushes.append(True) or True,
             "logger": SimpleNamespace(exception=lambda *args: None),
             "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
@@ -7141,6 +7212,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
             def close(self):
                 self.sequence.append("dispatcher-close")
+                return True
 
         result_queue = SignalingQueue()
         exchange_release = threading.Event()
@@ -7242,7 +7314,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(poll_close())
         self.assertTrue(transport_lock.locked())
         self.assertTrue(legacy_pending.is_set())
-        self.assertEqual(sequence, ["auxiliary", "joint"])
+        self.assertEqual(
+            sequence,
+            ["auxiliary", "joint", "dispatcher-close"],
+        )
         self.assertEqual(len(root.jobs), 1)
 
         exchange_release.set()
@@ -7331,7 +7406,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_virtual_motion_active": (
                 lambda: logical_motion_active["value"]
             ),
-            "joint_motion_dispatcher": SimpleNamespace(close=lambda: None),
+            "joint_motion_dispatcher": SimpleNamespace(close=lambda: True),
             "_flush_calibration_save": lambda: True,
             "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
             "almStatusLab2": SimpleNamespace(config=lambda **kwargs: None),
@@ -7463,7 +7538,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_poll_serial_events": lambda: None,
             "_poll_auxiliary_serial_events": lambda: None,
             "_poll_joint_motion_events": lambda: None,
-            "joint_motion_dispatcher": SimpleNamespace(close=lambda: None),
+            "joint_motion_dispatcher": SimpleNamespace(close=lambda: True),
             "_flush_calibration_save": lambda: True,
             "logger": SimpleNamespace(exception=lambda *args: None),
             "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
@@ -7695,7 +7770,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_poll_serial_events": lambda: None,
             "_poll_auxiliary_serial_events": lambda: None,
             "_poll_joint_motion_events": lambda: None,
-            "joint_motion_dispatcher": SimpleNamespace(close=lambda: None),
+            "joint_motion_dispatcher": SimpleNamespace(close=lambda: True),
             "_flush_calibration_save": lambda: outcomes.pop(0),
             "logger": SimpleNamespace(exception=lambda *args: None),
             "almStatusLab": first_label,
@@ -13942,6 +14017,250 @@ class HmiSourceContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "KeyboardInterrupt"):
             interrupted_event.wait()
 
+    def test_execute_row_rejects_selection_and_command_boundary_failures(self):
+        class Request:
+            pass
+
+        class ProgramView:
+            def __init__(self, selection, rows, failure=None):
+                self.selection = selection
+                self.rows = tuple(rows)
+                self.failure = failure
+
+            def curselection(self):
+                if self.failure == "selection":
+                    raise RuntimeError("selection unavailable")
+                return self.selection
+
+            def size(self):
+                return len(self.rows)
+
+            def get(self, row):
+                if self.failure == "read":
+                    raise RuntimeError("row unavailable")
+                return self.rows[row]
+
+            def see(self, row):
+                if self.failure == "scroll":
+                    raise RuntimeError("scroll unavailable")
+
+        request = Request()
+        runtime = {
+            "progRunning": False,
+            "rowinproc": 0,
+        }
+        statuses = []
+        errors = []
+        finishes = []
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "ProgramExecutionRequest": Request,
+            "ROW_EXECUTION_COMPLETE": "complete",
+            "ROW_EXECUTION_REJECTED": "rejected",
+            "RUN": runtime,
+            "program_stop_state_lock": threading.Lock(),
+            "program_execution_state_lock": threading.Lock(),
+            "program_execution_active_request": request,
+            "_reject_cancelled_program_row": lambda active: False,
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+            "_finish_execute_row": (
+                lambda: (
+                    finishes.append(True),
+                    runtime.update(progRunning=False, rowinproc=0),
+                )
+            ),
+            "logger": SimpleNamespace(
+                error=lambda *args: errors.append(("error", args)),
+                exception=lambda *args: errors.append(("exception", args)),
+            ),
+            "re": re,
+            "frozenset": frozenset,
+            "stopProg": lambda: self.fail(
+                "invalid program rows must not become Stop Program"
+            ),
+        }
+        constant_names = {
+            "PROGRAM_ROW_COMMAND_PREFIXES",
+            "PROGRAM_ROW_LONG_COMMAND_PREFIXES",
+        }
+        constant_nodes = [
+            copy.deepcopy(node)
+            for node in self.tree.body
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in constant_names
+            )
+        ]
+        self.assertEqual(len(constant_nodes), len(constant_names))
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=constant_nodes, type_ignores=[])
+                ),
+                str(AR4_SOURCE),
+                "exec",
+            ),
+            namespace,
+        )
+
+        def runtime_command_key(node):
+            if (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "RUN"
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value in {"cmdType", "cmdTypeLong"}
+            ):
+                return node.slice.value
+            return None
+
+        branch_prefixes = {
+            "cmdType": set(),
+            "cmdTypeLong": set(),
+        }
+        for node in ast.walk(self.module_functions["executeRow"]):
+            if not isinstance(node, ast.Compare) or len(node.ops) != 1:
+                continue
+            key = runtime_command_key(node.left)
+            if key is None:
+                continue
+            comparator = node.comparators[0]
+            if isinstance(node.ops[0], ast.Eq) and isinstance(
+                comparator,
+                ast.Constant,
+            ):
+                branch_prefixes[key].add(comparator.value)
+            elif isinstance(node.ops[0], ast.In) and isinstance(
+                comparator,
+                (ast.Set, ast.Tuple, ast.List),
+            ):
+                branch_prefixes[key].update(
+                    element.value
+                    for element in comparator.elts
+                    if isinstance(element, ast.Constant)
+                )
+        self.assertEqual(
+            namespace["PROGRAM_ROW_COMMAND_PREFIXES"],
+            branch_prefixes["cmdType"],
+        )
+        self.assertEqual(
+            namespace["PROGRAM_ROW_LONG_COMMAND_PREFIXES"],
+            branch_prefixes["cmdTypeLong"],
+        )
+
+        self.compile_function("_abort_program_row_execution", namespace)
+        self.compile_function("_selected_program_row", namespace)
+        self.compile_function("_decode_program_row_content", namespace)
+        self.compile_function("_read_selected_program_command", namespace)
+        self.compile_function("_program_row_is_supported", namespace)
+        self.compile_function("_program_row_error_detail", namespace)
+        self.compile_function("_reject_program_row_before_execution", namespace)
+        execute_row = self.compile_function("executeRow", namespace)
+
+        cases = (
+            (
+                "selection-read",
+                ProgramView((0,), (b"Stop Program\n",), "selection"),
+                "selection unavailable",
+            ),
+            (
+                "empty-selection",
+                ProgramView((), (b"Stop Program\n",)),
+                "no selected row",
+            ),
+            (
+                "multiple-selection",
+                ProgramView((0, 1), (b"Stop Program\n", b"Stop Program\n")),
+                "exactly one selected row",
+            ),
+            (
+                "out-of-range",
+                ProgramView((2,), (b"Stop Program\n",)),
+                "out of range",
+            ),
+            (
+                "row-read",
+                ProgramView((0,), (b"Stop Program\n",), "read"),
+                "row unavailable",
+            ),
+            (
+                "decode",
+                ProgramView((0,), (b"\xff\n",)),
+                "must contain UTF-8 text",
+            ),
+            (
+                "unknown-command",
+                ProgramView((0,), (b"Typo Program\n",)),
+                "unsupported robot program row",
+            ),
+        )
+        for name, program_view, expected_detail in cases:
+            with self.subTest(name=name):
+                runtime.update(progRunning=False, rowinproc=1)
+                statuses.clear()
+                errors.clear()
+                finishes.clear()
+                namespace["tab1"] = SimpleNamespace(progView=program_view)
+
+                self.assertEqual(
+                    execute_row(execution_request=request),
+                    "rejected",
+                )
+                self.assertFalse(runtime["progRunning"])
+                self.assertEqual(runtime["rowinproc"], 0)
+                self.assertEqual(finishes, [])
+                self.assertEqual(len(statuses), 1)
+                self.assertEqual(statuses[0][1], "Alarm.TLabel")
+                self.assertIn(expected_detail, statuses[0][0])
+                self.assertTrue(errors)
+
+        runtime.update(progRunning=False, rowinproc=1)
+        statuses.clear()
+        errors.clear()
+        finishes.clear()
+        namespace["tab1"] = SimpleNamespace(
+            progView=ProgramView((0,), (b"\n",), "scroll")
+        )
+        self.assertEqual(
+            execute_row(execution_request=request),
+            "complete",
+        )
+        self.assertFalse(runtime["progRunning"])
+        self.assertEqual(runtime["rowinproc"], 0)
+        self.assertEqual(finishes, [True])
+        self.assertEqual(statuses, [])
+        self.assertTrue(
+            any(
+                level == "exception"
+                and args[0] == "Unable to scroll the robot program view"
+                for level, args in errors
+            )
+        )
+
+        for row in (b"\n", b"## operator note\n", b"Tab Number 2\n"):
+            with self.subTest(structural_row=row):
+                runtime.update(progRunning=False, rowinproc=1)
+                statuses.clear()
+                errors.clear()
+                finishes.clear()
+                namespace["tab1"] = SimpleNamespace(
+                    progView=ProgramView((0,), (row,))
+                )
+
+                self.assertEqual(
+                    execute_row(execution_request=request),
+                    "complete",
+                )
+                self.assertFalse(runtime["progRunning"])
+                self.assertEqual(runtime["rowinproc"], 0)
+                self.assertEqual(finishes, [True])
+                self.assertEqual(statuses, [])
+                self.assertEqual(errors, [])
+
     def test_program_worker_selection_transitions_delegate_to_tk(self):
         expected_dispatch_calls = {"runProg": 3, "stepFwd": 1}
         for function_name, expected_count in expected_dispatch_calls.items():
@@ -16429,6 +16748,9 @@ class HmiSourceContractTests(unittest.TestCase):
             def curselection(self):
                 return (self.selected,)
 
+            def size(self):
+                return len(self.rows)
+
             def index(self, value):
                 if value != "end":
                     raise AssertionError("unexpected program-view index")
@@ -16814,6 +17136,10 @@ class HmiSourceContractTests(unittest.TestCase):
             @staticmethod
             def curselection():
                 return (0,)
+
+            @staticmethod
+            def size():
+                return 1
 
             @staticmethod
             def see(*args):
@@ -18421,6 +18747,10 @@ class HmiSourceContractTests(unittest.TestCase):
                 return (4,)
 
             @staticmethod
+            def size():
+                return 5
+
+            @staticmethod
             def selection_clear(*args):
                 pass
 
@@ -18430,6 +18760,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         tab.progView = ProgramView()
         namespace["threading"] = threading
+        namespace["END"] = "end"
         namespace["ROW_EXECUTION_COMPLETE"] = "complete"
         namespace["ROW_EXECUTION_PENDING"] = "pending"
         namespace["ROW_EXECUTION_REJECTED"] = "rejected"
@@ -18442,7 +18773,60 @@ class HmiSourceContractTests(unittest.TestCase):
             lambda row, succeeded: completions.append((row, succeeded))
         )
         namespace["_finish_step_reverse_selection"] = selections.append
+        self.compile_function("_selected_program_row", namespace)
+        self.compile_function("_program_row_error_detail", namespace)
         step_reverse = self.compile_function("stepRev", namespace)
+
+        class FailingSelectionView:
+            @staticmethod
+            def curselection():
+                raise RuntimeError("step-reverse selection unavailable")
+
+        tab.progView = FailingSelectionView()
+        callback_count = len(callbacks)
+        self.assertFalse(step_reverse())
+        self.assertFalse(execution_active())
+        self.assertEqual(len(callbacks), callback_count)
+        self.assertIn(
+            "step-reverse selection unavailable",
+            first_label.configurations[-1]["text"],
+        )
+        self.assertEqual(first_label.configurations[-1]["style"], "Alarm.TLabel")
+
+        class EmptySelectionView:
+            def __init__(self):
+                self.selection = ()
+
+            def curselection(self):
+                return self.selection
+
+            @staticmethod
+            def size():
+                return 2
+
+            @staticmethod
+            def selection_clear(*args):
+                pass
+
+            def select_set(self, row):
+                self.selection = (row,)
+
+        empty_selection_view = EmptySelectionView()
+        tab.progView = empty_selection_view
+        namespace["executeRow"] = (
+            lambda motion_complete=None, **kwargs: "complete"
+        )
+        self.assertTrue(step_reverse())
+        self.assertEqual(empty_selection_view.selection, (1,))
+        self.assertEqual(selections, [1])
+        selections.clear()
+
+        tab.progView = ProgramView()
+        namespace["executeRow"] = (
+            lambda motion_complete=None, **kwargs: (
+                callbacks.append(motion_complete) or "pending"
+            )
+        )
 
         self.assertTrue(step_reverse())
         self.assertTrue(execution_active())
@@ -19733,6 +20117,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.positions = []
                 self.accept = True
                 self.invalidations = []
+                self.active = False
+                self.fault_reason = None
 
             def synchronize(self, position):
                 self.positions.append(position)
@@ -19908,6 +20294,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
 
         dispatcher.accept = False
+        dispatcher.active = True
         calibration_before_rejection = dict(namespace["CAL"])
         rejected_response = response.replace("A1B", "A99B", 1)
         self.assertFalse(display_position(rejected_response))
@@ -19920,6 +20307,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertTrue(resynchronization_required.is_set())
         dispatcher.accept = True
+        dispatcher.active = False
         self.assertTrue(display_position(response))
         self.assertFalse(resynchronization_required.is_set())
         recovered_source_token = actual_source()
@@ -19932,6 +20320,18 @@ class HmiSourceContractTests(unittest.TestCase):
             virtual_updates[-1],
             (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
         )
+
+        dispatcher.accept = False
+        dispatcher.fault_reason = "controller ownership release failed"
+        self.assertFalse(display_position(rejected_response))
+        self.assertIn(
+            "could not release joint-motion ownership: "
+            "controller ownership release failed",
+            namespace["logger"].errors[-1],
+        )
+        dispatcher.accept = True
+        dispatcher.fault_reason = None
+        resynchronization_required.clear()
 
         calibration_before_limit_failure = dict(namespace["CAL"])
         dispatcher_positions_before_limit_failure = list(dispatcher.positions)
@@ -20014,6 +20414,10 @@ class HmiSourceContractTests(unittest.TestCase):
             @staticmethod
             def curselection():
                 return (0,)
+
+            @staticmethod
+            def size():
+                return 1
 
             @staticmethod
             def see(row):
@@ -20119,6 +20523,10 @@ class HmiSourceContractTests(unittest.TestCase):
             @staticmethod
             def curselection():
                 return (0,)
+
+            @staticmethod
+            def size():
+                return 1
 
             @staticmethod
             def see(row):
@@ -20265,6 +20673,10 @@ class HmiSourceContractTests(unittest.TestCase):
             @staticmethod
             def curselection():
                 return (0,)
+
+            @staticmethod
+            def size():
+                return 1
 
             @staticmethod
             def see(row):
@@ -20649,6 +21061,10 @@ class HmiSourceContractTests(unittest.TestCase):
                 return (0,)
 
             @staticmethod
+            def size():
+                return 1
+
+            @staticmethod
             def see(row):
                 pass
 
@@ -20747,6 +21163,10 @@ class HmiSourceContractTests(unittest.TestCase):
                 return (self.selection,)
 
             @staticmethod
+            def size():
+                return 5
+
+            @staticmethod
             def see(row):
                 pass
 
@@ -20799,6 +21219,10 @@ class HmiSourceContractTests(unittest.TestCase):
             @staticmethod
             def curselection():
                 return (0,)
+
+            @staticmethod
+            def size():
+                return 1
 
             @staticmethod
             def see(row):
@@ -32914,6 +33338,10 @@ class HmiSourceContractTests(unittest.TestCase):
 
             def curselection(self):
                 return tuple(self.selected)
+
+            @staticmethod
+            def size():
+                return 5
 
             def see(self, row):
                 pass

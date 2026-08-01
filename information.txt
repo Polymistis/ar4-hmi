@@ -62,7 +62,7 @@ b. Pausing
 
 
 c. IO
-- The set output on or set output off buttons allow you to insert a line of code that will turn Arduino IO of your choice on or off (see bottom on input outputs tab for available IO pins on the Arduino Mega). For example, if you have a pneumatic gripper you would hook up your solenoid per the wiring harness manual to output Arduino pin #38 and ender a line of code "Out On = 38" to control your gripper.
+- Legacy "Out On = N" and "Out Off = N" program rows have no executable handler and are rejected before execution. Use the active 5 V output or Modbus program controls for supported controller I/O.
 
 
 d. Navigation

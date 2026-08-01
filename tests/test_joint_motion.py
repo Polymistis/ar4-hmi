@@ -6512,6 +6512,229 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         wait_until(lambda: not dispatcher.active)
         self.assertTrue(registry.idle())
 
+    def test_activity_release_failure_releases_mutex_and_retries_lease(self):
+        class FailOnceRegistry(SerialActivityRegistry):
+            def __init__(self):
+                super().__init__(("ser",))
+                self.release_attempts = 0
+
+            def end(self, serial_name, control_injectable=False):
+                self.release_attempts += 1
+                if self.release_attempts == 1:
+                    raise RuntimeError("injected registry release failure")
+                return super().end(
+                    serial_name,
+                    control_injectable=control_injectable,
+                )
+
+        transport_lock = threading.Lock()
+        registry = FailOnceRegistry()
+        dispatcher = self.make_dispatcher(
+            lambda command: position_response((1, 0, 0, 0, 0, 0)),
+            transport_lock=transport_lock,
+            activity_factory=lambda: registry.lease("ser"),
+        )
+
+        dispatcher.submit_delta(0, 1, self.actual, self.profile)
+        events = collect_events_until_idle(dispatcher)
+
+        self.assertEqual(
+            [event.kind for event in events],
+            ["started", "completed", "transport-failed"],
+        )
+        self.assertIn(
+            "injected registry release failure",
+            events[-1].error,
+        )
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(registry.active("ser"))
+        self.assertFalse(dispatcher._transport_reserved)
+        self.assertIsNotNone(dispatcher._activity_lease)
+        self.assertIn("ownership release failed", dispatcher.fault_reason)
+        self.assertIsNone(dispatcher.desired_target)
+        self.assertTrue(transport_lock.acquire(blocking=False))
+        transport_lock.release()
+        with self.assertRaisesRegex(
+            MotionQueueFault,
+            "ownership release failed",
+        ):
+            dispatcher.submit_delta(0, 1, self.actual, self.profile)
+
+        with registry.operations(("ser",)):
+            self.assertTrue(dispatcher.synchronize(self.actual))
+            self.assertTrue(registry.active("ser"))
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(registry.idle())
+        self.assertFalse(dispatcher._transport_reserved)
+        self.assertIsNone(dispatcher._activity_lease)
+        self.assertIsNone(dispatcher.fault_reason)
+
+        dispatcher.submit_delta(0, 1, self.actual, self.profile)
+        recovered_events = collect_events_until_idle(dispatcher)
+        self.assertEqual(
+            [event.kind for event in recovered_events],
+            ["started", "completed"],
+        )
+        self.assertTrue(registry.idle())
+
+    def test_release_reports_and_recovers_multiple_ownership_failures(self):
+        class FailOnceRegistry(SerialActivityRegistry):
+            def __init__(self):
+                super().__init__(("ser",))
+                self.release_attempts = 0
+
+            def end(self, serial_name, control_injectable=False):
+                self.release_attempts += 1
+                if self.release_attempts == 1:
+                    raise RuntimeError("injected registry release failure")
+                return super().end(
+                    serial_name,
+                    control_injectable=control_injectable,
+                )
+
+        class FailOnceReleaseLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.release_attempts = 0
+
+            def acquire(self, blocking=True):
+                return self.lock.acquire(blocking)
+
+            def release(self):
+                self.release_attempts += 1
+                if self.release_attempts == 1:
+                    raise RuntimeError("injected transport release failure")
+                self.lock.release()
+
+            def locked(self):
+                return self.lock.locked()
+
+        transport_lock = FailOnceReleaseLock()
+        registry = FailOnceRegistry()
+        dispatcher = self.make_dispatcher(
+            lambda command: position_response((1, 0, 0, 0, 0, 0)),
+            transport_lock=transport_lock,
+            activity_factory=lambda: registry.lease("ser"),
+        )
+
+        dispatcher.submit_delta(0, 1, self.actual, self.profile)
+        events = collect_events_until_idle(dispatcher)
+
+        self.assertEqual(
+            [event.kind for event in events],
+            ["started", "completed", "transport-failed"],
+        )
+        self.assertIn("serial activity lease", events[-1].error)
+        self.assertIn("controller transport lock", events[-1].error)
+        self.assertTrue(transport_lock.locked())
+        self.assertTrue(registry.active("ser"))
+        self.assertTrue(dispatcher._transport_reserved)
+        self.assertIsNotNone(dispatcher._activity_lease)
+
+        self.assertTrue(dispatcher.synchronize(self.actual))
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(registry.idle())
+        self.assertFalse(dispatcher._transport_reserved)
+        self.assertIsNone(dispatcher._activity_lease)
+        self.assertIsNone(dispatcher.fault_reason)
+
+    def test_close_reports_retained_lease_failure_without_raising(self):
+        class FailTwiceRegistry(SerialActivityRegistry):
+            def __init__(self):
+                super().__init__(("ser",))
+                self.release_attempts = 0
+
+            def end(self, serial_name, control_injectable=False):
+                self.release_attempts += 1
+                if self.release_attempts <= 2:
+                    raise RuntimeError("injected retained lease failure")
+                return super().end(
+                    serial_name,
+                    control_injectable=control_injectable,
+                )
+
+        registry = FailTwiceRegistry()
+        dispatcher = self.make_dispatcher(
+            lambda command: position_response((1, 0, 0, 0, 0, 0)),
+            activity_factory=lambda: registry.lease("ser"),
+        )
+
+        dispatcher.submit_delta(0, 1, self.actual, self.profile)
+        collect_events_until_idle(dispatcher)
+        self.assertTrue(registry.active("ser"))
+
+        self.assertFalse(dispatcher.close())
+        close_events = dispatcher.drain_events()
+        self.assertEqual(
+            [event.kind for event in close_events],
+            ["transport-failed"],
+        )
+        self.assertIn("injected retained lease failure", close_events[0].error)
+        self.assertTrue(registry.active("ser"))
+        self.assertIsNotNone(dispatcher._activity_lease)
+
+        self.assertTrue(dispatcher.close())
+        self.assertTrue(registry.idle())
+        self.assertIsNone(dispatcher._activity_lease)
+        self.assertFalse(dispatcher.synchronize(self.actual))
+
+    def test_idle_worker_release_failure_publishes_without_a_move(self):
+        class FailOnceRegistry(SerialActivityRegistry):
+            def __init__(self):
+                super().__init__(("ser",))
+                self.release_attempts = 0
+
+            def end(self, serial_name, control_injectable=False):
+                self.release_attempts += 1
+                if self.release_attempts == 1:
+                    raise RuntimeError("injected idle release failure")
+                return super().end(
+                    serial_name,
+                    control_injectable=control_injectable,
+                )
+
+        class DeferredWorker:
+            instance = None
+
+            def __init__(self, target, **_kwargs):
+                self.target = target
+                type(self).instance = self
+
+            def start(self):
+                pass
+
+            def run(self):
+                self.target()
+
+        transport_lock = threading.Lock()
+        registry = FailOnceRegistry()
+        dispatcher = self.make_dispatcher(
+            lambda command: position_response((1, 0, 0, 0, 0, 0)),
+            transport_lock=transport_lock,
+            activity_factory=lambda: registry.lease("ser"),
+        )
+
+        with patch(
+            "ARrobots.HMI.joint_motion.threading.Thread",
+            DeferredWorker,
+        ):
+            dispatcher.submit_delta(0, 1, self.actual, self.profile)
+        self.assertTrue(dispatcher.invalidate("external invalidation"))
+        DeferredWorker.instance.run()
+
+        events = dispatcher.drain_events()
+        self.assertEqual([event.kind for event in events], ["transport-failed"])
+        self.assertIsNone(events[0].move)
+        self.assertIn("injected idle release failure", events[0].error)
+        self.assertFalse(dispatcher.active)
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(registry.active("ser"))
+        self.assertIn("ownership release failed", dispatcher.fault_reason)
+
+        self.assertTrue(dispatcher.synchronize(self.actual))
+        self.assertTrue(registry.idle())
+        self.assertIsNone(dispatcher.fault_reason)
+
     def test_idle_publication_waits_for_transport_release(self):
         transport_lock = ReleaseBarrierLock()
         command_count = 0

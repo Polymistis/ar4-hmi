@@ -1178,6 +1178,17 @@ Known M5 deviations:
 ## Current implementation boundary
 
 - Incremental J1-J9, absolute slider routing, offline external-axis rejection, and live-jog desktop wiring are statically or behaviorally checked without importing `AR4.py`; dispatcher coalescing, deferred intent ordering, controller and six-axis simulator command schemas, framed responses, optional protocol-authorized follow-up frames, full quiet-boundary acknowledgements, trailing-byte quarantine, retained failed-close ownership, configured Linux and Windows Xbox validation, watchdog scheduler failure, startup acknowledgement variants, startup finalizer rejection, set-position acknowledgement sequencing, live-stop injection and request ownership, pre-write cancellation admission, bounded-command timeout quarantine and restoration, cancellation-bound G-code playback, nonblocking G-code directory and deletion handoff, request-scoped virtual results, late virtual settlement, virtual-worker failures, program-worker startup failure, long Seconds-mode virtual deadlines, direct program and calibration response propagation, non-blocking calibration button dispatch, terminal-response-required calibration shutdown, calibration transport preflight and write-boundary recovery, binary and finite calibration validation, combined automatic-calibration preflight, native tool-frame order, offline position synchronization, forced calibration-position rejection, completion-only G-code navigation, legacy and dispatcher transport-release ordering, shutdown waits for virtual and retained cleanup owners, nested direct-operation transport admission, asynchronous worker reservation transfer and rollback, direct-operation shutdown tracking, applied program-motion results, G-code local stop admission, post-release collision correction, interruptible auxiliary-wait stop handoff with a shared post-transmission acknowledgement deadline, optional auxiliary startup, controller-buffer-reset failure handling, combined close-and-scheduler cleanup failure, startup timeout handling, non-preempting program-halt status, and response ownership are tested with deterministic fakes.
+- Coalesced joint-dispatch cleanup attempts serial-activity lease release before
+  transport-lock release and always attempts both components. A failed lease
+  remains retained for retry while successful transport-lock release keeps
+  controller position recovery admissible. Any unsuccessful component discards
+  uncommitted targets, latches a queue fault, and publishes a transport-failure
+  event. Worker cleanup publishes before inactivity becomes visible, including
+  an idle exit without a move. Close reports incomplete cleanup without raising;
+  application shutdown retries cleanup before registry-idle gating and continues
+  closing independently when no registry ownership remains. Fresh submissions
+  reject under that fault; confirmed-position synchronization retries retained
+  ownership before clearing the fault and reports retry failure explicitly.
 - Exact J1-J6 keyboard targets share the absolute semantic queue used by
   sliders. Active text edits survive controller and virtual position refreshes;
   accepted submissions resume confirmed-position display updates, and
@@ -1236,6 +1247,16 @@ Known M5 deviations:
   playback therefore reject cancellation before commitment while retaining
   response ownership after a committed write. Every main application-status
   label mutation passes through the stop-aware presenter.
+  Program-row acquisition accepts exactly one non-negative selected index and
+  performs strict UTF-8, single-line decoding before command classification.
+  Selection, size, row-read, and decode failures abort row ownership, publish an
+  alarm, and return `ROW_EXECUTION_REJECTED`; no failure is converted into `Stop
+  Program` or another executable row. Cosmetic scroll failures are logged and
+  do not change row execution. Blank rows, `##` comments, and numeric `Tab
+  Number` labels are explicit structural no-ops. Every other row must match a
+  currently implemented command prefix or is rejected before any command branch
+  runs. Legacy `Out On = N` and `Out Off = N` rows have no executable handler
+  and are rejected instead of completing as silent no-ops.
   Program `SC` and `SO` rows use the canonical controller builder before
   transmission. The framed exchange owner validates `-1` and `-2` through the
   same command-aware terminal classifier used for final disposition. A `-1`

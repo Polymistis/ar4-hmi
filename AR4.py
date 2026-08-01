@@ -416,6 +416,31 @@ nb.add(tab8, text='      Log      ')
 tab9 = ttk_bootstrap.Frame(nb)
 #nb.add(tab9, text='   Info    ')
 
+
+def _close_joint_motion_dispatcher_for_shutdown():
+  dispatcher = globals().get('joint_motion_dispatcher')
+  if dispatcher is None:
+    return True
+  try:
+    cleanup_complete = dispatcher.close()
+  except Exception:
+    logger.exception("Joint-motion dispatcher shutdown cleanup failed")
+    return False
+  if cleanup_complete is True:
+    return True
+  if cleanup_complete is not False:
+    logger.error(
+      "Joint-motion dispatcher returned an invalid shutdown cleanup state"
+    )
+    return False
+  if not dispatcher.active and dispatcher.fault_reason:
+    logger.error(
+      "Joint-motion dispatcher shutdown cleanup remains pending: %s",
+      dispatcher.fault_reason,
+    )
+  return False
+
+
 def on_closing():
   closing_event = globals().get('application_closing')
   with application_lifecycle_lock:
@@ -461,9 +486,7 @@ def on_closing():
     with offline_state_lock:
       offline_stop.set()
 
-  dispatcher = globals().get('joint_motion_dispatcher')
-  if dispatcher is not None and dispatcher.active:
-    dispatcher.close()
+  _close_joint_motion_dispatcher_for_shutdown()
 
   _set_application_status(text="SHUTDOWN WAITING FOR CONTROLLER", style="Warn.TLabel")
   _poll_application_close()
@@ -4397,6 +4420,7 @@ def _poll_application_close():
   _poll_joint_motion_events()
   _poll_virtual_motion_events()
   _poll_xbox_auxiliary_events()
+  _close_joint_motion_dispatcher_for_shutdown()
 
   with manual_controller_cleanup_lock:
     controller_io_cleanup_pending = (
@@ -4487,7 +4511,6 @@ def _poll_application_close():
   persisted = False
   closed = False
   try:
-    joint_motion_dispatcher.close()
     try:
       persisted = _flush_calibration_save() is True
     except Exception:
@@ -8876,6 +8899,24 @@ VIRTUAL_JOINT_SECONDS_SCALE = 4.5
 VIRTUAL_CARTESIAN_SECONDS_SCALE = 4.7
 VIRTUAL_TOOL_SECONDS_SCALE = 5.1
 LIVE_TOOL_JOG_INCREMENT = 0.25
+PROGRAM_ROW_COMMAND_PREFIXES = frozenset({
+  "Call P", "Run Gc", "Stop P", "Test L", "Test G", "Set En",
+  "Read E", "Servo ", "If Inp", "Read C", "If Reg", "If COM",
+  "If MBc", "If MBi", "If MBh", "If MBI", "Jump T", "Wait T",
+  "Regist", "Positi", "Calibr", "Cal_J1", "Cal_J2", "Cal_J3",
+  "Cal_J4", "Cal_J5", "Cal_J6", "Cal_J7", "Cal_J8", "Cal_J9",
+  "Tool S", "Move J", "OFF J ", "Move V", "Move P", "OFF PR",
+  "Move L", "Move R", "Move A", "Move C", "Start ", "End Sp",
+  "Cam On", "Cam Of", "Vis Fi",
+})
+PROGRAM_ROW_LONG_COMMAND_PREFIXES = frozenset({
+  "Wait 5v Inp",
+  "Wait MBcoil",
+  "Wait MBinpu",
+  "Set 5v Outp",
+  "Set MBcoil ",
+  "Set MBoutpu",
+})
 
 
 @dataclass(frozen=True)
@@ -14900,8 +14941,94 @@ def _program_position_register_values(register_number):
   )
 
 
-def _call_program_from_current_row(program_name, execution_request):
-  caller_row = tab1.progView.curselection()[0]
+def _selected_program_row(allow_empty=False):
+  if not isinstance(allow_empty, bool):
+    raise TypeError("program empty-selection policy must be boolean")
+  selected_rows = tuple(tab1.progView.curselection())
+  if len(selected_rows) > 1:
+    raise MotionInputError(
+      "program execution requires exactly one selected row"
+    )
+  if not selected_rows:
+    if allow_empty:
+      return None
+    raise MotionInputError("robot program view has no selected row")
+  selected_row = selected_rows[0]
+  if (
+    isinstance(selected_row, bool)
+    or not isinstance(selected_row, int)
+    or selected_row < 0
+  ):
+    raise MotionInputError(
+      "robot program selection must be a non-negative integer"
+    )
+  row_count = tab1.progView.size()
+  if (
+    isinstance(row_count, bool)
+    or not isinstance(row_count, int)
+    or row_count < 0
+  ):
+    raise MotionInputError(
+      "robot program view size must be a non-negative integer"
+    )
+  if selected_row >= row_count:
+    raise MotionInputError("selected robot program row is out of range")
+  return selected_row
+
+
+def _read_selected_program_command():
+  selected_row = _selected_program_row()
+  raw_command = tab1.progView.get(selected_row)
+  try:
+    command = _decode_program_row_content(raw_command)
+  except MotionInputError as exc:
+    raise MotionInputError(
+      f"selected robot program row is invalid: {exc}"
+    ) from exc
+  return selected_row, command.strip()
+
+
+def _program_row_is_supported(command):
+  if not isinstance(command, str):
+    raise TypeError("robot program command must be text")
+  if not command or command.startswith("##"):
+    return True
+  if (
+    command.startswith("Tab Number ")
+    and command[len("Tab Number "):].isdigit()
+  ):
+    return True
+  return (
+    command[:6] in PROGRAM_ROW_COMMAND_PREFIXES
+    or command[:11] in PROGRAM_ROW_LONG_COMMAND_PREFIXES
+  )
+
+
+def _program_row_error_detail(error):
+  try:
+    detail = " ".join(str(error).split())
+  except Exception:
+    return type(error).__name__
+  return detail or type(error).__name__
+
+
+def _reject_program_row_before_execution(error):
+  detail = _program_row_error_detail(error)
+  message = f"Program row rejected before execution: {detail}"
+  logger.error(message)
+  _abort_program_row_execution()
+  try:
+    _set_application_status(message, "Alarm.TLabel")
+  except Exception:
+    logger.exception("Unable to publish the program-row rejection")
+  return ROW_EXECUTION_REJECTED
+
+
+def _call_program_from_current_row(
+  program_name,
+  execution_request,
+  caller_row,
+):
   caller_program = ProgEntryField.get()
   if callProg(
     program_name,
@@ -15209,16 +15336,24 @@ def stepRev():
 
     try:
       completion_callback_invoked = threading.Event()
-      _set_application_status("SYSTEM READY", "OK.TLabel")
-      try:
-        selRow = tab1.progView.curselection()[0]
-      except Exception:
-        selRow = 1
+      selRow = _selected_program_row(allow_empty=True)
+      if selRow is None:
         tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(selRow)
-    except Exception:
+        tab1.progView.select_set(1)
+        selRow = _selected_program_row()
+      _set_application_status("SYSTEM READY", "OK.TLabel")
+    except Exception as exc:
+      _abort_program_row_execution()
       _finish_program_execution(execution_request)
-      logger.exception("Program step-reverse setup failed")
+      detail = _program_row_error_detail(exc)
+      message = f"Program step-reverse setup failed: {detail}"
+      logger.exception(message)
+      try:
+        _set_manual_auxiliary_status(message, "Alarm.TLabel")
+      except Exception:
+        logger.exception(
+          "Unable to publish the program step-reverse setup failure"
+        )
       return False
 
     def complete_step_reverse(succeeded):
@@ -15500,19 +15635,20 @@ def executeRow(motion_complete=None, execution_request=None):
   with program_stop_state_lock:
     RUN['progRunning'] = True
   try:
-    selRow = tab1.progView.curselection()[0]
+    selRow, command = _read_selected_program_command()
+  except Exception as exc:
+    return _reject_program_row_before_execution(exc)
+  try:
     tab1.progView.see(selRow+2)
   except Exception:
-    pass
+    logger.exception("Unable to scroll the robot program view")
 
-  try: 
-    data = list(map(int, tab1.progView.curselection()))
-    command=tab1.progView.get(data[0]).decode().strip()
-    RUN['cmdType'] =command[:6]
-    RUN['cmdTypeLong']=command[:11]
-  except:
-    RUN['cmdType'] = "Stop P"
-    RUN['cmdTypeLong'] = "Stop P"
+  RUN['cmdType'] = command[:6]
+  RUN['cmdTypeLong'] = command[:11]
+  if not _program_row_is_supported(command):
+    return _reject_program_row_before_execution(
+      MotionInputError(f"unsupported robot program row: {command[:80]!r}")
+    )
 
   if (RUN['cmdType'] == "Call P"):
     if _reject_cancelled_program_row(execution_request):
@@ -15524,6 +15660,7 @@ def executeRow(motion_complete=None, execution_request=None):
     if not _call_program_from_current_row(
       progName,
       execution_request,
+      selRow,
     ):
       return ROW_EXECUTION_REJECTED
     
@@ -15697,6 +15834,7 @@ def executeRow(motion_complete=None, execution_request=None):
         if not _call_program_from_current_row(
           progName,
           execution_request,
+          selRow,
         ):
           return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
@@ -15765,6 +15903,7 @@ def executeRow(motion_complete=None, execution_request=None):
         if not _call_program_from_current_row(
           progName,
           execution_request,
+          selRow,
         ):
           return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
@@ -15803,6 +15942,7 @@ def executeRow(motion_complete=None, execution_request=None):
         if not _call_program_from_current_row(
           progName,
           execution_request,
+          selRow,
         ):
           return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
@@ -15853,6 +15993,7 @@ def executeRow(motion_complete=None, execution_request=None):
         if not _call_program_from_current_row(
           progName,
           execution_request,
+          selRow,
         ):
           return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
@@ -15903,6 +16044,7 @@ def executeRow(motion_complete=None, execution_request=None):
         if not _call_program_from_current_row(
           progName,
           execution_request,
+          selRow,
         ):
           return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
@@ -15965,6 +16107,7 @@ def executeRow(motion_complete=None, execution_request=None):
         if not _call_program_from_current_row(
           progName,
           execution_request,
+          selRow,
         ):
           return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
@@ -16027,6 +16170,7 @@ def executeRow(motion_complete=None, execution_request=None):
         if not _call_program_from_current_row(
           progName,
           execution_request,
+          selRow,
         ):
           return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
@@ -26425,7 +26569,18 @@ def displayPosition(response, parsed=None, synchronize_dispatcher=True):
     if joint_motion_dispatcher.synchronize(
       parsed.joints + parsed.external
     ) is not True:
-      message = "Controller position response rejected while joint motion is active"
+      dispatcher_fault = joint_motion_dispatcher.fault_reason
+      if dispatcher_fault:
+        message = (
+          "Controller position response could not release joint-motion "
+          f"ownership: {dispatcher_fault}"
+        )
+      elif joint_motion_dispatcher.active:
+        message = (
+          "Controller position response rejected while joint motion is active"
+        )
+      else:
+        message = "Controller position response rejected by the joint dispatcher"
       _invalidate_joint_motion_state(message)
       logger.error(message)
       _set_application_status(text=message, style="Alarm.TLabel")
