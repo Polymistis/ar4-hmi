@@ -5862,7 +5862,12 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_program_execution_request_active": lambda current: True,
             "_program_execution_request_cancelled": (
-                lambda current: current.cancellation_boundary.is_set()
+                lambda current: (
+                    current.cancellation_boundary.is_set()
+                    or not namespace[
+                        "_program_execution_request_active"
+                    ](current)
+                )
             ),
             "_snapshot_program_vision_match_settings": (
                 lambda current: (
@@ -6343,6 +6348,62 @@ class HmiSourceContractTests(unittest.TestCase):
             set(),
         )
 
+        stale = operation_type(request, command)
+        stale.bind_program_rows(ProgramView.rows)
+        stale.bind_worker_request(15)
+        namespace["_program_execution_request_active"] = (
+            lambda current: False
+        )
+        selection_before = tuple(ProgramView.selected)
+        application_count = len(applications)
+        status_count = len(statuses)
+        self.assertFalse(
+            apply_event(
+                stale,
+                VisionOperationEvent(
+                    6,
+                    15,
+                    result=operation_result(True),
+                ),
+            )
+        )
+        self.assertEqual(warnings[-1], (
+            "Ignoring a stale program vision result",
+        ))
+        self.assertEqual(tuple(ProgramView.selected), selection_before)
+        self.assertEqual(len(applications), application_count)
+        self.assertEqual(len(statuses), status_count)
+
+        namespace["_program_execution_request_active"] = (
+            lambda current: True
+        )
+        cancellation_checks = iter((False, True))
+        namespace["_program_execution_request_cancelled"] = (
+            lambda current: next(cancellation_checks)
+        )
+        cancelled = operation_type(request, command)
+        cancelled.bind_program_rows(ProgramView.rows)
+        cancelled.bind_worker_request(16)
+        self.assertFalse(
+            apply_event(
+                cancelled,
+                VisionOperationEvent(
+                    7,
+                    16,
+                    result=operation_result(True),
+                ),
+            )
+        )
+        self.assertEqual(warnings[-1], (
+            "Discarding a program vision result after request cancellation",
+        ))
+        self.assertEqual(tuple(ProgramView.selected), selection_before)
+        self.assertEqual(len(applications), application_count)
+        self.assertEqual(len(statuses), status_count)
+        namespace["_program_execution_request_cancelled"] = (
+            lambda current: False
+        )
+
         changed = operation_type(request, command)
         changed.bind_program_rows(ProgramView.rows)
         changed.bind_worker_request(9)
@@ -6354,7 +6415,7 @@ class HmiSourceContractTests(unittest.TestCase):
         ):
             apply_event(
                 changed,
-                VisionOperationEvent(6, 9, result=operation_result(True)),
+                VisionOperationEvent(8, 9, result=operation_result(True)),
             )
         ProgramView.rows = original_rows
         self.assertEqual(
@@ -6369,7 +6430,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 apply_event(
                     failed,
                     VisionOperationEvent(
-                        7,
+                        9,
                         8,
                         result=operation_result(False),
                     ),

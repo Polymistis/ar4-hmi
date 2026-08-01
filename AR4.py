@@ -28860,12 +28860,8 @@ def _settle_program_vision_operation(
     raise TypeError("program vision settlement state is invalid")
   if error_detail is not None:
     detail = normalize_camera_exception_detail(error_detail)
-    request_active = _program_execution_request_active(
+    request_cancelled = _program_execution_request_cancelled(
       operation.execution_request
-    )
-    request_cancelled = (
-      not request_active
-      or _program_execution_request_cancelled(operation.execution_request)
     )
     if not request_cancelled:
       message = f"Vision program row rejected: {detail}"
@@ -29525,10 +29521,13 @@ def _apply_program_vision_match_event(operation, event):
     raise RuntimeError("program vision worker emitted an invalid event")
   if operation.worker_request_id != event.request_id:
     raise RuntimeError("program vision worker request ownership changed")
-  if (
-    not _program_execution_request_active(operation.execution_request)
-    or _program_execution_request_cancelled(operation.execution_request)
-  ):
+  if not _program_execution_request_active(operation.execution_request):
+    logger.warning("Ignoring a stale program vision result")
+    return False
+  if _program_execution_request_cancelled(operation.execution_request):
+    logger.warning(
+      "Discarding a program vision result after request cancellation"
+    )
     return False
   if event.error_detail is not None:
     raise MotionInputError(event.error_detail)
@@ -29554,6 +29553,9 @@ def _apply_program_vision_match_event(operation, event):
       f"vision result tab {selected_tab} does not exist"
     ) from exc
   if _program_execution_request_cancelled(operation.execution_request):
+    logger.warning(
+      "Discarding a program vision result after request cancellation"
+    )
     return False
   if tuple(tab1.progView.get(0, "end")) != program_rows:
     raise MotionInputError(
