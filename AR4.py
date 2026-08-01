@@ -294,6 +294,7 @@ from ARrobots.HMI.joint_visualization import (
 )
 from ARrobots.HMI.vision_io import (
   MAX_CAMERA_PREVIEW_EVENT_DETAIL,
+  VISION_TEMPLATE_PREVIEW_SIZE,
   CameraPreviewEvent,
   CameraPreviewFrame,
   CameraPreviewLifecycleState,
@@ -309,12 +310,18 @@ from ARrobots.HMI.vision_io import (
   VisionOperationEvent,
   VisionOperationSubmission,
   VisionOperationWorker,
+  VisionSelectionResult,
+  VisionSelectionSettings,
   fit_vision_preview_square,
   load_bounded_vision_image,
   normalize_camera_exception_detail,
   prepare_camera_preview_frame,
   prepare_vision_capture_result,
+  prepare_vision_mask_selection_result,
   prepare_vision_match_result,
+  prepare_vision_selection_image,
+  prepare_vision_template_selection_result,
+  select_vision_region,
 )
 
 #####################################################################################
@@ -362,8 +369,6 @@ else:
     DIR = pathlib.Path(__file__).resolve().parent         # folder containing AR4.py
 
 os.chdir(DIR)    
-
-RUN['cropping'] = False
 
 root = Tk()
 application_tk_thread_id = threading.get_ident()
@@ -641,6 +646,16 @@ def on_closing():
         camera_preview_shutdown_started_at = time.monotonic()
     except Exception:
       logger.exception("Unable to stop vision matching during shutdown")
+  selection_worker = globals().get('vision_selection_worker')
+  if selection_worker is not None:
+    try:
+      selection_closed = selection_worker.close()
+      if not isinstance(selection_closed, bool):
+        raise RuntimeError("vision selection returned an invalid close state")
+      if not selection_closed:
+        camera_preview_shutdown_started_at = time.monotonic()
+    except Exception:
+      logger.exception("Unable to stop vision selection during shutdown")
   try:
     program_vision_settled = _settle_program_vision_shutdown_operations()
     if not isinstance(program_vision_settled, bool):
@@ -656,6 +671,8 @@ def on_closing():
     runtime_state['cam_on'] = False
     runtime_state['visionCaptureRequestId'] = None
     runtime_state['visionMatchRequestId'] = None
+    runtime_state['visionSelectionRequestId'] = None
+    runtime_state['visionSelectionKind'] = None
 
   _close_joint_motion_dispatcher_for_shutdown()
 
@@ -680,6 +697,7 @@ camera_selection_lock = threading.Lock()
 camera_preview_request_lock = threading.Lock()
 vision_capture_request_lock = threading.Lock()
 vision_match_request_lock = threading.Lock()
+vision_selection_request_lock = threading.Lock()
 program_vision_operation_lock = threading.Lock()
 vision_artifact_lock = threading.Lock()
 selected_vision_camera_source = None
@@ -1012,7 +1030,6 @@ CONTROLLER_STARTUP_REQUIRED_CAPABILITIES = (
 EVENT_POLL_INTERVAL_MS = 25
 CAMERA_PREVIEW_SHUTDOWN_GRACE_SECONDS = 2.0
 CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS = 10.0
-VISION_SELECTION_INSET_PIXELS = 3
 EVENT_POLL_CALLBACK_NAMES = {
   "camera-preview": "_poll_camera_preview_events",
   "serial": "_poll_serial_events",
@@ -4918,10 +4935,21 @@ def _poll_application_close():
     except Exception:
       logger.exception("Unable to inspect vision matching shutdown state")
       match_worker_active = False
+  selection_worker = globals().get('vision_selection_worker')
+  selection_worker_active = False
+  if selection_worker is not None:
+    try:
+      selection_worker_active = selection_worker.active
+      if not isinstance(selection_worker_active, bool):
+        raise RuntimeError("vision selection returned an invalid active state")
+    except Exception:
+      logger.exception("Unable to inspect vision selection shutdown state")
+      selection_worker_active = False
   camera_worker_active = (
     camera_worker_active
     or capture_worker_active
     or match_worker_active
+    or selection_worker_active
   )
   if camera_worker_active:
     now = time.monotonic()
@@ -5041,7 +5069,6 @@ RUN['J4StepM'] = None
 RUN['J5StepM'] = None
 RUN['J6StepM'] = None
 
-RUN['oriImage'] = None
 RUN['StepMonitors'] = [0] * 6
 RUN['minSpeedDelay'] = 200 #µs
 RUN['speedViolation'] = "0"
@@ -5054,6 +5081,8 @@ RUN['cameraPreviewRequestId'] = None
 RUN['visionCaptureRequestId'] = None
 RUN['visionMatchRequestId'] = None
 RUN['visionMatchResult'] = None
+RUN['visionSelectionRequestId'] = None
+RUN['visionSelectionKind'] = None
 
 # Migrated global variables to RUN dictionary
 # Robot State & Control
@@ -5109,13 +5138,6 @@ RUN['cmdType'] = None
 RUN['cmdTypeLong'] = None
 
 # Vision System
-RUN['cropping'] = False
-RUN['button_down'] = None
-RUN['box_points'] = None
-RUN['x_start'] = None
-RUN['y_start'] = None
-RUN['x_end'] = None
-RUN['y_end'] = None
 RUN['mX1'] = None
 RUN['mY1'] = None
 RUN['mX2'] = None
@@ -28484,6 +28506,7 @@ def _poll_camera_preview_events():
     _drain_program_camera_completion_events()
     _drain_vision_capture_events()
     _drain_vision_match_events()
+    _drain_vision_selection_events()
     _drain_program_vision_start_events()
     for event in camera_preview_worker.drain_events():
       _apply_camera_preview_event(event)
@@ -29010,13 +29033,6 @@ def _dispatch_program_vision_operation(
       program_vision_start_queue.put(operation)
   return operation.wait()
 
-#vismenu.size
-
-def _vision_background_bgr(value):
-  red, green, blue = normalize_vision_background_color(value)
-  return blue, green, red
-
-
 def _vision_background_grayscale(value):
   rgb_pixel = np.asarray(
     [[normalize_vision_background_color(value)]],
@@ -29024,32 +29040,6 @@ def _vision_background_grayscale(value):
   )
   grayscale = cv2.cvtColor(rgb_pixel, cv2.COLOR_RGB2GRAY)
   return int(grayscale[0][0])
-
-
-def _average_vision_bgr_samples(samples):
-  try:
-    sample_values = np.asarray(samples, dtype=np.float64)
-  except (TypeError, ValueError, OverflowError) as exc:
-    raise MotionInputError(
-      "vision BGR samples must be numeric"
-    ) from exc
-  if (
-    sample_values.ndim != 2
-    or sample_values.shape[0] == 0
-    or sample_values.shape[1] != 3
-    or not np.all(np.isfinite(sample_values))
-    or np.any(sample_values < 0)
-    or np.any(sample_values > 255)
-  ):
-    raise MotionInputError(
-      "vision BGR samples must contain finite three-channel byte values"
-    )
-  averaged_bgr = tuple(
-    int(component)
-    for component in np.rint(np.mean(sample_values, axis=0))
-  )
-  averaged_rgb = tuple(reversed(averaged_bgr))
-  return averaged_bgr, averaged_rgb
 
 
 def _vision_sample_coordinate(value, label):
@@ -29064,52 +29054,6 @@ def _vision_sample_coordinate(value, label):
   if number < 0 or not number.is_integer():
     raise MotionInputError(f"{label} must be a non-negative integer")
   return int(number)
-
-
-def _validated_vision_sample_pixels(image, points):
-  shape = getattr(image, "shape", None)
-  if (
-    not isinstance(shape, (tuple, list))
-    or len(shape) < 2
-  ):
-    raise MotionInputError("vision sample image has no two-dimensional shape")
-  first_limit = _vision_sample_coordinate(
-    shape[0],
-    "vision image first dimension",
-  )
-  second_limit = _vision_sample_coordinate(
-    shape[1],
-    "vision image second dimension",
-  )
-  if first_limit <= 0 or second_limit <= 0:
-    raise MotionInputError("vision sample image dimensions must be positive")
-  if (
-    isinstance(points, (str, bytes))
-    or not isinstance(points, (tuple, list))
-    or not points
-  ):
-    raise MotionInputError("vision sample points must be a non-empty sequence")
-
-  samples = []
-  for index, point in enumerate(points, start=1):
-    if not isinstance(point, (tuple, list)) or len(point) != 2:
-      raise MotionInputError(
-        f"vision sample point {index} must contain two coordinates"
-      )
-    first = _vision_sample_coordinate(
-      point[0],
-      f"vision sample point {index} first coordinate",
-    )
-    second = _vision_sample_coordinate(
-      point[1],
-      f"vision sample point {index} second coordinate",
-    )
-    if first >= first_limit or second >= second_limit:
-      raise MotionInputError(
-        f"vision sample point {index} is outside the current image"
-      )
-    samples.append(image[first][second])
-  return tuple(samples)
 
 
 def _snapshot_vision_capture_settings(background_override=None):
@@ -29368,6 +29312,64 @@ def _perform_vision_match(settings, cancellation_event=None):
     )
 
 
+def _perform_vision_selection(settings, cancellation_event=None):
+  if not isinstance(settings, VisionSelectionSettings):
+    raise MotionInputError("vision selection settings are invalid")
+  if _vision_capture_cancelled(cancellation_event):
+    raise MotionInputError(
+      f"vision {settings.kind} selection was cancelled"
+    )
+  with _vision_artifact_operation(f"vision {settings.kind} selection"):
+    if settings.kind == "mask":
+      frame = _capture_current_vision_frame(cancellation_event)
+      if _vision_capture_cancelled(cancellation_event):
+        raise MotionInputError("vision mask selection was cancelled")
+      selection_image = prepare_vision_selection_image(
+        frame,
+        settings.capture_settings,
+      )
+      bounds = select_vision_region(
+        selection_image,
+        "AR4 Vision Mask",
+        cancellation_event,
+      )
+      result = prepare_vision_mask_selection_result(
+        frame,
+        settings,
+        bounds,
+      )
+      if _vision_capture_cancelled(cancellation_event):
+        raise MotionInputError("vision mask selection was cancelled")
+      if not cv2.imwrite('curImage.jpg', result.capture_result.image):
+        raise OSError("masked vision frame could not be persisted")
+      return result
+
+    image = load_bounded_vision_image(
+      'curImage.jpg',
+      cv2.IMREAD_COLOR,
+      "captured template frame",
+    )
+    bounds = select_vision_region(
+      image,
+      "AR4 Vision Template",
+      cancellation_event,
+    )
+    visual_options = tuple(sorted(set(
+      _startup_visual_options() + (settings.template_filename,)
+    )))
+    result = prepare_vision_template_selection_result(
+      image,
+      settings,
+      bounds,
+      visual_options,
+    )
+    if _vision_capture_cancelled(cancellation_event):
+      raise MotionInputError("vision template selection was cancelled")
+    if not cv2.imwrite(settings.template_filename, result.template_image):
+      raise OSError("vision template could not be persisted")
+    return result
+
+
 vision_capture_worker = VisionOperationWorker(
   _perform_vision_capture,
   VisionCaptureSettings,
@@ -29383,6 +29385,16 @@ vision_match_worker = VisionOperationWorker(
   VisionMatchOperationResult,
   "vision matching",
   "ar4-vision-match",
+  coalesce=False,
+)
+
+
+vision_selection_worker = VisionOperationWorker(
+  _perform_vision_selection,
+  VisionSelectionSettings,
+  VisionSelectionResult,
+  "vision selection",
+  "ar4-vision-selection",
   coalesce=False,
 )
 
@@ -29854,343 +29866,192 @@ def _capture_current_vision_frame(cancellation_event=None):
   )
 
 
-def _prepare_mask_selection_image():
-  frame = _capture_current_vision_frame()
-  brightness = int(VisBrightSlide.get())
-  contrast = int(VisContrastSlide.get())
-  CAL['zoom'] = int(VisZoomSlide.get())
-  frame = np.int16(frame)
-  frame = frame * (contrast/127+1) - contrast + brightness
-  frame = np.clip(frame, 0, 255)
-  frame = np.uint8(frame) 
-  cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
-  height, width = cv2image.shape
-  centerX,centerY=int(height/2),int(width/2)
-  radiusX,radiusY= int(CAL['zoom']*height/100),int(CAL['zoom']*width/100)
-  minX,maxX=centerX-radiusX,centerX+radiusX
-  minY,maxY=centerY-radiusY,centerY+radiusY
-  cropped = cv2image[minX:maxX, minY:maxY]
-  cv2image = cv2.resize(cropped, (width, height))
-  return cv2image
-
-
-def _capture_mask_selection_image():
-  with _vision_artifact_operation("vision mask selection"):
-    image = _prepare_mask_selection_image()
-    filename = 'curImage.jpg'
-    if not cv2.imwrite(filename, image):
-      raise OSError("captured mask frame could not be persisted")
-    return load_bounded_vision_image(
-      filename,
-      cv2.IMREAD_COLOR,
-      "captured mask frame",
-    )
-
-  
-
-
-
-def _normalized_vision_selection_bounds(image, start_x, start_y, end_x, end_y):
-  """Return clamped bounds, None for an undersized area, or raise on bad input."""
-
-  shape = getattr(image, "shape", None)
-  if not isinstance(shape, (tuple, list)) or len(shape) < 2:
-    raise MotionInputError("vision selection image has invalid dimensions")
-  height = _vision_sample_coordinate(
-    shape[0],
-    "vision selection image height",
-  )
-  width = _vision_sample_coordinate(
-    shape[1],
-    "vision selection image width",
-  )
-  if height == 0 or width == 0:
-    raise MotionInputError("vision selection image dimensions must be positive")
-
-  coordinates = []
-  for value, label in (
-    (start_x, "vision selection start X"),
-    (start_y, "vision selection start Y"),
-    (end_x, "vision selection end X"),
-    (end_y, "vision selection end Y"),
+def _vision_selection_owner_locked():
+  request_id = RUN.get('visionSelectionRequestId')
+  selection_kind = RUN.get('visionSelectionKind')
+  if request_id is not None and (
+    isinstance(request_id, bool)
+    or not isinstance(request_id, int)
+    or request_id < 0
   ):
-    if isinstance(value, bool):
-      raise MotionInputError(f"{label} must be an integer")
-    number = finite_number(value, label)
-    if not number.is_integer():
-      raise MotionInputError(f"{label} must be an integer")
-    coordinates.append(int(number))
-
-  x_start, y_start, x_end, y_end = coordinates
-  x_minimum = max(
-    0,
-    min(width, min(x_start, x_end) + VISION_SELECTION_INSET_PIXELS),
-  )
-  y_minimum = max(
-    0,
-    min(height, min(y_start, y_end) + VISION_SELECTION_INSET_PIXELS),
-  )
-  x_maximum = max(
-    0,
-    min(width, max(x_start, x_end) - VISION_SELECTION_INSET_PIXELS),
-  )
-  y_maximum = max(
-    0,
-    min(height, max(y_start, y_end) - VISION_SELECTION_INSET_PIXELS),
-  )
-  if x_minimum + 1 >= x_maximum or y_minimum + 1 >= y_maximum:
-    return None
-  return x_minimum, y_minimum, x_maximum, y_maximum
+    raise RuntimeError("vision selection owner is invalid")
+  if selection_kind is not None and selection_kind not in (
+    "mask",
+    "template",
+  ):
+    raise RuntimeError("vision selection owner kind is invalid")
+  if (request_id is None) != (selection_kind is None):
+    raise RuntimeError("vision selection ownership is incomplete")
+  return request_id, selection_kind
 
 
-def _reject_undersized_vision_selection(context):
-  message = f"VISION {context} SELECTION TOO SMALL"
-  logger.warning(message)
+def _request_vision_selection(settings):
+  label = "UNKNOWN"
   try:
-    _set_application_status(message, "Warn.TLabel")
+    if not isinstance(settings, VisionSelectionSettings):
+      raise MotionInputError("vision selection settings are invalid")
+    label = settings.kind.upper()
+    if application_closing.is_set():
+      raise MotionInputError("application shutdown is active")
+    with vision_selection_request_lock:
+      request_id, _ = _vision_selection_owner_locked()
+      if request_id is not None:
+        raise MotionInputError("vision selection is already active")
+      submission = vision_selection_worker.submit(
+        settings,
+        application_closing,
+      )
+      if not isinstance(submission, VisionOperationSubmission):
+        raise RuntimeError("vision selection returned an invalid submission")
+      if submission.coalesced:
+        raise RuntimeError("vision selection unexpectedly coalesced a request")
+      RUN['visionSelectionRequestId'] = submission.request_id
+      RUN['visionSelectionKind'] = settings.kind
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"VISION {label} SELECTION REJECTED: {detail}"
+    logger.exception(message)
+    try:
+      _set_application_status(message, "Alarm.TLabel")
+    except Exception:
+      logger.exception("Unable to present a vision selection rejection")
+    return False
+  try:
+    _set_application_status(
+      f"VISION {label} SELECTION IN PROGRESS",
+      "Warn.TLabel",
+    )
   except Exception:
-    logger.exception("Unable to present an undersized vision selection")
-  return False
+    logger.exception("Unable to present vision selection progress")
+  return True
 
 
-def _mask_crop(event, x, y, flags, param):
-    if (not RUN['button_down']) and (event == cv2.EVENT_LBUTTONDOWN):
-        RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = x, y, x, y
-        RUN['cropping'] = True
-        RUN['button_down'] = True
-        RUN['box_points'] = [(x, y)]
-        
-    elif (RUN['button_down']) and (event == cv2.EVENT_MOUSEMOVE):
-        if RUN['cropping']:
-            image_copy = RUN['oriImage'].copy()
-            RUN['x_end'], RUN['y_end'] = x, y
-            point = (x, y)
-            cv2.rectangle(image_copy, RUN['box_points'][0], point, (0, 255, 0), 2)
-            cv2.imshow("image", image_copy)
-
-    elif event == cv2.EVENT_LBUTTONUP and RUN['button_down']:
-        RUN['button_down'] = False
-        RUN['x_end'], RUN['y_end'] = x, y
-        RUN['cropping'] = False
-
-        bounds = _normalized_vision_selection_bounds(
-          RUN['oriImage'],
-          RUN['x_start'],
-          RUN['y_start'],
-          RUN['x_end'],
-          RUN['y_end'],
-        )
-        if bounds is None:
-          if (
-            RUN['x_start'] == RUN['x_end']
-            and RUN['y_start'] == RUN['y_end']
-          ):
-            return False
-          return _reject_undersized_vision_selection("MASK")
-        RUN['box_points'].append((x, y))
-        cv2.rectangle(RUN['oriImage'], RUN['box_points'][0], RUN['box_points'][1], (0, 255, 0), 2)
-        cv2.imshow("image", RUN['oriImage'])
-        (
-          RUN['mX1'],
-          RUN['mY1'],
-          RUN['mX2'],
-          RUN['mY2'],
-        ) = bounds
-
-        CAL['autoBGVal'] = int(RUN['autoBG'].get())
-        if(CAL['autoBGVal']==1):
-          BG1, BG2, BG3 = _validated_vision_sample_pixels(
-            RUN['oriImage'],
-            (
-              (VisX1PixEntryField.get(), VisY1PixEntryField.get()),
-              (VisX1PixEntryField.get(), VisY2PixEntryField.get()),
-              (VisX2PixEntryField.get(), VisY2PixEntryField.get()),
-            ),
-          )
-          background, canonical_rgb = _average_vision_bgr_samples(
-            (BG1, BG2, BG3)
-          )
-          RUN['BGavg'] = canonical_rgb
-          VisBacColorEntryField.configure(state='enabled')  
-          VisBacColorEntryField.delete(0, 'end')
-          VisBacColorEntryField.insert(0,str(RUN['BGavg']))
-          VisBacColorEntryField.configure(state='disabled')   
-        else:  
-          background = _vision_background_bgr(
-            VisBacColorEntryField.get()
-          )
-
-        h = RUN['oriImage'].shape[0]
-        w = RUN['oriImage'].shape[1]
-        # loop over the image
-        for y in range(0, h):
-            for x in range(0, w):
-                # change the pixel
-                RUN['oriImage'][y, x] = background if x >= RUN['mX2'] or x <= RUN['mX1'] or y <= RUN['mY1'] or y >= RUN['mY2'] else RUN['oriImage'][y, x]
-
-        display_image = cv2.cvtColor(
-            RUN['oriImage'],
-            cv2.COLOR_BGR2RGB,
-        )
-        img = Image.fromarray(display_image)
-        imgtk = ImageTk.PhotoImage(image=img) 
-        vid_lbl.imgtk = imgtk    
-        vid_lbl.configure(image=imgtk) 
-        filename = 'curImage.jpg'
-        with _vision_artifact_operation("vision mask persistence"):
-            if not cv2.imwrite(filename, RUN['oriImage']):
-                raise OSError("masked vision frame could not be persisted")
-        cv2.destroyAllWindows()
+def _apply_vision_selection_result(result):
+  if not isinstance(result, VisionSelectionResult):
+    raise MotionInputError("vision selection supplied an invalid result")
+  if result.kind == "mask":
+    (
+      RUN['mX1'],
+      RUN['mY1'],
+      RUN['mX2'],
+      RUN['mY2'],
+    ) = result.mask_bounds
+    _apply_vision_capture_result(result.capture_result)
     return True
 
+  updateVisOp(result.visual_options)
+  RUN['selectedTemplate'].set(result.template_filename)
+  image = Image.fromarray(result.template_preview)
+  imgtk = ImageTk.PhotoImage(image=image)
+  template_lbl.imgtk = imgtk
+  template_lbl.configure(image=imgtk, anchor='center')
+  return True
 
-def mask_crop(event, x, y, flags, param):
+
+def _apply_vision_selection_event(event):
+  if not isinstance(event, VisionOperationEvent):
+    raise RuntimeError("vision selection worker emitted an invalid event")
+  with vision_selection_request_lock:
+    request_id, selection_kind = _vision_selection_owner_locked()
+    current = request_id == event.request_id
+    if current:
+      RUN['visionSelectionRequestId'] = None
+      RUN['visionSelectionKind'] = None
+  if not current:
+    detail = (
+      f": {event.error_detail}"
+      if event.error_detail is not None
+      else ""
+    )
+    logger.warning(
+      "Ignoring stale vision selection request %s%s",
+      event.request_id,
+      detail,
+    )
+    return False
+  if event.error_detail is not None:
+    message = (
+      f"VISION {selection_kind.upper()} SELECTION FAILED: "
+      f"{event.error_detail}"
+    )
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  if (
+    not isinstance(event.result, VisionSelectionResult)
+    or event.result.kind != selection_kind
+  ):
+    raise RuntimeError("vision selection result ownership changed")
+  _apply_vision_selection_result(event.result)
+  _set_application_status(
+    f"VISION {selection_kind.upper()} SELECTION COMPLETE",
+    "OK.TLabel",
+  )
+  return True
+
+
+def _drain_vision_selection_events():
+  for event in vision_selection_worker.drain_events():
     try:
-        return _mask_crop(event, x, y, flags, param)
-    except Exception as exc:
-        detail = normalize_camera_exception_detail(exc)
-        message = f"VISION MASK PROCESSING FAILED: {detail}"
-        logger.exception(message)
-        try:
-            _set_application_status(message, "Alarm.TLabel")
-        except Exception:
-            logger.exception("Unable to present a vision mask failure")
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            logger.exception("Unable to close vision mask windows")
-        return False
+      _apply_vision_selection_event(event)
+    except Exception:
+      logger.exception("Unable to apply a vision selection result")
+      _set_application_status(
+        "VISION SELECTION RESULT FAILED",
+        "Alarm.TLabel",
+      )
+  return True
 
 
 def selectMask():
   try:
-    RUN['button_down'] = False
-    RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
-    image = _capture_mask_selection_image()
-    RUN['oriImage'] = image.copy()
-
-    cv2.namedWindow("image")
-    cv2.setMouseCallback("image", mask_crop)
-    cv2.imshow("image", image)
-    return True
-  except Exception:
-    logger.exception("Vision mask selection failed")
-    try:
-      cv2.destroyAllWindows()
-    except Exception:
-      logger.exception("Unable to close vision mask windows")
+    settings = VisionSelectionSettings(
+      kind="mask",
+      capture_settings=_snapshot_vision_capture_settings(),
+    )
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"VISION MASK SELECTION REJECTED: {detail}"
+    logger.exception(message)
+    _set_application_status(message, "Alarm.TLabel")
     return False
+  return _request_vision_selection(settings)
 
 
-
-def _mouse_crop(event, x, y, flags, param):
-    if (not RUN['button_down']) and (event == cv2.EVENT_LBUTTONDOWN):
-        RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = x, y, x, y
-        RUN['cropping'] = True
-        RUN['button_down'] = True
-        RUN['box_points'] = [(x, y)]
-        
-    elif (RUN['button_down']) and (event == cv2.EVENT_MOUSEMOVE):
-        if RUN['cropping']:
-            image_copy = RUN['oriImage'].copy()
-            RUN['x_end'], RUN['y_end'] = x, y
-            point = (x, y)
-            cv2.rectangle(image_copy, RUN['box_points'][0], point, (0, 255, 0), 2)
-            cv2.imshow("image", image_copy)
-
-    elif event == cv2.EVENT_LBUTTONUP and RUN['button_down']:
-        RUN['button_down'] = False
-        RUN['x_end'], RUN['y_end'] = x, y
-        RUN['cropping'] = False
-
-        bounds = _normalized_vision_selection_bounds(
-          RUN['oriImage'],
-          RUN['x_start'],
-          RUN['y_start'],
-          RUN['x_end'],
-          RUN['y_end'],
-        )
-        if bounds is None:
-          if (
-            RUN['x_start'] == RUN['x_end']
-            and RUN['y_start'] == RUN['y_end']
-          ):
-            return False
-          return _reject_undersized_vision_selection("TEMPLATE")
-        x_minimum, y_minimum, x_maximum, y_maximum = bounds
-        RUN['box_points'].append((x, y))
-        cv2.rectangle(RUN['oriImage'], RUN['box_points'][0], RUN['box_points'][1], (0, 255, 0), 2)
-        cv2.imshow("image", RUN['oriImage'])
-        roi = RUN['oriImage'][
-          y_minimum:y_maximum,
-          x_minimum:x_maximum,
-        ]
-        cv2.imshow("Cropped", roi)
-        template_name = simpledialog.askstring(
-          title="Teach Vision Object",
-          prompt="Save Object As:",
-        )
-        if template_name is None:
-          cv2.destroyAllWindows()
-          return False
-        if (
-          not isinstance(template_name, str)
-          or not template_name
-          or template_name != template_name.strip()
-          or os.path.basename(template_name) != template_name
-          or "\x00" in template_name
-        ):
-          raise MotionInputError("vision template name is invalid")
-        template_filename = template_name + ".jpg"
-        with _vision_artifact_operation("vision template persistence"):
-          if not cv2.imwrite(template_filename, roi):
-            raise OSError("vision template could not be persisted")
-        cv2.destroyAllWindows()
-        updateVisOp()
-    return True
-
-
-def mouse_crop(event, x, y, flags, param):
-    try:
-        return _mouse_crop(event, x, y, flags, param)
-    except Exception as exc:
-        detail = normalize_camera_exception_detail(exc)
-        message = f"VISION TEMPLATE PROCESSING FAILED: {detail}"
-        logger.exception(message)
-        try:
-            _set_application_status(message, "Alarm.TLabel")
-        except Exception:
-            logger.exception("Unable to present a vision template failure")
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            logger.exception("Unable to close vision template windows")
-        return False
 
 
 
 def selectTemplate():
   try:
-    RUN['button_down'] = False
-    RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
-    with _vision_artifact_operation("vision template selection"):
-      image = load_bounded_vision_image(
-        'curImage.jpg',
-        cv2.IMREAD_COLOR,
-        "captured template frame",
+    template_name = simpledialog.askstring(
+      title="Teach Vision Object",
+      prompt="Save Object As:",
+    )
+    if template_name is None:
+      _set_application_status(
+        "VISION TEMPLATE SELECTION CANCELLED",
+        "Warn.TLabel",
       )
-    RUN['oriImage'] = image.copy()
-    cv2.namedWindow("image")
-    cv2.setMouseCallback("image", mouse_crop)
-    cv2.imshow("image", image)
-  except Exception:
-    logger.exception("Vision template selection failed")
-    try:
-      cv2.destroyAllWindows()
-    except Exception:
-      logger.exception("Unable to close vision template windows")
+      return False
+    if (
+      not isinstance(template_name, str)
+      or not template_name
+      or template_name != template_name.strip()
+    ):
+      raise MotionInputError("vision template name is invalid")
+    settings = VisionSelectionSettings(
+      kind="template",
+      template_filename=template_name + ".jpg",
+    )
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"VISION TEMPLATE SELECTION REJECTED: {detail}"
+    logger.exception(message)
+    _set_application_status(message, "Alarm.TLabel")
     return False
-  return True
+  return _request_vision_selection(settings)
+
+
 
 
 
@@ -30232,7 +30093,10 @@ def VisOpUpdate(foo):
           "vision template",
         )
       img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-      square = fit_vision_preview_square(img, 150)
+      square = fit_vision_preview_square(
+        img,
+        VISION_TEMPLATE_PREVIEW_SIZE,
+      )
       img = Image.fromarray(square)
       imgtk = ImageTk.PhotoImage(image=img)
       template_lbl.imgtk = imgtk

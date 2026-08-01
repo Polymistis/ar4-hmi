@@ -397,10 +397,15 @@ Tk serializes event callbacks on the interpreter thread. Long event handlers blo
   matching artifacts use a non-waiting owner, so overlap rejects instead of
   racing image files or blocking Tk. Successful capture events are presented in
   worker order, preserving alignment between the most recent retained success
-  and the persisted frame when a coalesced successor fails. Mask and template
-  selections normalize drag direction, clamp to image bounds, reject undersized
-  regions before mask-state mutation, and surface callback persistence failures
-  through the HMI alarm.
+  and the persisted frame when a coalesced successor fails. Interactive mask
+  and template requests use a shared non-coalescing worker that owns acquisition or
+  bounded loading, a cancellation-polled OpenCV drag window, vectorized mask
+  application or template cropping, and checked persistence under the shared
+  artifact lease. Tk snapshots requests and applies only the matching terminal
+  result. Direction-normalized bounds clamp to the captured image; undersized
+  drags remain uncommitted for another attempt. Shutdown cancellation requests
+  worker-owned window cleanup and supervises the worker through the bounded
+  camera cleanup path.
   Manual Snap-and-Find snapshots all Tk-backed capture and match inputs before
   submitting one non-coalescing request. One daemon operation owns acquisition,
   captured-image persistence, bounded template loading, rotation matching, and
@@ -409,10 +414,9 @@ Tk serializes event callbacks on the interpreter thread. Long event handlers blo
   cancellation between candidates, avoids the duplicated second revolution in
   full search, retains the strongest sub-threshold candidate, applies symmetric
   J6 fallback limits, and clears stale coordinates on failure. Shutdown includes
-  the matching worker in bounded camera cleanup supervision. The program-row
-  vision path reuses the pure matcher but still separates synchronous capture
-  and matching. Program-row capture and matching plus interactive mask and
-  template workflows remain blocking surfaces.
+  the matching worker in bounded camera cleanup supervision. Program-row vision
+  requests reuse the same capture-and-match worker with request-scoped Tk
+  settlement.
 
 Automated coverage is hardware-free and never imports `AR4.py`.
 
@@ -464,12 +468,11 @@ Cartesian adjustments still use raw commands that can be rejected while serial w
 ### Remaining performance surfaces
 
 - Large optional packages, including VTK, OpenCV, and Matplotlib, load during module startup even when corresponding tabs are unused.
-- Snap-and-Find and program-row camera acquisition, matching, interactive mask,
-  template, program, and remaining auxiliary-board paths retain synchronous
-  work. Program-row Modbus operations remain coupled to the broader program
-  state machine, while the visible manual Modbus panel no longer waits for
-  controller completion on Tk. Legacy main-controller exchanges still wait
-  synchronously where remaining Tk callbacks invoke them.
+- Remaining program and auxiliary-board paths retain synchronous work.
+  Program-row Modbus operations remain coupled to the broader program state
+  machine, while the visible manual Modbus panel no longer waits for controller
+  completion on Tk. Legacy main-controller exchanges still wait synchronously
+  where remaining Tk callbacks invoke them.
 - Calibration result application still snapshots and serializes the complete UI log on Tk; persistence remains a measured M4A2 optimization surface.
 - Full calibration serialization still reads a broad Tk-backed state dictionary; debouncing reduces frequency but does not reduce payload or provide atomic replacement.
 - `moveInProc` contains comparison expressions used where assignments appear intended, but the surrounding state is not consumed consistently enough for a safe isolated edit. The program-state-machine pass must replace that implicit state rather than patch isolated operators.

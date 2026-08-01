@@ -632,10 +632,18 @@ Implemented portion:
   image files or blocking Tk behind another workflow. Shutdown cancels pending
   capture-only work and
   supervises an active capture under the bounded camera-worker grace period.
-  Mask and template drag bounds normalize direction, clamp to the captured
-  image, and reject undersized selections before mutating stored mask state;
-  callback persistence failures close the OpenCV windows and publish an HMI
-  alarm. Successful capture events are presented in worker order, so a failed
+  Mask and template buttons submit immutable requests to a non-coalescing
+  selection worker. The worker retains the shared artifact owner through
+  camera acquisition or bounded image loading, a cancellable OpenCV drag loop,
+  vectorized mask application or template cropping, and checked persistence.
+  Drag bounds normalize direction and clamp to the captured image; undersized
+  drags remain uncommitted and allow another selection. Request identity and
+  selection kind are verified before the camera poll applies mask state or a
+  template preview on Tk. Selection failures publish an HMI alarm, stale
+  results are ignored with a diagnostic, and shutdown cancellation is included
+  in the bounded camera-worker supervision path. The superseded pixel loop and
+  OpenCV callbacks that read or mutated Tk state have been removed.
+  Successful capture events are presented in worker order, so a failed
   coalesced successor cannot leave the most recent retained successful capture
   hidden behind an older displayed still frame.
   Manual `Snap & Find` now snapshots capture, template, score, rotation,
@@ -677,8 +685,8 @@ Implemented portion:
   Hardware camera behavior and timing remain unverified.
 
 Remaining scope includes broader program and G-code row-execution admission,
-interactive mask and template workflows, Modbus, auxiliary connection and
-device paths, durable event-poll failure handling when the Tk
+Modbus, auxiliary connection and device paths, durable event-poll failure
+handling when the Tk
 scheduler or interpreter is unavailable, application-lifecycle, timing, and
 calibration-preemption work.
 
