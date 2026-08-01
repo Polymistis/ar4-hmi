@@ -26,6 +26,7 @@ from ARrobots.HMI.vision_io import (
     VisionMatchOptions,
     VisionMatchResult,
     VisionMatchSettings,
+    VisionOperationDrainState,
     VisionOperationWorker,
     _rotate_vision_template,
     fit_vision_preview_square,
@@ -285,7 +286,12 @@ class VisionIoTests(unittest.TestCase):
         self.assertEqual(worker.pending_request_id, submission.request_id)
 
         self.assertFalse(worker.close())
-        events = worker.drain_events()
+        drain_state = worker.drain_events_state()
+        self.assertIsInstance(drain_state, VisionOperationDrainState)
+        self.assertTrue(drain_state.active)
+        self.assertIsNone(drain_state.active_request_id)
+        self.assertIsNone(drain_state.pending_request_id)
+        events = drain_state.events
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].request_id, submission.request_id)
         self.assertIsNone(events[0].result)
@@ -299,6 +305,16 @@ class VisionIoTests(unittest.TestCase):
         self.assertTrue(worker.wait_stopped(1))
         self.assertEqual(operation_calls, [])
         self.assertTrue(worker.close())
+
+    def test_vision_operation_drain_state_rejects_invalid_lifecycle(self):
+        with self.assertRaisesRegex(MotionInputError, "events must be a tuple"):
+            VisionOperationDrainState([], False, None, None)
+        with self.assertRaisesRegex(MotionInputError, "must be boolean"):
+            VisionOperationDrainState((), 1, None, None)
+        with self.assertRaisesRegex(MotionInputError, "request id"):
+            VisionOperationDrainState((), True, True, None)
+        with self.assertRaisesRegex(MotionInputError, "cannot retain"):
+            VisionOperationDrainState((), False, 1, None)
 
     def test_vision_capture_worker_rolls_back_startup_failures(self):
         settings = self.vision_capture_settings()

@@ -503,6 +503,33 @@ class VisionOperationEvent:
 
 
 @dataclass(frozen=True)
+class VisionOperationDrainState:
+    events: tuple
+    active: bool
+    active_request_id: int | None
+    pending_request_id: int | None
+
+    def __post_init__(self):
+        if not isinstance(self.events, tuple):
+            raise MotionInputError("vision drain events must be a tuple")
+        if not isinstance(self.active, bool):
+            raise MotionInputError("vision drain active state must be boolean")
+        for field_name, value in (
+            ("vision drain active request id", self.active_request_id),
+            ("vision drain pending request id", self.pending_request_id),
+        ):
+            if value is not None:
+                _validate_nonnegative_integer(value, field_name)
+        if not self.active and (
+            self.active_request_id is not None
+            or self.pending_request_id is not None
+        ):
+            raise MotionInputError(
+                "an inactive vision drain cannot retain request ownership"
+            )
+
+
+@dataclass(frozen=True)
 class VisionOperationSubmission:
     request_id: int
     coalesced: bool
@@ -1293,10 +1320,23 @@ class VisionOperationWorker:
             return VisionOperationSubmission(request.request_id, coalesced)
 
     def drain_events(self):
+        return self.drain_events_state().events
+
+    def drain_events_state(self):
         with self._lock:
             events = tuple(self._events)
+            state = VisionOperationDrainState(
+                events=events,
+                active=self._worker is not None,
+                active_request_id=self._active_request_id,
+                pending_request_id=(
+                    None
+                    if self._pending is None
+                    else self._pending.request_id
+                ),
+            )
             self._events.clear()
-            return events
+            return state
 
     def close(self):
         with self._lock:

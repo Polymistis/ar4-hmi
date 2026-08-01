@@ -305,6 +305,7 @@ from ARrobots.HMI.vision_io import (
   VisionMatchOptions,
   VisionMatchResult,
   VisionMatchSettings,
+  VisionOperationDrainState,
   VisionOperationEvent,
   VisionOperationSubmission,
   VisionOperationWorker,
@@ -565,6 +566,11 @@ def on_closing():
   if isinstance(runtime_state, dict):
     runtime_state['xboxUse'] = 0
 
+  try:
+    _cancel_active_program_execution()
+  except Exception:
+    logger.exception("Unable to cancel program execution during shutdown")
+
   conversion_active = globals().get('gcode_conversion_active')
   conversion_tab = globals().get('tab7')
   if (
@@ -635,6 +641,16 @@ def on_closing():
         camera_preview_shutdown_started_at = time.monotonic()
     except Exception:
       logger.exception("Unable to stop vision matching during shutdown")
+  try:
+    program_vision_settled = _settle_program_vision_shutdown_operations()
+    if not isinstance(program_vision_settled, bool):
+      raise RuntimeError(
+        "program vision shutdown returned an invalid settlement state"
+      )
+    if not program_vision_settled:
+      logger.error("Program vision shutdown settlement was incomplete")
+  except Exception:
+    logger.exception("Unable to settle program vision during shutdown")
   camera_preview_shutdown_timeout_reported = False
   if isinstance(runtime_state, dict):
     runtime_state['cam_on'] = False
@@ -670,6 +686,7 @@ selected_vision_camera_source = None
 program_camera_completion_queue = Queue()
 program_vision_start_queue = Queue()
 program_vision_operations = {}
+program_vision_retired_request_ids = set()
 offline_live_jog_lock = threading.Lock()
 offline_live_jog_state_lock = threading.Lock()
 offline_live_jog_stop_event = threading.Event()
@@ -1276,7 +1293,9 @@ class ProgramVisionOperation:
     return True
 
   def wait(self):
-    self._completion.wait()
+    while not self._completion.wait(CONTROL_POLL_INTERVAL_SECONDS):
+      if self.execution_request.cancellation_boundary.is_set():
+        return False
     with self._settlement_lock:
       if not self._settled or not isinstance(self._succeeded, bool):
         raise RuntimeError(
@@ -28859,6 +28878,48 @@ def _settle_program_vision_operation(
   return succeeded
 
 
+def _settle_program_vision_shutdown_operations():
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "program vision shutdown settlement must run on the Tk event thread"
+    )
+  if not application_closing.is_set():
+    raise RuntimeError(
+      "program vision shutdown settlement requires active shutdown"
+    )
+
+  operations = []
+  while True:
+    try:
+      operations.append(program_vision_start_queue.get_nowait())
+    except Empty:
+      break
+  with program_vision_operation_lock:
+    operations.extend(program_vision_operations.values())
+    program_vision_retired_request_ids.update(program_vision_operations)
+    program_vision_operations.clear()
+
+  unique_operations = []
+  operation_identities = set()
+  for operation in operations:
+    identity = id(operation)
+    if identity in operation_identities:
+      continue
+    operation_identities.add(identity)
+    unique_operations.append(operation)
+
+  settled = True
+  for operation in unique_operations:
+    try:
+      _settle_program_vision_operation(operation, False)
+    except Exception:
+      settled = False
+      logger.exception(
+        "Unable to settle a program vision owner during shutdown"
+      )
+  return settled
+
+
 def _start_program_vision_operation(operation):
   if threading.get_ident() != application_tk_thread_id:
     raise RuntimeError(
@@ -29515,7 +29576,10 @@ def _apply_program_vision_match_event(operation, event):
 
 
 def _drain_vision_match_events():
-  for event in vision_match_worker.drain_events():
+  drain_state = vision_match_worker.drain_events_state()
+  if not isinstance(drain_state, VisionOperationDrainState):
+    raise RuntimeError("vision matching worker returned an invalid drain state")
+  for event in drain_state.events:
     if not isinstance(event, VisionOperationEvent):
       with program_vision_operation_lock:
         orphaned_operations = tuple(program_vision_operations.values())
@@ -29539,7 +29603,12 @@ def _drain_vision_match_events():
       continue
     with program_vision_operation_lock:
       operation = program_vision_operations.pop(event.request_id, None)
+      retired = event.request_id in program_vision_retired_request_ids
+      if retired:
+        program_vision_retired_request_ids.discard(event.request_id)
     if operation is None:
+      if retired:
+        continue
       try:
         _apply_vision_match_event(event)
       except Exception:
@@ -29567,6 +29636,31 @@ def _drain_vision_match_events():
       )
     except Exception:
       logger.exception("Unable to settle a program vision result")
+  owned_request_ids = {
+    request_id
+    for request_id in (
+      drain_state.active_request_id,
+      drain_state.pending_request_id,
+    )
+    if request_id is not None
+  }
+  with program_vision_operation_lock:
+    orphaned_operations = tuple(
+      program_vision_operations.pop(request_id)
+      for request_id in tuple(program_vision_operations)
+      if request_id not in owned_request_ids
+    )
+  if orphaned_operations:
+    for operation in orphaned_operations:
+      try:
+        _settle_program_vision_operation(
+          operation,
+          False,
+          "vision matching worker lost request ownership without a "
+          "terminal event",
+        )
+      except Exception:
+        logger.exception("Unable to settle an orphaned program vision result")
   return True
 
 

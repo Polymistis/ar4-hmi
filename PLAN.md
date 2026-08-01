@@ -653,6 +653,13 @@ Implemented portion:
   worker contract removes an accepted request still pending worker pickup and
   appends a terminal cancellation event during the same locked close
   transition, allowing a waiting program-row owner to settle during shutdown.
+  Shutdown also cancels the active program request and directly settles queued
+  and registered program-vision owners on Tk, independent of later camera-poll
+  delivery. Off-Tk program waits observe request cancellation, and an atomic
+  worker drain-and-lifecycle snapshot rejects any registered owner that loses
+  active and pending worker ownership without a terminal event.
+  Worker results arriving after direct shutdown settlement are discarded by
+  request identity instead of being misreported as failed manual matches.
   Program `Vis Find` rows parse
   into validated immutable commands, snapshot capture, matching, and exact
   program-view inputs on Tk, and reuse the same non-coalescing worker for one
@@ -671,9 +678,7 @@ Implemented portion:
 
 Remaining scope includes broader program and G-code row-execution admission,
 interactive mask and template workflows, Modbus, auxiliary connection and
-device paths,
-request-scoped program-owner watchdog and recovery semantics for a lost worker
-or completion callback, durable event-poll failure handling when the Tk
+device paths, durable event-poll failure handling when the Tk
 scheduler or interpreter is unavailable, application-lifecycle, timing, and
 calibration-preemption work.
 

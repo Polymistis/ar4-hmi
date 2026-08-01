@@ -146,6 +146,7 @@ from ARrobots.HMI.vision_io import (
     VisionMatchOptions,
     VisionMatchResult,
     VisionMatchSettings,
+    VisionOperationDrainState,
     VisionOperationEvent,
     VisionOperationSubmission,
     normalize_camera_exception_detail,
@@ -5781,6 +5782,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "threading": threading,
             "math": math,
             "MotionInputError": MotionInputError,
+            "CONTROL_POLL_INTERVAL_SECONDS": 0.001,
             "PROGRAM_EXECUTION_MODES": frozenset(
                 ("run", "step-forward", "step-reverse")
             ),
@@ -5831,6 +5833,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "VisionOperationSubmission": VisionOperationSubmission,
             "program_vision_start_queue": start_queue,
             "program_vision_operations": operations,
+            "program_vision_retired_request_ids": set(),
             "program_vision_operation_lock": threading.Lock(),
             "vision_match_request_lock": threading.Lock(),
             "vision_match_worker": Worker,
@@ -5942,6 +5945,51 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(callbacks[-1], (False, main_thread))
         self.assertEqual(len(submissions), 2)
 
+        shutdown_callbacks = []
+        queued = operation_type(request, command, shutdown_callbacks.append)
+        registered = operation_type(
+            request,
+            command,
+            shutdown_callbacks.append,
+        )
+        registered.bind_worker_request(90)
+        start_queue.put(queued)
+        operations[90] = registered
+        namespace["application_closing"].set()
+        settle_shutdown = self.compile_function(
+            "_settle_program_vision_shutdown_operations",
+            namespace,
+        )
+        self.assertTrue(settle_shutdown())
+        self.assertFalse(queued.wait())
+        self.assertFalse(registered.wait())
+        self.assertEqual(shutdown_callbacks, [False, False])
+        self.assertTrue(start_queue.empty())
+        self.assertEqual(operations, {})
+        self.assertEqual(
+            namespace["program_vision_retired_request_ids"],
+            {90},
+        )
+
+        cancelled_wait_request = request_type(
+            3,
+            "run",
+            request_namespace["SerialWriteCancellationBoundary"](
+                "cancelled program vision wait test"
+            ),
+        )
+        cancelled_wait = operation_type(cancelled_wait_request, command)
+        wait_results = []
+        wait_thread = threading.Thread(
+            target=lambda: wait_results.append(cancelled_wait.wait())
+        )
+        wait_thread.start()
+        cancelled_wait_request.cancellation_boundary.cancel()
+        wait_thread.join(1.0)
+        self.assertFalse(wait_thread.is_alive())
+        self.assertEqual(wait_results, [False])
+        cancelled_wait.settle(False)
+
     def test_program_vision_match_commits_result_branch_only_on_tk(self):
         main_thread = threading.get_ident()
 
@@ -5975,6 +6023,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "threading": threading,
             "math": math,
             "MotionInputError": MotionInputError,
+            "CONTROL_POLL_INTERVAL_SECONDS": 0.001,
             "PROGRAM_EXECUTION_MODES": frozenset(
                 ("run", "step-forward", "step-reverse")
             ),
@@ -6121,13 +6170,20 @@ class HmiSourceContractTests(unittest.TestCase):
         events = [
             VisionOperationEvent(2, 10, result=operation_result(True))
         ]
+        worker_ownership = [(False, None, None)]
+        manual_events = []
         namespace.update({
             "program_vision_operation_lock": threading.Lock(),
             "program_vision_operations": {10: drained},
+            "program_vision_retired_request_ids": set(),
             "vision_match_request_lock": threading.Lock(),
             "vision_match_worker": SimpleNamespace(
-                drain_events=lambda: tuple(events)
+                drain_events_state=lambda: VisionOperationDrainState(
+                    tuple(events),
+                    *worker_ownership[0],
+                )
             ),
+            "VisionOperationDrainState": VisionOperationDrainState,
             "RUN": {
                 "visionMatchRequestId": None,
                 "visionMatchResult": None,
@@ -6139,7 +6195,9 @@ class HmiSourceContractTests(unittest.TestCase):
                 error=lambda *args: None,
                 exception=lambda *args: None,
             ),
-            "_apply_vision_match_event": lambda event: False,
+            "_apply_vision_match_event": (
+                lambda event: manual_events.append(event) or False
+            ),
         })
         namespace["_apply_program_vision_match_event"] = apply_event
         namespace["_settle_program_vision_operation"] = self.compile_function(
@@ -6187,6 +6245,54 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
         )
 
+        orphaned_completions = []
+        orphaned = operation_type(
+            request,
+            command,
+            orphaned_completions.append,
+        )
+        orphaned.bind_worker_request(12)
+        namespace["program_vision_operations"][12] = orphaned
+        events.clear()
+        worker_ownership[0] = (True, None, 12)
+        self.assertTrue(drain_events())
+        self.assertIs(namespace["program_vision_operations"][12], orphaned)
+        self.assertEqual(orphaned_completions, [])
+        worker_ownership[0] = (True, 12, None)
+        self.assertTrue(drain_events())
+        self.assertIs(namespace["program_vision_operations"][12], orphaned)
+        self.assertEqual(orphaned_completions, [])
+        worker_ownership[0] = (False, None, None)
+        self.assertTrue(drain_events())
+        self.assertFalse(orphaned.wait())
+        self.assertEqual(orphaned_completions, [False])
+        self.assertEqual(namespace["program_vision_operations"], {})
+        self.assertEqual(
+            statuses[-1],
+            (
+                "Vision program row rejected: vision matching worker "
+                "lost request ownership without a terminal event",
+                "Alarm.TLabel",
+            ),
+        )
+
+        status_count = len(statuses)
+        namespace["program_vision_retired_request_ids"].add(13)
+        events[:] = [
+            VisionOperationEvent(
+                4,
+                13,
+                error_detail="vision matching was cancelled during shutdown",
+            )
+        ]
+        self.assertTrue(drain_events())
+        self.assertEqual(manual_events, [])
+        self.assertEqual(len(statuses), status_count)
+        self.assertEqual(
+            namespace["program_vision_retired_request_ids"],
+            set(),
+        )
+
         changed = operation_type(request, command)
         changed.bind_program_rows(ProgramView.rows)
         changed.bind_worker_request(9)
@@ -6198,7 +6304,7 @@ class HmiSourceContractTests(unittest.TestCase):
         ):
             apply_event(
                 changed,
-                VisionOperationEvent(4, 9, result=operation_result(True)),
+                VisionOperationEvent(5, 9, result=operation_result(True)),
             )
         ProgramView.rows = original_rows
         self.assertEqual(
@@ -6213,7 +6319,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 apply_event(
                     failed,
                     VisionOperationEvent(
-                        5,
+                        6,
                         8,
                         result=operation_result(False),
                     ),
@@ -9302,6 +9408,8 @@ class HmiSourceContractTests(unittest.TestCase):
         camera_closes = []
         vision_closes = []
         match_closes = []
+        program_cancellations = []
+        program_vision_settlements = []
         namespace = {
             "application_closing": closing,
             "serial_activity_registry": activity,
@@ -9334,6 +9442,12 @@ class HmiSourceContractTests(unittest.TestCase):
             "vision_match_worker": SimpleNamespace(
                 close=lambda: match_closes.append(True) or True,
             ),
+            "_cancel_active_program_execution": (
+                lambda: program_cancellations.append(True) or True
+            ),
+            "_settle_program_vision_shutdown_operations": (
+                lambda: program_vision_settlements.append(True) or True
+            ),
             "logger": logger,
             "_poll_application_close": lambda: poll_calls.append(True),
             "almStatusLab": first_label,
@@ -9351,6 +9465,8 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(camera_closes, [True])
         self.assertEqual(vision_closes, [True])
         self.assertEqual(match_closes, [True])
+        self.assertEqual(program_cancellations, [True])
+        self.assertEqual(program_vision_settlements, [True])
         self.assertFalse(namespace["RUN"]["cam_on"])
         self.assertIsNone(namespace["RUN"]["visionCaptureRequestId"])
         self.assertIsNone(namespace["RUN"]["visionMatchRequestId"])
@@ -9365,6 +9481,8 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(second_label.text, first_label.text)
         self.assertFalse(close_application())
         self.assertEqual(poll_calls, [True])
+        self.assertEqual(program_cancellations, [True])
+        self.assertEqual(program_vision_settlements, [True])
 
     def test_shutdown_waits_for_retained_manual_controller_cleanup(self):
         class Root:
