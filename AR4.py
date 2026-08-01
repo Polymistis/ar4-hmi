@@ -575,6 +575,10 @@ def on_closing():
     _cancel_active_program_execution()
   except Exception:
     logger.exception("Unable to cancel program execution during shutdown")
+  try:
+    _cancel_auxiliary_device_read()
+  except Exception:
+    logger.exception("Unable to cancel auxiliary-device I/O during shutdown")
 
   conversion_active = globals().get('gcode_conversion_active')
   conversion_tab = globals().get('tab7')
@@ -741,6 +745,15 @@ manual_auxiliary_active_request = None
 manual_auxiliary_next_request_id = 0
 manual_auxiliary_state_lock = threading.Lock()
 manual_auxiliary_stop_barrier = threading.Event()
+auxiliary_device_event_queue = Queue()
+auxiliary_device_state_lock = threading.Lock()
+auxiliary_device_read_active = threading.Event()
+auxiliary_device_worker_active = threading.Event()
+auxiliary_device_cancel_requested = threading.Event()
+auxiliary_device_active_request = None
+auxiliary_device_active_serial = None
+auxiliary_device_pending_result = None
+auxiliary_device_next_request_id = 0
 manual_controller_event_queue = Queue()
 manual_controller_active_request = None
 manual_controller_activity_lease = None
@@ -942,6 +955,13 @@ SERIAL_EVENT_APPLICATION_MARGIN_SECONDS = 5
 SERIAL_WRITE_TIMEOUT_SECONDS = 5
 SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS = 5
 SERIAL_AUXILIARY_WAIT_MARGIN_SECONDS = 5
+AUXILIARY_DEVICE_BAUD_RATE = 9600
+AUXILIARY_DEVICE_READ_TIMEOUT_SECONDS = 5
+AUXILIARY_DEVICE_MAX_READ_BYTES = 4096
+AUXILIARY_DEVICE_MAX_PORT_NUMBER = 65535
+AUXILIARY_DEVICE_MAX_ERROR_DETAIL = 512
+AUXILIARY_DEVICE_CLEANUP_RETRY_SECONDS = 1.0
+AUXILIARY_DEVICE_SHUTDOWN_CLOSE_ATTEMPTS = 3
 # Teensy WJ, WK, and WT convert seconds to signed 32-bit milliseconds.
 MAIN_FIRMWARE_WAIT_MAX_SECONDS = 2147483
 # Firmware emits the live acknowledgement before entering segment execution.
@@ -1036,6 +1056,7 @@ EVENT_POLL_CALLBACK_NAMES = {
   "manual-controller": "_poll_manual_controller_events",
   "auxiliary-serial": "_poll_auxiliary_serial_events",
   "manual-auxiliary": "_poll_manual_auxiliary_events",
+  "auxiliary-device": "_poll_auxiliary_device_events",
   "gcode-storage": "_poll_gcode_storage_events",
   "called-program": "_poll_called_program_navigation_events",
   "program-selection": "_poll_program_selection_events",
@@ -1142,6 +1163,77 @@ class ProgramExecutionRequest:
       raise MotionInputError(
         "program execution cancellation boundary is invalid"
       )
+
+
+@dataclass(frozen=True)
+class AuxiliaryDeviceReadRequest:
+  request_id: int
+  port: str
+  read_size: int
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError("auxiliary-device request ID must be positive")
+    if (
+      not isinstance(self.port, str)
+      or len(self.port) > 3 + len(str(AUXILIARY_DEVICE_MAX_PORT_NUMBER))
+    ):
+      raise MotionInputError("auxiliary-device port is invalid")
+    match = re.fullmatch(r"COM([1-9][0-9]*)", self.port)
+    if (
+      match is None
+      or int(match.group(1)) > AUXILIARY_DEVICE_MAX_PORT_NUMBER
+    ):
+      raise MotionInputError("auxiliary-device port is invalid")
+    if (
+      isinstance(self.read_size, bool)
+      or not isinstance(self.read_size, int)
+      or not 1 <= self.read_size <= AUXILIARY_DEVICE_MAX_READ_BYTES
+    ):
+      raise MotionInputError("auxiliary-device read size is invalid")
+
+
+@dataclass(frozen=True)
+class AuxiliaryDeviceReadResult:
+  request_id: int
+  outcome: str
+  value: str
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError("auxiliary-device result ID must be positive")
+    if self.outcome not in ("completed", "failed", "cancelled"):
+      raise MotionInputError("auxiliary-device result outcome is invalid")
+    if not isinstance(self.value, str):
+      raise MotionInputError("auxiliary-device result value must be text")
+    try:
+      encoded_value = self.value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+      raise MotionInputError(
+        "auxiliary-device result value must be valid UTF-8"
+      ) from exc
+    if self.outcome == "completed":
+      if (
+        len(encoded_value) > AUXILIARY_DEVICE_MAX_READ_BYTES
+        or any(not character.isprintable() for character in self.value)
+      ):
+        raise MotionInputError("auxiliary-device response text is invalid")
+      return
+    if (
+      not self.value
+      or self.value != self.value.strip()
+      or " ".join(self.value.split()) != self.value
+      or len(encoded_value) > AUXILIARY_DEVICE_MAX_ERROR_DETAIL
+    ):
+      raise MotionInputError("auxiliary-device error detail is invalid")
 
 
 @dataclass(frozen=True)
@@ -3454,6 +3546,23 @@ def _begin_program_execution(mode):
       return None
     if manual_controller_program_admission_active:
       return None
+    with auxiliary_device_state_lock:
+      auxiliary_device_active = auxiliary_device_read_active.is_set()
+      if not isinstance(auxiliary_device_active, bool):
+        raise RuntimeError("auxiliary-device active state is invalid")
+      if auxiliary_device_active != (
+        auxiliary_device_active_request is not None
+      ):
+        raise RuntimeError(
+          "auxiliary-device request ownership is inconsistent"
+        )
+      if auxiliary_device_active and not isinstance(
+        auxiliary_device_active_request,
+        AuxiliaryDeviceReadRequest,
+      ):
+        raise RuntimeError("active auxiliary-device request is invalid")
+      if auxiliary_device_active:
+        return None
     if program_execution_active_request is not None:
       if not isinstance(
         program_execution_active_request,
@@ -3605,6 +3714,23 @@ def _program_execution_busy_message():
         return "PROGRAM EXECUTION REJECTED DURING G-CODE CONVERSION"
       if gcode_storage_program_admission_active:
         return "PROGRAM EXECUTION REJECTED DURING G-CODE STORAGE"
+      with auxiliary_device_state_lock:
+        auxiliary_device_active = auxiliary_device_read_active.is_set()
+        if not isinstance(auxiliary_device_active, bool):
+          raise RuntimeError("auxiliary-device active state is invalid")
+        if auxiliary_device_active != (
+          auxiliary_device_active_request is not None
+        ):
+          raise RuntimeError(
+            "auxiliary-device request ownership is inconsistent"
+          )
+        if auxiliary_device_active and not isinstance(
+          auxiliary_device_active_request,
+          AuxiliaryDeviceReadRequest,
+        ):
+          raise RuntimeError("active auxiliary-device request is invalid")
+        if auxiliary_device_active:
+          return "PROGRAM EXECUTION REJECTED DURING AUXILIARY COM READ"
       with auxiliary_stop_state_lock:
         with program_stop_state_lock:
           stop_reason = _program_execution_stop_admission_reason_locked()
@@ -4824,6 +4950,7 @@ def _poll_application_close():
   _poll_calibration_events()
   _poll_auxiliary_serial_events()
   _poll_manual_auxiliary_events()
+  _poll_auxiliary_device_events()
   _poll_gcode_storage_events()
   _poll_called_program_navigation_events()
   _poll_program_selection_events()
@@ -4831,6 +4958,20 @@ def _poll_application_close():
   _poll_virtual_motion_events()
   _poll_xbox_auxiliary_events()
   _close_joint_motion_dispatcher_for_shutdown()
+
+  try:
+    _cancel_auxiliary_device_read()
+    auxiliary_device_pending = _auxiliary_device_read_pending()
+  except Exception:
+    logger.exception("Unable to settle auxiliary-device I/O during shutdown")
+    auxiliary_device_pending = True
+  if auxiliary_device_pending:
+    _set_application_status(
+      "SHUTDOWN WAITING FOR AUXILIARY COM READ",
+      "Warn.TLabel",
+    )
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
 
   with manual_controller_cleanup_lock:
     controller_io_cleanup_pending = (
@@ -4995,6 +5136,11 @@ def _poll_application_close():
     if persisted:
       closed = _close_serial_port('ser')
       closed = _close_serial_port('ser2') and closed
+      if not _close_serial_port('ser3'):
+        logger.error(
+          "Auxiliary-device serial close remained incomplete; process exit "
+          "will retire the read-only handle"
+        )
   finally:
     auxiliary_serial_lock.release()
     serial_lock.release()
@@ -23729,23 +23875,976 @@ def ReadAuxCom():
     f.close()
 
 
+def _auxiliary_device_port(value):
+  if (
+    not isinstance(value, str)
+    or not value
+    or value != value.strip()
+    or len(value) > len(str(AUXILIARY_DEVICE_MAX_PORT_NUMBER))
+    or re.fullmatch(r"[0-9]+", value) is None
+  ):
+    raise MotionInputError(
+      "auxiliary-device port must be a positive COM number"
+    )
+  port_number = int(value)
+  if not 1 <= port_number <= AUXILIARY_DEVICE_MAX_PORT_NUMBER:
+    raise MotionInputError(
+      "auxiliary-device port number is outside the supported range"
+    )
+  return f"COM{port_number}"
+
+
+def _auxiliary_device_read_size(value):
+  if (
+    not isinstance(value, str)
+    or not value
+    or value != value.strip()
+    or len(value) > len(str(AUXILIARY_DEVICE_MAX_READ_BYTES))
+    or re.fullmatch(r"[0-9]+", value) is None
+  ):
+    raise MotionInputError(
+      "auxiliary-device character count must be a positive integer"
+    )
+  read_size = int(value)
+  if not 1 <= read_size <= AUXILIARY_DEVICE_MAX_READ_BYTES:
+    raise MotionInputError(
+      "auxiliary-device character count is outside the supported range"
+    )
+  return read_size
+
+
+def _auxiliary_device_detail_prefix(value, maximum_bytes):
+  if not isinstance(value, str) or not value:
+    raise TypeError("auxiliary-device detail text is invalid")
+  if (
+    isinstance(maximum_bytes, bool)
+    or not isinstance(maximum_bytes, int)
+    or maximum_bytes <= 0
+  ):
+    raise TypeError("auxiliary-device detail limit is invalid")
+  encoded = value[:maximum_bytes].encode("utf-8", errors="replace")
+  return encoded[:maximum_bytes].decode(
+    "utf-8",
+    errors="ignore",
+  ).rstrip()
+
+
+def _auxiliary_device_error_detail(error, fallback):
+  if not isinstance(error, Exception):
+    raise TypeError("auxiliary-device error must be an exception")
+  if (
+    not isinstance(fallback, str)
+    or not fallback
+    or " ".join(fallback.split()) != fallback
+  ):
+    raise TypeError("auxiliary-device error fallback is invalid")
+  try:
+    detail = " ".join(str(error).split())
+  except Exception:
+    detail = type(error).__name__
+  detail = "".join(
+    character if character.isprintable() else "\uFFFD"
+    for character in detail
+  )
+  detail = " ".join(detail.split())
+  detail = detail or fallback
+  return _auxiliary_device_detail_prefix(
+    detail,
+    AUXILIARY_DEVICE_MAX_ERROR_DETAIL,
+  )
+
+
+def _combine_auxiliary_device_error_details(primary, cleanup):
+  if (
+    not isinstance(primary, str)
+    or not primary
+    or " ".join(primary.split()) != primary
+  ):
+    raise TypeError("auxiliary-device primary error detail is invalid")
+  if (
+    not isinstance(cleanup, str)
+    or not cleanup
+    or " ".join(cleanup.split()) != cleanup
+  ):
+    raise TypeError("auxiliary-device cleanup error detail is invalid")
+  separator = "; serial cleanup failed: "
+  available = (
+    AUXILIARY_DEVICE_MAX_ERROR_DETAIL - len(separator.encode("utf-8"))
+  )
+  half = available // 2
+  primary_bytes = len(primary.encode("utf-8"))
+  cleanup_bytes = len(cleanup.encode("utf-8"))
+  if primary_bytes < half:
+    primary_limit = primary_bytes
+    cleanup_limit = available - primary_limit
+  elif cleanup_bytes < half:
+    cleanup_limit = cleanup_bytes
+    primary_limit = available - cleanup_limit
+  else:
+    primary_limit = half
+    cleanup_limit = available - primary_limit
+  return (
+    _auxiliary_device_detail_prefix(primary, primary_limit)
+    + separator
+    + _auxiliary_device_detail_prefix(cleanup, cleanup_limit)
+  )
+
+
+def _auxiliary_device_read_cancelled():
+  closing = application_closing.is_set()
+  cancelled = auxiliary_device_cancel_requested.is_set()
+  if not isinstance(closing, bool) or not isinstance(cancelled, bool):
+    raise RuntimeError("auxiliary-device cancellation state is invalid")
+  return closing or cancelled
+
+
+def _close_auxiliary_device_serial(serial_port, context):
+  global auxiliary_device_active_serial
+
+  if serial_port is None:
+    return True, ()
+  if (
+    not isinstance(context, str)
+    or not context
+    or context != context.strip()
+  ):
+    raise TypeError("auxiliary-device serial close context is invalid")
+
+  with auxiliary_device_state_lock:
+    bound_port = RUN.get('ser3')
+    active_port = auxiliary_device_active_serial
+    bound_here = bound_port is serial_port
+    active_here = active_port is serial_port
+    if bound_here != active_here:
+      raise RuntimeError(
+        "auxiliary-device serial ownership is only partially bound"
+      )
+    if bound_port is not None and not bound_here:
+      raise RuntimeError("auxiliary-device runtime serial ownership changed")
+    if active_port is not None and not active_here:
+      raise RuntimeError("auxiliary-device active serial ownership changed")
+    was_bound = bound_here
+
+  errors = []
+  try:
+    close = getattr(serial_port, "close", None)
+    if not callable(close):
+      raise TypeError("auxiliary-device serial close is unavailable")
+    close()
+  except Exception as exc:
+    errors.append(exc)
+  try:
+    is_open = getattr(serial_port, "is_open", None)
+    if not isinstance(is_open, bool):
+      raise TypeError("auxiliary-device serial open state is invalid")
+  except Exception as exc:
+    errors.append(exc)
+    is_open = True
+
+  closed = not is_open
+  if closed:
+    with auxiliary_device_state_lock:
+      if was_bound:
+        if (
+          RUN.get('ser3') is not serial_port
+          or auxiliary_device_active_serial is not serial_port
+        ):
+          raise RuntimeError(
+            "auxiliary-device serial ownership changed during close"
+          )
+        RUN['ser3'] = None
+        auxiliary_device_active_serial = None
+      elif (
+        RUN.get('ser3') is not None
+        or auxiliary_device_active_serial is not None
+      ):
+        raise RuntimeError(
+          "unbound auxiliary-device serial ownership changed during close"
+        )
+    return True, tuple(errors)
+
+  if not was_bound:
+    with auxiliary_device_state_lock:
+      if auxiliary_device_active_request is None:
+        raise RuntimeError(
+          "auxiliary-device failed close has no request owner"
+        )
+      if (
+        RUN.get('ser3') is not None
+        or auxiliary_device_active_serial is not None
+      ):
+        raise RuntimeError(
+          "auxiliary-device failed close conflicts with serial ownership"
+        )
+      RUN['ser3'] = serial_port
+      auxiliary_device_active_serial = serial_port
+  if not errors:
+    errors.append(OSError("auxiliary-device serial port did not close"))
+  return False, tuple(errors)
+
+
+def _settle_auxiliary_device_serial(serial_port, context):
+  if serial_port is None:
+    return True, None
+  first_error = None
+  shutdown_attempts = 0
+
+  def retain_error(error):
+    nonlocal first_error
+
+    if not isinstance(error, Exception):
+      error = RuntimeError(
+        "auxiliary-device serial cleanup raised a nonstandard exception"
+      )
+    if first_error is None:
+      first_error = error
+      return
+    logger.error(
+      "Additional auxiliary-device serial cleanup error during %s: %s",
+      context,
+      _auxiliary_device_error_detail(
+        error,
+        "additional serial cleanup failure",
+      ),
+    )
+
+  while True:
+    try:
+      closed, close_errors = _close_auxiliary_device_serial(
+        serial_port,
+        context,
+      )
+      if not isinstance(closed, bool) or not isinstance(close_errors, tuple):
+        raise RuntimeError(
+          "auxiliary-device serial close returned invalid state"
+        )
+      for close_error in close_errors:
+        retain_error(close_error)
+    except Exception as exc:
+      closed = False
+      retain_error(exc)
+    if closed:
+      return True, first_error
+
+    try:
+      cancelled = _auxiliary_device_read_cancelled()
+    except Exception as exc:
+      retain_error(exc)
+      cancelled = True
+    if cancelled:
+      shutdown_attempts += 1
+      if shutdown_attempts >= AUXILIARY_DEVICE_SHUTDOWN_CLOSE_ATTEMPTS:
+        if first_error is None:
+          first_error = OSError(
+            "auxiliary-device serial cleanup did not settle during shutdown"
+          )
+        logger.error(
+          "Auxiliary-device serial cleanup remained incomplete after %s "
+          "shutdown attempts; process exit will retire the read-only handle",
+          shutdown_attempts,
+        )
+        return False, first_error
+    try:
+      time.sleep(AUXILIARY_DEVICE_CLEANUP_RETRY_SECONDS)
+    except Exception as exc:
+      retain_error(exc)
+      return False, first_error
+
+
+def _publish_auxiliary_device_result(request, result):
+  global auxiliary_device_pending_result
+
+  if not isinstance(request, AuxiliaryDeviceReadRequest):
+    raise TypeError("auxiliary-device result request is invalid")
+  if (
+    not isinstance(result, AuxiliaryDeviceReadResult)
+    or result.request_id != request.request_id
+  ):
+    raise TypeError("auxiliary-device worker result is invalid")
+  try:
+    auxiliary_device_event_queue.put_nowait(result)
+    return True
+  except Exception:
+    logger.exception("Unable to queue an auxiliary-device worker result")
+  with auxiliary_device_state_lock:
+    if (
+      auxiliary_device_active_request is request
+      and auxiliary_device_pending_result is None
+    ):
+      auxiliary_device_pending_result = result
+      return True
+  raise RuntimeError(
+    "auxiliary-device worker result could not retain ownership"
+  )
+
+
+def _run_auxiliary_device_read(request):
+  global auxiliary_device_active_serial
+
+  if not isinstance(request, AuxiliaryDeviceReadRequest):
+    raise TypeError("auxiliary-device worker request is invalid")
+  serial_port = None
+  cleanup_attempted = False
+  operation_error = None
+  cleanup_error = None
+  response = None
+
+  def retain_error(error, *, cleanup):
+    nonlocal operation_error
+    nonlocal cleanup_error
+
+    if not isinstance(error, Exception):
+      error = RuntimeError(
+        "auxiliary-device worker raised a nonstandard exception"
+      )
+    if cleanup:
+      if cleanup_error is None:
+        cleanup_error = error
+        return
+      category = "cleanup"
+    else:
+      if operation_error is None:
+        operation_error = error
+        return
+      category = "operation"
+    logger.error(
+      "Additional auxiliary-device %s error: %s",
+      category,
+      _auxiliary_device_error_detail(
+        error,
+        f"additional auxiliary-device {category} failure",
+      ),
+    )
+
+  try:
+    with auxiliary_device_state_lock:
+      if auxiliary_device_active_request is not request:
+        raise RuntimeError("auxiliary-device worker ownership changed")
+      if auxiliary_device_active_serial is not None:
+        raise RuntimeError(
+          "auxiliary-device worker started with an active serial owner"
+        )
+      serial_port = RUN.get('ser3')
+      if serial_port is not None:
+        auxiliary_device_active_serial = serial_port
+    if serial_port is not None:
+      cleanup_attempted = True
+      closed, stale_cleanup_error = _settle_auxiliary_device_serial(
+        serial_port,
+        "previous auxiliary-device program read",
+      )
+      if stale_cleanup_error is not None:
+        retain_error(stale_cleanup_error, cleanup=True)
+      if not closed:
+        raise MotionInputError(
+          "previous auxiliary-device serial cleanup did not settle"
+        )
+      serial_port = None
+      if cleanup_error is not None:
+        raise MotionInputError(
+          "previous auxiliary-device serial cleanup reported an error"
+        )
+    if _auxiliary_device_read_cancelled():
+      raise MotionInputError("auxiliary-device read was cancelled")
+    cleanup_attempted = False
+    serial_port = serial.Serial(
+      request.port,
+      baudrate=AUXILIARY_DEVICE_BAUD_RATE,
+      timeout=AUXILIARY_DEVICE_READ_TIMEOUT_SECONDS,
+    )
+    with auxiliary_device_state_lock:
+      if auxiliary_device_active_request is not request:
+        raise RuntimeError("auxiliary-device worker ownership changed")
+      if RUN.get('ser3') is not None:
+        raise RuntimeError("auxiliary-device serial ownership is already bound")
+      RUN['ser3'] = serial_port
+      auxiliary_device_active_serial = serial_port
+    is_open = getattr(serial_port, "is_open", None)
+    if not isinstance(is_open, bool) or not is_open:
+      raise OSError("auxiliary-device serial port did not open")
+    if _auxiliary_device_read_cancelled():
+      raise MotionInputError("auxiliary-device read was cancelled")
+    reset_input = getattr(serial_port, "reset_input_buffer", None)
+    if not callable(reset_input):
+      reset_input = getattr(serial_port, "flushInput", None)
+    if not callable(reset_input):
+      raise TypeError("auxiliary-device serial input reset is unavailable")
+    reset_input()
+    if _auxiliary_device_read_cancelled():
+      raise MotionInputError("auxiliary-device read was cancelled")
+    payload = serial_port.read(request.read_size)
+    if not isinstance(payload, (bytes, bytearray)):
+      raise MotionInputError("auxiliary-device read returned invalid bytes")
+    if len(payload) != request.read_size:
+      raise MotionInputError(
+        "auxiliary-device read returned "
+        f"{len(payload)} of {request.read_size} requested bytes"
+      )
+    payload = bytes(payload)
+    if _auxiliary_device_read_cancelled():
+      raise MotionInputError("auxiliary-device read was cancelled")
+    try:
+      response = payload.strip().decode("utf-8")
+    except UnicodeDecodeError as exc:
+      raise MotionInputError(
+        "auxiliary-device response is not valid UTF-8"
+      ) from exc
+    if any(not character.isprintable() for character in response):
+      raise MotionInputError(
+        "auxiliary-device response contains unsupported control characters"
+      )
+  except Exception as exc:
+    retain_error(exc, cleanup=False)
+  finally:
+    if serial_port is not None and not cleanup_attempted:
+      try:
+        closed, serial_cleanup_error = _settle_auxiliary_device_serial(
+          serial_port,
+          "auxiliary-device one-shot read",
+        )
+        if serial_cleanup_error is not None:
+          retain_error(serial_cleanup_error, cleanup=True)
+        if not closed and serial_cleanup_error is None:
+          retain_error(
+            OSError("auxiliary-device serial cleanup did not settle"),
+            cleanup=True,
+          )
+      except Exception as exc:
+        retain_error(exc, cleanup=True)
+    try:
+      with auxiliary_device_state_lock:
+        if auxiliary_device_active_request is not request:
+          raise RuntimeError(
+            "auxiliary-device request ownership changed during cleanup"
+          )
+        if auxiliary_device_active_serial is not RUN.get('ser3'):
+          raise RuntimeError(
+            "auxiliary-device serial ownership changed during cleanup"
+          )
+    except Exception as exc:
+      retain_error(exc, cleanup=True)
+
+  cancelled = False
+  try:
+    cancelled = _auxiliary_device_read_cancelled()
+  except Exception as exc:
+    retain_error(exc, cleanup=False)
+  if operation_error is None and cleanup_error is None:
+    result = AuxiliaryDeviceReadResult(
+      request.request_id,
+      "completed",
+      response,
+    )
+  else:
+    detail = _auxiliary_device_error_detail(
+      operation_error or cleanup_error,
+      "auxiliary-device read failed",
+    )
+    if cleanup_error is not None and cleanup_error is not operation_error:
+      cleanup_detail = _auxiliary_device_error_detail(
+        cleanup_error,
+        "serial cleanup failed",
+      )
+      detail = _combine_auxiliary_device_error_details(
+        detail,
+        cleanup_detail,
+      )
+    result = AuxiliaryDeviceReadResult(
+      request.request_id,
+      "cancelled" if cancelled else "failed",
+      detail,
+    )
+  _publish_auxiliary_device_result(request, result)
+  return result.outcome == "completed"
+
+
+def _run_auxiliary_device_read_safe(request):
+  global auxiliary_device_active_serial
+
+  try:
+    return _run_auxiliary_device_read(request)
+  except BaseException as failure:
+    logger.exception("Auxiliary-device worker terminated unexpectedly")
+    if isinstance(failure, Exception):
+      operation_error = failure
+    else:
+      operation_error = RuntimeError(
+        "auxiliary-device worker terminated with "
+        f"{type(failure).__name__}"
+      )
+    cleanup_error = None
+    try:
+      with auxiliary_device_state_lock:
+        if auxiliary_device_active_request is not request:
+          raise RuntimeError(
+            "auxiliary-device worker failure lost request ownership"
+          )
+        serial_port = auxiliary_device_active_serial
+        if serial_port is None and RUN.get('ser3') is not None:
+          serial_port = RUN.get('ser3')
+          auxiliary_device_active_serial = serial_port
+      if serial_port is not None:
+        closed, cleanup_error = _settle_auxiliary_device_serial(
+          serial_port,
+          "unexpected auxiliary-device worker termination",
+        )
+        if not closed and cleanup_error is None:
+          cleanup_error = OSError(
+            "auxiliary-device serial cleanup did not settle"
+          )
+    except BaseException as cleanup_failure:
+      logger.exception(
+        "Unable to settle auxiliary-device serial ownership after worker "
+        "termination"
+      )
+      if isinstance(cleanup_failure, Exception):
+        cleanup_error = cleanup_failure
+      else:
+        cleanup_error = RuntimeError(
+          "auxiliary-device cleanup terminated with "
+          f"{type(cleanup_failure).__name__}"
+        )
+    try:
+      cancelled = _auxiliary_device_read_cancelled()
+    except Exception as cancellation_error:
+      logger.exception(
+        "Unable to inspect auxiliary-device cancellation after worker "
+        "termination"
+      )
+      cancelled = False
+      if cleanup_error is None:
+        cleanup_error = cancellation_error
+      else:
+        logger.error(
+          "Additional auxiliary-device failure-state error: %s",
+          _auxiliary_device_error_detail(
+            cancellation_error,
+            "auxiliary-device cancellation inspection failed",
+          ),
+        )
+    detail = _auxiliary_device_error_detail(
+      operation_error,
+      "auxiliary-device worker terminated unexpectedly",
+    )
+    if cleanup_error is not None:
+      detail = _combine_auxiliary_device_error_details(
+        detail,
+        _auxiliary_device_error_detail(
+          cleanup_error,
+          "serial cleanup failed",
+        ),
+      )
+    result = AuxiliaryDeviceReadResult(
+      request.request_id,
+      "cancelled" if cancelled else "failed",
+      detail,
+    )
+    try:
+      _publish_auxiliary_device_result(request, result)
+    except BaseException:
+      logger.exception(
+        "Unable to retain a terminal auxiliary-device worker failure"
+      )
+    return False
+  finally:
+    auxiliary_device_worker_active.clear()
+
+
+def _request_auxiliary_device_read(port_value, read_size_value):
+  global auxiliary_device_active_request
+  global auxiliary_device_next_request_id
+
+  try:
+    port = _auxiliary_device_port(port_value)
+    read_size = _auxiliary_device_read_size(read_size_value)
+    with program_execution_state_lock:
+      closing = application_closing.is_set()
+      if not isinstance(closing, bool):
+        raise RuntimeError("application shutdown state is invalid")
+      if closing:
+        raise MotionInputError("application shutdown is active")
+      if program_execution_active_request is not None:
+        if not isinstance(
+          program_execution_active_request,
+          ProgramExecutionRequest,
+        ):
+          raise RuntimeError("active program execution request is invalid")
+        raise MotionInputError("robot program execution is active")
+      with auxiliary_device_state_lock:
+        active = auxiliary_device_read_active.is_set()
+        worker_active = auxiliary_device_worker_active.is_set()
+        if not isinstance(active, bool) or not isinstance(worker_active, bool):
+          raise RuntimeError("auxiliary-device worker state is invalid")
+        if active != (auxiliary_device_active_request is not None):
+          raise RuntimeError(
+            "auxiliary-device request ownership is inconsistent"
+          )
+        if worker_active and not active:
+          raise RuntimeError("auxiliary-device worker has no request owner")
+        if active and not isinstance(
+          auxiliary_device_active_request,
+          AuxiliaryDeviceReadRequest,
+        ):
+          raise RuntimeError("active auxiliary-device request is invalid")
+        if active:
+          raise MotionInputError("another auxiliary-device read is active")
+        if auxiliary_device_pending_result is not None:
+          raise RuntimeError("auxiliary-device result has no request owner")
+        if auxiliary_device_active_serial is not None:
+          raise RuntimeError(
+            "inactive auxiliary-device request retained a serial owner"
+          )
+        if (
+          isinstance(auxiliary_device_next_request_id, bool)
+          or not isinstance(auxiliary_device_next_request_id, int)
+          or auxiliary_device_next_request_id < 0
+        ):
+          raise RuntimeError("auxiliary-device request counter is invalid")
+        request = AuxiliaryDeviceReadRequest(
+          auxiliary_device_next_request_id + 1,
+          port,
+          read_size,
+        )
+        auxiliary_device_next_request_id = request.request_id
+        auxiliary_device_active_request = request
+        auxiliary_device_cancel_requested.clear()
+        auxiliary_device_worker_active.set()
+        auxiliary_device_read_active.set()
+  except Exception as exc:
+    detail = _auxiliary_device_error_detail(
+      exc,
+      "auxiliary-device request was rejected",
+    )
+    message = f"AUXILIARY COM READ REJECTED: {detail}"
+    logger.error(message)
+    try:
+      _set_application_status(message, "Alarm.TLabel")
+    except Exception:
+      logger.exception("Unable to present an auxiliary-device rejection")
+    return False
+
+  try:
+    worker = Thread(
+      target=_run_auxiliary_device_read_safe,
+      args=(request,),
+      name=f"ar4-auxiliary-device-{request.request_id}",
+      daemon=True,
+    )
+    worker.start()
+  except Exception as exc:
+    rollback_error = None
+    with auxiliary_device_state_lock:
+      if auxiliary_device_active_request is not request:
+        rollback_error = RuntimeError(
+          "auxiliary-device worker startup ownership changed"
+        )
+      elif (
+        auxiliary_device_active_serial is not None
+        or auxiliary_device_pending_result is not None
+      ):
+        rollback_error = RuntimeError(
+          "auxiliary-device worker startup could not roll back safely"
+        )
+      else:
+        auxiliary_device_active_request = None
+        auxiliary_device_cancel_requested.clear()
+        auxiliary_device_worker_active.clear()
+        auxiliary_device_read_active.clear()
+    detail = _auxiliary_device_error_detail(
+      exc,
+      "auxiliary-device worker did not start",
+    )
+    if rollback_error is not None:
+      detail = _combine_auxiliary_device_error_details(
+        detail,
+        _auxiliary_device_error_detail(
+          rollback_error,
+          "auxiliary-device startup rollback failed",
+        ),
+      )
+    message = f"AUXILIARY COM READ REJECTED: {detail}"
+    logger.exception(message)
+    try:
+      _set_application_status(message, "Alarm.TLabel")
+    except Exception:
+      logger.exception("Unable to present an auxiliary-device startup failure")
+    return False
+  try:
+    _set_application_status(
+      f"AUXILIARY COM READ IN PROGRESS: {request.port}",
+      "Warn.TLabel",
+    )
+  except Exception:
+    logger.exception("Unable to present auxiliary-device progress")
+  return True
+
+
+def _auxiliary_device_read_pending():
+  with auxiliary_device_state_lock:
+    active = auxiliary_device_read_active.is_set()
+    worker_active = auxiliary_device_worker_active.is_set()
+    if not isinstance(active, bool) or not isinstance(worker_active, bool):
+      raise RuntimeError("auxiliary-device worker state is invalid")
+    if active != (auxiliary_device_active_request is not None):
+      raise RuntimeError("auxiliary-device request ownership is inconsistent")
+    if worker_active and not active:
+      raise RuntimeError("auxiliary-device worker has no request owner")
+    if active and not isinstance(
+      auxiliary_device_active_request,
+      AuxiliaryDeviceReadRequest,
+    ):
+      raise RuntimeError("active auxiliary-device request is invalid")
+    if auxiliary_device_pending_result is not None:
+      if not active:
+        raise RuntimeError("auxiliary-device result has no request owner")
+      if (
+        not isinstance(
+          auxiliary_device_pending_result,
+          AuxiliaryDeviceReadResult,
+        )
+        or auxiliary_device_pending_result.request_id
+        != auxiliary_device_active_request.request_id
+      ):
+        raise RuntimeError("auxiliary-device pending result is invalid")
+    if active:
+      if auxiliary_device_active_serial is not RUN.get('ser3'):
+        raise RuntimeError(
+          "auxiliary-device serial ownership is inconsistent"
+        )
+    elif auxiliary_device_active_serial is not None:
+      raise RuntimeError(
+        "inactive auxiliary-device request retained a serial owner"
+      )
+    return active
+
+
+def _cancel_auxiliary_device_read():
+  with auxiliary_device_state_lock:
+    request = auxiliary_device_active_request
+    serial_port = auxiliary_device_active_serial
+    active = auxiliary_device_read_active.is_set()
+    worker_active = auxiliary_device_worker_active.is_set()
+    if not isinstance(active, bool) or not isinstance(worker_active, bool):
+      raise RuntimeError("auxiliary-device worker state is invalid")
+    if request is None:
+      if active or worker_active:
+        raise RuntimeError(
+          "auxiliary-device cancellation found unowned activity"
+        )
+      return False
+    if not isinstance(request, AuxiliaryDeviceReadRequest):
+      raise RuntimeError("active auxiliary-device request is invalid")
+    if not active:
+      raise RuntimeError(
+        "auxiliary-device cancellation found an inactive request"
+      )
+    cancellation_already_requested = auxiliary_device_cancel_requested.is_set()
+    if not isinstance(cancellation_already_requested, bool):
+      raise RuntimeError("auxiliary-device cancellation state is invalid")
+    if cancellation_already_requested:
+      return False
+    if serial_port is not RUN.get('ser3'):
+      raise RuntimeError(
+        "auxiliary-device serial ownership is inconsistent"
+      )
+    auxiliary_device_cancel_requested.set()
+  cancel_read = getattr(serial_port, "cancel_read", None)
+  if (
+    worker_active
+    and callable(cancel_read)
+  ):
+    try:
+      cancel_read()
+    except Exception:
+      logger.exception("Unable to cancel the auxiliary-device serial read")
+  return True
+
+
+def _apply_auxiliary_device_result(result):
+  global auxiliary_device_active_request
+  global auxiliary_device_active_serial
+  global auxiliary_device_pending_result
+
+  if not isinstance(result, AuxiliaryDeviceReadResult):
+    raise RuntimeError("auxiliary-device worker emitted an invalid result")
+  with auxiliary_device_state_lock:
+    request = auxiliary_device_active_request
+    if (
+      not isinstance(request, AuxiliaryDeviceReadRequest)
+      or request.request_id != result.request_id
+      or auxiliary_device_pending_result is not result
+    ):
+      raise RuntimeError(
+        "auxiliary-device worker result ownership is invalid"
+      )
+    worker_active = auxiliary_device_worker_active.is_set()
+    active = auxiliary_device_read_active.is_set()
+    if not isinstance(worker_active, bool) or not isinstance(active, bool):
+      raise RuntimeError("auxiliary-device worker state is invalid")
+    if not active:
+      raise RuntimeError("auxiliary-device result has no active request")
+    if worker_active:
+      return False
+    closing = application_closing.is_set()
+    if not isinstance(closing, bool):
+      raise RuntimeError("application shutdown state is invalid")
+    serial_port = auxiliary_device_active_serial
+    if serial_port is not RUN.get('ser3'):
+      raise RuntimeError(
+        "auxiliary-device serial ownership is inconsistent"
+      )
+
+  if serial_port is not None and not closing:
+    raise RuntimeError(
+      "auxiliary-device worker result retained serial ownership"
+    )
+
+  if result.outcome == "completed":
+    com3outPortEntryField.delete(0, 'end')
+    com3outPortEntryField.insert(0, result.value)
+    message = "AUXILIARY COM READ COMPLETE"
+    style = "OK.TLabel"
+  elif result.outcome == "cancelled":
+    message = f"AUXILIARY COM READ CANCELLED: {result.value}"
+    style = "Warn.TLabel"
+    logger.warning(message)
+  else:
+    message = f"AUXILIARY COM READ FAILED: {result.value}"
+    style = "Alarm.TLabel"
+    logger.error(message)
+  _set_application_status(message, style)
+  if serial_port is not None:
+    logger.error(
+      "Auxiliary-device serial cleanup remains pending at process exit"
+    )
+
+  with auxiliary_device_state_lock:
+    if (
+      auxiliary_device_active_request is not request
+      or auxiliary_device_pending_result is not result
+      or auxiliary_device_worker_active.is_set()
+      or auxiliary_device_active_serial is not serial_port
+      or RUN.get('ser3') is not serial_port
+    ):
+      raise RuntimeError(
+        "auxiliary-device result ownership changed during presentation"
+      )
+    if serial_port is not None:
+      auxiliary_device_active_serial = None
+    auxiliary_device_active_request = None
+    auxiliary_device_pending_result = None
+    auxiliary_device_cancel_requested.clear()
+    auxiliary_device_read_active.clear()
+  return True
+
+
+def _drain_auxiliary_device_events():
+  global auxiliary_device_pending_result
+
+  applied = False
+  while True:
+    with auxiliary_device_state_lock:
+      result = auxiliary_device_pending_result
+      if result is not None and not isinstance(
+        result,
+        AuxiliaryDeviceReadResult,
+      ):
+        request = auxiliary_device_active_request
+        if not isinstance(request, AuxiliaryDeviceReadRequest):
+          raise RuntimeError(
+            "invalid auxiliary-device result has no request owner"
+          )
+        result = AuxiliaryDeviceReadResult(
+          request.request_id,
+          "failed",
+          "auxiliary-device pending result is invalid",
+        )
+        auxiliary_device_pending_result = result
+    if result is None:
+      try:
+        result = auxiliary_device_event_queue.get_nowait()
+      except Empty:
+        break
+      if not isinstance(result, AuxiliaryDeviceReadResult):
+        with auxiliary_device_state_lock:
+          request = auxiliary_device_active_request
+        if request is None:
+          logger.warning(
+            "Discarding an unowned invalid auxiliary-device result"
+          )
+          continue
+        if not isinstance(request, AuxiliaryDeviceReadRequest):
+          raise RuntimeError(
+            "active auxiliary-device request is invalid"
+          )
+        result = AuxiliaryDeviceReadResult(
+          request.request_id,
+          "failed",
+          "auxiliary-device worker emitted an invalid result",
+        )
+      with auxiliary_device_state_lock:
+        request = auxiliary_device_active_request
+        if request is None:
+          logger.warning(
+            "Discarding stale auxiliary-device result %s",
+            result.request_id,
+          )
+          continue
+        if not isinstance(request, AuxiliaryDeviceReadRequest):
+          raise RuntimeError("active auxiliary-device request is invalid")
+        if result.request_id != request.request_id:
+          logger.warning(
+            "Discarding stale auxiliary-device result %s for request %s",
+            result.request_id,
+            request.request_id,
+          )
+          continue
+        if auxiliary_device_pending_result is not None:
+          raise RuntimeError(
+            "auxiliary-device result ownership changed during dequeue"
+          )
+        auxiliary_device_pending_result = result
+    if not _apply_auxiliary_device_result(result):
+      break
+    applied = True
+  return applied
+
+
+def _poll_auxiliary_device_events():
+  try:
+    _drain_auxiliary_device_events()
+  except Exception:
+    logger.exception(
+      "Unable to apply an auxiliary-device result on the Tk event thread"
+    )
+    try:
+      _set_application_status(
+        "AUXILIARY COM READ RESULT FAILED",
+        "Alarm.TLabel",
+      )
+    except Exception:
+      logger.exception("Unable to present auxiliary-device result failure")
+  finally:
+    _reschedule_event_poll("auxiliary-device")
+
+
 def TestAuxCom():
   try:
-    # global RUN['ser3']
-    port = "COM" + com3PortEntryField.get()
-    baud = 9600
-    RUN['ser3'] = serial.Serial(port,baud,timeout=5)
-  except:
-    #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-    #tab8.ElogView.insert(END, Curtime+" - UNABLE TO ESTABLISH COMMUNICATIONS WITH SERIAL DEVICE")
-    logger.error("UNABLE TO ESTABLISH COMMUNICATIONS WITH SERIAL DEVICE")
-    value=tab8.ElogView.get(0,END)
-    pickle.dump(value,open("ErrorLog","wb"))
-  RUN['ser3'].flushInput()
-  numChar = int(com3charPortEntryField.get())
-  response = str(RUN['ser3'].read(numChar).strip(),'utf-8')
-  com3outPortEntryField .delete(0, 'end')
-  com3outPortEntryField .insert(0,response)
+    port_value = com3PortEntryField.get()
+    read_size_value = com3charPortEntryField.get()
+  except Exception as exc:
+    detail = _auxiliary_device_error_detail(
+      exc,
+      "auxiliary-device controls are unavailable",
+    )
+    message = f"AUXILIARY COM READ REJECTED: {detail}"
+    logger.exception(message)
+    try:
+      _set_application_status(message, "Alarm.TLabel")
+    except Exception:
+      logger.exception("Unable to present an auxiliary-device control failure")
+    return False
+  return _request_auxiliary_device_read(port_value, read_size_value)
 
 
 
@@ -36295,6 +37394,7 @@ _schedule_event_poll("manual-controller")
 _schedule_event_poll("calibration")
 _schedule_event_poll("auxiliary-serial")
 _schedule_event_poll("manual-auxiliary")
+_schedule_event_poll("auxiliary-device")
 _schedule_event_poll("gcode-storage")
 _schedule_event_poll("called-program")
 _schedule_event_poll("program-selection")

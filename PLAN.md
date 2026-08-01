@@ -458,6 +458,21 @@ Implemented portion:
   replace an active stop alarm. A later manual-panel interaction acknowledges a
   terminal stop-status reservation only when no stop, E-stop, or position fault
   remains active.
+- The `AUX COM DEVICE` panel snapshots the COM number and exact byte count on
+  Tk, validates both values against bounded immutable request and result
+  contracts, and performs port opening, input reset, timeout-controlled exact
+  reading, UTF-8 validation, and verified close on a worker. Failed close
+  attempts remain worker-owned and retry at
+  `AUXILIARY_DEVICE_CLEANUP_RETRY_SECONDS`; shutdown bounds remaining attempts
+  with `AUXILIARY_DEVICE_SHUTDOWN_CLOSE_ATTEMPTS`. One
+  request owner spans worker startup through retryable Tk result presentation.
+  Overlapping panel work and program admission reject atomically, failed port
+  close remains owned through cleanup retry, a stale handle left by the legacy
+  program branch is adopted and closed before a panel read, and application
+  shutdown requests read cancellation and waits for terminal settlement. The legacy `.ar4`
+  `Read COM` execution branch remains part of broader program-state-machine
+  migration and still performs blocking serial and Tk work on the program
+  worker.
 - Visible manual Modbus read and write controls build canonical requests on Tk
   against the same slave, address, quantity, coil, and register domains
   enforced by the Teensy firmware. Request-scoped work retains main-transport
@@ -685,8 +700,8 @@ Implemented portion:
   Hardware camera behavior and timing remain unverified.
 
 Remaining scope includes broader program and G-code row-execution admission,
-Modbus, auxiliary connection and device paths, durable event-poll failure
-handling when the Tk
+program-owned Modbus and `Read COM`, auxiliary connection paths, durable
+event-poll failure handling when the Tk
 scheduler or interpreter is unavailable, application-lifecycle, timing, and
 calibration-preemption work.
 

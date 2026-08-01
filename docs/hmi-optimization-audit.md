@@ -103,6 +103,22 @@ Tk serializes event callbacks on the interpreter thread. Long event handlers blo
   handle; another non-identity response fails startup. Joint-reader quarantine
   detaches a closed main handle and clears matching controller identity before
   dispatcher ownership releases.
+- The `AUX COM DEVICE` test callback now captures only the port number and
+  requested byte count on Tk. A non-coalescing worker owns one validated
+  request through port opening, input reset, an exact timeout-controlled read,
+  strict UTF-8 and printable-text validation, and verified close. Failed close
+  attempts remain on the worker at
+  `AUXILIARY_DEVICE_CLEANUP_RETRY_SECONDS`; shutdown limits remaining attempts
+  through `AUXILIARY_DEVICE_SHUTDOWN_CLOSE_ATTEMPTS`. Tk polling
+  applies the correlated immutable result and retains the
+  same owner when widget presentation or serial cleanup requires retry.
+  Program admission and panel admission share one lock order and reject
+  overlap. A stale serial handle left by the legacy program branch is adopted
+  and closed on the panel worker before a new port opens. Shutdown requests
+  read cancellation, drains terminal presentation, and settles the request
+  owner without allowing a failed read-only close to hold process exit. The
+  `.ar4` `Read COM` branch remains a separate blocking program-state-machine
+  migration surface.
 - Visible manual Modbus read and write controls validate and canonicalize the
   request on Tk against the Teensy slave, address, quantity, coil, and register
   domains. `BA`, `BH`, and `BD` accept exactly one register because the
@@ -469,10 +485,11 @@ Cartesian adjustments still use raw commands that can be rejected while serial w
 
 - Large optional packages, including VTK, OpenCV, and Matplotlib, load during module startup even when corresponding tabs are unused.
 - Remaining program and auxiliary-board paths retain synchronous work.
-  Program-row Modbus operations remain coupled to the broader program state
-  machine, while the visible manual Modbus panel no longer waits for controller
-  completion on Tk. Legacy main-controller exchanges still wait synchronously
-  where remaining Tk callbacks invoke them.
+  Program-row Modbus and `Read COM` operations remain coupled to the broader
+  program state machine, while the visible manual Modbus and `AUX COM DEVICE`
+  panels no longer wait for controller completion on Tk. Legacy
+  main-controller exchanges still wait synchronously where remaining Tk
+  callbacks invoke them.
 - Calibration result application still snapshots and serializes the complete UI log on Tk; persistence remains a measured M4A2 optimization surface.
 - Full calibration serialization still reads a broad Tk-backed state dictionary; debouncing reduces frequency but does not reduce payload or provide atomic replacement.
 - `moveInProc` contains comparison expressions used where assignments appear intended, but the surrounding state is not consumed consistently enough for a safe isolated edit. The program-state-machine pass must replace that implicit state rather than patch isolated operators.

@@ -549,6 +549,7 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "on_closing": (
                 "_close_joint_motion_dispatcher_for_shutdown",
+                "_cancel_auxiliary_device_read",
             ),
             "_begin_program_execution": (
                 "_program_execution_stop_admission_reason_locked",
@@ -731,6 +732,42 @@ class HmiSourceContractTests(unittest.TestCase):
             "manual_auxiliary_state_lock",
             threading.Lock(),
         )
+        namespace.setdefault(
+            "auxiliary_device_state_lock",
+            threading.Lock(),
+        )
+        namespace.setdefault(
+            "auxiliary_device_read_active",
+            threading.Event(),
+        )
+        namespace.setdefault(
+            "auxiliary_device_worker_active",
+            threading.Event(),
+        )
+        namespace.setdefault(
+            "auxiliary_device_cancel_requested",
+            threading.Event(),
+        )
+        namespace.setdefault("auxiliary_device_active_request", None)
+        namespace.setdefault("auxiliary_device_active_serial", None)
+        namespace.setdefault("auxiliary_device_pending_result", None)
+        namespace.setdefault("auxiliary_device_next_request_id", 0)
+        namespace.setdefault("auxiliary_device_event_queue", Queue())
+        for constant_name in (
+            "AUXILIARY_DEVICE_BAUD_RATE",
+            "AUXILIARY_DEVICE_READ_TIMEOUT_SECONDS",
+            "AUXILIARY_DEVICE_MAX_READ_BYTES",
+            "AUXILIARY_DEVICE_MAX_PORT_NUMBER",
+            "AUXILIARY_DEVICE_MAX_ERROR_DETAIL",
+            "AUXILIARY_DEVICE_CLEANUP_RETRY_SECONDS",
+            "AUXILIARY_DEVICE_SHUTDOWN_CLOSE_ATTEMPTS",
+        ):
+            namespace.setdefault(
+                constant_name,
+                self.module_literal(constant_name),
+            )
+        namespace.setdefault("Empty", Empty)
+        namespace.setdefault("re", re)
         namespace.setdefault(
             "auxiliary_serial_lock",
             threading.Lock(),
@@ -1006,6 +1043,22 @@ class HmiSourceContractTests(unittest.TestCase):
                 "ProgramExecutionRequest",
                 namespace,
             )
+        for class_name in (
+            "AuxiliaryDeviceReadRequest",
+            "AuxiliaryDeviceReadResult",
+        ):
+            if (
+                class_name not in namespace
+                and any(
+                    isinstance(node, ast.Name)
+                    and node.id == class_name
+                    for node in ast.walk(self.module_functions[name])
+                )
+            ):
+                namespace[class_name] = self.compile_class(
+                    class_name,
+                    namespace,
+                )
         if (
             name == "executeRow"
             and namespace.get("program_execution_active_request") is None
@@ -1163,6 +1216,47 @@ class HmiSourceContractTests(unittest.TestCase):
                     "_request_manual_output",
                 )
             },
+            "_run_auxiliary_device_read": (
+                "_auxiliary_device_read_cancelled",
+                "_settle_auxiliary_device_serial",
+                "_auxiliary_device_error_detail",
+                "_combine_auxiliary_device_error_details",
+                "_publish_auxiliary_device_result",
+            ),
+            "_run_auxiliary_device_read_safe": (
+                "_run_auxiliary_device_read",
+                "_settle_auxiliary_device_serial",
+                "_auxiliary_device_read_cancelled",
+                "_auxiliary_device_error_detail",
+                "_combine_auxiliary_device_error_details",
+                "_publish_auxiliary_device_result",
+            ),
+            "_settle_auxiliary_device_serial": (
+                "_close_auxiliary_device_serial",
+                "_auxiliary_device_read_cancelled",
+                "_auxiliary_device_error_detail",
+            ),
+            "_auxiliary_device_error_detail": (
+                "_auxiliary_device_detail_prefix",
+            ),
+            "_combine_auxiliary_device_error_details": (
+                "_auxiliary_device_detail_prefix",
+            ),
+            "_request_auxiliary_device_read": (
+                "_auxiliary_device_port",
+                "_auxiliary_device_read_size",
+                "_auxiliary_device_error_detail",
+            ),
+            "_drain_auxiliary_device_events": (
+                "_apply_auxiliary_device_result",
+            ),
+            "_poll_auxiliary_device_events": (
+                "_drain_auxiliary_device_events",
+            ),
+            "TestAuxCom": (
+                "_auxiliary_device_error_detail",
+                "_request_auxiliary_device_read",
+            ),
             "_try_dispatch_manual_auxiliary_request": (
                 "_manual_auxiliary_error_detail",
                 "_manual_auxiliary_program_active",
@@ -1423,6 +1517,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "program_execution_state_lock",
             threading.Lock(),
         )
+        namespace.setdefault("program_execution_next_request_id", 0)
         namespace.setdefault("program_execution_active_request", None)
         namespace.setdefault(
             "program_execution_cancelled",
@@ -1571,6 +1666,9 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault("_poll_camera_preview_events", lambda: None)
         namespace.setdefault("_poll_manual_controller_events", lambda: None)
         namespace.setdefault("_poll_manual_auxiliary_events", lambda: None)
+        namespace.setdefault("_poll_auxiliary_device_events", lambda: None)
+        namespace.setdefault("_cancel_auxiliary_device_read", lambda: False)
+        namespace.setdefault("_auxiliary_device_read_pending", lambda: False)
         namespace.setdefault("_poll_gcode_storage_events", lambda: None)
         namespace.setdefault(
             "_poll_called_program_navigation_events",
@@ -1644,6 +1742,21 @@ class HmiSourceContractTests(unittest.TestCase):
                 "SerialWriteCancellationBoundary",
                 namespace,
             )
+        if name in (
+            "AuxiliaryDeviceReadRequest",
+            "AuxiliaryDeviceReadResult",
+        ):
+            for constant_name in (
+                "AUXILIARY_DEVICE_MAX_READ_BYTES",
+                "AUXILIARY_DEVICE_MAX_PORT_NUMBER",
+                "AUXILIARY_DEVICE_MAX_ERROR_DETAIL",
+            ):
+                namespace.setdefault(
+                    constant_name,
+                    self.module_literal(constant_name),
+                )
+            namespace.setdefault("re", re)
+            namespace.setdefault("MotionInputError", MotionInputError)
         namespace.setdefault("PrimaryHomeReference", PrimaryHomeReference)
         namespace.setdefault(
             "CONTROLLER_ESTOP_ADMISSION_FLAG",
@@ -9604,6 +9717,7 @@ class HmiSourceContractTests(unittest.TestCase):
         match_closes = []
         selection_closes = []
         program_cancellations = []
+        auxiliary_device_cancellations = []
         program_vision_settlements = []
         namespace = {
             "application_closing": closing,
@@ -9643,6 +9757,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "_cancel_active_program_execution": (
                 lambda: program_cancellations.append(True) or True
             ),
+            "_cancel_auxiliary_device_read": (
+                lambda: auxiliary_device_cancellations.append(True) or True
+            ),
             "_settle_program_vision_shutdown_operations": (
                 lambda: program_vision_settlements.append(True) or True
             ),
@@ -9665,6 +9782,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(match_closes, [True])
         self.assertEqual(selection_closes, [True])
         self.assertEqual(program_cancellations, [True])
+        self.assertEqual(auxiliary_device_cancellations, [True])
         self.assertEqual(program_vision_settlements, [True])
         self.assertFalse(namespace["RUN"]["cam_on"])
         self.assertIsNone(namespace["RUN"]["visionCaptureRequestId"])
@@ -9683,7 +9801,114 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(close_application())
         self.assertEqual(poll_calls, [True])
         self.assertEqual(program_cancellations, [True])
+        self.assertEqual(auxiliary_device_cancellations, [True])
         self.assertEqual(program_vision_settlements, [True])
+
+    def test_shutdown_waits_for_auxiliary_device_terminal_settlement(self):
+        class Root:
+            def __init__(self):
+                self.jobs = []
+                self.destroy_count = 0
+
+            def after(self, delay, callback):
+                self.jobs.append((delay, callback))
+
+            def quit(self):
+                pass
+
+            def destroy(self):
+                self.destroy_count += 1
+
+        class Port:
+            def __init__(self):
+                self.cancel_calls = 0
+
+            def cancel_read(self):
+                self.cancel_calls += 1
+
+        type_namespace = {
+            "dataclass": dataclass,
+            "re": re,
+            "MotionInputError": MotionInputError,
+        }
+        request_type = self.compile_class(
+            "AuxiliaryDeviceReadRequest",
+            type_namespace,
+        )
+        request = request_type(1, "COM14", 2)
+        port = Port()
+        root = Root()
+        read_active = threading.Event()
+        read_active.set()
+        worker_active = threading.Event()
+        worker_active.set()
+        close_calls = []
+        errors = []
+        namespace = {
+            **type_namespace,
+            "AuxiliaryDeviceReadRequest": request_type,
+            "RUN": {"ser3": port},
+            "auxiliary_device_state_lock": threading.Lock(),
+            "auxiliary_device_read_active": read_active,
+            "auxiliary_device_worker_active": worker_active,
+            "auxiliary_device_cancel_requested": threading.Event(),
+            "auxiliary_device_active_request": request,
+            "auxiliary_device_active_serial": port,
+            "auxiliary_device_pending_result": None,
+            "serial_lock": threading.Lock(),
+            "auxiliary_serial_lock": threading.Lock(),
+            "serial_activity_registry": SerialActivityRegistry(
+                ("ser", "ser2")
+            ),
+            "application_shutdown_started_at": None,
+            "SERIAL_SHUTDOWN_ACTIVITY_GRACE_SECONDS": 1.0,
+            "SERIAL_SHUTDOWN_POLL_MS": 25,
+            "SERIAL_SHUTDOWN_RETRY_MS": 1000,
+            "root": root,
+            "_close_serial_port": (
+                lambda name: close_calls.append(name) or name != "ser3"
+            ),
+            "_poll_serial_events": lambda: None,
+            "_poll_auxiliary_serial_events": lambda: None,
+            "_poll_joint_motion_events": lambda: None,
+            "joint_motion_dispatcher": SimpleNamespace(close=lambda: True),
+            "_flush_calibration_save": lambda: True,
+            "logger": SimpleNamespace(
+                error=lambda *args: errors.append(args),
+                exception=lambda *args: None,
+            ),
+            "almStatusLab": SimpleNamespace(config=lambda **kwargs: None),
+            "almStatusLab2": SimpleNamespace(config=lambda **kwargs: None),
+            "cv2": SimpleNamespace(destroyAllWindows=lambda: None),
+        }
+        namespace["_cancel_auxiliary_device_read"] = self.compile_function(
+            "_cancel_auxiliary_device_read",
+            namespace,
+        )
+        namespace["_auxiliary_device_read_pending"] = self.compile_function(
+            "_auxiliary_device_read_pending",
+            namespace,
+        )
+        poll_close = self.compile_function("_poll_application_close", namespace)
+
+        self.assertFalse(poll_close())
+        self.assertEqual(port.cancel_calls, 1)
+        self.assertTrue(
+            namespace["auxiliary_device_cancel_requested"].is_set()
+        )
+        self.assertEqual(close_calls, [])
+        self.assertEqual(root.jobs[0][0], 25)
+
+        worker_active.clear()
+        read_active.clear()
+        namespace["auxiliary_device_active_request"] = None
+        namespace["auxiliary_device_active_serial"] = None
+        namespace["RUN"]["ser3"] = None
+
+        self.assertTrue(root.jobs.pop(0)[1]())
+        self.assertEqual(close_calls, ["ser", "ser2", "ser3"])
+        self.assertEqual(root.destroy_count, 1)
+        self.assertTrue(any("process exit" in entry[0] for entry in errors))
 
     def test_shutdown_waits_for_retained_manual_controller_cleanup(self):
         class Root:
@@ -9813,7 +10038,7 @@ class HmiSourceContractTests(unittest.TestCase):
         final_retry = root.jobs.pop(0)[1]
         self.assertTrue(final_retry())
         self.assertTrue(lock.asserted_nonblocking)
-        self.assertEqual(closed_ports, ["ser", "ser2"])
+        self.assertEqual(closed_ports, ["ser", "ser2", "ser3"])
         self.assertEqual(
             drained_events,
             [
@@ -10045,7 +10270,7 @@ class HmiSourceContractTests(unittest.TestCase):
             stop_requested.clear()
 
         self.assertTrue(root.jobs.pop(0)[1]())
-        self.assertEqual(closed_ports, ["ser", "ser2"])
+        self.assertEqual(closed_ports, ["ser", "ser2", "ser3"])
         self.assertEqual(root.quit_count, 1)
         self.assertEqual(root.destroy_count, 1)
 
@@ -10140,7 +10365,7 @@ class HmiSourceContractTests(unittest.TestCase):
             stop_requested.clear()
 
         self.assertTrue(root.jobs.pop(0)[1]())
-        self.assertEqual(closed_ports, ["ser", "ser2"])
+        self.assertEqual(closed_ports, ["ser", "ser2", "ser3"])
         self.assertEqual(root.destroy_count, 1)
 
     def test_shutdown_waits_for_retained_cleanup_and_virtual_owners(self):
@@ -10231,7 +10456,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertTrue(root.jobs.pop(0)[1]())
         self.assertEqual(flushes, [True])
-        self.assertEqual(closes, ["ser", "ser2"])
+        self.assertEqual(closes, ["ser", "ser2", "ser3"])
         self.assertEqual(root.destroy_count, 1)
 
     def test_shutdown_drains_a_late_legacy_result_before_lock_acquisition(self):
@@ -10403,7 +10628,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertLess(sequence.index("result"), sequence.index("flush"))
         self.assertEqual(
             [entry for entry in sequence if entry.startswith("close-")],
-            ["close-ser", "close-ser2"],
+            ["close-ser", "close-ser2", "close-ser3"],
         )
         self.assertEqual(root.quit_count, 1)
         self.assertEqual(root.destroy_count, 1)
@@ -10624,7 +10849,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(root.destroy_count, 1)
         self.assertEqual(lock.release_count, 2)
         self.assertEqual(auxiliary_lock.release_count, 2)
-        self.assertEqual(attempts, ["ser", "ser2", "ser", "ser2"])
+        self.assertEqual(
+            attempts,
+            ["ser", "ser2", "ser3", "ser", "ser2", "ser3"],
+        )
 
     def test_failed_connection_retains_transport_until_serial_close(self):
         class Lock:
@@ -10857,7 +11085,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(root.jobs[0][0], 1000)
 
         self.assertTrue(root.jobs[0][1]())
-        self.assertEqual(closed_ports, ["ser", "ser2"])
+        self.assertEqual(closed_ports, ["ser", "ser2", "ser3"])
         self.assertEqual(root.destroy_count, 1)
 
     def test_shutdown_retains_calibration_terminal_response_ownership(self):
@@ -14986,6 +15214,815 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(event_queue.empty())
         self.assertFalse(retained_stop_port.is_open)
         self.assertIsNone(runtime["ser"])
+
+    def test_auxiliary_device_contracts_and_callback_are_bounded(self):
+        namespace = {
+            "dataclass": dataclass,
+            "re": re,
+            "MotionInputError": MotionInputError,
+        }
+        request_type = self.compile_class(
+            "AuxiliaryDeviceReadRequest",
+            namespace,
+        )
+        result_type = self.compile_class(
+            "AuxiliaryDeviceReadResult",
+            namespace,
+        )
+        normalize_port = self.compile_function(
+            "_auxiliary_device_port",
+            namespace,
+        )
+        normalize_size = self.compile_function(
+            "_auxiliary_device_read_size",
+            namespace,
+        )
+        error_detail = self.compile_function(
+            "_auxiliary_device_error_detail",
+            namespace,
+        )
+        combine_details = self.compile_function(
+            "_combine_auxiliary_device_error_details",
+            namespace,
+        )
+
+        self.assertEqual(normalize_port("14"), "COM14")
+        self.assertEqual(normalize_port("0014"), "COM14")
+        self.assertEqual(normalize_size("4096"), 4096)
+        for value in (None, "", " 14", "14 ", "COM14", "0", "65536"):
+            with self.subTest(port=value):
+                with self.assertRaises(MotionInputError):
+                    normalize_port(value)
+        for value in (None, "", " 1", "1 ", "1.0", "0", "4097"):
+            with self.subTest(read_size=value):
+                with self.assertRaises(MotionInputError):
+                    normalize_size(value)
+
+        unicode_detail = error_detail(
+            RuntimeError("\U0001f642" * 600),
+            "fallback",
+        )
+        self.assertLessEqual(
+            len(unicode_detail.encode("utf-8")),
+            512,
+        )
+        combined_detail = combine_details(unicode_detail, unicode_detail)
+        self.assertLessEqual(
+            len(combined_detail.encode("utf-8")),
+            512,
+        )
+        self.assertEqual(
+            error_detail(RuntimeError("bad\x00detail"), "fallback"),
+            "bad\uFFFDdetail",
+        )
+
+        self.assertEqual(
+            request_type(1, "COM14", 3),
+            request_type(1, "COM14", 3),
+        )
+        self.assertEqual(result_type(1, "completed", "OK").value, "OK")
+        for args in (
+            (True, "COM14", 3),
+            (1, "COM0", 3),
+            (1, "COM65536", 3),
+            (1, "COM14", True),
+            (1, "COM14", 0),
+            (1, "COM14", 4097),
+        ):
+            with self.subTest(request=args):
+                with self.assertRaises(MotionInputError):
+                    request_type(*args)
+        for args in (
+            (1, "unknown", "failure"),
+            (1, "failed", " failure"),
+            (1, "failed", "failure  detail"),
+            (1, "completed", "bad\x00value"),
+            (1, "completed", "\ud800"),
+        ):
+            with self.subTest(result=args):
+                with self.assertRaises(MotionInputError):
+                    result_type(*args)
+
+        callback = self.module_functions["TestAuxCom"]
+        callback_names = {
+            node.id for node in ast.walk(callback) if isinstance(node, ast.Name)
+        }
+        callback_attributes = {
+            node.attr
+            for node in ast.walk(callback)
+            if isinstance(node, ast.Attribute)
+        }
+        self.assertNotIn("serial", callback_names)
+        self.assertNotIn("Thread", callback_names)
+        self.assertFalse(
+            {"read", "reset_input_buffer", "flushInput"}
+            & callback_attributes
+        )
+        for worker_name in (
+            "_run_auxiliary_device_read",
+            "_run_auxiliary_device_read_safe",
+        ):
+            worker = self.module_functions[worker_name]
+            worker_names = {
+                node.id
+                for node in ast.walk(worker)
+                if isinstance(node, ast.Name)
+            }
+            self.assertFalse(
+                {
+                    "com3PortEntryField",
+                    "com3charPortEntryField",
+                    "com3outPortEntryField",
+                    "almStatusLab",
+                    "almStatusLab2",
+                }
+                & worker_names,
+                worker_name,
+            )
+        for function_name in (
+            "_apply_auxiliary_device_result",
+            "_drain_auxiliary_device_events",
+            "_poll_auxiliary_device_events",
+        ):
+            function = self.module_functions[function_name]
+            names = {
+                node.id
+                for node in ast.walk(function)
+                if isinstance(node, ast.Name)
+            }
+            attributes = {
+                node.attr
+                for node in ast.walk(function)
+                if isinstance(node, ast.Attribute)
+            }
+            self.assertNotIn("serial", names, function_name)
+            self.assertNotIn(
+                "_close_auxiliary_device_serial",
+                names,
+                function_name,
+            )
+            self.assertFalse(
+                {"read", "close", "reset_input_buffer", "flushInput"}
+                & attributes,
+                function_name,
+            )
+
+        captured = []
+
+        class Entry:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        callback_namespace = {
+            "com3PortEntryField": Entry("14"),
+            "com3charPortEntryField": Entry("3"),
+            "_request_auxiliary_device_read": (
+                lambda port, size: captured.append((port, size)) or True
+            ),
+            "_set_application_status": lambda *args: True,
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+        }
+        test_auxiliary = self.compile_function(
+            "TestAuxCom",
+            callback_namespace,
+        )
+        self.assertTrue(test_auxiliary())
+        self.assertEqual(captured, [("14", "3")])
+
+        poll_registry = self.module_literal("EVENT_POLL_CALLBACK_NAMES")
+        self.assertEqual(
+            poll_registry.get("auxiliary-device"),
+            "_poll_auxiliary_device_events",
+        )
+        scheduled_polls = [
+            call.args[0].value
+            for call in ast.walk(self.tree)
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_schedule_event_poll"
+                and len(call.args) == 1
+                and isinstance(call.args[0], ast.Constant)
+                and isinstance(call.args[0].value, str)
+            )
+        ]
+        self.assertIn("auxiliary-device", scheduled_polls)
+
+    def test_auxiliary_device_worker_owns_exact_read_and_cleanup(self):
+        class Port:
+            def __init__(
+                self,
+                payload=b"OK",
+                *,
+                legacy_reset=False,
+                reset_error=None,
+                read_error=None,
+                close_failures=0,
+                open_state=True,
+                read_callback=None,
+            ):
+                self.payload = payload
+                self.reset_error = reset_error
+                self.read_error = read_error
+                self.close_failures = close_failures
+                self.is_open = open_state
+                self.read_callback = read_callback
+                self.reset_calls = 0
+                self.legacy_reset_calls = 0
+                self.read_sizes = []
+                self.close_calls = 0
+                if legacy_reset:
+                    self.reset_input_buffer = None
+
+            def reset_input_buffer(self):
+                self.reset_calls += 1
+                if self.reset_error is not None:
+                    raise self.reset_error
+
+            def flushInput(self):
+                self.legacy_reset_calls += 1
+                if self.reset_error is not None:
+                    raise self.reset_error
+
+            def read(self, size):
+                self.read_sizes.append(size)
+                if self.read_error is not None:
+                    raise self.read_error
+                if self.read_callback is not None:
+                    self.read_callback()
+                return self.payload
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_calls > self.close_failures:
+                    self.is_open = False
+
+        def run_case(
+            port=None,
+            *,
+            factory_error=None,
+            read_size=2,
+            stale_port=None,
+            cancel_after_read=False,
+        ):
+            runtime = {"ser3": stale_port}
+            event_queue = Queue()
+            request_active = threading.Event()
+            worker_active = threading.Event()
+            worker_active.set()
+            cancellation = threading.Event()
+            if port is not None and cancel_after_read:
+                port.read_callback = cancellation.set
+            request_type_namespace = {
+                "dataclass": dataclass,
+                "re": re,
+                "MotionInputError": MotionInputError,
+            }
+            request_type = self.compile_class(
+                "AuxiliaryDeviceReadRequest",
+                request_type_namespace,
+            )
+            result_type = self.compile_class(
+                "AuxiliaryDeviceReadResult",
+                request_type_namespace,
+            )
+            request = request_type(1, "COM14", read_size)
+            request_active.set()
+            serial_calls = []
+
+            def open_port(*args, **kwargs):
+                serial_calls.append((args, kwargs))
+                if factory_error is not None:
+                    raise factory_error
+                return port
+
+            logged = []
+            sleep_delays = []
+            namespace = {
+                **request_type_namespace,
+                "AuxiliaryDeviceReadRequest": request_type,
+                "AuxiliaryDeviceReadResult": result_type,
+                "RUN": runtime,
+                "serial": SimpleNamespace(Serial=open_port),
+                "auxiliary_device_event_queue": event_queue,
+                "auxiliary_device_state_lock": threading.Lock(),
+                "auxiliary_device_read_active": request_active,
+                "auxiliary_device_worker_active": worker_active,
+                "auxiliary_device_cancel_requested": cancellation,
+                "auxiliary_device_active_request": request,
+                "auxiliary_device_active_serial": None,
+                "auxiliary_device_pending_result": None,
+                "application_closing": threading.Event(),
+                "time": SimpleNamespace(
+                    sleep=lambda delay: sleep_delays.append(delay)
+                ),
+                "logger": SimpleNamespace(
+                    error=lambda *args: logged.append(("error", args)),
+                    warning=lambda *args: logged.append(("warning", args)),
+                    exception=lambda *args: logged.append(("exception", args)),
+                ),
+            }
+            run_worker = self.compile_function(
+                "_run_auxiliary_device_read_safe",
+                namespace,
+            )
+            succeeded = run_worker(request)
+            result = event_queue.get_nowait()
+            return (
+                succeeded,
+                result,
+                namespace,
+                serial_calls,
+                logged,
+                sleep_delays,
+            )
+
+        success_port = Port(b"OK")
+        succeeded, result, namespace, serial_calls, _, _ = run_case(
+            success_port
+        )
+        self.assertTrue(succeeded)
+        self.assertEqual(result.outcome, "completed")
+        self.assertEqual(result.value, "OK")
+        self.assertEqual(success_port.reset_calls, 1)
+        self.assertEqual(success_port.read_sizes, [2])
+        self.assertEqual(success_port.close_calls, 1)
+        self.assertIsNone(namespace["RUN"]["ser3"])
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
+        self.assertFalse(namespace["auxiliary_device_worker_active"].is_set())
+        self.assertEqual(
+            serial_calls,
+            [
+                (
+                    ("COM14",),
+                    {
+                        "baudrate": 9600,
+                        "timeout": 5,
+                    },
+                )
+            ],
+        )
+
+        legacy_port = Port(b"YES", legacy_reset=True)
+        succeeded, result, _, _, _, _ = run_case(
+            legacy_port,
+            read_size=3,
+        )
+        self.assertTrue(succeeded)
+        self.assertEqual(result.value, "YES")
+        self.assertEqual(legacy_port.reset_calls, 0)
+        self.assertEqual(legacy_port.legacy_reset_calls, 1)
+
+        whitespace_port = Port(b"\tA\t")
+        succeeded, result, _, _, _, _ = run_case(
+            whitespace_port,
+            read_size=3,
+        )
+        self.assertTrue(succeeded)
+        self.assertEqual(result.value, "A")
+
+        cases = (
+            (Port(b"A"), 2, "returned 1 of 2 requested bytes"),
+            (Port(b"\xff"), 1, "not valid UTF-8"),
+            (Port(b"A\x00"), 2, "unsupported control characters"),
+            (
+                Port(b"OK", reset_error=OSError("reset failed")),
+                2,
+                "reset failed",
+            ),
+            (
+                Port(b"OK", read_error=OSError("read failed")),
+                2,
+                "read failed",
+            ),
+            (Port(b"OK", open_state=False), 2, "did not open"),
+        )
+        for port, read_size, expected_detail in cases:
+            with self.subTest(detail=expected_detail):
+                succeeded, result, namespace, _, _, _ = run_case(
+                    port,
+                    read_size=read_size,
+                )
+                self.assertFalse(succeeded)
+                self.assertEqual(result.outcome, "failed")
+                self.assertIn(expected_detail, result.value)
+                self.assertFalse(port.is_open)
+                self.assertIsNone(namespace["RUN"]["ser3"])
+
+        succeeded, result, namespace, _, _, _ = run_case(
+            factory_error=OSError("port unavailable"),
+        )
+        self.assertFalse(succeeded)
+        self.assertEqual(result.outcome, "failed")
+        self.assertIn("port unavailable", result.value)
+        self.assertIsNone(namespace["RUN"]["ser3"])
+
+        retried_port = Port(b"OK", close_failures=1)
+        succeeded, result, namespace, _, _, sleep_delays = run_case(
+            retried_port
+        )
+        self.assertFalse(succeeded)
+        self.assertEqual(result.outcome, "failed")
+        self.assertIn("did not close", result.value)
+        self.assertEqual(retried_port.close_calls, 2)
+        self.assertEqual(sleep_delays, [1.0])
+        self.assertIsNone(namespace["RUN"]["ser3"])
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
+
+        stale_port = Port(b"unused")
+        replacement_port = Port(b"OK")
+        succeeded, result, namespace, serial_calls, _, _ = run_case(
+            replacement_port,
+            stale_port=stale_port,
+        )
+        self.assertTrue(succeeded)
+        self.assertEqual(result.value, "OK")
+        self.assertEqual(stale_port.close_calls, 1)
+        self.assertEqual(replacement_port.close_calls, 1)
+        self.assertEqual(len(serial_calls), 1)
+        self.assertIsNone(namespace["RUN"]["ser3"])
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
+
+        retained_port = Port(b"OK", close_failures=10)
+        succeeded, result, namespace, _, logs, sleep_delays = run_case(
+            retained_port,
+            cancel_after_read=True,
+        )
+        self.assertFalse(succeeded)
+        self.assertEqual(result.outcome, "cancelled")
+        self.assertEqual(retained_port.close_calls, 3)
+        self.assertEqual(sleep_delays, [1.0, 1.0])
+        self.assertIs(namespace["RUN"]["ser3"], retained_port)
+        self.assertIs(
+            namespace["auxiliary_device_active_serial"],
+            retained_port,
+        )
+        self.assertTrue(
+            any("process exit" in str(entry) for entry in logs)
+        )
+
+    def test_auxiliary_device_safe_worker_publishes_terminal_failure(self):
+        class Logger:
+            def __init__(self):
+                self.exceptions = []
+
+            def exception(self, *args):
+                self.exceptions.append(args)
+
+            def error(self, *args):
+                pass
+
+        def terminate_worker(request):
+            raise KeyboardInterrupt("worker interrupted")
+
+        type_namespace = {
+            "dataclass": dataclass,
+            "re": re,
+            "MotionInputError": MotionInputError,
+        }
+        request_type = self.compile_class(
+            "AuxiliaryDeviceReadRequest",
+            type_namespace,
+        )
+        result_type = self.compile_class(
+            "AuxiliaryDeviceReadResult",
+            type_namespace,
+        )
+        request = request_type(1, "COM14", 2)
+        event_queue = Queue()
+        worker_active = threading.Event()
+        worker_active.set()
+        namespace = {
+            **type_namespace,
+            "AuxiliaryDeviceReadRequest": request_type,
+            "AuxiliaryDeviceReadResult": result_type,
+            "RUN": {"ser3": None},
+            "auxiliary_device_event_queue": event_queue,
+            "auxiliary_device_state_lock": threading.Lock(),
+            "auxiliary_device_read_active": threading.Event(),
+            "auxiliary_device_worker_active": worker_active,
+            "auxiliary_device_cancel_requested": threading.Event(),
+            "auxiliary_device_active_request": request,
+            "auxiliary_device_active_serial": None,
+            "auxiliary_device_pending_result": None,
+            "application_closing": threading.Event(),
+            "_run_auxiliary_device_read": terminate_worker,
+            "_settle_auxiliary_device_serial": (
+                lambda serial_port, context: (True, None)
+            ),
+            "_auxiliary_device_read_cancelled": lambda: False,
+            "logger": Logger(),
+        }
+        namespace["auxiliary_device_read_active"].set()
+        run_safe = self.compile_function(
+            "_run_auxiliary_device_read_safe",
+            namespace,
+        )
+
+        self.assertFalse(run_safe(request))
+        result = event_queue.get_nowait()
+        self.assertEqual(result.outcome, "failed")
+        self.assertIn("KeyboardInterrupt", result.value)
+        self.assertFalse(worker_active.is_set())
+        self.assertEqual(len(namespace["logger"].exceptions), 1)
+
+    def test_auxiliary_device_admission_and_result_retry_are_owned(self):
+        class CapturedThread:
+            instances = []
+
+            def __init__(self, target, args, name, daemon):
+                self.target = target
+                self.args = args
+                self.name = name
+                self.daemon = daemon
+                self.started = False
+                CapturedThread.instances.append(self)
+
+            def start(self):
+                self.started = True
+
+        class Entry:
+            def __init__(self, value=""):
+                self.value = value
+                self.fail_insert = False
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                if self.fail_insert:
+                    self.fail_insert = False
+                    raise RuntimeError("output unavailable")
+                self.value = value
+
+        runtime = {
+            "ser3": None,
+            "programStopRequestId": None,
+            "programStopStatusLatched": False,
+            "programStopState": "completed",
+            "estopActive": False,
+            "posOutreach": False,
+        }
+        statuses = []
+        logs = []
+        event_queue = Queue()
+        namespace = {
+            "dataclass": dataclass,
+            "re": re,
+            "MotionInputError": MotionInputError,
+            "RUN": runtime,
+            "Thread": CapturedThread,
+            "_run_auxiliary_device_read_safe": lambda request: True,
+            "auxiliary_device_event_queue": event_queue,
+            "auxiliary_device_state_lock": threading.Lock(),
+            "auxiliary_device_read_active": threading.Event(),
+            "auxiliary_device_worker_active": threading.Event(),
+            "auxiliary_device_cancel_requested": threading.Event(),
+            "auxiliary_device_active_request": None,
+            "auxiliary_device_active_serial": None,
+            "auxiliary_device_pending_result": None,
+            "auxiliary_device_next_request_id": 0,
+            "application_closing": threading.Event(),
+            "program_execution_state_lock": threading.Lock(),
+            "program_execution_active_request": None,
+            "com3outPortEntryField": Entry("previous"),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style)) or True
+            ),
+            "logger": SimpleNamespace(
+                error=lambda *args: logs.append(("error", args)),
+                warning=lambda *args: logs.append(("warning", args)),
+                exception=lambda *args: logs.append(("exception", args)),
+            ),
+            "_close_serial_port": lambda *args: True,
+        }
+        request_type = self.compile_class(
+            "AuxiliaryDeviceReadRequest",
+            namespace,
+        )
+        result_type = self.compile_class(
+            "AuxiliaryDeviceReadResult",
+            namespace,
+        )
+        namespace["AuxiliaryDeviceReadRequest"] = request_type
+        namespace["AuxiliaryDeviceReadResult"] = result_type
+        request_read = self.compile_function(
+            "_request_auxiliary_device_read",
+            namespace,
+        )
+
+        self.assertTrue(request_read("14", "2"))
+        request = namespace["auxiliary_device_active_request"]
+        self.assertIsInstance(request, request_type)
+        self.assertTrue(namespace["auxiliary_device_read_active"].is_set())
+        self.assertTrue(namespace["auxiliary_device_worker_active"].is_set())
+        self.assertEqual(len(CapturedThread.instances), 1)
+        self.assertTrue(CapturedThread.instances[0].started)
+        self.assertTrue(CapturedThread.instances[0].daemon)
+        self.assertIs(
+            CapturedThread.instances[0].target,
+            namespace["_run_auxiliary_device_read_safe"],
+        )
+        self.assertEqual(
+            CapturedThread.instances[0].name,
+            "ar4-auxiliary-device-1",
+        )
+        self.assertFalse(request_read("15", "2"))
+        self.assertEqual(len(CapturedThread.instances), 1)
+
+        begin_execution = self.compile_function(
+            "_begin_program_execution",
+            namespace,
+        )
+        busy_message = self.compile_function(
+            "_program_execution_busy_message",
+            namespace,
+        )
+        self.assertIsNone(begin_execution("run"))
+        self.assertEqual(
+            busy_message(),
+            "PROGRAM EXECUTION REJECTED DURING AUXILIARY COM READ",
+        )
+
+        namespace["auxiliary_device_worker_active"].clear()
+        result = result_type(request.request_id, "completed", "OK")
+        event_queue.put(result)
+        namespace["com3outPortEntryField"].fail_insert = True
+        drain_results = self.compile_function(
+            "_drain_auxiliary_device_events",
+            namespace,
+        )
+        with self.assertRaisesRegex(RuntimeError, "output unavailable"):
+            drain_results()
+        self.assertIs(namespace["auxiliary_device_pending_result"], result)
+        self.assertIs(namespace["auxiliary_device_active_request"], request)
+        self.assertTrue(namespace["auxiliary_device_read_active"].is_set())
+
+        self.assertTrue(drain_results())
+        self.assertEqual(namespace["com3outPortEntryField"].value, "OK")
+        self.assertIsNone(namespace["auxiliary_device_pending_result"])
+        self.assertIsNone(namespace["auxiliary_device_active_request"])
+        self.assertFalse(namespace["auxiliary_device_read_active"].is_set())
+        program_request = begin_execution("run")
+        self.assertIsNotNone(program_request)
+
+        namespace["application_closing"].set()
+        self.assertFalse(request_read("14", "2"))
+        namespace["application_closing"].clear()
+        self.assertFalse(request_read("14", "2"))
+        finish_execution = self.compile_function(
+            "_finish_program_execution",
+            namespace,
+        )
+        self.assertTrue(finish_execution(program_request))
+
+        legacy_serial_owner = object()
+        runtime["ser3"] = legacy_serial_owner
+        self.assertTrue(request_read("14", "2"))
+        self.assertIs(runtime["ser3"], legacy_serial_owner)
+        namespace["auxiliary_device_active_request"] = None
+        namespace["auxiliary_device_read_active"].clear()
+        namespace["auxiliary_device_worker_active"].clear()
+        namespace["auxiliary_device_cancel_requested"].clear()
+
+        class FailingThread(CapturedThread):
+            def start(self):
+                raise RuntimeError("thread unavailable")
+
+        namespace["Thread"] = FailingThread
+        self.assertFalse(request_read("14", "2"))
+        self.assertIsNone(namespace["auxiliary_device_active_request"])
+        self.assertFalse(namespace["auxiliary_device_read_active"].is_set())
+        self.assertFalse(namespace["auxiliary_device_worker_active"].is_set())
+        self.assertIs(runtime["ser3"], legacy_serial_owner)
+
+    def test_auxiliary_device_cancellation_and_result_settlement_are_owned(self):
+        class Port:
+            def __init__(self):
+                self.is_open = True
+                self.cancel_calls = 0
+
+            def cancel_read(self):
+                self.cancel_calls += 1
+
+        runtime = {"ser3": None}
+        port = Port()
+        statuses = []
+        event_queue = Queue()
+        namespace = {
+            "dataclass": dataclass,
+            "re": re,
+            "MotionInputError": MotionInputError,
+            "RUN": runtime,
+            "auxiliary_device_event_queue": event_queue,
+            "auxiliary_device_state_lock": threading.Lock(),
+            "auxiliary_device_read_active": threading.Event(),
+            "auxiliary_device_worker_active": threading.Event(),
+            "auxiliary_device_cancel_requested": threading.Event(),
+            "auxiliary_device_active_request": None,
+            "auxiliary_device_active_serial": port,
+            "auxiliary_device_pending_result": None,
+            "application_closing": threading.Event(),
+            "com3outPortEntryField": SimpleNamespace(
+                delete=lambda *args: None,
+                insert=lambda *args: None,
+            ),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style)) or True
+            ),
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                warning=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+        }
+        request_type = self.compile_class(
+            "AuxiliaryDeviceReadRequest",
+            namespace,
+        )
+        result_type = self.compile_class(
+            "AuxiliaryDeviceReadResult",
+            namespace,
+        )
+        request = request_type(7, "COM14", 2)
+        result = result_type(7, "failed", "read failed")
+        namespace["AuxiliaryDeviceReadRequest"] = request_type
+        namespace["AuxiliaryDeviceReadResult"] = result_type
+        namespace["auxiliary_device_active_request"] = request
+        namespace["auxiliary_device_pending_result"] = result
+        namespace["auxiliary_device_read_active"].set()
+        runtime["ser3"] = port
+        apply_result = self.compile_function(
+            "_apply_auxiliary_device_result",
+            namespace,
+        )
+        cancel_read = self.compile_function(
+            "_cancel_auxiliary_device_read",
+            namespace,
+        )
+        pending = self.compile_function(
+            "_auxiliary_device_read_pending",
+            namespace,
+        )
+
+        namespace["auxiliary_device_worker_active"].set()
+        self.assertTrue(cancel_read())
+        self.assertFalse(cancel_read())
+        self.assertEqual(port.cancel_calls, 1)
+        self.assertFalse(apply_result(result))
+        self.assertTrue(pending())
+
+        namespace["auxiliary_device_worker_active"].clear()
+        runtime["ser3"] = None
+        namespace["auxiliary_device_active_serial"] = None
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
+        self.assertTrue(apply_result(result))
+        self.assertFalse(pending())
+        self.assertIsNone(namespace["auxiliary_device_active_request"])
+        self.assertIn("READ FAILED: read failed", statuses[-1][0])
+
+        cancelled_request = request_type(8, "COM14", 2)
+        cancelled_result = result_type(
+            8,
+            "cancelled",
+            "application shutdown is active",
+        )
+        namespace["auxiliary_device_active_request"] = cancelled_request
+        namespace["auxiliary_device_pending_result"] = cancelled_result
+        namespace["auxiliary_device_read_active"].set()
+        self.assertTrue(apply_result(cancelled_result))
+        self.assertIn(
+            "READ CANCELLED: application shutdown is active",
+            statuses[-1][0],
+        )
+
+        retained_request = request_type(9, "COM14", 2)
+        retained_result = result_type(
+            9,
+            "cancelled",
+            "serial cleanup did not settle",
+        )
+        namespace["application_closing"].set()
+        namespace["auxiliary_device_active_request"] = retained_request
+        namespace["auxiliary_device_active_serial"] = port
+        namespace["auxiliary_device_pending_result"] = retained_result
+        namespace["auxiliary_device_read_active"].set()
+        runtime["ser3"] = port
+        self.assertTrue(apply_result(retained_result))
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
+        self.assertIs(runtime["ser3"], port)
+        namespace["application_closing"].clear()
+        runtime["ser3"] = None
+
+        legacy_serial_owner = object()
+        runtime["ser3"] = legacy_serial_owner
+        self.assertFalse(pending())
 
     def test_manual_auxiliary_buttons_are_nonblocking_thin_wrappers(self):
         for channel in range(4):
