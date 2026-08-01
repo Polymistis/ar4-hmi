@@ -39,6 +39,9 @@ MAX_VISION_TEMPLATE_FILENAME = 255
 VISION_SELECTION_KINDS = frozenset(("mask", "template"))
 VISION_SELECTION_INSET_PIXELS = 3
 VISION_SELECTION_POLL_MILLISECONDS = 20
+VISION_SELECTION_TOO_SMALL_MESSAGE = (
+    "Selection too small; drag a larger area"
+)
 VISION_TEMPLATE_PREVIEW_SIZE = 150
 VISION_TEMPLATE_SAVE_FORBIDDEN_CHARACTERS = frozenset('<>:"/\\|?*')
 VISION_TEMPLATE_SAVE_RESERVED_STEMS = frozenset(
@@ -498,6 +501,12 @@ class VisionSelectionSettings:
 
 @dataclass(frozen=True, eq=False)
 class VisionSelectionResult:
+    """Carry validated worker output across the OpenCV/Tk boundary.
+
+    Template images retain OpenCV BGR channel order for persistence and
+    matching. Template previews use RGB channel order for PIL/Tk rendering.
+    """
+
     kind: str
     capture_result: VisionCaptureResult | None = None
     mask_bounds: tuple[int, int, int, int] | None = None
@@ -521,20 +530,24 @@ class VisionSelectionResult:
                 self.mask_bounds,
                 self.capture_result.image,
             )
-            if (
-                any(
-                    value is not None
-                    for value in (
-                        self.template_filename,
-                        self.template_image,
-                        self.template_preview,
-                    )
+            if any(
+                value is not None
+                for value in (
+                    self.template_filename,
+                    self.template_image,
+                    self.template_preview,
                 )
-                or not isinstance(self.visual_options, tuple)
-                or self.visual_options
             ):
                 raise MotionInputError(
                     "vision mask selection result contains template data"
+                )
+            if not isinstance(self.visual_options, tuple):
+                raise MotionInputError(
+                    "vision mask selection result options are invalid"
+                )
+            if self.visual_options:
+                raise MotionInputError(
+                    "vision mask selection result contains template options"
                 )
             return
         if self.capture_result is not None or self.mask_bounds is not None:
@@ -1166,10 +1179,22 @@ def select_vision_region(image, window_name, cancellation_event=None):
                 state["start"] = None
                 state["bounds"] = bounds
             if bounds is None:
-                cv2.imshow(window_name, source)
+                feedback = source.copy()
+                cv2.putText(
+                    feedback,
+                    VISION_SELECTION_TOO_SMALL_MESSAGE,
+                    (8, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                cv2.imshow(window_name, feedback)
         except BaseException as exc:
             with state_lock:
-                state["error"] = exc
+                if state["error"] is None:
+                    state["error"] = exc
 
     window_created = False
     selected_bounds = None
@@ -1216,15 +1241,25 @@ def select_vision_region(image, window_name, cancellation_event=None):
         except BaseException as exc:
             cleanup_error = exc
     if operation_error is not None:
+        detail = normalize_camera_exception_detail(operation_error)
+        if not isinstance(operation_error, MotionInputError):
+            detail = f"vision selection window failed: {detail}"
         if cleanup_error is not None:
-            detail = normalize_camera_exception_detail(operation_error)
-            raise MotionInputError(
-                f"{detail}; vision selection window cleanup failed"
-            ) from cleanup_error
-        raise operation_error
+            cleanup_detail = normalize_camera_exception_detail(cleanup_error)
+            detail += (
+                "; vision selection window cleanup failed: "
+                + cleanup_detail
+            )
+        if cleanup_error is None and isinstance(
+            operation_error,
+            MotionInputError,
+        ):
+            raise operation_error
+        raise MotionInputError(detail) from operation_error
     if cleanup_error is not None:
+        cleanup_detail = normalize_camera_exception_detail(cleanup_error)
         raise MotionInputError(
-            "vision selection window cleanup failed"
+            "vision selection window cleanup failed: " + cleanup_detail
         ) from cleanup_error
     return _validate_vision_selection_bounds(selected_bounds, source)
 
@@ -1793,6 +1828,13 @@ class VisionOperationWorker:
                     if not isinstance(result, self._result_type):
                         raise MotionInputError(
                             f"{self._operation_name} returned an invalid result"
+                        )
+                    if (
+                        isinstance(request.settings, VisionSelectionSettings)
+                        and result.kind != request.settings.kind
+                    ):
+                        raise MotionInputError(
+                            "vision selection result kind does not match request"
                         )
                 except BaseException as exc:
                     result = None
@@ -2671,11 +2713,14 @@ def fit_vision_preview_square(image, target_size):
     else:
         resized_height = target_size
         resized_width = max(1, round(width * target_size / height))
-    resized = cv2.resize(
-        image,
-        (resized_width, resized_height),
-        interpolation=cv2.INTER_AREA,
-    )
+    try:
+        resized = cv2.resize(
+            image,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_AREA,
+        )
+    except cv2.error as exc:
+        raise MotionInputError("vision preview resize failed") from exc
     square = np.zeros((target_size, target_size, 3), dtype=np.uint8)
     x_offset = (target_size - resized_width) // 2
     y_offset = (target_size - resized_height) // 2
