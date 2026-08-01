@@ -1325,8 +1325,9 @@ class VisionOperationWorker:
     def drain_events_state(self):
         """Atomically drain outcomes and snapshot request ownership.
 
-        Consumers treat an absent outcome and absent request ownership as a
-        lost terminal event, so both observations must share one lock hold.
+        Non-coalescing consumers may treat an absent outcome and absent request
+        ownership as a lost terminal event, so both observations must share
+        one lock hold. Coalescing consumers track only the retained request.
         """
 
         with self._lock:

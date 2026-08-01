@@ -28860,18 +28860,26 @@ def _settle_program_vision_operation(
     raise TypeError("program vision settlement state is invalid")
   if error_detail is not None:
     detail = normalize_camera_exception_detail(error_detail)
-    if (
-      _program_execution_request_active(operation.execution_request)
-      and not _program_execution_request_cancelled(
-        operation.execution_request
-      )
-    ):
+    request_active = _program_execution_request_active(
+      operation.execution_request
+    )
+    request_cancelled = (
+      not request_active
+      or _program_execution_request_cancelled(operation.execution_request)
+    )
+    if not request_cancelled:
       message = f"Vision program row rejected: {detail}"
       logger.error(message)
       try:
         _set_application_status(message, "Alarm.TLabel")
       except Exception:
         logger.exception("Unable to present a program vision failure")
+    else:
+      logger.warning(
+        "Discarding program vision failure after request cancellation or "
+        "ownership change: %s",
+        detail,
+      )
   operation.settle(succeeded)
   if operation.completion_callback is not None:
     operation.completion_callback(succeeded)

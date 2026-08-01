@@ -5777,6 +5777,7 @@ class HmiSourceContractTests(unittest.TestCase):
         submissions = []
         snapshots = []
         callbacks = []
+        warnings = []
         request_namespace = {
             "dataclass": dataclass,
             "threading": threading,
@@ -5873,6 +5874,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "logger": SimpleNamespace(
                 error=lambda *args: None,
                 exception=lambda *args: None,
+                warning=lambda *args: warnings.append(args),
             ),
         }
         namespace["_settle_program_vision_operation"] = self.compile_function(
@@ -5944,6 +5946,24 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(callbacks[-1], (False, main_thread))
         self.assertEqual(len(submissions), 2)
+
+        late_failure = operation_type(cancelled_request, command)
+        self.assertFalse(
+            namespace["_settle_program_vision_operation"](
+                late_failure,
+                False,
+                "late vision worker failure",
+            )
+        )
+        self.assertFalse(late_failure.wait())
+        self.assertEqual(
+            warnings,
+            [(
+                "Discarding program vision failure after request "
+                "cancellation or ownership change: %s",
+                "late vision worker failure",
+            )],
+        )
 
         shutdown_callbacks = []
         queued = operation_type(request, command, shutdown_callbacks.append)
