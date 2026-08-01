@@ -33,6 +33,13 @@ MAX_CAMERA_PREVIEW_EVENTS = 64
 MAX_RETAINED_CAMERA_TERMINAL_EVENTS = 32
 MAX_CAMERA_SOURCE_TEXT = 512
 CAMERA_PREVIEW_CANCELLATION_POLL_SECONDS = 0.05
+MAX_VISION_CAPTURE_EVENTS = 64
+VISION_CAPTURE_ADJUSTMENT_MINIMUM = -127
+VISION_CAPTURE_ADJUSTMENT_MAXIMUM = 127
+VISION_CAPTURE_ZOOM_MINIMUM = 1
+VISION_CAPTURE_ZOOM_MAXIMUM = 50
+VISION_CAPTURE_DISPLAY_WIDTH = 640
+VISION_CAPTURE_DISPLAY_HEIGHT = 480
 CAMERA_PREVIEW_EVENT_KINDS = frozenset(
     ("starting", "started", "stopping", "stopped", "failed")
 )
@@ -106,6 +113,202 @@ class CameraPreviewLifecycleState:
 
 
 @dataclass(frozen=True)
+class VisionCaptureSettings:
+    brightness: int
+    contrast: int
+    zoom_percent: int
+    mask_bounds: tuple[int, int, int, int]
+    auto_background: bool
+    persist_auto_background: bool
+    background_grayscale: int | None
+    sample_points: tuple[tuple[int, int], ...]
+
+    def __post_init__(self):
+        for value, field_name in (
+            (self.brightness, "vision brightness"),
+            (self.contrast, "vision contrast"),
+        ):
+            _validate_bounded_integer(
+                value,
+                field_name,
+                VISION_CAPTURE_ADJUSTMENT_MINIMUM,
+                VISION_CAPTURE_ADJUSTMENT_MAXIMUM,
+            )
+        _validate_bounded_integer(
+            self.zoom_percent,
+            "vision zoom",
+            VISION_CAPTURE_ZOOM_MINIMUM,
+            VISION_CAPTURE_ZOOM_MAXIMUM,
+        )
+        if not isinstance(self.mask_bounds, tuple) or len(self.mask_bounds) != 4:
+            raise MotionInputError("vision mask bounds are invalid")
+        x_minimum, y_minimum, x_maximum, y_maximum = self.mask_bounds
+        for value, field_name in zip(
+            self.mask_bounds,
+            (
+                "vision mask minimum X",
+                "vision mask minimum Y",
+                "vision mask maximum X",
+                "vision mask maximum Y",
+            ),
+        ):
+            _validate_bounded_integer(
+                value,
+                field_name,
+                0,
+                MAX_CAMERA_FRAME_DIMENSION,
+            )
+        if x_minimum + 1 >= x_maximum or y_minimum + 1 >= y_maximum:
+            raise MotionInputError("vision mask bounds must enclose an area")
+        if not isinstance(self.auto_background, bool):
+            raise MotionInputError("vision automatic-background state is invalid")
+        if not isinstance(self.persist_auto_background, bool):
+            raise MotionInputError(
+                "vision automatic-background persistence state is invalid"
+            )
+        if self.auto_background:
+            if self.background_grayscale is not None:
+                raise MotionInputError(
+                    "automatic vision background cannot include a manual value"
+                )
+            if (
+                not isinstance(self.sample_points, tuple)
+                or len(self.sample_points) != 3
+            ):
+                raise MotionInputError(
+                    "automatic vision background requires three sample points"
+                )
+        else:
+            _validate_bounded_integer(
+                self.background_grayscale,
+                "vision background grayscale",
+                0,
+                255,
+            )
+            if self.sample_points != ():
+                raise MotionInputError(
+                    "manual vision background cannot include sample points"
+                )
+        for index, point in enumerate(self.sample_points, start=1):
+            if not isinstance(point, tuple) or len(point) != 2:
+                raise MotionInputError(
+                    f"vision sample point {index} is invalid"
+                )
+            for value, coordinate in zip(point, ("first", "second")):
+                _validate_bounded_integer(
+                    value,
+                    f"vision sample point {index} {coordinate} coordinate",
+                    0,
+                    MAX_CAMERA_FRAME_DIMENSION,
+                )
+
+
+@dataclass(frozen=True, eq=False)
+class VisionCaptureResult:
+    image: np.ndarray
+    display_image: np.ndarray
+    zoom_percent: int
+    auto_background: bool
+    persist_auto_background: bool
+    background_grayscale: int
+    auto_background_rgb: tuple[int, int, int] | None
+
+    def __post_init__(self):
+        _validated_grayscale_image(self.image, "vision capture image")
+        _validated_grayscale_image(
+            self.display_image,
+            "vision capture display image",
+        )
+        if self.display_image.shape != (
+            VISION_CAPTURE_DISPLAY_HEIGHT,
+            VISION_CAPTURE_DISPLAY_WIDTH,
+        ):
+            raise MotionInputError(
+                "vision capture display dimensions are invalid"
+            )
+        _validate_bounded_integer(
+            self.zoom_percent,
+            "vision zoom",
+            VISION_CAPTURE_ZOOM_MINIMUM,
+            VISION_CAPTURE_ZOOM_MAXIMUM,
+        )
+        if not isinstance(self.auto_background, bool):
+            raise MotionInputError("vision automatic-background state is invalid")
+        if not isinstance(self.persist_auto_background, bool):
+            raise MotionInputError(
+                "vision automatic-background persistence state is invalid"
+            )
+        _validate_bounded_integer(
+            self.background_grayscale,
+            "vision background grayscale",
+            0,
+            255,
+        )
+        if self.auto_background:
+            _validate_rgb_triplet(
+                self.auto_background_rgb,
+                "automatic vision background",
+            )
+        elif self.auto_background_rgb is not None:
+            raise MotionInputError(
+                "manual vision capture cannot return an automatic background"
+            )
+
+
+@dataclass(frozen=True, eq=False)
+class VisionCaptureEvent:
+    sequence: int
+    request_id: int
+    result: VisionCaptureResult | None = None
+    error_detail: str | None = None
+
+    def __post_init__(self):
+        _validate_nonnegative_integer(self.sequence, "vision event sequence")
+        _validate_nonnegative_integer(self.request_id, "vision request id")
+        if (self.result is None) == (self.error_detail is None):
+            raise MotionInputError(
+                "vision capture event must contain one terminal outcome"
+            )
+        if self.result is not None and not isinstance(
+            self.result,
+            VisionCaptureResult,
+        ):
+            raise MotionInputError("vision capture result is invalid")
+        if self.error_detail is not None and (
+            not isinstance(self.error_detail, str)
+            or not self.error_detail
+            or self.error_detail != self.error_detail.strip()
+            or " ".join(self.error_detail.split()) != self.error_detail
+            or "\r" in self.error_detail
+            or "\n" in self.error_detail
+            or len(self.error_detail) > MAX_CAMERA_PREVIEW_EVENT_DETAIL
+        ):
+            raise MotionInputError("vision capture error detail is invalid")
+
+
+@dataclass(frozen=True)
+class VisionCaptureSubmission:
+    request_id: int
+    coalesced: bool
+
+    def __post_init__(self):
+        _validate_nonnegative_integer(self.request_id, "vision request id")
+        if not isinstance(self.coalesced, bool):
+            raise MotionInputError("vision coalescing state is invalid")
+
+
+@dataclass(frozen=True)
+class _VisionCaptureRequest:
+    request_id: int
+    settings: VisionCaptureSettings
+
+    def __post_init__(self):
+        _validate_nonnegative_integer(self.request_id, "vision request id")
+        if not isinstance(self.settings, VisionCaptureSettings):
+            raise MotionInputError("vision capture settings are invalid")
+
+
+@dataclass(frozen=True)
 class _CameraPreviewRequest:
     request_id: int
     camera_source: int | str
@@ -118,6 +321,27 @@ class _CameraPreviewRequest:
 def _validate_nonnegative_integer(value, field_name):
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise MotionInputError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _validate_bounded_integer(value, field_name, minimum, maximum):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or value > maximum
+    ):
+        raise MotionInputError(
+            f"{field_name} must be an integer between {minimum} and {maximum}"
+        )
+    return value
+
+
+def _validate_rgb_triplet(value, field_name):
+    if not isinstance(value, tuple) or len(value) != 3:
+        raise MotionInputError(f"{field_name} must contain three byte values")
+    for component in value:
+        _validate_bounded_integer(component, field_name, 0, 255)
     return value
 
 
@@ -213,6 +437,18 @@ def _validated_camera_frame(image, field_name):
     return image
 
 
+def _validated_grayscale_image(image, field_name):
+    if (
+        not isinstance(image, np.ndarray)
+        or image.ndim != 2
+        or image.dtype != np.uint8
+    ):
+        raise MotionInputError(f"{field_name} must contain 8-bit grayscale data")
+    height, width = image.shape
+    _validated_image_dimensions(width, height, field_name)
+    return image
+
+
 def copy_camera_capture_frame(image):
     """Validate camera output and detach storage owned by the backend."""
 
@@ -248,6 +484,298 @@ def prepare_camera_preview_frame(image, width=480, height=320):
         copy=True,
         order="C",
     )
+
+
+def prepare_vision_capture_result(image, settings):
+    """Apply one immutable vision-input snapshot away from Tk."""
+
+    source = _validated_camera_frame(image, "vision capture frame")
+    _validated_image_dimensions(
+        source.shape[1],
+        source.shape[0],
+        "vision capture frame",
+    )
+    if not isinstance(settings, VisionCaptureSettings):
+        raise MotionInputError("vision capture settings are invalid")
+    try:
+        adjusted = np.int16(source)
+        adjusted = (
+            adjusted * (settings.contrast / 127 + 1)
+            - settings.contrast
+            + settings.brightness
+        )
+        adjusted = np.uint8(np.clip(adjusted, 0, 255))
+        grayscale = cv2.cvtColor(adjusted, cv2.COLOR_BGR2GRAY)
+        height, width = grayscale.shape
+        row_radius = int(settings.zoom_percent * height / 100)
+        column_radius = int(settings.zoom_percent * width / 100)
+        row_center = int(height / 2)
+        column_center = int(width / 2)
+        cropped = grayscale[
+            row_center - row_radius:row_center + row_radius,
+            column_center - column_radius:column_center + column_radius,
+        ]
+        if cropped.size == 0:
+            raise MotionInputError(
+                "vision zoom produced an empty capture region"
+            )
+        grayscale = cv2.resize(cropped, (width, height))
+    except MotionInputError:
+        raise
+    except (cv2.error, TypeError, ValueError, OverflowError) as exc:
+        raise MotionInputError("vision capture conversion failed") from exc
+
+    if settings.auto_background:
+        samples = []
+        for index, (first, second) in enumerate(
+            settings.sample_points,
+            start=1,
+        ):
+            if first >= height or second >= width:
+                raise MotionInputError(
+                    f"vision sample point {index} is outside the current image"
+                )
+            samples.append(int(grayscale[first, second]))
+        background = int(np.rint(np.mean(np.asarray(samples, dtype=np.float64))))
+        auto_background_rgb = (background, background, background)
+    else:
+        background = settings.background_grayscale
+        auto_background_rgb = None
+
+    x_minimum, y_minimum, x_maximum, y_maximum = settings.mask_bounds
+    masked = np.full_like(grayscale, background)
+    inner_x_minimum = min(max(x_minimum + 1, 0), width)
+    inner_x_maximum = min(max(x_maximum, 0), width)
+    inner_y_minimum = min(max(y_minimum + 1, 0), height)
+    inner_y_maximum = min(max(y_maximum, 0), height)
+    if (
+        inner_x_minimum < inner_x_maximum
+        and inner_y_minimum < inner_y_maximum
+    ):
+        masked[
+            inner_y_minimum:inner_y_maximum,
+            inner_x_minimum:inner_x_maximum,
+        ] = grayscale[
+            inner_y_minimum:inner_y_maximum,
+            inner_x_minimum:inner_x_maximum,
+        ]
+    try:
+        display_image = cv2.resize(
+            masked,
+            (VISION_CAPTURE_DISPLAY_WIDTH, VISION_CAPTURE_DISPLAY_HEIGHT),
+            interpolation=cv2.INTER_LINEAR,
+        )
+    except cv2.error as exc:
+        raise MotionInputError("vision display conversion failed") from exc
+    captured = np.array(masked, dtype=np.uint8, copy=True, order="C")
+    display = np.array(
+        display_image,
+        dtype=np.uint8,
+        copy=True,
+        order="C",
+    )
+    captured.setflags(write=False)
+    display.setflags(write=False)
+    return VisionCaptureResult(
+        image=captured,
+        display_image=display,
+        zoom_percent=settings.zoom_percent,
+        auto_background=settings.auto_background,
+        persist_auto_background=settings.persist_auto_background,
+        background_grayscale=background,
+        auto_background_rgb=auto_background_rgb,
+    )
+
+
+class VisionCaptureWorker:
+    """Coalesce capture-only HMI requests behind one non-Tk worker."""
+
+    def __init__(self, operation, *, thread_factory=threading.Thread):
+        if not callable(operation):
+            raise MotionInputError("vision capture operation must be callable")
+        if not callable(thread_factory):
+            raise MotionInputError("vision capture thread factory must be callable")
+        self._operation = operation
+        self._thread_factory = thread_factory
+        self._lock = threading.Lock()
+        self._events = deque(maxlen=MAX_VISION_CAPTURE_EVENTS)
+        self._next_event_sequence = 0
+        self._next_request_id = 0
+        self._pending = None
+        self._active_request_id = None
+        self._worker = None
+        self._worker_stopped = threading.Event()
+        self._worker_stopped.set()
+        self._close_requested = threading.Event()
+        self._closed = False
+
+    @property
+    def active(self):
+        with self._lock:
+            return self._worker is not None
+
+    @property
+    def closed(self):
+        with self._lock:
+            return self._closed
+
+    @property
+    def active_request_id(self):
+        with self._lock:
+            return self._active_request_id
+
+    @property
+    def pending_request_id(self):
+        with self._lock:
+            return None if self._pending is None else self._pending.request_id
+
+    def submit(self, settings):
+        if not isinstance(settings, VisionCaptureSettings):
+            raise MotionInputError("vision capture settings are invalid")
+        with self._lock:
+            if self._closed:
+                raise MotionInputError("vision capture worker is closed")
+            self._next_request_id += 1
+            request = _VisionCaptureRequest(
+                request_id=self._next_request_id,
+                settings=settings,
+            )
+            coalesced = self._worker is not None or self._pending is not None
+            self._pending = request
+            if self._worker is not None:
+                return VisionCaptureSubmission(request.request_id, coalesced)
+
+            self._worker_stopped.clear()
+            try:
+                worker = self._thread_factory(
+                    target=self._run,
+                    name="ar4-vision-capture",
+                    daemon=True,
+                )
+            except Exception as exc:
+                self._pending = None
+                self._worker_stopped.set()
+                detail = normalize_camera_exception_detail(
+                    exc,
+                    "vision capture thread creation failed: ",
+                )
+                raise RuntimeError(detail) from exc
+            if not isinstance(worker, threading.Thread):
+                self._pending = None
+                self._worker_stopped.set()
+                raise MotionInputError(
+                    "vision capture thread factory returned an invalid worker"
+                )
+            self._worker = worker
+            try:
+                worker.start()
+            except Exception as exc:
+                self._worker = None
+                self._pending = None
+                self._worker_stopped.set()
+                detail = normalize_camera_exception_detail(
+                    exc,
+                    "vision capture worker startup failed: ",
+                )
+                raise RuntimeError(detail) from exc
+            return VisionCaptureSubmission(request.request_id, coalesced)
+
+    def drain_events(self):
+        with self._lock:
+            events = tuple(self._events)
+            self._events.clear()
+            return events
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            self._pending = None
+            self._close_requested.set()
+            return self._worker is None
+
+    def wait_stopped(self, timeout=None):
+        if timeout is not None:
+            timeout = _validate_camera_wait_timeout(timeout)
+        return self._worker_stopped.wait(timeout)
+
+    def _append_event_locked(self, request_id, result=None, error_detail=None):
+        event = VisionCaptureEvent(
+            sequence=self._next_event_sequence,
+            request_id=request_id,
+            result=result,
+            error_detail=error_detail,
+        )
+        self._next_event_sequence += 1
+        self._events.append(event)
+        return event
+
+    def _run(self):
+        current_thread = threading.current_thread()
+        try:
+            while True:
+                with self._lock:
+                    request = self._pending
+                    self._pending = None
+                    if request is None or self._closed:
+                        if self._worker is current_thread:
+                            self._worker = None
+                            self._active_request_id = None
+                            self._worker_stopped.set()
+                        return
+                    self._active_request_id = request.request_id
+                result = None
+                error_detail = None
+                try:
+                    result = self._operation(
+                        request.settings,
+                        self._close_requested,
+                    )
+                    if not isinstance(result, VisionCaptureResult):
+                        raise MotionInputError(
+                            "vision capture operation returned an invalid result"
+                        )
+                except BaseException as exc:
+                    result = None
+                    error_detail = normalize_camera_exception_detail(
+                        exc,
+                        "vision capture failed: ",
+                    )
+                with self._lock:
+                    self._append_event_locked(
+                        request.request_id,
+                        result=result,
+                        error_detail=error_detail,
+                    )
+                    self._active_request_id = None
+                    if self._closed:
+                        self._pending = None
+        except BaseException as exc:
+            detail = normalize_camera_exception_detail(
+                exc,
+                "vision capture worker terminated: ",
+            )
+            with self._lock:
+                request_ids = []
+                if self._active_request_id is not None:
+                    request_ids.append(self._active_request_id)
+                if self._pending is not None:
+                    request_ids.append(self._pending.request_id)
+                self._active_request_id = None
+                self._pending = None
+                if self._worker is current_thread:
+                    self._worker = None
+                    self._worker_stopped.set()
+                for request_id in dict.fromkeys(request_ids):
+                    self._append_event_locked(
+                        request_id,
+                        error_detail=detail,
+                    )
+        finally:
+            with self._lock:
+                if self._worker is current_thread:
+                    self._worker = None
+                    self._active_request_id = None
+                    self._worker_stopped.set()
 
 
 class CameraPreviewWorker:
@@ -473,12 +1001,26 @@ class CameraPreviewWorker:
     def close(self):
         return self.close_state().clean
 
-    def wait_stopped(self, timeout=None):
+    def wait_stopped(self, timeout=None, cancellation_event=None):
         """Wait for worker retirement from a non-Tk lifecycle owner."""
 
         if timeout is not None:
             timeout = _validate_camera_wait_timeout(timeout)
-        return self._worker_stopped.wait(timeout)
+        if cancellation_event is None:
+            return self._worker_stopped.wait(timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if _camera_cancellation_requested(cancellation_event):
+                return False
+            if self._worker_stopped.is_set():
+                return True
+            wait_seconds = CAMERA_PREVIEW_CANCELLATION_POLL_SECONDS
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                wait_seconds = min(wait_seconds, remaining)
+            self._worker_stopped.wait(wait_seconds)
 
     def wait_ready(self, request_id, timeout, cancellation_event=None):
         """Wait off Tk until a request owns a validated raw frame."""
@@ -515,6 +1057,58 @@ class CameraPreviewWorker:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
+                if cancellation_event is not None:
+                    remaining = min(
+                        remaining,
+                        CAMERA_PREVIEW_CANCELLATION_POLL_SECONDS,
+                    )
+                self._state_changed.wait(remaining)
+
+    def wait_snapshot_or_stopped(
+        self,
+        request_id,
+        timeout,
+        cancellation_event=None,
+    ):
+        """Return an owned frame from startup or wait for stopped cleanup."""
+
+        _validate_nonnegative_integer(request_id, "camera request id")
+        timeout = _validate_camera_wait_timeout(timeout)
+        deadline = time.monotonic() + timeout
+        with self._state_changed:
+            while True:
+                if _camera_cancellation_requested(cancellation_event):
+                    raise MotionInputError("camera capture was cancelled")
+                if (
+                    self._latest_raw_frame is not None
+                    and self._latest_raw_frame[0] == request_id
+                ):
+                    return np.array(
+                        self._latest_raw_frame[1],
+                        dtype=np.uint8,
+                        copy=True,
+                        order="C",
+                    )
+                if self._fault_reason is not None:
+                    raise MotionInputError(
+                        "camera preview cleanup requires an application "
+                        "restart: " + self._fault_reason
+                    )
+                desired_request_id = (
+                    None
+                    if self._desired is None
+                    else self._desired.request_id
+                )
+                if (
+                    desired_request_id != request_id
+                    and self._active_request_id != request_id
+                ):
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MotionInputError(
+                        "camera preview transition did not settle before timeout"
+                    )
                 if cancellation_event is not None:
                     remaining = min(
                         remaining,

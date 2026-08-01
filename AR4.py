@@ -298,10 +298,16 @@ from ARrobots.HMI.vision_io import (
   CameraPreviewFrame,
   CameraPreviewLifecycleState,
   CameraPreviewWorker,
+  VisionCaptureEvent,
+  VisionCaptureResult,
+  VisionCaptureSettings,
+  VisionCaptureSubmission,
+  VisionCaptureWorker,
   fit_vision_preview_square,
   load_bounded_vision_image,
   normalize_camera_exception_detail,
   prepare_camera_preview_frame,
+  prepare_vision_capture_result,
 )
 
 #####################################################################################
@@ -603,9 +609,20 @@ def on_closing():
         camera_preview_shutdown_started_at = time.monotonic()
     except Exception:
       logger.exception("Unable to stop camera preview during shutdown")
+  capture_worker = globals().get('vision_capture_worker')
+  if capture_worker is not None:
+    try:
+      capture_closed = capture_worker.close()
+      if not isinstance(capture_closed, bool):
+        raise RuntimeError("vision capture returned an invalid close state")
+      if not capture_closed:
+        camera_preview_shutdown_started_at = time.monotonic()
+    except Exception:
+      logger.exception("Unable to stop vision capture during shutdown")
   camera_preview_shutdown_timeout_reported = False
   if isinstance(runtime_state, dict):
     runtime_state['cam_on'] = False
+    runtime_state['visionCaptureRequestId'] = None
 
   _close_joint_motion_dispatcher_for_shutdown()
 
@@ -628,6 +645,8 @@ live_tool_lock = threading.Lock()
 application_lifecycle_lock = threading.Lock()
 camera_selection_lock = threading.Lock()
 camera_preview_request_lock = threading.Lock()
+vision_capture_request_lock = threading.Lock()
+vision_artifact_lock = threading.Lock()
 selected_vision_camera_source = None
 program_camera_completion_queue = Queue()
 offline_live_jog_lock = threading.Lock()
@@ -955,6 +974,7 @@ CONTROLLER_STARTUP_REQUIRED_CAPABILITIES = (
 EVENT_POLL_INTERVAL_MS = 25
 CAMERA_PREVIEW_SHUTDOWN_GRACE_SECONDS = 2.0
 CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS = 10.0
+VISION_SELECTION_INSET_PIXELS = 3
 EVENT_POLL_CALLBACK_NAMES = {
   "camera-preview": "_poll_camera_preview_events",
   "serial": "_poll_serial_events",
@@ -4696,6 +4716,17 @@ def _poll_application_close():
     except Exception:
       logger.exception("Unable to inspect camera preview shutdown state")
       camera_worker_active = False
+  capture_worker = globals().get('vision_capture_worker')
+  capture_worker_active = False
+  if capture_worker is not None:
+    try:
+      capture_worker_active = capture_worker.active
+      if not isinstance(capture_worker_active, bool):
+        raise RuntimeError("vision capture returned an invalid active state")
+    except Exception:
+      logger.exception("Unable to inspect vision capture shutdown state")
+      capture_worker_active = False
+  camera_worker_active = camera_worker_active or capture_worker_active
   if camera_worker_active:
     now = time.monotonic()
     if camera_preview_shutdown_started_at is None:
@@ -4705,7 +4736,7 @@ def _poll_application_close():
       < CAMERA_PREVIEW_SHUTDOWN_GRACE_SECONDS
     ):
       _set_application_status(
-        "SHUTDOWN WAITING FOR CAMERA PREVIEW",
+        "SHUTDOWN WAITING FOR CAMERA WORKERS",
         "Warn.TLabel",
       )
       root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
@@ -4713,8 +4744,8 @@ def _poll_application_close():
     if not camera_preview_shutdown_timeout_reported:
       camera_preview_shutdown_timeout_reported = True
       logger.error(
-        "Camera preview did not stop before the shutdown grace period; "
-        "process exit will retire the daemon worker"
+        "Camera work did not stop before the shutdown grace period; "
+        "process exit will retire remaining daemon workers"
       )
 
   if not serial_lock.acquire(blocking=False):
@@ -4824,6 +4855,7 @@ RUN['KinematicError'] = 0
 
 RUN['cam_on'] = False
 RUN['cameraPreviewRequestId'] = None
+RUN['visionCaptureRequestId'] = None
 
 # Migrated global variables to RUN dictionary
 # Robot State & Control
@@ -17265,7 +17297,12 @@ def executeRow(motion_complete=None, execution_request=None):
             f"{label} must be a non-negative integer"
           )
       min_score = score*.01
-      if take_pic(capture_background) is not True:
+      if take_pic(
+        capture_background,
+        execution_request.cancellation_boundary,
+      ) is not True:
+        if _reject_cancelled_program_row(execution_request):
+          return ROW_EXECUTION_REJECTED
         raise MotionInputError("vision capture failed")
       if background is None:
         background = _vision_background_grayscale(RUN['BGavg'])
@@ -28103,7 +28140,6 @@ def _vision_camera_source_for_selection(selection):
       camera_index = camera_source.removeprefix("rpicam:")
       if re.fullmatch(r"[0-9]+", camera_index) is None:
         raise MotionInputError("CSI camera source identity is invalid")
-      return camera_source
     return camera_source
   raise MotionInputError("camera platform is unsupported")
 
@@ -28329,6 +28365,7 @@ def _drain_program_camera_completion_events():
 def _poll_camera_preview_events():
   try:
     _drain_program_camera_completion_events()
+    _drain_vision_capture_events()
     for event in camera_preview_worker.drain_events():
       _apply_camera_preview_event(event)
     with camera_preview_request_lock:
@@ -28373,9 +28410,15 @@ def start_vid():
 
 def stop_vid():
   try:
-    _, stopped = _request_camera_preview_stop()
+    request_id, stopped = _request_camera_preview_stop()
     if not isinstance(stopped, bool):
       raise RuntimeError("camera preview returned an invalid stop result")
+    if request_id is None:
+      _set_application_status(
+        "CAMERA PREVIEW STOP REJECTED: no preview request is active",
+        "Warn.TLabel",
+      )
+      return False
     return stopped
   except Exception as exc:
     detail = normalize_camera_exception_detail(exc)
@@ -28395,7 +28438,11 @@ def _request_camera_preview_stop():
     ):
       raise MotionInputError("camera preview has no valid request owner")
     RUN['cam_on'] = False
-    stopped = camera_preview_worker.request_stop(request_id)
+    stopped = (
+      False
+      if request_id is None
+      else camera_preview_worker.request_stop(request_id)
+    )
   return request_id, stopped
 
 
@@ -28439,12 +28486,14 @@ def _wait_for_program_camera_start(execution_request):
     with camera_preview_request_lock:
       if RUN.get('cameraPreviewRequestId') == request_id:
         RUN['cameraPreviewRequestId'] = None
+        RUN['cam_on'] = False
     raise MotionInputError(
       "camera preview cleanup timed out after readiness timeout"
     )
   with camera_preview_request_lock:
     if RUN.get('cameraPreviewRequestId') == request_id:
       RUN['cameraPreviewRequestId'] = None
+      RUN['cam_on'] = False
   if cancelled:
     return False
   raise MotionInputError(
@@ -28461,7 +28510,16 @@ def _wait_for_program_camera_stop(execution_request):
     if not isinstance(camera_active, bool):
       raise RuntimeError("camera preview returned an invalid active state")
     if camera_active:
-      raise MotionInputError("camera preview has no valid request owner")
+      settled = camera_preview_worker.wait_stopped(
+        CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+        execution_request.cancellation_boundary,
+      )
+      if not isinstance(settled, bool):
+        raise RuntimeError("camera preview returned an invalid stop result")
+      if not settled:
+        if _program_execution_request_cancelled(execution_request):
+          return False
+        raise MotionInputError("camera capture did not stop before timeout")
     camera_fault = camera_preview_worker.fault_reason
     if camera_fault is not None:
       if (
@@ -28703,7 +28761,222 @@ def _validated_vision_sample_pixels(image, points):
   return tuple(samples)
 
 
-def _capture_current_vision_frame():
+def _snapshot_vision_capture_settings(background_override=None):
+  brightness = int(VisBrightSlide.get())
+  contrast = int(VisContrastSlide.get())
+  zoom_percent = int(VisZoomSlide.get())
+  mask_bounds = tuple(
+    _vision_sample_coordinate(RUN[key], label)
+    for key, label in (
+      ('mX1', "vision mask minimum X"),
+      ('mY1', "vision mask minimum Y"),
+      ('mX2', "vision mask maximum X"),
+      ('mY2', "vision mask maximum Y"),
+    )
+  )
+  if background_override is None:
+    auto_background_value = int(RUN['autoBG'].get())
+    if auto_background_value not in (0, 1):
+      raise MotionInputError(
+        "vision automatic-background state must be zero or one"
+      )
+    auto_background = auto_background_value == 1
+    persist_auto_background = True
+    manual_background = VisBacColorEntryField.get()
+  elif background_override == "Auto":
+    auto_background = True
+    persist_auto_background = False
+    manual_background = None
+  else:
+    auto_background = False
+    persist_auto_background = False
+    manual_background = normalize_vision_background_color(
+      background_override
+    )
+  if auto_background:
+    background_grayscale = None
+    sample_points = tuple(
+      (
+        _vision_sample_coordinate(first, first_label),
+        _vision_sample_coordinate(second, second_label),
+      )
+      for first, second, first_label, second_label in (
+        (
+          VisX1PixEntryField.get(),
+          VisY1PixEntryField.get(),
+          "vision background point 1 first coordinate",
+          "vision background point 1 second coordinate",
+        ),
+        (
+          VisX2PixEntryField.get(),
+          VisY1PixEntryField.get(),
+          "vision background point 2 first coordinate",
+          "vision background point 2 second coordinate",
+        ),
+        (
+          VisX1PixEntryField.get(),
+          VisY2PixEntryField.get(),
+          "vision background point 3 first coordinate",
+          "vision background point 3 second coordinate",
+        ),
+      )
+    )
+  else:
+    background_grayscale = _vision_background_grayscale(manual_background)
+    sample_points = ()
+  return VisionCaptureSettings(
+    brightness=brightness,
+    contrast=contrast,
+    zoom_percent=zoom_percent,
+    mask_bounds=mask_bounds,
+    auto_background=auto_background,
+    persist_auto_background=persist_auto_background,
+    background_grayscale=background_grayscale,
+    sample_points=sample_points,
+  )
+
+
+def _vision_capture_cancelled(cancellation_event):
+  if cancellation_event is None:
+    return False
+  is_set = getattr(cancellation_event, "is_set", None)
+  if not callable(is_set):
+    raise MotionInputError(
+      "vision capture cancellation event does not satisfy the event contract"
+    )
+  cancelled = is_set()
+  if not isinstance(cancelled, bool):
+    raise MotionInputError("vision capture cancellation state must be boolean")
+  return cancelled
+
+
+@contextmanager
+def _vision_artifact_operation(context):
+  if (
+    not isinstance(context, str)
+    or not context
+    or context != context.strip()
+    or "\r" in context
+    or "\n" in context
+  ):
+    raise TypeError("vision artifact context must be normalized text")
+  acquired = vision_artifact_lock.acquire(blocking=False)
+  if acquired is not True:
+    raise MotionInputError(
+      f"{context} is unavailable while another vision artifact operation is active"
+    )
+  try:
+    yield
+  finally:
+    vision_artifact_lock.release()
+
+
+def _perform_vision_capture(settings, cancellation_event=None):
+  if not isinstance(settings, VisionCaptureSettings):
+    raise MotionInputError("vision capture settings are invalid")
+  with _vision_artifact_operation("vision capture"):
+    if _vision_capture_cancelled(cancellation_event):
+      raise MotionInputError("vision capture was cancelled")
+    frame = _capture_current_vision_frame(cancellation_event)
+    if _vision_capture_cancelled(cancellation_event):
+      raise MotionInputError("vision capture was cancelled")
+    result = prepare_vision_capture_result(frame, settings)
+    if _vision_capture_cancelled(cancellation_event):
+      raise MotionInputError("vision capture was cancelled")
+    if not cv2.imwrite('curImage.jpg', result.image):
+      raise OSError("captured vision frame could not be persisted")
+    return result
+
+
+vision_capture_worker = VisionCaptureWorker(_perform_vision_capture)
+
+
+def _apply_vision_capture_result(result):
+  if not isinstance(result, VisionCaptureResult):
+    raise MotionInputError("vision capture supplied an invalid result")
+  CAL['zoom'] = result.zoom_percent
+  if result.persist_auto_background:
+    CAL['autoBGVal'] = int(result.auto_background)
+  if result.auto_background:
+    RUN['BGavg'] = result.auto_background_rgb
+    VisBacColorEntryField.configure(state='enabled')
+    VisBacColorEntryField.delete(0, 'end')
+    VisBacColorEntryField.insert(0, str(RUN['BGavg']))
+    VisBacColorEntryField.configure(state='disabled')
+  img = Image.fromarray(result.display_image)
+  imgtk = ImageTk.PhotoImage(image=img)
+  vid_lbl.imgtk = imgtk
+  vid_lbl.configure(image=imgtk)
+  return True
+
+
+def _apply_vision_capture_event(event):
+  if not isinstance(event, VisionCaptureEvent):
+    raise RuntimeError("vision capture worker emitted an invalid event")
+  with vision_capture_request_lock:
+    request_id = RUN.get('visionCaptureRequestId')
+    current = request_id == event.request_id
+    if current:
+      RUN['visionCaptureRequestId'] = None
+  if not current:
+    if event.error_detail is not None:
+      logger.error(
+        "Vision capture request %s failed after ownership changed: %s",
+        event.request_id,
+        event.error_detail,
+      )
+    else:
+      _apply_vision_capture_result(event.result)
+    return False
+  if event.error_detail is not None:
+    message = f"VISION CAPTURE FAILED: {event.error_detail}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  _apply_vision_capture_result(event.result)
+  _set_application_status("VISION CAPTURE COMPLETE", "OK.TLabel")
+  return True
+
+
+def _drain_vision_capture_events():
+  for event in vision_capture_worker.drain_events():
+    try:
+      _apply_vision_capture_event(event)
+    except Exception:
+      logger.exception("Unable to apply a vision capture result")
+      _set_application_status(
+        "VISION CAPTURE RESULT FAILED",
+        "Alarm.TLabel",
+      )
+  return True
+
+
+def request_vision_capture(background_override=None):
+  try:
+    if application_closing.is_set():
+      raise MotionInputError("application shutdown is active")
+    settings = _snapshot_vision_capture_settings(background_override)
+    submission = vision_capture_worker.submit(settings)
+    if not isinstance(submission, VisionCaptureSubmission):
+      raise RuntimeError("vision capture returned an invalid submission")
+    with vision_capture_request_lock:
+      RUN['visionCaptureRequestId'] = submission.request_id
+    message = (
+      "VISION CAPTURE QUEUED"
+      if submission.coalesced
+      else "VISION CAPTURE IN PROGRESS"
+    )
+    _set_application_status(message, "Warn.TLabel")
+    return True
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"VISION CAPTURE REJECTED: {detail}"
+    logger.exception(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+
+
+def _capture_current_vision_frame(cancellation_event=None):
   with camera_preview_request_lock:
     request_id = RUN.get('cameraPreviewRequestId')
     valid_request_id = (
@@ -28723,11 +28996,37 @@ def _capture_current_vision_frame():
     if not valid_request_id:
       raise MotionInputError("camera preview has no valid request owner")
     raise MotionInputError("camera preview has no captured frame")
+  if valid_request_id:
+    transitional_frame = camera_preview_worker.wait_snapshot_or_stopped(
+      request_id,
+      CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+      cancellation_event,
+    )
+    if transitional_frame is not None:
+      return transitional_frame
+    with camera_preview_request_lock:
+      current_request_id = RUN.get('cameraPreviewRequestId')
+      if current_request_id == request_id:
+        RUN['cameraPreviewRequestId'] = None
+        RUN['cam_on'] = False
+      elif current_request_id is not None:
+        raise MotionInputError(
+          "camera preview ownership changed during vision capture"
+        )
   camera_active = camera_preview_worker.active
   if not isinstance(camera_active, bool):
     raise RuntimeError("camera preview returned an invalid active state")
   if camera_active:
-    raise MotionInputError("camera preview transition is still active")
+    settled = camera_preview_worker.wait_stopped(
+      CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+      cancellation_event,
+    )
+    if not isinstance(settled, bool):
+      raise RuntimeError("camera preview returned an invalid stop result")
+    if not settled:
+      if _vision_capture_cancelled(cancellation_event):
+        raise MotionInputError("vision capture was cancelled")
+      raise MotionInputError("camera capture did not stop before timeout")
   camera_fault = camera_preview_worker.fault_reason
   if camera_fault is not None:
     if (
@@ -28745,90 +29044,20 @@ def _capture_current_vision_frame():
   return camera_preview_worker.capture_once(
     camera_source,
     CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+    cancellation_event,
   )
 
 
-def take_pic(background_override=None):
+def take_pic(background_override=None, cancellation_event=None):
   try:
-    frame = _capture_current_vision_frame()
-
-    brightness = int(VisBrightSlide.get())
-    contrast = int(VisContrastSlide.get())
-    CAL['zoom'] = int(VisZoomSlide.get())
-
-    frame = np.int16(frame)
-    frame = frame * (contrast/127+1) - contrast + brightness
-    frame = np.clip(frame, 0, 255)
-    frame = np.uint8(frame) 
-    cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
-    
-
-    height, width = cv2image.shape
-
-    centerX,centerY=int(height/2),int(width/2)
-    radiusX,radiusY= int(CAL['zoom']*height/100),int(CAL['zoom']*width/100)
-
-    minX,maxX=centerX-radiusX,centerX+radiusX
-    minY,maxY=centerY-radiusY,centerY+radiusY
-
-    cropped = cv2image[minX:maxX, minY:maxY]
-    cv2image = cv2.resize(cropped, (width, height))
-
-    if background_override is None:
-      auto_background = int(RUN['autoBG'].get())
-      CAL['autoBGVal'] = auto_background
-      manual_background = VisBacColorEntryField.get()
-    elif background_override == "Auto":
-      auto_background = 1
-      manual_background = None
-    else:
-      auto_background = 0
-      manual_background = normalize_vision_background_color(
-        background_override
-      )
-    if(auto_background==1):
-      BG1, BG2, BG3 = _validated_vision_sample_pixels(
-        cv2image,
-        (
-          (VisX1PixEntryField.get(), VisY1PixEntryField.get()),
-          (VisX2PixEntryField.get(), VisY1PixEntryField.get()),
-          (VisX1PixEntryField.get(), VisY2PixEntryField.get()),
-        ),
-      )
-      avg = _average_vision_grayscale_samples((BG1, BG2, BG3))
-      RUN['BGavg'] = (avg,avg,avg) 
-      background = avg
-      VisBacColorEntryField.configure(state='enabled')  
-      VisBacColorEntryField.delete(0, 'end')
-      VisBacColorEntryField.insert(0,str(RUN['BGavg']))
-      VisBacColorEntryField.configure(state='disabled')  
-    else:
-      background = _vision_background_grayscale(
-        manual_background
-      )
-
-    h = cv2image.shape[0]
-    w = cv2image.shape[1]
-    for y in range(0, h):
-      for x in range(0, w):
-        cv2image[y, x] = background if x >= RUN['mX2'] or x <= RUN['mX1'] or y <= RUN['mY1'] or y >= RUN['mY2'] else cv2image[y, x]  
-
-    img = Image.fromarray(cv2image).resize((640,480))
-
-    
-
-    imgtk = ImageTk.PhotoImage(image=img) 
-    vid_lbl.imgtk = imgtk    
-    vid_lbl.configure(image=imgtk) 
-    filename = 'curImage.jpg'
-    if not cv2.imwrite(filename, cv2image):
-      raise OSError("captured vision frame could not be persisted")
-    return True
+    settings = _snapshot_vision_capture_settings(background_override)
+    result = _perform_vision_capture(settings, cancellation_event)
+    return _apply_vision_capture_result(result)
   except Exception:
     logger.exception("Vision capture failed")
     return False
 
-def mask_pic():
+def _prepare_mask_selection_image():
   frame = _capture_current_vision_frame()
   brightness = int(VisBrightSlide.get())
   contrast = int(VisContrastSlide.get())
@@ -28845,19 +29074,79 @@ def mask_pic():
   minY,maxY=centerY-radiusY,centerY+radiusY
   cropped = cv2image[minX:maxX, minY:maxY]
   cv2image = cv2.resize(cropped, (width, height))
-  filename = 'curImage.jpg'
-  if not cv2.imwrite(filename, cv2image):
-    raise OSError("captured mask frame could not be persisted")
-  return True
+  return cv2image
+
+
+def _capture_mask_selection_image():
+  with _vision_artifact_operation("vision mask selection"):
+    image = _prepare_mask_selection_image()
+    filename = 'curImage.jpg'
+    if not cv2.imwrite(filename, image):
+      raise OSError("captured mask frame could not be persisted")
+    return load_bounded_vision_image(
+      filename,
+      cv2.IMREAD_COLOR,
+      "captured mask frame",
+    )
 
   
 
 
 
-def _mask_crop(event, x, y, flags, param):
-    cropDone = False
-    
+def _normalized_vision_selection_bounds(image, start_x, start_y, end_x, end_y):
+  shape = getattr(image, "shape", None)
+  if not isinstance(shape, (tuple, list)) or len(shape) < 2:
+    raise MotionInputError("vision selection image has invalid dimensions")
+  height = _vision_sample_coordinate(
+    shape[0],
+    "vision selection image height",
+  )
+  width = _vision_sample_coordinate(
+    shape[1],
+    "vision selection image width",
+  )
+  if height == 0 or width == 0:
+    raise MotionInputError("vision selection image dimensions must be positive")
 
+  coordinates = []
+  for value, label in (
+    (start_x, "vision selection start X"),
+    (start_y, "vision selection start Y"),
+    (end_x, "vision selection end X"),
+    (end_y, "vision selection end Y"),
+  ):
+    if isinstance(value, bool):
+      raise MotionInputError(f"{label} must be an integer")
+    number = finite_number(value, label)
+    if not number.is_integer():
+      raise MotionInputError(f"{label} must be an integer")
+    coordinates.append(int(number))
+
+  x_start, y_start, x_end, y_end = coordinates
+  x_minimum = max(
+    0,
+    min(width, min(x_start, x_end) + VISION_SELECTION_INSET_PIXELS),
+  )
+  y_minimum = max(
+    0,
+    min(height, min(y_start, y_end) + VISION_SELECTION_INSET_PIXELS),
+  )
+  x_maximum = max(
+    0,
+    min(width, max(x_start, x_end) - VISION_SELECTION_INSET_PIXELS),
+  )
+  y_maximum = max(
+    0,
+    min(height, max(y_start, y_end) - VISION_SELECTION_INSET_PIXELS),
+  )
+  if x_minimum + 1 >= x_maximum or y_minimum + 1 >= y_maximum:
+    raise MotionInputError(
+      "vision selection must enclose an area after applying the inset"
+    )
+  return x_minimum, y_minimum, x_maximum, y_maximum
+
+
+def _mask_crop(event, x, y, flags, param):
     if (not RUN['button_down']) and (event == cv2.EVENT_LBUTTONDOWN):
         RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = x, y, x, y
         RUN['cropping'] = True
@@ -28883,10 +29172,18 @@ def _mask_crop(event, x, y, flags, param):
         RUN['x_end'], RUN['y_end'] = x, y
         RUN['cropping'] = False # cropping is finished
 
-        RUN['mX1'] = RUN['x_start']+3
-        RUN['mY1'] = RUN['y_start']+3
-        RUN['mX2'] = RUN['x_end']-3
-        RUN['mY2'] = RUN['y_end']-3
+        (
+          RUN['mX1'],
+          RUN['mY1'],
+          RUN['mX2'],
+          RUN['mY2'],
+        ) = _normalized_vision_selection_bounds(
+          RUN['oriImage'],
+          RUN['x_start'],
+          RUN['y_start'],
+          RUN['x_end'],
+          RUN['y_end'],
+        )
 
         CAL['autoBGVal'] = int(RUN['autoBG'].get())
         if(CAL['autoBGVal']==1):
@@ -28928,8 +29225,9 @@ def _mask_crop(event, x, y, flags, param):
         vid_lbl.imgtk = imgtk    
         vid_lbl.configure(image=imgtk) 
         filename = 'curImage.jpg'
-        if not cv2.imwrite(filename, RUN['oriImage']):
-            raise OSError("masked vision frame could not be persisted")
+        with _vision_artifact_operation("vision mask persistence"):
+            if not cv2.imwrite(filename, RUN['oriImage']):
+                raise OSError("masked vision frame could not be persisted")
         cv2.destroyAllWindows()
     return True
 
@@ -28937,8 +29235,14 @@ def _mask_crop(event, x, y, flags, param):
 def mask_crop(event, x, y, flags, param):
     try:
         return _mask_crop(event, x, y, flags, param)
-    except Exception:
-        logger.exception("Vision mask processing failed")
+    except Exception as exc:
+        detail = normalize_camera_exception_detail(exc)
+        message = f"VISION MASK PROCESSING FAILED: {detail}"
+        logger.exception(message)
+        try:
+            _set_application_status(message, "Alarm.TLabel")
+        except Exception:
+            logger.exception("Unable to present a vision mask failure")
         try:
             cv2.destroyAllWindows()
         except Exception:
@@ -28950,14 +29254,7 @@ def selectMask():
   try:
     RUN['button_down'] = False
     RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
-    if mask_pic() is not True:
-      raise MotionInputError("vision mask capture failed")
-
-    image = load_bounded_vision_image(
-      'curImage.jpg',
-      cv2.IMREAD_COLOR,
-      "captured mask frame",
-    )
+    image = _capture_mask_selection_image()
     RUN['oriImage'] = image.copy()
 
     cv2.namedWindow("image")
@@ -28974,10 +29271,7 @@ def selectMask():
 
 
 
-def mouse_crop(event, x, y, flags, param):
-    cropDone = False
-    
-
+def _mouse_crop(event, x, y, flags, param):
     if (not RUN['button_down']) and (event == cv2.EVENT_LBUTTONDOWN):
         RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = x, y, x, y
         RUN['cropping'] = True
@@ -29003,18 +29297,56 @@ def mouse_crop(event, x, y, flags, param):
         RUN['x_end'], RUN['y_end'] = x, y
         RUN['cropping'] = False # cropping is finished
 
-        refPoint = [(RUN['x_start']+3, RUN['y_start']+3), (RUN['x_end']-3, RUN['y_end']-3)]
+        x_minimum, y_minimum, x_maximum, y_maximum = (
+          _normalized_vision_selection_bounds(
+            RUN['oriImage'],
+            RUN['x_start'],
+            RUN['y_start'],
+            RUN['x_end'],
+            RUN['y_end'],
+          )
+        )
+        roi = RUN['oriImage'][
+          y_minimum:y_maximum,
+          x_minimum:x_maximum,
+        ]
+        cv2.imshow("Cropped", roi)
+        template_name = simpledialog.askstring(
+          title="Teach Vision Object",
+          prompt="Save Object As:",
+        )
+        if (
+          not isinstance(template_name, str)
+          or not template_name
+          or template_name != template_name.strip()
+          or os.path.basename(template_name) != template_name
+          or "\x00" in template_name
+        ):
+          raise MotionInputError("vision template name is invalid")
+        template_filename = template_name + ".jpg"
+        with _vision_artifact_operation("vision template persistence"):
+          if not cv2.imwrite(template_filename, roi):
+            raise OSError("vision template could not be persisted")
+        cv2.destroyAllWindows()
+        updateVisOp()
 
-        if len(refPoint) == 2: #when two points were found
-            roi = RUN['oriImage'][refPoint[0][1]:refPoint[1][1], refPoint[0][0]:refPoint[1][0]]
-            
-            cv2.imshow("Cropped", roi)
-            USER_INP = simpledialog.askstring(title="Teach Vision Object",
-                                  prompt="Save Object As:")
-            templateName = USER_INP+".jpg"                      
-            cv2.imwrite(templateName, roi)
+
+def mouse_crop(event, x, y, flags, param):
+    try:
+        return _mouse_crop(event, x, y, flags, param)
+    except Exception as exc:
+        detail = normalize_camera_exception_detail(exc)
+        message = f"VISION TEMPLATE PROCESSING FAILED: {detail}"
+        logger.exception(message)
+        try:
+            _set_application_status(message, "Alarm.TLabel")
+        except Exception:
+            logger.exception("Unable to present a vision template failure")
+        try:
             cv2.destroyAllWindows()
-            updateVisOp()  
+        except Exception:
+            logger.exception("Unable to close vision template windows")
+        return False
 
 
 
@@ -29022,11 +29354,12 @@ def selectTemplate():
   try:
     RUN['button_down'] = False
     RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
-    image = load_bounded_vision_image(
-      'curImage.jpg',
-      cv2.IMREAD_COLOR,
-      "captured template frame",
-    )
+    with _vision_artifact_operation("vision template selection"):
+      image = load_bounded_vision_image(
+        'curImage.jpg',
+        cv2.IMREAD_COLOR,
+        "captured template frame",
+      )
     RUN['oriImage'] = image.copy()
     cv2.namedWindow("image")
     cv2.setMouseCallback("image", mouse_crop)
@@ -29045,7 +29378,7 @@ def selectTemplate():
 
 def snapFind():
   try:
-    if take_pic() is not True:
+    if take_pic(cancellation_event=application_closing) is not True:
       return False
     template = RUN['selectedTemplate'].get()
     min_score = float(VisScoreEntryField.get())*.01
@@ -29096,18 +29429,19 @@ def visFind(template,min_score,background):
     if min_score < 0 or min_score > 1:
       raise MotionInputError(
         "vision minimum score must be between 0 and 1"
-      )
+    )
     background = _average_vision_grayscale_samples((background,))
-    img1 = load_bounded_vision_image(
-      'curImage.jpg',
-      cv2.IMREAD_GRAYSCALE,
-      "captured vision frame",
-    )
-    img2 = load_bounded_vision_image(
-      template,
-      cv2.IMREAD_GRAYSCALE,
-      "vision template",
-    )
+    with _vision_artifact_operation("vision matching input"):
+      img1 = load_bounded_vision_image(
+        'curImage.jpg',
+        cv2.IMREAD_GRAYSCALE,
+        "captured vision frame",
+      )
+      img2 = load_bounded_vision_image(
+        template,
+        cv2.IMREAD_GRAYSCALE,
+        "vision template",
+      )
     if img2.shape[0] > img1.shape[0] or img2.shape[1] > img1.shape[1]:
       raise MotionInputError(
         "vision template must not exceed the captured frame dimensions"
@@ -29332,11 +29666,12 @@ def VisOpUpdate(foo):
     file = RUN['selectedTemplate'].get()
     logger.info(file)
     try:
-      img = load_bounded_vision_image(
-        file,
-        cv2.IMREAD_COLOR,
-        "vision template",
-      )
+      with _vision_artifact_operation("vision template preview"):
+        img = load_bounded_vision_image(
+          file,
+          cv2.IMREAD_COLOR,
+          "vision template",
+        )
       img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
       square = fit_vision_preview_square(img, 150)
       img = Image.fromarray(square)
@@ -29360,10 +29695,10 @@ def zeroBrCn():
   RUN['mY2'] = 480
   VisBrightSlide.set(0)
   VisContrastSlide.set(0)
-  return take_pic()
+  return request_vision_capture()
 
 def VisUpdateBriCon(foo):
-  return take_pic()
+  return request_vision_capture()
 
   
   
@@ -34672,7 +35007,7 @@ match CE['Platform']['OS']:
       camList = []
       label_to_id = {}
 
-    selected_label = tk.StringVar(value=(camList[0] if camList else "Select a Camera"))
+    selected_label = camList[0] if camList else "Select a Camera"
 
     visoptions = StringVar(tab6)
     visoptions.set("Select a Camera")
@@ -34681,7 +35016,7 @@ match CE['Platform']['OS']:
       vismenu = OptionMenu(
         tab6,
         visoptions,
-        selected_label.get(),
+        selected_label,
         *camList,
         command=_on_vision_camera_select,
       )
@@ -34700,7 +35035,12 @@ StartCamBut.place(x=200, y=10)
 StopCamBut = Button(tab6,  text="Stop Camera",  width=12, command = stop_vid)
 StopCamBut.place(x=315, y=10)
 
-CapImgBut = Button(tab6,  text="Snap Image",  width=12, command = take_pic)
+CapImgBut = Button(
+  tab6,
+  text="Snap Image",
+  width=12,
+  command=request_vision_capture,
+)
 CapImgBut.place(x=10, y=50)
 
 TeachImgBut = Button(tab6,  text="Teach Object",  width=12, command = selectTemplate)

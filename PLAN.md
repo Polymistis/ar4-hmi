@@ -618,11 +618,30 @@ Implemented portion:
   or a quiescent device. Step Reverse returns camera settlement through the Tk
   event poll, and cancellation retires an unready start request before row
   ownership is released. Preview-off still capture reuses the same validated
-  worker lifecycle and backend instead of opening an independent capture path,
-  but the calling Tk workflow still waits for that result.
+  worker lifecycle and backend instead of opening an independent capture path.
+  A capture-only worker now snapshots brightness, contrast, zoom, mask, and
+  background inputs on Tk; coalesces pending `Snap Image`, `Zero`, and slider-
+  release requests to the latest complete settings record; and performs camera
+  acquisition, grayscale conversion, zoom, mask application, display resizing,
+  and image persistence away from Tk. Request-scoped results return through the
+  existing camera poll for Tk-only image and field presentation. A capture
+  submitted during preview startup waits for the first owned frame, while a
+  capture submitted during preview teardown waits for device quiescence before
+  starting a one-shot request. A non-waiting artifact owner rejects overlapping
+  capture, mask, template, and matching file access instead of racing the shared
+  image files or blocking Tk behind another workflow. Shutdown cancels pending
+  capture-only work and
+  supervises an active capture under the bounded camera-worker grace period.
+  Mask and template drag bounds normalize direction, clamp to the captured
+  image, and reject undersized selections before mutating stored mask state;
+  callback persistence failures close the OpenCV windows and publish an HMI
+  alarm. Successful capture events are presented in worker order, so a failed
+  coalesced successor cannot leave the most recent retained successful capture
+  hidden behind an older displayed still frame.
+  Hardware camera behavior and timing remain unverified.
 
 Remaining scope includes broader program and G-code row-execution admission,
-asynchronous still-capture presentation and image processing, matching, mask,
+asynchronous Snap-and-Find and program-row capture, matching, interactive mask,
 and template workflows, Modbus, auxiliary connection and device paths,
 request-scoped program-owner watchdog and recovery semantics for a lost worker
 or completion callback, durable event-poll failure handling when the Tk

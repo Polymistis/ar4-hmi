@@ -139,7 +139,12 @@ from ARrobots.HMI.vision_io import (
     CameraPreviewEvent,
     CameraPreviewFrame,
     CameraPreviewLifecycleState,
+    VisionCaptureEvent,
+    VisionCaptureResult,
+    VisionCaptureSettings,
+    VisionCaptureSubmission,
     normalize_camera_exception_detail,
+    prepare_vision_capture_result,
 )
 from ARrobots.HMI.Calibration import apply_calibration
 from ARrobots.Calibration import snapshot_calibration_values
@@ -419,6 +424,15 @@ class HmiSourceContractTests(unittest.TestCase):
                 "programStopStatusLatched": False,
             },
         )
+
+        @contextmanager
+        def vision_artifact_operation(context):
+            yield
+
+        namespace.setdefault(
+            "_vision_artifact_operation",
+            vision_artifact_operation,
+        )
         namespace.setdefault("gcode_storage_state_lock", threading.Lock())
         namespace.setdefault(
             "controller_identity_state_lock",
@@ -567,6 +581,15 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_selected_program_row",
                 "_program_row_error_detail",
             ),
+            "_capture_mask_selection_image": (
+                "_prepare_mask_selection_image",
+            ),
+            "selectMask": ("_capture_mask_selection_image",),
+            "_normalized_vision_selection_bounds": (
+                "_vision_sample_coordinate",
+            ),
+            "_mask_crop": ("_normalized_vision_selection_bounds",),
+            "_mouse_crop": ("_normalized_vision_selection_bounds",),
             "_commit_called_program_navigation": (
                 "_clear_robot_program_return_state",
             ),
@@ -3877,6 +3900,18 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(worker.stops, 1)
         self.assertEqual(statuses, [])
 
+        namespace["RUN"]["cameraPreviewRequestId"] = None
+        self.assertFalse(stop())
+        self.assertEqual(worker.stops, 1)
+        self.assertEqual(
+            statuses[-1],
+            (
+                "CAMERA PREVIEW STOP REJECTED: "
+                "no preview request is active",
+                "Warn.TLabel",
+            ),
+        )
+
         closing.set()
         self.assertFalse(start())
         self.assertEqual(worker.starts, ["/dev/video4"])
@@ -3914,7 +3949,11 @@ class HmiSourceContractTests(unittest.TestCase):
             if (
                 len(assignment.targets) != 1
                 or not isinstance(assignment.targets[0], ast.Name)
-                or assignment.targets[0].id not in {"StartCamBut", "StopCamBut"}
+                or assignment.targets[0].id not in {
+                    "StartCamBut",
+                    "StopCamBut",
+                    "CapImgBut",
+                }
                 or not isinstance(assignment.value, ast.Call)
             ):
                 continue
@@ -3927,9 +3966,16 @@ class HmiSourceContractTests(unittest.TestCase):
                 None,
             )
             button_commands[assignment.targets[0].id] = command
-        self.assertEqual(set(button_commands), {"StartCamBut", "StopCamBut"})
+        self.assertEqual(
+            set(button_commands),
+            {"StartCamBut", "StopCamBut", "CapImgBut"},
+        )
         self.assertEqual(button_commands["StartCamBut"].id, "start_vid")
         self.assertEqual(button_commands["StopCamBut"].id, "stop_vid")
+        self.assertEqual(
+            button_commands["CapImgBut"].id,
+            "request_vision_capture",
+        )
 
         camera_menus = [
             node
@@ -4124,9 +4170,11 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.settled = True
                 self.active = False
                 self.fault_reason = None
+                self.idle_settled = True
                 self.ready_calls = []
                 self.stop_calls = []
                 self.settle_calls = []
+                self.idle_wait_calls = []
                 self.close_calls = 0
 
             def wait_ready(self, request_id, timeout, cancellation):
@@ -4160,6 +4208,10 @@ class HmiSourceContractTests(unittest.TestCase):
             def close(self):
                 self.close_calls += 1
                 return False
+
+            def wait_stopped(self, timeout, cancellation=None):
+                self.idle_wait_calls.append((timeout, cancellation))
+                return self.idle_settled
 
         worker = Worker()
         submitted_sources = []
@@ -4232,6 +4284,37 @@ class HmiSourceContractTests(unittest.TestCase):
             worker.settle_calls[-1],
             (8, 10.0, cancellation, True),
         )
+
+        worker.ready = False
+        worker.settled = False
+        namespace["RUN"]["cameraPreviewRequestId"] = 7
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "cleanup timed out after readiness timeout",
+        ):
+            wait_start(execution_request)
+        self.assertEqual(worker.close_calls, 1)
+        self.assertIsNone(namespace["RUN"]["cameraPreviewRequestId"])
+        self.assertFalse(namespace["RUN"]["cam_on"])
+
+        namespace["RUN"]["cameraPreviewRequestId"] = 9
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "did not stop before timeout",
+        ):
+            wait_stop(execution_request)
+        self.assertEqual(worker.close_calls, 2)
+        self.assertIsNone(namespace["RUN"]["cameraPreviewRequestId"])
+
+        worker.active = True
+        worker.idle_settled = True
+        namespace["RUN"]["cameraPreviewRequestId"] = None
+        self.assertTrue(wait_stop(execution_request))
+        self.assertEqual(
+            worker.idle_wait_calls[-1],
+            (10.0, cancellation),
+        )
+
         program_start = self.module_functions[
             "_wait_for_program_camera_start"
         ]
@@ -4551,6 +4634,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 lambda message, style: statuses.append((message, style))
             ),
             "_drain_program_camera_completion_events": lambda: True,
+            "_drain_vision_capture_events": lambda: True,
             "_reschedule_event_poll": rescheduled.append,
         }
         namespace["show_frame"] = self.compile_function(
@@ -4624,6 +4708,16 @@ class HmiSourceContractTests(unittest.TestCase):
             ],
         )
 
+        namespace["RUN"]["cameraPreviewRequestId"] = request_id + 1
+        namespace["RUN"]["cam_on"] = True
+        events.append(
+            CameraPreviewEvent(4, "stopped", request_id + 1)
+        )
+        poll()
+        self.assertFalse(namespace["RUN"]["cam_on"])
+        self.assertIsNone(namespace["RUN"]["cameraPreviewRequestId"])
+        self.assertEqual(len(rescheduled), 4)
+
     def test_vision_capture_uses_preview_snapshot_or_owned_one_shot(self):
         preview_frame = np.full((2, 3, 3), 8, dtype=np.uint8)
 
@@ -4631,16 +4725,41 @@ class HmiSourceContractTests(unittest.TestCase):
             active = True
             fault_reason = None
             one_shot_calls = []
-
-            @staticmethod
-            def snapshot_raw_frame(request_id):
-                self.assertEqual(request_id, 6)
-                return preview_frame.copy()
+            stop_wait_calls = []
+            transition_wait_calls = []
+            transition_frame = None
 
             @classmethod
-            def capture_once(cls, camera_source, timeout):
-                cls.one_shot_calls.append((camera_source, timeout))
+            def snapshot_raw_frame(cls, request_id):
+                return preview_frame.copy() if request_id == 6 else None
+
+            @classmethod
+            def capture_once(cls, camera_source, timeout, cancellation=None):
+                cls.one_shot_calls.append(
+                    (camera_source, timeout, cancellation)
+                )
                 return np.ones((2, 3, 3), dtype=np.uint8)
+
+            @classmethod
+            def wait_stopped(cls, timeout, cancellation=None):
+                cls.stop_wait_calls.append((timeout, cancellation))
+                cls.active = False
+                return True
+
+            @classmethod
+            def wait_snapshot_or_stopped(
+                cls,
+                request_id,
+                timeout,
+                cancellation=None,
+            ):
+                cls.transition_wait_calls.append(
+                    (request_id, timeout, cancellation)
+                )
+                if cls.transition_frame is not None:
+                    return cls.transition_frame.copy()
+                cls.active = False
+                return None
 
         namespace = {
             "RUN": {
@@ -4668,14 +4787,54 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(np.all(captured == 1))
         self.assertEqual(
             PreviewWorker.one_shot_calls,
-            [("/dev/video3", 10.0)],
+            [("/dev/video3", 10.0, None)],
         )
 
         namespace["camera_preview_worker"].active = True
-        with self.assertRaisesRegex(
-            MotionInputError,
-            "transition is still active",
-        ):
+        captured = capture_frame()
+        self.assertTrue(np.all(captured == 1))
+        self.assertEqual(
+            PreviewWorker.stop_wait_calls,
+            [(10.0, None)],
+        )
+
+        namespace["RUN"]["cameraPreviewRequestId"] = 8
+        PreviewWorker.transition_frame = np.full(
+            (2, 3, 3),
+            9,
+            dtype=np.uint8,
+        )
+        namespace["camera_preview_worker"].active = True
+        captured = capture_frame()
+        self.assertTrue(np.all(captured == 9))
+        self.assertEqual(
+            PreviewWorker.transition_wait_calls,
+            [(8, 10.0, None)],
+        )
+        self.assertEqual(namespace["RUN"]["cameraPreviewRequestId"], 8)
+
+        namespace["RUN"]["cameraPreviewRequestId"] = 9
+        PreviewWorker.transition_frame = None
+        namespace["camera_preview_worker"].active = True
+        captured = capture_frame()
+        self.assertTrue(np.all(captured == 1))
+        self.assertEqual(
+            PreviewWorker.transition_wait_calls[-1],
+            (9, 10.0, None),
+        )
+        self.assertIsNone(namespace["RUN"]["cameraPreviewRequestId"])
+
+        namespace["RUN"]["cameraPreviewRequestId"] = 10
+        namespace["camera_preview_worker"].active = True
+
+        def replace_during_wait(request_id, timeout, cancellation=None):
+            namespace["RUN"]["cameraPreviewRequestId"] = 11
+            return None
+
+        namespace[
+            "camera_preview_worker"
+        ].wait_snapshot_or_stopped = replace_during_wait
+        with self.assertRaisesRegex(MotionInputError, "ownership changed"):
             capture_frame()
 
         namespace["camera_preview_worker"].active = False
@@ -4694,7 +4853,337 @@ class HmiSourceContractTests(unittest.TestCase):
         ):
             capture_frame()
 
-    def test_mask_capture_uses_owned_frame_source(self):
+    def test_capture_only_request_snapshots_tk_and_applies_on_poll(self):
+        class Entry:
+            def __init__(self, value):
+                self.value = value
+                self.states = []
+
+            def get(self):
+                return self.value
+
+            def configure(self, **kwargs):
+                self.states.append(kwargs)
+
+            def delete(self, *args):
+                self.value = ""
+
+            def insert(self, index, value):
+                self.value = value
+
+        runtime = {
+            "autoBG": Entry("0"),
+            "mX1": 0,
+            "mY1": 0,
+            "mX2": 6,
+            "mY2": 4,
+            "visionCaptureRequestId": None,
+        }
+        background_entry = Entry("[255, 1, 2]")
+        namespace = {
+            "RUN": runtime,
+            "VisBrightSlide": Entry("3"),
+            "VisContrastSlide": Entry("-4"),
+            "VisZoomSlide": Entry("50"),
+            "VisBacColorEntryField": background_entry,
+            "VisX1PixEntryField": Entry("0"),
+            "VisY1PixEntryField": Entry("0"),
+            "VisX2PixEntryField": Entry("1"),
+            "VisY2PixEntryField": Entry("1"),
+            "VisionCaptureSettings": VisionCaptureSettings,
+            "normalize_vision_background_color": (
+                normalize_vision_background_color
+            ),
+            "finite_number": finite_number,
+            "MotionInputError": MotionInputError,
+            "re": re,
+            "np": np,
+            "cv2": cv2,
+        }
+        namespace["_vision_sample_coordinate"] = self.compile_function(
+            "_vision_sample_coordinate",
+            namespace,
+        )
+        namespace["_vision_background_grayscale"] = self.compile_function(
+            "_vision_background_grayscale",
+            namespace,
+        )
+        snapshot = self.compile_function(
+            "_snapshot_vision_capture_settings",
+            namespace,
+        )
+
+        manual = snapshot()
+        self.assertEqual(manual.brightness, 3)
+        self.assertEqual(manual.contrast, -4)
+        self.assertFalse(manual.auto_background)
+        self.assertTrue(manual.persist_auto_background)
+        self.assertEqual(manual.mask_bounds, (0, 0, 6, 4))
+
+        runtime["autoBG"].value = "1"
+        automatic = snapshot()
+        self.assertTrue(automatic.auto_background)
+        self.assertEqual(
+            automatic.sample_points,
+            ((0, 0), (1, 0), (0, 1)),
+        )
+        program_automatic = snapshot("Auto")
+        self.assertTrue(program_automatic.auto_background)
+        self.assertFalse(program_automatic.persist_auto_background)
+
+        submissions = []
+
+        class Worker:
+            @staticmethod
+            def submit(settings):
+                submissions.append(settings)
+                return VisionCaptureSubmission(4, False)
+
+        statuses = []
+        namespace.update({
+            "application_closing": threading.Event(),
+            "vision_capture_worker": Worker(),
+            "vision_capture_request_lock": threading.Lock(),
+            "VisionCaptureSubmission": VisionCaptureSubmission,
+            "_snapshot_vision_capture_settings": snapshot,
+            "normalize_camera_exception_detail": (
+                normalize_camera_exception_detail
+            ),
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                exception=lambda *args: None,
+            ),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+        })
+        request_capture = self.compile_function(
+            "request_vision_capture",
+            namespace,
+        )
+        self.assertTrue(request_capture())
+        self.assertEqual(runtime["visionCaptureRequestId"], 4)
+        self.assertEqual(submissions, [automatic])
+        self.assertEqual(statuses[-1][0], "VISION CAPTURE IN PROGRESS")
+
+        result = prepare_vision_capture_result(
+            np.zeros((4, 6, 3), dtype=np.uint8),
+            automatic,
+        )
+        label = SimpleNamespace(
+            imgtk=None,
+            configure=lambda **kwargs: None,
+        )
+        namespace.update({
+            "CAL": {},
+            "VisionCaptureEvent": VisionCaptureEvent,
+            "VisionCaptureResult": VisionCaptureResult,
+            "Image": SimpleNamespace(fromarray=lambda image: image),
+            "ImageTk": SimpleNamespace(PhotoImage=lambda image: image),
+            "vid_lbl": label,
+        })
+        namespace["_apply_vision_capture_result"] = self.compile_function(
+            "_apply_vision_capture_result",
+            namespace,
+        )
+        apply_event = self.compile_function(
+            "_apply_vision_capture_event",
+            namespace,
+        )
+        self.assertTrue(apply_event(VisionCaptureEvent(0, 4, result=result)))
+        self.assertIsNone(runtime["visionCaptureRequestId"])
+        self.assertEqual(runtime["BGavg"], result.auto_background_rgb)
+        self.assertEqual(namespace["CAL"]["zoom"], 50)
+        self.assertEqual(namespace["CAL"]["autoBGVal"], 1)
+        self.assertIs(label.imgtk, result.display_image)
+        self.assertEqual(statuses[-1][0], "VISION CAPTURE COMPLETE")
+
+        fallback = prepare_vision_capture_result(
+            np.full((4, 6, 3), 90, dtype=np.uint8),
+            manual,
+        )
+        runtime["visionCaptureRequestId"] = 5
+        self.assertFalse(
+            apply_event(VisionCaptureEvent(1, 4, result=fallback))
+        )
+        self.assertEqual(runtime["visionCaptureRequestId"], 5)
+        self.assertIs(label.imgtk, fallback.display_image)
+        self.assertFalse(
+            apply_event(
+                VisionCaptureEvent(
+                    2,
+                    5,
+                    error_detail="replacement capture failed",
+                )
+            )
+        )
+        self.assertIsNone(runtime["visionCaptureRequestId"])
+        self.assertIs(label.imgtk, fallback.display_image)
+
+        for function_name in ("zeroBrCn", "VisUpdateBriCon"):
+            calls = {
+                node.func.id
+                for node in ast.walk(self.module_functions[function_name])
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                )
+            }
+            self.assertIn("request_vision_capture", calls)
+            self.assertNotIn("take_pic", calls)
+
+        request_calls = {
+            node.func.id
+            for node in ast.walk(
+                self.module_functions["request_vision_capture"]
+            )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+            )
+        }
+        self.assertTrue(
+            request_calls.isdisjoint(
+                {
+                    "_capture_current_vision_frame",
+                    "_perform_vision_capture",
+                    "prepare_vision_capture_result",
+                }
+            )
+        )
+        worker_names = {
+            node.id
+            for node in ast.walk(
+                self.module_functions["_perform_vision_capture"]
+            )
+            if isinstance(node, ast.Name)
+        }
+        self.assertTrue(
+            worker_names.isdisjoint(
+                {
+                    "VisBrightSlide",
+                    "VisContrastSlide",
+                    "VisZoomSlide",
+                    "VisBacColorEntryField",
+                    "VisX1PixEntryField",
+                    "VisY1PixEntryField",
+                    "VisX2PixEntryField",
+                    "VisY2PixEntryField",
+                    "vid_lbl",
+                }
+            )
+        )
+
+    def test_vision_artifact_operations_reject_overlap_without_waiting(self):
+        namespace = {
+            "contextmanager": contextmanager,
+            "vision_artifact_lock": threading.Lock(),
+            "MotionInputError": MotionInputError,
+        }
+        artifact_operation = self.compile_function(
+            "_vision_artifact_operation",
+            namespace,
+            preserve_decorators=True,
+        )
+
+        with artifact_operation("vision test"):
+            with self.assertRaisesRegex(
+                MotionInputError,
+                "another vision artifact operation is active",
+            ):
+                with artifact_operation("overlapping vision test"):
+                    self.fail("overlapping artifact work must not run")
+        self.assertFalse(namespace["vision_artifact_lock"].locked())
+        with self.assertRaisesRegex(TypeError, "normalized text"):
+            with artifact_operation(" invalid"):
+                self.fail("invalid artifact context must not run")
+
+    def test_shared_vision_artifact_call_sites_acquire_the_owner(self):
+        expected_contexts = {
+            "_perform_vision_capture": "vision capture",
+            "_capture_mask_selection_image": "vision mask selection",
+            "_mask_crop": "vision mask persistence",
+            "_mouse_crop": "vision template persistence",
+            "selectTemplate": "vision template selection",
+            "visFind": "vision matching input",
+            "VisOpUpdate": "vision template preview",
+        }
+
+        for function_name, expected_context in expected_contexts.items():
+            contexts = []
+            for node in ast.walk(self.module_functions[function_name]):
+                if not isinstance(node, ast.With):
+                    continue
+                for item in node.items:
+                    expression = item.context_expr
+                    if (
+                        isinstance(expression, ast.Call)
+                        and isinstance(expression.func, ast.Name)
+                        and expression.func.id == "_vision_artifact_operation"
+                        and len(expression.args) == 1
+                        and isinstance(expression.args[0], ast.Constant)
+                    ):
+                        contexts.append(expression.args[0].value)
+            self.assertIn(expected_context, contexts, function_name)
+
+    def test_capture_worker_operation_persists_without_tk_access(self):
+        settings = VisionCaptureSettings(
+            brightness=0,
+            contrast=0,
+            zoom_percent=50,
+            mask_bounds=(0, 0, 6, 4),
+            auto_background=False,
+            persist_auto_background=True,
+            background_grayscale=0,
+            sample_points=(),
+        )
+        frame = np.zeros((4, 6, 3), dtype=np.uint8)
+        expected = prepare_vision_capture_result(frame, settings)
+        captures = []
+        writes = []
+        write_succeeds = [True]
+        cancellation = threading.Event()
+        namespace = {
+            "VisionCaptureSettings": VisionCaptureSettings,
+            "MotionInputError": MotionInputError,
+            "_capture_current_vision_frame": (
+                lambda event: captures.append(event) or frame.copy()
+            ),
+            "prepare_vision_capture_result": (
+                lambda captured, captured_settings: expected
+            ),
+            "cv2": SimpleNamespace(
+                imwrite=lambda filename, image: (
+                    writes.append((filename, image))
+                    or write_succeeds[0]
+                )
+            ),
+        }
+        namespace["_vision_capture_cancelled"] = self.compile_function(
+            "_vision_capture_cancelled",
+            namespace,
+        )
+        perform = self.compile_function(
+            "_perform_vision_capture",
+            namespace,
+        )
+
+        self.assertIs(perform(settings, cancellation), expected)
+        self.assertEqual(captures, [cancellation])
+        self.assertEqual(writes[0][0], "curImage.jpg")
+        self.assertIs(writes[0][1], expected.image)
+
+        write_succeeds[0] = False
+        with self.assertRaisesRegex(OSError, "could not be persisted"):
+            perform(settings, cancellation)
+
+        cancellation.set()
+        capture_count = len(captures)
+        with self.assertRaisesRegex(MotionInputError, "was cancelled"):
+            perform(settings, cancellation)
+        self.assertEqual(len(captures), capture_count)
+
+    def test_mask_selection_capture_owns_persistence_and_reload(self):
         class Value:
             def __init__(self, value):
                 self.value = value
@@ -4704,7 +5193,15 @@ class HmiSourceContractTests(unittest.TestCase):
 
         captures = []
         writes = []
+        loads = []
+        artifact_contexts = []
         frame = np.full((4, 6, 3), 40, dtype=np.uint8)
+
+        @contextmanager
+        def artifact_operation(context):
+            artifact_contexts.append(context)
+            yield
+
         namespace = {
             "CAL": {"zoom": 50},
             "VisBrightSlide": Value(0),
@@ -4714,7 +5211,16 @@ class HmiSourceContractTests(unittest.TestCase):
                 lambda: captures.append(True) or frame.copy()
             ),
             "np": np,
+            "MotionInputError": MotionInputError,
+            "_vision_artifact_operation": artifact_operation,
+            "load_bounded_vision_image": (
+                lambda filename, mode, context: (
+                    loads.append((filename, mode, context))
+                    or np.zeros((4, 6, 3), dtype=np.uint8)
+                )
+            ),
             "cv2": SimpleNamespace(
+                IMREAD_COLOR=cv2.IMREAD_COLOR,
                 COLOR_BGR2GRAY=cv2.COLOR_BGR2GRAY,
                 cvtColor=cv2.cvtColor,
                 resize=cv2.resize,
@@ -4725,157 +5231,99 @@ class HmiSourceContractTests(unittest.TestCase):
                 ),
             ),
         }
-        mask_pic = self.compile_function("mask_pic", namespace)
+        capture_mask = self.compile_function(
+            "_capture_mask_selection_image",
+            namespace,
+        )
 
-        self.assertTrue(mask_pic())
+        image = capture_mask()
         self.assertEqual(captures, [True])
+        self.assertEqual(artifact_contexts, ["vision mask selection"])
         self.assertEqual(writes[0][0], "curImage.jpg")
         self.assertEqual(writes[0][1].shape, (4, 6))
-
-    def test_take_pic_propagates_failure_and_uses_rgb_grayscale(self):
-        class Entry:
-            def __init__(self, value="0"):
-                self.value = value
-
-            def get(self):
-                return self.value
-
-            def configure(self, **kwargs):
-                pass
-
-            def delete(self, *args):
-                self.value = ""
-
-            def insert(self, index, value):
-                self.value = value
-
-        class Capture:
-            succeeds = True
-
-            @classmethod
-            def read(cls):
-                if not cls.succeeds:
-                    return False, None
-                return True, np.zeros((4, 4, 3), dtype=np.uint8)
-
-        class PillowImage:
-            def resize(self, size):
-                return self
-
-        writes = []
-        write_succeeds = [True]
-        errors = []
-        vision_cv2 = SimpleNamespace(
-            COLOR_BGR2GRAY=cv2.COLOR_BGR2GRAY,
-            COLOR_RGB2GRAY=cv2.COLOR_RGB2GRAY,
-            cvtColor=cv2.cvtColor,
-            resize=cv2.resize,
-            imwrite=lambda filename, image: (
-                writes.append((filename, image.copy()))
-                or write_succeeds[0]
-            ),
+        self.assertEqual(
+            loads,
+            [
+                (
+                    "curImage.jpg",
+                    cv2.IMREAD_COLOR,
+                    "captured mask frame",
+                )
+            ],
         )
+        self.assertEqual(image.shape, (4, 6, 3))
+
+    def test_take_pic_propagates_capture_and_presentation_failures(self):
+        settings = VisionCaptureSettings(
+            brightness=0,
+            contrast=0,
+            zoom_percent=50,
+            mask_bounds=(0, 0, 4, 4),
+            auto_background=False,
+            persist_auto_background=True,
+            background_grayscale=0,
+            sample_points=(),
+        )
+        result = prepare_vision_capture_result(
+            np.zeros((4, 4, 3), dtype=np.uint8),
+            settings,
+        )
+        snapshots = []
+        captures = []
+        presentations = []
+        errors = []
+        cancellation = threading.Event()
         namespace = {
-            "MotionInputError": MotionInputError,
-            "finite_number": finite_number,
-            "normalize_vision_background_color": (
-                normalize_vision_background_color
+            "_snapshot_vision_capture_settings": (
+                lambda background: (
+                    snapshots.append(background) or settings
+                )
             ),
-            "np": np,
-            "cv2": vision_cv2,
-            "re": re,
+            "_perform_vision_capture": (
+                lambda captured_settings, captured_cancellation: (
+                    captures.append(
+                        (captured_settings, captured_cancellation)
+                    )
+                    or result
+                )
+            ),
+            "_apply_vision_capture_result": (
+                lambda captured_result: (
+                    presentations.append(captured_result) or True
+                )
+            ),
             "logger": SimpleNamespace(
                 exception=lambda *args: errors.append(args),
             ),
-            "RUN": {
-                "cam_on": True,
-                "cap": Capture(),
-                "autoBG": Entry("0"),
-                "mX1": 10,
-                "mY1": 0,
-                "mX2": 10,
-                "mY2": 10,
-            },
-            "CAL": {"zoom": 50},
-            "VisBrightSlide": Entry("0"),
-            "VisContrastSlide": Entry("0"),
-            "VisZoomSlide": Entry("50"),
-            "VisBacColorEntryField": Entry("[255, 1, 2]"),
-            "VisX1PixEntryField": Entry("0"),
-            "VisY1PixEntryField": Entry("0"),
-            "VisX2PixEntryField": Entry("1"),
-            "VisY2PixEntryField": Entry("1"),
-            "Image": SimpleNamespace(
-                fromarray=lambda image: PillowImage(),
-            ),
-            "ImageTk": SimpleNamespace(
-                PhotoImage=lambda image: object(),
-            ),
-            "_capture_current_vision_frame": (
-                lambda: Capture.read()[1]
-                if Capture.succeeds
-                else (_ for _ in ()).throw(
-                    MotionInputError(
-                        "camera did not return a captured frame"
-                    )
-                )
-            ),
-            "vid_lbl": SimpleNamespace(
-                imgtk=None,
-                configure=lambda **kwargs: None,
-            ),
         }
-        namespace["_vision_background_grayscale"] = self.compile_function(
-            "_vision_background_grayscale",
-            namespace,
-        )
-        namespace["_average_vision_grayscale_samples"] = self.compile_function(
-            "_average_vision_grayscale_samples",
-            namespace,
-        )
-        namespace["_vision_sample_coordinate"] = self.compile_function(
-            "_vision_sample_coordinate",
-            namespace,
-        )
-        namespace["_validated_vision_sample_pixels"] = self.compile_function(
-            "_validated_vision_sample_pixels",
-            namespace,
-        )
         take_pic = self.compile_function("take_pic", namespace)
 
-        self.assertTrue(take_pic())
-        self.assertEqual(len(writes), 1)
-        expected_grayscale = int(
-            cv2.cvtColor(
-                np.asarray([[[255, 1, 2]]], dtype=np.uint8),
-                cv2.COLOR_RGB2GRAY,
-            )[0][0]
-        )
-        self.assertTrue(np.all(writes[0][1] == expected_grayscale))
+        self.assertTrue(take_pic(cancellation_event=cancellation))
+        self.assertEqual(snapshots, [None])
+        self.assertEqual(captures, [(settings, cancellation)])
+        self.assertEqual(presentations, [result])
         self.assertEqual(errors, [])
 
-        namespace["VisX1PixEntryField"].value = "99"
-        self.assertFalse(take_pic("Auto"))
-        self.assertEqual(len(writes), 1)
+        namespace["_perform_vision_capture"] = (
+            lambda captured_settings, captured_cancellation: (
+                _ for _ in ()
+            ).throw(
+                MotionInputError("camera did not return a frame")
+            )
+        )
+        self.assertFalse(take_pic())
         self.assertEqual(len(errors), 1)
-        self.assertEqual(namespace["CAL"]["autoBGVal"], 0)
 
-        namespace["VisX1PixEntryField"].value = "0"
-        self.assertTrue(take_pic("Auto"))
-        self.assertEqual(len(writes), 2)
-        self.assertEqual(namespace["RUN"]["BGavg"], (0, 0, 0))
-        self.assertEqual(namespace["CAL"]["autoBGVal"], 0)
-
-        Capture.succeeds = False
+        namespace["_perform_vision_capture"] = (
+            lambda captured_settings, captured_cancellation: result
+        )
+        namespace["_apply_vision_capture_result"] = (
+            lambda captured_result: (_ for _ in ()).throw(
+                RuntimeError("presentation unavailable")
+            )
+        )
         self.assertFalse(take_pic())
-        self.assertEqual(len(writes), 2)
         self.assertEqual(len(errors), 2)
-
-        Capture.succeeds = True
-        write_succeeds[0] = False
-        self.assertFalse(take_pic())
-        self.assertEqual(len(writes), 3)
-        self.assertEqual(len(errors), 3)
 
     def test_snap_find_stops_after_capture_failure_and_converts_rgb(self):
         class Entry:
@@ -4895,6 +5343,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.value = value
 
         matches = []
+        capture_cancellations = []
+        closing = threading.Event()
         namespace = {
             "normalize_vision_background_color": (
                 normalize_vision_background_color
@@ -4911,10 +5361,14 @@ class HmiSourceContractTests(unittest.TestCase):
             "CAL": {},
             "VisScoreEntryField": Entry("85"),
             "VisBacColorEntryField": Entry("[255, 1, 2]"),
+            "application_closing": closing,
             "visFind": lambda template, score, background: (
                 matches.append((template, score, background)) or "pass"
             ),
-            "take_pic": lambda: False,
+            "take_pic": lambda **kwargs: (
+                capture_cancellations.append(kwargs["cancellation_event"])
+                or False
+            ),
         }
         namespace["_vision_background_grayscale"] = self.compile_function(
             "_vision_background_grayscale",
@@ -4927,8 +5381,12 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertFalse(snap_find())
         self.assertEqual(matches, [])
+        self.assertEqual(capture_cancellations, [closing])
 
-        namespace["take_pic"] = lambda: True
+        namespace["take_pic"] = lambda **kwargs: (
+            capture_cancellations.append(kwargs["cancellation_event"])
+            or True
+        )
         self.assertEqual(snap_find(), "pass")
         self.assertEqual(
             matches[-1],
@@ -5000,8 +5458,8 @@ class HmiSourceContractTests(unittest.TestCase):
             "re": re,
             "cv2": cv2,
             "np": np,
-            "take_pic": lambda background: (
-                captures.append(background) or False
+            "take_pic": lambda background, cancellation: (
+                captures.append((background, cancellation)) or False
             ),
             "visFind": lambda *args: matches.append(args) or "pass",
             "logger": SimpleNamespace(error=lambda *args: None),
@@ -5033,6 +5491,9 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace,
         )
         execute = self.compile_function("executeRow", namespace)
+        execution_cancellation = namespace[
+            "program_execution_active_request"
+        ].cancellation_boundary
         expected_background = namespace["_vision_background_grayscale"](
             [255, 1, 2]
         )
@@ -5040,11 +5501,11 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(execute(), "rejected")
         self.assertEqual(finishes, [True])
         self.assertEqual(matches, [])
-        self.assertEqual(captures, [[255, 1, 2]])
+        self.assertEqual(captures, [([255, 1, 2], execution_cancellation)])
         self.assertEqual(len(alarms), 2)
 
-        namespace["take_pic"] = lambda background: (
-            captures.append(background) or True
+        namespace["take_pic"] = lambda background, cancellation: (
+            captures.append((background, cancellation)) or True
         )
         finishes.clear()
         alarms.clear()
@@ -5053,7 +5514,7 @@ class HmiSourceContractTests(unittest.TestCase):
             matches[-1],
             ("template.jpg", 0.85, expected_background),
         )
-        self.assertEqual(captures[-1], [255, 1, 2])
+        self.assertEqual(captures[-1], ([255, 1, 2], execution_cancellation))
         self.assertEqual(ProgramView.selected, [0])
         self.assertEqual(finishes, [True])
         self.assertEqual(alarms, [])
@@ -5064,7 +5525,7 @@ class HmiSourceContractTests(unittest.TestCase):
         ).encode("ascii")
         finishes.clear()
         self.assertEqual(execute(), "complete")
-        self.assertEqual(captures[-1], "Auto")
+        self.assertEqual(captures[-1], ("Auto", execution_cancellation))
         self.assertEqual(
             matches[-1],
             ("template.jpg", 0.85, expected_background),
@@ -5077,7 +5538,7 @@ class HmiSourceContractTests(unittest.TestCase):
         ).encode("ascii")
         finishes.clear()
         self.assertEqual(execute(), "complete")
-        self.assertEqual(captures[-1], [255, 1, 2])
+        self.assertEqual(captures[-1], ([255, 1, 2], execution_cancellation))
         self.assertEqual(
             matches[-1],
             ("template.jpg", 0.85, expected_background),
@@ -5110,6 +5571,31 @@ class HmiSourceContractTests(unittest.TestCase):
         finishes.clear()
         self.assertEqual(execute(), "rejected")
         self.assertEqual(finishes, [True])
+
+    def test_vision_selection_bounds_normalize_clamp_and_reject_tiny_drags(self):
+        namespace = {
+            "MotionInputError": MotionInputError,
+            "finite_number": finite_number,
+            "VISION_SELECTION_INSET_PIXELS": 3,
+        }
+        normalize = self.compile_function(
+            "_normalized_vision_selection_bounds",
+            namespace,
+        )
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        self.assertEqual(
+            normalize(image, 630, 470, 10, 10),
+            (13, 13, 627, 467),
+        )
+        self.assertEqual(
+            normalize(image, -20, -30, 700, 520),
+            (0, 0, 640, 480),
+        )
+        with self.assertRaisesRegex(MotionInputError, "enclose an area"):
+            normalize(image, 10, 10, 15, 15)
+        with self.assertRaisesRegex(MotionInputError, "enclose an area"):
+            normalize(image, 10, 10, 17, 17)
 
     def test_mask_crop_writes_manual_rgb_as_bgr(self):
         class Entry:
@@ -5146,7 +5632,8 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             destroyAllWindows=lambda: None,
         )
-        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        image = np.zeros((12, 12, 3), dtype=np.uint8)
+        statuses = []
         namespace = {
             "normalize_vision_background_color": (
                 normalize_vision_background_color
@@ -5155,6 +5642,15 @@ class HmiSourceContractTests(unittest.TestCase):
             "logger": SimpleNamespace(
                 exception=lambda *args: errors.append(args),
             ),
+            "normalize_camera_exception_detail": (
+                normalize_camera_exception_detail
+            ),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+            "MotionInputError": MotionInputError,
+            "finite_number": finite_number,
+            "VISION_SELECTION_INSET_PIXELS": 3,
             "RUN": {
                 "button_down": True,
                 "box_points": [(0, 0)],
@@ -5192,36 +5688,52 @@ class HmiSourceContractTests(unittest.TestCase):
         mask_crop = self.compile_function("mask_crop", namespace)
 
         self.assertTrue(
-            mask_crop(vision_cv2.EVENT_LBUTTONUP, 4, 4, None, None)
+            mask_crop(vision_cv2.EVENT_LBUTTONUP, 12, 12, None, None)
         )
 
         self.assertEqual(len(writes), 1)
-        self.assertTrue(
-            np.all(writes[0][1] == np.asarray([2, 1, 255], dtype=np.uint8))
+        np.testing.assert_array_equal(
+            writes[0][1][0, 0],
+            np.asarray([2, 1, 255], dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            writes[0][1][5, 5],
+            np.asarray([0, 0, 0], dtype=np.uint8),
         )
         self.assertEqual(len(displays), 1)
-        self.assertTrue(
-            np.all(displays[0] == np.asarray([255, 1, 2], dtype=np.uint8))
+        np.testing.assert_array_equal(
+            displays[0][0, 0],
+            np.asarray([255, 1, 2], dtype=np.uint8),
+        )
+        self.assertEqual(
+            (
+                namespace["RUN"]["mX1"],
+                namespace["RUN"]["mY1"],
+                namespace["RUN"]["mX2"],
+                namespace["RUN"]["mY2"],
+            ),
+            (3, 3, 9, 9),
         )
 
         namespace["RUN"].update({
             "button_down": True,
             "box_points": [(0, 0)],
-            "oriImage": np.zeros((4, 4, 3), dtype=np.uint8),
+            "oriImage": np.zeros((12, 12, 3), dtype=np.uint8),
             "x_start": 0,
             "y_start": 0,
             "cropping": True,
         })
         namespace["VisBacColorEntryField"].value = "not-a-color"
         self.assertFalse(
-            mask_crop(vision_cv2.EVENT_LBUTTONUP, 4, 4, None, None)
+            mask_crop(vision_cv2.EVENT_LBUTTONUP, 12, 12, None, None)
         )
         self.assertEqual(len(errors), 1)
+        self.assertIn("VISION MASK PROCESSING FAILED", statuses[-1][0])
 
         namespace["RUN"].update({
             "button_down": True,
             "box_points": [(0, 0)],
-            "oriImage": np.zeros((4, 4, 3), dtype=np.uint8),
+            "oriImage": np.zeros((12, 12, 3), dtype=np.uint8),
             "x_start": 0,
             "y_start": 0,
             "cropping": True,
@@ -5229,7 +5741,7 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace["VisBacColorEntryField"].value = "[255, 1, 2]"
         write_succeeds[0] = False
         self.assertFalse(
-            mask_crop(vision_cv2.EVENT_LBUTTONUP, 4, 4, None, None)
+            mask_crop(vision_cv2.EVENT_LBUTTONUP, 12, 12, None, None)
         )
         self.assertEqual(len(errors), 2)
 
@@ -5237,7 +5749,9 @@ class HmiSourceContractTests(unittest.TestCase):
         errors = []
         callbacks = []
         destroy_calls = []
-        image_result = [np.zeros((2, 2, 3), dtype=np.uint8)]
+        capture_result = [
+            MotionInputError("camera did not return a mask frame")
+        ]
         window_failure = [False]
 
         def show_image(name, image):
@@ -5252,22 +5766,12 @@ class HmiSourceContractTests(unittest.TestCase):
             destroyAllWindows=lambda: destroy_calls.append(True),
         )
         namespace = {
-            "MotionInputError": MotionInputError,
             "RUN": {},
             "cv2": vision_cv2,
-            "load_bounded_vision_image": (
-                lambda *args: (
-                    image_result[0]
-                    if image_result[0] is not None
-                    else (_ for _ in ()).throw(
-                        MotionInputError(
-                            "captured mask frame could not be decoded"
-                        )
-                    )
-                )
-            ),
-            "mask_pic": lambda: (_ for _ in ()).throw(
-                MotionInputError("camera did not return a mask frame")
+            "_capture_mask_selection_image": lambda: (
+                (_ for _ in ()).throw(capture_result[0])
+                if isinstance(capture_result[0], Exception)
+                else capture_result[0]
             ),
             "mask_crop": object(),
             "logger": SimpleNamespace(
@@ -5280,12 +5784,13 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertEqual(len(destroy_calls), 1)
 
-        namespace["mask_pic"] = lambda: True
-        image_result[0] = None
+        capture_result[0] = MotionInputError(
+            "captured mask frame could not be decoded"
+        )
         self.assertFalse(select_mask())
         self.assertEqual(len(errors), 2)
 
-        image_result[0] = np.zeros((2, 2, 3), dtype=np.uint8)
+        capture_result[0] = np.zeros((2, 2, 3), dtype=np.uint8)
         window_failure[0] = True
         self.assertFalse(select_mask())
         self.assertEqual(len(errors), 3)
@@ -5337,6 +5842,48 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(select_template())
         self.assertIs(namespace["RUN"]["oriImage"].base, None)
         self.assertIs(callbacks[-1], namespace["mouse_crop"])
+
+    def test_template_mouse_callback_reports_and_cleans_up_failures(self):
+        errors = []
+        statuses = []
+        destroy_calls = []
+        callback_result = [True]
+
+        def perform_callback(*args):
+            result = callback_result[0]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        namespace = {
+            "_mouse_crop": perform_callback,
+            "normalize_camera_exception_detail": (
+                normalize_camera_exception_detail
+            ),
+            "logger": SimpleNamespace(
+                exception=lambda *args: errors.append(args),
+            ),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+            "cv2": SimpleNamespace(
+                destroyAllWindows=lambda: destroy_calls.append(True),
+            ),
+        }
+        callback = self.compile_function("mouse_crop", namespace)
+
+        self.assertTrue(callback(1, 2, 3, 4, None))
+        callback_result[0] = OSError("template write failed")
+        self.assertFalse(callback(1, 2, 3, 4, None))
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(len(destroy_calls), 1)
+        self.assertEqual(
+            statuses[-1],
+            (
+                "VISION TEMPLATE PROCESSING FAILED: template write failed",
+                "Alarm.TLabel",
+            ),
+        )
 
     def test_program_item_writer_replaces_only_complete_utf8_documents(self):
         from unittest.mock import patch
@@ -7735,6 +8282,7 @@ class HmiSourceContractTests(unittest.TestCase):
         activity = SerialActivityRegistry(("ser", "ser2"))
         poll_calls = []
         camera_closes = []
+        vision_closes = []
         namespace = {
             "application_closing": closing,
             "serial_activity_registry": activity,
@@ -7761,6 +8309,9 @@ class HmiSourceContractTests(unittest.TestCase):
                 ),
             ),
             "CameraPreviewLifecycleState": CameraPreviewLifecycleState,
+            "vision_capture_worker": SimpleNamespace(
+                close=lambda: vision_closes.append(True) or True,
+            ),
             "logger": logger,
             "_poll_application_close": lambda: poll_calls.append(True),
             "almStatusLab": first_label,
@@ -7776,7 +8327,9 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(conversion_cancel_requested.is_set())
         self.assertEqual(conversion_tab.GCrunTrue, 0)
         self.assertEqual(camera_closes, [True])
+        self.assertEqual(vision_closes, [True])
         self.assertFalse(namespace["RUN"]["cam_on"])
+        self.assertIsNone(namespace["RUN"]["visionCaptureRequestId"])
         self.assertTrue(dispatcher.closed)
         self.assertEqual(len(logger.errors), 1)
         self.assertIn("active worker", logger.errors[0][0])
@@ -7953,7 +8506,8 @@ class HmiSourceContractTests(unittest.TestCase):
         errors = []
         statuses = []
         namespace = {
-            "camera_preview_worker": SimpleNamespace(active=True),
+            "camera_preview_worker": SimpleNamespace(active=False),
+            "vision_capture_worker": SimpleNamespace(active=True),
             "camera_preview_shutdown_started_at": 10.0,
             "camera_preview_shutdown_timeout_reported": False,
             "time": SimpleNamespace(monotonic=lambda: next(clock)),
@@ -7986,7 +8540,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(serial_lock.attempts, 0)
         self.assertEqual(
             statuses[-1],
-            ("SHUTDOWN WAITING FOR CAMERA PREVIEW", "Warn.TLabel"),
+            ("SHUTDOWN WAITING FOR CAMERA WORKERS", "Warn.TLabel"),
         )
         self.assertEqual(len(root.jobs), 1)
 

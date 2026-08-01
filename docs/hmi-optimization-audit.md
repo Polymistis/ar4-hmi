@@ -388,8 +388,21 @@ Tk serializes event callbacks on the interpreter thread. Long event handlers blo
   blocking Tk. Step Reverse receives camera settlement through the Tk event
   poll, and cancellation retires an unready start request before row ownership
   is released. Preview-off capture uses the same validated worker lifecycle and
-  platform backend. Still-capture presentation and image processing, matching,
-  mask, and template workflows remain blocking surfaces.
+  platform backend. Capture-only `Snap Image`, `Zero`, and vision-slider release
+  callbacks now submit immutable settings to one coalescing worker. Camera
+  acquisition, grayscale conversion, zoom, mask application, display resizing,
+  and persistence run away from Tk; the camera poll applies the latest result.
+  A starting preview supplies the first owned frame, while a stopping preview
+  settles before one-shot acquisition. Shared capture, mask, template, and
+  matching artifacts use a non-waiting owner, so overlap rejects instead of
+  racing image files or blocking Tk. Successful capture events are presented in
+  worker order, preserving alignment between the most recent retained success
+  and the persisted frame when a coalesced successor fails. Mask and template
+  selections normalize drag direction, clamp to image bounds, reject undersized
+  regions before mask-state mutation, and surface callback persistence failures
+  through the HMI alarm.
+  Snap-and-Find and program-row capture,
+  matching, interactive mask, and template workflows remain blocking surfaces.
 
 Automated coverage is hardware-free and never imports `AR4.py`.
 
@@ -441,7 +454,7 @@ Cartesian adjustments still use raw commands that can be rejected while serial w
 ### Remaining performance surfaces
 
 - Large optional packages, including VTK, OpenCV, and Matplotlib, load during module startup even when corresponding tabs are unused.
-- Camera still-capture presentation and image processing, matching, mask,
+- Snap-and-Find and program-row camera acquisition, matching, interactive mask,
   template, program, and remaining auxiliary-board paths retain synchronous
   work. Program-row Modbus operations remain coupled to the broader program
   state machine, while the visible manual Modbus panel no longer waits for

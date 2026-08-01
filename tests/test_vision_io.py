@@ -19,10 +19,14 @@ from ARrobots.HMI.vision_io import (
     CameraPreviewFrame,
     CameraPreviewLifecycleState,
     CameraPreviewWorker,
+    VisionCaptureResult,
+    VisionCaptureSettings,
+    VisionCaptureWorker,
     fit_vision_preview_square,
     load_bounded_vision_image,
     normalize_camera_exception_detail,
     prepare_camera_preview_frame,
+    prepare_vision_capture_result,
 )
 
 
@@ -57,6 +61,253 @@ def wait_for(predicate, timeout=2):
 
 
 class VisionIoTests(unittest.TestCase):
+    @staticmethod
+    def vision_capture_settings(brightness=0):
+        return VisionCaptureSettings(
+            brightness=brightness,
+            contrast=0,
+            zoom_percent=50,
+            mask_bounds=(0, 0, 6, 4),
+            auto_background=False,
+            persist_auto_background=True,
+            background_grayscale=17,
+            sample_points=(),
+        )
+
+    def test_vision_capture_processing_validates_and_masks_owned_results(self):
+        frame = np.zeros((4, 6, 3), dtype=np.uint8)
+        frame[:, :] = (10, 20, 30)
+        settings = self.vision_capture_settings()
+
+        result = prepare_vision_capture_result(frame, settings)
+
+        expected_gray = int(
+            cv2.cvtColor(
+                np.asarray([[[10, 20, 30]]], dtype=np.uint8),
+                cv2.COLOR_BGR2GRAY,
+            )[0, 0]
+        )
+        self.assertIsInstance(result, VisionCaptureResult)
+        self.assertEqual(result.image.shape, (4, 6))
+        self.assertTrue(np.all(result.image[0, :] == 17))
+        self.assertTrue(np.all(result.image[:, 0] == 17))
+        self.assertTrue(np.all(result.image[1:, 1:] == expected_gray))
+        self.assertEqual(result.display_image.shape, (480, 640))
+        self.assertFalse(result.image.flags.writeable)
+        self.assertFalse(result.display_image.flags.writeable)
+        self.assertTrue(result.persist_auto_background)
+        self.assertIsNone(result.auto_background_rgb)
+
+        automatic = VisionCaptureSettings(
+            brightness=0,
+            contrast=0,
+            zoom_percent=50,
+            mask_bounds=(0, 0, 6, 4),
+            auto_background=True,
+            persist_auto_background=False,
+            background_grayscale=None,
+            sample_points=((1, 1), (1, 2), (2, 1)),
+        )
+        automatic_result = prepare_vision_capture_result(frame, automatic)
+        self.assertEqual(
+            automatic_result.auto_background_rgb,
+            (expected_gray,) * 3,
+        )
+        self.assertFalse(automatic_result.persist_auto_background)
+
+        with self.assertRaisesRegex(MotionInputError, "enclose an area"):
+            VisionCaptureSettings(
+                brightness=0,
+                contrast=0,
+                zoom_percent=50,
+                mask_bounds=(1, 0, 1, 4),
+                auto_background=False,
+                persist_auto_background=True,
+                background_grayscale=0,
+                sample_points=(),
+            )
+        with self.assertRaisesRegex(MotionInputError, "enclose an area"):
+            VisionCaptureSettings(
+                brightness=0,
+                contrast=0,
+                zoom_percent=50,
+                mask_bounds=(1, 0, 2, 4),
+                auto_background=False,
+                persist_auto_background=True,
+                background_grayscale=0,
+                sample_points=(),
+            )
+        with self.assertRaisesRegex(MotionInputError, "outside"):
+            prepare_vision_capture_result(
+                frame,
+                VisionCaptureSettings(
+                    brightness=0,
+                    contrast=0,
+                    zoom_percent=50,
+                    mask_bounds=(0, 0, 6, 4),
+                    auto_background=True,
+                    persist_auto_background=True,
+                    background_grayscale=None,
+                    sample_points=((4, 0), (1, 1), (2, 2)),
+                ),
+            )
+
+        oversized = np.lib.stride_tricks.as_strided(
+            np.zeros((1, 1, 3), dtype=np.uint8),
+            shape=(4097, 4097, 3),
+            strides=(0, 0, 0),
+        )
+        with self.assertRaisesRegex(MotionInputError, "pixel count"):
+            prepare_vision_capture_result(oversized, settings)
+
+    def test_vision_capture_worker_runs_off_caller_and_coalesces_pending(self):
+        first_started = threading.Event()
+        release_first = threading.Event()
+        operation_threads = []
+
+        def operation(settings, cancellation_event):
+            operation_threads.append(threading.get_ident())
+            if settings.brightness == 1:
+                first_started.set()
+                self.assertTrue(release_first.wait(1))
+            self.assertFalse(cancellation_event.is_set())
+            frame = np.full((4, 6, 3), settings.brightness, dtype=np.uint8)
+            return prepare_vision_capture_result(frame, settings)
+
+        worker = VisionCaptureWorker(operation)
+        caller_thread = threading.get_ident()
+        first = worker.submit(self.vision_capture_settings(1))
+        self.assertFalse(first.coalesced)
+        self.assertTrue(first_started.wait(1))
+        second = worker.submit(self.vision_capture_settings(2))
+        third = worker.submit(self.vision_capture_settings(3))
+        self.assertTrue(second.coalesced)
+        self.assertTrue(third.coalesced)
+        self.assertEqual(worker.active_request_id, first.request_id)
+        self.assertEqual(worker.pending_request_id, third.request_id)
+
+        release_first.set()
+        self.assertTrue(worker.wait_stopped(2))
+        events = worker.drain_events()
+        self.assertEqual(
+            [event.request_id for event in events],
+            [first.request_id, third.request_id],
+        )
+        self.assertTrue(all(event.result is not None for event in events))
+        self.assertNotIn(caller_thread, operation_threads)
+        self.assertEqual(len(operation_threads), 2)
+        self.assertTrue(worker.close())
+        self.assertTrue(worker.closed)
+        with self.assertRaisesRegex(MotionInputError, "worker is closed"):
+            worker.submit(self.vision_capture_settings())
+
+    def test_vision_capture_worker_close_cancels_active_operation(self):
+        operation_started = threading.Event()
+
+        def operation(settings, cancellation_event):
+            operation_started.set()
+            self.assertTrue(cancellation_event.wait(1))
+            raise MotionInputError("capture cancelled for shutdown")
+
+        worker = VisionCaptureWorker(operation)
+        submission = worker.submit(self.vision_capture_settings())
+        self.assertTrue(operation_started.wait(1))
+        self.assertFalse(worker.close())
+        self.assertTrue(worker.wait_stopped(1))
+        event = worker.drain_events()[0]
+        self.assertEqual(event.request_id, submission.request_id)
+        self.assertIsNone(event.result)
+        self.assertIn("cancelled for shutdown", event.error_detail)
+
+    def test_vision_capture_worker_rolls_back_startup_failures(self):
+        settings = self.vision_capture_settings()
+        with self.assertRaisesRegex(MotionInputError, "operation"):
+            VisionCaptureWorker(None)
+        with self.assertRaisesRegex(MotionInputError, "thread factory"):
+            VisionCaptureWorker(lambda *args: None, thread_factory=None)
+
+        def failing_factory(**kwargs):
+            raise RuntimeError("thread construction unavailable")
+
+        worker = VisionCaptureWorker(
+            lambda *args: self.fail("operation must not run"),
+            thread_factory=failing_factory,
+        )
+        with self.assertRaisesRegex(RuntimeError, "construction unavailable"):
+            worker.submit(settings)
+        self.assertFalse(worker.active)
+        self.assertIsNone(worker.pending_request_id)
+        self.assertTrue(worker.wait_stopped(0))
+
+        class FailingThread(threading.Thread):
+            def start(self):
+                raise RuntimeError("thread startup unavailable")
+
+        worker = VisionCaptureWorker(
+            lambda *args: self.fail("operation must not run"),
+            thread_factory=FailingThread,
+        )
+        with self.assertRaisesRegex(RuntimeError, "startup unavailable"):
+            worker.submit(settings)
+        self.assertFalse(worker.active)
+        self.assertIsNone(worker.pending_request_id)
+        self.assertTrue(worker.wait_stopped(0))
+
+    def test_vision_capture_worker_retires_all_requests_after_terminal_failure(self):
+        settings = self.vision_capture_settings()
+        result = prepare_vision_capture_result(
+            np.zeros((4, 6, 3), dtype=np.uint8),
+            settings,
+        )
+        stringify_started = threading.Event()
+        finish_stringify = threading.Event()
+
+        class DelayedTerminalError(RuntimeError):
+            def __str__(self):
+                stringify_started.set()
+                if not finish_stringify.wait(1):
+                    return "terminal publication wait timed out"
+                return "terminal publication failed"
+
+        worker = VisionCaptureWorker(lambda *args: result)
+        append_event = worker._append_event_locked
+        fail_next_append = [True]
+
+        def append_with_failure(*args, **kwargs):
+            if fail_next_append[0]:
+                fail_next_append[0] = False
+                raise DelayedTerminalError()
+            return append_event(*args, **kwargs)
+
+        worker._append_event_locked = append_with_failure
+        first = worker.submit(settings)
+        self.assertTrue(stringify_started.wait(1))
+        second = worker.submit(settings)
+        self.assertTrue(second.coalesced)
+        finish_stringify.set()
+        self.assertTrue(worker.wait_stopped(1))
+
+        failed_events = worker.drain_events()
+        self.assertEqual(
+            [event.request_id for event in failed_events],
+            [first.request_id, second.request_id],
+        )
+        self.assertTrue(
+            all(
+                "terminal publication failed" in event.error_detail
+                for event in failed_events
+            )
+        )
+        self.assertFalse(worker.active)
+        self.assertIsNone(worker.pending_request_id)
+
+        recovered = worker.submit(settings)
+        self.assertTrue(worker.wait_stopped(1))
+        recovered_event = worker.drain_events()[0]
+        self.assertEqual(recovered_event.request_id, recovered.request_id)
+        self.assertIs(recovered_event.result, result)
+        self.assertTrue(worker.close())
+
     def test_camera_preview_worker_validates_constructor_contract(self):
         valid_factory = lambda camera_index: None
         constructors = (
@@ -238,6 +489,32 @@ class VisionIoTests(unittest.TestCase):
         self.assertTrue(worker.request_stop(request_id))
         capture.responses.put((False, None))
         self.assertTrue(worker.wait_request_stopped(request_id, 1))
+
+    def test_camera_transition_snapshot_distinguishes_start_from_stop(self):
+        capture = QueuedCapture()
+        worker = CameraPreviewWorker(
+            lambda camera_source: capture,
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0,
+        )
+        request_id = worker.request_start(0)
+        expected = np.full((2, 3, 3), 23, dtype=np.uint8)
+        capture.responses.put((True, expected))
+
+        captured = worker.wait_snapshot_or_stopped(request_id, 1)
+
+        np.testing.assert_array_equal(captured, expected)
+        self.assertIsNot(captured, expected)
+        self.assertTrue(worker.request_stop(request_id))
+        capture.responses.put((False, None))
+        self.assertIsNone(worker.wait_snapshot_or_stopped(request_id, 1))
+        self.assertTrue(worker.wait_stopped(1))
+
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(MotionInputError, "was cancelled"):
+            worker.wait_snapshot_or_stopped(request_id, 1, cancelled)
 
     def test_camera_stop_before_worker_entry_has_terminal_lifecycle(self):
         worker_entry = threading.Event()
