@@ -29554,7 +29554,7 @@ def _apply_program_vision_match_event(operation, event):
     ) from exc
   if _program_execution_request_cancelled(operation.execution_request):
     logger.warning(
-      "Discarding a program vision result after request cancellation"
+      "Discarding a program vision result cancelled before commitment"
     )
     return False
   if tuple(tab1.progView.get(0, "end")) != program_rows:

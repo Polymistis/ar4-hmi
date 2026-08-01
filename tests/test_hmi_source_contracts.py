@@ -6118,6 +6118,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         applications = []
         statuses = []
+        warnings = []
         namespace = {
             **request_namespace,
             "ProgramVisionOperation": operation_type,
@@ -6127,7 +6128,14 @@ class HmiSourceContractTests(unittest.TestCase):
             "tab1": SimpleNamespace(progView=ProgramView),
             "END": "end",
             "_program_execution_request_active": lambda current: True,
-            "_program_execution_request_cancelled": lambda current: False,
+            "_program_execution_request_cancelled": (
+                lambda current: (
+                    current.cancellation_boundary.is_set()
+                    or not namespace[
+                        "_program_execution_request_active"
+                    ](current)
+                )
+            ),
             "_apply_vision_match_operation_result": (
                 lambda result: (
                     applications.append(threading.get_ident())
@@ -6136,6 +6144,11 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_set_application_status": (
                 lambda message, style: statuses.append((message, style))
+            ),
+            "logger": SimpleNamespace(
+                error=lambda *args: None,
+                exception=lambda *args: None,
+                warning=lambda *args: warnings.append(args),
             ),
         }
         namespace["_decode_program_row_content"] = self.compile_function(
@@ -6197,7 +6210,6 @@ class HmiSourceContractTests(unittest.TestCase):
         ]
         worker_ownership = [(False, None, None)]
         manual_events = []
-        warnings = []
         namespace.update({
             "program_vision_operation_lock": threading.Lock(),
             "program_vision_operations": {10: drained},
@@ -6216,11 +6228,6 @@ class HmiSourceContractTests(unittest.TestCase):
             },
             "normalize_camera_exception_detail": (
                 normalize_camera_exception_detail
-            ),
-            "logger": SimpleNamespace(
-                error=lambda *args: None,
-                exception=lambda *args: None,
-                warning=lambda *args: warnings.append(args),
             ),
             "_apply_vision_match_event": (
                 lambda event: manual_events.append(event) or False
@@ -6377,16 +6384,15 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace["_program_execution_request_active"] = (
             lambda current: True
         )
-        cancellation_checks = iter((False, True))
         namespace["_program_execution_request_cancelled"] = (
-            lambda current: next(cancellation_checks)
+            lambda current: True
         )
-        cancelled = operation_type(request, command)
-        cancelled.bind_program_rows(ProgramView.rows)
-        cancelled.bind_worker_request(16)
+        cancelled_before_processing = operation_type(request, command)
+        cancelled_before_processing.bind_program_rows(ProgramView.rows)
+        cancelled_before_processing.bind_worker_request(16)
         self.assertFalse(
             apply_event(
-                cancelled,
+                cancelled_before_processing,
                 VisionOperationEvent(
                     7,
                     16,
@@ -6400,8 +6406,37 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(tuple(ProgramView.selected), selection_before)
         self.assertEqual(len(applications), application_count)
         self.assertEqual(len(statuses), status_count)
+
+        cancellation_checks = iter((False, True))
         namespace["_program_execution_request_cancelled"] = (
-            lambda current: False
+            lambda current: next(cancellation_checks)
+        )
+        cancelled_before_commitment = operation_type(request, command)
+        cancelled_before_commitment.bind_program_rows(ProgramView.rows)
+        cancelled_before_commitment.bind_worker_request(17)
+        self.assertFalse(
+            apply_event(
+                cancelled_before_commitment,
+                VisionOperationEvent(
+                    8,
+                    17,
+                    result=operation_result(True),
+                ),
+            )
+        )
+        self.assertEqual(warnings[-1], (
+            "Discarding a program vision result cancelled before commitment",
+        ))
+        self.assertEqual(tuple(ProgramView.selected), selection_before)
+        self.assertEqual(len(applications), application_count)
+        self.assertEqual(len(statuses), status_count)
+        namespace["_program_execution_request_cancelled"] = (
+            lambda current: (
+                current.cancellation_boundary.is_set()
+                or not namespace[
+                    "_program_execution_request_active"
+                ](current)
+            )
         )
 
         changed = operation_type(request, command)
@@ -6415,7 +6450,7 @@ class HmiSourceContractTests(unittest.TestCase):
         ):
             apply_event(
                 changed,
-                VisionOperationEvent(8, 9, result=operation_result(True)),
+                VisionOperationEvent(9, 9, result=operation_result(True)),
             )
         ProgramView.rows = original_rows
         self.assertEqual(
@@ -6430,7 +6465,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 apply_event(
                     failed,
                     VisionOperationEvent(
-                        9,
+                        10,
                         8,
                         result=operation_result(False),
                     ),
