@@ -6660,16 +6660,18 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         )
 
         dispatcher.submit_delta(0, 1, self.actual, self.profile)
-        collect_events_until_idle(dispatcher)
+        initial_events = collect_events_until_idle(dispatcher)
+        self.assertEqual(
+            [event.kind for event in initial_events],
+            ["started", "completed", "transport-failed"],
+        )
         self.assertTrue(registry.active("ser"))
+        self.assertFalse(dispatcher.closed)
 
         self.assertFalse(dispatcher.close())
+        self.assertTrue(dispatcher.closed)
         close_events = dispatcher.drain_events()
-        self.assertEqual(
-            [event.kind for event in close_events],
-            ["transport-failed"],
-        )
-        self.assertIn("injected retained lease failure", close_events[0].error)
+        self.assertEqual(close_events, [])
         self.assertTrue(registry.active("ser"))
         self.assertIsNotNone(dispatcher._activity_lease)
 

@@ -1181,14 +1181,21 @@ Known M5 deviations:
 - Coalesced joint-dispatch cleanup attempts serial-activity lease release before
   transport-lock release and always attempts both components. A failed lease
   remains retained for retry while successful transport-lock release keeps
-  controller position recovery admissible. Any unsuccessful component discards
-  uncommitted targets, latches a queue fault, and publishes a transport-failure
-  event. Worker cleanup publishes before inactivity becomes visible, including
-  an idle exit without a move. Close reports incomplete cleanup without raising;
-  application shutdown retries cleanup before registry-idle gating and continues
-  closing independently when no registry ownership remains. Fresh submissions
-  reject under that fault; confirmed-position synchronization retries retained
-  ownership before clearing the fault and reports retry failure explicitly.
+  controller position recovery admissible. A newly observed unsuccessful
+  component discards uncommitted targets, latches a queue fault, and publishes a
+  transport-failure event. Worker cleanup publishes before inactivity becomes
+  visible, including an idle exit without a move. Close reports incomplete
+  cleanup without raising; application shutdown retries cleanup before
+  registry-idle gating and continues closing independently when no registry
+  ownership remains. An unchanged retained-release failure does not enqueue
+  another transport-failure event. Active-worker, retained-fault, invalid-state,
+  and cleanup-exception shutdown states each publish one bounded diagnostic.
+  Fresh submissions reject under that fault; confirmed-position synchronization
+  retries retained ownership before clearing the fault and reports retry failure
+  explicitly.
+  Position-response rejection distinguishes an active worker, a closed
+  dispatcher, and retained ownership. Transport-release events use a dedicated
+  ownership-failure alarm rather than reporting a completed move as failed.
 - Exact J1-J6 keyboard targets share the absolute semantic queue used by
   sliders. Active text edits survive controller and virtual position refreshes;
   accepted submissions resume confirmed-position display updates, and
@@ -1253,10 +1260,13 @@ Known M5 deviations:
   alarm, and return `ROW_EXECUTION_REJECTED`; no failure is converted into `Stop
   Program` or another executable row. Cosmetic scroll failures are logged and
   do not change row execution. Blank rows, `##` comments, and numeric `Tab
-  Number` labels are explicit structural no-ops. Every other row must match a
-  currently implemented command prefix or is rejected before any command branch
-  runs. Legacy `Out On = N` and `Out Off = N` rows have no executable handler
-  and are rejected instead of completing as silent no-ops.
+  Number` labels containing the same decimal character class accepted by tab
+  lookup are explicit structural no-ops. Tab-label, direct-jump, and conditional-
+  jump builders normalize that value and reject invalid input before inserting
+  or persisting a row. Every other row must match a currently implemented
+  command prefix or is rejected before any command branch runs.
+  Legacy `Out On = N` and `Out Off = N` rows have no executable handler and are
+  rejected instead of completing as silent no-ops.
   Program `SC` and `SO` rows use the canonical controller builder before
   transmission. The framed exchange owner validates `-1` and `-2` through the
   same command-aware terminal classifier used for final disposition. A `-1`

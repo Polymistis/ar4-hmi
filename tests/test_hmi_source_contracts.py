@@ -392,6 +392,17 @@ class HmiSourceContractTests(unittest.TestCase):
             ):
                 if constant_name not in namespace:
                     self.compile_assignment(constant_name, namespace)
+        if (
+            name in {
+                "_close_joint_motion_dispatcher_for_shutdown",
+                "_report_joint_motion_shutdown_cleanup_once",
+            }
+            and "_joint_motion_shutdown_cleanup_diagnostics" not in namespace
+        ):
+            self.compile_assignment(
+                "_joint_motion_shutdown_cleanup_diagnostics",
+                namespace,
+            )
         namespace.setdefault(
             "RUN",
             {
@@ -474,6 +485,24 @@ class HmiSourceContractTests(unittest.TestCase):
             "_poll_application_close": (
                 "_serial_shutdown_ready_for_close",
                 "_close_joint_motion_dispatcher_for_shutdown",
+            ),
+            "_close_joint_motion_dispatcher_for_shutdown": (
+                "_report_joint_motion_shutdown_cleanup_once",
+            ),
+            "_program_tab_row_index": (
+                "_normalize_program_tab_number",
+            ),
+            "_program_row_is_supported": (
+                "_normalize_program_tab_number",
+            ),
+            "tabNumber": (
+                "_normalize_program_tab_number",
+            ),
+            "jumpTab": (
+                "_normalize_program_tab_number",
+            ),
+            "IfCMDInsert": (
+                "_normalize_program_tab_number",
             ),
             "on_closing": (
                 "_close_joint_motion_dispatcher_for_shutdown",
@@ -6620,16 +6649,33 @@ class HmiSourceContractTests(unittest.TestCase):
             def __init__(self):
                 self.results = [
                     RuntimeError("injected close failure"),
-                    False,
+                    RuntimeError("injected close failure with changed detail"),
+                    None,
+                    None,
+                    (False, None),
+                    True,
+                    (True, None),
+                    (True, None),
+                    (
+                        False,
+                        "controller ownership release failed: retained lease",
+                    ),
+                    (
+                        False,
+                        "controller ownership release failed: retained lease",
+                    ),
                     True,
                 ]
                 self.active = False
-                self.fault_reason = "retained ownership"
+                self.fault_reason = None
 
             def close(self):
                 result = self.results.pop(0)
                 if isinstance(result, Exception):
                     raise result
+                if isinstance(result, tuple):
+                    self.active, self.fault_reason = result
+                    return False
                 return result
 
         logs = []
@@ -6647,10 +6693,37 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertFalse(close_dispatcher())
         self.assertEqual(logs[-1][0], "exception")
+        self.assertEqual(len(logs), 1)
+        self.assertFalse(close_dispatcher())
+        self.assertEqual(len(logs), 1)
         self.assertFalse(close_dispatcher())
         self.assertEqual(logs[-1][0], "error")
-        self.assertIn("retained ownership", logs[-1][1])
+        self.assertIn("invalid shutdown cleanup state", logs[-1][1][0])
+        self.assertEqual(len(logs), 2)
+        self.assertFalse(close_dispatcher())
+        self.assertEqual(len(logs), 2)
         self.assertTrue(close_dispatcher())
+        self.assertEqual(len(logs), 2)
+        self.assertFalse(close_dispatcher())
+        self.assertIn("waiting for the active worker", logs[-1][1][0])
+        self.assertEqual(len(logs), 3)
+        self.assertFalse(close_dispatcher())
+        self.assertEqual(len(logs), 3)
+        self.assertFalse(close_dispatcher())
+        self.assertIn("retained lease", logs[-1][1][1])
+        self.assertEqual(len(logs), 4)
+        self.assertFalse(close_dispatcher())
+        self.assertEqual(len(logs), 4)
+        self.assertTrue(close_dispatcher())
+        self.assertEqual(
+            namespace["_joint_motion_shutdown_cleanup_diagnostics"],
+            {
+                "close-exception",
+                "invalid-return",
+                "cleanup-incomplete-active",
+                "cleanup-incomplete-ownership-release",
+            },
+        )
 
     def test_shutdown_requests_online_and_offline_stop_before_final_flush(self):
         class Flag:
@@ -6667,6 +6740,7 @@ class HmiSourceContractTests(unittest.TestCase):
             def __init__(self):
                 self.closed = False
                 self.active = True
+                self.fault_reason = None
 
             def close(self):
                 self.closed = True
@@ -6689,9 +6763,13 @@ class HmiSourceContractTests(unittest.TestCase):
         class Logger:
             def __init__(self):
                 self.errors = []
+                self.exceptions = []
 
-            def error(self, message):
-                self.errors.append(message)
+            def error(self, *args):
+                self.errors.append(args)
+
+            def exception(self, *args):
+                self.exceptions.append(args)
 
         closing = Flag()
         live_pending = Flag(True)
@@ -6701,6 +6779,7 @@ class HmiSourceContractTests(unittest.TestCase):
         conversion_cancel_requested = Flag()
         conversion_tab = SimpleNamespace(GCrunTrue=1)
         dispatcher = Dispatcher()
+        logger = Logger()
         first_label = Label()
         second_label = Label()
         root = Root()
@@ -6720,6 +6799,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "gcode_conversion_cancel_lock": threading.Lock(),
             "tab7": conversion_tab,
             "joint_motion_dispatcher": dispatcher,
+            "logger": logger,
             "_poll_application_close": lambda: poll_calls.append(True),
             "almStatusLab": first_label,
             "almStatusLab2": second_label,
@@ -6734,6 +6814,8 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(conversion_cancel_requested.is_set())
         self.assertEqual(conversion_tab.GCrunTrue, 0)
         self.assertTrue(dispatcher.closed)
+        self.assertEqual(len(logger.errors), 1)
+        self.assertIn("active worker", logger.errors[0][0])
         with self.assertRaises(SerialActivityRejected):
             activity.begin("ser")
         self.assertEqual(poll_calls, [True])
@@ -14197,6 +14279,11 @@ class HmiSourceContractTests(unittest.TestCase):
                 ProgramView((0,), (b"Typo Program\n",)),
                 "unsupported robot program row",
             ),
+            (
+                "non-decimal-tab-label",
+                ProgramView((0,), ("Tab Number \N{SUPERSCRIPT TWO}\n".encode("utf-8"),)),
+                "unsupported robot program row",
+            ),
         )
         for name, program_view, expected_detail in cases:
             with self.subTest(name=name):
@@ -14241,7 +14328,12 @@ class HmiSourceContractTests(unittest.TestCase):
             )
         )
 
-        for row in (b"\n", b"## operator note\n", b"Tab Number 2\n"):
+        for row in (
+            b"\n",
+            b"## operator note\n",
+            b"Tab Number 2\n",
+            "Tab Number \N{ARABIC-INDIC DIGIT TWO}\n".encode("utf-8"),
+        ):
             with self.subTest(structural_row=row):
                 runtime.update(progRunning=False, rowinproc=1)
                 statuses.clear()
@@ -14260,6 +14352,153 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.assertEqual(finishes, [True])
                 self.assertEqual(statuses, [])
                 self.assertEqual(errors, [])
+
+    def test_program_tab_builders_validate_before_persistence(self):
+        class Entry:
+            def __init__(self, value=""):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class ProgramView:
+            def __init__(self):
+                self.rows = [b"Base\n"]
+                self.selected = 0
+                self.selection_reads = 0
+
+            def curselection(self):
+                self.selection_reads += 1
+                return (self.selected,)
+
+            def index(self, value):
+                if value != "end":
+                    raise AssertionError("unexpected program-view index")
+                return len(self.rows)
+
+            def insert(self, index, row):
+                self.rows.insert(index, row)
+
+            def selection_clear(self, *args):
+                self.selected = None
+
+            def select_set(self, index):
+                self.selected = index
+
+            def get(self, first, last=None):
+                if last is not None:
+                    return tuple(self.rows)
+                return self.rows[first]
+
+        view = ProgramView()
+        tab_entry = Entry("\N{SUPERSCRIPT TWO}")
+        jump_entry = Entry("\N{SUPERSCRIPT TWO}")
+        statuses = []
+        errors = []
+
+        def set_status(message=None, style=None, **kwargs):
+            statuses.append(
+                (
+                    kwargs.get("text", message),
+                    kwargs.get("style", style),
+                )
+            )
+
+        with BoundedTemporaryDirectory(prefix="ar4-tab-builder-") as directory:
+            program_path = Path(directory) / "program.ar4"
+            program_path.write_bytes(b"Base\n")
+            namespace = {
+                "MotionInputError": MotionInputError,
+                "tab1": SimpleNamespace(progView=view),
+                "tabNumEntryField": tab_entry,
+                "jumpTabEntryField": jump_entry,
+                "ProgEntryField": Entry(str(program_path)),
+                "END": "end",
+                "path": SimpleNamespace(relpath=lambda value: value),
+                "logger": SimpleNamespace(
+                    error=lambda *args: errors.append(args),
+                ),
+                "_set_application_status": set_status,
+            }
+            insert_tab = self.compile_function("tabNumber", namespace)
+            insert_jump = self.compile_function("jumpTab", namespace)
+
+            self.assertFalse(insert_tab())
+            self.assertEqual(view.selection_reads, 0)
+            self.assertEqual(view.rows, [b"Base\n"])
+            self.assertEqual(program_path.read_bytes(), b"Base\n")
+            self.assertIn("must contain decimal digits", statuses[-1][0])
+
+            tab_entry.value = "  \N{ARABIC-INDIC DIGIT TWO}  "
+            self.assertTrue(insert_tab())
+            self.assertEqual(
+                view.rows[1],
+                "Tab Number \N{ARABIC-INDIC DIGIT TWO}\n".encode("utf-8"),
+            )
+
+            selection_reads = view.selection_reads
+            self.assertFalse(insert_jump())
+            self.assertEqual(view.selection_reads, selection_reads)
+            self.assertEqual(len(view.rows), 2)
+            self.assertIn("must contain decimal digits", statuses[-1][0])
+
+            jump_entry.value = " \N{ARABIC-INDIC DIGIT TWO} "
+            self.assertTrue(insert_jump())
+            self.assertEqual(
+                view.rows[2],
+                "Jump Tab-\N{ARABIC-INDIC DIGIT TWO}\n".encode("utf-8"),
+            )
+            self.assertEqual(
+                program_path.read_text(encoding="utf-8").splitlines(),
+                [
+                    "Base",
+                    "Tab Number \N{ARABIC-INDIC DIGIT TWO}",
+                    "Jump Tab-\N{ARABIC-INDIC DIGIT TWO}",
+                ],
+            )
+            self.assertEqual(len(errors), 2)
+
+            namespace.update(
+                {
+                    "iFoption": Entry("5v Input"),
+                    "iFselection": Entry("Jump Tab"),
+                    "IfVarEntryField": Entry("2"),
+                    "IfInputEntryField": Entry("1"),
+                    "IfDestEntryField": Entry("\N{SUPERSCRIPT TWO}"),
+                }
+            )
+            insert_conditional = self.compile_function(
+                "IfCMDInsert",
+                namespace,
+            )
+            rows_before_conditional = list(view.rows)
+            insert_conditional()
+            self.assertEqual(view.rows, rows_before_conditional)
+            self.assertIn("must contain decimal digits", statuses[-1][0])
+
+            namespace["IfDestEntryField"].value = (
+                " \N{ARABIC-INDIC DIGIT TWO} "
+            )
+            insert_conditional()
+            self.assertEqual(
+                view.rows[3],
+                (
+                    "If Input # 2 = 1 : Jump to Tab "
+                    "\N{ARABIC-INDIC DIGIT TWO}\n"
+                ).encode("utf-8"),
+            )
+            self.assertEqual(
+                program_path.read_text(encoding="utf-8").splitlines(),
+                [
+                    "Base",
+                    "Tab Number \N{ARABIC-INDIC DIGIT TWO}",
+                    "Jump Tab-\N{ARABIC-INDIC DIGIT TWO}",
+                    (
+                        "If Input # 2 = 1 : Jump to Tab "
+                        "\N{ARABIC-INDIC DIGIT TWO}"
+                    ),
+                ],
+            )
 
     def test_program_worker_selection_transitions_delegate_to_tk(self):
         expected_dispatch_calls = {"runProg": 3, "stepFwd": 1}
@@ -20118,6 +20357,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.accept = True
                 self.invalidations = []
                 self.active = False
+                self.closed = False
                 self.fault_reason = None
 
             def synchronize(self, position):
@@ -20295,6 +20535,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         dispatcher.accept = False
         dispatcher.active = True
+        dispatcher.fault_reason = "controller rejected a prior move"
         calibration_before_rejection = dict(namespace["CAL"])
         rejected_response = response.replace("A1B", "A99B", 1)
         self.assertFalse(display_position(rejected_response))
@@ -20308,6 +20549,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertTrue(resynchronization_required.is_set())
         dispatcher.accept = True
         dispatcher.active = False
+        dispatcher.fault_reason = None
         self.assertTrue(display_position(response))
         self.assertFalse(resynchronization_required.is_set())
         recovered_source_token = actual_source()
@@ -20322,11 +20564,38 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         dispatcher.accept = False
-        dispatcher.fault_reason = "controller ownership release failed"
+        dispatcher.fault_reason = (
+            "controller ownership release failed: retained activity lease"
+        )
         self.assertFalse(display_position(rejected_response))
         self.assertIn(
             "could not release joint-motion ownership: "
-            "controller ownership release failed",
+            "controller ownership release failed: retained activity lease",
+            namespace["logger"].errors[-1],
+        )
+        dispatcher.accept = True
+        dispatcher.fault_reason = None
+        resynchronization_required.clear()
+
+        dispatcher.accept = False
+        dispatcher.closed = True
+        dispatcher.fault_reason = "controller ownership release failed: stale"
+        self.assertFalse(display_position(rejected_response))
+        self.assertIn(
+            "rejected because the joint dispatcher is closed",
+            namespace["logger"].errors[-1],
+        )
+        dispatcher.accept = True
+        dispatcher.closed = False
+        dispatcher.fault_reason = None
+        resynchronization_required.clear()
+
+        dispatcher.accept = False
+        dispatcher.fault_reason = "controller rejected a completed move"
+        self.assertFalse(display_position(rejected_response))
+        self.assertIn(
+            "rejected by the joint dispatcher: "
+            "controller rejected a completed move",
             namespace["logger"].errors[-1],
         )
         dispatcher.accept = True
@@ -35558,6 +35827,73 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertTrue(event.acknowledged)
         self.assertEqual(display_calls, [])
+        self.assertEqual(finish_calls, [False])
+
+    def test_joint_transport_release_failure_uses_ownership_alarm(self):
+        class Event:
+            kind = "transport-failed"
+            error = "controller ownership release failed: retained lease"
+            pending_discarded = False
+
+            def __init__(self):
+                self.acknowledged = False
+
+            def acknowledge(self):
+                self.acknowledged = True
+
+        class Dispatcher:
+            pending = False
+
+            def __init__(self, event):
+                self.events = [event]
+
+            def drain_events(self):
+                events = self.events
+                self.events = []
+                return events
+
+        event = Event()
+        controller_positions = tuple(float(index) for index in range(9))
+        virtual_resets = []
+        invalidations = []
+        statuses = []
+        errors = []
+        finish_calls = []
+        namespace = {
+            "joint_motion_dispatcher": Dispatcher(event),
+            "_current_joint_positions": lambda: controller_positions,
+            "_try_set_virtual_joint_target": (
+                lambda positions: virtual_resets.append(tuple(positions)) or True
+            ),
+            "_invalidate_joint_motion_state": invalidations.append,
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+            "logger": SimpleNamespace(
+                warning=lambda *args: None,
+                error=lambda *args: errors.append(args),
+                exception=lambda *args: None,
+            ),
+            "_finish_joint_motion_visualization": (
+                lambda preserve_actual: finish_calls.append(preserve_actual)
+            ),
+            "_finish_joint_motion_request_if_idle": lambda: True,
+            "_refresh_joint_motion_visualization": lambda: None,
+            "application_closing": SimpleNamespace(is_set=lambda: True),
+        }
+        poll = self.compile_function("_poll_joint_motion_events", namespace)
+
+        poll()
+
+        expected_message = (
+            "Joint-motion transport fault: "
+            "controller ownership release failed: retained lease"
+        )
+        self.assertTrue(event.acknowledged)
+        self.assertEqual(virtual_resets, [controller_positions])
+        self.assertEqual(invalidations, [expected_message])
+        self.assertEqual(statuses, [(expected_message, "Alarm.TLabel")])
+        self.assertEqual(errors, [(expected_message,)])
         self.assertEqual(finish_calls, [False])
 
     def test_joint_completion_reports_ready_or_retained_pending_target(self):

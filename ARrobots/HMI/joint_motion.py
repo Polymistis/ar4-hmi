@@ -6117,11 +6117,17 @@ class CoalescingJointDispatcher:
         self._transport_reserved = False
         self._activity_lease = None
         self._result_acknowledgement = None
+        self._transport_release_event_reason = None
 
     @property
     def active(self):
         with self._lock:
             return self._worker is not None
+
+    @property
+    def closed(self):
+        with self._lock:
+            return self._closed
 
     @property
     def fault_reason(self):
@@ -6331,16 +6337,18 @@ class CoalescingJointDispatcher:
         release_reason, pending_discarded = (
             self._latch_transport_release_fault_locked(error)
         )
-        self._events.append(
-            self._next_event_record_locked(
-                MotionEvent(
-                    kind="transport-failed",
-                    move=move,
-                    error=release_reason,
-                    pending_discarded=pending_discarded,
+        if release_reason != self._transport_release_event_reason:
+            self._transport_release_event_reason = release_reason
+            self._events.append(
+                self._next_event_record_locked(
+                    MotionEvent(
+                        kind="transport-failed",
+                        move=move,
+                        error=release_reason,
+                        pending_discarded=pending_discarded,
+                    )
                 )
             )
-        )
         return release_reason
 
     def _finish_worker_locked(self, move=None):
@@ -6371,6 +6379,7 @@ class CoalescingJointDispatcher:
                     return False
             self._desired = normalized
             self._fault_reason = None
+            self._transport_release_event_reason = None
             return True
 
     def discard_pending_after_completion(self, confirmed_positions):

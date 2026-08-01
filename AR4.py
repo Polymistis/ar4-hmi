@@ -417,27 +417,117 @@ tab9 = ttk_bootstrap.Frame(nb)
 #nb.add(tab9, text='   Info    ')
 
 
+_joint_motion_shutdown_cleanup_diagnostics = set()
+
+
+def _report_joint_motion_shutdown_cleanup_once(
+  diagnostic_key,
+  message,
+  *args,
+  include_traceback=False,
+):
+  if diagnostic_key in _joint_motion_shutdown_cleanup_diagnostics:
+    return False
+  _joint_motion_shutdown_cleanup_diagnostics.add(diagnostic_key)
+  if include_traceback:
+    logger.exception(message, *args)
+  else:
+    logger.error(message, *args)
+  return True
+
+
 def _close_joint_motion_dispatcher_for_shutdown():
   dispatcher = globals().get('joint_motion_dispatcher')
   if dispatcher is None:
     return True
-  try:
-    cleanup_complete = dispatcher.close()
-  except Exception:
-    logger.exception("Joint-motion dispatcher shutdown cleanup failed")
-    return False
-  if cleanup_complete is True:
-    return True
-  if cleanup_complete is not False:
-    logger.error(
-      "Joint-motion dispatcher returned an invalid shutdown cleanup state"
+  for cleanup_attempt in range(2):
+    try:
+      cleanup_complete = dispatcher.close()
+    except Exception as exc:
+      try:
+        detail = " ".join(str(exc).split())
+      except Exception:
+        detail = type(exc).__name__
+      detail = detail or type(exc).__name__
+      _report_joint_motion_shutdown_cleanup_once(
+        "close-exception",
+        "Joint-motion dispatcher shutdown cleanup failed: %s",
+        detail,
+        include_traceback=True,
+      )
+      return False
+    if cleanup_complete is True:
+      return True
+    if cleanup_complete is not False:
+      _report_joint_motion_shutdown_cleanup_once(
+        "invalid-return",
+        "Joint-motion dispatcher returned an invalid shutdown cleanup state",
+      )
+      return False
+    try:
+      dispatcher_active = dispatcher.active
+    except Exception:
+      _report_joint_motion_shutdown_cleanup_once(
+        "cleanup-status-exception",
+        "Unable to inspect incomplete joint-motion dispatcher cleanup",
+        include_traceback=True,
+      )
+      return False
+    if not isinstance(dispatcher_active, bool):
+      _report_joint_motion_shutdown_cleanup_once(
+        "invalid-active-state",
+        "Joint-motion dispatcher returned an invalid active state during shutdown",
+      )
+      return False
+    if dispatcher_active:
+      _report_joint_motion_shutdown_cleanup_once(
+        "cleanup-incomplete-active",
+        "Joint-motion dispatcher shutdown cleanup is waiting for the active worker",
+      )
+      return False
+    try:
+      dispatcher_fault = dispatcher.fault_reason
+    except Exception:
+      _report_joint_motion_shutdown_cleanup_once(
+        "cleanup-status-exception",
+        "Unable to inspect incomplete joint-motion dispatcher cleanup",
+        include_traceback=True,
+      )
+      return False
+    if dispatcher_fault is None or dispatcher_fault == "":
+      if cleanup_attempt == 0:
+        continue
+      _report_joint_motion_shutdown_cleanup_once(
+        "cleanup-incomplete-without-fault",
+        "Joint-motion dispatcher shutdown cleanup remains incomplete without a fault reason",
+      )
+      return False
+    if not isinstance(dispatcher_fault, str):
+      _report_joint_motion_shutdown_cleanup_once(
+        "invalid-fault-state",
+        "Joint-motion dispatcher returned an invalid fault state during shutdown",
+      )
+      return False
+    fault_detail = " ".join(dispatcher_fault.split())
+    if not fault_detail:
+      if cleanup_attempt == 0:
+        continue
+      _report_joint_motion_shutdown_cleanup_once(
+        "cleanup-incomplete-without-fault",
+        "Joint-motion dispatcher shutdown cleanup remains incomplete without a fault reason",
+      )
+      return False
+    fault_category = (
+      "ownership-release"
+      if "controller ownership release failed:" in fault_detail
+      else "other-fault"
+    )
+    _report_joint_motion_shutdown_cleanup_once(
+      f"cleanup-incomplete-{fault_category}",
+      "Joint-motion dispatcher shutdown cleanup remains incomplete: %s",
+      fault_detail,
     )
     return False
-  if not dispatcher.active and dispatcher.fault_reason:
-    logger.error(
-      "Joint-motion dispatcher shutdown cleanup remains pending: %s",
-      dispatcher.fault_reason,
-    )
   return False
 
 
@@ -14847,14 +14937,19 @@ def _program_row_index(rows, expected_row):
   raise MotionInputError(f"program row {expected_row!r} does not exist")
 
 
-def _program_tab_row_index(rows, tab_number):
+def _normalize_program_tab_number(tab_number):
   if not isinstance(tab_number, str):
     raise MotionInputError("program tab number must be text")
-  tab_number = tab_number.strip()
-  if re.fullmatch(r"\d+", tab_number) is None:
+  normalized = tab_number.strip()
+  if not normalized or not normalized.isdecimal():
     raise MotionInputError(
-      "program tab number must be a non-negative integer"
+      "program tab number must contain decimal digits"
     )
+  return normalized
+
+
+def _program_tab_row_index(rows, tab_number):
+  tab_number = _normalize_program_tab_number(tab_number)
   return _program_row_index(rows, f"Tab Number {tab_number}")
 
 
@@ -14993,11 +15088,13 @@ def _program_row_is_supported(command):
     raise TypeError("robot program command must be text")
   if not command or command.startswith("##"):
     return True
-  if (
-    command.startswith("Tab Number ")
-    and command[len("Tab Number "):].isdigit()
-  ):
-    return True
+  if command.startswith("Tab Number "):
+    tab_number = command[len("Tab Number "):]
+    try:
+      normalized_tab_number = _normalize_program_tab_number(tab_number)
+    except MotionInputError:
+      return False
+    return tab_number == normalized_tab_number
   return (
     command[:6] in PROGRAM_ROW_COMMAND_PREFIXES
     or command[:11] in PROGRAM_ROW_LONG_COMMAND_PREFIXES
@@ -20307,6 +20404,22 @@ def _poll_joint_motion_events():
                 _set_joint_motion_target_display(desired_target)
             continue
 
+          if event.kind == "transport-failed":
+            _try_set_virtual_joint_target(_current_joint_positions())
+            if isinstance(event.error, str) and event.error.strip():
+              detail = event.error.strip()
+            else:
+              detail = "unknown controller ownership release failure"
+            message = f"Joint-motion transport fault: {detail}"
+            _invalidate_joint_motion_state(message)
+            logger.error(message)
+            _set_application_status(message, "Alarm.TLabel")
+            if event.pending_discarded:
+              logger.warning(
+                "Pending joint target discarded because controller state is unknown"
+              )
+            continue
+
           if event.position is not None:
             if position_response_is_physical_estop(event.position):
               if not RUN.get('estopActive'):
@@ -22914,13 +23027,19 @@ def setOutputOff():
 
 def tabNumber():
   try:
+    tabNum = _normalize_program_tab_number(tabNumEntryField.get())
+  except MotionInputError as exc:
+    message = f"Program tab label rejected: {exc}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  try:
     selRow = tab1.progView.curselection()[0]
     selRow += 1
   except:
     last = tab1.progView.index('end')
     selRow = last
     tab1.progView.select_set(selRow)
-  tabNum = tabNumEntryField.get()
   tabins = "Tab Number "+tabNum              
   tab1.progView.insert(selRow, bytes(tabins + '\n', 'utf-8')) 
   tab1.progView.selection_clear(0, END)
@@ -22932,6 +23051,7 @@ def tabNumber():
       f.write(str(item.strip(), encoding='utf-8'))
       f.write('\n')
     f.close()
+  return True
 
 
 
@@ -22940,13 +23060,19 @@ def tabNumber():
 
 def jumpTab():
   try:
+    tabNum = _normalize_program_tab_number(jumpTabEntryField.get())
+  except MotionInputError as exc:
+    message = f"Program tab jump rejected: {exc}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  try:
     selRow = tab1.progView.curselection()[0]
     selRow += 1
   except:
     last = tab1.progView.index('end')
     selRow = last
     tab1.progView.select_set(selRow)
-  tabNum = jumpTabEntryField.get()
   tabjmp = "Jump Tab-"+tabNum              
   tab1.progView.insert(selRow, bytes(tabjmp + '\n', 'utf-8')) 
   tab1.progView.selection_clear(0, END)
@@ -22958,6 +23084,7 @@ def jumpTab():
       f.write(str(item.strip(), encoding='utf-8'))
       f.write('\n')
     f.close()
+  return True
  
 def cameraOn():
   try:
@@ -23076,9 +23203,11 @@ def IfCMDInsert():
       _set_application_status(text=message, style="Alarm.TLabel")
     value = prefix  + " Call Prog " + destVal
   elif(selection == "Jump Tab"):
-    if (destVal == ""):
+    try:
+      destVal = _normalize_program_tab_number(destVal)
+    except MotionInputError as exc:
       localErrorFlag = True
-      message = "Please enter a destination tab" 
+      message = f"Program conditional jump rejected: {exc}"
       _set_application_status(text=message, style="Alarm.TLabel")
     value = prefix + " Jump to Tab " + destVal
   elif(selection == "Stop"):
@@ -26569,15 +26698,30 @@ def displayPosition(response, parsed=None, synchronize_dispatcher=True):
     if joint_motion_dispatcher.synchronize(
       parsed.joints + parsed.external
     ) is not True:
+      dispatcher_closed = joint_motion_dispatcher.closed
+      dispatcher_active = joint_motion_dispatcher.active
       dispatcher_fault = joint_motion_dispatcher.fault_reason
-      if dispatcher_fault:
+      if dispatcher_closed:
+        message = (
+          "Controller position response rejected because the joint "
+          "dispatcher is closed"
+        )
+      elif dispatcher_active:
+        message = (
+          "Controller position response rejected while joint motion is active"
+        )
+      elif (
+        dispatcher_fault
+        and "controller ownership release failed:" in dispatcher_fault
+      ):
         message = (
           "Controller position response could not release joint-motion "
           f"ownership: {dispatcher_fault}"
         )
-      elif joint_motion_dispatcher.active:
+      elif isinstance(dispatcher_fault, str) and dispatcher_fault.strip():
         message = (
-          "Controller position response rejected while joint motion is active"
+          "Controller position response rejected by the joint dispatcher: "
+          f"{dispatcher_fault.strip()}"
         )
       else:
         message = "Controller position response rejected by the joint dispatcher"
