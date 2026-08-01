@@ -104,7 +104,7 @@ was exercised. M4A7 powered telemetry verification therefore remains pending.
 The original record identified development-history commit
 `d845471ce4767c0ec75a7fdf253bd1073c658b7b`. Publication reparented the
 unchanged commit sequence onto the official upstream fork point, producing
-publication-history commit `07399f21e015859ca092cd8992132b4c965464d8` for
+publication-history commit `63cef1d1119bf8f2c7af6a45aa26898a36c6140a` for
 the same uniquely titled change. Both commits contain firmware-directory tree
 `05dca406d98c4c8e0d246cd3517e35bf2dc7cc07`, now used above as the durable
 source identifier. No hardware observation or procedure was changed by this
