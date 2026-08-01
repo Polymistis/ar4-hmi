@@ -1,4 +1,7 @@
 from pathlib import Path
+from queue import Queue
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -13,12 +16,786 @@ else:
 
 from ARrobots.HMI.joint_motion import MotionInputError
 from ARrobots.HMI.vision_io import (
+    CameraPreviewFrame,
+    CameraPreviewWorker,
     fit_vision_preview_square,
     load_bounded_vision_image,
+    prepare_camera_preview_frame,
 )
 
 
+class QueuedCapture:
+    def __init__(self):
+        self.responses = Queue()
+        self.read_threads = []
+        self.release_threads = []
+        self.release_count = 0
+        self.opened = True
+
+    def isOpened(self):
+        return self.opened
+
+    def read(self):
+        self.read_threads.append(threading.get_ident())
+        return self.responses.get(timeout=2)
+
+    def release(self):
+        self.release_threads.append(threading.get_ident())
+        self.release_count += 1
+        self.opened = False
+
+
+def wait_for(predicate, timeout=2):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
 class VisionIoTests(unittest.TestCase):
+    def test_camera_preview_worker_validates_constructor_contract(self):
+        valid_factory = lambda camera_index: None
+        constructors = (
+            (
+                "capture factory",
+                lambda: CameraPreviewWorker(None),
+                "capture factory",
+            ),
+            (
+                "frame transform",
+                lambda: CameraPreviewWorker(
+                    valid_factory,
+                    frame_transform=None,
+                ),
+                "frame transform",
+            ),
+            (
+                "warmup",
+                lambda: CameraPreviewWorker(
+                    valid_factory,
+                    warmup_frames=-1,
+                ),
+                "warmup frame count",
+            ),
+            (
+                "warmup upper bound",
+                lambda: CameraPreviewWorker(
+                    valid_factory,
+                    warmup_frames=121,
+                ),
+                "warmup frame count exceeds",
+            ),
+            (
+                "read limit",
+                lambda: CameraPreviewWorker(
+                    valid_factory,
+                    read_failure_limit=0,
+                ),
+                "read failure limit must be positive",
+            ),
+            (
+                "read upper bound",
+                lambda: CameraPreviewWorker(
+                    valid_factory,
+                    read_failure_limit=121,
+                ),
+                "read failure count exceeds",
+            ),
+            (
+                "retry",
+                lambda: CameraPreviewWorker(
+                    valid_factory,
+                    retry_seconds=float("inf"),
+                ),
+                "retry interval",
+            ),
+            (
+                "retry upper bound",
+                lambda: CameraPreviewWorker(
+                    valid_factory,
+                    retry_seconds=5.1,
+                ),
+                "retry interval",
+            ),
+            (
+                "release attempts",
+                lambda: CameraPreviewWorker(
+                    valid_factory,
+                    release_attempts=0,
+                ),
+                "release attempt count must be positive",
+            ),
+            (
+                "release upper bound",
+                lambda: CameraPreviewWorker(
+                    valid_factory,
+                    release_attempts=11,
+                ),
+                "release attempt count exceeds",
+            ),
+            (
+                "thread factory",
+                lambda: CameraPreviewWorker(
+                    valid_factory,
+                    thread_factory=None,
+                ),
+                "thread factory",
+            ),
+        )
+        for name, constructor, expected_detail in constructors:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    expected_detail,
+                ):
+                    constructor()
+
+    def test_camera_preview_worker_moves_io_off_caller_and_coalesces_frames(self):
+        capture = QueuedCapture()
+        factory_threads = []
+
+        def factory(camera_index):
+            factory_threads.append((camera_index, threading.get_ident()))
+            return capture
+
+        worker = CameraPreviewWorker(
+            factory,
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0,
+        )
+        self.assertFalse(worker.closed)
+        caller_thread = threading.get_ident()
+        request_id = worker.request_start(2)
+        for value in (1, 2, 3):
+            capture.responses.put(
+                (
+                    True,
+                    np.full((3, 4, 3), value, dtype=np.uint8),
+                )
+            )
+
+        def latest_raw_is_three():
+            frame = worker.snapshot_raw_frame(request_id)
+            return frame is not None and np.all(frame == 3)
+
+        self.assertTrue(wait_for(latest_raw_is_three))
+        self.assertEqual(worker.active_request_id, request_id)
+        self.assertIsNone(worker.take_latest_frame(request_id + 1))
+        preview = worker.take_latest_frame(request_id)
+        self.assertIsNotNone(preview)
+        self.assertTrue(np.all(preview.image == 3))
+        self.assertFalse(preview.image.flags.writeable)
+        self.assertEqual(factory_threads[0][0], 2)
+        self.assertNotEqual(factory_threads[0][1], caller_thread)
+        self.assertTrue(capture.read_threads)
+        self.assertNotIn(caller_thread, capture.read_threads)
+
+        events = list(worker.drain_events())
+        self.assertEqual(
+            [event.kind for event in events],
+            ["starting", "started"],
+        )
+        self.assertEqual(
+            [event.sequence for event in events],
+            sorted(event.sequence for event in events),
+        )
+
+        self.assertTrue(worker.request_stop())
+        capture.responses.put((False, None))
+        self.assertTrue(wait_for(lambda: not worker.active))
+        self.assertEqual(capture.release_count, 1)
+        self.assertNotIn(caller_thread, capture.release_threads)
+        self.assertEqual(
+            [event.kind for event in worker.drain_events()],
+            ["stopping", "stopped"],
+        )
+
+    def test_camera_preview_worker_uses_default_warmup_and_transform(self):
+        capture = QueuedCapture()
+        worker = CameraPreviewWorker(
+            lambda camera_index: capture,
+            retry_seconds=0,
+        )
+        request_id = worker.request_start(0)
+        for value in range(5):
+            capture.responses.put(
+                (
+                    True,
+                    np.full((2, 3, 3), value, dtype=np.uint8),
+                )
+            )
+        final_frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        final_frame[:, :] = (10, 20, 30)
+        capture.responses.put((True, final_frame))
+
+        self.assertTrue(
+            wait_for(
+                lambda: worker.snapshot_raw_frame(request_id) is not None
+            )
+        )
+        raw = worker.snapshot_raw_frame(request_id)
+        np.testing.assert_array_equal(raw, final_frame)
+        preview = worker.take_latest_frame(request_id)
+        self.assertEqual(preview.image.shape, (320, 480, 3))
+        np.testing.assert_array_equal(preview.image[0, 0], (30, 20, 10))
+        self.assertFalse(preview.image.flags.writeable)
+
+        self.assertTrue(worker.request_stop())
+        capture.responses.put((False, None))
+        self.assertTrue(worker.wait_stopped(1))
+
+    def test_camera_preview_restart_cannot_be_stranded_during_worker_exit(self):
+        first = QueuedCapture()
+        second = QueuedCapture()
+        worker = CameraPreviewWorker(
+            lambda camera_index: (first, second)[camera_index],
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0,
+        )
+
+        class ExitBoundaryLock:
+            def __init__(self, owner):
+                self._lock = threading.Lock()
+                self.owner = owner
+                self.candidate_releases = 0
+                self.boundary = threading.Event()
+                self.resume = threading.Event()
+
+            def acquire(self, *args, **kwargs):
+                return self._lock.acquire(*args, **kwargs)
+
+            def release(self):
+                current = threading.current_thread()
+                exit_candidate = (
+                    current.name == "ar4-camera-preview"
+                    and self.owner._desired is None
+                    and self.owner._active_request_id is None
+                )
+                if exit_candidate:
+                    self.candidate_releases += 1
+                self._lock.release()
+                if exit_candidate and self.candidate_releases == 2:
+                    self.boundary.set()
+                    if not self.resume.wait(2):
+                        raise RuntimeError("exit-boundary test was not resumed")
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self.release()
+
+        boundary_lock = ExitBoundaryLock(worker)
+        worker._lock = boundary_lock
+        first_request = worker.request_start(0)
+        first.responses.put(
+            (True, np.full((2, 2, 3), 1, dtype=np.uint8))
+        )
+        self.assertTrue(
+            wait_for(
+                lambda: worker.snapshot_raw_frame(first_request) is not None
+            )
+        )
+        old_thread = worker._worker
+
+        self.assertTrue(worker.request_stop())
+        first.responses.put((False, None))
+        self.assertTrue(boundary_lock.boundary.wait(2))
+        second_request = worker.request_start(1)
+        self.assertIsNot(worker._worker, old_thread)
+        self.assertEqual(worker.desired_request_id, second_request)
+        boundary_lock.resume.set()
+        old_thread.join(1)
+        self.assertFalse(old_thread.is_alive())
+
+        second.responses.put(
+            (True, np.full((2, 2, 3), 2, dtype=np.uint8))
+        )
+        self.assertTrue(
+            wait_for(
+                lambda: worker.snapshot_raw_frame(second_request) is not None
+            )
+        )
+        self.assertEqual(worker.active_request_id, second_request)
+        self.assertTrue(worker.request_stop())
+        second.responses.put((False, None))
+        self.assertTrue(worker.wait_stopped(1))
+
+    def test_camera_preview_close_reports_and_waits_for_live_retirement(self):
+        capture = QueuedCapture()
+        worker = CameraPreviewWorker(
+            lambda camera_index: capture,
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0,
+        )
+        request_id = worker.request_start(0)
+        capture.responses.put(
+            (True, np.ones((2, 2, 3), dtype=np.uint8))
+        )
+        self.assertTrue(
+            wait_for(
+                lambda: worker.snapshot_raw_frame(request_id) is not None
+            )
+        )
+
+        self.assertFalse(worker.close())
+        self.assertTrue(worker.closed)
+        self.assertFalse(worker.wait_stopped(0))
+        capture.responses.put((False, None))
+        self.assertTrue(worker.wait_stopped(1))
+        self.assertFalse(worker.active)
+        with self.assertRaisesRegex(MotionInputError, "worker is closed"):
+            worker.request_start(1)
+        with self.assertRaisesRegex(MotionInputError, "stop timeout"):
+            worker.wait_stopped(float("nan"))
+        with self.assertRaisesRegex(MotionInputError, "stop timeout"):
+            worker.wait_stopped(threading.TIMEOUT_MAX + 1)
+
+    def test_camera_preview_worker_replaces_active_request_without_tk_wait(self):
+        first = QueuedCapture()
+        second = QueuedCapture()
+        captures = {4: first, 7: second}
+        factory_calls = []
+
+        def factory(camera_index):
+            factory_calls.append(camera_index)
+            return captures[camera_index]
+
+        worker = CameraPreviewWorker(
+            factory,
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0,
+        )
+        first_request = worker.request_start(4)
+        first.responses.put(
+            (True, np.full((2, 2, 3), 4, dtype=np.uint8))
+        )
+        self.assertTrue(
+            wait_for(
+                lambda: worker.snapshot_raw_frame(first_request) is not None
+            )
+        )
+
+        second_request = worker.request_start(7)
+        self.assertNotEqual(first_request, second_request)
+        self.assertEqual(worker.desired_request_id, second_request)
+        first.responses.put((False, None))
+        second.responses.put(
+            (True, np.full((2, 2, 3), 7, dtype=np.uint8))
+        )
+
+        def replacement_is_live():
+            frame = worker.snapshot_raw_frame(second_request)
+            return frame is not None and np.all(frame == 7)
+
+        self.assertTrue(wait_for(replacement_is_live))
+        self.assertEqual(factory_calls, [4, 7])
+        self.assertEqual(first.release_count, 1)
+        self.assertIsNone(worker.snapshot_raw_frame(first_request))
+
+        self.assertTrue(worker.request_stop())
+        second.responses.put((False, None))
+        self.assertTrue(wait_for(lambda: not worker.active))
+        self.assertEqual(second.release_count, 1)
+        events = worker.drain_events()
+        first_stopped = next(
+            index
+            for index, event in enumerate(events)
+            if event.kind == "stopped"
+            and event.request_id == first_request
+        )
+        second_started = next(
+            index
+            for index, event in enumerate(events)
+            if event.kind == "started"
+            and event.request_id == second_request
+        )
+        self.assertLess(first_stopped, second_started)
+
+    def test_camera_preview_replacement_preserves_undelivered_failure(self):
+        class ClosedCapture(QueuedCapture):
+            def __init__(self):
+                super().__init__()
+                self.opened = False
+
+        first = ClosedCapture()
+        second = QueuedCapture()
+        captures = iter((first, second))
+        worker = CameraPreviewWorker(
+            lambda camera_index: next(captures),
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0,
+        )
+        first_request = worker.request_start(0)
+        self.assertTrue(worker.wait_stopped(1))
+
+        second_request = worker.request_start(0)
+        second.responses.put(
+            (True, np.ones((2, 2, 3), dtype=np.uint8))
+        )
+        self.assertTrue(
+            wait_for(
+                lambda: worker.snapshot_raw_frame(second_request) is not None
+            )
+        )
+        events = worker.drain_events()
+        retained_failure = next(
+            event
+            for event in events
+            if event.kind == "failed"
+            and event.request_id == first_request
+        )
+        self.assertIn("did not open", retained_failure.detail)
+        self.assertIn(
+            ("started", second_request),
+            tuple((event.kind, event.request_id) for event in events),
+        )
+
+        self.assertTrue(worker.request_stop())
+        second.responses.put((False, None))
+        self.assertTrue(worker.wait_stopped(1))
+
+    def test_camera_preview_worker_rejects_invalid_frames_without_poisoning(self):
+        capture = QueuedCapture()
+        worker = CameraPreviewWorker(
+            lambda camera_index: capture,
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0,
+        )
+        request_id = worker.request_start(0)
+        capture.responses.put(
+            (True, np.zeros((2, 2), dtype=np.uint8))
+        )
+        self.assertTrue(wait_for(lambda: not worker.active))
+        self.assertIsNone(worker.fault_reason)
+        self.assertIsNone(worker.snapshot_raw_frame(request_id))
+        self.assertEqual(capture.release_count, 1)
+        events = worker.drain_events()
+        failures = [event for event in events if event.kind == "failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("three 8-bit channels", failures[0].detail)
+        self.assertEqual(events[-1].kind, "stopped")
+
+    def test_camera_preview_worker_exhausts_bounded_read_failures(self):
+        capture = QueuedCapture()
+        worker = CameraPreviewWorker(
+            lambda camera_index: capture,
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0,
+        )
+        worker.request_start(0)
+        for _ in range(3):
+            capture.responses.put((False, None))
+
+        self.assertTrue(worker.wait_stopped(1))
+        self.assertEqual(capture.release_count, 1)
+        failure = next(
+            event
+            for event in worker.drain_events()
+            if event.kind == "failed"
+        )
+        self.assertIn("consecutive read-failure limit", failure.detail)
+
+    def test_camera_preview_worker_rejects_open_and_read_contract_failures(self):
+        class ResultCapture:
+            def __init__(self, result, opened=True):
+                self.result = result
+                self.opened = opened
+                self.read_count = 0
+                self.release_count = 0
+
+            def isOpened(self):
+                return self.opened
+
+            def read(self):
+                self.read_count += 1
+                return self.result
+
+            def release(self):
+                self.release_count += 1
+                self.opened = False
+
+        cases = (
+            ("closed", ResultCapture((True, None), opened=False), "did not open"),
+            ("shape", ResultCapture("invalid"), "read result is invalid"),
+            ("status", ResultCapture((1, None)), "read status is invalid"),
+            (
+                "failed-data",
+                ResultCapture(
+                    (False, np.zeros((2, 2, 3), dtype=np.uint8))
+                ),
+                "unexpected frame data",
+            ),
+        )
+        for name, capture, expected_detail in cases:
+            with self.subTest(name=name):
+                worker = CameraPreviewWorker(
+                    lambda camera_index, selected=capture: selected,
+                    frame_transform=lambda frame: frame,
+                    warmup_frames=0,
+                    retry_seconds=0,
+                )
+                worker.request_start(0)
+                self.assertTrue(worker.wait_stopped(1))
+                failure = next(
+                    event
+                    for event in worker.drain_events()
+                    if event.kind == "failed"
+                )
+                self.assertIn(expected_detail, failure.detail)
+                self.assertEqual(capture.release_count, 1)
+                self.assertEqual(
+                    capture.read_count,
+                    0 if name == "closed" else 1,
+                )
+
+    def test_camera_preview_worker_rejects_missing_capture_operations(self):
+        class MissingRead:
+            @staticmethod
+            def isOpened():
+                return True
+
+            @staticmethod
+            def release():
+                pass
+
+        class MissingRelease:
+            @staticmethod
+            def isOpened():
+                return True
+
+            @staticmethod
+            def read():
+                return False, None
+
+        class InvalidOpenState:
+            @staticmethod
+            def isOpened():
+                return 1
+
+            @staticmethod
+            def read():
+                return False, None
+
+            @staticmethod
+            def release():
+                pass
+
+        cases = (
+            (MissingRead(), "no read operation"),
+            (MissingRelease(), "no release operation"),
+            (InvalidOpenState(), "open state is invalid"),
+        )
+        for capture, expected_detail in cases:
+            with self.subTest(expected_detail=expected_detail):
+                worker = CameraPreviewWorker(
+                    lambda camera_index, selected=capture: selected,
+                    retry_seconds=0,
+                )
+                worker.request_start(0)
+                self.assertTrue(worker.wait_stopped(1))
+                failure = next(
+                    event
+                    for event in worker.drain_events()
+                    if event.kind == "failed"
+                    and expected_detail in event.detail
+                )
+                self.assertIn(expected_detail, failure.detail)
+
+    def test_camera_preview_error_details_are_fully_bounded_and_normalized(self):
+        prefix = "camera preview failed: "
+        long_detail = "x" * (512 - len(prefix) - 1) + " " + "tail"
+        worker = CameraPreviewWorker(
+            lambda camera_index: (_ for _ in ()).throw(
+                RuntimeError(long_detail)
+            ),
+            retry_seconds=0,
+        )
+        worker.request_start(0)
+
+        self.assertTrue(worker.wait_stopped(1))
+        failure = next(
+            event
+            for event in worker.drain_events()
+            if event.kind == "failed"
+        )
+        self.assertLessEqual(len(failure.detail), 512)
+        self.assertEqual(len(failure.detail), 511)
+        self.assertEqual(failure.detail, failure.detail.strip())
+        self.assertIsNone(worker.fault_reason)
+
+    def test_camera_preview_worker_latches_unreleased_capture(self):
+        class UnreleasedCapture:
+            @staticmethod
+            def isOpened():
+                return True
+
+            @staticmethod
+            def read():
+                return True, np.zeros((2, 2), dtype=np.uint8)
+
+            @staticmethod
+            def release():
+                raise RuntimeError("device remains owned")
+
+        worker = CameraPreviewWorker(
+            lambda camera_index: UnreleasedCapture(),
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0,
+        )
+        worker.request_start(0)
+        self.assertTrue(wait_for(lambda: not worker.active))
+        self.assertIn("camera release failed", worker.fault_reason)
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "requires an application restart",
+        ):
+            worker.request_start(1)
+        self.assertFalse(worker.close())
+        failures = [
+            event
+            for event in worker.drain_events()
+            if event.kind == "failed"
+        ]
+        self.assertEqual(len(failures), 2)
+        self.assertIn("device remains owned", failures[-1].detail)
+
+    def test_camera_preview_release_retries_and_latches_persistent_open_state(self):
+        class DelayedReleaseCapture:
+            def __init__(self, closes_after):
+                self.closes_after = closes_after
+                self.release_count = 0
+
+            def isOpened(self):
+                return self.release_count < self.closes_after
+
+            @staticmethod
+            def read():
+                return True, np.zeros((2, 2), dtype=np.uint8)
+
+            def release(self):
+                self.release_count += 1
+
+        recovering_capture = DelayedReleaseCapture(2)
+        recovering_worker = CameraPreviewWorker(
+            lambda camera_index: recovering_capture,
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0.25,
+        )
+        recovering_sleeps = []
+        with patch(
+            "ARrobots.HMI.vision_io.time.sleep",
+            side_effect=recovering_sleeps.append,
+        ):
+            recovering_worker.request_start(0)
+            self.assertTrue(recovering_worker.wait_stopped(1))
+        self.assertEqual(recovering_capture.release_count, 2)
+        self.assertEqual(recovering_sleeps, [0.25])
+        self.assertIsNone(recovering_worker.fault_reason)
+
+        retained_capture = DelayedReleaseCapture(4)
+        retained_worker = CameraPreviewWorker(
+            lambda camera_index: retained_capture,
+            frame_transform=lambda frame: frame,
+            warmup_frames=0,
+            retry_seconds=0.25,
+        )
+        retained_sleeps = []
+        with patch(
+            "ARrobots.HMI.vision_io.time.sleep",
+            side_effect=retained_sleeps.append,
+        ):
+            retained_worker.request_start(0)
+            self.assertTrue(retained_worker.wait_stopped(1))
+        self.assertEqual(retained_capture.release_count, 3)
+        self.assertEqual(retained_sleeps, [0.25, 0.25])
+        self.assertIn("device remained open", retained_worker.fault_reason)
+
+    def test_camera_preview_worker_rolls_back_thread_start_failure(self):
+        def failing_thread_factory(**kwargs):
+            raise RuntimeError("thread construction unavailable")
+
+        creation_worker = CameraPreviewWorker(
+            lambda camera_index: self.fail("capture factory must not run"),
+            thread_factory=failing_thread_factory,
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "thread construction unavailable",
+        ):
+            creation_worker.request_start(0)
+        self.assertFalse(creation_worker.active)
+        self.assertIsNone(creation_worker.desired_request_id)
+        self.assertTrue(creation_worker.wait_stopped(0))
+        self.assertEqual(
+            [event.kind for event in creation_worker.drain_events()],
+            ["starting", "failed"],
+        )
+
+        invalid_worker = CameraPreviewWorker(
+            lambda camera_index: self.fail("capture factory must not run"),
+            thread_factory=lambda **kwargs: object(),
+        )
+        with self.assertRaisesRegex(MotionInputError, "invalid worker"):
+            invalid_worker.request_start(0)
+        self.assertFalse(invalid_worker.active)
+        self.assertIsNone(invalid_worker.desired_request_id)
+        self.assertTrue(invalid_worker.wait_stopped(0))
+
+        class FailingThread(threading.Thread):
+            def start(self):
+                raise RuntimeError("thread unavailable")
+
+        worker = CameraPreviewWorker(
+            lambda camera_index: self.fail("capture factory must not run"),
+            thread_factory=FailingThread,
+        )
+        with self.assertRaisesRegex(RuntimeError, "thread unavailable"):
+            worker.request_start(0)
+        self.assertFalse(worker.active)
+        self.assertIsNone(worker.desired_request_id)
+        self.assertEqual(
+            [event.kind for event in worker.drain_events()],
+            ["starting", "failed"],
+        )
+        self.assertTrue(worker.close())
+
+    def test_camera_preview_frame_conversion_validates_and_converts_bgr(self):
+        source = np.zeros((2, 3, 3), dtype=np.uint8)
+        source[:, :] = (1, 2, 3)
+        preview = prepare_camera_preview_frame(source, 3, 2)
+
+        np.testing.assert_array_equal(preview[0, 0], (3, 2, 1))
+        np.testing.assert_array_equal(source[0, 0], (1, 2, 3))
+        with self.assertRaisesRegex(MotionInputError, "three 8-bit channels"):
+            prepare_camera_preview_frame(
+                np.zeros((2, 3), dtype=np.uint8),
+                3,
+                2,
+            )
+        with patch(
+            "ARrobots.HMI.vision_io.MAX_CAMERA_FRAME_PIXELS",
+            3,
+        ):
+            with self.assertRaisesRegex(MotionInputError, "pixel count"):
+                prepare_camera_preview_frame(source, 3, 2)
+        first = CameraPreviewFrame(0, 0, preview)
+        second = CameraPreviewFrame(0, 0, preview)
+        self.assertIsNot(first, second)
+        self.assertNotEqual(first, second)
+
     def test_bounded_loader_decodes_valid_image_from_admitted_bytes(self):
         with BoundedTemporaryDirectory() as directory:
             image_path = Path(directory) / "template.png"
