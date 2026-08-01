@@ -28899,17 +28899,8 @@ def _settle_program_vision_shutdown_operations():
     program_vision_retired_request_ids.update(program_vision_operations)
     program_vision_operations.clear()
 
-  unique_operations = []
-  operation_identities = set()
-  for operation in operations:
-    identity = id(operation)
-    if identity in operation_identities:
-      continue
-    operation_identities.add(identity)
-    unique_operations.append(operation)
-
   settled = True
-  for operation in unique_operations:
+  for operation in operations:
     try:
       _settle_program_vision_operation(operation, False)
     except Exception:
@@ -29608,6 +29599,19 @@ def _drain_vision_match_events():
         program_vision_retired_request_ids.discard(event.request_id)
     if operation is None:
       if retired:
+        if event.error_detail is None:
+          logger.warning(
+            "Discarding retired program vision request %s result after "
+            "shutdown settlement",
+            event.request_id,
+          )
+        else:
+          logger.warning(
+            "Discarding retired program vision request %s failure after "
+            "shutdown settlement: %s",
+            event.request_id,
+            event.error_detail,
+          )
         continue
       try:
         _apply_vision_match_event(event)

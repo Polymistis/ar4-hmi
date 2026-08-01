@@ -6172,6 +6172,7 @@ class HmiSourceContractTests(unittest.TestCase):
         ]
         worker_ownership = [(False, None, None)]
         manual_events = []
+        warnings = []
         namespace.update({
             "program_vision_operation_lock": threading.Lock(),
             "program_vision_operations": {10: drained},
@@ -6194,6 +6195,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "logger": SimpleNamespace(
                 error=lambda *args: None,
                 exception=lambda *args: None,
+                warning=lambda *args: warnings.append(args),
             ),
             "_apply_vision_match_event": (
                 lambda event: manual_events.append(event) or False
@@ -6289,6 +6291,34 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(manual_events, [])
         self.assertEqual(len(statuses), status_count)
         self.assertEqual(
+            warnings,
+            [(
+                "Discarding retired program vision request %s failure after "
+                "shutdown settlement: %s",
+                13,
+                "vision matching was cancelled during shutdown",
+            )],
+        )
+        self.assertEqual(
+            namespace["program_vision_retired_request_ids"],
+            set(),
+        )
+        namespace["program_vision_retired_request_ids"].add(14)
+        events[:] = [
+            VisionOperationEvent(5, 14, result=operation_result(True))
+        ]
+        self.assertTrue(drain_events())
+        self.assertEqual(manual_events, [])
+        self.assertEqual(len(statuses), status_count)
+        self.assertEqual(
+            warnings[-1],
+            (
+                "Discarding retired program vision request %s result after "
+                "shutdown settlement",
+                14,
+            ),
+        )
+        self.assertEqual(
             namespace["program_vision_retired_request_ids"],
             set(),
         )
@@ -6304,7 +6334,7 @@ class HmiSourceContractTests(unittest.TestCase):
         ):
             apply_event(
                 changed,
-                VisionOperationEvent(5, 9, result=operation_result(True)),
+                VisionOperationEvent(6, 9, result=operation_result(True)),
             )
         ProgramView.rows = original_rows
         self.assertEqual(
@@ -6319,7 +6349,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 apply_event(
                     failed,
                     VisionOperationEvent(
-                        6,
+                        7,
                         8,
                         result=operation_result(False),
                     ),

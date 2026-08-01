@@ -231,10 +231,19 @@ class VisionIoTests(unittest.TestCase):
         self.assertTrue(third.coalesced)
         self.assertEqual(worker.active_request_id, first.request_id)
         self.assertEqual(worker.pending_request_id, third.request_id)
+        ownership = worker.drain_events_state()
+        self.assertEqual(ownership.events, ())
+        self.assertTrue(ownership.active)
+        self.assertEqual(ownership.active_request_id, first.request_id)
+        self.assertEqual(ownership.pending_request_id, third.request_id)
 
         release_first.set()
         self.assertTrue(worker.wait_stopped(2))
-        events = worker.drain_events()
+        terminal = worker.drain_events_state()
+        self.assertFalse(terminal.active)
+        self.assertIsNone(terminal.active_request_id)
+        self.assertIsNone(terminal.pending_request_id)
+        events = terminal.events
         self.assertEqual(
             [event.request_id for event in events],
             [first.request_id, third.request_id],

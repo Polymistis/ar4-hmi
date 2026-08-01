@@ -1323,6 +1323,12 @@ class VisionOperationWorker:
         return self.drain_events_state().events
 
     def drain_events_state(self):
+        """Atomically drain outcomes and snapshot request ownership.
+
+        Consumers treat an absent outcome and absent request ownership as a
+        lost terminal event, so both observations must share one lock hold.
+        """
+
         with self._lock:
             events = tuple(self._events)
             state = VisionOperationDrainState(
