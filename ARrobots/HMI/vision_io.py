@@ -508,6 +508,7 @@ class VisionSelectionResult:
     """
 
     kind: str
+    settings: VisionSelectionSettings
     capture_result: VisionCaptureResult | None = None
     mask_bounds: tuple[int, int, int, int] | None = None
     template_filename: str | None = None
@@ -521,6 +522,13 @@ class VisionSelectionResult:
             or self.kind not in VISION_SELECTION_KINDS
         ):
             raise MotionInputError("vision selection result kind is invalid")
+        if (
+            not isinstance(self.settings, VisionSelectionSettings)
+            or self.settings.kind != self.kind
+        ):
+            raise MotionInputError(
+                "vision selection result settings do not match the result kind"
+            )
         if self.kind == "mask":
             if not isinstance(self.capture_result, VisionCaptureResult):
                 raise MotionInputError(
@@ -555,6 +563,10 @@ class VisionSelectionResult:
                 "vision template selection result contains mask data"
             )
         _validate_new_vision_template_filename(self.template_filename)
+        if self.template_filename != self.settings.template_filename:
+            raise MotionInputError(
+                "vision template result filename does not match its settings"
+            )
         _validated_camera_frame(
             self.template_image,
             "vision template selection image",
@@ -1179,6 +1191,9 @@ def select_vision_region(image, window_name, cancellation_event=None):
                 state["start"] = None
                 state["bounds"] = bounds
             if bounds is None:
+                if x == start[0] and y == start[1]:
+                    cv2.imshow(window_name, source)
+                    return
                 feedback = source.copy()
                 cv2.putText(
                     feedback,
@@ -1241,14 +1256,28 @@ def select_vision_region(image, window_name, cancellation_event=None):
         except BaseException as exc:
             cleanup_error = exc
     if operation_error is not None:
+        if not isinstance(operation_error, Exception):
+            if cleanup_error is not None:
+                operation_error.add_note(
+                    normalize_camera_exception_detail(
+                        cleanup_error,
+                        "vision selection window cleanup failed: ",
+                    )
+                )
+            raise operation_error
         detail = normalize_camera_exception_detail(operation_error)
         if not isinstance(operation_error, MotionInputError):
             detail = f"vision selection window failed: {detail}"
         if cleanup_error is not None:
             cleanup_detail = normalize_camera_exception_detail(cleanup_error)
-            detail += (
-                "; vision selection window cleanup failed: "
-                + cleanup_detail
+            separator = "; vision selection window cleanup failed: "
+            available = MAX_CAMERA_PREVIEW_EVENT_DETAIL - len(separator)
+            operation_limit = available // 2
+            cleanup_limit = available - operation_limit
+            detail = (
+                detail[:operation_limit].rstrip()
+                + separator
+                + cleanup_detail[:cleanup_limit].rstrip()
             )
         if cleanup_error is None and isinstance(
             operation_error,
@@ -1831,10 +1860,10 @@ class VisionOperationWorker:
                         )
                     if (
                         isinstance(request.settings, VisionSelectionSettings)
-                        and result.kind != request.settings.kind
+                        and result.settings != request.settings
                     ):
                         raise MotionInputError(
-                            "vision selection result kind does not match request"
+                            "vision selection result settings do not match request"
                         )
                 except BaseException as exc:
                     result = None
@@ -2759,6 +2788,7 @@ def prepare_vision_mask_selection_result(image, settings, mask_bounds):
     )
     return VisionSelectionResult(
         kind="mask",
+        settings=settings,
         capture_result=prepare_vision_capture_result(image, applied_settings),
         mask_bounds=bounds,
     )
@@ -2814,6 +2844,7 @@ def prepare_vision_template_selection_result(
     template_preview.setflags(write=False)
     return VisionSelectionResult(
         kind="template",
+        settings=settings,
         template_filename=settings.template_filename,
         template_image=template_image,
         template_preview=template_preview,
