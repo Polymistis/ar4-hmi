@@ -3695,9 +3695,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(len(queued), 1)
         self.assertNotEqual(queued[0][2], tk_thread)
 
-    def test_template_preview_reports_decode_failure_and_applies_square_image(self):
+    def test_vision_template_preview_size_matches_hmi_contract(self):
         self.assertEqual(VISION_TEMPLATE_PREVIEW_SIZE, 150)
 
+    def test_template_preview_reports_decode_failure_and_applies_square_image(self):
         statuses = []
         logged = []
         configured = []
@@ -5252,6 +5253,12 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace,
         )
 
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "vision selection settings are invalid",
+        ):
+            perform(object(), cancellation)
+
         mask_result = perform(mask_settings, cancellation)
         self.assertIsInstance(mask_result, VisionSelectionResult)
         self.assertEqual(mask_result.kind, "mask")
@@ -5315,15 +5322,21 @@ class HmiSourceContractTests(unittest.TestCase):
         cancellation.clear()
         cancel_after_capture[0] = False
         cancel_after_selection[0] = True
+        selection_count = len(selections)
         write_count = len(writes)
         with self.assertRaisesRegex(MotionInputError, "was cancelled"):
             perform(mask_settings, cancellation)
+        self.assertEqual(len(selections), selection_count + 1)
         self.assertEqual(len(writes), write_count)
         self.assertFalse(artifact_active[0])
 
         cancellation.clear()
+        load_count = len(loads)
+        selection_count = len(selections)
         with self.assertRaisesRegex(MotionInputError, "was cancelled"):
             perform(template_settings, cancellation)
+        self.assertEqual(len(loads), load_count + 1)
+        self.assertEqual(len(selections), selection_count + 1)
         self.assertEqual(len(writes), write_count)
         self.assertFalse(artifact_active[0])
 
@@ -6807,6 +6820,7 @@ class HmiSourceContractTests(unittest.TestCase):
         statuses = []
         errors = []
         status_failure = [False]
+        submission_result = [VisionOperationSubmission(41, False)]
 
         def set_status(message, style):
             if status_failure[0]:
@@ -6817,7 +6831,7 @@ class HmiSourceContractTests(unittest.TestCase):
             @staticmethod
             def submit(settings, cancellation):
                 submissions.append((settings, cancellation))
-                return VisionOperationSubmission(41, False)
+                return submission_result[0]
 
         closing = threading.Event()
         namespace = {
@@ -6875,6 +6889,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         namespace["RUN"]["visionSelectionRequestId"] = None
         namespace["RUN"]["visionSelectionKind"] = None
+        status_failure[0] = True
         closing.set()
         self.assertFalse(request_selection(mask_settings))
         self.assertIn(
@@ -6886,6 +6901,14 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(request_selection(mask_settings))
         self.assertIn("shutdown is active", statuses[-1][0])
         closing.clear()
+
+        submission_result[0] = object()
+        self.assertFalse(request_selection(mask_settings))
+        self.assertIn("invalid submission", statuses[-1][0])
+
+        submission_result[0] = VisionOperationSubmission(42, True)
+        self.assertFalse(request_selection(mask_settings))
+        self.assertIn("unexpectedly coalesced", statuses[-1][0])
 
         dispatched = []
         mask_namespace = {
@@ -6986,6 +7009,7 @@ class HmiSourceContractTests(unittest.TestCase):
         configured = []
         statuses = []
         warnings = []
+        application_errors = []
         selected_template = Variable()
         runtime = {
             "visionSelectionRequestId": 1,
@@ -7019,20 +7043,32 @@ class HmiSourceContractTests(unittest.TestCase):
             "logger": SimpleNamespace(
                 error=lambda *args: None,
                 warning=lambda *args: warnings.append(args),
-                exception=lambda *args: None,
+                exception=lambda *args: application_errors.append(args),
             ),
             "_set_application_status": (
                 lambda message, style: statuses.append((message, style))
             ),
         }
-        namespace["_apply_vision_selection_result"] = self.compile_function(
+        apply_result = self.compile_function(
             "_apply_vision_selection_result",
             namespace,
         )
+        namespace["_apply_vision_selection_result"] = apply_result
         apply_event = self.compile_function(
             "_apply_vision_selection_event",
             namespace,
         )
+
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "supplied an invalid result",
+        ):
+            apply_result(object())
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "emitted an invalid event",
+        ):
+            apply_event(object())
 
         self.assertTrue(
             apply_event(VisionOperationEvent(0, 1, result=mask_result))
@@ -7122,12 +7158,21 @@ class HmiSourceContractTests(unittest.TestCase):
         events[:] = [VisionOperationEvent(7, 7, result=mask_result)]
         runtime["visionSelectionRequestId"] = 7
         runtime["visionSelectionKind"] = "mask"
+        rejected_results = []
 
-        def reject_event(event):
-            raise RuntimeError(f"request {event.request_id} apply failed")
+        def reject_result(result):
+            rejected_results.append(result)
+            raise RuntimeError("selection result apply failed")
 
-        namespace["_apply_vision_selection_event"] = reject_event
+        namespace["_apply_vision_selection_result"] = reject_result
         self.assertTrue(drain_events())
+        self.assertEqual(rejected_results, [mask_result])
+        self.assertIsNone(runtime["visionSelectionRequestId"])
+        self.assertIsNone(runtime["visionSelectionKind"])
+        self.assertIn(
+            "Unable to apply a vision selection result",
+            application_errors[-1][0],
+        )
         self.assertEqual(
             statuses[-1],
             ("VISION SELECTION RESULT FAILED", "Alarm.TLabel"),
