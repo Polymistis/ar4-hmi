@@ -21,12 +21,18 @@ from ARrobots.HMI.vision_io import (
     CameraPreviewWorker,
     VisionCaptureResult,
     VisionCaptureSettings,
-    VisionCaptureWorker,
+    VisionCoordinateMapping,
+    VisionMatchOperationResult,
+    VisionMatchOptions,
+    VisionMatchResult,
+    VisionMatchSettings,
+    VisionOperationWorker,
     fit_vision_preview_square,
     load_bounded_vision_image,
     normalize_camera_exception_detail,
     prepare_camera_preview_frame,
     prepare_vision_capture_result,
+    prepare_vision_match_result,
 )
 
 
@@ -73,6 +79,44 @@ class VisionIoTests(unittest.TestCase):
             background_grayscale=17,
             sample_points=(),
         )
+
+    @staticmethod
+    def vision_capture_worker(operation, **kwargs):
+        return VisionOperationWorker(
+            operation,
+            VisionCaptureSettings,
+            VisionCaptureResult,
+            "vision capture",
+            "ar4-vision-capture-test",
+            **kwargs,
+        )
+
+    @staticmethod
+    def vision_coordinate_mapping(pixel_extent=48):
+        return VisionCoordinateMapping(
+            first_pixel_origin=0.0,
+            first_robot_origin=0.0,
+            second_pixel_origin=0.0,
+            second_robot_origin=0.0,
+            first_pixel_end=float(pixel_extent),
+            first_robot_end=float(pixel_extent * 10),
+            second_pixel_end=float(pixel_extent),
+            second_robot_end=float(pixel_extent * 10),
+        )
+
+    def vision_match_options(self, **overrides):
+        values = {
+            "template_filename": "template.jpg",
+            "minimum_score": 0.99,
+            "full_rotation_search": True,
+            "pick_closest_180": False,
+            "try_closest_out_of_range": False,
+            "joint6_positive_limit": 180.0,
+            "joint6_negative_limit": 180.0,
+            "coordinate_mapping": self.vision_coordinate_mapping(),
+        }
+        values.update(overrides)
+        return VisionMatchOptions(**values)
 
     def test_vision_capture_processing_validates_and_masks_owned_results(self):
         frame = np.zeros((4, 6, 3), dtype=np.uint8)
@@ -174,7 +218,7 @@ class VisionIoTests(unittest.TestCase):
             frame = np.full((4, 6, 3), settings.brightness, dtype=np.uint8)
             return prepare_vision_capture_result(frame, settings)
 
-        worker = VisionCaptureWorker(operation)
+        worker = self.vision_capture_worker(operation)
         caller_thread = threading.get_ident()
         first = worker.submit(self.vision_capture_settings(1))
         self.assertFalse(first.coalesced)
@@ -209,7 +253,7 @@ class VisionIoTests(unittest.TestCase):
             self.assertTrue(cancellation_event.wait(1))
             raise MotionInputError("capture cancelled for shutdown")
 
-        worker = VisionCaptureWorker(operation)
+        worker = self.vision_capture_worker(operation)
         submission = worker.submit(self.vision_capture_settings())
         self.assertTrue(operation_started.wait(1))
         self.assertFalse(worker.close())
@@ -222,14 +266,25 @@ class VisionIoTests(unittest.TestCase):
     def test_vision_capture_worker_rolls_back_startup_failures(self):
         settings = self.vision_capture_settings()
         with self.assertRaisesRegex(MotionInputError, "operation"):
-            VisionCaptureWorker(None)
+            self.vision_capture_worker(None)
         with self.assertRaisesRegex(MotionInputError, "thread factory"):
-            VisionCaptureWorker(lambda *args: None, thread_factory=None)
+            self.vision_capture_worker(
+                lambda *args: None,
+                thread_factory=None,
+            )
+        with self.assertRaisesRegex(MotionInputError, "type contract"):
+            VisionOperationWorker(
+                lambda *args: None,
+                VisionCaptureSettings,
+                VisionMatchOperationResult,
+                "vision capture",
+                "ar4-vision-invalid-test",
+            )
 
         def failing_factory(**kwargs):
             raise RuntimeError("thread construction unavailable")
 
-        worker = VisionCaptureWorker(
+        worker = self.vision_capture_worker(
             lambda *args: self.fail("operation must not run"),
             thread_factory=failing_factory,
         )
@@ -243,7 +298,7 @@ class VisionIoTests(unittest.TestCase):
             def start(self):
                 raise RuntimeError("thread startup unavailable")
 
-        worker = VisionCaptureWorker(
+        worker = self.vision_capture_worker(
             lambda *args: self.fail("operation must not run"),
             thread_factory=FailingThread,
         )
@@ -269,7 +324,7 @@ class VisionIoTests(unittest.TestCase):
                     return "terminal publication wait timed out"
                 return "terminal publication failed"
 
-        worker = VisionCaptureWorker(lambda *args: result)
+        worker = self.vision_capture_worker(lambda *args: result)
         append_event = worker._append_event_locked
         fail_next_append = [True]
 
@@ -307,6 +362,177 @@ class VisionIoTests(unittest.TestCase):
         self.assertEqual(recovered_event.request_id, recovered.request_id)
         self.assertIs(recovered_event.result, result)
         self.assertTrue(worker.close())
+
+    def test_vision_match_processing_returns_owned_worker_ready_result(self):
+        random = np.random.default_rng(17)
+        source = np.full((48, 48), 11, dtype=np.uint8)
+        template = random.integers(
+            0,
+            256,
+            size=(8, 10),
+            dtype=np.uint8,
+        )
+        source[12:20, 18:28] = template
+
+        result = prepare_vision_match_result(
+            source,
+            template,
+            11,
+            self.vision_match_options(),
+        )
+
+        self.assertIsInstance(result, VisionMatchResult)
+        self.assertTrue(result.matched)
+        self.assertGreaterEqual(result.score, 0.99)
+        self.assertEqual(result.angle_degrees, 0.0)
+        self.assertEqual(result.pixel_position, (16, 23))
+        self.assertEqual(result.robot_position, (160.0, 230.0))
+        self.assertEqual(result.annotated_image.shape, (48, 48, 3))
+        self.assertEqual(result.display_image.shape, (480, 640, 3))
+        self.assertFalse(result.annotated_image.flags.writeable)
+        self.assertFalse(result.display_image.flags.writeable)
+        self.assertTrue(
+            np.any(np.all(result.annotated_image == (0, 255, 0), axis=2))
+        )
+
+    def test_vision_match_clamps_both_joint6_limits_when_enabled(self):
+        source = np.zeros((48, 48), dtype=np.uint8)
+        template = np.zeros((8, 10), dtype=np.uint8)
+        positive = (0.95, 120.0, (18, 12), 10, 8)
+        with patch(
+            "ARrobots.HMI.vision_io._best_narrow_vision_rotation",
+            return_value=positive,
+        ):
+            rejected = prepare_vision_match_result(
+                source,
+                template,
+                0,
+                self.vision_match_options(
+                    minimum_score=0.9,
+                    full_rotation_search=False,
+                    joint6_positive_limit=90.0,
+                ),
+            )
+            clamped = prepare_vision_match_result(
+                source,
+                template,
+                0,
+                self.vision_match_options(
+                    minimum_score=0.9,
+                    full_rotation_search=False,
+                    try_closest_out_of_range=True,
+                    joint6_positive_limit=90.0,
+                ),
+            )
+        self.assertFalse(rejected.matched)
+        self.assertTrue(clamped.matched)
+        self.assertEqual(clamped.angle_degrees, 90.0)
+
+        negative = (0.95, 240.0, (18, 12), 10, 8)
+        with patch(
+            "ARrobots.HMI.vision_io._best_narrow_vision_rotation",
+            return_value=negative,
+        ):
+            clamped = prepare_vision_match_result(
+                source,
+                template,
+                0,
+                self.vision_match_options(
+                    minimum_score=0.9,
+                    full_rotation_search=False,
+                    try_closest_out_of_range=True,
+                    joint6_negative_limit=75.0,
+                ),
+            )
+        self.assertTrue(clamped.matched)
+        self.assertEqual(clamped.angle_degrees, -75.0)
+
+    def test_full_rotation_search_checks_each_unique_degree_at_most_once(self):
+        source = np.zeros((48, 48), dtype=np.uint8)
+        template = np.zeros((8, 10), dtype=np.uint8)
+        angles = []
+
+        def candidate(image, current_template, angle, background):
+            angles.append(angle)
+            score = 0.5 if angle == 211 else 0.1
+            return score, float(angle), (0, 0), 10, 8
+
+        with patch(
+            "ARrobots.HMI.vision_io._vision_rotation_candidate",
+            side_effect=candidate,
+        ):
+            result = prepare_vision_match_result(
+                source,
+                template,
+                0,
+                self.vision_match_options(minimum_score=0.9),
+            )
+
+        self.assertFalse(result.matched)
+        self.assertEqual(result.score, 0.5)
+        self.assertEqual(angles, list(range(360)))
+
+    def test_vision_match_worker_rejects_overlap_and_honors_cancellation(self):
+        capture_settings = self.vision_capture_settings()
+        settings = VisionMatchSettings(
+            capture_settings,
+            self.vision_match_options(),
+        )
+        started = threading.Event()
+        external_cancellation = threading.Event()
+
+        def operation(match_settings, cancellation_event):
+            self.assertIs(match_settings, settings)
+            started.set()
+            self.assertTrue(cancellation_event.wait(1))
+            raise MotionInputError("matching cancelled by test")
+
+        worker = VisionOperationWorker(
+            operation,
+            VisionMatchSettings,
+            VisionMatchOperationResult,
+            "vision matching",
+            "ar4-vision-match-test",
+            coalesce=False,
+        )
+        submission = worker.submit(settings, external_cancellation)
+        self.assertTrue(started.wait(1))
+        with self.assertRaisesRegex(MotionInputError, "already active"):
+            worker.submit(settings)
+        external_cancellation.set()
+        self.assertTrue(worker.wait_stopped(1))
+        event = worker.drain_events()[0]
+        self.assertEqual(event.request_id, submission.request_id)
+        self.assertIsNone(event.result)
+        self.assertIn("matching cancelled by test", event.error_detail)
+        self.assertTrue(worker.close())
+
+    def test_vision_match_boundaries_reject_invalid_inputs(self):
+        with self.assertRaisesRegex(MotionInputError, "lowercase .jpg"):
+            self.vision_match_options(template_filename="../template.jpg")
+        with self.assertRaisesRegex(MotionInputError, "lowercase .jpg"):
+            self.vision_match_options(template_filename="..\\template.jpg")
+        with self.assertRaisesRegex(MotionInputError, "between 0 and 1"):
+            self.vision_match_options(minimum_score=1.01)
+        with self.assertRaisesRegex(MotionInputError, "calibration spans"):
+            VisionCoordinateMapping(*(0.0 for _ in range(8)))
+        with self.assertRaisesRegex(MotionInputError, "must not exceed"):
+            prepare_vision_match_result(
+                np.zeros((4, 4), dtype=np.uint8),
+                np.zeros((5, 4), dtype=np.uint8),
+                0,
+                self.vision_match_options(),
+            )
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(MotionInputError, "was cancelled"):
+            prepare_vision_match_result(
+                np.zeros((48, 48), dtype=np.uint8),
+                np.zeros((8, 10), dtype=np.uint8),
+                0,
+                self.vision_match_options(),
+                cancelled,
+            )
 
     def test_camera_preview_worker_validates_constructor_contract(self):
         valid_factory = lambda camera_index: None

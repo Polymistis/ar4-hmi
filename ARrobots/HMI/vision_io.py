@@ -3,6 +3,7 @@
 from collections import deque
 from dataclasses import dataclass
 from io import BytesIO
+import math
 import os
 import stat
 import threading
@@ -33,7 +34,8 @@ MAX_CAMERA_PREVIEW_EVENTS = 64
 MAX_RETAINED_CAMERA_TERMINAL_EVENTS = 32
 MAX_CAMERA_SOURCE_TEXT = 512
 CAMERA_PREVIEW_CANCELLATION_POLL_SECONDS = 0.05
-MAX_VISION_CAPTURE_EVENTS = 64
+MAX_VISION_OPERATION_EVENTS = 64
+MAX_VISION_TEMPLATE_FILENAME = 255
 VISION_CAPTURE_ADJUSTMENT_MINIMUM = -127
 VISION_CAPTURE_ADJUSTMENT_MAXIMUM = 127
 VISION_CAPTURE_ZOOM_MINIMUM = 1
@@ -255,11 +257,225 @@ class VisionCaptureResult:
             )
 
 
+@dataclass(frozen=True)
+class VisionCoordinateMapping:
+    first_pixel_origin: float
+    first_robot_origin: float
+    second_pixel_origin: float
+    second_robot_origin: float
+    first_pixel_end: float
+    first_robot_end: float
+    second_pixel_end: float
+    second_robot_end: float
+
+    def __post_init__(self):
+        for value, field_name in (
+            (self.first_pixel_origin, "vision first-pixel origin"),
+            (self.first_robot_origin, "vision first-robot origin"),
+            (self.second_pixel_origin, "vision second-pixel origin"),
+            (self.second_robot_origin, "vision second-robot origin"),
+            (self.first_pixel_end, "vision first-pixel end"),
+            (self.first_robot_end, "vision first-robot end"),
+            (self.second_pixel_end, "vision second-pixel end"),
+            (self.second_robot_end, "vision second-robot end"),
+        ):
+            _validate_finite_number(value, field_name)
+        first_pixel_range = _validate_finite_number(
+            self.first_pixel_end - self.first_pixel_origin,
+            "vision first-pixel calibration span",
+        )
+        second_pixel_range = _validate_finite_number(
+            self.second_pixel_end - self.second_pixel_origin,
+            "vision second-pixel calibration span",
+        )
+        _validate_finite_number(
+            self.first_robot_end - self.first_robot_origin,
+            "vision first-robot calibration span",
+        )
+        _validate_finite_number(
+            self.second_robot_end - self.second_robot_origin,
+            "vision second-robot calibration span",
+        )
+        if first_pixel_range == 0 or second_pixel_range == 0:
+            raise MotionInputError(
+                "vision pixel-to-robot calibration spans must be nonzero"
+            )
+
+    def map_position(self, first_pixel, second_pixel):
+        _validate_nonnegative_integer(first_pixel, "vision first-pixel result")
+        _validate_nonnegative_integer(second_pixel, "vision second-pixel result")
+        first_pixel_range = self.first_pixel_end - self.first_pixel_origin
+        second_pixel_range = self.second_pixel_end - self.second_pixel_origin
+        first_robot = self.first_robot_origin + (
+            (first_pixel - self.first_pixel_origin)
+            / first_pixel_range
+            * (self.first_robot_end - self.first_robot_origin)
+        )
+        second_robot = self.second_robot_origin + (
+            (second_pixel - self.second_pixel_origin)
+            / second_pixel_range
+            * (self.second_robot_end - self.second_robot_origin)
+        )
+        return (
+            _validate_finite_number(first_robot, "vision first-robot result"),
+            _validate_finite_number(second_robot, "vision second-robot result"),
+        )
+
+
+@dataclass(frozen=True)
+class VisionMatchOptions:
+    template_filename: str
+    minimum_score: float
+    full_rotation_search: bool
+    pick_closest_180: bool
+    try_closest_out_of_range: bool
+    joint6_positive_limit: float
+    joint6_negative_limit: float
+    coordinate_mapping: VisionCoordinateMapping
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.template_filename, str)
+            or not self.template_filename
+            or self.template_filename != self.template_filename.strip()
+            or os.path.basename(self.template_filename) != self.template_filename
+            or "/" in self.template_filename
+            or "\\" in self.template_filename
+            or not self.template_filename.endswith(".jpg")
+            or "\x00" in self.template_filename
+            or "\r" in self.template_filename
+            or "\n" in self.template_filename
+            or len(self.template_filename) > MAX_VISION_TEMPLATE_FILENAME
+        ):
+            raise MotionInputError(
+                "vision template must be a lowercase .jpg leaf filename"
+            )
+        minimum_score = _validate_finite_number(
+            self.minimum_score,
+            "vision minimum score",
+        )
+        if minimum_score < 0 or minimum_score > 1:
+            raise MotionInputError(
+                "vision minimum score must be between 0 and 1"
+            )
+        for value, field_name in (
+            (self.full_rotation_search, "vision full-rotation state"),
+            (self.pick_closest_180, "vision closest-180 state"),
+            (
+                self.try_closest_out_of_range,
+                "vision out-of-range fallback state",
+            ),
+        ):
+            if not isinstance(value, bool):
+                raise MotionInputError(f"{field_name} must be boolean")
+        for value, field_name in (
+            (self.joint6_positive_limit, "vision J6 positive limit"),
+            (self.joint6_negative_limit, "vision J6 negative limit"),
+        ):
+            limit = _validate_finite_number(value, field_name)
+            if limit < 0:
+                raise MotionInputError(f"{field_name} must be non-negative")
+        if not isinstance(self.coordinate_mapping, VisionCoordinateMapping):
+            raise MotionInputError("vision coordinate mapping is invalid")
+
+
+@dataclass(frozen=True)
+class VisionMatchSettings:
+    capture_settings: VisionCaptureSettings
+    match_options: VisionMatchOptions
+
+    def __post_init__(self):
+        if not isinstance(self.capture_settings, VisionCaptureSettings):
+            raise MotionInputError("vision match capture settings are invalid")
+        if not isinstance(self.match_options, VisionMatchOptions):
+            raise MotionInputError("vision match options are invalid")
+
+
 @dataclass(frozen=True, eq=False)
-class VisionCaptureEvent:
+class VisionMatchResult:
+    matched: bool
+    score: float
+    angle_degrees: float | None
+    pixel_position: tuple[int, int] | None
+    robot_position: tuple[float, float] | None
+    annotated_image: np.ndarray
+    display_image: np.ndarray
+
+    def __post_init__(self):
+        if not isinstance(self.matched, bool):
+            raise MotionInputError("vision match state is invalid")
+        score = _validate_finite_number(self.score, "vision template score")
+        if score < -1 or score > 1:
+            raise MotionInputError(
+                "vision template score must be between -1 and 1"
+            )
+        _validated_camera_frame(
+            self.annotated_image,
+            "vision annotated frame",
+        )
+        _validated_camera_frame(
+            self.display_image,
+            "vision match display frame",
+        )
+        if self.display_image.shape != (
+            VISION_CAPTURE_DISPLAY_HEIGHT,
+            VISION_CAPTURE_DISPLAY_WIDTH,
+            3,
+        ):
+            raise MotionInputError("vision match display dimensions are invalid")
+        optional_values = (
+            self.angle_degrees,
+            self.pixel_position,
+            self.robot_position,
+        )
+        if self.matched != all(value is not None for value in optional_values):
+            raise MotionInputError(
+                "vision match coordinates are inconsistent with the result"
+            )
+        if not self.matched:
+            return
+        angle = _validate_finite_number(
+            self.angle_degrees,
+            "vision match angle",
+        )
+        if angle < -180 or angle > 180:
+            raise MotionInputError("vision match angle is outside normalization")
+        if (
+            not isinstance(self.pixel_position, tuple)
+            or len(self.pixel_position) != 2
+        ):
+            raise MotionInputError("vision match pixel position is invalid")
+        for value in self.pixel_position:
+            _validate_nonnegative_integer(value, "vision match pixel position")
+        if (
+            not isinstance(self.robot_position, tuple)
+            or len(self.robot_position) != 2
+        ):
+            raise MotionInputError("vision match robot position is invalid")
+        for value in self.robot_position:
+            _validate_finite_number(value, "vision match robot position")
+
+
+@dataclass(frozen=True, eq=False)
+class VisionMatchOperationResult:
+    capture_result: VisionCaptureResult
+    match_result: VisionMatchResult
+    match_options: VisionMatchOptions
+
+    def __post_init__(self):
+        if not isinstance(self.capture_result, VisionCaptureResult):
+            raise MotionInputError("vision match capture result is invalid")
+        if not isinstance(self.match_result, VisionMatchResult):
+            raise MotionInputError("vision match result is invalid")
+        if not isinstance(self.match_options, VisionMatchOptions):
+            raise MotionInputError("vision match result options are invalid")
+
+
+@dataclass(frozen=True, eq=False)
+class VisionOperationEvent:
     sequence: int
     request_id: int
-    result: VisionCaptureResult | None = None
+    result: VisionCaptureResult | VisionMatchOperationResult | None = None
     error_detail: str | None = None
 
     def __post_init__(self):
@@ -267,13 +483,13 @@ class VisionCaptureEvent:
         _validate_nonnegative_integer(self.request_id, "vision request id")
         if (self.result is None) == (self.error_detail is None):
             raise MotionInputError(
-                "vision capture event must contain one terminal outcome"
+                "vision operation event must contain one terminal outcome"
             )
         if self.result is not None and not isinstance(
             self.result,
-            VisionCaptureResult,
+            (VisionCaptureResult, VisionMatchOperationResult),
         ):
-            raise MotionInputError("vision capture result is invalid")
+            raise MotionInputError("vision operation result is invalid")
         if self.error_detail is not None and (
             not isinstance(self.error_detail, str)
             or not self.error_detail
@@ -283,11 +499,11 @@ class VisionCaptureEvent:
             or "\n" in self.error_detail
             or len(self.error_detail) > MAX_CAMERA_PREVIEW_EVENT_DETAIL
         ):
-            raise MotionInputError("vision capture error detail is invalid")
+            raise MotionInputError("vision operation error detail is invalid")
 
 
 @dataclass(frozen=True)
-class VisionCaptureSubmission:
+class VisionOperationSubmission:
     request_id: int
     coalesced: bool
 
@@ -298,14 +514,17 @@ class VisionCaptureSubmission:
 
 
 @dataclass(frozen=True)
-class _VisionCaptureRequest:
+class _VisionOperationRequest:
     request_id: int
-    settings: VisionCaptureSettings
+    settings: object
+    cancellation_event: object = None
 
     def __post_init__(self):
         _validate_nonnegative_integer(self.request_id, "vision request id")
-        if not isinstance(self.settings, VisionCaptureSettings):
-            raise MotionInputError("vision capture settings are invalid")
+        if self.settings is None:
+            raise MotionInputError("vision operation settings are invalid")
+        if self.cancellation_event is not None:
+            _camera_cancellation_requested(self.cancellation_event)
 
 
 @dataclass(frozen=True)
@@ -335,6 +554,18 @@ def _validate_bounded_integer(value, field_name, minimum, maximum):
             f"{field_name} must be an integer between {minimum} and {maximum}"
         )
     return value
+
+
+def _validate_finite_number(value, field_name):
+    if isinstance(value, bool) or not isinstance(
+        value,
+        (int, float, np.integer, np.floating),
+    ):
+        raise MotionInputError(f"{field_name} must be numeric")
+    number = float(value)
+    if not np.isfinite(number):
+        raise MotionInputError(f"{field_name} must be finite")
+    return number
 
 
 def _validate_rgb_triplet(value, field_name):
@@ -587,18 +818,382 @@ def prepare_vision_capture_result(image, settings):
     )
 
 
-class VisionCaptureWorker:
-    """Coalesce capture-only HMI requests behind one non-Tk worker."""
+def _raise_if_vision_match_cancelled(cancellation_event):
+    if _camera_cancellation_requested(cancellation_event):
+        raise MotionInputError("vision matching was cancelled")
 
-    def __init__(self, operation, *, thread_factory=threading.Thread):
+
+def _rotate_vision_template(template, angle, background):
+    source = _validated_grayscale_image(template, "vision template")
+    angle = _validate_finite_number(angle, "vision template angle")
+    _validate_bounded_integer(
+        background,
+        "vision template background",
+        0,
+        255,
+    )
+    image_center = tuple(np.asarray(source.shape[1::-1], dtype=float) / 2)
+    try:
+        rotation = cv2.getRotationMatrix2D(image_center, -angle, 1.0)
+        rotated = cv2.warpAffine(
+            source,
+            rotation,
+            source.shape[1::-1],
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=background,
+            flags=cv2.INTER_LINEAR,
+        )
+    except cv2.error as exc:
+        raise MotionInputError("vision template rotation failed") from exc
+    return np.array(
+        _validated_grayscale_image(rotated, "rotated vision template"),
+        dtype=np.uint8,
+        copy=True,
+        order="C",
+    )
+
+
+def _vision_template_match(image, template):
+    source = _validated_grayscale_image(image, "captured vision frame")
+    candidate = _validated_grayscale_image(template, "rotated vision template")
+    if (
+        candidate.shape[0] > source.shape[0]
+        or candidate.shape[1] > source.shape[1]
+    ):
+        raise MotionInputError(
+            "vision template must not exceed the captured frame dimensions"
+        )
+    try:
+        scores = cv2.matchTemplate(
+            source,
+            candidate,
+            cv2.TM_CCOEFF_NORMED,
+        )
+        _, maximum, _, location = cv2.minMaxLoc(scores)
+    except cv2.error as exc:
+        raise MotionInputError("vision template comparison failed") from exc
+    maximum = _validate_finite_number(maximum, "vision template score")
+    if maximum < -1 or maximum > 1:
+        raise MotionInputError(
+            "vision template score must be between -1 and 1"
+        )
+    if (
+        not isinstance(location, tuple)
+        or len(location) != 2
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in location
+        )
+    ):
+        raise MotionInputError("vision template location is invalid")
+    return maximum, location
+
+
+def _vision_rotation_candidate(image, template, angle, background):
+    rotated = _rotate_vision_template(template, angle, background)
+    score, location = _vision_template_match(image, rotated)
+    return score, float(angle), location, rotated.shape[1], rotated.shape[0]
+
+
+def _best_narrow_vision_rotation(
+    image,
+    template,
+    background,
+    cancellation_event,
+):
+    best = None
+    for angle in (0.0, 120.0, 240.0):
+        _raise_if_vision_match_cancelled(cancellation_event)
+        candidate = _vision_rotation_candidate(
+            image,
+            template,
+            angle,
+            background,
+        )
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+
+    refinement = 180.0
+    while refinement >= 0.9:
+        for angle in (best[1] + refinement, best[1] - refinement):
+            _raise_if_vision_match_cancelled(cancellation_event)
+            candidate = _vision_rotation_candidate(
+                image,
+                template,
+                angle,
+                background,
+            )
+            if candidate[0] > best[0]:
+                best = candidate
+        refinement /= 2
+    return best
+
+
+def _best_full_vision_rotation(
+    image,
+    template,
+    background,
+    minimum_score,
+    cancellation_event,
+):
+    best = None
+    for angle in range(360):
+        _raise_if_vision_match_cancelled(cancellation_event)
+        candidate = _vision_rotation_candidate(
+            image,
+            template,
+            angle,
+            background,
+        )
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+        if candidate[0] >= minimum_score:
+            break
+    return best
+
+
+def _normalized_vision_match_angle(angle, pick_closest_180):
+    angle = _validate_finite_number(angle, "vision match angle") % 360
+    if angle > 180:
+        angle -= 360
+    if pick_closest_180:
+        if angle > 90:
+            angle -= 180
+        elif angle < -90:
+            angle += 180
+    return angle
+
+
+def _draw_vision_match_axes(image, column, row, angle):
+    green = (0, 255, 0)
+    dark_green = (0, 128, 0)
+    first_end = (
+        int(column + 60 * math.cos(math.radians(angle - 90))),
+        int(row + 60 * math.sin(math.radians(angle - 90))),
+    )
+    second_end = (
+        int(column + 60 * math.cos(math.radians(angle + 90))),
+        int(row + 60 * math.sin(math.radians(angle + 90))),
+    )
+    third_end = (
+        int(column + 30 * math.cos(math.radians(angle))),
+        int(row + 30 * math.sin(math.radians(angle))),
+    )
+    fourth_end = (
+        int(column + 30 * math.cos(math.radians(angle + 180))),
+        int(row + 30 * math.sin(math.radians(angle + 180))),
+    )
+    cv2.line(image, (column, row), first_end, green, 3)
+    cv2.line(image, (column, row), second_end, green, 3)
+    cv2.line(image, (column, row), third_end, green, 3)
+    cv2.line(image, (column, row), fourth_end, green, 3)
+    tip_start = (
+        int(column + 56 * math.cos(math.radians(angle - 90))),
+        int(row + 56 * math.sin(math.radians(angle - 90))),
+    )
+    cv2.line(image, tip_start, first_end, dark_green, 2)
+    cv2.circle(image, (column, row), 20, green, 1)
+
+
+def prepare_vision_match_result(
+    image,
+    template,
+    background,
+    options,
+    cancellation_event=None,
+):
+    """Match one captured frame from immutable inputs away from Tk."""
+
+    source = _validated_grayscale_image(image, "captured vision frame")
+    candidate = _validated_grayscale_image(template, "vision template")
+    if not isinstance(options, VisionMatchOptions):
+        raise MotionInputError("vision match options are invalid")
+    _validate_bounded_integer(
+        background,
+        "vision template background",
+        0,
+        255,
+    )
+    if (
+        candidate.shape[0] > source.shape[0]
+        or candidate.shape[1] > source.shape[1]
+    ):
+        raise MotionInputError(
+            "vision template must not exceed the captured frame dimensions"
+        )
+    _raise_if_vision_match_cancelled(cancellation_event)
+    if options.full_rotation_search:
+        best = _best_full_vision_rotation(
+            source,
+            candidate,
+            background,
+            options.minimum_score,
+            cancellation_event,
+        )
+    else:
+        best = _best_narrow_vision_rotation(
+            source,
+            candidate,
+            background,
+            cancellation_event,
+        )
+    _raise_if_vision_match_cancelled(cancellation_event)
+
+    score, angle, location, width, height = best
+    matched = score >= options.minimum_score
+    angle_degrees = None
+    pixel_position = None
+    robot_position = None
+    try:
+        annotated = cv2.cvtColor(source, cv2.COLOR_GRAY2BGR)
+        if matched:
+            angle = _normalized_vision_match_angle(
+                angle,
+                options.pick_closest_180,
+            )
+            if angle > options.joint6_positive_limit:
+                if options.try_closest_out_of_range:
+                    angle = options.joint6_positive_limit
+                else:
+                    matched = False
+            if angle < -options.joint6_negative_limit:
+                if options.try_closest_out_of_range:
+                    angle = -options.joint6_negative_limit
+                else:
+                    matched = False
+
+            column = int(location[0] + width / 2)
+            row = int(location[1] + height / 2)
+            _draw_vision_match_axes(annotated, column, row, angle)
+            if matched:
+                angle_degrees = angle
+                pixel_position = (row, column)
+                robot_position = options.coordinate_mapping.map_position(
+                    row,
+                    column,
+                )
+        if not matched:
+            cv2.rectangle(
+                annotated,
+                (5, 5),
+                (max(5, source.shape[1] - 5), max(5, source.shape[0] - 5)),
+                (0, 0, 255),
+                5,
+            )
+        display_bgr = cv2.resize(
+            annotated,
+            (VISION_CAPTURE_DISPLAY_WIDTH, VISION_CAPTURE_DISPLAY_HEIGHT),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        display_rgb = cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
+    except MotionInputError:
+        raise
+    except (cv2.error, TypeError, ValueError, OverflowError) as exc:
+        raise MotionInputError("vision match presentation failed") from exc
+
+    annotated_result = np.array(
+        annotated,
+        dtype=np.uint8,
+        copy=True,
+        order="C",
+    )
+    display_result = np.array(
+        display_rgb,
+        dtype=np.uint8,
+        copy=True,
+        order="C",
+    )
+    annotated_result.setflags(write=False)
+    display_result.setflags(write=False)
+    return VisionMatchResult(
+        matched=matched,
+        score=score,
+        angle_degrees=angle_degrees,
+        pixel_position=pixel_position,
+        robot_position=robot_position,
+        annotated_image=annotated_result,
+        display_image=display_result,
+    )
+
+
+class _CombinedVisionCancellation:
+    def __init__(self, first, second):
+        for event in (first, second):
+            _camera_cancellation_requested(event)
+        self._first = first
+        self._second = second
+
+    def is_set(self):
+        return _camera_cancellation_requested(
+            self._first
+        ) or _camera_cancellation_requested(self._second)
+
+    def wait(self, timeout=None):
+        if timeout is not None:
+            timeout = _validate_camera_wait_timeout(timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            wait_seconds = CAMERA_PREVIEW_CANCELLATION_POLL_SECONDS
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                wait_seconds = min(wait_seconds, remaining)
+            self._first.wait(wait_seconds)
+        return True
+
+
+class VisionOperationWorker:
+    """Run validated, optionally coalesced vision work away from Tk."""
+
+    def __init__(
+        self,
+        operation,
+        settings_type,
+        result_type,
+        operation_name,
+        thread_name,
+        *,
+        coalesce=True,
+        thread_factory=threading.Thread,
+    ):
         if not callable(operation):
-            raise MotionInputError("vision capture operation must be callable")
+            raise MotionInputError("vision operation must be callable")
+        if not isinstance(settings_type, type):
+            raise MotionInputError("vision settings type is invalid")
+        if not isinstance(result_type, type):
+            raise MotionInputError("vision result type is invalid")
+        if (settings_type, result_type) not in (
+            (VisionCaptureSettings, VisionCaptureResult),
+            (VisionMatchSettings, VisionMatchOperationResult),
+        ):
+            raise MotionInputError("vision operation type contract is invalid")
+        for value, field_name in (
+            (operation_name, "vision operation name"),
+            (thread_name, "vision thread name"),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+                or "\r" in value
+                or "\n" in value
+                or len(value) > 64
+            ):
+                raise MotionInputError(f"{field_name} is invalid")
+        if not isinstance(coalesce, bool):
+            raise MotionInputError("vision coalescing state is invalid")
         if not callable(thread_factory):
-            raise MotionInputError("vision capture thread factory must be callable")
+            raise MotionInputError("vision thread factory must be callable")
         self._operation = operation
+        self._settings_type = settings_type
+        self._result_type = result_type
+        self._operation_name = operation_name
+        self._thread_name = thread_name
+        self._coalesce = coalesce
         self._thread_factory = thread_factory
         self._lock = threading.Lock()
-        self._events = deque(maxlen=MAX_VISION_CAPTURE_EVENTS)
+        self._events = deque(maxlen=MAX_VISION_OPERATION_EVENTS)
         self._next_event_sequence = 0
         self._next_request_id = 0
         self._pending = None
@@ -629,27 +1224,43 @@ class VisionCaptureWorker:
         with self._lock:
             return None if self._pending is None else self._pending.request_id
 
-    def submit(self, settings):
-        if not isinstance(settings, VisionCaptureSettings):
-            raise MotionInputError("vision capture settings are invalid")
+    def submit(self, settings, cancellation_event=None):
+        if not isinstance(settings, self._settings_type):
+            raise MotionInputError(
+                f"{self._operation_name} settings are invalid"
+            )
+        if cancellation_event is not None:
+            if _camera_cancellation_requested(cancellation_event):
+                raise MotionInputError(
+                    f"{self._operation_name} was cancelled"
+                )
         with self._lock:
             if self._closed:
-                raise MotionInputError("vision capture worker is closed")
+                raise MotionInputError(
+                    f"{self._operation_name} worker is closed"
+                )
+            if not self._coalesce and (
+                self._worker is not None or self._pending is not None
+            ):
+                raise MotionInputError(
+                    f"{self._operation_name} is already active"
+                )
             self._next_request_id += 1
-            request = _VisionCaptureRequest(
+            request = _VisionOperationRequest(
                 request_id=self._next_request_id,
                 settings=settings,
+                cancellation_event=cancellation_event,
             )
             coalesced = self._worker is not None or self._pending is not None
             self._pending = request
             if self._worker is not None:
-                return VisionCaptureSubmission(request.request_id, coalesced)
+                return VisionOperationSubmission(request.request_id, coalesced)
 
             self._worker_stopped.clear()
             try:
                 worker = self._thread_factory(
                     target=self._run,
-                    name="ar4-vision-capture",
+                    name=self._thread_name,
                     daemon=True,
                 )
             except Exception as exc:
@@ -657,14 +1268,15 @@ class VisionCaptureWorker:
                 self._worker_stopped.set()
                 detail = normalize_camera_exception_detail(
                     exc,
-                    "vision capture thread creation failed: ",
+                    f"{self._operation_name} thread creation failed: ",
                 )
                 raise RuntimeError(detail) from exc
             if not isinstance(worker, threading.Thread):
                 self._pending = None
                 self._worker_stopped.set()
                 raise MotionInputError(
-                    "vision capture thread factory returned an invalid worker"
+                    f"{self._operation_name} thread factory returned "
+                    "an invalid worker"
                 )
             self._worker = worker
             try:
@@ -675,10 +1287,10 @@ class VisionCaptureWorker:
                 self._worker_stopped.set()
                 detail = normalize_camera_exception_detail(
                     exc,
-                    "vision capture worker startup failed: ",
+                    f"{self._operation_name} worker startup failed: ",
                 )
                 raise RuntimeError(detail) from exc
-            return VisionCaptureSubmission(request.request_id, coalesced)
+            return VisionOperationSubmission(request.request_id, coalesced)
 
     def drain_events(self):
         with self._lock:
@@ -699,7 +1311,7 @@ class VisionCaptureWorker:
         return self._worker_stopped.wait(timeout)
 
     def _append_event_locked(self, request_id, result=None, error_detail=None):
-        event = VisionCaptureEvent(
+        event = VisionOperationEvent(
             sequence=self._next_event_sequence,
             request_id=request_id,
             result=result,
@@ -708,6 +1320,14 @@ class VisionCaptureWorker:
         self._next_event_sequence += 1
         self._events.append(event)
         return event
+
+    def _operation_cancellation(self, request):
+        if request.cancellation_event is None:
+            return self._close_requested
+        return _CombinedVisionCancellation(
+            self._close_requested,
+            request.cancellation_event,
+        )
 
     def _run(self):
         current_thread = threading.current_thread()
@@ -728,17 +1348,17 @@ class VisionCaptureWorker:
                 try:
                     result = self._operation(
                         request.settings,
-                        self._close_requested,
+                        self._operation_cancellation(request),
                     )
-                    if not isinstance(result, VisionCaptureResult):
+                    if not isinstance(result, self._result_type):
                         raise MotionInputError(
-                            "vision capture operation returned an invalid result"
+                            f"{self._operation_name} returned an invalid result"
                         )
                 except BaseException as exc:
                     result = None
                     error_detail = normalize_camera_exception_detail(
                         exc,
-                        "vision capture failed: ",
+                        f"{self._operation_name} failed: ",
                     )
                 with self._lock:
                     self._append_event_locked(
@@ -752,7 +1372,7 @@ class VisionCaptureWorker:
         except BaseException as exc:
             detail = normalize_camera_exception_detail(
                 exc,
-                "vision capture worker terminated: ",
+                f"{self._operation_name} worker terminated: ",
             )
             with self._lock:
                 request_ids = []

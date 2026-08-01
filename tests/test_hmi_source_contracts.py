@@ -139,12 +139,18 @@ from ARrobots.HMI.vision_io import (
     CameraPreviewEvent,
     CameraPreviewFrame,
     CameraPreviewLifecycleState,
-    VisionCaptureEvent,
     VisionCaptureResult,
     VisionCaptureSettings,
-    VisionCaptureSubmission,
+    VisionCoordinateMapping,
+    VisionMatchOperationResult,
+    VisionMatchOptions,
+    VisionMatchResult,
+    VisionMatchSettings,
+    VisionOperationEvent,
+    VisionOperationSubmission,
     normalize_camera_exception_detail,
     prepare_vision_capture_result,
+    prepare_vision_match_result,
 )
 from ARrobots.HMI.Calibration import apply_calibration
 from ARrobots.Calibration import snapshot_calibration_values
@@ -1347,6 +1353,32 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_handle_calibration_result_application_failure": (
                 "_calibration_result_failure_details",
+            ),
+            "_snapshot_vision_match_options": (
+                "_vision_binary_option",
+            ),
+            "_snapshot_vision_match_settings": (
+                "_snapshot_vision_capture_settings",
+                "_snapshot_vision_match_options",
+            ),
+            "_perform_vision_capture": (
+                "_capture_vision_result_under_artifact_owner",
+            ),
+            "_perform_vision_match": (
+                "_capture_vision_result_under_artifact_owner",
+            ),
+            "_apply_vision_capture_result": (
+                "_apply_vision_capture_state",
+            ),
+            "_apply_vision_match_presentation": (
+                "_replace_vision_result_field",
+            ),
+            "_apply_vision_match_operation_result": (
+                "_apply_vision_capture_state",
+                "_apply_vision_match_presentation",
+            ),
+            "_apply_vision_match_event": (
+                "_apply_vision_match_operation_result",
             ),
         }
         if (
@@ -3590,190 +3622,136 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         self.assertEqual(to_bgr([255, 1, 2]), (2, 1, 255))
-        expected_grayscale = int(
-            cv2.cvtColor(
-                np.asarray([[[255, 1, 2]]], dtype=np.uint8),
-                cv2.COLOR_RGB2GRAY,
-            )[0][0]
-        )
-        self.assertEqual(to_grayscale([255, 1, 2]), expected_grayscale)
+        self.assertEqual(to_grayscale([255, 1, 2]), 77)
         self.assertEqual(
             average_bgr(((10, 20, 30), (30, 40, 50))),
             ((20, 30, 40), (40, 30, 20)),
         )
         self.assertEqual(average_grayscale((10, 30, 50)), 30)
 
-    def test_vision_matching_uses_grayscale_inputs_and_border(self):
-        class Entry:
-            def __init__(self, value="0"):
-                self.value = value
-
-            def get(self):
-                return self.value
-
-            def delete(self, *args):
-                self.value = ""
-
-            def insert(self, index, value):
-                self.value = value
-
-        class PillowImage:
-            def resize(self, size):
-                return self
-
+    def test_legacy_vision_match_routes_through_pure_matcher(self):
+        mapping = VisionCoordinateMapping(
+            first_pixel_origin=0,
+            first_robot_origin=0,
+            second_pixel_origin=0,
+            second_robot_origin=0,
+            first_pixel_end=10,
+            first_robot_end=10,
+            second_pixel_end=10,
+            second_robot_end=10,
+        )
+        options = VisionMatchOptions(
+            template_filename="template.jpg",
+            minimum_score=0.9,
+            full_rotation_search=False,
+            pick_closest_180=False,
+            try_closest_out_of_range=False,
+            joint6_positive_limit=170,
+            joint6_negative_limit=170,
+            coordinate_mapping=mapping,
+        )
+        annotated = np.zeros((12, 16, 3), dtype=np.uint8)
+        display = np.zeros((480, 640, 3), dtype=np.uint8)
+        result = VisionMatchResult(
+            matched=False,
+            score=0.25,
+            angle_degrees=None,
+            pixel_position=None,
+            robot_position=None,
+            annotated_image=annotated,
+            display_image=display,
+        )
+        source = np.zeros((12, 16), dtype=np.uint8)
+        template = np.zeros((4, 4), dtype=np.uint8)
+        operation_active = [False]
+        contexts = []
         reads = []
-        borders = []
-        match_shapes = []
-        displays = []
+        matches = []
         writes = []
+        presentations = []
         write_succeeds = [True]
-        match_score = [0.1]
-        unavailable_images = set()
-        target = np.zeros((480, 640), dtype=np.uint8)
-        template = np.zeros((20, 20), dtype=np.uint8)
+        cancellation = threading.Event()
 
-        def read_image(path, mode):
-            reads.append((path, mode))
-            if path in unavailable_images:
-                return None
-            return target.copy() if path == "curImage.jpg" else template.copy()
+        @contextmanager
+        def artifact_operation(context):
+            self.assertFalse(operation_active[0])
+            operation_active[0] = True
+            contexts.append(context)
+            try:
+                yield
+            finally:
+                operation_active[0] = False
 
-        def load_image(path, mode, field_name):
-            image = read_image(path, mode)
-            if image is None:
-                raise MotionInputError(f"{field_name} could not be loaded")
-            return image
+        def load_image(filename, mode, label):
+            self.assertTrue(operation_active[0])
+            reads.append((filename, mode, label))
+            return source if filename == "curImage.jpg" else template
 
-        def warp_affine(image, matrix, size, **kwargs):
-            borders.append(kwargs["borderValue"])
-            return cv2.warpAffine(image, matrix, size, **kwargs)
+        def match_image(image, candidate, background, captured_options, event):
+            self.assertTrue(operation_active[0])
+            matches.append(
+                (image, candidate, background, captured_options, event)
+            )
+            return result
 
-        def match_template(image, rotated_template, method):
-            match_shapes.append((image.shape, rotated_template.shape))
-            return np.asarray([[match_score[0]]], dtype=np.float32)
+        def persist(filename, image):
+            self.assertTrue(operation_active[0])
+            writes.append((filename, image))
+            return write_succeeds[0]
 
-        vision_cv2 = SimpleNamespace(
-            IMREAD_GRAYSCALE=cv2.IMREAD_GRAYSCALE,
-            COLOR_GRAY2BGR=cv2.COLOR_GRAY2BGR,
-            COLOR_BGR2RGB=cv2.COLOR_BGR2RGB,
-            BORDER_CONSTANT=cv2.BORDER_CONSTANT,
-            INTER_LINEAR=cv2.INTER_LINEAR,
-            TM_CCOEFF_NORMED=cv2.TM_CCOEFF_NORMED,
-            TM_CCORR_NORMED=cv2.TM_CCORR_NORMED,
-            imread=read_image,
-            getRotationMatrix2D=cv2.getRotationMatrix2D,
-            warpAffine=warp_affine,
-            matchTemplate=match_template,
-            minMaxLoc=cv2.minMaxLoc,
-            cvtColor=cv2.cvtColor,
-            rectangle=cv2.rectangle,
-            line=cv2.line,
-            circle=cv2.circle,
-            imwrite=lambda filename, image: (
-                writes.append((filename, image.copy()))
-                or write_succeeds[0]
-            ),
-        )
         namespace = {
-            "MotionInputError": MotionInputError,
-            "math": math,
-            "np": np,
-            "cv2": vision_cv2,
+            "_snapshot_vision_match_options": (
+                lambda filename, score: options
+            ),
+            "_average_vision_grayscale_samples": lambda values: values[0],
+            "_vision_artifact_operation": artifact_operation,
             "load_bounded_vision_image": load_image,
-            "CAL": {
-                "fullRotVal": 0,
-                "J6PosLim": 170,
-                "J6NegLim": 170,
-            },
-            "RUN": {
-                "fullRot": Entry("0"),
-                "pick180": Entry("0"),
-                "pickClosest": Entry("0"),
-                "xMMpos": 0,
-                "yMMpos": 0,
-            },
-            "Image": SimpleNamespace(
-                fromarray=lambda image: (
-                    displays.append(image.copy()) or PillowImage()
-                ),
+            "prepare_vision_match_result": match_image,
+            "_apply_vision_match_presentation": (
+                lambda matched, captured_options: (
+                    presentations.append((matched, captured_options))
+                    or "fail"
+                )
             ),
-            "ImageTk": SimpleNamespace(
-                PhotoImage=lambda image: object(),
+            "application_closing": cancellation,
+            "cv2": SimpleNamespace(
+                IMREAD_GRAYSCALE=cv2.IMREAD_GRAYSCALE,
+                imwrite=persist,
             ),
-            "vid_lbl": SimpleNamespace(
-                imgtk=None,
-                configure=lambda **kwargs: None,
-            ),
-            "VisRetScoreEntryField": Entry(),
-            "VisRetAngleEntryField": Entry(),
-            "VisRetXpixEntryField": Entry(),
-            "VisRetYpixEntryField": Entry(),
-            "VisRetXrobEntryField": Entry(),
-            "VisRetYrobEntryField": Entry(),
-            "viscalc": lambda: None,
         }
-        namespace["_average_vision_grayscale_samples"] = self.compile_function(
-            "_average_vision_grayscale_samples",
-            namespace,
-        )
-        namespace["rotate_image"] = self.compile_function(
-            "rotate_image",
-            namespace,
-        )
-        namespace["_vision_match_maximum"] = self.compile_function(
-            "_vision_match_maximum",
-            namespace,
-        )
         vision_match = self.compile_function("visFind", namespace)
 
         self.assertEqual(vision_match("template.jpg", 0.9, 77), "fail")
+        self.assertEqual(contexts, ["vision matching"])
         self.assertEqual(
             reads,
             [
-                ("curImage.jpg", cv2.IMREAD_GRAYSCALE),
-                ("template.jpg", cv2.IMREAD_GRAYSCALE),
+                (
+                    "curImage.jpg",
+                    cv2.IMREAD_GRAYSCALE,
+                    "captured vision frame",
+                ),
+                (
+                    "template.jpg",
+                    cv2.IMREAD_GRAYSCALE,
+                    "vision template",
+                ),
             ],
         )
-        self.assertTrue(borders)
-        self.assertTrue(all(border == 77 for border in borders))
-        self.assertTrue(match_shapes)
-        self.assertTrue(
-            all(len(image_shape) == 2 for image_shape, _ in match_shapes)
-        )
-        self.assertEqual(writes[0][0], "temp.jpg")
-        self.assertEqual(displays[0].shape, (480, 640, 3))
-        np.testing.assert_array_equal(
-            writes[0][1][5, 5],
-            np.asarray([0, 0, 255], dtype=np.uint8),
-        )
-        np.testing.assert_array_equal(
-            displays[0][5, 5],
-            np.asarray([255, 0, 0], dtype=np.uint8),
-        )
+        self.assertEqual(len(matches), 1)
+        self.assertIs(matches[0][0], source)
+        self.assertIs(matches[0][1], template)
+        self.assertEqual(matches[0][2], 77)
+        self.assertIs(matches[0][3], options)
+        self.assertIs(matches[0][4], cancellation)
+        self.assertEqual(writes, [("temp.jpg", annotated)])
+        self.assertEqual(presentations, [(result, options)])
+        self.assertFalse(operation_active[0])
 
-        match_score[0] = 0.95
-        self.assertEqual(vision_match("template.jpg", 0.9, 77), "pass")
-        self.assertTrue(
-            np.any(np.all(writes[1][1] == (0, 255, 0), axis=2))
-        )
-        self.assertTrue(
-            np.any(np.all(displays[1] == (0, 255, 0), axis=2))
-        )
-
-        unavailable_images.add("template.jpg")
-        with self.assertRaisesRegex(
-            MotionInputError,
-            "template could not be loaded",
-        ):
-            vision_match("template.jpg", 0.9, 77)
-
-        unavailable_images.clear()
         write_succeeds[0] = False
-        with self.assertRaisesRegex(
-            OSError,
-            "result frame could not be persisted",
-        ):
+        with self.assertRaisesRegex(OSError, "could not be persisted"):
             vision_match("template.jpg", 0.9, 77)
+        self.assertFalse(operation_active[0])
 
     def test_template_preview_reports_decode_failure_and_applies_square_image(self):
         statuses = []
@@ -4615,6 +4593,7 @@ class HmiSourceContractTests(unittest.TestCase):
         errors = []
         statuses = []
         rescheduled = []
+        match_drains = []
         label = SimpleNamespace(
             imgtk=None,
             configure=lambda **kwargs: configured.append(kwargs),
@@ -4641,6 +4620,9 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_drain_program_camera_completion_events": lambda: True,
             "_drain_vision_capture_events": lambda: True,
+            "_drain_vision_match_events": (
+                lambda: match_drains.append(True) or True
+            ),
             "_reschedule_event_poll": rescheduled.append,
         }
         namespace["show_frame"] = self.compile_function(
@@ -4662,6 +4644,7 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIs(configured[-1]["image"], preview.image)
         self.assertEqual(statuses, [])
         self.assertEqual(rescheduled, ["camera-preview"])
+        self.assertEqual(match_drains, [True])
 
         events.append(
             CameraPreviewEvent(
@@ -4947,14 +4930,14 @@ class HmiSourceContractTests(unittest.TestCase):
             @staticmethod
             def submit(settings):
                 submissions.append(settings)
-                return VisionCaptureSubmission(4, False)
+                return VisionOperationSubmission(4, False)
 
         statuses = []
         namespace.update({
             "application_closing": threading.Event(),
             "vision_capture_worker": Worker(),
             "vision_capture_request_lock": threading.Lock(),
-            "VisionCaptureSubmission": VisionCaptureSubmission,
+            "VisionOperationSubmission": VisionOperationSubmission,
             "_snapshot_vision_capture_settings": snapshot,
             "normalize_camera_exception_detail": (
                 normalize_camera_exception_detail
@@ -4986,7 +4969,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         namespace.update({
             "CAL": {},
-            "VisionCaptureEvent": VisionCaptureEvent,
+            "VisionOperationEvent": VisionOperationEvent,
             "VisionCaptureResult": VisionCaptureResult,
             "Image": SimpleNamespace(fromarray=lambda image: image),
             "ImageTk": SimpleNamespace(PhotoImage=lambda image: image),
@@ -5000,7 +4983,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_apply_vision_capture_event",
             namespace,
         )
-        self.assertTrue(apply_event(VisionCaptureEvent(0, 4, result=result)))
+        self.assertTrue(apply_event(VisionOperationEvent(0, 4, result=result)))
         self.assertIsNone(runtime["visionCaptureRequestId"])
         self.assertEqual(runtime["BGavg"], result.auto_background_rgb)
         self.assertEqual(namespace["CAL"]["zoom"], 50)
@@ -5014,13 +4997,13 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         runtime["visionCaptureRequestId"] = 5
         self.assertFalse(
-            apply_event(VisionCaptureEvent(1, 4, result=fallback))
+            apply_event(VisionOperationEvent(1, 4, result=fallback))
         )
         self.assertEqual(runtime["visionCaptureRequestId"], 5)
         self.assertIs(label.imgtk, fallback.display_image)
         self.assertFalse(
             apply_event(
-                VisionCaptureEvent(
+                VisionOperationEvent(
                     2,
                     5,
                     error_detail="replacement capture failed",
@@ -5111,11 +5094,12 @@ class HmiSourceContractTests(unittest.TestCase):
     def test_shared_vision_artifact_call_sites_acquire_the_owner(self):
         expected_contexts = {
             "_perform_vision_capture": "vision capture",
+            "_perform_vision_match": "vision capture and matching",
             "_capture_mask_selection_image": "vision mask selection",
             "_mask_crop": "vision mask persistence",
             "_mouse_crop": "vision template persistence",
             "selectTemplate": "vision template selection",
-            "visFind": "vision matching input",
+            "visFind": "vision matching",
             "VisOpUpdate": "vision template preview",
         }
 
@@ -5150,9 +5134,16 @@ class HmiSourceContractTests(unittest.TestCase):
         frame = np.zeros((4, 6, 3), dtype=np.uint8)
         expected = prepare_vision_capture_result(frame, settings)
         captures = []
+        artifact_contexts = []
         writes = []
         write_succeeds = [True]
         cancellation = threading.Event()
+
+        @contextmanager
+        def artifact_operation(context):
+            artifact_contexts.append(context)
+            yield
+
         namespace = {
             "VisionCaptureSettings": VisionCaptureSettings,
             "MotionInputError": MotionInputError,
@@ -5162,6 +5153,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "prepare_vision_capture_result": (
                 lambda captured, captured_settings: expected
             ),
+            "_vision_artifact_operation": artifact_operation,
             "cv2": SimpleNamespace(
                 imwrite=lambda filename, image: (
                     writes.append((filename, image))
@@ -5180,6 +5172,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertIs(perform(settings, cancellation), expected)
         self.assertEqual(captures, [cancellation])
+        self.assertEqual(artifact_contexts, ["vision capture"])
         self.assertEqual(writes[0][0], "curImage.jpg")
         self.assertIs(writes[0][1], expected.image)
 
@@ -5335,16 +5328,374 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertFalse(take_pic())
         self.assertEqual(len(errors), 2)
 
-    def test_snap_find_stops_after_capture_failure_and_converts_rgb(self):
+    def test_vision_match_settings_snapshot_validates_tk_inputs(self):
         class Entry:
-            def __init__(self, value="0"):
+            def __init__(self, value):
                 self.value = value
 
             def get(self):
                 return self.value
 
+        runtime = {
+            "selectedTemplate": Entry("template.jpg"),
+            "fullRot": Entry("1"),
+            "pick180": Entry("1"),
+            "pickClosest": Entry("0"),
+            "autoBG": Entry("0"),
+            "mX1": 0,
+            "mY1": 0,
+            "mX2": 640,
+            "mY2": 480,
+        }
+        namespace = {
+            "RUN": runtime,
+            "CAL": {
+                "J6PosLim": 170,
+                "J6NegLim": 160,
+            },
+            "VisBrightSlide": Entry("3"),
+            "VisContrastSlide": Entry("-4"),
+            "VisZoomSlide": Entry("50"),
+            "VisBacColorEntryField": Entry("[12, 34, 56]"),
+            "VisScoreEntryField": Entry("85"),
+            "VisX1PixEntryField": Entry("1"),
+            "VisX1RobEntryField": Entry("10"),
+            "VisY1PixEntryField": Entry("2"),
+            "VisY1RobEntryField": Entry("20"),
+            "VisX2PixEntryField": Entry("101"),
+            "VisX2RobEntryField": Entry("110"),
+            "VisY2PixEntryField": Entry("202"),
+            "VisY2RobEntryField": Entry("220"),
+            "VisionCaptureSettings": VisionCaptureSettings,
+            "VisionCoordinateMapping": VisionCoordinateMapping,
+            "VisionMatchOptions": VisionMatchOptions,
+            "VisionMatchSettings": VisionMatchSettings,
+            "normalize_vision_background_color": (
+                normalize_vision_background_color
+            ),
+            "finite_number": finite_number,
+            "MotionInputError": MotionInputError,
+            "re": re,
+            "np": np,
+            "cv2": cv2,
+        }
+        namespace["_vision_sample_coordinate"] = self.compile_function(
+            "_vision_sample_coordinate",
+            namespace,
+        )
+        namespace["_vision_background_grayscale"] = self.compile_function(
+            "_vision_background_grayscale",
+            namespace,
+        )
+        namespace["_snapshot_vision_capture_settings"] = self.compile_function(
+            "_snapshot_vision_capture_settings",
+            namespace,
+        )
+        namespace["_vision_binary_option"] = self.compile_function(
+            "_vision_binary_option",
+            namespace,
+        )
+        namespace["_snapshot_vision_match_options"] = self.compile_function(
+            "_snapshot_vision_match_options",
+            namespace,
+        )
+        snapshot = self.compile_function(
+            "_snapshot_vision_match_settings",
+            namespace,
+        )
+
+        settings = snapshot()
+
+        self.assertEqual(settings.capture_settings.brightness, 3)
+        self.assertEqual(settings.capture_settings.contrast, -4)
+        self.assertEqual(settings.capture_settings.background_grayscale, 30)
+        self.assertEqual(
+            settings.match_options.template_filename,
+            "template.jpg",
+        )
+        self.assertEqual(settings.match_options.minimum_score, 0.85)
+        self.assertTrue(settings.match_options.full_rotation_search)
+        self.assertTrue(settings.match_options.pick_closest_180)
+        self.assertFalse(
+            settings.match_options.try_closest_out_of_range
+        )
+        self.assertEqual(settings.match_options.joint6_positive_limit, 170)
+        self.assertEqual(settings.match_options.joint6_negative_limit, 160)
+        self.assertEqual(
+            settings.match_options.coordinate_mapping.map_position(51, 102),
+            (60.0, 120.0),
+        )
+
+        runtime["selectedTemplate"].value = "../template.jpg"
+        with self.assertRaisesRegex(MotionInputError, "leaf filename"):
+            snapshot()
+        runtime["selectedTemplate"].value = "template.jpg"
+        runtime["fullRot"].value = "2"
+        with self.assertRaisesRegex(MotionInputError, "zero or one"):
+            snapshot()
+
+    def test_snap_find_submits_one_nonblocking_owned_request(self):
+        capture_settings = VisionCaptureSettings(
+            brightness=0,
+            contrast=0,
+            zoom_percent=50,
+            mask_bounds=(0, 0, 6, 4),
+            auto_background=False,
+            persist_auto_background=True,
+            background_grayscale=0,
+            sample_points=(),
+        )
+        mapping = VisionCoordinateMapping(
+            first_pixel_origin=0,
+            first_robot_origin=0,
+            second_pixel_origin=0,
+            second_robot_origin=0,
+            first_pixel_end=10,
+            first_robot_end=10,
+            second_pixel_end=10,
+            second_robot_end=10,
+        )
+        options = VisionMatchOptions(
+            template_filename="template.jpg",
+            minimum_score=0.85,
+            full_rotation_search=False,
+            pick_closest_180=False,
+            try_closest_out_of_range=False,
+            joint6_positive_limit=170,
+            joint6_negative_limit=170,
+            coordinate_mapping=mapping,
+        )
+        settings = VisionMatchSettings(capture_settings, options)
+        submissions = []
+        statuses = []
+        errors = []
+        closing = threading.Event()
+
+        class Worker:
+            @staticmethod
+            def submit(captured_settings, cancellation):
+                submissions.append((captured_settings, cancellation))
+                return VisionOperationSubmission(7, False)
+
+        runtime = {"visionMatchRequestId": None}
+        namespace = {
+            "RUN": runtime,
+            "application_closing": closing,
+            "vision_match_request_lock": threading.Lock(),
+            "vision_match_worker": Worker(),
+            "_snapshot_vision_match_settings": lambda: settings,
+            "VisionOperationSubmission": VisionOperationSubmission,
+            "MotionInputError": MotionInputError,
+            "normalize_camera_exception_detail": (
+                normalize_camera_exception_detail
+            ),
+            "logger": SimpleNamespace(
+                exception=lambda *args: errors.append(args)
+            ),
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
+            ),
+        }
+        request_match = self.compile_function(
+            "request_vision_match",
+            namespace,
+        )
+        namespace["request_vision_match"] = request_match
+        snap_find = self.compile_function("snapFind", namespace)
+
+        self.assertTrue(snap_find())
+        self.assertEqual(submissions, [(settings, closing)])
+        self.assertEqual(runtime["visionMatchRequestId"], 7)
+        self.assertEqual(
+            statuses[-1],
+            ("VISION MATCHING IN PROGRESS", "Warn.TLabel"),
+        )
+
+        self.assertFalse(snap_find())
+        self.assertEqual(len(submissions), 1)
+        self.assertIn("already active", statuses[-1][0])
+        self.assertEqual(len(errors), 1)
+
+        runtime["visionMatchRequestId"] = None
+        closing.set()
+        self.assertFalse(snap_find())
+        self.assertEqual(len(submissions), 1)
+        self.assertIn("shutdown is active", statuses[-1][0])
+
+        snap_calls = {
+            node.func.id
+            for node in ast.walk(self.module_functions["snapFind"])
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+            )
+        }
+        self.assertEqual(snap_calls, {"request_vision_match"})
+        request_calls = {
+            node.func.id
+            for node in ast.walk(
+                self.module_functions["request_vision_match"]
+            )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+            )
+        }
+        self.assertTrue(
+            request_calls.isdisjoint(
+                {
+                    "_capture_current_vision_frame",
+                    "_perform_vision_match",
+                    "prepare_vision_match_result",
+                    "take_pic",
+                    "visFind",
+                }
+            )
+        )
+
+    def test_vision_match_worker_and_tk_presentation_are_separated(self):
+        capture_settings = VisionCaptureSettings(
+            brightness=0,
+            contrast=0,
+            zoom_percent=50,
+            mask_bounds=(0, 0, 16, 12),
+            auto_background=False,
+            persist_auto_background=False,
+            background_grayscale=77,
+            sample_points=(),
+        )
+        mapping = VisionCoordinateMapping(
+            first_pixel_origin=0,
+            first_robot_origin=0,
+            second_pixel_origin=0,
+            second_robot_origin=0,
+            first_pixel_end=16,
+            first_robot_end=160,
+            second_pixel_end=12,
+            second_robot_end=120,
+        )
+        options = VisionMatchOptions(
+            template_filename="template.jpg",
+            minimum_score=0.8,
+            full_rotation_search=True,
+            pick_closest_180=True,
+            try_closest_out_of_range=False,
+            joint6_positive_limit=170,
+            joint6_negative_limit=170,
+            coordinate_mapping=mapping,
+        )
+        settings = VisionMatchSettings(capture_settings, options)
+        capture_result = prepare_vision_capture_result(
+            np.zeros((12, 16, 3), dtype=np.uint8),
+            capture_settings,
+        )
+        annotated = np.zeros((12, 16, 3), dtype=np.uint8)
+        display = np.zeros((480, 640, 3), dtype=np.uint8)
+        match_result = VisionMatchResult(
+            matched=True,
+            score=0.95,
+            angle_degrees=12.5,
+            pixel_position=(3, 4),
+            robot_position=(30.0, 40.0),
+            annotated_image=annotated,
+            display_image=display,
+        )
+        operation_active = [False]
+        contexts = []
+        loads = []
+        matches = []
+        writes = []
+        write_succeeds = [True]
+        cancellation = threading.Event()
+
+        @contextmanager
+        def artifact_operation(context):
+            self.assertFalse(operation_active[0])
+            operation_active[0] = True
+            contexts.append(context)
+            try:
+                yield
+            finally:
+                operation_active[0] = False
+
+        def capture(captured_settings, event):
+            self.assertTrue(operation_active[0])
+            self.assertIs(captured_settings, capture_settings)
+            self.assertIs(event, cancellation)
+            return capture_result
+
+        def load_image(filename, mode, label):
+            self.assertTrue(operation_active[0])
+            loads.append((filename, mode, label))
+            return np.zeros((4, 4), dtype=np.uint8)
+
+        def match(image, template, background, captured_options, event):
+            self.assertTrue(operation_active[0])
+            matches.append(
+                (image, template, background, captured_options, event)
+            )
+            return match_result
+
+        def persist(filename, image):
+            self.assertTrue(operation_active[0])
+            writes.append((filename, image))
+            return write_succeeds[0]
+
+        worker_namespace = {
+            "VisionMatchSettings": VisionMatchSettings,
+            "VisionMatchOperationResult": VisionMatchOperationResult,
+            "MotionInputError": MotionInputError,
+            "_vision_artifact_operation": artifact_operation,
+            "_capture_vision_result_under_artifact_owner": capture,
+            "load_bounded_vision_image": load_image,
+            "prepare_vision_match_result": match,
+            "_vision_capture_cancelled": lambda event: event.is_set(),
+            "cv2": SimpleNamespace(
+                IMREAD_GRAYSCALE=cv2.IMREAD_GRAYSCALE,
+                imwrite=persist,
+            ),
+        }
+        perform = self.compile_function(
+            "_perform_vision_match",
+            worker_namespace,
+        )
+
+        operation_result = perform(settings, cancellation)
+
+        self.assertIs(operation_result.capture_result, capture_result)
+        self.assertIs(operation_result.match_result, match_result)
+        self.assertIs(operation_result.match_options, options)
+        self.assertEqual(contexts, ["vision capture and matching"])
+        self.assertEqual(
+            loads,
+            [
+                (
+                    "template.jpg",
+                    cv2.IMREAD_GRAYSCALE,
+                    "vision template",
+                )
+            ],
+        )
+        self.assertEqual(len(matches), 1)
+        self.assertIs(matches[0][0], capture_result.image)
+        self.assertEqual(matches[0][2], 77)
+        self.assertIs(matches[0][3], options)
+        self.assertIs(matches[0][4], cancellation)
+        self.assertEqual(writes, [("temp.jpg", annotated)])
+        self.assertFalse(operation_active[0])
+
+        write_succeeds[0] = False
+        with self.assertRaisesRegex(OSError, "could not be persisted"):
+            perform(settings, cancellation)
+        self.assertFalse(operation_active[0])
+
+        class Entry:
+            def __init__(self, value=""):
+                self.value = value
+                self.states = []
+
             def configure(self, **kwargs):
-                pass
+                self.states.append(kwargs)
 
             def delete(self, *args):
                 self.value = ""
@@ -5352,63 +5703,148 @@ class HmiSourceContractTests(unittest.TestCase):
             def insert(self, index, value):
                 self.value = value
 
-        matches = []
-        capture_cancellations = []
-        closing = threading.Event()
-        namespace = {
-            "normalize_vision_background_color": (
-                normalize_vision_background_color
+        fields = {
+            "VisRetScoreEntryField": Entry(),
+            "VisRetAngleEntryField": Entry(),
+            "VisRetXpixEntryField": Entry(),
+            "VisRetYpixEntryField": Entry(),
+            "VisRetXrobEntryField": Entry(),
+            "VisRetYrobEntryField": Entry(),
+        }
+        runtime = {
+            "visionMatchRequestId": 8,
+            "xMMpos": 0,
+            "yMMpos": 0,
+        }
+        calibration = {}
+        label = SimpleNamespace(
+            imgtk=None,
+            configure=lambda **kwargs: None,
+        )
+        statuses = []
+        warnings = []
+        errors = []
+        presentation_namespace = {
+            **fields,
+            "RUN": runtime,
+            "CAL": calibration,
+            "vision_match_request_lock": threading.Lock(),
+            "VisionOperationEvent": VisionOperationEvent,
+            "VisionMatchOperationResult": VisionMatchOperationResult,
+            "VisionCaptureResult": VisionCaptureResult,
+            "VisionMatchResult": VisionMatchResult,
+            "VisionMatchOptions": VisionMatchOptions,
+            "MotionInputError": MotionInputError,
+            "VisBacColorEntryField": Entry(),
+            "Image": SimpleNamespace(fromarray=lambda image: image),
+            "ImageTk": SimpleNamespace(PhotoImage=lambda image: image),
+            "vid_lbl": label,
+            "logger": SimpleNamespace(
+                error=lambda *args: errors.append(args),
+                warning=lambda *args: warnings.append(args),
             ),
-            "re": re,
-            "cv2": cv2,
-            "np": np,
-            "logger": SimpleNamespace(exception=lambda *args: None),
-            "RUN": {
-                "selectedTemplate": Entry("template.jpg"),
-                "autoBG": Entry("0"),
-                "BGavg": (255, 1, 2),
-            },
-            "CAL": {},
-            "VisScoreEntryField": Entry("85"),
-            "VisBacColorEntryField": Entry("[255, 1, 2]"),
-            "application_closing": closing,
-            "visFind": lambda template, score, background: (
-                matches.append((template, score, background)) or "pass"
-            ),
-            "take_pic": lambda **kwargs: (
-                capture_cancellations.append(kwargs["cancellation_event"])
-                or False
+            "_set_application_status": (
+                lambda message, style: statuses.append((message, style))
             ),
         }
-        namespace["_vision_background_grayscale"] = self.compile_function(
-            "_vision_background_grayscale",
-            namespace,
-        )
-        snap_find = self.compile_function("snapFind", namespace)
-        expected_background = namespace["_vision_background_grayscale"](
-            [255, 1, 2]
+        apply_event = self.compile_function(
+            "_apply_vision_match_event",
+            presentation_namespace,
         )
 
-        self.assertFalse(snap_find())
-        self.assertEqual(matches, [])
-        self.assertEqual(capture_cancellations, [closing])
-
-        namespace["take_pic"] = lambda **kwargs: (
-            capture_cancellations.append(kwargs["cancellation_event"])
-            or True
+        self.assertTrue(
+            apply_event(
+                VisionOperationEvent(
+                    0,
+                    8,
+                    result=operation_result,
+                )
+            )
         )
-        self.assertEqual(snap_find(), "pass")
+        self.assertIsNone(runtime["visionMatchRequestId"])
+        self.assertEqual(runtime["xMMpos"], 30.0)
+        self.assertEqual(runtime["yMMpos"], 40.0)
+        self.assertEqual(fields["VisRetScoreEntryField"].value, "95.0")
+        self.assertEqual(fields["VisRetAngleEntryField"].value, "12.5")
+        self.assertEqual(fields["VisRetXpixEntryField"].value, "3")
+        self.assertEqual(fields["VisRetYpixEntryField"].value, "4")
+        self.assertEqual(fields["VisRetXrobEntryField"].value, "30.0")
+        self.assertEqual(fields["VisRetYrobEntryField"].value, "40.0")
+        self.assertEqual(calibration["fullRotVal"], 1)
+        self.assertEqual(calibration["pick180Val"], 1)
+        self.assertEqual(calibration["pickClosestVal"], 0)
+        self.assertIs(label.imgtk, display)
         self.assertEqual(
-            matches[-1],
-            ("template.jpg", 0.85, expected_background),
+            statuses[-1],
+            ("VISION MATCH PASSED", "OK.TLabel"),
         )
 
-        namespace["RUN"]["autoBG"].value = "1"
-        self.assertEqual(snap_find(), "pass")
-        self.assertEqual(
-            matches[-1],
-            ("template.jpg", 0.85, expected_background),
+        failed_match = VisionMatchResult(
+            matched=False,
+            score=0.1,
+            angle_degrees=None,
+            pixel_position=None,
+            robot_position=None,
+            annotated_image=annotated,
+            display_image=display,
         )
+        failed_operation = VisionMatchOperationResult(
+            capture_result,
+            failed_match,
+            options,
+        )
+        runtime["visionMatchRequestId"] = 9
+        self.assertTrue(
+            apply_event(
+                VisionOperationEvent(
+                    1,
+                    9,
+                    result=failed_operation,
+                )
+            )
+        )
+        self.assertIsNone(runtime["visionMatchRequestId"])
+        self.assertIsNone(runtime["xMMpos"])
+        self.assertIsNone(runtime["yMMpos"])
+        for field_name in (
+            "VisRetAngleEntryField",
+            "VisRetXpixEntryField",
+            "VisRetYpixEntryField",
+            "VisRetXrobEntryField",
+            "VisRetYrobEntryField",
+        ):
+            self.assertEqual(fields[field_name].value, "NA")
+        self.assertEqual(
+            statuses[-1],
+            ("VISION MATCH FAILED", "Warn.TLabel"),
+        )
+
+        runtime["visionMatchRequestId"] = 10
+        self.assertFalse(
+            apply_event(
+                VisionOperationEvent(
+                    2,
+                    9,
+                    result=operation_result,
+                )
+            )
+        )
+        self.assertEqual(runtime["visionMatchRequestId"], 10)
+        self.assertEqual(fields["VisRetAngleEntryField"].value, "NA")
+        self.assertEqual(len(warnings), 1)
+
+        self.assertFalse(
+            apply_event(
+                VisionOperationEvent(
+                    3,
+                    10,
+                    error_detail="camera read failed",
+                )
+            )
+        )
+        self.assertIsNone(runtime["visionMatchRequestId"])
+        self.assertIn("camera read failed", statuses[-1][0])
+        self.assertEqual(len(errors), 1)
 
     def test_execute_row_rejects_failed_vision_capture_before_matching(self):
         class ProgramView:
@@ -8471,6 +8907,7 @@ class HmiSourceContractTests(unittest.TestCase):
         poll_calls = []
         camera_closes = []
         vision_closes = []
+        match_closes = []
         namespace = {
             "application_closing": closing,
             "serial_activity_registry": activity,
@@ -8500,6 +8937,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "vision_capture_worker": SimpleNamespace(
                 close=lambda: vision_closes.append(True) or True,
             ),
+            "vision_match_worker": SimpleNamespace(
+                close=lambda: match_closes.append(True) or True,
+            ),
             "logger": logger,
             "_poll_application_close": lambda: poll_calls.append(True),
             "almStatusLab": first_label,
@@ -8516,8 +8956,10 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(conversion_tab.GCrunTrue, 0)
         self.assertEqual(camera_closes, [True])
         self.assertEqual(vision_closes, [True])
+        self.assertEqual(match_closes, [True])
         self.assertFalse(namespace["RUN"]["cam_on"])
         self.assertIsNone(namespace["RUN"]["visionCaptureRequestId"])
+        self.assertIsNone(namespace["RUN"]["visionMatchRequestId"])
         self.assertTrue(dispatcher.closed)
         self.assertEqual(len(logger.errors), 1)
         self.assertIn("active worker", logger.errors[0][0])
@@ -8695,7 +9137,8 @@ class HmiSourceContractTests(unittest.TestCase):
         statuses = []
         namespace = {
             "camera_preview_worker": SimpleNamespace(active=False),
-            "vision_capture_worker": SimpleNamespace(active=True),
+            "vision_capture_worker": SimpleNamespace(active=False),
+            "vision_match_worker": SimpleNamespace(active=True),
             "camera_preview_shutdown_started_at": 10.0,
             "camera_preview_shutdown_timeout_reported": False,
             "time": SimpleNamespace(monotonic=lambda: next(clock)),
@@ -8741,6 +9184,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         namespace["camera_preview_worker"].active = True
         namespace["vision_capture_worker"].active = False
+        namespace["vision_match_worker"].active = False
         namespace["camera_preview_shutdown_started_at"] = 20.0
         namespace["camera_preview_shutdown_timeout_reported"] = False
         namespace["time"] = SimpleNamespace(monotonic=lambda: 20.5)

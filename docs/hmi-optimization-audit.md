@@ -401,8 +401,18 @@ Tk serializes event callbacks on the interpreter thread. Long event handlers blo
   selections normalize drag direction, clamp to image bounds, reject undersized
   regions before mask-state mutation, and surface callback persistence failures
   through the HMI alarm.
-  Snap-and-Find and program-row capture,
-  matching, interactive mask, and template workflows remain blocking surfaces.
+  Manual Snap-and-Find snapshots all Tk-backed capture and match inputs before
+  submitting one non-coalescing request. One daemon operation owns acquisition,
+  captured-image persistence, bounded template loading, rotation matching, and
+  annotated-result persistence under the shared artifact lease; the camera
+  poll applies the terminal image and fields on Tk. The pure matcher checks
+  cancellation between candidates, avoids the duplicated second revolution in
+  full search, retains the strongest sub-threshold candidate, applies symmetric
+  J6 fallback limits, and clears stale coordinates on failure. Shutdown includes
+  the matching worker in bounded camera cleanup supervision. The program-row
+  vision path reuses the pure matcher but still separates synchronous capture
+  and matching. Program-row capture and matching plus interactive mask and
+  template workflows remain blocking surfaces.
 
 Automated coverage is hardware-free and never imports `AR4.py`.
 

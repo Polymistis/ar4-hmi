@@ -638,11 +638,26 @@ Implemented portion:
   alarm. Successful capture events are presented in worker order, so a failed
   coalesced successor cannot leave the most recent retained successful capture
   hidden behind an older displayed still frame.
+  Manual `Snap & Find` now snapshots capture, template, score, rotation,
+  joint-limit, and pixel-to-robot calibration inputs on Tk and submits one
+  non-coalescing request. A daemon worker owns frame acquisition, captured-image
+  persistence, bounded template loading, rotation matching, and annotated-result
+  persistence under one artifact lease; the camera event poll performs the
+  resulting Tk-only field and image presentation. Matching consumes immutable
+  inputs, checks cancellation between rotation candidates, examines each of the
+  360 unique integer-degree orientations at most once during full search,
+  retains the best sub-threshold result, and applies symmetric J6 fallback
+  limits. Failed matches clear stale pixel and robot-coordinate outputs.
+  Application shutdown cancels and supervises the matching worker under the
+  existing bounded camera-worker grace period. The legacy program-row vision
+  path now reuses the same pure matcher but still performs capture and matching
+  as separate synchronous operations; request-scoped program integration
+  remains pending.
   Hardware camera behavior and timing remain unverified.
 
 Remaining scope includes broader program and G-code row-execution admission,
-asynchronous Snap-and-Find and program-row capture, matching, interactive mask,
-and template workflows, Modbus, auxiliary connection and device paths,
+asynchronous program-row capture and matching, interactive mask and template
+workflows, Modbus, auxiliary connection and device paths,
 request-scoped program-owner watchdog and recovery semantics for a lost worker
 or completion callback, durable event-poll failure handling when the Tk
 scheduler or interpreter is unavailable, application-lifecycle, timing, and

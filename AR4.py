@@ -298,16 +298,22 @@ from ARrobots.HMI.vision_io import (
   CameraPreviewFrame,
   CameraPreviewLifecycleState,
   CameraPreviewWorker,
-  VisionCaptureEvent,
   VisionCaptureResult,
   VisionCaptureSettings,
-  VisionCaptureSubmission,
-  VisionCaptureWorker,
+  VisionCoordinateMapping,
+  VisionMatchOperationResult,
+  VisionMatchOptions,
+  VisionMatchResult,
+  VisionMatchSettings,
+  VisionOperationEvent,
+  VisionOperationSubmission,
+  VisionOperationWorker,
   fit_vision_preview_square,
   load_bounded_vision_image,
   normalize_camera_exception_detail,
   prepare_camera_preview_frame,
   prepare_vision_capture_result,
+  prepare_vision_match_result,
 )
 
 #####################################################################################
@@ -619,10 +625,21 @@ def on_closing():
         camera_preview_shutdown_started_at = time.monotonic()
     except Exception:
       logger.exception("Unable to stop vision capture during shutdown")
+  match_worker = globals().get('vision_match_worker')
+  if match_worker is not None:
+    try:
+      match_closed = match_worker.close()
+      if not isinstance(match_closed, bool):
+        raise RuntimeError("vision matching returned an invalid close state")
+      if not match_closed:
+        camera_preview_shutdown_started_at = time.monotonic()
+    except Exception:
+      logger.exception("Unable to stop vision matching during shutdown")
   camera_preview_shutdown_timeout_reported = False
   if isinstance(runtime_state, dict):
     runtime_state['cam_on'] = False
     runtime_state['visionCaptureRequestId'] = None
+    runtime_state['visionMatchRequestId'] = None
 
   _close_joint_motion_dispatcher_for_shutdown()
 
@@ -646,6 +663,7 @@ application_lifecycle_lock = threading.Lock()
 camera_selection_lock = threading.Lock()
 camera_preview_request_lock = threading.Lock()
 vision_capture_request_lock = threading.Lock()
+vision_match_request_lock = threading.Lock()
 vision_artifact_lock = threading.Lock()
 selected_vision_camera_source = None
 program_camera_completion_queue = Queue()
@@ -4726,7 +4744,21 @@ def _poll_application_close():
     except Exception:
       logger.exception("Unable to inspect vision capture shutdown state")
       capture_worker_active = False
-  camera_worker_active = camera_worker_active or capture_worker_active
+  match_worker = globals().get('vision_match_worker')
+  match_worker_active = False
+  if match_worker is not None:
+    try:
+      match_worker_active = match_worker.active
+      if not isinstance(match_worker_active, bool):
+        raise RuntimeError("vision matching returned an invalid active state")
+    except Exception:
+      logger.exception("Unable to inspect vision matching shutdown state")
+      match_worker_active = False
+  camera_worker_active = (
+    camera_worker_active
+    or capture_worker_active
+    or match_worker_active
+  )
   if camera_worker_active:
     now = time.monotonic()
     if camera_preview_shutdown_started_at is None:
@@ -4856,6 +4888,7 @@ RUN['KinematicError'] = 0
 RUN['cam_on'] = False
 RUN['cameraPreviewRequestId'] = None
 RUN['visionCaptureRequestId'] = None
+RUN['visionMatchRequestId'] = None
 
 # Migrated global variables to RUN dictionary
 # Robot State & Control
@@ -28366,6 +28399,7 @@ def _poll_camera_preview_events():
   try:
     _drain_program_camera_completion_events()
     _drain_vision_capture_events()
+    _drain_vision_match_events()
     for event in camera_preview_worker.drain_events():
       _apply_camera_preview_event(event)
     with camera_preview_request_lock:
@@ -28836,6 +28870,94 @@ def _snapshot_vision_capture_settings(background_override=None):
   )
 
 
+def _vision_binary_option(variable, label):
+  value = int(variable.get())
+  if value not in (0, 1):
+    raise MotionInputError(f"{label} must be zero or one")
+  return value == 1
+
+
+def _snapshot_vision_match_options(template=None, minimum_score=None):
+  if template is None:
+    template = RUN['selectedTemplate'].get()
+  if minimum_score is None:
+    minimum_score = finite_number(
+      VisScoreEntryField.get(),
+      "vision score",
+    ) * 0.01
+  else:
+    minimum_score = finite_number(
+      minimum_score,
+      "vision minimum score",
+    )
+  coordinate_mapping = VisionCoordinateMapping(
+    first_pixel_origin=finite_number(
+      VisX1PixEntryField.get(),
+      "vision first-pixel origin",
+    ),
+    first_robot_origin=finite_number(
+      VisX1RobEntryField.get(),
+      "vision first-robot origin",
+    ),
+    second_pixel_origin=finite_number(
+      VisY1PixEntryField.get(),
+      "vision second-pixel origin",
+    ),
+    second_robot_origin=finite_number(
+      VisY1RobEntryField.get(),
+      "vision second-robot origin",
+    ),
+    first_pixel_end=finite_number(
+      VisX2PixEntryField.get(),
+      "vision first-pixel end",
+    ),
+    first_robot_end=finite_number(
+      VisX2RobEntryField.get(),
+      "vision first-robot end",
+    ),
+    second_pixel_end=finite_number(
+      VisY2PixEntryField.get(),
+      "vision second-pixel end",
+    ),
+    second_robot_end=finite_number(
+      VisY2RobEntryField.get(),
+      "vision second-robot end",
+    ),
+  )
+  return VisionMatchOptions(
+    template_filename=template,
+    minimum_score=minimum_score,
+    full_rotation_search=_vision_binary_option(
+      RUN['fullRot'],
+      "vision full-rotation state",
+    ),
+    pick_closest_180=_vision_binary_option(
+      RUN['pick180'],
+      "vision closest-180 state",
+    ),
+    try_closest_out_of_range=_vision_binary_option(
+      RUN['pickClosest'],
+      "vision out-of-range fallback state",
+    ),
+    joint6_positive_limit=finite_number(
+      CAL['J6PosLim'],
+      "vision J6 positive limit",
+    ),
+    joint6_negative_limit=finite_number(
+      CAL['J6NegLim'],
+      "vision J6 negative limit",
+    ),
+    coordinate_mapping=coordinate_mapping,
+  )
+
+
+def _snapshot_vision_match_settings():
+  return VisionMatchSettings(
+    capture_settings=_snapshot_vision_capture_settings(),
+    match_options=_snapshot_vision_match_options(),
+  )
+
+
 def _vision_capture_cancelled(cancellation_event):
   if cancellation_event is None:
     return False
@@ -28871,27 +28993,84 @@ def _vision_artifact_operation(context):
     vision_artifact_lock.release()
 
 
-def _perform_vision_capture(settings, cancellation_event=None):
+def _capture_vision_result_under_artifact_owner(
+  settings,
+  cancellation_event=None,
+):
   if not isinstance(settings, VisionCaptureSettings):
     raise MotionInputError("vision capture settings are invalid")
+  if _vision_capture_cancelled(cancellation_event):
+    raise MotionInputError("vision capture was cancelled")
+  frame = _capture_current_vision_frame(cancellation_event)
+  if _vision_capture_cancelled(cancellation_event):
+    raise MotionInputError("vision capture was cancelled")
+  result = prepare_vision_capture_result(frame, settings)
+  if _vision_capture_cancelled(cancellation_event):
+    raise MotionInputError("vision capture was cancelled")
+  if not cv2.imwrite('curImage.jpg', result.image):
+    raise OSError("captured vision frame could not be persisted")
+  return result
+
+
+def _perform_vision_capture(settings, cancellation_event=None):
   with _vision_artifact_operation("vision capture"):
+    return _capture_vision_result_under_artifact_owner(
+      settings,
+      cancellation_event,
+    )
+
+
+def _perform_vision_match(settings, cancellation_event=None):
+  if not isinstance(settings, VisionMatchSettings):
+    raise MotionInputError("vision match settings are invalid")
+  with _vision_artifact_operation("vision capture and matching"):
+    capture_result = _capture_vision_result_under_artifact_owner(
+      settings.capture_settings,
+      cancellation_event,
+    )
+    template = load_bounded_vision_image(
+      settings.match_options.template_filename,
+      cv2.IMREAD_GRAYSCALE,
+      "vision template",
+    )
+    match_result = prepare_vision_match_result(
+      capture_result.image,
+      template,
+      capture_result.background_grayscale,
+      settings.match_options,
+      cancellation_event,
+    )
     if _vision_capture_cancelled(cancellation_event):
-      raise MotionInputError("vision capture was cancelled")
-    frame = _capture_current_vision_frame(cancellation_event)
-    if _vision_capture_cancelled(cancellation_event):
-      raise MotionInputError("vision capture was cancelled")
-    result = prepare_vision_capture_result(frame, settings)
-    if _vision_capture_cancelled(cancellation_event):
-      raise MotionInputError("vision capture was cancelled")
-    if not cv2.imwrite('curImage.jpg', result.image):
-      raise OSError("captured vision frame could not be persisted")
-    return result
+      raise MotionInputError("vision matching was cancelled")
+    if not cv2.imwrite('temp.jpg', match_result.annotated_image):
+      raise OSError("vision result frame could not be persisted")
+    return VisionMatchOperationResult(
+      capture_result=capture_result,
+      match_result=match_result,
+      match_options=settings.match_options,
+    )
 
 
-vision_capture_worker = VisionCaptureWorker(_perform_vision_capture)
+vision_capture_worker = VisionOperationWorker(
+  _perform_vision_capture,
+  VisionCaptureSettings,
+  VisionCaptureResult,
+  "vision capture",
+  "ar4-vision-capture",
+)
 
 
-def _apply_vision_capture_result(result):
+vision_match_worker = VisionOperationWorker(
+  _perform_vision_match,
+  VisionMatchSettings,
+  VisionMatchOperationResult,
+  "vision matching",
+  "ar4-vision-match",
+  coalesce=False,
+)
+
+
+def _apply_vision_capture_state(result):
   if not isinstance(result, VisionCaptureResult):
     raise MotionInputError("vision capture supplied an invalid result")
   CAL['zoom'] = result.zoom_percent
@@ -28903,6 +29082,11 @@ def _apply_vision_capture_result(result):
     VisBacColorEntryField.delete(0, 'end')
     VisBacColorEntryField.insert(0, str(RUN['BGavg']))
     VisBacColorEntryField.configure(state='disabled')
+  return True
+
+
+def _apply_vision_capture_result(result):
+  _apply_vision_capture_state(result)
   img = Image.fromarray(result.display_image)
   imgtk = ImageTk.PhotoImage(image=img)
   vid_lbl.imgtk = imgtk
@@ -28910,8 +29094,117 @@ def _apply_vision_capture_result(result):
   return True
 
 
+def _replace_vision_result_field(field, value):
+  field.delete(0, 'end')
+  field.insert(0, value)
+  return True
+
+
+def _apply_vision_match_presentation(result, options):
+  if not isinstance(result, VisionMatchResult):
+    raise MotionInputError("vision matching supplied an invalid result")
+  if not isinstance(options, VisionMatchOptions):
+    raise MotionInputError("vision match options are invalid")
+  CAL['fullRotVal'] = int(options.full_rotation_search)
+  CAL['pick180Val'] = int(options.pick_closest_180)
+  CAL['pickClosestVal'] = int(options.try_closest_out_of_range)
+  image = Image.fromarray(result.display_image)
+  imgtk = ImageTk.PhotoImage(image=image)
+  vid_lbl.imgtk = imgtk
+  vid_lbl.configure(image=imgtk)
+  _replace_vision_result_field(
+    VisRetScoreEntryField,
+    str(round(result.score * 100, 2)),
+  )
+  if not result.matched:
+    for field in (
+      VisRetAngleEntryField,
+      VisRetXpixEntryField,
+      VisRetYpixEntryField,
+      VisRetXrobEntryField,
+      VisRetYrobEntryField,
+    ):
+      _replace_vision_result_field(field, "NA")
+    RUN['xMMpos'] = None
+    RUN['yMMpos'] = None
+    return "fail"
+
+  first_pixel, second_pixel = result.pixel_position
+  first_robot, second_robot = result.robot_position
+  RUN['xMMpos'] = first_robot
+  RUN['yMMpos'] = second_robot
+  for field, value in (
+    (VisRetAngleEntryField, result.angle_degrees),
+    (VisRetXpixEntryField, first_pixel),
+    (VisRetYpixEntryField, second_pixel),
+    (VisRetXrobEntryField, round(first_robot, 2)),
+    (VisRetYrobEntryField, round(second_robot, 2)),
+  ):
+    _replace_vision_result_field(field, str(value))
+  return "pass"
+
+
+def _apply_vision_match_operation_result(result):
+  if not isinstance(result, VisionMatchOperationResult):
+    raise MotionInputError("vision matching supplied an invalid operation result")
+  _apply_vision_capture_state(result.capture_result)
+  return _apply_vision_match_presentation(
+    result.match_result,
+    result.match_options,
+  )
+
+
+def _apply_vision_match_event(event):
+  if not isinstance(event, VisionOperationEvent):
+    raise RuntimeError("vision matching worker emitted an invalid event")
+  with vision_match_request_lock:
+    request_id = RUN.get('visionMatchRequestId')
+    current = request_id == event.request_id
+    if current:
+      RUN['visionMatchRequestId'] = None
+  if not current:
+    if event.error_detail is not None:
+      logger.error(
+        "Vision match request %s failed after ownership changed: %s",
+        event.request_id,
+        event.error_detail,
+      )
+    else:
+      logger.warning(
+        "Ignoring vision match request %s after ownership changed",
+        event.request_id,
+      )
+    return False
+  if event.error_detail is not None:
+    message = f"VISION MATCHING FAILED: {event.error_detail}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  status = _apply_vision_match_operation_result(event.result)
+  if status == "pass":
+    _set_application_status("VISION MATCH PASSED", "OK.TLabel")
+  elif status == "fail":
+    _set_application_status("VISION MATCH FAILED", "Warn.TLabel")
+  else:
+    raise RuntimeError("vision matching returned an invalid result")
+  return True
+
+
+def _drain_vision_match_events():
+  for event in vision_match_worker.drain_events():
+    try:
+      _apply_vision_match_event(event)
+    except Exception:
+      logger.exception("Unable to apply a vision match result")
+      _set_application_status(
+        "VISION MATCH RESULT FAILED",
+        "Alarm.TLabel",
+      )
+  return True
+
+
 def _apply_vision_capture_event(event):
-  if not isinstance(event, VisionCaptureEvent):
+  if not isinstance(event, VisionOperationEvent):
     raise RuntimeError("vision capture worker emitted an invalid event")
   with vision_capture_request_lock:
     request_id = RUN.get('visionCaptureRequestId')
@@ -28957,7 +29250,7 @@ def request_vision_capture(background_override=None):
       raise MotionInputError("application shutdown is active")
     settings = _snapshot_vision_capture_settings(background_override)
     submission = vision_capture_worker.submit(settings)
-    if not isinstance(submission, VisionCaptureSubmission):
+    if not isinstance(submission, VisionOperationSubmission):
       raise RuntimeError("vision capture returned an invalid submission")
     with vision_capture_request_lock:
       RUN['visionCaptureRequestId'] = submission.request_id
@@ -28971,6 +29264,43 @@ def request_vision_capture(background_override=None):
   except Exception as exc:
     detail = normalize_camera_exception_detail(exc)
     message = f"VISION CAPTURE REJECTED: {detail}"
+    logger.exception(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+
+
+def request_vision_match():
+  try:
+    if application_closing.is_set():
+      raise MotionInputError("application shutdown is active")
+    with vision_match_request_lock:
+      request_id = RUN.get('visionMatchRequestId')
+      if request_id is not None:
+        if (
+          isinstance(request_id, bool)
+          or not isinstance(request_id, int)
+          or request_id < 0
+        ):
+          raise MotionInputError("vision matching has an invalid request owner")
+        raise MotionInputError("vision matching is already active")
+      settings = _snapshot_vision_match_settings()
+      submission = vision_match_worker.submit(
+        settings,
+        application_closing,
+      )
+      if not isinstance(submission, VisionOperationSubmission):
+        raise RuntimeError("vision matching returned an invalid submission")
+      if submission.coalesced:
+        raise RuntimeError("vision matching unexpectedly coalesced a request")
+      RUN['visionMatchRequestId'] = submission.request_id
+    _set_application_status(
+      "VISION MATCHING IN PROGRESS",
+      "Warn.TLabel",
+    )
+    return True
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"VISION MATCHING REJECTED: {detail}"
     logger.exception(message)
     _set_application_status(message, "Alarm.TLabel")
     return False
@@ -29147,8 +29477,6 @@ def _normalized_vision_selection_bounds(image, start_x, start_y, end_x, end_y):
 
 
 def _reject_undersized_vision_selection(context):
-  if context not in ("MASK", "TEMPLATE"):
-    raise MotionInputError("vision selection context is invalid")
   message = f"VISION {context} SELECTION TOO SMALL"
   logger.warning(message)
   try:
@@ -29401,269 +29729,35 @@ def selectTemplate():
 
 
 def snapFind():
-  try:
-    if take_pic(cancellation_event=application_closing) is not True:
-      return False
-    template = RUN['selectedTemplate'].get()
-    min_score = float(VisScoreEntryField.get())*.01
-    CAL['autoBGVal'] = int(RUN['autoBG'].get())
-    if(CAL['autoBGVal']==1):
-      background = _vision_background_grayscale(RUN['BGavg'])
-      VisBacColorEntryField.configure(state='enabled')
-      VisBacColorEntryField.delete(0, 'end')
-      VisBacColorEntryField.insert(0,str(RUN['BGavg']))
-      VisBacColorEntryField.configure(state='disabled')
-    else:
-      background = _vision_background_grayscale(
-        VisBacColorEntryField.get()
-      )
-    return visFind(template,min_score,background)
-  except Exception:
-    logger.exception("Vision matching failed")
-    return False
+  return request_vision_match()
 
 
-
-
-def rotate_image(img,angle,background):
-    image_center = tuple(np.array(img.shape[1::-1]) / 2)
-    rot_mat = cv2.getRotationMatrix2D(image_center, -angle, 1.0)
-    result = cv2.warpAffine(img, rot_mat, img.shape[1::-1],borderMode=cv2.BORDER_CONSTANT, borderValue=background, flags=cv2.INTER_LINEAR)
-    return result
-
-
-def _vision_match_maximum(result):
-    _, maximum, _, location = cv2.minMaxLoc(result)
-    maximum = finite_number(maximum, "vision template score")
-    if maximum < -1 or maximum > 1:
-        raise MotionInputError(
-            "vision template score must be between -1 and 1"
-        )
-    return maximum, location
-
-
-def visFind(template,min_score,background):
-    green = (0,255,0)
-    red = (0,0,255)
-    blue = (0,0,255)
-    dkgreen = (0,128,0)
-    status = "fail"
-    highscore = -math.inf
-    min_score = finite_number(min_score, "vision minimum score")
-    if min_score < 0 or min_score > 1:
-      raise MotionInputError(
-        "vision minimum score must be between 0 and 1"
+def visFind(template, min_score, background):
+  options = _snapshot_vision_match_options(template, min_score)
+  background = _average_vision_grayscale_samples((background,))
+  with _vision_artifact_operation("vision matching"):
+    image = load_bounded_vision_image(
+      'curImage.jpg',
+      cv2.IMREAD_GRAYSCALE,
+      "captured vision frame",
     )
-    background = _average_vision_grayscale_samples((background,))
-    with _vision_artifact_operation("vision matching input"):
-      img1 = load_bounded_vision_image(
-        'curImage.jpg',
-        cv2.IMREAD_GRAYSCALE,
-        "captured vision frame",
-      )
-      img2 = load_bounded_vision_image(
-        template,
-        cv2.IMREAD_GRAYSCALE,
-        "vision template",
-      )
-    if img2.shape[0] > img1.shape[0] or img2.shape[1] > img1.shape[1]:
-      raise MotionInputError(
-        "vision template must not exceed the captured frame dimensions"
-      )
-    
-    #method = cv2.TM_CCOEFF_NORMED
-    #method = cv2.TM_CCORR_NORMED
-
-    img = img1.copy()
-
-    CAL['fullRotVal'] = int(RUN['fullRot'].get())
-
-    for i in range (1):
-      if(i==0):
-        method = cv2.TM_CCOEFF_NORMED
-      else:
-        #method = cv2.TM_CCOEFF_NORMED
-        method = cv2.TM_CCORR_NORMED  
-
-      #USE 1/3 - EACH SIDE SEARCH
-      if (CAL['fullRotVal'] == 0): 
-        ## fist pass 1/3rds
-        curangle = 0
-        highangle = 0
-        highscore = -math.inf
-        highmax_loc = (0, 0)
-        for x in range(3):
-          template = img2
-          template = rotate_image(img2,curangle,background)
-          w, h = template.shape[1::-1]
-          res = cv2.matchTemplate(img,template,method)
-          max_val, max_loc = _vision_match_maximum(res)
-          if(max_val>highscore):
-            highscore=max_val
-            highangle=curangle
-            highmax_loc=max_loc
-            highw,highh = w,h
-          curangle += 120
-        
-        #check each side and narrow in
-        while True:
-          curangle=curangle/2
-          if(curangle<.9):
-            break
-          nextangle1 = highangle+curangle
-          nextangle2 = highangle-curangle
-          template = img2
-          template = rotate_image(img2,nextangle1,background)
-          w, h = template.shape[1::-1]
-          res = cv2.matchTemplate(img,template,method)
-          max_val, max_loc = _vision_match_maximum(res)
-          if(max_val>highscore):
-            highscore=max_val
-            highangle=nextangle1
-            highmax_loc=max_loc
-            highw,highh = w,h
-          template = img2
-          template = rotate_image(img2,nextangle2,background)
-          w, h = template.shape[1::-1]
-          res = cv2.matchTemplate(img,template,method)
-          max_val, max_loc = _vision_match_maximum(res)
-          if(max_val>highscore):
-            highscore=max_val
-            highangle=nextangle2
-            highmax_loc=max_loc
-            highw,highh = w,h     
-    
-      #USE FULL 360 SEARCh
-      else:
-        for i in range (720):
-          template = rotate_image(img2,i,background)
-          w, h = template.shape[1::-1]
-
-          img = img1.copy()
-          # Apply template Matching
-          res = cv2.matchTemplate(img,template,method)
-          max_val, max_loc = _vision_match_maximum(res)
-          highscore=max_val
-          highangle=i
-          highmax_loc=max_loc
-          highw,highh = w,h
-          if highscore >= min_score:
-            break
-      if(i==1):
-        highscore = highscore*.5    
-      if highscore >= min_score:
-        break         
-
-    display_image = cv2.cvtColor(img1, cv2.COLOR_GRAY2BGR)
-    if highscore >= min_score:
-      status = "pass"
-      #normalize angle to increment of +180 to -180
-      if(highangle>180):
-        highangle = -360 + highangle
-      #pick closest 180   
-      CAL['pick180Val'] = int(RUN['pick180'].get())  
-      if (CAL['pick180Val'] == 1):
-        if (highangle>90):
-          highangle = -180 + highangle
-        elif (highangle<-90):
-          highangle = 180 + highangle
-      #try closest
-      CAL['pickClosestVal'] = int(RUN['pickClosest'].get())
-      if (CAL['pickClosestVal'] == highangle and highangle>int(CAL['J6PosLim'])):
-        highangle=CAL['J6PosLim']
-      elif (CAL['pickClosestVal'] == 0 and highangle>int(CAL['J6PosLim'])):    
-        status = "fail"
-      if (CAL['pickClosestVal'] == 1 and highangle<(int(CAL['J6NegLim'])*-1)):
-        highangle=CAL['J6NegLim']*-1
-      elif (CAL['pickClosestVal'] == 0 and highangle<(int(CAL['J6NegLim'])*-1)):  
-        status = "fail"
-
-      top_left = highmax_loc
-      #find center
-      center = (top_left[0] + highw/2, top_left[1] + highh/2)
-      xPos = int(center[1])
-      yPos = int(center[0])
-
-      imgxPos = int(center[0])
-      imgyPos = int(center[1])
-
-      #find line 1 end
-      line1x = int(imgxPos + 60*math.cos(math.radians(highangle-90)))
-      line1y = int(imgyPos + 60*math.sin(math.radians(highangle-90)))
-      cv2.line(display_image, (imgxPos,imgyPos), (line1x,line1y), green, 3)
-
-      #find line 2 end
-      line2x = int(imgxPos + 60*math.cos(math.radians(highangle+90)))
-      line2y = int(imgyPos + 60*math.sin(math.radians(highangle+90)))
-      cv2.line(display_image, (imgxPos,imgyPos), (line2x,line2y), green, 3)
-
-      #find line 3 end
-      line3x = int(imgxPos + 30*math.cos(math.radians(highangle)))
-      line3y = int(imgyPos + 30*math.sin(math.radians(highangle)))
-      cv2.line(display_image, (imgxPos,imgyPos), (line3x,line3y), green, 3)
-
-      #find line 4 end
-      line4x = int(imgxPos + 30*math.cos(math.radians(highangle+180)))
-      line4y = int(imgyPos + 30*math.sin(math.radians(highangle+180)))
-      cv2.line(display_image, (imgxPos,imgyPos), (line4x,line4y), green, 3)
-
-      #find tip start
-      lineTx = int(imgxPos + 56*math.cos(math.radians(highangle-90)))
-      lineTy = int(imgyPos + 56*math.sin(math.radians(highangle-90)))
-      cv2.line(display_image, (lineTx,lineTy), (line1x,line1y), dkgreen, 2)
+    candidate = load_bounded_vision_image(
+      options.template_filename,
+      cv2.IMREAD_GRAYSCALE,
+      "vision template",
+    )
+    result = prepare_vision_match_result(
+      image,
+      candidate,
+      background,
+      options,
+      application_closing,
+    )
+    if not cv2.imwrite('temp.jpg', result.annotated_image):
+      raise OSError("vision result frame could not be persisted")
+  return _apply_vision_match_presentation(result, options)
 
 
-
-      cv2.circle(display_image, (imgxPos,imgyPos), 20, green, 1)
-      if not cv2.imwrite('temp.jpg', display_image):
-        raise OSError("vision result frame could not be persisted")
-      display_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
-      display = Image.fromarray(display_rgb).resize((640,480))
-      imgtk = ImageTk.PhotoImage(image=display)
-      vid_lbl.imgtk = imgtk    
-      vid_lbl.configure(image=imgtk)
-      VisRetScoreEntryField.delete(0, 'end')
-      VisRetScoreEntryField.insert(0,str(round((highscore*100),2))) 
-      VisRetAngleEntryField.delete(0, 'end')
-      VisRetAngleEntryField.insert(0,str(highangle)) 
-      VisRetXpixEntryField.delete(0, 'end')
-      VisRetXpixEntryField.insert(0,str(xPos))
-      VisRetYpixEntryField.delete(0, 'end')
-      VisRetYpixEntryField.insert(0,str(yPos))           
-      viscalc()
-      VisRetXrobEntryField .delete(0, 'end')
-      VisRetXrobEntryField .insert(0,str(round(RUN['xMMpos'],2)))  
-      VisRetYrobEntryField .delete(0, 'end')
-      VisRetYrobEntryField .insert(0,str(round(RUN['yMMpos'],2)))  
-
-      
-
-
-          #break
-        #if (score > highscore):
-          #highscore=score
-
-
-    if status == "fail":
-      cv2.rectangle(display_image,(5,5), (635,475), red, 5)
-      if not cv2.imwrite('temp.jpg', display_image):
-        raise OSError("vision result frame could not be persisted")
-      display_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
-      display = Image.fromarray(display_rgb).resize((640,480))
-      imgtk = ImageTk.PhotoImage(image=display)
-      vid_lbl.imgtk = imgtk    
-      vid_lbl.configure(image=imgtk)
-      VisRetScoreEntryField.delete(0, 'end')
-      VisRetScoreEntryField.insert(0,str(round((highscore*100),2)))
-      VisRetAngleEntryField.delete(0, 'end')
-      VisRetAngleEntryField.insert(0,"NA")
-      VisRetXpixEntryField.delete(0, 'end')
-      VisRetXpixEntryField.insert(0,"NA")
-      VisRetYpixEntryField.delete(0, 'end')
-      VisRetYpixEntryField.insert(0,"NA") 
-
-    return (status)    
-    
 def updateVisOp(filelist=None):
   RUN['selectedTemplate'] = StringVar()
   if filelist is None:
