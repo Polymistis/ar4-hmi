@@ -1290,8 +1290,16 @@ def select_vision_region(image, window_name, cancellation_event=None):
             cleanup_detail = normalize_camera_exception_detail(cleanup_error)
             separator = "; vision selection window cleanup failed: "
             available = MAX_CAMERA_PREVIEW_EVENT_DETAIL - len(separator)
-            cleanup_limit = min(len(cleanup_detail), available // 2)
-            operation_limit = available - cleanup_limit
+            half = available // 2
+            if len(detail) < half:
+                operation_limit = len(detail)
+                cleanup_limit = available - operation_limit
+            elif len(cleanup_detail) < half:
+                cleanup_limit = len(cleanup_detail)
+                operation_limit = available - cleanup_limit
+            else:
+                operation_limit = half
+                cleanup_limit = available - operation_limit
             detail = (
                 detail[:operation_limit].rstrip()
                 + separator
@@ -1304,9 +1312,11 @@ def select_vision_region(image, window_name, cancellation_event=None):
             raise operation_error
         raise MotionInputError(detail) from operation_error
     if cleanup_error is not None:
-        cleanup_detail = normalize_camera_exception_detail(cleanup_error)
         raise MotionInputError(
-            "vision selection window cleanup failed: " + cleanup_detail
+            normalize_camera_exception_detail(
+                cleanup_error,
+                "vision selection window cleanup failed: ",
+            )
         ) from cleanup_error
     return _validate_vision_selection_bounds(selected_bounds, source)
 

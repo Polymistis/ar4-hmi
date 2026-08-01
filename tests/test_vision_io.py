@@ -558,7 +558,7 @@ class VisionIoTests(unittest.TestCase):
 
         def select_bounds(delay):
             self.assertGreater(delay, 0)
-            callback = selected_callbacks[0]
+            callback = selected_callbacks[-1]
             callback(cv2.EVENT_LBUTTONDOWN, 1, 1, 0, None)
             callback(cv2.EVENT_LBUTTONUP, 14, 10, 0, None)
             return -1
@@ -582,6 +582,27 @@ class VisionIoTests(unittest.TestCase):
                 select_vision_region(image, "AR4 Vision Test")
 
         with patch("ARrobots.HMI.vision_io.cv2.namedWindow"), patch(
+            "ARrobots.HMI.vision_io.cv2.setMouseCallback",
+            side_effect=(
+                lambda name, callback: selected_callbacks.append(callback)
+            ),
+        ), patch("ARrobots.HMI.vision_io.cv2.imshow"), patch(
+            "ARrobots.HMI.vision_io.cv2.waitKey",
+            side_effect=select_bounds,
+        ), patch(
+            "ARrobots.HMI.vision_io.cv2.destroyWindow",
+            side_effect=RuntimeError("c" * 600),
+        ):
+            with self.assertRaises(MotionInputError) as cleanup_only_error:
+                select_vision_region(image, "AR4 Vision Test")
+        cleanup_only_detail = str(cleanup_only_error.exception)
+        self.assertEqual(
+            len(cleanup_only_detail),
+            MAX_CAMERA_PREVIEW_EVENT_DETAIL,
+        )
+        self.assertIn("c" * 400, cleanup_only_detail)
+
+        with patch("ARrobots.HMI.vision_io.cv2.namedWindow"), patch(
             "ARrobots.HMI.vision_io.cv2.setMouseCallback"
         ), patch("ARrobots.HMI.vision_io.cv2.imshow"), patch(
             "ARrobots.HMI.vision_io.cv2.waitKey",
@@ -599,6 +620,44 @@ class VisionIoTests(unittest.TestCase):
         )
         self.assertIn("w" * 400, bounded_detail)
         self.assertIn("vision selection window cleanup failed", bounded_detail)
+
+        with patch("ARrobots.HMI.vision_io.cv2.namedWindow"), patch(
+            "ARrobots.HMI.vision_io.cv2.setMouseCallback"
+        ), patch("ARrobots.HMI.vision_io.cv2.imshow"), patch(
+            "ARrobots.HMI.vision_io.cv2.waitKey",
+            side_effect=RuntimeError("w" * 600),
+        ), patch(
+            "ARrobots.HMI.vision_io.cv2.destroyWindow",
+            side_effect=RuntimeError("d" * 600),
+        ):
+            with self.assertRaises(MotionInputError) as two_long_errors:
+                select_vision_region(image, "AR4 Vision Test")
+        two_long_details = str(two_long_errors.exception)
+        self.assertEqual(
+            len(two_long_details),
+            MAX_CAMERA_PREVIEW_EVENT_DETAIL,
+        )
+        self.assertIn("w" * 100, two_long_details)
+        self.assertIn("d" * 100, two_long_details)
+
+        with patch("ARrobots.HMI.vision_io.cv2.namedWindow"), patch(
+            "ARrobots.HMI.vision_io.cv2.setMouseCallback"
+        ), patch("ARrobots.HMI.vision_io.cv2.imshow"), patch(
+            "ARrobots.HMI.vision_io.cv2.waitKey",
+            side_effect=RuntimeError("wait unavailable"),
+        ), patch(
+            "ARrobots.HMI.vision_io.cv2.destroyWindow",
+            side_effect=RuntimeError("d" * 600),
+        ):
+            with self.assertRaises(MotionInputError) as long_cleanup_error:
+                select_vision_region(image, "AR4 Vision Test")
+        long_cleanup_detail = str(long_cleanup_error.exception)
+        self.assertEqual(
+            len(long_cleanup_detail),
+            MAX_CAMERA_PREVIEW_EVENT_DETAIL,
+        )
+        self.assertIn("window failed: wait unavailable", long_cleanup_detail)
+        self.assertIn("d" * 400, long_cleanup_detail)
 
         interrupted_cleanup = []
 
@@ -622,6 +681,24 @@ class VisionIoTests(unittest.TestCase):
             "vision selection window cleanup failed: interrupt destroy "
             "unavailable",
             normalize_camera_exception_detail(interrupted_error.exception),
+        )
+
+        clean_interrupt_cleanup = []
+        with patch("ARrobots.HMI.vision_io.cv2.namedWindow"), patch(
+            "ARrobots.HMI.vision_io.cv2.setMouseCallback"
+        ), patch("ARrobots.HMI.vision_io.cv2.imshow"), patch(
+            "ARrobots.HMI.vision_io.cv2.waitKey",
+            side_effect=KeyboardInterrupt(),
+        ), patch(
+            "ARrobots.HMI.vision_io.cv2.destroyWindow",
+            side_effect=lambda name: clean_interrupt_cleanup.append(name),
+        ):
+            with self.assertRaises(KeyboardInterrupt) as clean_interrupt:
+                select_vision_region(image, "AR4 Vision Test")
+        self.assertEqual(clean_interrupt_cleanup, ["AR4 Vision Test"])
+        self.assertEqual(
+            normalize_camera_exception_detail(clean_interrupt.exception),
+            "KeyboardInterrupt",
         )
 
         with patch("ARrobots.HMI.vision_io.cv2.namedWindow"), patch(
