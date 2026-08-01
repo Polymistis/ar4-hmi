@@ -36,6 +36,17 @@ MAX_CAMERA_SOURCE_TEXT = 512
 CAMERA_PREVIEW_CANCELLATION_POLL_SECONDS = 0.05
 MAX_VISION_OPERATION_EVENTS = 64
 MAX_VISION_TEMPLATE_FILENAME = 255
+VISION_SELECTION_KINDS = frozenset(("mask", "template"))
+VISION_SELECTION_INSET_PIXELS = 3
+VISION_SELECTION_POLL_MILLISECONDS = 20
+VISION_TEMPLATE_PREVIEW_SIZE = 150
+VISION_TEMPLATE_SAVE_FORBIDDEN_CHARACTERS = frozenset('<>:"/\\|?*')
+VISION_TEMPLATE_SAVE_RESERVED_STEMS = frozenset(
+    ("CON", "PRN", "AUX", "NUL")
+    + tuple(f"COM{index}" for index in range(1, 10))
+    + tuple(f"LPT{index}" for index in range(1, 10))
+)
+VISION_TEMPLATE_INTERNAL_FILENAMES = frozenset(("curimage.jpg", "temp.jpg"))
 VISION_CAPTURE_ADJUSTMENT_MINIMUM = -127
 VISION_CAPTURE_ADJUSTMENT_MAXIMUM = 127
 VISION_CAPTURE_ZOOM_MINIMUM = 1
@@ -334,22 +345,7 @@ class VisionMatchOptions:
     coordinate_mapping: VisionCoordinateMapping
 
     def __post_init__(self):
-        if (
-            not isinstance(self.template_filename, str)
-            or not self.template_filename
-            or self.template_filename != self.template_filename.strip()
-            or os.path.basename(self.template_filename) != self.template_filename
-            or "/" in self.template_filename
-            or "\\" in self.template_filename
-            or not self.template_filename.endswith(".jpg")
-            or "\x00" in self.template_filename
-            or "\r" in self.template_filename
-            or "\n" in self.template_filename
-            or len(self.template_filename) > MAX_VISION_TEMPLATE_FILENAME
-        ):
-            raise MotionInputError(
-                "vision template must be a lowercase .jpg leaf filename"
-            )
+        _validate_vision_template_filename(self.template_filename)
         minimum_score = _validate_finite_number(
             self.minimum_score,
             "vision minimum score",
@@ -471,11 +467,121 @@ class VisionMatchOperationResult:
             raise MotionInputError("vision match result options are invalid")
 
 
+@dataclass(frozen=True)
+class VisionSelectionSettings:
+    kind: str
+    capture_settings: VisionCaptureSettings | None = None
+    template_filename: str | None = None
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.kind, str)
+            or self.kind not in VISION_SELECTION_KINDS
+        ):
+            raise MotionInputError("vision selection kind is invalid")
+        if self.kind == "mask":
+            if not isinstance(self.capture_settings, VisionCaptureSettings):
+                raise MotionInputError(
+                    "vision mask selection capture settings are invalid"
+                )
+            if self.template_filename is not None:
+                raise MotionInputError(
+                    "vision mask selection cannot include a template filename"
+                )
+            return
+        if self.capture_settings is not None:
+            raise MotionInputError(
+                "vision template selection cannot include capture settings"
+            )
+        _validate_new_vision_template_filename(self.template_filename)
+
+
+@dataclass(frozen=True, eq=False)
+class VisionSelectionResult:
+    kind: str
+    capture_result: VisionCaptureResult | None = None
+    mask_bounds: tuple[int, int, int, int] | None = None
+    template_filename: str | None = None
+    template_image: np.ndarray | None = None
+    template_preview: np.ndarray | None = None
+    visual_options: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.kind, str)
+            or self.kind not in VISION_SELECTION_KINDS
+        ):
+            raise MotionInputError("vision selection result kind is invalid")
+        if self.kind == "mask":
+            if not isinstance(self.capture_result, VisionCaptureResult):
+                raise MotionInputError(
+                    "vision mask selection result capture is invalid"
+                )
+            _validate_vision_selection_bounds(
+                self.mask_bounds,
+                self.capture_result.image,
+            )
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        self.template_filename,
+                        self.template_image,
+                        self.template_preview,
+                    )
+                )
+                or not isinstance(self.visual_options, tuple)
+                or self.visual_options
+            ):
+                raise MotionInputError(
+                    "vision mask selection result contains template data"
+                )
+            return
+        if self.capture_result is not None or self.mask_bounds is not None:
+            raise MotionInputError(
+                "vision template selection result contains mask data"
+            )
+        _validate_new_vision_template_filename(self.template_filename)
+        _validated_camera_frame(
+            self.template_image,
+            "vision template selection image",
+        )
+        _validated_camera_frame(
+            self.template_preview,
+            "vision template selection preview",
+        )
+        if self.template_preview.shape[:2] != (
+            VISION_TEMPLATE_PREVIEW_SIZE,
+            VISION_TEMPLATE_PREVIEW_SIZE,
+        ):
+            raise MotionInputError(
+                "vision template selection preview dimensions are invalid"
+            )
+        if isinstance(self.visual_options, (str, bytes)):
+            raise MotionInputError("vision template options are invalid")
+        try:
+            visual_options = tuple(self.visual_options)
+        except TypeError as exc:
+            raise MotionInputError("vision template options are invalid") from exc
+        for filename in visual_options:
+            _validate_vision_template_filename(filename)
+        if self.template_filename not in visual_options:
+            raise MotionInputError(
+                "saved vision template is missing from the option list"
+            )
+        object.__setattr__(self, "visual_options", visual_options)
+
+
 @dataclass(frozen=True, eq=False)
 class VisionOperationEvent:
     sequence: int
     request_id: int
-    result: VisionCaptureResult | VisionMatchOperationResult | None = None
+    result: (
+        VisionCaptureResult
+        | VisionMatchOperationResult
+        | VisionSelectionResult
+        | None
+    ) = None
     error_detail: str | None = None
 
     def __post_init__(self):
@@ -487,7 +593,11 @@ class VisionOperationEvent:
             )
         if self.result is not None and not isinstance(
             self.result,
-            (VisionCaptureResult, VisionMatchOperationResult),
+            (
+                VisionCaptureResult,
+                VisionMatchOperationResult,
+                VisionSelectionResult,
+            ),
         ):
             raise MotionInputError("vision operation result is invalid")
         if self.error_detail is not None and (
@@ -625,6 +735,74 @@ def _validate_camera_source(value):
     return value
 
 
+def _validate_vision_template_filename(value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or os.path.basename(value) != value
+        or "/" in value
+        or "\\" in value
+        or not value.endswith(".jpg")
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or len(value) > MAX_VISION_TEMPLATE_FILENAME
+    ):
+        raise MotionInputError(
+            "vision template must be a lowercase .jpg leaf filename"
+        )
+    return value
+
+
+def _validate_new_vision_template_filename(value):
+    filename = _validate_vision_template_filename(value)
+    stem = filename[:-4]
+    device_stem = stem.split(".", 1)[0].rstrip(" .").upper()
+    if (
+        not stem
+        or any(
+            character in VISION_TEMPLATE_SAVE_FORBIDDEN_CHARACTERS
+            for character in filename
+        )
+        or device_stem in VISION_TEMPLATE_SAVE_RESERVED_STEMS
+        or filename.casefold() in VISION_TEMPLATE_INTERNAL_FILENAMES
+    ):
+        raise MotionInputError(
+            "vision template save filename is invalid or reserved"
+        )
+    return filename
+
+
+def _validate_vision_selection_bounds(bounds, image):
+    if not isinstance(bounds, tuple) or len(bounds) != 4:
+        raise MotionInputError("vision selection bounds are invalid")
+    shape = getattr(image, "shape", None)
+    if not isinstance(shape, (tuple, list)) or len(shape) < 2:
+        raise MotionInputError("vision selection image has invalid dimensions")
+    height = _validate_bounded_integer(
+        shape[0],
+        "vision selection image height",
+        1,
+        MAX_VISION_IMAGE_DIMENSION,
+    )
+    width = _validate_bounded_integer(
+        shape[1],
+        "vision selection image width",
+        1,
+        MAX_VISION_IMAGE_DIMENSION,
+    )
+    x_minimum, y_minimum, x_maximum, y_maximum = bounds
+    for value, field_name, maximum in (
+        (x_minimum, "vision selection minimum X", width),
+        (y_minimum, "vision selection minimum Y", height),
+        (x_maximum, "vision selection maximum X", width),
+        (y_maximum, "vision selection maximum Y", height),
+    ):
+        _validate_bounded_integer(value, field_name, 0, maximum)
+    if x_minimum + 1 >= x_maximum or y_minimum + 1 >= y_maximum:
+        raise MotionInputError("vision selection bounds must enclose an area")
+    return bounds
+
+
 def _validate_camera_wait_timeout(value):
     if (
         isinstance(value, bool)
@@ -744,9 +922,7 @@ def prepare_camera_preview_frame(image, width=480, height=320):
     )
 
 
-def prepare_vision_capture_result(image, settings):
-    """Apply one immutable vision-input snapshot away from Tk."""
-
+def _prepare_vision_grayscale(image, settings):
     source = _validated_camera_frame(image, "vision capture frame")
     _validated_image_dimensions(
         source.shape[1],
@@ -782,6 +958,35 @@ def prepare_vision_capture_result(image, settings):
         raise
     except (cv2.error, TypeError, ValueError, OverflowError) as exc:
         raise MotionInputError("vision capture conversion failed") from exc
+    return grayscale
+
+
+def prepare_vision_selection_image(image, settings):
+    """Return an owned BGR selection frame from immutable capture settings."""
+
+    grayscale = _prepare_vision_grayscale(image, settings)
+    try:
+        selection_image = cv2.cvtColor(grayscale, cv2.COLOR_GRAY2BGR)
+    except cv2.error as exc:
+        raise MotionInputError("vision selection conversion failed") from exc
+    result = np.array(
+        _validated_camera_frame(
+            selection_image,
+            "vision selection frame",
+        ),
+        dtype=np.uint8,
+        copy=True,
+        order="C",
+    )
+    result.setflags(write=False)
+    return result
+
+
+def prepare_vision_capture_result(image, settings):
+    """Apply one immutable vision-input snapshot away from Tk."""
+
+    grayscale = _prepare_vision_grayscale(image, settings)
+    height, width = grayscale.shape
 
     if settings.auto_background:
         samples = []
@@ -843,6 +1048,185 @@ def prepare_vision_capture_result(image, settings):
         background_grayscale=background,
         auto_background_rgb=auto_background_rgb,
     )
+
+
+def normalize_vision_selection_bounds(
+    image,
+    start_x,
+    start_y,
+    end_x,
+    end_y,
+):
+    """Normalize a dragged region or return None for an undersized area."""
+
+    shape = getattr(image, "shape", None)
+    if not isinstance(shape, (tuple, list)) or len(shape) < 2:
+        raise MotionInputError("vision selection image has invalid dimensions")
+    height = _validate_bounded_integer(
+        shape[0],
+        "vision selection image height",
+        1,
+        MAX_VISION_IMAGE_DIMENSION,
+    )
+    width = _validate_bounded_integer(
+        shape[1],
+        "vision selection image width",
+        1,
+        MAX_VISION_IMAGE_DIMENSION,
+    )
+    coordinates = []
+    for value, field_name in (
+        (start_x, "vision selection start X"),
+        (start_y, "vision selection start Y"),
+        (end_x, "vision selection end X"),
+        (end_y, "vision selection end Y"),
+    ):
+        number = _validate_finite_number(value, field_name)
+        if not number.is_integer():
+            raise MotionInputError(f"{field_name} must be an integer")
+        coordinates.append(int(number))
+
+    x_start, y_start, x_end, y_end = coordinates
+    x_minimum = max(
+        0,
+        min(width, min(x_start, x_end) + VISION_SELECTION_INSET_PIXELS),
+    )
+    y_minimum = max(
+        0,
+        min(height, min(y_start, y_end) + VISION_SELECTION_INSET_PIXELS),
+    )
+    x_maximum = max(
+        0,
+        min(width, max(x_start, x_end) - VISION_SELECTION_INSET_PIXELS),
+    )
+    y_maximum = max(
+        0,
+        min(height, max(y_start, y_end) - VISION_SELECTION_INSET_PIXELS),
+    )
+    if x_minimum + 1 >= x_maximum or y_minimum + 1 >= y_maximum:
+        return None
+    return x_minimum, y_minimum, x_maximum, y_maximum
+
+
+def select_vision_region(image, window_name, cancellation_event=None):
+    """Run a cancellable OpenCV drag loop on the calling worker thread."""
+
+    source = np.array(
+        _validated_camera_frame(image, "vision selection frame"),
+        dtype=np.uint8,
+        copy=True,
+        order="C",
+    )
+    if (
+        not isinstance(window_name, str)
+        or not window_name
+        or window_name != window_name.strip()
+        or "\r" in window_name
+        or "\n" in window_name
+        or len(window_name) > 64
+    ):
+        raise MotionInputError("vision selection window name is invalid")
+    if _camera_cancellation_requested(cancellation_event):
+        raise MotionInputError("vision selection was cancelled")
+
+    state_lock = threading.Lock()
+    state = {
+        "start": None,
+        "bounds": None,
+        "error": None,
+    }
+
+    def handle_mouse(event, x, y, flags, parameter):
+        del flags, parameter
+        try:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                with state_lock:
+                    state["start"] = (x, y)
+                    state["bounds"] = None
+                return
+            with state_lock:
+                start = state["start"]
+            if start is None:
+                return
+            if event == cv2.EVENT_MOUSEMOVE:
+                preview = source.copy()
+                cv2.rectangle(preview, start, (x, y), (0, 255, 0), 2)
+                cv2.imshow(window_name, preview)
+                return
+            if event != cv2.EVENT_LBUTTONUP:
+                return
+            bounds = normalize_vision_selection_bounds(
+                source,
+                start[0],
+                start[1],
+                x,
+                y,
+            )
+            with state_lock:
+                state["start"] = None
+                state["bounds"] = bounds
+            if bounds is None:
+                cv2.imshow(window_name, source)
+        except BaseException as exc:
+            with state_lock:
+                state["error"] = exc
+
+    window_created = False
+    selected_bounds = None
+    operation_error = None
+    try:
+        cv2.namedWindow(window_name)
+        window_created = True
+        cv2.setMouseCallback(window_name, handle_mouse)
+        cv2.imshow(window_name, source)
+        while selected_bounds is None:
+            if _camera_cancellation_requested(cancellation_event):
+                raise MotionInputError("vision selection was cancelled")
+            key = cv2.waitKey(VISION_SELECTION_POLL_MILLISECONDS)
+            if isinstance(key, bool) or not isinstance(key, (int, np.integer)):
+                raise MotionInputError(
+                    "vision selection window returned an invalid key state"
+                )
+            if int(key) >= 0 and int(key) & 0xFF == 27:
+                raise MotionInputError("vision selection was cancelled")
+            with state_lock:
+                callback_error = state["error"]
+                selected_bounds = state["bounds"]
+            if callback_error is not None:
+                raise callback_error
+            if selected_bounds is not None:
+                break
+            visible = cv2.getWindowProperty(
+                window_name,
+                cv2.WND_PROP_VISIBLE,
+            )
+            visible = _validate_finite_number(
+                visible,
+                "vision selection window visibility",
+            )
+            if visible < 1:
+                raise MotionInputError("vision selection window was closed")
+    except BaseException as exc:
+        operation_error = exc
+
+    cleanup_error = None
+    if window_created:
+        try:
+            cv2.destroyWindow(window_name)
+        except BaseException as exc:
+            cleanup_error = exc
+    if operation_error is not None:
+        if cleanup_error is not None:
+            detail = normalize_camera_exception_detail(operation_error)
+            raise MotionInputError(
+                f"{detail}; vision selection window cleanup failed"
+            ) from cleanup_error
+        raise operation_error
+    if cleanup_error is not None:
+        raise MotionInputError(
+            "vision selection window cleanup failed"
+        ) from cleanup_error
+    return _validate_vision_selection_bounds(selected_bounds, source)
 
 
 def _raise_if_vision_match_cancelled(cancellation_event):
@@ -1193,6 +1577,7 @@ class VisionOperationWorker:
         if (settings_type, result_type) not in (
             (VisionCaptureSettings, VisionCaptureResult),
             (VisionMatchSettings, VisionMatchOperationResult),
+            (VisionSelectionSettings, VisionSelectionResult),
         ):
             raise MotionInputError("vision operation type contract is invalid")
         for value, field_name in (
@@ -2299,3 +2684,93 @@ def fit_vision_preview_square(image, target_size):
         x_offset:x_offset + resized_width,
     ] = resized
     return square
+
+
+def prepare_vision_mask_selection_result(image, settings, mask_bounds):
+    if (
+        not isinstance(settings, VisionSelectionSettings)
+        or settings.kind != "mask"
+        or not isinstance(settings.capture_settings, VisionCaptureSettings)
+    ):
+        raise MotionInputError("vision mask selection settings are invalid")
+    source = _validated_camera_frame(
+        image,
+        "vision mask selection source",
+    )
+    bounds = _validate_vision_selection_bounds(
+        mask_bounds,
+        source,
+    )
+    source_settings = settings.capture_settings
+    applied_settings = VisionCaptureSettings(
+        brightness=source_settings.brightness,
+        contrast=source_settings.contrast,
+        zoom_percent=source_settings.zoom_percent,
+        mask_bounds=bounds,
+        auto_background=source_settings.auto_background,
+        persist_auto_background=source_settings.persist_auto_background,
+        background_grayscale=source_settings.background_grayscale,
+        sample_points=source_settings.sample_points,
+    )
+    return VisionSelectionResult(
+        kind="mask",
+        capture_result=prepare_vision_capture_result(image, applied_settings),
+        mask_bounds=bounds,
+    )
+
+
+def prepare_vision_template_selection_result(
+    image,
+    settings,
+    template_bounds,
+    visual_options,
+):
+    if (
+        not isinstance(settings, VisionSelectionSettings)
+        or settings.kind != "template"
+        or settings.template_filename is None
+    ):
+        raise MotionInputError("vision template selection settings are invalid")
+    source = np.array(
+        _validated_camera_frame(image, "vision template selection source"),
+        dtype=np.uint8,
+        copy=True,
+        order="C",
+    )
+    x_minimum, y_minimum, x_maximum, y_maximum = (
+        _validate_vision_selection_bounds(template_bounds, source)
+    )
+    template_image = np.array(
+        source[y_minimum:y_maximum, x_minimum:x_maximum],
+        dtype=np.uint8,
+        copy=True,
+        order="C",
+    )
+    _validated_camera_frame(
+        template_image,
+        "vision template selection image",
+    )
+    try:
+        template_rgb = cv2.cvtColor(template_image, cv2.COLOR_BGR2RGB)
+    except cv2.error as exc:
+        raise MotionInputError(
+            "vision template selection preview conversion failed"
+        ) from exc
+    template_preview = np.array(
+        fit_vision_preview_square(
+            template_rgb,
+            VISION_TEMPLATE_PREVIEW_SIZE,
+        ),
+        dtype=np.uint8,
+        copy=True,
+        order="C",
+    )
+    template_image.setflags(write=False)
+    template_preview.setflags(write=False)
+    return VisionSelectionResult(
+        kind="template",
+        template_filename=settings.template_filename,
+        template_image=template_image,
+        template_preview=template_preview,
+        visual_options=visual_options,
+    )

@@ -28,13 +28,20 @@ from ARrobots.HMI.vision_io import (
     VisionMatchSettings,
     VisionOperationDrainState,
     VisionOperationWorker,
+    VisionSelectionResult,
+    VisionSelectionSettings,
     _rotate_vision_template,
     fit_vision_preview_square,
     load_bounded_vision_image,
+    normalize_vision_selection_bounds,
     normalize_camera_exception_detail,
     prepare_camera_preview_frame,
     prepare_vision_capture_result,
+    prepare_vision_mask_selection_result,
     prepare_vision_match_result,
+    prepare_vision_selection_image,
+    prepare_vision_template_selection_result,
+    select_vision_region,
 )
 
 
@@ -205,6 +212,263 @@ class VisionIoTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(MotionInputError, "pixel count"):
             prepare_vision_capture_result(oversized, settings)
+
+    def test_vision_selection_processing_uses_validated_owned_results(self):
+        frame = np.zeros((12, 16, 3), dtype=np.uint8)
+        frame[:, :] = (10, 20, 30)
+        capture_settings = VisionCaptureSettings(
+            brightness=0,
+            contrast=0,
+            zoom_percent=50,
+            mask_bounds=(0, 0, 16, 12),
+            auto_background=False,
+            persist_auto_background=True,
+            background_grayscale=17,
+            sample_points=(),
+        )
+        mask_settings = VisionSelectionSettings(
+            kind="mask",
+            capture_settings=capture_settings,
+        )
+
+        selection_image = prepare_vision_selection_image(
+            frame,
+            capture_settings,
+        )
+        self.assertEqual(selection_image.shape, (12, 16, 3))
+        self.assertFalse(selection_image.flags.writeable)
+        np.testing.assert_array_equal(
+            selection_image[:, :, 0],
+            selection_image[:, :, 1],
+        )
+        self.assertEqual(
+            normalize_vision_selection_bounds(
+                selection_image,
+                15,
+                11,
+                0,
+                0,
+            ),
+            (3, 3, 12, 8),
+        )
+        self.assertEqual(
+            normalize_vision_selection_bounds(
+                selection_image,
+                -10,
+                -10,
+                30,
+                30,
+            ),
+            (0, 0, 16, 12),
+        )
+        self.assertIsNone(
+            normalize_vision_selection_bounds(
+                selection_image,
+                1,
+                1,
+                6,
+                6,
+            )
+        )
+
+        mask_result = prepare_vision_mask_selection_result(
+            frame,
+            mask_settings,
+            (3, 3, 12, 8),
+        )
+        self.assertIsInstance(mask_result, VisionSelectionResult)
+        self.assertEqual(mask_result.kind, "mask")
+        self.assertEqual(mask_result.mask_bounds, (3, 3, 12, 8))
+        self.assertTrue(np.all(mask_result.capture_result.image[0, :] == 17))
+        self.assertFalse(mask_result.capture_result.image.flags.writeable)
+
+        template_settings = VisionSelectionSettings(
+            kind="template",
+            template_filename="part.jpg",
+        )
+        template_result = prepare_vision_template_selection_result(
+            frame,
+            template_settings,
+            (3, 3, 12, 8),
+            ("part.jpg",),
+        )
+        self.assertEqual(template_result.kind, "template")
+        self.assertEqual(template_result.template_image.shape, (5, 9, 3))
+        self.assertEqual(template_result.template_preview.shape, (150, 150, 3))
+        self.assertFalse(template_result.template_image.flags.writeable)
+        self.assertFalse(template_result.template_preview.flags.writeable)
+
+        with self.assertRaisesRegex(MotionInputError, "kind"):
+            VisionSelectionSettings(kind="unknown")
+        with self.assertRaisesRegex(MotionInputError, "kind"):
+            VisionSelectionSettings(kind=[])
+        with self.assertRaisesRegex(MotionInputError, "cannot include"):
+            VisionSelectionSettings(
+                kind="mask",
+                capture_settings=capture_settings,
+                template_filename="part.jpg",
+            )
+        with self.assertRaisesRegex(MotionInputError, "cannot include"):
+            VisionSelectionSettings(
+                kind="template",
+                capture_settings=capture_settings,
+                template_filename="part.jpg",
+            )
+        with self.assertRaisesRegex(MotionInputError, "lowercase .jpg"):
+            VisionSelectionSettings(
+                kind="template",
+                template_filename="../part.jpg",
+            )
+        for filename in ("curImage.jpg", "CON.jpg", "part:name.jpg"):
+            with self.subTest(filename=filename):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "invalid or reserved",
+                ):
+                    VisionSelectionSettings(
+                        kind="template",
+                        template_filename=filename,
+                    )
+        with self.assertRaisesRegex(MotionInputError, "contains template data"):
+            VisionSelectionResult(
+                kind="mask",
+                capture_result=mask_result.capture_result,
+                mask_bounds=mask_result.mask_bounds,
+                visual_options=[],
+            )
+        with self.assertRaisesRegex(MotionInputError, "missing"):
+            prepare_vision_template_selection_result(
+                frame,
+                template_settings,
+                (3, 3, 12, 8),
+                ("other.jpg",),
+            )
+
+    def test_interactive_vision_selection_is_cancellable_and_cleans_up(self):
+        image = np.zeros((12, 16, 3), dtype=np.uint8)
+        callbacks = []
+        destroyed = []
+        wait_calls = []
+
+        def register_callback(window_name, callback):
+            self.assertEqual(window_name, "AR4 Vision Test")
+            callbacks.append(callback)
+
+        def wait_key(delay):
+            self.assertGreater(delay, 0)
+            wait_calls.append(delay)
+            if len(wait_calls) == 1:
+                callback = callbacks[0]
+                callback(cv2.EVENT_LBUTTONDOWN, 1, 1, 0, None)
+                callback(cv2.EVENT_LBUTTONUP, 5, 5, 0, None)
+            elif len(wait_calls) == 2:
+                callback = callbacks[0]
+                callback(cv2.EVENT_LBUTTONDOWN, 1, 1, 0, None)
+                callback(cv2.EVENT_MOUSEMOVE, 14, 10, 0, None)
+                callback(cv2.EVENT_LBUTTONUP, 14, 10, 0, None)
+            return -1
+
+        patches = (
+            patch("ARrobots.HMI.vision_io.cv2.namedWindow"),
+            patch(
+                "ARrobots.HMI.vision_io.cv2.setMouseCallback",
+                side_effect=register_callback,
+            ),
+            patch("ARrobots.HMI.vision_io.cv2.imshow"),
+            patch("ARrobots.HMI.vision_io.cv2.rectangle"),
+            patch(
+                "ARrobots.HMI.vision_io.cv2.waitKey",
+                side_effect=wait_key,
+            ),
+            patch(
+                "ARrobots.HMI.vision_io.cv2.getWindowProperty",
+                return_value=1.0,
+            ),
+            patch(
+                "ARrobots.HMI.vision_io.cv2.destroyWindow",
+                side_effect=lambda name: destroyed.append(name),
+            ),
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                patches[5], patches[6]:
+            bounds = select_vision_region(image, "AR4 Vision Test")
+        self.assertEqual(bounds, (4, 4, 11, 7))
+        self.assertEqual(destroyed, ["AR4 Vision Test"])
+        self.assertEqual(len(wait_calls), 2)
+
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(MotionInputError, "was cancelled"):
+            select_vision_region(image, "AR4 Vision Test", cancelled)
+
+        destroyed.clear()
+        with patch("ARrobots.HMI.vision_io.cv2.namedWindow"), patch(
+            "ARrobots.HMI.vision_io.cv2.setMouseCallback"
+        ), patch("ARrobots.HMI.vision_io.cv2.imshow"), patch(
+            "ARrobots.HMI.vision_io.cv2.waitKey",
+            return_value=27,
+        ), patch(
+            "ARrobots.HMI.vision_io.cv2.destroyWindow",
+            side_effect=lambda name: destroyed.append(name),
+        ):
+            with self.assertRaisesRegex(MotionInputError, "was cancelled"):
+                select_vision_region(image, "AR4 Vision Test")
+        self.assertEqual(destroyed, ["AR4 Vision Test"])
+
+        destroyed.clear()
+        with patch("ARrobots.HMI.vision_io.cv2.namedWindow"), patch(
+            "ARrobots.HMI.vision_io.cv2.setMouseCallback"
+        ), patch("ARrobots.HMI.vision_io.cv2.imshow"), patch(
+            "ARrobots.HMI.vision_io.cv2.waitKey",
+            return_value=-1,
+        ), patch(
+            "ARrobots.HMI.vision_io.cv2.getWindowProperty",
+            return_value=0.0,
+        ), patch(
+            "ARrobots.HMI.vision_io.cv2.destroyWindow",
+            side_effect=lambda name: destroyed.append(name),
+        ):
+            with self.assertRaisesRegex(MotionInputError, "was closed"):
+                select_vision_region(image, "AR4 Vision Test")
+        self.assertEqual(destroyed, ["AR4 Vision Test"])
+
+    def test_vision_selection_worker_uses_the_noncoalescing_type_contract(self):
+        settings = VisionSelectionSettings(
+            kind="template",
+            template_filename="part.jpg",
+        )
+        result = prepare_vision_template_selection_result(
+            np.zeros((12, 16, 3), dtype=np.uint8),
+            settings,
+            (3, 3, 12, 8),
+            ("part.jpg",),
+        )
+        operation_threads = []
+
+        def operation(current, cancellation):
+            operation_threads.append(threading.get_ident())
+            self.assertIs(current, settings)
+            self.assertFalse(cancellation.is_set())
+            return result
+
+        caller_thread = threading.get_ident()
+        worker = VisionOperationWorker(
+            operation,
+            VisionSelectionSettings,
+            VisionSelectionResult,
+            "vision selection",
+            "ar4-vision-selection-test",
+            coalesce=False,
+        )
+
+        submission = worker.submit(settings)
+        self.assertTrue(worker.wait_stopped(1))
+        event = worker.drain_events()[0]
+        self.assertEqual(event.request_id, submission.request_id)
+        self.assertIs(event.result, result)
+        self.assertEqual(len(operation_threads), 1)
+        self.assertNotEqual(operation_threads[0], caller_thread)
+        self.assertTrue(worker.close())
 
     def test_vision_capture_worker_runs_off_caller_and_coalesces_pending(self):
         first_started = threading.Event()
