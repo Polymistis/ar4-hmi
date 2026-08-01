@@ -6889,7 +6889,6 @@ class HmiSourceContractTests(unittest.TestCase):
 
         namespace["RUN"]["visionSelectionRequestId"] = None
         namespace["RUN"]["visionSelectionKind"] = None
-        status_failure[0] = True
         closing.set()
         self.assertFalse(request_selection(mask_settings))
         self.assertIn(
@@ -6905,10 +6904,14 @@ class HmiSourceContractTests(unittest.TestCase):
         submission_result[0] = object()
         self.assertFalse(request_selection(mask_settings))
         self.assertIn("invalid submission", statuses[-1][0])
+        self.assertIsNone(namespace["RUN"]["visionSelectionRequestId"])
+        self.assertIsNone(namespace["RUN"]["visionSelectionKind"])
 
         submission_result[0] = VisionOperationSubmission(42, True)
         self.assertFalse(request_selection(mask_settings))
         self.assertIn("unexpectedly coalesced", statuses[-1][0])
+        self.assertIsNone(namespace["RUN"]["visionSelectionRequestId"])
+        self.assertIsNone(namespace["RUN"]["visionSelectionKind"])
 
         dispatched = []
         mask_namespace = {
@@ -7053,7 +7056,6 @@ class HmiSourceContractTests(unittest.TestCase):
             "_apply_vision_selection_result",
             namespace,
         )
-        namespace["_apply_vision_selection_result"] = apply_result
         apply_event = self.compile_function(
             "_apply_vision_selection_event",
             namespace,
@@ -7147,7 +7149,6 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace["vision_selection_worker"] = SimpleNamespace(
             drain_events=lambda: tuple(events)
         )
-        namespace["_apply_vision_selection_event"] = apply_event
         drain_events = self.compile_function(
             "_drain_vision_selection_events",
             namespace,
