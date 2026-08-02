@@ -13,7 +13,7 @@ Development prioritizes mechanical self-protection, known controller state, nonb
 ## Current baseline
 
 - Host application: AR4 HMI 6.7 derivative.
-- Main controller: Teensy 4.1 line-oriented firmware derivative `6.7.1-ar4hmi.9`.
+- Main controller: Teensy 4.1 line-oriented firmware derivative `6.7.1-ar4hmi.10`.
 - Auxiliary controllers: Nano and Mega v1.5 line-oriented compatibility firmware; selected 2.0 capabilities remain under evaluation.
 - Runtime calibration and machine-specific state remain local. `defaults.json` is the tracked fallback calibration profile and contains saved machine parameters that require validation against connected hardware.
 - The latest recorded live controller deployment reported `6.7.1-ar4hmi.5`; later firmware revisions have hardware-free build coverage but still require deployment verification.
@@ -34,7 +34,7 @@ Status terms and complete acceptance criteria are defined in the detailed-contra
 | M4A - HMI responsiveness pass | `Implemented` | Preserve nonblocking motion controls, semantic coalescing, and explicit ownership. |
 | M4A2 - HMI boundary completion | `In progress` | Finish remaining Tk boundaries, timing evidence, and auxiliary lifecycle ownership. |
 | M4A3 - Delivered 7.0/2.0 baseline audit | `Tested` | Retain the selective-integration decision. |
-| M4A4 - Selective 7.0/2.0 integration | `In progress` | Complete command domains, typed switch polarity, correlated protocol design, and selected auxiliary capabilities. |
+| M4A4 - Selective 7.0/2.0 integration | `In progress` | Complete command domains, correlated protocol design, and selected auxiliary capabilities. |
 | M4A5 - Desired-versus-estimated-and-encoder joint display | `Tested` | Keep desired, active-target, estimate, and encoder channels distinct. |
 | M4A6 - Main-control workspace and named positions | `Tested` | Maintain tabbed controls and validated Start and Shutdown positions. |
 | M4A7 - Low-priority joint encoder telemetry | `Blocked` | Implementation remains in progress; powered acceptance prerequisites remain unmet. |
@@ -77,7 +77,7 @@ This collapsed appendix is a normative part of `PLAN.md` and preserves the detai
 - The uniquely titled `chore: import AR4 control software baseline` commit,
   dated `2026-07-15`, preserves the imported control-software baseline across
   both the original and publication histories.
-- `AR4.py` identifies host source version 6.7. The imported Teensy baseline identifies version 6.7.1; the current tracked derivative identifies version `6.7.1-ar4hmi.9` and advertises `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, `HOME_REFERENCE_V1`, `HOME_REFERENCE_V2`, `JOINT_TELEMETRY_V1`, and `ESTOP_ADMISSION_V1`. The latest dated deployment record identifies controller version `6.7.1-ar4hmi.5`; `.9` deployment remains unverified.
+- `AR4.py` identifies host source version 6.7. The imported Teensy baseline identifies version 6.7.1; the current tracked derivative identifies version `6.7.1-ar4hmi.10` and advertises `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, `HOME_REFERENCE_V1`, `HOME_REFERENCE_V2`, `JOINT_TELEMETRY_V1`, `ESTOP_ADMISSION_V1`, and `CALIBRATION_SWITCH_POLARITY_V1`. The latest dated deployment record identifies controller version `6.7.1-ar4hmi.5`; `.10` deployment remains unverified.
 - Runtime calibration and machine state remain untracked; `defaults.json` remains the tracked default profile.
 - No live-arm command, firmware flash, calibration cycle, or movement was performed during repository setup.
 
@@ -229,7 +229,7 @@ Implemented HMI work:
   the response deadline cannot provide that interval. Host response parsing
   distinguishes controller-initiated `EB` physical-stop events from correlated
   `EA` command-admission rejections. The tracked Teensy
-  `6.7.1-ar4hmi.9` derivative atomically checks the physical-stop latch and
+  `6.7.1-ar4hmi.10` derivative atomically checks the physical-stop latch and
   input at the queue boundary and again after side-effect-free opcode
   extraction. A loop-scoped response owner brackets every ordinary,
   admission, and telemetry terminal writer. The E-stop interrupt records
@@ -418,7 +418,7 @@ Implemented HMI work:
   Feed values convert from active units per minute to millimetres per second,
   and imperial coordinates convert from the parsed axis value before start
   offsets are applied. `Tool Set` rows reject without transmission because the
-  tracked Teensy `6.7.1-ar4hmi.9` protocol has no `TF` handler.
+  tracked Teensy `6.7.1-ar4hmi.10` protocol has no `TF` handler.
 - Virtual program completion preserves the original deadline when Tk scheduling falls back to a background owner. Timeout remains a failed result while ownership waits for the matching request-scoped operation to settle; failure to start the fallback worker retains the same settlement synchronously instead of publishing an early terminal row result.
 
 - `controller_degree_to_native_radians` defines shared binary32 degree-to-radian and round-trip representability for motion envelopes, `UP` construction, custom-profile validation, startup native preflight, and Teensy conversion. Values rejected by the native public-degree boundary are rejected before controller writes or profile persistence.
@@ -794,7 +794,7 @@ Integration unit status:
 - Line-oriented strict numeric syntax and shared motion-command grammar: `Tested`.
 - Line-oriented auxiliary-controller compatibility hardening: `Tested`.
 - Line-oriented command-specific numeric and safety-domain coverage: `In progress`.
-- Typed configuration normalization and MK5 calibration-switch polarity: `In progress`.
+- Typed configuration normalization and MK5 calibration-switch polarity: `Tested`.
 - Correlated host/Teensy JSON protocol and firmware safety corrections: `Proposed`.
 - Hardened HMI transport adoption of the correlated protocol: `Proposed`.
 - Mega/Nano 2.0 JSON capability integration: `Proposed`.
@@ -899,14 +899,24 @@ Implemented portions of the active integration unit:
   only when every configured output belongs to one disjoint Nano or Mega pin
   range; mixed or unknown assignments require an explicit migration choice,
   while profiles without configured outputs remain disconnected.
-  Switch polarity is not yet exposed in the HMI or transmitted to the
-  controller; paired host and firmware protocol work remains required before
-  any `LOW` selection can affect calibration behavior.
+  Read-only `HIGH` and `LOW` selectors expose the active J1-J9 calibration
+  switch state in the HMI. Schema normalization rejects missing or invalid
+  selections before the host encodes a J1-low-bit mask in the paired `UP`
+  command. Startup requires `CALIBRATION_SWITCH_POLARITY_V1`, preventing the
+  extended command from reaching firmware without the matching parser.
+  Firmware validates and stages the complete mask before configuration
+  mutation, commits the staged switch states with the sibling validated `UP`
+  fields before the native kinematic refresh, and uses each configured active
+  and released state during bounded calibration search and backoff. Existing
+  and migrated profiles keep
+  the all-`HIGH` behavior. Automated host, firmware-contract, and no-upload
+  compile checks pass; deployment and live switch-polarity verification remain
+  pending.
 - Native inverse kinematics rejects wrong-size, non-finite, and unrepresentable motion inputs, keeps candidate state local, enforces configured joint limits, validates selected-candidate round trips, and shares physical-displacement wrist seed and ranking rules with Teensy firmware through singular and wrap-boundary poses.
 - `AR4.py` uses the wrist mode encoded in each validated motion command for virtual inverse kinematics and rejects any physical/virtual mismatch before dispatch. Motion requires the wrist-aware configured solver; legacy solver fallback is rejected before invocation.
 - Native configuration stages and validates binary32 values, derived tool-frame radians, and public-unit round trips before atomic binding application. Motion requires the atomic configuration setter and wrist-aware configured solver, so bundled legacy Linux extensions fail closed without mutating native state. Configuration repair, generic non-motion program exchanges, and controller reconnection remain admissible without enabling kinematics-dependent motion.
 - The Windows CPython 3.12 x64 module is rebuilt under an ABI-tagged filename from the tracked source with an isolated pinned pybind11 build dependency, explicit Release optimization, warning-clean compilation, and direct binding runtime tests. Linux motion requires a matching extension built from the tracked native source; bundled legacy Linux files are unsupported for motion. Hardware-free build and test results are recorded in `docs/hardware-free-verification-2026-07-19.md`.
-- Discrete and live Cartesian and tool commands carry the same command-local wrist field through host validation, virtual preview, and Teensy parsing. Tool motion snapshots the active calibration frame rather than editable staged fields. Startup requires the controller's `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, and `ESTOP_ADMISSION_V1` capabilities before auxiliary connection, calibration writes, or position synchronization.
+- Discrete and live Cartesian and tool commands carry the same command-local wrist field through host validation, virtual preview, and Teensy parsing. Tool motion snapshots the active calibration frame rather than editable staged fields. Startup requires the controller's `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, `ESTOP_ADMISSION_V1`, and `CALIBRATION_SWITCH_POLARITY_V1` capabilities before auxiliary connection, calibration writes, or position synchronization.
 - Controller-bound Cartesian orientation, vision rotation, and rotational tool-jog fields must remain representable after both binary32 degree encoding and binary32 radian conversion. The paired firmware conversion contract rejects nonzero values that collapse to zero before solver or tool-frame mutation. Vision rotation applies to the native Rx tool slot and restores that slot after inverse kinematics; `UP` validates tool and DH rotations before mutation and refreshes the active kinematic cache before acknowledging success.
 - The line-oriented Teensy strict parser accepts only complete delimiter-safe plain-decimal fields. Serial preprocessing removes one required line ending, SD preprocessing removes only the line ending already consumed by the SD reader, and neither path removes payload whitespace before command parsing. Shared `JT`, Cartesian, vision, joint, and live-jog grammars reject malformed text, junk prefixes, trailing data, marker collisions, invalid fixed-width fields, non-finite values, binary32 overflow, nonzero binary32 underflow, and integer overflow before parsed output mutation. Every sibling `String.toFloat()` and `String.toInt()` conversion has been replaced by shared strict parsing. Command-specific domain validation now covers motion timing with a shared `(0, 100]` ramp range, calibrated targets, stored step rows, waits, Modbus values, explicit main-controller `ON`/`OF` rejection because no safe GPIO profile exists, controller filenames with a shared 255-byte limit, and nondegenerate path geometry using the complete traversed arc angle. Ordered arc validation and execution share the same staged center, axis, radius, and traversal angle, including midpoint-selected major arcs. Host and firmware live-jog parsing accept only Percent mode and integral axis/direction vectors inside the applicable joint domain; validated speed, acceleration, deceleration, and ramp fields reach every controller and offline handler, and joint live jog accepts only the effective `WA` wrist suffix. All line-oriented serial readers share the host's 4096-byte command-frame ceiling, reject overflow once, discard through the next LF before accepting another frame, and never append an empty-read sentinel to a command buffer. Motion handlers pass the command-local wrist selector directly into inverse kinematics and stage wrist and encoder loop modes until the motor driver completes internal timing, direction, and emergency-stop preflight; rejected, zero-distance, and precompute-only frames preserve the preceding global mode state. Only `ML` accepts the required nonnegative `Rnd` field; other Cartesian motion and storage opcodes reject rounding instead of discarding the field. Unsupported `ML Q1` wrist suppression and nonzero `MA` or `MC Tr` values fail closed in both host and firmware parsing instead of becoming silent no-ops. Host Modbus rows classify command-specific success and response shapes before state advancement. Exhaustive firmware command-domain coverage remains `In progress`.
 - Rounded `ML` execution carries the originating command-local wrist selector and loop modes into the derived `MA` frame. Live `LC`, `LJ`, and `LT` control readers accept only exact `S` lines with LF or CRLF termination; overlength or other complete control frames receive one error from the live terminal-response owner, while ordinary command-ingress callers own their separate overflow responses. Host and firmware filename validation rejects the complete FAT-reserved character set, the comma-delimited controller-directory separator, outer spaces, and control or non-ASCII input. Controller-directory framing additionally rejects `.txt` entries without a reversible stem and caps the aggregate payload at 4096 bytes before emission. Controller Modbus polling waits require a positive timeout so every accepted wait performs at least one polling interval.
@@ -949,7 +959,7 @@ Implemented portions of the active integration unit:
   stored playback stops before reading another row. Emergency-stop state read
   by motion loops is declared volatile because the interrupt handler writes
   that state asynchronously.
-- The paired line-oriented Teensy `6.7.1-ar4hmi.9` compatibility unit advertises `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, `HOME_REFERENCE_V1`, `HOME_REFERENCE_V2`, `JOINT_TELEMETRY_V1`, and `ESTOP_ADMISSION_V1` and compiles for `teensy:avr:teensy41` with PJRC core 1.62.0, bundled SdFat 2.1.2, and ModbusMaster 2.0.1. The compile regression parses the verbose dependency report and requires the active SPI and SdFat folders under the selected Teensy platform; [`docs/hardware-free-verification-2026-07-19.md`](docs/hardware-free-verification-2026-07-19.md) records dated no-upload compatibility results through `.9` and establishes no live-arm behavior or correlated JSON readiness.
+- The paired line-oriented Teensy `6.7.1-ar4hmi.10` compatibility unit advertises `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, `HOME_REFERENCE_V1`, `HOME_REFERENCE_V2`, `JOINT_TELEMETRY_V1`, `ESTOP_ADMISSION_V1`, and `CALIBRATION_SWITCH_POLARITY_V1` and compiles for `teensy:avr:teensy41` with PJRC core 1.62.0, bundled SdFat 2.1.2, and ModbusMaster 2.0.1. The compile regression parses the verbose dependency report and requires the active SPI and SdFat folders under the selected Teensy platform; [`docs/hardware-free-verification-2026-07-19.md`](docs/hardware-free-verification-2026-07-19.md) records dated no-upload compatibility results through `.10` and establishes no live-arm behavior or correlated JSON readiness.
 - Firmware identity fields share a bounded printable-ASCII storage and response contract with the host, use the same tested JSON producer as the sketch, and load from explicitly terminated EEPROM buffers. The `SR` transport reserves `[M]`, `[V]`, `[B]`, `[S]`, and `[A]`; its shared parser rejects missing, reordered, duplicated, field-embedded, empty, control-byte, and overlength input before persistence, while stored and migrated legacy identity values retain the complete printable range. Erased identity storage, an in-progress transaction, a current committed record, a legacy committed record, and corrupt storage have distinct marker states. Startup migrates valid legacy identity and binary debug data through verified current-schema records, substitutes `Unset` only for erased legacy identity fields, and blocks `HO` after failed migration. The erased debug byte left by the legacy `SR` path migrates to the disabled safe default; every other legacy debug byte outside the binary domain aborts migration before any current-schema write. Interrupted current-schema identity writes reload as corrupt and also block `HO`. `HO` emits one protocol frame regardless of persistent debug or spline state. Debug commands validate the complete grammar before transactional persistence and live-state mutation; complete-buffer EEPROM verification failure suppresses success. Every early `loop()` exit consumes the active command through a tested queue-rotation primitive, so invalid `DB`, `SR`, `JT`, and missing-file `PG` commands cannot wedge later work.
 - Native boundary, binary32 underflow, degree-to-radian underflow, strict firmware numeric parsing through the complete shared `JT`, `MJ`, and `MV` handler grammar, serial and SD frame extraction into the shared parser, exact live-control classification and terminal-response selection, strict `SR` identity extraction, paired host/firmware ramp and FAT-reserved filename limits, positive Modbus polling timeouts, rounded `ML` wrist preservation, ordered minor- and major-arc execution geometry, branch, singularity, near-singularity, shared native/firmware wrist generation, cross-seam branch parity, nearest in-range multi-turn normalization, joint-limit, unreachable-target, tool-frame representability, tool-rotation geometry, vision-Rx restoration, immediate firmware kinematic-cache refresh, parallel-determinism, sanitizer, host-routing, command-specific Modbus response classification, generic program admission, Windows loaded-binding, Linux source-build/import, firmware identity, old-`SR` EEPROM migration with erased debug storage, binary legacy debug migration, marker-valid identity corruption, interrupted identity transaction reload, partial-byte EEPROM failure, command-queue, control-query spline isolation, large-finite wrist normalization, transactional debug-command, Cartesian display/wire-to-native ordering, Cartesian direction, firmware wrist-selection rejection, and paired tool-jog signed-TCP-displacement contracts have hardware-free regression coverage.
 - G-code directory contract coverage includes exact and overflowing aggregate
@@ -1448,7 +1458,7 @@ Known M5 deviations:
   reconnection plus device-state verification; `-2` remains a pre-write
   controller rejection.
   Broader non-motion row migration remains incomplete.
-- Tracked Teensy `6.7.1-ar4hmi.9` `MA` and `MC` parsing stages `Tr` in a command-local value instead of writing beyond the Cartesian pose array and accepts only the supported zero value. `ML` accepts only `Q0` because wrist-suppression semantics remain unimplemented. `RB` performs the Teensy 4.1 target reset without consulting mutable controller identity fields and emits no terminal frame before reset. Current no-upload toolchain results are recorded in [`docs/hardware-free-verification-2026-07-19.md`](docs/hardware-free-verification-2026-07-19.md). Host arc and circle program transmission remains disabled until deterministic trajectory simulation and an authorized hardware-validation plan cover the broader algorithms. Spline program transmission also remains disabled until a terminal response-owner contract replaces speculative acknowledgements.
+- Tracked Teensy `6.7.1-ar4hmi.10` `MA` and `MC` parsing stages `Tr` in a command-local value instead of writing beyond the Cartesian pose array and accepts only the supported zero value. `ML` accepts only `Q0` because wrist-suppression semantics remain unimplemented. `RB` performs the Teensy 4.1 target reset without consulting mutable controller identity fields and emits no terminal frame before reset. Current no-upload toolchain results are recorded in [`docs/hardware-free-verification-2026-07-19.md`](docs/hardware-free-verification-2026-07-19.md). Host arc and circle program transmission remains disabled until deterministic trajectory simulation and an authorized hardware-validation plan cover the broader algorithms. Spline program transmission also remains disabled until a terminal response-owner contract replaces speculative acknowledgements.
 - Teensy coordinated joint pulse scheduling now deducts bounded telemetry work
   from the existing pulse wait. A telemetry-enabled `RJ` also owns response
   framing across the coordinated drive, so an interrupt latches the stop while
@@ -1460,7 +1470,7 @@ Known M5 deviations:
   A stop deferred after telemetry terminal selection becomes an admission
   block during atomic ownership commit and produces an immediate post-terminal
   `EB`. The
-  `6.7.1-ar4hmi.9` protocol reports asynchronous physical-stop events as `EB`
+  `6.7.1-ar4hmi.10` protocol reports asynchronous physical-stop events as `EB`
   and correlated command-admission rejection as `EA`. Queue-boundary and
   post-parse gates snapshot the stop state with interrupts disabled; the `EA`
   response reserves interrupt framing through atomic loop-response teardown,

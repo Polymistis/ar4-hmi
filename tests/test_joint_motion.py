@@ -20,6 +20,7 @@ from ARrobots.HMI.joint_motion import (
     CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+    CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
     CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
     CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
     CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
@@ -71,6 +72,7 @@ from ARrobots.HMI.joint_motion import (
     controller_number,
     controller_protocol_decimal,
     decode_serial_response_line,
+    encode_calibration_switch_mask,
     exchange_serial_line,
     exchange_serial_line_until_cancelled,
     estimate_commanded_joint_trajectory,
@@ -118,6 +120,50 @@ from ARrobots.HMI.joint_motion import (
     validate_controller_modbus_command,
     write_serial_control,
 )
+
+
+class CalibrationSwitchProtocolTests(unittest.TestCase):
+    def test_switch_mask_encodes_j1_as_low_bit(self):
+        self.assertEqual(
+            encode_calibration_switch_mask(
+                (
+                    "HIGH",
+                    "LOW",
+                    "HIGH",
+                    "LOW",
+                    "LOW",
+                    "HIGH",
+                    "LOW",
+                    "HIGH",
+                    "LOW",
+                )
+            ),
+            165,
+        )
+        self.assertEqual(
+            CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
+            "CALIBRATION_SWITCH_POLARITY_V1",
+        )
+        self.assertEqual(
+            encode_calibration_switch_mask(("HIGH",) * 9),
+            511,
+        )
+        self.assertEqual(
+            encode_calibration_switch_mask(("LOW",) * 9),
+            0,
+        )
+
+    def test_switch_mask_rejects_unvalidated_states(self):
+        for states in (
+            "HIGH",
+            ("HIGH",) * 8,
+            ("HIGH",) * 8 + ("high",),
+            ("HIGH",) * 8 + (1,),
+        ):
+            with self.subTest(states=states):
+                with self.assertRaises(MotionInputError):
+                    encode_calibration_switch_mask(states)
+
 
 TEST_CONTROLLER_MEDIA_ID = "00112233445566778899AABBCCDDEEFF"
 

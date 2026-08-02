@@ -3,10 +3,11 @@
 The commands below compile without uploading. Do not add `--upload`. Any firmware upload requires a separate operator-approved procedure under [`SAFETY.md`](../SAFETY.md), and the resulting record must satisfy the complete live-verification field contract there. Powered testing also requires a cleared workspace, verification of the independent physical stop path, and confirmation of physical driver microsteps or measured motion scale.
 
 The tracked line-oriented Teensy compatibility source identifies version
-`6.7.1-ar4hmi.9`, advertises the required `JT_WRIST_CONFIG_V1`,
+`6.7.1-ar4hmi.10`, advertises the required `JT_WRIST_CONFIG_V1`,
 `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`,
-`GCODE_WRITE_IDENTITY_V1`, and `ESTOP_ADMISSION_V1` host capabilities plus the
-optional legacy `HOME_REFERENCE_V1`, preferred `HOME_REFERENCE_V2`
+`GCODE_WRITE_IDENTITY_V1`, `ESTOP_ADMISSION_V1`, and
+`CALIBRATION_SWITCH_POLARITY_V1` host capabilities plus the optional legacy
+`HOME_REFERENCE_V1`, preferred `HOME_REFERENCE_V2`
 parking-reference, and `JOINT_TELEMETRY_V1` request-scoped J1-J6 encoder
 telemetry contracts, and compiles with Arduino CLI,
 PJRC Teensy core 1.62.0, bundled SdFat 2.1.2, and ModbusMaster 2.0.1. `HO`
@@ -16,6 +17,11 @@ without consulting mutable controller identity fields. Compilation
 establishes source and toolchain compatibility only; hardware-free fixtures
 cover selected protocol behavior, while correlated JSON parsing and
 Cartesian-bound work remain later integration units.
+
+`CALIBRATION_SWITCH_POLARITY_V1` extends `UP` with a J1-low-bit mask describing
+the active state of each J1-J9 calibration switch. Existing and migrated
+profiles send the all-`HIGH` mask. Calibration search, bounded release, and the
+`TL` diagnostic classify each switch against the configured active state.
 
 `JOINT_TELEMETRY_V1` accepts the optional `T1` suffix only on `RJ` commands.
 The controller targets ten samples per second, formats signed millidegrees in a
@@ -125,5 +131,5 @@ selected executable and an existing external temporary build parent. The test
 requires Arduino AVR core 1.8.8 and Servo 1.3.0 in compiler dependency output.
 
 The dated hardware-free build record, including the current
-`6.7.1-ar4hmi.9` result, is recorded in
+`6.7.1-ar4hmi.10` result, is recorded in
 [`docs/hardware-free-verification-2026-07-19.md`](../docs/hardware-free-verification-2026-07-19.md).

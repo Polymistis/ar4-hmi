@@ -38,6 +38,7 @@ from ARrobots.HMI.joint_motion import (
     CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+    CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
     CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
     CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
     CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
@@ -88,6 +89,7 @@ from ARrobots.HMI.joint_motion import (
     controller_protocol_decimal,
     controller_ratio,
     decode_serial_response_line,
+    encode_calibration_switch_mask,
     exchange_serial_line,
     exchange_serial_line_until_cancelled,
     finite_number,
@@ -189,6 +191,9 @@ TEENSY_ANGLE_CONVERSION_CONTRACT = TEENSY_SOURCE.with_name(
 TEENSY_CARTESIAN_POSE_CONTRACT = TEENSY_SOURCE.with_name(
     "cartesian_pose_contract.h"
 )
+TEENSY_CALIBRATION_SWITCH_CONTRACT = TEENSY_SOURCE.with_name(
+    "calibration_switch_contract.h"
+)
 TEENSY_CONTROLLER_DOMAIN_CONTRACT = TEENSY_SOURCE.with_name(
     "controller_domain_contract.h"
 )
@@ -241,6 +246,7 @@ VALID_CONTROLLER_IDENTITY_RESPONSE = json.dumps(
         "SerialNumber": "Unset",
         "AssetTag": "Unset",
         "ProtocolCapabilities": [
+            CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
             CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
             CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
             CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
@@ -987,6 +993,11 @@ class HmiSourceContractTests(unittest.TestCase):
             "normalize_calibration_data",
             normalize_calibration_data,
         )
+        namespace.setdefault("CalibrationSchemaError", CalibrationSchemaError)
+        namespace.setdefault(
+            "encode_calibration_switch_mask",
+            encode_calibration_switch_mask,
+        )
         namespace.setdefault(
             "reconcile_auxiliary_output_assignments",
             reconcile_auxiliary_output_assignments,
@@ -1024,6 +1035,10 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault(
             "CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1",
             CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+        )
+        namespace.setdefault(
+            "CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1",
+            CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
         )
         namespace.setdefault(
             "CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1",
@@ -2190,6 +2205,7 @@ class HmiSourceContractTests(unittest.TestCase):
         for axis in range(1, 10):
             values[f"J{axis}MotDir"] = 1
             values[f"J{axis}CalDir"] = 1
+            values[f"J{axis}CalSwitch"] = "HIGH"
         for axis in range(1, 7):
             values.update(
                 {
@@ -3422,6 +3438,30 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(calibration, {"sentinel": "unchanged"})
         self.assertEqual(native_calls, [])
         self.assertEqual(widget_calls, [])
+
+    def test_update_parameters_encode_typed_calibration_switches(self):
+        namespace = {"CAL": self._valid_runtime_calibration()}
+        self.add_custom_profile_validation_dependencies(namespace)
+        prepare = namespace["_prepare_update_parameters_from_values"]
+        values = self._valid_update_parameter_values()
+        states = (
+            " high ", "low", "HIGH", "LOW", "LOW",
+            "HIGH", "LOW", "HIGH", "LOW",
+        )
+        for axis, state in enumerate(states, start=1):
+            values[f"J{axis}CalSwitch"] = state
+
+        prepared, command = prepare(values)
+
+        self.assertTrue(command.endswith("|165\n"))
+        self.assertEqual(
+            tuple(prepared[f"J{axis}CalSwitch"] for axis in range(1, 10)),
+            tuple(state.strip().upper() for state in states),
+        )
+
+        values["J4CalSwitch"] = "ACTIVE"
+        with self.assertRaisesRegex(MotionInputError, "J4CalSwitch"):
+            prepare(values)
 
     def test_transmitting_calibration_preflights_before_local_mutation(self):
         for function_name, prepare_name, apply_name, transmit_name in (
@@ -7658,6 +7698,24 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(prepared["J1DriveMS"], 16)
         self.assertEqual(prepared["J9steps"], 36000.0)
 
+        legacy_profile = dict(profile)
+        for axis in range(1, 10):
+            del legacy_profile[f"J{axis}CalSwitch"]
+        migrated_profile = prepare(legacy_profile)
+        self.assertEqual(
+            tuple(
+                migrated_profile[f"J{axis}CalSwitch"]
+                for axis in range(1, 10)
+            ),
+            ("HIGH",) * 9,
+        )
+        self.assertTrue(
+            all(
+                f"J{axis}CalSwitch" not in legacy_profile
+                for axis in range(1, 10)
+            )
+        )
+
         active_calibration["J1AngCur"] = 20.0
         outside_active_pose = dict(profile)
         outside_active_pose["J1PosLim"] = 10.0
@@ -7789,20 +7847,39 @@ class HmiSourceContractTests(unittest.TestCase):
                 self.insertions.append((index, value))
                 self.value = value
 
+        class Combo:
+            def __init__(self, value):
+                self.value = value
+                self.assignments = []
+
+            def set(self, value):
+                self.assignments.append(value)
+                self.value = value
+
         binding_function = self.module_functions[
             "_custom_calibration_field_bindings"
         ]
         field_names = {
             node.id
             for node in ast.walk(binding_function)
-            if isinstance(node, ast.Name) and node.id.endswith("EntryField")
+            if (
+                isinstance(node, ast.Name)
+                and node.id.endswith(("EntryField", "CalSwitchField"))
+            )
         }
         active_calibration = {"sentinel": "active"}
         namespace = {
             "CAL": active_calibration,
             "MotionInputError": MotionInputError,
         }
-        namespace.update({name: Entry(name) for name in field_names})
+        namespace.update({
+            name: (
+                Combo(name)
+                if name.endswith("CalSwitchField")
+                else Entry(name)
+            )
+            for name in field_names
+        })
         namespace["_custom_calibration_profile_keys"] = self.compile_function(
             "_custom_calibration_profile_keys",
             namespace,
@@ -7821,6 +7898,17 @@ class HmiSourceContractTests(unittest.TestCase):
         )
 
         profile = self._valid_custom_calibration_profile()
+        bindings = namespace["_custom_calibration_field_bindings"](profile)
+        self.assertEqual(
+            sum(1 for _, _, is_selector in bindings if is_selector),
+            9,
+        )
+        self.assertTrue(
+            all(
+                is_selector == isinstance(field, Combo)
+                for field, _, is_selector in bindings
+            )
+        )
         self.assertTrue(synchronize(profile))
 
         self.assertEqual(active_calibration, {"sentinel": "active"})
@@ -7833,6 +7921,10 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace["J9calOffEntryField"].value,
             str(profile["J9calOff"]),
         )
+        self.assertEqual(
+            namespace["J1CalSwitchField"].value,
+            profile["J1CalSwitch"],
+        )
         self.assertTrue(
             all(field.deletions == [(0, "end")] for field in namespace.values()
                 if isinstance(field, Entry))
@@ -7841,6 +7933,64 @@ class HmiSourceContractTests(unittest.TestCase):
             all(len(field.insertions) == 1 for field in namespace.values()
                 if isinstance(field, Entry))
         )
+        self.assertTrue(
+            all(len(field.assignments) == 1 for field in namespace.values()
+                if isinstance(field, Combo))
+        )
+
+    def test_machine_presets_reset_calibration_switch_polarity(self):
+        class Entry:
+            def __init__(self):
+                self.deletions = []
+
+            def delete(self, start, end):
+                self.deletions.append((start, end))
+
+        class Combo:
+            def __init__(self):
+                self.assignments = []
+
+            def set(self, value):
+                self.assignments.append(value)
+
+        clear_function = self.module_functions["ClearKinTabFields"]
+        field_names = {
+            node.id
+            for node in ast.walk(clear_function)
+            if (
+                isinstance(node, ast.Name)
+                and node.id.endswith(("EntryField", "CalSwitchField"))
+            )
+        }
+        namespace = {
+            name: Combo() if name.endswith("CalSwitchField") else Entry()
+            for name in field_names
+        }
+        clear_fields = self.compile_function("ClearKinTabFields", namespace)
+
+        clear_fields()
+
+        selectors = [
+            field for field in namespace.values() if isinstance(field, Combo)
+        ]
+        self.assertEqual(len(selectors), 9)
+        self.assertTrue(
+            all(field.assignments == ["HIGH"] for field in selectors)
+        )
+        for preset_name in (
+            "LoadAR4Mk3default",
+            "LoadAR4Mk2default",
+            "LoadAR4default",
+            "LoadAR3default",
+            "LoadMaxdefault",
+        ):
+            preset = self.module_functions[preset_name]
+            self.assertTrue(any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "ClearKinTabFields"
+                for node in ast.walk(preset)
+            ))
 
     def test_custom_profile_callbacks_preserve_active_calibration(self):
         active_calibration = {"sentinel": "active"}
@@ -29403,9 +29553,10 @@ class HmiSourceContractTests(unittest.TestCase):
             backoff_source,
         )
         self.assertIn(
-            "digitalRead(calPins[axis]) == LOW",
+            "ar4_protocol::calibration_switch_is_released(",
             backoff_source,
         )
+        self.assertIn("calibrationLimitSensor[axis]", backoff_source)
         self.assertIn(
             ">= CALIBRATION_RELEASE_STABLE_MICROSECONDS",
             backoff_source,
@@ -36050,14 +36201,55 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertNotIn("fall back to unfiltered best", solver)
 
         self.assertIn(
-            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.9";',
+            'const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.10";',
             firmware,
         )
         self.assertIn('"JT_WRIST_CONFIG_V1"', firmware)
         self.assertIn('"GCODE_DIRECTORY_FRAMING_V1"', firmware)
         self.assertIn('"GCODE_DELETE_IDENTITY_V1"', firmware)
         self.assertIn('"GCODE_WRITE_IDENTITY_V1"', firmware)
+        self.assertIn('"CALIBRATION_SWITCH_POLARITY_V1"', firmware)
         self.assertIn("PROTOCOL_CAPABILITIES", firmware)
+        identity_contract = TEENSY_IDENTITY_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+        capability_constants = dict(re.findall(
+            r'const char \*(\w+_CAPABILITY)\s*=\s*"([A-Z0-9_]+)";',
+            firmware,
+        ))
+        capability_array = re.search(
+            r"const char \*const PROTOCOL_CAPABILITIES\[\]\s*=\s*\{"
+            r"(?P<body>.*?)\};",
+            firmware,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(capability_array)
+        capability_names = re.findall(
+            r"\b([A-Z][A-Z0-9_]*_CAPABILITY)\s*,",
+            capability_array.group("body"),
+        )
+        advertised_capabilities = tuple(
+            capability_constants[name]
+            for name in capability_names
+        )
+        capability_ceiling = re.search(
+            r"kProtocolCapabilityMaximumCount\s*=\s*(\d+)\s*;",
+            identity_contract,
+        )
+        self.assertIsNotNone(capability_ceiling)
+        self.assertLessEqual(
+            len(advertised_capabilities),
+            int(capability_ceiling.group(1)),
+        )
+        self.assertEqual(
+            len(advertised_capabilities),
+            len(set(advertised_capabilities)),
+        )
+        self.assertRegex(
+            firmware,
+            r"static_assert\(\s*PROTOCOL_CAPABILITY_COUNT\s*"
+            r"<=\s*ar4_protocol::kProtocolCapabilityMaximumCount",
+        )
 
         host = AR4_SOURCE.read_text(encoding="utf-8")
         self.assertNotIn('+"I"+ACCramp+"Lm"+LoopMode', host)
@@ -36978,6 +37170,67 @@ class HmiSourceContractTests(unittest.TestCase):
             "if (writeSD(filename, info, expected_media_id))",
             write_branch,
         )
+
+    def test_calibration_switch_polarity_is_paired_across_host_and_firmware(self):
+        host = AR4_SOURCE.read_text(encoding="utf-8")
+        firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
+        contract = TEENSY_CALIBRATION_SWITCH_CONTRACT.read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1",
+            host,
+        )
+        self.assertIn(
+            'command_fields.append(("|", calibration_switch_mask))',
+            host,
+        )
+        self.assertIn("kCalibrationSwitchMaskMaximum", contract)
+        self.assertIn("decode_calibration_switch_mask", contract)
+        self.assertIn("calibration_switch_is_active", contract)
+        self.assertIn("calibration_switch_is_released", contract)
+
+        update_start = firmware.index('if (function == "UP")')
+        update_end = firmware.index('if (function == "CE")', update_start)
+        update_branch = firmware[update_start:update_end]
+        decode = update_branch.index("decode_calibration_switch_mask(")
+        first_mutation = update_branch.index("Robot_Kin_Tool[0] =")
+        configuration_commit = update_branch.index("if (!robot_set_AR())")
+        switch_commit = update_branch.index(
+            "calibrationLimitSensor[axis] = stagedCalibrationSwitches[axis]"
+        )
+        self.assertIn("inData.indexOf('|')", update_branch)
+        self.assertLess(decode, first_mutation)
+        self.assertLess(switch_commit, configuration_commit)
+
+        drive_start = firmware.index("bool driveLimit(")
+        drive_end = firmware.index("bool backOff(", drive_start)
+        backoff_end = firmware.index("//CHECK ENCODERS", drive_end)
+        self.assertIn(
+            "calibration_switch_is_active(",
+            firmware[drive_start:drive_end],
+        )
+        self.assertIn(
+            "calibrationLimitSensor[i]",
+            firmware[drive_start:drive_end],
+        )
+        self.assertIn(
+            "calibration_switch_is_released(",
+            firmware[drive_end:backoff_end],
+        )
+        test_limit_start = firmware.index('if (function == "TL")')
+        test_limit_end = firmware.index(
+            'if (function == "SE")',
+            test_limit_start,
+        )
+        test_limit_branch = firmware[test_limit_start:test_limit_end]
+        self.assertNotIn("== HIGH", test_limit_branch)
+        for axis in range(6):
+            self.assertIn(
+                f"calibrationLimitSensor[{axis}]",
+                test_limit_branch,
+            )
 
     def test_joint_estimator_timing_constants_match_active_firmware(self):
         firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
@@ -44574,6 +44827,7 @@ class HmiSourceContractTests(unittest.TestCase):
             position_command = "SPA1\n"
 
         for missing_capability in (
+            CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
             CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
             CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
             CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,

@@ -185,6 +185,7 @@ from ARrobots.Calibration import (
   snapshot_calibration_values,
 )
 from ARrobots.calibration_schema import (
+  CalibrationSchemaError,
   normalize_calibration_data,
   normalize_vision_background_color,
   reconcile_auxiliary_output_assignments,
@@ -198,6 +199,7 @@ from ARrobots.HMI.joint_motion import (
   CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
   CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
   CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+  CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
   CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
   CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
   CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
@@ -248,6 +250,7 @@ from ARrobots.HMI.joint_motion import (
   controller_protocol_decimal,
   controller_ratio,
   decode_serial_response_line,
+  encode_calibration_switch_mask,
   exchange_serial_line,
   exchange_serial_line_until_cancelled,
   finite_number,
@@ -1048,6 +1051,7 @@ GCODE_LISTBOX_STYLE_OPTIONS = (
   "selectforeground",
 )
 CONTROLLER_STARTUP_REQUIRED_CAPABILITIES = (
+  CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
   CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
   CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
   CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
@@ -27566,6 +27570,7 @@ def _collect_update_parameter_values():
   field_groups = (
     ('MotDir', (J1MotDirEntryField, J2MotDirEntryField, J3MotDirEntryField, J4MotDirEntryField, J5MotDirEntryField, J6MotDirEntryField, J7MotDirEntryField, J8MotDirEntryField, J9MotDirEntryField)),
     ('CalDir', (J1CalDirEntryField, J2CalDirEntryField, J3CalDirEntryField, J4CalDirEntryField, J5CalDirEntryField, J6CalDirEntryField, J7CalDirEntryField, J8CalDirEntryField, J9CalDirEntryField)),
+    ('CalSwitch', (J1CalSwitchField, J2CalSwitchField, J3CalSwitchField, J4CalSwitchField, J5CalSwitchField, J6CalSwitchField, J7CalSwitchField, J8CalSwitchField, J9CalSwitchField)),
     ('PosLim', (J1PosLimEntryField, J2PosLimEntryField, J3PosLimEntryField, J4PosLimEntryField, J5PosLimEntryField, J6PosLimEntryField)),
     ('NegLim', (J1NegLimEntryField, J2NegLimEntryField, J3NegLimEntryField, J4NegLimEntryField, J5NegLimEntryField, J6NegLimEntryField)),
     ('StepDeg', (J1StepDegEntryField, J2StepDegEntryField, J3StepDegEntryField, J4StepDegEntryField, J5StepDegEntryField, J6StepDegEntryField)),
@@ -27618,6 +27623,7 @@ def _prepare_update_parameters_from_values(source_values):
     for suffix, axis_count in (
       ('MotDir', 9),
       ('CalDir', 9),
+      ('CalSwitch', 9),
       ('PosLim', 6),
       ('NegLim', 6),
       ('StepDeg', 6),
@@ -27643,6 +27649,23 @@ def _prepare_update_parameters_from_values(source_values):
         values[f'J{axis}{suffix}'],
         f"J{axis} {suffix}",
       )
+  switch_values = {
+    f'J{axis}CalSwitch': values[f'J{axis}CalSwitch']
+    for axis in range(1, 10)
+  }
+  try:
+    switch_values = normalize_calibration_data(
+      switch_values,
+      require_runtime_fields=False,
+      migrate_legacy_switches=False,
+      migrate_legacy_auxiliary_board=False,
+    )
+  except CalibrationSchemaError as exc:
+    raise MotionInputError(str(exc)) from exc
+  values.update(switch_values)
+  calibration_switch_mask = encode_calibration_switch_mask(
+    tuple(values[f'J{axis}CalSwitch'] for axis in range(1, 10))
+  )
   _robot_joint_calibration_from_values(values)
   encoder_multipliers = []
   for axis in range(1, 7):
@@ -27716,6 +27739,7 @@ def _prepare_update_parameters_from_values(source_values):
     ("<", ">", "?", "{", "}", "~"),
     tuple(values[f'J{axis}aDHpar'] for axis in range(1, 7)),
   ))
+  command_fields.append(("|", calibration_switch_mask))
   return values, _build_startup_numeric_command("UP", command_fields)
 
 
@@ -28568,6 +28592,12 @@ def ClearKinTabFields():
   J4aEntryField.delete(0, 'end')
   J5aEntryField.delete(0, 'end')
   J6aEntryField.delete(0, 'end')
+  for field in (
+    J1CalSwitchField, J2CalSwitchField, J3CalSwitchField,
+    J4CalSwitchField, J5CalSwitchField, J6CalSwitchField,
+    J7CalSwitchField, J8CalSwitchField, J9CalSwitchField,
+  ):
+    field.set("HIGH")
 
 
 def LoadAR4Mk3default():
@@ -28951,6 +28981,7 @@ def _custom_calibration_profile_keys():
   for suffix, axis_count in (
     ('MotDir', 9),
     ('CalDir', 9),
+    ('CalSwitch', 9),
     ('PosLim', 6),
     ('NegLim', 6),
     ('StepDeg', 6),
@@ -28986,7 +29017,16 @@ def _custom_calibration_field_values(calibration_values):
 
 
 def _prepare_custom_calibration_profile(loaded_calibration):
-  profile_values = _custom_calibration_field_values(loaded_calibration)
+  try:
+    migrated_calibration = normalize_calibration_data(
+      loaded_calibration,
+      require_runtime_fields=False,
+      migrate_legacy_switches=True,
+      migrate_legacy_auxiliary_board=False,
+    )
+  except CalibrationSchemaError as exc:
+    raise MotionInputError(str(exc)) from exc
+  profile_values = _custom_calibration_field_values(migrated_calibration)
   update_values, _ = _prepare_update_parameters_from_values(profile_values)
   staged_values = dict(CAL)
   staged_values.update(update_values)
@@ -29075,6 +29115,11 @@ def _custom_calibration_field_bindings(calibration_values):
     J4CalDirEntryField, J5CalDirEntryField, J6CalDirEntryField,
     J7CalDirEntryField, J8CalDirEntryField, J9CalDirEntryField,
   ))
+  fields.extend((
+    J1CalSwitchField, J2CalSwitchField, J3CalSwitchField,
+    J4CalSwitchField, J5CalSwitchField, J6CalSwitchField,
+    J7CalSwitchField, J8CalSwitchField, J9CalSwitchField,
+  ))
   for field_group in (
     (J1PosLimEntryField, J2PosLimEntryField, J3PosLimEntryField,
      J4PosLimEntryField, J5PosLimEntryField, J6PosLimEntryField),
@@ -29110,7 +29155,7 @@ def _custom_calibration_field_bindings(calibration_values):
   if len(fields) != len(keys):
     raise RuntimeError("custom calibration field mapping is inconsistent")
   return tuple(
-    (field, values[key])
+    (field, values[key], key.endswith('CalSwitch'))
     for field, key in zip(fields, keys)
   )
 
@@ -29118,9 +29163,12 @@ def _custom_calibration_field_bindings(calibration_values):
 def sync_calibration_to_fields(calibration_values=None):
   source_values = CAL if calibration_values is None else calibration_values
   bindings = _custom_calibration_field_bindings(source_values)
-  for field, value in bindings:
-    field.delete(0, 'end')
-    field.insert(0, str(value))
+  for field, value, is_selector in bindings:
+    if is_selector:
+      field.set(str(value))
+    else:
+      field.delete(0, 'end')
+      field.insert(0, str(value))
   return True
 
 def _collect_fields_to_calibration():
@@ -34655,7 +34703,7 @@ cmdRecEntryField.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
 # ============================================================================
 tab3.grid_rowconfigure(0, weight=1)
 tab3.grid_rowconfigure(1, weight=1)
-tab3.grid_columnconfigure(0, weight=0, minsize=180)  # Motor Dir, Cal Dir
+tab3.grid_columnconfigure(0, weight=0, minsize=300)  # Motor Dir, Cal Dir/Switch
 tab3.grid_columnconfigure(1, weight=0, minsize=180)  # Pos Limits, Steps/Deg
 tab3.grid_columnconfigure(2, weight=0, minsize=220)  # Drive MS, Encoder CPR
 tab3.grid_columnconfigure(3, weight=0, minsize=280)  # DH Parameters, Tool Frame
@@ -34718,55 +34766,83 @@ J9MotDirEntryField.grid(row=8, column=1, sticky="w", padx=5, pady=2)
 # ============================================================================
 # Calibration Direction Frame (Row 1, Column 0)
 # ============================================================================
-calDirFrame = LabelFrame(tab3, text="Calibration Direction", padding=10)
+calDirFrame = LabelFrame(
+  tab3,
+  text="Calibration Direction / Active Switch",
+  padding=10,
+)
 calDirFrame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
 calDirFrame.grid_columnconfigure(0, weight=0)
-calDirFrame.grid_columnconfigure(1, weight=1)
+calDirFrame.grid_columnconfigure(1, weight=0)
+calDirFrame.grid_columnconfigure(2, weight=0)
+calDirFrame.grid_columnconfigure(3, weight=1)
+
+
+def _create_calibration_switch_field(parent, row):
+  active_label = Label(parent, font=("Arial", 8), text="Active")
+  active_label.grid(row=row, column=2, sticky="e", padx=(8, 2), pady=2)
+  field = ttk.Combobox(
+    parent,
+    values=("HIGH", "LOW"),
+    state="readonly",
+    width=6,
+  )
+  field.grid(row=row, column=3, sticky="w", padx=(2, 5), pady=2)
+  return field
 
 J1CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J1 Calibration Dir.")
 J1CalDirLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
 J1CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J1CalDirEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+J1CalSwitchField = _create_calibration_switch_field(calDirFrame, 0)
 
 J2CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J2 Calibration Dir.")
 J2CalDirLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
 J2CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J2CalDirEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+J2CalSwitchField = _create_calibration_switch_field(calDirFrame, 1)
 
 J3CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J3 Calibration Dir.")
 J3CalDirLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
 J3CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J3CalDirEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+J3CalSwitchField = _create_calibration_switch_field(calDirFrame, 2)
 
 J4CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J4 Calibration Dir.")
 J4CalDirLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
 J4CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J4CalDirEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+J4CalSwitchField = _create_calibration_switch_field(calDirFrame, 3)
 
 J5CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J5 Calibration Dir.")
 J5CalDirLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
 J5CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J5CalDirEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+J5CalSwitchField = _create_calibration_switch_field(calDirFrame, 4)
 
 J6CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J6 Calibration Dir.")
 J6CalDirLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
 J6CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J6CalDirEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
+J6CalSwitchField = _create_calibration_switch_field(calDirFrame, 5)
 
 J7CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J7 Calibration Dir.")
 J7CalDirLab_grid.grid(row=6, column=0, sticky="w", padx=5, pady=2)
 J7CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J7CalDirEntryField.grid(row=6, column=1, sticky="w", padx=5, pady=2)
+J7CalSwitchField = _create_calibration_switch_field(calDirFrame, 6)
 
 J8CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J8 Calibration Dir.")
 J8CalDirLab_grid.grid(row=7, column=0, sticky="w", padx=5, pady=2)
 J8CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J8CalDirEntryField.grid(row=7, column=1, sticky="w", padx=5, pady=2)
+J8CalSwitchField = _create_calibration_switch_field(calDirFrame, 7)
 
 J9CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J9 Calibration Dir.")
 J9CalDirLab_grid.grid(row=8, column=0, sticky="w", padx=5, pady=2)
 J9CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
 J9CalDirEntryField.grid(row=8, column=1, sticky="w", padx=5, pady=2)
+J9CalSwitchField = _create_calibration_switch_field(calDirFrame, 8)
 
 # ============================================================================
 # Position Limits Frame (Row 0, Column 1)
@@ -37476,6 +37552,15 @@ J6CalDirEntryField.insert(0,str(CAL['J6CalDir']))
 J7CalDirEntryField.insert(0,str(CAL['J7CalDir']))
 J8CalDirEntryField.insert(0,str(CAL['J8CalDir']))
 J9CalDirEntryField.insert(0,str(CAL['J9CalDir']))
+J1CalSwitchField.set(CAL['J1CalSwitch'])
+J2CalSwitchField.set(CAL['J2CalSwitch'])
+J3CalSwitchField.set(CAL['J3CalSwitch'])
+J4CalSwitchField.set(CAL['J4CalSwitch'])
+J5CalSwitchField.set(CAL['J5CalSwitch'])
+J6CalSwitchField.set(CAL['J6CalSwitch'])
+J7CalSwitchField.set(CAL['J7CalSwitch'])
+J8CalSwitchField.set(CAL['J8CalSwitch'])
+J9CalSwitchField.set(CAL['J9CalSwitch'])
 J1PosLimEntryField.insert(0,str(CAL['J1PosLim']))
 J1NegLimEntryField.insert(0,str(CAL['J1NegLim']))
 J2PosLimEntryField.insert(0,str(CAL['J2PosLim']))

@@ -75,6 +75,9 @@ CONTROLLER_CAPABILITY_HOME_REFERENCE_V1 = "HOME_REFERENCE_V1"
 CONTROLLER_CAPABILITY_HOME_REFERENCE_V2 = "HOME_REFERENCE_V2"
 CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1 = "JOINT_TELEMETRY_V1"
 CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1 = "ESTOP_ADMISSION_V1"
+CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1 = (
+    "CALIBRATION_SWITCH_POLARITY_V1"
+)
 CONTROLLER_ESTOP_ADMISSION_FLAG = "EA"
 CONTROLLER_ESTOP_EVENT_FLAG = "EB"
 CONTROLLER_PHYSICAL_ESTOP_FLAGS = frozenset(
@@ -111,6 +114,34 @@ _SERIAL_QUARANTINED_PORTS = {}
 
 class MotionInputError(ValueError):
     """A command input cannot be represented safely by the controller protocol."""
+
+
+def encode_calibration_switch_mask(states):
+    """Encode normalized J1-J9 active switch states for the controller."""
+    if isinstance(states, (str, bytes)):
+        raise MotionInputError(
+            "calibration switch states must be a nine-value sequence"
+        )
+    try:
+        states = tuple(states)
+    except TypeError as exc:
+        raise MotionInputError(
+            "calibration switch states must be a nine-value sequence"
+        ) from exc
+    if len(states) != JOINT_COUNT:
+        raise MotionInputError(
+            "calibration switch states must contain 9 values"
+        )
+
+    mask = 0
+    for axis, state in enumerate(states, start=1):
+        if state not in ("LOW", "HIGH"):
+            raise MotionInputError(
+                f"J{axis} calibration switch state must be normalized LOW or HIGH"
+            )
+        if state == "HIGH":
+            mask |= 1 << (axis - 1)
+    return mask
 
 
 class DeferredJointDispatchOutcome(Enum):

@@ -66,7 +66,7 @@
 // 6.6 - 2/22/26 - update kinematic solver to reduce J4/6 wrap | reimplement wrist N/F config
 // 6.7 - 3/11/26 MB holding reg bug fix
 // 6.7.1 - 3/11/26 bug fix calibration debounce
-const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.9";
+const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.10";
 const char *JT_WRIST_CONFIG_CAPABILITY = "JT_WRIST_CONFIG_V1";
 const char *GCODE_DIRECTORY_CAPABILITY = "GCODE_DIRECTORY_FRAMING_V1";
 const char *GCODE_DELETE_IDENTITY_CAPABILITY = "GCODE_DELETE_IDENTITY_V1";
@@ -75,6 +75,8 @@ const char *HOME_REFERENCE_V1_CAPABILITY = "HOME_REFERENCE_V1";
 const char *HOME_REFERENCE_V2_CAPABILITY = "HOME_REFERENCE_V2";
 const char *JOINT_TELEMETRY_CAPABILITY = "JOINT_TELEMETRY_V1";
 const char *ESTOP_ADMISSION_CAPABILITY = "ESTOP_ADMISSION_V1";
+const char *CALIBRATION_SWITCH_POLARITY_CAPABILITY =
+  "CALIBRATION_SWITCH_POLARITY_V1";
 
 //////////////////////////////////////////////////////////////////////////////
 //DEBUGGING
@@ -92,6 +94,7 @@ const char *ESTOP_ADMISSION_CAPABILITY = "ESTOP_ADMISSION_V1";
 #include <ModbusMaster.h>
 #include <EEPROM.h>
 #include "angle_conversion_contract.h"
+#include "calibration_switch_contract.h"
 #include "command_queue_contract.h"
 #include "controller_domain_contract.h"
 #include "cartesian_pose_contract.h"
@@ -116,9 +119,15 @@ const char *const PROTOCOL_CAPABILITIES[] = {
   HOME_REFERENCE_V2_CAPABILITY,
   JOINT_TELEMETRY_CAPABILITY,
   ESTOP_ADMISSION_CAPABILITY,
+  CALIBRATION_SWITCH_POLARITY_CAPABILITY,
 };
 constexpr size_t PROTOCOL_CAPABILITY_COUNT =
   sizeof(PROTOCOL_CAPABILITIES) / sizeof(PROTOCOL_CAPABILITIES[0]);
+static_assert(
+  PROTOCOL_CAPABILITY_COUNT
+    <= ar4_protocol::kProtocolCapabilityMaximumCount,
+  "Advertised protocol capabilities exceed the identity contract"
+);
 #pragma GCC diagnostic ignored "-Warray-bounds"
 #pragma GCC diagnostic ignored "-Wunused-variable"
 #pragma GCC diagnostic ignored "-Wsequence-point"
@@ -381,6 +390,9 @@ typedef ar4_protocol::MotionModeTransaction<
   ROBOT_nDOFs
 > FirmwareMotionModeTransaction;
 const int numJoints = 9;
+uint8_t calibrationLimitSensor[numJoints] = {
+  HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH,
+};
 typedef float tRobotJoints[ROBOT_nDOFs];
 typedef float tRobotPose[ROBOT_nDOFs];
 
@@ -2275,13 +2287,12 @@ bool driveLimit(
     return false;
   }
   const unsigned long DEBOUNCE_US = 3000;  // 3 ms
-  unsigned long firstHighUs[numJoints] = { 0 };
+  unsigned long firstActiveUs[numJoints] = { 0 };
 
   int calcStepGap = minSpeedDelay / (SpeedVal / 100);
   if (calcStepGap <= 0) return false;
 
   // Define arrays for calibration directions, motor directions, and direction pins
-  const uint8_t limitSensor[numJoints] = { HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH };
   int calDir[numJoints] = { J1CalDir, J2CalDir, J3CalDir, J4CalDir, J5CalDir, J6CalDir, J7CalDir, J8CalDir, J9CalDir };
   int motDir[numJoints] = { J1MotDir, J2MotDir, J3MotDir, J4MotDir, J5MotDir, J6MotDir, J7MotDir, J8MotDir, J9MotDir };
   int dirPins[numJoints] = { J1dirPin, J2dirPin, J3dirPin, J4dirPin, J5dirPin, J6dirPin, J7dirPin, J8dirPin, J9dirPin };
@@ -2332,20 +2343,23 @@ bool driveLimit(
       curState[i] = digitalRead(calPins[i]);
 
       // Debounced limit detection, but stop immediately on first detection
-      if (curState[i] == limitSensor[i]) {
+      if (ar4_protocol::calibration_switch_is_active(
+          curState[i],
+          calibrationLimitSensor[i]
+      )) {
 
-        if (firstHighUs[i] == 0) {
-          firstHighUs[i] = micros();
+        if (firstActiveUs[i] == 0) {
+          firstActiveUs[i] = micros();
           limitSeen[i] = 1;  // stop stepping this axis immediately
         }
 
-        if ((micros() - firstHighUs[i]) >= DEBOUNCE_US) {
+        if ((micros() - firstActiveUs[i]) >= DEBOUNCE_US) {
           complete[i] = 1;
           limitConfirmed[i] = 1;
         }
 
       } else {
-        firstHighUs[i] = 0;
+        firstActiveUs[i] = 0;
         limitSeen[i] = 0;
       }
 
@@ -2486,7 +2500,10 @@ bool backOff(uint8_t J1req, uint8_t J2req, uint8_t J3req, uint8_t J4req, uint8_t
     for (int axis = 0; axis < numJoints; ++axis) {
       if (releaseConfirmed[axis]) continue;
       allReleased = false;
-      if (digitalRead(calPins[axis]) == LOW) {
+      if (ar4_protocol::calibration_switch_is_released(
+          digitalRead(calPins[axis]),
+          calibrationLimitSensor[axis]
+      )) {
         if (!releaseCandidate[axis]) {
           releaseCandidate[axis] = true;
           releaseStarted[axis] = now;
@@ -4369,22 +4386,40 @@ void loop() {
       String J5calTest = "0";
       String J6calTest = "0";
 
-      if (digitalRead(J1calPin) == HIGH) {
+      if (ar4_protocol::calibration_switch_is_active(
+          digitalRead(J1calPin),
+          calibrationLimitSensor[0]
+      )) {
         J1calTest = "1";
       }
-      if (digitalRead(J2calPin) == HIGH) {
+      if (ar4_protocol::calibration_switch_is_active(
+          digitalRead(J2calPin),
+          calibrationLimitSensor[1]
+      )) {
         J2calTest = "1";
       }
-      if (digitalRead(J3calPin) == HIGH) {
+      if (ar4_protocol::calibration_switch_is_active(
+          digitalRead(J3calPin),
+          calibrationLimitSensor[2]
+      )) {
         J3calTest = "1";
       }
-      if (digitalRead(J4calPin) == HIGH) {
+      if (ar4_protocol::calibration_switch_is_active(
+          digitalRead(J4calPin),
+          calibrationLimitSensor[3]
+      )) {
         J4calTest = "1";
       }
-      if (digitalRead(J5calPin) == HIGH) {
+      if (ar4_protocol::calibration_switch_is_active(
+          digitalRead(J5calPin),
+          calibrationLimitSensor[4]
+      )) {
         J5calTest = "1";
       }
-      if (digitalRead(J6calPin) == HIGH) {
+      if (ar4_protocol::calibration_switch_is_active(
+          digitalRead(J6calPin),
+          calibrationLimitSensor[5]
+      )) {
         J6calTest = "1";
       }
       String TestLim = " J1 = " + J1calTest + "   J2 = " + J2calTest + "   J3 = " + J3calTest + "   J4 = " + J4calTest + "   J5 = " + J5calTest + "   J6 = " + J6calTest;
@@ -4607,6 +4642,7 @@ void loop() {
       int J4aDHparStart = inData.indexOf('{');
       int J5aDHparStart = inData.indexOf('}');
       int J6aDHparStart = inData.indexOf('~');
+      int calibrationSwitchMaskStart = inData.indexOf('|');
 
       const int positions[] = {
         TFxStart,
@@ -4681,6 +4717,7 @@ void loop() {
         J4aDHparStart,
         J5aDHparStart,
         J6aDHparStart,
+        calibrationSwitchMaskStart,
         static_cast<int>(inData.length()),
       };
       float stagedTool[ROBOT_nDOFs];
@@ -4692,6 +4729,8 @@ void loop() {
       float stagedDHAlpha[ROBOT_nDOFs];
       float stagedDHD[ROBOT_nDOFs];
       float stagedDHA[ROBOT_nDOFs];
+      int stagedCalibrationSwitchMask = 0;
+      uint8_t stagedCalibrationSwitches[numJoints] = {};
       if (
         !ar4_protocol::field_boundaries_cover_command(
           inData.length(),
@@ -4711,6 +4750,16 @@ void loop() {
         || !parse_float_marker_fields(inData, positions + 54, stagedDHAlpha)
         || !parse_float_marker_fields(inData, positions + 60, stagedDHD)
         || !parse_float_marker_fields(inData, positions + 66, stagedDHA)
+        || !parse_int_span(
+          inData,
+          calibrationSwitchMaskStart + 1,
+          static_cast<int>(inData.length()),
+          stagedCalibrationSwitchMask
+        )
+        || !ar4_protocol::decode_calibration_switch_mask(
+          stagedCalibrationSwitchMask,
+          stagedCalibrationSwitches
+        )
       ) {
         Serial.println("ER");
         consume_current_command();
@@ -4863,6 +4912,9 @@ void loop() {
       J5zeroStep = stagedZeroSteps[4];
       J6zeroStep = stagedZeroSteps[5];
 
+      for (int axis = 0; axis < numJoints; ++axis) {
+        calibrationLimitSensor[axis] = stagedCalibrationSwitches[axis];
+      }
       primaryHomeReference = invalidatedHomeReference;
       if (!robot_set_AR()) {
         Serial.println("ER");

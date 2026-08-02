@@ -33,6 +33,17 @@ Result: the complete hardware-free suite passed. The bundled legacy Linux module
 
 Syntax compilation also succeeded for `AR4.py`, `ARrobots/HMI/joint_motion.py`, and the associated Python test modules without importing `AR4.py`.
 
+The 2026-08-02 complete Windows host suite passed after typed J1-J9
+calibration-switch polarity was added across schema validation, custom-profile
+migration, HMI fields, startup capability negotiation, command encoding, and
+paired firmware source contracts. Coverage binds the advertised capability
+array to the firmware ceiling and checks preset polarity reset behavior. The
+run completed 790 tests with four expected environment-specific skips.
+
+```text
+Complete Windows host suite: Ran 790 tests in 14.196s; OK (skipped=4)
+```
+
 The complete suite was rerun on 2026-07-20 after firmware command-domain remediation. The Windows run exercised the packaged CPython 3.12 binding and passed with the expected Linux source-build and GNU sanitizer skips. The Ubuntu run built the Linux binding from tracked source, executed the sanitized native harness, and passed with the expected packaged-Windows-module skip. The Windows runner required a temporary directory with ordinary create and remove access for calibration-persistence fixtures. Command-specific Modbus response classification, the shared host/firmware ramp and filename boundaries, exact firmware ingress preprocessing, and legacy EEPROM migration were included.
 
 Another complete 2026-07-20 run passed on Windows and Ubuntu after live-jog profile forwarding, unsupported motion-option rejection, complete traversed arc-length calculation, and invalid legacy debug-byte handling were added. The Windows run retained the expected Linux source-build and GNU sanitizer skips; the Ubuntu run retained the expected packaged-Windows-module skip.
@@ -311,6 +322,12 @@ successfully and quickly under a short Linux process watchdog.
 Sanitized contract harness: exit code 0; elapsed 6.2s
 ```
 
+The 2026-08-02 Ubuntu 26.04 sanitizer rerun covered calibration-switch mask
+decoding, invalid-state classification, mutation-free rejection, and firmware
+identity-capability bounds. Strict `-Wall -Wextra -Werror -pedantic`
+compilation plus AddressSanitizer and UndefinedBehaviorSanitizer completed with
+exit code `0`.
+
 ## Teensy 4.1 firmware
 
 Toolchain:
@@ -402,6 +419,13 @@ pre-reset terminal frame. Arduino CLI 1.5.1 selected PJRC Teensy core 1.62.0,
 the platform `SPI` library, bundled SdFat 2.1.2, and ModbusMaster 2.0.1. The
 compiler returned exit code `0`; no upload, serial connection, controller
 command, calibration action, or arm motion occurred.
+
+The 2026-08-02 environment-gated no-upload rerun compiled the tracked
+`6.7.1-ar4hmi.10` Teensy source after paired host and firmware support for
+typed J1-J9 calibration-switch polarity was added. Arduino CLI 1.5.1 selected
+PJRC Teensy core 1.62.0, the platform `SPI` library, bundled SdFat 2.1.2, and
+ModbusMaster 2.0.1. The compiler returned exit code `0`; no upload, serial
+connection, controller command, calibration action, or arm motion occurred.
 
 ## Nano and Mega auxiliary firmware
 

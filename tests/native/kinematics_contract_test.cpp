@@ -15,6 +15,7 @@
 #include "../../ARrobots/src/kinematics.cpp"
 #include "../../ArduinoSketches/AR4_nano_sketch_v1.5/auxiliary_protocol_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/cartesian_pose_contract.h"
+#include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/calibration_switch_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/command_queue_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/controller_domain_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/debug_contract.h"
@@ -2684,6 +2685,54 @@ void test_tool_jog_signed_tcp_displacement() {
     );
 }
 
+void test_calibration_switch_contract() {
+    uint8_t states[ar4_protocol::kCalibrationSwitchCount] = {};
+    require(
+        ar4_protocol::decode_calibration_switch_mask(165, states),
+        "valid calibration-switch mask was rejected"
+    );
+    const uint8_t expected[] = {1, 0, 1, 0, 0, 1, 0, 1, 0};
+    require(
+        std::equal(std::begin(states), std::end(states), std::begin(expected)),
+        "calibration-switch mask axis order changed"
+    );
+    require(
+        ar4_protocol::decode_calibration_switch_mask(
+            ar4_protocol::kCalibrationSwitchMaskMaximum,
+            states
+        )
+            && std::all_of(
+                std::begin(states),
+                std::end(states),
+                [](uint8_t value) { return value == 1; }
+            ),
+        "all-HIGH calibration-switch mask was rejected"
+    );
+
+    std::fill(std::begin(states), std::end(states), 7);
+    require(
+        !ar4_protocol::decode_calibration_switch_mask(-1, states)
+            && !ar4_protocol::decode_calibration_switch_mask(512, states)
+            && std::all_of(
+                std::begin(states),
+                std::end(states),
+                [](uint8_t value) { return value == 7; }
+            ),
+        "invalid calibration-switch mask mutated staged state"
+    );
+    require(
+        ar4_protocol::calibration_switch_is_active(0, 0)
+            && ar4_protocol::calibration_switch_is_active(1, 1)
+            && ar4_protocol::calibration_switch_is_released(1, 0)
+            && ar4_protocol::calibration_switch_is_released(0, 1)
+            && !ar4_protocol::calibration_switch_is_active(2, 1)
+            && !ar4_protocol::calibration_switch_is_active(1, 2)
+            && !ar4_protocol::calibration_switch_is_released(0, 2)
+            && !ar4_protocol::calibration_switch_is_released(2, 1),
+        "calibration-switch active-state classification is invalid"
+    );
+}
+
 void test_primary_home_reference_contract() {
     ar4_protocol::PrimaryHomeReferenceState state = {
         {false, false, false},
@@ -4825,6 +4874,7 @@ int main(int argc, char** argv) {
         test_controller_domain_contract();
         test_tool_frame_axis_order();
         test_tool_jog_signed_tcp_displacement();
+        test_calibration_switch_contract();
         test_primary_home_reference_contract();
         test_joint_telemetry_contract();
         test_firmware_identity_contract();
