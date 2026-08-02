@@ -44,9 +44,7 @@ The repository provides a supported native binary for Windows CPython 3.12 x64. 
 ## ⚙️ Setup & Running from Source
 
 Project status and hardware boundaries are documented in [`PLAN.md`](PLAN.md)
-and [`SAFETY.md`](SAFETY.md). Git does not transfer hooks to fresh clones.
-Existing development clones with a manually installed custom pre-commit hook
-must remove or replace that clone-local hook before updating.
+and [`SAFETY.md`](SAFETY.md).
 
 ```bash
 # Clone the repository
@@ -69,7 +67,10 @@ validated configuration and position synchronization, configured auxiliary
 connection, and board-defined startup effects. Confirm the intended controllers
 and active profile before launch. The main-controller startup sequence sends no
 motor-drive command. Opening a configured auxiliary port can reset the board and
-invoke firmware-defined output-pin or servo initialization.
+invoke firmware-defined digital-I/O initialization. The tracked Mega firmware
+preloads pins 28-35 high before switching output pins to output mode. Both
+tracked auxiliary firmware builds leave servos detached until an `SV` command
+supplies a target.
 
 ## 🧠 Troubleshooting
 - **Serial connection issues** → Verify the correct COM port and a Teensy 4.1 firmware build identifying version `6.7.1-ar4hmi.9` and advertising `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, and `ESTOP_ADMISSION_V1`.

@@ -2,14 +2,14 @@
 
 ## Software-only development
 
-- `AR4.py` is an executable application entry point, not an importable library. Import attempts fail before GUI construction or saved-controller scheduling; routine analysis and automated tests read or parse the source without executing the file.
+- Current boundary: `AR4.py` is an executable application entry point, not an importable library. Import attempts fail before GUI construction or saved-controller scheduling; routine analysis and automated tests read or parse the source without executing the file. M2B targets side-effect-free import and explicit lifecycle construction while preserving automatic saved-controller connection during direct execution.
 - Hardware-free tests may read source, parse syntax, exercise extracted modules, compile firmware without upload, and use mocked transports.
 - Simulation, static analysis, successful compilation, and mocked serial traffic do not establish live-arm behavior.
 - Machine-specific runtime calibration remains outside version control. `defaults.json` is the tracked fallback calibration profile and contains saved machine parameters that require validation against connected hardware.
 
 ## Hardware side effects
 
-Starting `AR4.py` is explicit operator admission for the saved main-controller connection, validated configuration and position synchronization, configured auxiliary connection, auxiliary-board reset, and firmware-defined startup effects. The main-controller sequence sends no motor-drive command. Opening an auxiliary port can reset the board; auxiliary firmware can initialize output pins or servo positions during setup.
+Starting `AR4.py` is explicit operator admission for the saved main-controller connection, validated configuration and position synchronization, configured auxiliary connection, auxiliary-board reset, and firmware-defined startup effects. The main-controller sequence sends no motor-drive command. Opening an auxiliary port can reset the board. The tracked Mega firmware preloads pins 28-35 high before configuring output pins 28-53 as outputs; the tracked Nano firmware configures output pins 8-13 without an explicit startup write. Both firmware builds leave servos detached until an `SV` command supplies a target.
 
 After startup, firmware upload, calibration cycles, homing, operator-commanded output changes, and powered motion require a separate operator-approved procedure. Before powered motion, confirm a cleared work envelope and verify the independent physical stop path under power.
 

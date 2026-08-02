@@ -392,6 +392,12 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIsNotNone(assignment, name)
         return ast.literal_eval(assignment.value)
 
+    def require_first(self, values, message):
+        missing = object()
+        value = next(values, missing)
+        self.assertIsNot(value, missing, message)
+        return value
+
     def test_application_entry_point_rejects_import_before_imports(self):
         executable_nodes = [
             node
@@ -428,10 +434,13 @@ class HmiSourceContractTests(unittest.TestCase):
                 for node in ast.walk(import_guard)
             )
         )
-        first_import = next(
-            node
-            for node in executable_nodes
-            if isinstance(node, (ast.Import, ast.ImportFrom))
+        first_import = self.require_first(
+            (
+                node
+                for node in executable_nodes
+                if isinstance(node, (ast.Import, ast.ImportFrom))
+            ),
+            "AR4.py must contain a module-level import after the entry-point guard",
         )
         self.assertLess(import_guard.end_lineno, first_import.lineno)
 
@@ -4049,13 +4058,13 @@ class HmiSourceContractTests(unittest.TestCase):
                 or not isinstance(assignment.value, ast.Call)
             ):
                 continue
-            command = next(
+            command = self.require_first(
                 (
                     keyword.value
                     for keyword in assignment.value.keywords
                     if keyword.arg == "command"
                 ),
-                None,
+                f"{assignment.targets[0].id} must define a command",
             )
             button_commands[assignment.targets[0].id] = command
         self.assertEqual(
@@ -4085,13 +4094,13 @@ class HmiSourceContractTests(unittest.TestCase):
         ]
         self.assertTrue(camera_menus)
         for menu in camera_menus:
-            command = next(
+            command = self.require_first(
                 (
                     keyword.value
                     for keyword in menu.keywords
                     if keyword.arg == "command"
                 ),
-                None,
+                "camera OptionMenu must define a command",
             )
             self.assertIsInstance(command, ast.Name)
             self.assertEqual(command.id, "_on_vision_camera_select")
@@ -5521,10 +5530,13 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIsInstance(worker_call, ast.Call)
         self.assertIsInstance(worker_call.func, ast.Name)
         self.assertEqual(worker_call.func.id, "VisionOperationWorker")
-        coalesce_keyword = next(
-            keyword
-            for keyword in worker_call.keywords
-            if keyword.arg == "coalesce"
+        coalesce_keyword = self.require_first(
+            (
+                keyword
+                for keyword in worker_call.keywords
+                if keyword.arg == "coalesce"
+            ),
+            "vision selection worker must define coalescing behavior",
         )
         self.assertIsInstance(coalesce_keyword.value, ast.Constant)
         self.assertIs(coalesce_keyword.value.value, False)
@@ -7947,15 +7959,18 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
 
     def test_startup_calibration_rejects_loader_failure_before_application(self):
-        startup_assignment = next(
-            node
-            for node in self.tree.body
-            if isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name)
-                and target.id == "loaded_calibration"
-                for target in node.targets
-            )
+        startup_assignment = self.require_first(
+            (
+                node
+                for node in self.tree.body
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id == "loaded_calibration"
+                    for target in node.targets
+                )
+            ),
+            "startup must assign loaded_calibration",
         )
         self.assertIsInstance(startup_assignment.value, ast.Call)
         self.assertIsInstance(startup_assignment.value.func, ast.Name)
@@ -9066,10 +9081,15 @@ class HmiSourceContractTests(unittest.TestCase):
             ("clear-faults", startup_serial, position),
             calls,
         )
-        self.assertLess(
-            next(index for index, call in enumerate(calls) if call[0] == "validate"),
-            next(index for index, call in enumerate(calls) if call[0] == "apply"),
+        validate_index = self.require_first(
+            (index for index, call in enumerate(calls) if call[0] == "validate"),
+            "startup must validate before application",
         )
+        apply_index = self.require_first(
+            (index for index, call in enumerate(calls) if call[0] == "apply"),
+            "startup must apply validated calibration",
+        )
+        self.assertLess(validate_index, apply_index)
         self.assertEqual(
             [call[0] for call in calls if call[0] in ("open", "dump", "close")],
             ["open", "dump", "close"],
@@ -13695,11 +13715,14 @@ class HmiSourceContractTests(unittest.TestCase):
             }
             self.assertIn("_write_legacy_auxiliary_command", called_names)
 
-        send_xbox_auxiliary = next(
-            node
-            for node in ast.walk(self.tree)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "send_xbox_auxiliary"
+        send_xbox_auxiliary = self.require_first(
+            (
+                node
+                for node in ast.walk(self.tree)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "send_xbox_auxiliary"
+            ),
+            "send_xbox_auxiliary function must exist",
         )
         send_calls = {
             node.func.id
@@ -18594,11 +18617,14 @@ class HmiSourceContractTests(unittest.TestCase):
         expected_dispatch_calls = {"runProg": 3, "stepFwd": 1}
         for function_name, expected_count in expected_dispatch_calls.items():
             function = self.module_functions[function_name]
-            thread_function = next(
-                node
-                for node in ast.walk(function)
-                if isinstance(node, ast.FunctionDef)
-                and node.name == "threadProg"
+            thread_function = self.require_first(
+                (
+                    node
+                    for node in ast.walk(function)
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "threadProg"
+                ),
+                f"{function_name} must define threadProg",
             )
             self.assertFalse(
                 any(
@@ -22692,15 +22718,18 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual((tab.lastRow, tab.lastProg), expected_return)
 
     def test_program_execution_owner_covers_start_and_reverse_completion(self):
-        constant_node = next(
-            copy.deepcopy(node)
-            for node in self.tree.body
-            if (
-                isinstance(node, ast.Assign)
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and node.targets[0].id == "PROGRAM_EXECUTION_MODES"
-            )
+        constant_node = self.require_first(
+            (
+                copy.deepcopy(node)
+                for node in self.tree.body
+                if (
+                    isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "PROGRAM_EXECUTION_MODES"
+                )
+            ),
+            "PROGRAM_EXECUTION_MODES assignment must exist",
         )
         namespace = {
             "dataclass": dataclass,
@@ -28453,10 +28482,13 @@ class HmiSourceContractTests(unittest.TestCase):
             [
                 (
                     call.value.args[0].id,
-                    next(
-                        ast.literal_eval(keyword.value)
-                        for keyword in call.value.keywords
-                        if keyword.arg == "text"
+                    self.require_first(
+                        (
+                            ast.literal_eval(keyword.value)
+                            for keyword in call.value.keywords
+                            if keyword.arg == "text"
+                        ),
+                        "motion-control tab must define display text",
                     ).strip(),
                 )
                 for call in notebook_add_calls
@@ -28525,10 +28557,13 @@ class HmiSourceContractTests(unittest.TestCase):
         for name in ("startPositionBut", "shutdownPositionBut"):
             constructor = self.module_assignments[name].value
             self.assertIsInstance(constructor, ast.Call)
-            button_commands[name] = next(
-                keyword.value.id
-                for keyword in constructor.keywords
-                if keyword.arg == "command"
+            button_commands[name] = self.require_first(
+                (
+                    keyword.value.id
+                    for keyword in constructor.keywords
+                    if keyword.arg == "command"
+                ),
+                f"{name} must define a command",
             )
         self.assertEqual(
             button_commands,
@@ -29616,15 +29651,18 @@ class HmiSourceContractTests(unittest.TestCase):
     def test_controller_identity_writers_invalidate_source_before_transition(self):
         def direct_lock_assignments(function_name):
             function = self.module_functions[function_name]
-            lock_block = next(
-                node
-                for node in function.body
-                if (
-                    isinstance(node, ast.With)
-                    and isinstance(node.items[0].context_expr, ast.Name)
-                    and node.items[0].context_expr.id
-                    == "controller_identity_state_lock"
-                )
+            lock_block = self.require_first(
+                (
+                    node
+                    for node in function.body
+                    if (
+                        isinstance(node, ast.With)
+                        and isinstance(node.items[0].context_expr, ast.Name)
+                        and node.items[0].context_expr.id
+                        == "controller_identity_state_lock"
+                    )
+                ),
+                f"{function_name} must acquire controller_identity_state_lock",
             )
             return [
                 target.id
@@ -29922,33 +29960,42 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertEqual(entry_argument.id, "entry")
 
     def test_primary_joint_pose_keys_match_widget_group_order(self):
-        primary_count_assignment = next(
-            node
-            for node in self.tree.body
-            if isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name)
-                and target.id == "PRIMARY_JOINT_COUNT"
-                for target in node.targets
-            )
+        primary_count_assignment = self.require_first(
+            (
+                node
+                for node in self.tree.body
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id == "PRIMARY_JOINT_COUNT"
+                    for target in node.targets
+                )
+            ),
+            "PRIMARY_JOINT_COUNT assignment must exist",
         )
-        position_keys_assignment = next(
-            node
-            for node in self.tree.body
-            if isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name)
-                and target.id == "CALIBRATION_POSITION_KEYS"
-                for target in node.targets
-            )
+        position_keys_assignment = self.require_first(
+            (
+                node
+                for node in self.tree.body
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id == "CALIBRATION_POSITION_KEYS"
+                    for target in node.targets
+                )
+            ),
+            "CALIBRATION_POSITION_KEYS assignment must exist",
         )
         primary_joint_count = ast.literal_eval(primary_count_assignment.value)
         position_keys = ast.literal_eval(position_keys_assignment.value)
         widget_groups = self.module_functions["_calibration_pose_widget_groups"]
-        return_node = next(
-            node
-            for node in widget_groups.body
-            if isinstance(node, ast.Return)
+        return_node = self.require_first(
+            (
+                node
+                for node in widget_groups.body
+                if isinstance(node, ast.Return)
+            ),
+            "_calibration_pose_widget_groups must return widget groups",
         )
         entry_names = tuple(
             entry.id
@@ -36655,16 +36702,19 @@ class HmiSourceContractTests(unittest.TestCase):
                 encoding="utf-8"
             ),
         )
-        runtime_assignment = next(
-            node
-            for node in self.tree.body
-            if isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Subscript)
-            and isinstance(node.targets[0].value, ast.Name)
-            and node.targets[0].value.id == "RUN"
-            and isinstance(node.targets[0].slice, ast.Constant)
-            and node.targets[0].slice.value == "minSpeedDelay"
+        runtime_assignment = self.require_first(
+            (
+                node
+                for node in self.tree.body
+                if isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Subscript)
+                and isinstance(node.targets[0].value, ast.Name)
+                and node.targets[0].value.id == "RUN"
+                and isinstance(node.targets[0].slice, ast.Constant)
+                and node.targets[0].slice.value == "minSpeedDelay"
+            ),
+            "startup must initialize RUN['minSpeedDelay']",
         )
 
         self.assertIsNotNone(distribution_match)

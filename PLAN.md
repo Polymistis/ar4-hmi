@@ -8,16 +8,7 @@ Development prioritizes mechanical self-protection, known controller state, nonb
 
 ## Authority
 
-`PLAN.md` is the source of truth for project scope, status, acceptance criteria, functionality, data-flow contracts, and architectural decisions. The concise roadmap controls prioritization and milestone status. The collapsed detailed-contract appendix is normative and must remain consistent with the roadmap.
-
-## Status vocabulary
-
-- `Proposed`: scope is defined; implementation has not started.
-- `In progress`: implementation exists but required integration or verification remains.
-- `Implemented`: repository behavior exists; later hardware verification may remain.
-- `Tested`: automated hardware-free checks exercise the stated behavior.
-- `Hardware-verified`: an authorized live-arm procedure produced recorded observations.
-- `Blocked`: a named prerequisite prevents acceptance work.
+`PLAN.md` is the source of truth for project scope, status, acceptance criteria, functionality, data-flow contracts, and architectural decisions. The detailed-contract appendix is normative. The roadmap is a non-normative navigation summary; any mismatch must be corrected against the appendix.
 
 ## Current baseline
 
@@ -27,197 +18,28 @@ Development prioritizes mechanical self-protection, known controller state, nonb
 - Runtime calibration and machine-specific state remain local. `defaults.json` is the tracked fallback calibration profile and contains saved machine parameters that require validation against connected hardware.
 - The latest recorded live controller deployment reported `6.7.1-ar4hmi.5`; later firmware revisions have hardware-free build coverage but still require deployment verification.
 
-## Milestones
-
-### M0 - Repository baseline
-
-Status: `Implemented`
-
-Acceptance criteria:
-
-- The imported AR4 control-software baseline remains identifiable in Git history.
-- Runtime calibration, captured images, error logs, and machine-specific state remain outside version control.
-
-### M1 - Application requirements
-
-Status: `Blocked`
-
-Blocking condition: robot configuration, target workflow, end effector, payload, workspace, external I/O, failure recovery, and measurable performance targets remain incomplete.
-
-Acceptance criteria:
-
-- Target workflows, end effector, payload, workspace, external I/O, failure recovery, and non-goals are explicit.
-- Accuracy, repeatability, latency, speed, duty-cycle, and maintenance targets are measurable before application-specific optimization is accepted.
-
-### M2 - Testable HMI transport boundary
-
-Status: `Implemented`
-
-Acceptance criteria:
-
-- Testable transport, framing, validation, and motion-queue modules operate with deterministic fakes and cannot connect to hardware during import.
-- Controller protocol behavior remains separate from GUI construction.
-
-### M2B - Application lifecycle separation
-
-Status: `In progress`
-
-Acceptance criteria:
-
-- Application import, GUI construction, configuration loading, serial connection, and controller synchronization become explicit lifecycle operations.
-- Importing the application entry point cannot construct the GUI or schedule a saved controller connection.
-- Runtime configuration is schema-validated before use.
-
-Implemented work includes schema-validated runtime profiles, startup workers, and an entry-point import guard. Explicit GUI construction and connection lifecycle operations remain incomplete.
-
-### M3 - HMI motion regression foundation
-
-Status: `Tested`
-
-Acceptance criteria:
-
-- Hardware-free tests cover command serialization, response parsing, coalescing, deferred input, transport release, timeout, quarantine, and Tk event handoff.
-- Source-contract tests inspect HMI routing without importing `AR4.py`.
-
-### M3B - Broader regression foundation
-
-Status: `In progress`
-
-Acceptance criteria:
-
-- `.ar4` parsing, editing, navigation, and execution-state transitions have focused tests.
-- Kinematics, calibration conversion, firmware compatibility, and recovery boundaries have deterministic fixtures without hardware activation.
-
-Existing fixtures cover program navigation and execution, native kinematics, calibration, and firmware contracts. Broader parser, editor, and execution-state coverage remains incomplete.
-
-### M4 - Purpose-specific optimization
-
-Status: `Blocked`
-
-Blocking condition: M1 application, hardware, safety, workflow, and measurement inputs are required before purpose-specific optimization can be accepted. Authorized host-only HMI work continues under M4A and M4A2.
-
-Acceptance criteria:
-
-- Each optimization has a documented baseline, target, and measurement method.
-- Changes preserve joint limits, state validation, stop handling, and protocol compatibility.
-
-### M4A - Responsive motion controls
-
-Status: `Implemented`
-
-Acceptance criteria:
-
-- Covered joint and live-jog callbacks perform no serial read, fixed sleep, or motion wait on Tk.
-- Input recorded during an active coordinated move coalesces into the latest semantic target from confirmed controller state.
-- Uncertain transmission or framing blocks later motion until explicit resynchronization.
-
-Delivered behavior includes exact J1-J6 keyboard targets, coalesced slider and jog input, request-scoped transport ownership, bounded response handling, and Tk event-queue settlement.
-
-### M4A2 - HMI boundary completion
-
-Status: `In progress`
-
-Acceptance criteria:
-
-- Remaining program-owned Modbus, auxiliary `Read COM`, and auxiliary connection paths perform no blocking work in Tk callbacks.
-- Worker threads never read or mutate Tk widgets.
-- Event-loop, serial, rendering, and persistence timing is recorded before and after completion.
-- Event-queue settlement remains durable when Tk scheduling is unavailable.
-- The auxiliary-device worker startup/shutdown ownership race is resolved and regression tested.
-
-### M4A3 - Delivered 7.0/2.0 baseline audit
-
-Status: `Tested`
-
-Acceptance criteria:
-
-- Delivered archives remain isolated comparison inputs.
-- Host, firmware, native kinematics, configuration, packaging, and protocol deltas are classified before integration.
-- Baseline replacement requires an explicit decision supported by hardware-free evidence.
-
-The audit selected targeted integration into the hardened 6.7 derivative rather than replacement by the delivered 7.0 host.
-
-### M4A4 - Selective 7.0/2.0 integration
-
-Status: `In progress`
-
-Acceptance criteria:
-
-- Host and firmware protocol changes land together with deterministic compatibility fixtures.
-- Configuration migration rejects malformed, non-finite, or out-of-range values before mutation.
-- Firmware sources compile without upload before any controlled deployment.
-- Optional CAD and EOAT functionality remains isolated from normal startup and dependencies.
-
-Implemented work includes configured native inverse kinematics, singularity continuity, command-local wrist propagation, strict calibration schemas, strict Teensy numeric parsing, and bounded Nano/Mega compatibility commands. Remaining work covers command-domain completion, typed switch polarity, correlated JSON design, and selective auxiliary JSON capabilities.
-
-### M4A5 - Desired, target, estimate, and encoder display
-
-Status: `Tested`
-
-Acceptance criteria:
-
-- Desired input, active command target, command estimate, and validated encoder sample remain distinct visual channels.
-- Marker updates run on Tk without serial I/O or worker waits.
-- Source loss, quarantine, malformed telemetry, or unsupported axes never fabricate encoder data.
-
-### M4A6 - Main-control workspace and named positions
-
-Status: `Tested`
-
-Acceptance criteria:
-
-- Joint, Cartesian, and Tool Frame controls occupy separate tabs with consistent jog presentation.
-- Start Position uses the canonical post-calibration pose.
-- Shutdown Position uses fresh controller-reported J2 and J3 home references while retaining centered J1.
-
-### M4A7 - Low-priority joint encoder telemetry
-
-Status: `Blocked`
-
-Blocking condition: powered acceptance requires fresh work-envelope confirmation and powered verification of the independent physical stop path.
-
-Acceptance criteria:
-
-- `JOINT_TELEMETRY_V1` remains request-scoped to coordinated joint motion and optional for older controllers.
-- Telemetry work yields to pulse timing, terminal framing, and emergency-event ownership; USB backpressure drops samples without delaying control work.
-- Controlled testing measures cadence, encoder accuracy, USB load, terminal priority, and worst-case pulse timing at representative speeds with telemetry enabled and disabled.
-- Results identify the deployed controller and firmware and remain separate from estimator or mocked-transport evidence.
-
-### M4B - Repeatability and dynamic interception
-
-Status: `Proposed`
-
-Acceptance criteria:
-
-- Accuracy, repeatability, backlash, latency, payload effects, and workspace constraints are measured.
-- Deterministic simulation and recorded-observation replay exercise state estimation, prediction, reachable intercept selection, and continuous replanning.
-- Acceleration, deceleration, and jerk-limited trajectories are tuned from recorded controller traces.
-- Stale perception, uncertainty, collision, singularity, joint-limit, timeout, and failed-grasp behavior is explicit.
-
-### M5 - Controlled hardware validation
-
-Status: `Blocked`
-
-Blocking condition: every powered procedure requires fresh work-envelope confirmation and powered verification of the independent physical stop path.
-
-Acceptance criteria:
-
-- Physical driver microstep settings or measured motion scale match the active profile before any calibration reference or powered-motion result is accepted.
-- Every live record includes date, controller and firmware identity, configuration profile, starting state, exact executed procedure, observed result, and operator confirmation.
-- Planned motion uses conservative limits, named abort conditions, and explicit recovery steps.
-- Results distinguish observed hardware behavior from compilation, simulation, static analysis, and mocked serial traffic.
-
-## Architectural decisions
-
-- Preserve the current directory layout until startup and asset-path dependencies are isolated.
-- Keep mutable calibration, captured images, error logs, and hardware-specific runtime state outside version control.
-- Treat host commands, firmware parsers, native kinematics bindings, and `.ar4` programs as versioned integration contracts.
-- Queue semantic targets rather than raw UI events; coordinate spaces remain separate until recomputed from confirmed state.
-- Keep desktop command coalescing separate from future real-time servo and replaceable-setpoint control.
-- Retain the hardened 6.7 derivative and use delivered 7.0/2.0 sources only for selective integration.
-- Require matching host and firmware changes for protocol revisions.
-- Never infer live-arm behavior from automated checks.
-- Preserve automatic saved-controller connection during direct HMI launch. Starting the application is explicit admission for the bounded connection, validated configuration, position synchronization, auxiliary reset, and firmware-defined initialization sequence. Main-controller startup sends no motor-drive command; later HMI output commands require separate admission.
+## Roadmap
+
+Status terms and complete acceptance criteria are defined in the detailed-contract appendix.
+
+| Milestone | Status | Current focus |
+| --- | --- | --- |
+| M0 - Repository baseline | `Implemented` | Preserve the imported baseline and public project boundary. |
+| M1 - Application requirement capture | `Blocked` | Record the missing workflow, hardware, payload, workspace, I/O, recovery, and performance targets. |
+| M2 - Testable HMI transport boundary | `Implemented` | Maintain deterministic transport, framing, validation, and motion-queue seams. |
+| M2B - Application lifecycle separation | `In progress` | Separate GUI construction, configuration, serial connection, and synchronization. |
+| M3 - HMI motion regression foundation | `Tested` | Maintain transport, coalescing, timeout, quarantine, and Tk handoff coverage. |
+| M3B - Broader regression foundation | `In progress` | Expand program parser, editor, execution, kinematics, calibration, firmware, and recovery coverage. |
+| M4 - Purpose-specific optimization | `Blocked` | Continue authorized host-only HMI work while application measurements remain unavailable. |
+| M4A - HMI responsiveness pass | `Implemented` | Preserve nonblocking motion controls, semantic coalescing, and explicit ownership. |
+| M4A2 - HMI boundary completion | `In progress` | Finish remaining Tk boundaries, timing evidence, and auxiliary lifecycle ownership. |
+| M4A3 - Delivered 7.0/2.0 baseline audit | `Tested` | Retain the selective-integration decision. |
+| M4A4 - Selective 7.0/2.0 integration | `In progress` | Complete command domains, typed switch polarity, correlated protocol design, and selected auxiliary capabilities. |
+| M4A5 - Desired-versus-estimated-and-encoder joint display | `Tested` | Keep desired, active-target, estimate, and encoder channels distinct. |
+| M4A6 - Main-control workspace and named positions | `Tested` | Maintain tabbed controls and validated Start and Shutdown positions. |
+| M4A7 - Low-priority joint encoder telemetry | `Blocked` | Implementation remains in progress; powered acceptance prerequisites remain unmet. |
+| M4B - Repeatability and dynamic interception pass | `Proposed` | Define measurement, simulation, prediction, trajectory, and replanning work. |
+| M5 - Controlled hardware validation | `Blocked` | Await the prerequisites defined by the controlled verification contract. |
 
 ## Verification records
 
@@ -281,12 +103,15 @@ Status: `Implemented`
 
 Acceptance criteria:
 
-- Original source preserved in a local Git baseline.
+- The imported AR4 control-software baseline remains identifiable in Git history.
+- Runtime calibration, transient capture files, error logs, and machine-specific runtime state remain outside version control. Reusable vision templates may be tracked as project assets.
 - Project safety and verification boundaries are tracked.
 
 ### M1 - Application requirement capture
 
 Status: `Blocked`
+
+Blocking condition: robot configuration, target workflow, end effector, payload, workspace, external I/O, failure recovery, and measurable performance targets remain incomplete.
 
 Recorded priorities:
 
@@ -309,8 +134,8 @@ Required inputs:
 
 Acceptance criteria:
 
-- Target workflow and non-goals are explicit.
-- Measurable performance and safety constraints are recorded.
+- Target workflow, end effector, payload, workspace, external I/O, failure recovery, and non-goals are explicit.
+- Accuracy, repeatability, latency, speed, duty-cycle, maintenance, and safety constraints are measurable.
 - Hardware and software boundaries are identified.
 - Priority order is approved before hardware optimization work begins.
 
@@ -334,7 +159,7 @@ Acceptance criteria:
 - Importing the application entry point cannot construct the GUI or schedule a saved controller connection.
 - Runtime configuration is schema-validated before use.
 
-Implemented work includes schema-validated runtime profiles, startup workers, and an entry-point import guard. Explicit GUI construction and connection lifecycle operations remain incomplete.
+Implemented work includes schema-validated runtime profiles, startup workers, and an interim entry-point import guard. M2B acceptance requires replacing that guard with side-effect-free import and explicit construction and connection lifecycle operations. Direct execution must continue scheduling the saved-controller connection.
 
 ### M3 - HMI motion regression foundation
 
@@ -352,8 +177,8 @@ Status: `In progress`
 
 Acceptance criteria:
 
-- `.ar4` parsing, editing, and execution-state transitions have focused tests.
-- Kinematics boundary behavior and calibration conversion have deterministic tests.
+- `.ar4` parsing, editing, navigation, and execution-state transitions have focused tests.
+- Kinematics boundary behavior, calibration conversion, and recovery boundaries have deterministic tests.
 - Firmware protocol fixtures cover command compatibility without energizing motors.
 
 Existing fixtures cover program navigation and execution, native kinematics, calibration, and firmware contracts. Broader parser, editor, and execution-state coverage remains incomplete.
@@ -368,8 +193,8 @@ Blocking condition: M1 hardware identity, workflow, safety, and performance inpu
 
 Acceptance criteria:
 
-- Baseline measurement and target are documented.
-- Changes preserve safety invariants and protocol compatibility.
+- Baseline measurement, target, and measurement method are documented.
+- Changes preserve joint limits, state validation, stop handling, safety invariants, and protocol compatibility.
 - Automated evidence demonstrates the intended improvement.
 
 ### M4A - HMI responsiveness pass
@@ -611,6 +436,8 @@ Acceptance criteria:
 - Worker threads do not read or mutate Tk widgets.
 - Discrete motion, program execution, and remaining stop paths have explicit preemption and response ownership; the live-jog path has that ownership now.
 - Baseline and post-change event-loop, serial, render, and persistence timings are recorded.
+- Event-queue settlement remains durable when Tk scheduling is unavailable.
+- The auxiliary-device worker startup/shutdown ownership race is resolved and regression tested.
 - J1-J6 position fields provide validated exact keyboard targets through the
   existing semantic queue, and asynchronous position refreshes do not overwrite
   active edits.
@@ -1407,8 +1234,10 @@ Acceptance criteria:
 - The tracked Teensy source compiles without upload for Teensy 4.1 with the
   pinned toolchain.
 - Hardware verification remains pending for observed cadence, encoder accuracy,
-  USB load, terminal priority, and pulse-timing behavior across representative
-  speeds and simultaneous-axis moves.
+  USB load, terminal priority, and pulse-timing behavior with telemetry enabled
+  and disabled across representative speeds and simultaneous-axis moves.
+- Results identify the deployed controller and firmware and remain separate from
+  estimator output, mocked transports, and other hardware-free evidence.
 - During drive-off deployment on 2026-07-29, Arduino CLI returned exit code
   `0`, and the re-enumerated Teensy 4.1 hardware identity `1705B6`
   self-reported version `6.7.1-ar4hmi.5`. Live `HO` and `H2` responses reported
@@ -1436,8 +1265,9 @@ Research direction:
 
 Acceptance criteria:
 
-- Accuracy, repeatability, latency, speed, payload, workspace, and grasp thresholds are measurable.
+- Accuracy, repeatability, backlash, latency, speed, payload, workspace, and grasp thresholds are measurable.
 - A deterministic simulator and recorded-observation replay path exercise estimator, predictor, feasibility, and replanning behavior.
+- Acceleration, deceleration, and jerk-limited trajectories are tuned from recorded controller traces.
 - Stale data, uncertainty, collision, singularity, joint-limit, controller-timeout, and failed-grasp behavior are explicit.
 - Hardware experiments follow M5 and distinguish observed results from simulation.
 
@@ -1453,8 +1283,9 @@ powered M5 procedure.
 
 Acceptance criteria:
 
-- Authorized procedure identifies firmware, configuration, start pose, speed limits, expected motion, abort conditions, and recovery steps.
+- Authorized procedure identifies firmware, configuration, start pose, conservative speed limits, expected motion, named abort conditions, and recovery steps.
 - Physical emergency stop is tested before commanded movement.
+- Every live record satisfies the complete [`SAFETY.md`](SAFETY.md) live-verification field contract, including conservative limits and abort conditions.
 - Results distinguish observed hardware behavior from software-only evidence.
 - Deviations become tracked requirements or defects before broader operation.
 - Commissioning verifies physical driver microstep settings or measured motion
@@ -1496,11 +1327,13 @@ Known M5 deviations:
 ## Architectural decisions
 
 - Preserve the current directory layout until startup and asset-path dependencies are isolated.
-- Keep mutable calibration, captured images, error logs, and local development artifacts outside version control.
+- Keep mutable calibration, transient capture files, error logs, machine-specific runtime state, and local development artifacts outside version control. Reusable vision templates may be tracked as project assets.
 - Treat host commands, firmware parsers, native kinematics bindings, and `.ar4` programs as versioned integration contracts.
 - Queue semantic targets, not raw input events. Joint, Cartesian, and tool-frame intents cannot be merged across coordinate spaces without recomputation from confirmed state.
 - Keep desktop command coalescing separate from future real-time servo and trajectory-control loops.
 - Retain the current hardened baseline and use delivered 7.0/2.0 sources only as isolated selective-integration input under M4A4.
+- Require matching host and firmware changes for protocol revisions.
+- Never infer live-arm behavior from automated checks.
 - Preserve automatic saved-controller connection during direct HMI launch. Starting the application is explicit admission for the bounded connection, validated configuration, position synchronization, auxiliary reset, and firmware-defined initialization sequence. Main-controller startup sends no motor-drive command; later HMI output commands require separate admission.
 
 ## Current implementation boundary
