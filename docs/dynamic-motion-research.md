@@ -145,9 +145,43 @@ byte-level hashes therefore identify encoded files rather than logical replay
 equivalence.
 
 Current scope stops before acceleration estimation, transforms, innovation
-tests, impacts, reachability, IK, collision checking, trajectory generation,
+tests, impacts, production IK or collision checking, trajectory generation,
 controller setpoint replacement, or grasp supervision. No live-arm result is
 established by the deterministic module or associated tests.
+
+## Implemented deterministic intercept selection
+
+`ARrobots.interception` extends the hardware-free foundation through bounded
+intercept-time selection. Configuration defines a coordinate frame, estimate
+age and future-skew limits, minimum and maximum lead times, a sampling
+interval, maximum predicted position standard deviation, maximum terminal
+object speed, and minimum arrival margin. Configuration rejects a lead-time
+interval that cannot produce strictly advancing samples. Selector construction
+fails when the predictor cannot cover the permitted estimate age plus lead
+time, and selection fails when absolute timestamps cannot represent strictly
+advancing candidates.
+
+Each predicted state first passes the uncertainty and terminal-speed limits.
+A deterministic injected evaluator then classifies production-feasibility
+domains as feasible, unreachable, joint-limited, singular, colliding, or
+missing an arrival-time estimate. A feasible result supplies the minimum robot
+arrival duration measured from the selector evaluation timestamp and an
+application-defined non-negative risk score. The selector compares the largest
+per-axis predicted position standard deviation with the uncertainty limit,
+enforces the arrival margin, and ranks accepted candidates by risk, predicted
+timestamp, and original candidate order. The evaluator receives the predicted
+state and selection timestamp. Stale and future estimates return explicit
+non-selected statuses without invoking the evaluator. Exceptions or malformed
+evaluator output fail the selection boundary.
+
+`select_replay_intercepts` validates the complete recorded estimator sequence
+and the bounded record-by-candidate workload before feasibility evaluation,
+then recomputes selection after every estimate update. That behavior exercises
+deterministic target reselection after new observations; no geometric path,
+trajectory, controller setpoint, or grasp is generated. The injected evaluator
+provides simulation decisions only and does not establish physical
+reachability, collision clearance, singularity margin, joint-limit compliance,
+or arrival performance.
 
 ## Product constraints requiring later decisions
 

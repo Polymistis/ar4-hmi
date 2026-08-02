@@ -38,7 +38,7 @@ Status terms and complete acceptance criteria are defined in the detailed-contra
 | M4A5 - Desired-versus-estimated-and-encoder joint display | `Tested` | Keep desired, active-target, estimate, and encoder channels distinct. |
 | M4A6 - Main-control workspace and named positions | `Tested` | Maintain tabbed controls and validated Start and Shutdown positions. |
 | M4A7 - Low-priority joint encoder telemetry | `Blocked` | Implementation remains in progress; powered acceptance prerequisites remain unmet. |
-| M4B - Repeatability and dynamic interception pass | `In progress` | Exercise deterministic observation replay, state estimation, and bounded prediction. |
+| M4B - Repeatability and dynamic interception pass | `In progress` | Extend deterministic observation replay through bounded intercept selection. |
 | M5 - Controlled hardware validation | `Blocked` | Await the prerequisites defined by the controlled verification contract. |
 
 ## Verification records
@@ -1303,9 +1303,34 @@ Implemented foundation:
   record cannot leave a caller-owned estimator partially advanced.
 - Deterministic hardware-free tests cover validation, estimator reset and
   rejection behavior, covariance propagation, bounded prediction, canonical
-  record round trips, and replay failures. No controller command, live motion,
-  acceleration model, reachability decision, trajectory generation, or grasp
-  behavior is included in the current foundation.
+  record round trips, and replay failures.
+- `ARrobots.interception` samples a configured bounded lead-time horizon and
+  rejects candidates whose predicted covariance, terminal object speed, or
+  arrival margin violates an explicit threshold. Selector construction
+  requires the predictor horizon to cover the permitted estimate age and
+  candidate lead time. Configuration rejects lead-time samples that cannot
+  advance in the host numeric range, and selection rejects indistinguishable
+  absolute candidate timestamps.
+- A deterministic injected feasibility boundary represents production IK,
+  joint-limit, singularity, collision, and minimum-arrival-time decisions.
+  Feasible results carry a non-negative application risk score. Selection uses
+  the lowest score, then the earliest predicted timestamp, then candidate
+  order as stable tie-breaks. Invalid evaluator output or an evaluator failure
+  aborts selection instead of converting the failure into a feasible result.
+- Selection reports stale estimates, future estimates, unavailable feasible
+  candidates, and every configured rejection class explicitly. Recorded
+  observation replay validates the complete estimator input sequence before
+  invoking feasibility logic, bounds the total record-by-candidate evaluation
+  workload, then recomputes an intercept selection after every estimate update
+  using the matching receipt timestamp.
+- Hardware-free tests cover selection configuration and result invariants,
+  threshold boundaries, deterministic ranking, explicit feasibility
+  rejections, arrival timing, stale and future estimates, callback failures,
+  numeric precision limits, and replay-driven reselection. The injected
+  feasibility boundary is simulation input, not evidence of physical
+  reachability. No controller command, live motion, calibrated transform,
+  acceleration model, production IK or collision engine, trajectory
+  generation, local path replanning, or grasp behavior is included.
 
 ### M5 - Controlled hardware validation
 
