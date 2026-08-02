@@ -758,6 +758,7 @@ auxiliary_device_worker_active = threading.Event()
 auxiliary_device_cancel_requested = threading.Event()
 auxiliary_device_active_request = None
 auxiliary_device_active_serial = None
+auxiliary_device_retained_serials = []
 auxiliary_device_pending_result = None
 auxiliary_device_next_request_id = 0
 manual_controller_event_queue = Queue()
@@ -5146,6 +5147,20 @@ def _poll_application_close():
         logger.error(
           "Auxiliary-device serial close remained incomplete; process exit "
           "will retire the read-only handle"
+        )
+      try:
+        retained_auxiliary_closed = (
+          _close_retained_auxiliary_device_serials()
+        )
+      except Exception:
+        logger.exception(
+          "Unable to close retained auxiliary-device serial handles"
+        )
+        retained_auxiliary_closed = False
+      if not retained_auxiliary_closed:
+        logger.error(
+          "Retained auxiliary-device serial cleanup remained incomplete; "
+          "process exit will retire the read-only handles"
         )
   finally:
     auxiliary_serial_lock.release()
@@ -24171,21 +24186,23 @@ def _reconcile_auxiliary_device_serial_ownership(request, context):
 
   with auxiliary_device_state_lock:
     if auxiliary_device_active_request is not request:
-      raise RuntimeError("auxiliary-device serial ownership changed")
+      raise RuntimeError("auxiliary-device request ownership changed")
+    if not isinstance(auxiliary_device_retained_serials, list):
+      raise RuntimeError("retained auxiliary-device serial state is invalid")
     active_serial = auxiliary_device_active_serial
     bound_serial = RUN.get('ser3')
     if active_serial is bound_serial:
       return bound_serial, False, ()
-    serial_ports = []
-    for serial_port in (active_serial, bound_serial):
-      if serial_port is not None and all(
-        retained_port is not serial_port for retained_port in serial_ports
-      ):
-        serial_ports.append(serial_port)
+    serial_ports = tuple(
+      serial_port
+      for serial_port in (active_serial, bound_serial)
+      if serial_port is not None
+    )
     RUN['ser3'] = None
     auxiliary_device_active_serial = None
 
   errors = []
+  retained_serials = []
   for serial_port in serial_ports:
     with auxiliary_device_state_lock:
       if auxiliary_device_active_request is not request:
@@ -24201,11 +24218,20 @@ def _reconcile_auxiliary_device_serial_ownership(request, context):
         )
       RUN['ser3'] = serial_port
       auxiliary_device_active_serial = serial_port
+    closed = False
+    cleanup_error = None
     try:
       closed, cleanup_error = _settle_auxiliary_device_serial(
         serial_port,
         context,
       )
+      if not isinstance(closed, bool) or (
+        cleanup_error is not None
+        and not isinstance(cleanup_error, Exception)
+      ):
+        raise RuntimeError(
+          "auxiliary-device serial recovery returned invalid state"
+        )
       if cleanup_error is not None:
         errors.append(cleanup_error)
       if not closed:
@@ -24213,10 +24239,22 @@ def _reconcile_auxiliary_device_serial_ownership(request, context):
           errors.append(
             OSError("auxiliary-device serial recovery did not settle")
           )
-        break
     except Exception as exc:
       errors.append(exc)
-      break
+    if closed:
+      continue
+    with auxiliary_device_state_lock:
+      if (
+        auxiliary_device_active_request is not request
+        or RUN.get('ser3') is not serial_port
+        or auxiliary_device_active_serial is not serial_port
+      ):
+        raise RuntimeError(
+          "auxiliary-device failed recovery lost serial ownership"
+        )
+      RUN['ser3'] = None
+      auxiliary_device_active_serial = None
+    retained_serials.append(serial_port)
 
   with auxiliary_device_state_lock:
     if auxiliary_device_active_request is not request:
@@ -24227,8 +24265,73 @@ def _reconcile_auxiliary_device_serial_ownership(request, context):
       raise RuntimeError(
         "auxiliary-device serial recovery left inconsistent ownership"
       )
+    for serial_port in retained_serials:
+      if all(
+        retained_port is not serial_port
+        for retained_port in auxiliary_device_retained_serials
+      ):
+        auxiliary_device_retained_serials.append(serial_port)
     retained_serial = auxiliary_device_active_serial
   return retained_serial, True, tuple(errors)
+
+
+def _close_retained_auxiliary_device_serials():
+  with auxiliary_device_state_lock:
+    if (
+      auxiliary_device_active_request is not None
+      or auxiliary_device_active_serial is not None
+    ):
+      raise RuntimeError(
+        "retained auxiliary-device cleanup found active ownership"
+      )
+    if not isinstance(auxiliary_device_retained_serials, list):
+      raise RuntimeError("retained auxiliary-device serial state is invalid")
+    retained_serials = tuple(auxiliary_device_retained_serials)
+
+  all_closed = True
+  for serial_port in retained_serials:
+    errors = []
+    try:
+      close = getattr(serial_port, "close", None)
+      if not callable(close):
+        raise TypeError("retained auxiliary-device serial close is unavailable")
+      close()
+    except Exception as exc:
+      errors.append(exc)
+    try:
+      is_open = getattr(serial_port, "is_open", None)
+      if not isinstance(is_open, bool):
+        raise TypeError(
+          "retained auxiliary-device serial open state is invalid"
+        )
+    except Exception as exc:
+      errors.append(exc)
+      is_open = True
+    if is_open:
+      all_closed = False
+      if not errors:
+        errors.append(OSError("retained auxiliary-device serial did not close"))
+    else:
+      with auxiliary_device_state_lock:
+        for index, retained_port in enumerate(
+          auxiliary_device_retained_serials
+        ):
+          if retained_port is serial_port:
+            auxiliary_device_retained_serials.pop(index)
+            break
+        else:
+          raise RuntimeError(
+            "retained auxiliary-device serial ownership changed during close"
+          )
+    for error in errors:
+      logger.error(
+        "Retained auxiliary-device serial cleanup error: %s",
+        _auxiliary_device_error_detail(
+          error,
+          "retained auxiliary-device serial cleanup failed",
+        ),
+      )
+  return all_closed
 
 
 def _publish_auxiliary_device_result(request, result):
@@ -24616,6 +24719,14 @@ def _request_auxiliary_device_read(port_value, read_size_value):
         if auxiliary_device_active_serial is not None:
           raise RuntimeError(
             "inactive auxiliary-device request retained a serial owner"
+          )
+        if not isinstance(auxiliary_device_retained_serials, list):
+          raise RuntimeError(
+            "retained auxiliary-device serial state is invalid"
+          )
+        if auxiliary_device_retained_serials:
+          raise MotionInputError(
+            "previous auxiliary-device serial cleanup remains pending"
           )
         if (
           isinstance(auxiliary_device_next_request_id, bool)

@@ -1292,6 +1292,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "_reconcile_auxiliary_device_serial_ownership": (
                 "_settle_auxiliary_device_serial",
             ),
+            "_close_retained_auxiliary_device_serials": (
+                "_auxiliary_device_error_detail",
+            ),
             "_auxiliary_device_error_detail": (
                 "_auxiliary_device_detail_prefix",
             ),
@@ -1725,6 +1728,10 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace.setdefault("_poll_auxiliary_device_events", lambda: None)
         namespace.setdefault("_cancel_auxiliary_device_read", lambda: False)
         namespace.setdefault("_auxiliary_device_read_pending", lambda: False)
+        namespace.setdefault(
+            "_close_retained_auxiliary_device_serials",
+            lambda: True,
+        )
         namespace.setdefault("_poll_gcode_storage_events", lambda: None)
         namespace.setdefault(
             "_poll_called_program_navigation_events",
@@ -9910,6 +9917,7 @@ class HmiSourceContractTests(unittest.TestCase):
         worker_active = threading.Event()
         worker_active.set()
         close_calls = []
+        retained_close_calls = []
         errors = []
         namespace = {
             **type_namespace,
@@ -9934,6 +9942,9 @@ class HmiSourceContractTests(unittest.TestCase):
             "root": root,
             "_close_serial_port": (
                 lambda name: close_calls.append(name) or name != "ser3"
+            ),
+            "_close_retained_auxiliary_device_serials": (
+                lambda: retained_close_calls.append(True) or True
             ),
             "_poll_serial_events": lambda: None,
             "_poll_auxiliary_serial_events": lambda: None,
@@ -9974,6 +9985,7 @@ class HmiSourceContractTests(unittest.TestCase):
 
         self.assertTrue(root.jobs.pop(0)[1]())
         self.assertEqual(close_calls, ["ser", "ser2", "ser3"])
+        self.assertEqual(retained_close_calls, [True])
         self.assertEqual(root.destroy_count, 1)
         self.assertTrue(any("process exit" in entry[0] for entry in errors))
 
@@ -15542,6 +15554,7 @@ class HmiSourceContractTests(unittest.TestCase):
             read_size=2,
             stale_port=None,
             cancel_after_read=False,
+            cancel_before_recovery=False,
             active_serial=default_active_serial,
         ):
             runtime = {"ser3": stale_port}
@@ -15550,6 +15563,8 @@ class HmiSourceContractTests(unittest.TestCase):
             worker_active = threading.Event()
             worker_active.set()
             cancellation = threading.Event()
+            if cancel_before_recovery:
+                cancellation.set()
             if port is not None and cancel_after_read:
                 port.read_callback = cancellation.set
             request_type_namespace = {
@@ -15594,6 +15609,7 @@ class HmiSourceContractTests(unittest.TestCase):
                     if active_serial is default_active_serial
                     else active_serial
                 ),
+                "auxiliary_device_retained_serials": [],
                 "auxiliary_device_pending_result": None,
                 "application_closing": threading.Event(),
                 "time": SimpleNamespace(
@@ -15790,6 +15806,31 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIsNone(namespace["RUN"]["ser3"])
         self.assertIsNone(namespace["auxiliary_device_active_serial"])
 
+        retained_conflicting_port = Port(b"active", close_failures=10)
+        detached_conflicting_port = Port(b"bound", close_failures=1)
+        succeeded, result, namespace, serial_calls, logs, sleep_delays = run_case(
+            Port(b"OK"),
+            stale_port=detached_conflicting_port,
+            active_serial=retained_conflicting_port,
+            cancel_before_recovery=True,
+        )
+        self.assertFalse(succeeded)
+        self.assertEqual(result.outcome, "cancelled")
+        self.assertIn("recovered inconsistent serial ownership", result.value)
+        self.assertIn("did not close", result.value)
+        self.assertEqual(retained_conflicting_port.close_calls, 3)
+        self.assertEqual(detached_conflicting_port.close_calls, 2)
+        self.assertFalse(detached_conflicting_port.is_open)
+        self.assertEqual(serial_calls, [])
+        self.assertEqual(sleep_delays, [1.0, 1.0, 1.0])
+        self.assertIsNone(namespace["RUN"]["ser3"])
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
+        self.assertEqual(
+            namespace["auxiliary_device_retained_serials"],
+            [retained_conflicting_port],
+        )
+        self.assertTrue(any("process exit" in str(entry) for entry in logs))
+
         retained_port = Port(b"OK", close_failures=10)
         succeeded, result, namespace, _, logs, sleep_delays = run_case(
             retained_port,
@@ -15852,6 +15893,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "auxiliary_device_cancel_requested": threading.Event(),
             "auxiliary_device_active_request": request,
             "auxiliary_device_active_serial": None,
+            "auxiliary_device_retained_serials": [],
             "auxiliary_device_pending_result": None,
             "application_closing": threading.Event(),
             "_run_auxiliary_device_read": terminate_worker,
@@ -15919,6 +15961,46 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIsNone(namespace["auxiliary_device_active_serial"])
         self.assertTrue(pending())
 
+    def test_retained_auxiliary_device_serials_are_retried_for_shutdown(self):
+        class Port:
+            def __init__(self):
+                self.is_open = True
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_calls > 1:
+                    self.is_open = False
+
+        serial_port = Port()
+        errors = []
+        namespace = {
+            "RUN": {"ser3": None},
+            "auxiliary_device_state_lock": threading.Lock(),
+            "auxiliary_device_active_request": None,
+            "auxiliary_device_active_serial": None,
+            "auxiliary_device_retained_serials": [serial_port],
+            "logger": SimpleNamespace(
+                error=lambda *args: errors.append(args),
+            ),
+        }
+        close_retained = self.compile_function(
+            "_close_retained_auxiliary_device_serials",
+            namespace,
+        )
+
+        self.assertFalse(close_retained())
+        self.assertEqual(serial_port.close_calls, 1)
+        self.assertEqual(
+            namespace["auxiliary_device_retained_serials"],
+            [serial_port],
+        )
+        self.assertTrue(errors)
+
+        self.assertTrue(close_retained())
+        self.assertEqual(serial_port.close_calls, 2)
+        self.assertEqual(namespace["auxiliary_device_retained_serials"], [])
+
     def test_auxiliary_device_admission_and_result_retry_are_owned(self):
         class CapturedThread:
             instances = []
@@ -15981,6 +16063,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "auxiliary_device_cancel_requested": threading.Event(),
             "auxiliary_device_active_request": None,
             "auxiliary_device_active_serial": None,
+            "auxiliary_device_retained_serials": [],
             "auxiliary_device_pending_result": None,
             "auxiliary_device_next_request_id": 0,
             "application_closing": threading.Event(),
@@ -16169,6 +16252,19 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace["auxiliary_device_active_serial"] = None
             namespace["auxiliary_device_read_active"].clear()
             namespace["auxiliary_device_cancel_requested"].clear()
+
+        retained_serial = object()
+        namespace["auxiliary_device_retained_serials"].append(retained_serial)
+        self.assertFalse(request_read("14", "2"))
+        self.assertEqual(
+            statuses[-1],
+            (
+                "AUXILIARY COM READ REJECTED: previous auxiliary-device "
+                "serial cleanup remains pending",
+                "Alarm.TLabel",
+            ),
+        )
+        namespace["auxiliary_device_retained_serials"].clear()
 
     def test_auxiliary_device_cancellation_and_result_settlement_are_owned(self):
         class Port:
