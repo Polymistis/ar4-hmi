@@ -1268,6 +1268,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
             },
             "_run_auxiliary_device_read": (
+                "_reconcile_auxiliary_device_serial_ownership",
                 "_auxiliary_device_read_cancelled",
                 "_settle_auxiliary_device_serial",
                 "_auxiliary_device_error_detail",
@@ -1276,6 +1277,7 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_run_auxiliary_device_read_safe": (
                 "_run_auxiliary_device_read",
+                "_reconcile_auxiliary_device_serial_ownership",
                 "_settle_auxiliary_device_serial",
                 "_auxiliary_device_read_cancelled",
                 "_auxiliary_device_error_detail",
@@ -1286,6 +1288,9 @@ class HmiSourceContractTests(unittest.TestCase):
                 "_close_auxiliary_device_serial",
                 "_auxiliary_device_read_cancelled",
                 "_auxiliary_device_error_detail",
+            ),
+            "_reconcile_auxiliary_device_serial_ownership": (
+                "_settle_auxiliary_device_serial",
             ),
             "_auxiliary_device_error_detail": (
                 "_auxiliary_device_detail_prefix",
@@ -15528,6 +15533,8 @@ class HmiSourceContractTests(unittest.TestCase):
                 if self.close_calls > self.close_failures:
                     self.is_open = False
 
+        default_active_serial = object()
+
         def run_case(
             port=None,
             *,
@@ -15535,6 +15542,7 @@ class HmiSourceContractTests(unittest.TestCase):
             read_size=2,
             stale_port=None,
             cancel_after_read=False,
+            active_serial=default_active_serial,
         ):
             runtime = {"ser3": stale_port}
             event_queue = Queue()
@@ -15581,7 +15589,11 @@ class HmiSourceContractTests(unittest.TestCase):
                 "auxiliary_device_worker_active": worker_active,
                 "auxiliary_device_cancel_requested": cancellation,
                 "auxiliary_device_active_request": request,
-                "auxiliary_device_active_serial": None,
+                "auxiliary_device_active_serial": (
+                    stale_port
+                    if active_serial is default_active_serial
+                    else active_serial
+                ),
                 "auxiliary_device_pending_result": None,
                 "application_closing": threading.Event(),
                 "time": SimpleNamespace(
@@ -15714,6 +15726,70 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIsNone(namespace["RUN"]["ser3"])
         self.assertIsNone(namespace["auxiliary_device_active_serial"])
 
+        mismatched_port = Port(b"unused")
+        succeeded, result, namespace, serial_calls, _, sleep_delays = run_case(
+            Port(b"OK"),
+            stale_port=mismatched_port,
+            active_serial=None,
+        )
+        self.assertFalse(succeeded)
+        self.assertEqual(result.outcome, "failed")
+        self.assertIn("recovered inconsistent serial ownership", result.value)
+        self.assertEqual(serial_calls, [])
+        self.assertEqual(sleep_delays, [])
+        self.assertEqual(mismatched_port.close_calls, 1)
+        self.assertIsNone(namespace["RUN"]["ser3"])
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
+        pending = self.compile_function(
+            "_auxiliary_device_read_pending",
+            namespace,
+        )
+        self.assertTrue(pending())
+
+        orphaned_active_port = Port(b"unused")
+        succeeded, result, namespace, serial_calls, _, sleep_delays = run_case(
+            Port(b"OK"),
+            active_serial=orphaned_active_port,
+        )
+        self.assertFalse(succeeded)
+        self.assertEqual(result.outcome, "failed")
+        self.assertIn("recovered inconsistent serial ownership", result.value)
+        self.assertEqual(serial_calls, [])
+        self.assertEqual(sleep_delays, [])
+        self.assertEqual(orphaned_active_port.close_calls, 1)
+        self.assertIsNone(namespace["RUN"]["ser3"])
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
+
+        recovering_port = Port(b"unused", close_failures=1)
+        succeeded, result, namespace, _, _, sleep_delays = run_case(
+            Port(b"OK"),
+            stale_port=recovering_port,
+            active_serial=None,
+        )
+        self.assertFalse(succeeded)
+        self.assertIn("recovered inconsistent serial ownership", result.value)
+        self.assertIn("did not close", result.value)
+        self.assertEqual(recovering_port.close_calls, 2)
+        self.assertEqual(sleep_delays, [1.0])
+        self.assertIsNone(namespace["RUN"]["ser3"])
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
+
+        conflicting_active_port = Port(b"active")
+        conflicting_bound_port = Port(b"bound")
+        succeeded, result, namespace, serial_calls, _, sleep_delays = run_case(
+            Port(b"OK"),
+            stale_port=conflicting_bound_port,
+            active_serial=conflicting_active_port,
+        )
+        self.assertFalse(succeeded)
+        self.assertIn("recovered inconsistent serial ownership", result.value)
+        self.assertEqual(conflicting_active_port.close_calls, 1)
+        self.assertEqual(conflicting_bound_port.close_calls, 1)
+        self.assertEqual(serial_calls, [])
+        self.assertEqual(sleep_delays, [])
+        self.assertIsNone(namespace["RUN"]["ser3"])
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
+
         retained_port = Port(b"OK", close_failures=10)
         succeeded, result, namespace, _, logs, sleep_delays = run_case(
             retained_port,
@@ -15761,6 +15837,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         request = request_type(1, "COM14", 2)
         event_queue = Queue()
+        settled_serials = []
         worker_active = threading.Event()
         worker_active.set()
         namespace = {
@@ -15778,12 +15855,17 @@ class HmiSourceContractTests(unittest.TestCase):
             "auxiliary_device_pending_result": None,
             "application_closing": threading.Event(),
             "_run_auxiliary_device_read": terminate_worker,
-            "_settle_auxiliary_device_serial": (
-                lambda serial_port, context: (True, None)
-            ),
             "_auxiliary_device_read_cancelled": lambda: False,
             "logger": Logger(),
         }
+
+        def settle_serial(serial_port, context):
+            settled_serials.append(serial_port)
+            namespace["RUN"]["ser3"] = None
+            namespace["auxiliary_device_active_serial"] = None
+            return True, None
+
+        namespace["_settle_auxiliary_device_serial"] = settle_serial
         namespace["auxiliary_device_read_active"].set()
         run_safe = self.compile_function(
             "_run_auxiliary_device_read_safe",
@@ -15796,6 +15878,46 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIn("KeyboardInterrupt", result.value)
         self.assertFalse(worker_active.is_set())
         self.assertEqual(len(namespace["logger"].exceptions), 1)
+
+        mismatched_serial = object()
+        namespace["RUN"]["ser3"] = mismatched_serial
+        worker_active.set()
+        self.assertFalse(run_safe(request))
+        mismatch_result = event_queue.get_nowait()
+        self.assertEqual(mismatch_result.outcome, "failed")
+        self.assertIn(
+            "recovered inconsistent serial ownership",
+            mismatch_result.value,
+        )
+        self.assertFalse(worker_active.is_set())
+        self.assertIsNone(namespace["RUN"]["ser3"])
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
+        pending = self.compile_function(
+            "_auxiliary_device_read_pending",
+            namespace,
+        )
+        self.assertTrue(pending())
+
+        conflicting_active_serial = object()
+        conflicting_bound_serial = object()
+        namespace["auxiliary_device_active_serial"] = conflicting_active_serial
+        namespace["RUN"]["ser3"] = conflicting_bound_serial
+        worker_active.set()
+        self.assertFalse(run_safe(request))
+        conflict_result = event_queue.get_nowait()
+        self.assertEqual(conflict_result.outcome, "failed")
+        self.assertIn(
+            "recovered inconsistent serial ownership",
+            conflict_result.value,
+        )
+        self.assertEqual(
+            settled_serials[-2:],
+            [conflicting_active_serial, conflicting_bound_serial],
+        )
+        self.assertFalse(worker_active.is_set())
+        self.assertIsNone(namespace["RUN"]["ser3"])
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
+        self.assertTrue(pending())
 
     def test_auxiliary_device_admission_and_result_retry_are_owned(self):
         class CapturedThread:
@@ -15835,8 +15957,16 @@ class HmiSourceContractTests(unittest.TestCase):
             "posOutreach": False,
         }
         statuses = []
+        status_failures = []
         logs = []
         event_queue = Queue()
+
+        def set_status(message, style):
+            statuses.append((message, style))
+            if status_failures:
+                raise RuntimeError(status_failures.pop(0))
+            return True
+
         namespace = {
             "dataclass": dataclass,
             "re": re,
@@ -15857,9 +15987,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "program_execution_state_lock": threading.Lock(),
             "program_execution_active_request": None,
             "com3outPortEntryField": Entry("previous"),
-            "_set_application_status": (
-                lambda message, style: statuses.append((message, style)) or True
-            ),
+            "_set_application_status": set_status,
             "logger": SimpleNamespace(
                 error=lambda *args: logs.append(("error", args)),
                 warning=lambda *args: logs.append(("warning", args)),
@@ -15898,8 +16026,24 @@ class HmiSourceContractTests(unittest.TestCase):
             CapturedThread.instances[0].name,
             "ar4-auxiliary-device-1",
         )
+        status_failures.append("rejection presentation unavailable")
         self.assertFalse(request_read("15", "2"))
         self.assertEqual(len(CapturedThread.instances), 1)
+        self.assertEqual(logs[-2][0], "error")
+        self.assertIn("another auxiliary-device read is active", logs[-2][1][0])
+        self.assertEqual(logs[-1][0], "exception")
+        self.assertEqual(
+            logs[-1][1][0],
+            "Unable to present an auxiliary-device rejection",
+        )
+        self.assertEqual(
+            statuses[-1],
+            (
+                "AUXILIARY COM READ REJECTED: "
+                "another auxiliary-device read is active",
+                "Alarm.TLabel",
+            ),
+        )
 
         begin_execution = self.compile_function(
             "_begin_program_execution",
@@ -15951,7 +16095,22 @@ class HmiSourceContractTests(unittest.TestCase):
         runtime["ser3"] = legacy_serial_owner
         self.assertTrue(request_read("14", "2"))
         self.assertIs(runtime["ser3"], legacy_serial_owner)
+        self.assertIs(
+            namespace["auxiliary_device_active_serial"],
+            legacy_serial_owner,
+        )
+        pending = self.compile_function(
+            "_auxiliary_device_read_pending",
+            namespace,
+        )
+        cancel_read = self.compile_function(
+            "_cancel_auxiliary_device_read",
+            namespace,
+        )
+        self.assertTrue(pending())
+        self.assertTrue(cancel_read())
         namespace["auxiliary_device_active_request"] = None
+        namespace["auxiliary_device_active_serial"] = None
         namespace["auxiliary_device_read_active"].clear()
         namespace["auxiliary_device_worker_active"].clear()
         namespace["auxiliary_device_cancel_requested"].clear()
@@ -15961,11 +16120,55 @@ class HmiSourceContractTests(unittest.TestCase):
                 raise RuntimeError("thread unavailable")
 
         namespace["Thread"] = FailingThread
+        status_failures.append("startup presentation unavailable")
         self.assertFalse(request_read("14", "2"))
         self.assertIsNone(namespace["auxiliary_device_active_request"])
+        self.assertIsNone(namespace["auxiliary_device_active_serial"])
         self.assertFalse(namespace["auxiliary_device_read_active"].is_set())
         self.assertFalse(namespace["auxiliary_device_worker_active"].is_set())
         self.assertIs(runtime["ser3"], legacy_serial_owner)
+        self.assertEqual(logs[-2][0], "exception")
+        self.assertIn("thread unavailable", logs[-2][1][0])
+        self.assertEqual(logs[-1][0], "exception")
+        self.assertEqual(
+            logs[-1][1][0],
+            "Unable to present an auxiliary-device startup failure",
+        )
+        self.assertEqual(
+            statuses[-1],
+            (
+                "AUXILIARY COM READ REJECTED: thread unavailable",
+                "Alarm.TLabel",
+            ),
+        )
+
+        worker_finished = threading.Event()
+        worker_observations = []
+
+        def run_real_worker(request):
+            with namespace["program_execution_state_lock"]:
+                with namespace["auxiliary_device_state_lock"]:
+                    worker_observations.append(
+                        (
+                            namespace["auxiliary_device_active_request"]
+                            is request,
+                            namespace["auxiliary_device_active_serial"]
+                            is runtime["ser3"],
+                        )
+                    )
+            namespace["auxiliary_device_worker_active"].clear()
+            worker_finished.set()
+
+        namespace["Thread"] = threading.Thread
+        namespace["_run_auxiliary_device_read_safe"] = run_real_worker
+        self.assertTrue(request_read("14", "2"))
+        self.assertTrue(worker_finished.wait(2))
+        self.assertEqual(worker_observations, [(True, True)])
+        with namespace["auxiliary_device_state_lock"]:
+            namespace["auxiliary_device_active_request"] = None
+            namespace["auxiliary_device_active_serial"] = None
+            namespace["auxiliary_device_read_active"].clear()
+            namespace["auxiliary_device_cancel_requested"].clear()
 
     def test_auxiliary_device_cancellation_and_result_settlement_are_owned(self):
         class Port:

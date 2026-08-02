@@ -24157,6 +24157,80 @@ def _settle_auxiliary_device_serial(serial_port, context):
       return False, first_error
 
 
+def _reconcile_auxiliary_device_serial_ownership(request, context):
+  global auxiliary_device_active_serial
+
+  if not isinstance(request, AuxiliaryDeviceReadRequest):
+    raise TypeError("auxiliary-device ownership request is invalid")
+  if (
+    not isinstance(context, str)
+    or not context
+    or context != context.strip()
+  ):
+    raise TypeError("auxiliary-device ownership context is invalid")
+
+  with auxiliary_device_state_lock:
+    if auxiliary_device_active_request is not request:
+      raise RuntimeError("auxiliary-device serial ownership changed")
+    active_serial = auxiliary_device_active_serial
+    bound_serial = RUN.get('ser3')
+    if active_serial is bound_serial:
+      return bound_serial, False, ()
+    serial_ports = []
+    for serial_port in (active_serial, bound_serial):
+      if serial_port is not None and all(
+        retained_port is not serial_port for retained_port in serial_ports
+      ):
+        serial_ports.append(serial_port)
+    RUN['ser3'] = None
+    auxiliary_device_active_serial = None
+
+  errors = []
+  for serial_port in serial_ports:
+    with auxiliary_device_state_lock:
+      if auxiliary_device_active_request is not request:
+        raise RuntimeError(
+          "auxiliary-device request changed during ownership recovery"
+        )
+      if (
+        RUN.get('ser3') is not None
+        or auxiliary_device_active_serial is not None
+      ):
+        raise RuntimeError(
+          "auxiliary-device serial recovery found an unexpected owner"
+        )
+      RUN['ser3'] = serial_port
+      auxiliary_device_active_serial = serial_port
+    try:
+      closed, cleanup_error = _settle_auxiliary_device_serial(
+        serial_port,
+        context,
+      )
+      if cleanup_error is not None:
+        errors.append(cleanup_error)
+      if not closed:
+        if cleanup_error is None:
+          errors.append(
+            OSError("auxiliary-device serial recovery did not settle")
+          )
+        break
+    except Exception as exc:
+      errors.append(exc)
+      break
+
+  with auxiliary_device_state_lock:
+    if auxiliary_device_active_request is not request:
+      raise RuntimeError(
+        "auxiliary-device request changed after ownership recovery"
+      )
+    if auxiliary_device_active_serial is not RUN.get('ser3'):
+      raise RuntimeError(
+        "auxiliary-device serial recovery left inconsistent ownership"
+      )
+    retained_serial = auxiliary_device_active_serial
+  return retained_serial, True, tuple(errors)
+
+
 def _publish_auxiliary_device_result(request, result):
   global auxiliary_device_pending_result
 
@@ -24223,16 +24297,23 @@ def _run_auxiliary_device_read(request):
     )
 
   try:
-    with auxiliary_device_state_lock:
-      if auxiliary_device_active_request is not request:
-        raise RuntimeError("auxiliary-device worker ownership changed")
-      if auxiliary_device_active_serial is not None:
-        raise RuntimeError(
-          "auxiliary-device worker started with an active serial owner"
-        )
-      serial_port = RUN.get('ser3')
-      if serial_port is not None:
-        auxiliary_device_active_serial = serial_port
+    (
+      serial_port,
+      ownership_recovered,
+      ownership_errors,
+    ) = _reconcile_auxiliary_device_serial_ownership(
+      request,
+      "auxiliary-device worker ownership recovery",
+    )
+    for ownership_error in ownership_errors:
+      retain_error(ownership_error, cleanup=True)
+    if ownership_recovered:
+      recovery_error = RuntimeError(
+        "auxiliary-device worker recovered inconsistent serial ownership"
+      )
+      retain_error(recovery_error, cleanup=True)
+      cleanup_attempted = True
+      raise recovery_error
     if serial_port is not None:
       cleanup_attempted = True
       closed, stale_cleanup_error = _settle_auxiliary_device_serial(
@@ -24365,8 +24446,6 @@ def _run_auxiliary_device_read(request):
 
 
 def _run_auxiliary_device_read_safe(request):
-  global auxiliary_device_active_serial
-
   try:
     return _run_auxiliary_device_read(request)
   except BaseException as failure:
@@ -24380,23 +24459,59 @@ def _run_auxiliary_device_read_safe(request):
       )
     cleanup_error = None
     try:
-      with auxiliary_device_state_lock:
-        if auxiliary_device_active_request is not request:
-          raise RuntimeError(
-            "auxiliary-device worker failure lost request ownership"
+      (
+        serial_port,
+        ownership_recovered,
+        ownership_errors,
+      ) = _reconcile_auxiliary_device_serial_ownership(
+        request,
+        "unexpected auxiliary-device worker termination",
+      )
+      for ownership_error in ownership_errors:
+        if cleanup_error is None:
+          cleanup_error = ownership_error
+        else:
+          logger.error(
+            "Additional auxiliary-device ownership cleanup error: %s",
+            _auxiliary_device_error_detail(
+              ownership_error,
+              "auxiliary-device ownership cleanup failed",
+            ),
           )
-        serial_port = auxiliary_device_active_serial
-        if serial_port is None and RUN.get('ser3') is not None:
-          serial_port = RUN.get('ser3')
-          auxiliary_device_active_serial = serial_port
-      if serial_port is not None:
-        closed, cleanup_error = _settle_auxiliary_device_serial(
+      if not ownership_recovered and serial_port is not None:
+        closed, serial_cleanup_error = _settle_auxiliary_device_serial(
           serial_port,
           "unexpected auxiliary-device worker termination",
         )
+        if serial_cleanup_error is not None:
+          if cleanup_error is None:
+            cleanup_error = serial_cleanup_error
+          else:
+            logger.error(
+              "Additional auxiliary-device serial cleanup error: %s",
+              _auxiliary_device_error_detail(
+                serial_cleanup_error,
+                "auxiliary-device serial cleanup failed",
+              ),
+            )
         if not closed and cleanup_error is None:
           cleanup_error = OSError(
             "auxiliary-device serial cleanup did not settle"
+          )
+      if ownership_recovered:
+        recovery_error = RuntimeError(
+          "auxiliary-device worker failure recovered inconsistent serial "
+          "ownership"
+        )
+        if cleanup_error is None:
+          cleanup_error = recovery_error
+        else:
+          logger.error(
+            "Additional auxiliary-device recovery error: %s",
+            _auxiliary_device_error_detail(
+              recovery_error,
+              "auxiliary-device serial ownership recovery occurred",
+            ),
           )
     except BaseException as cleanup_failure:
       logger.exception(
@@ -24458,8 +24573,10 @@ def _run_auxiliary_device_read_safe(request):
 
 def _request_auxiliary_device_read(port_value, read_size_value):
   global auxiliary_device_active_request
+  global auxiliary_device_active_serial
   global auxiliary_device_next_request_id
 
+  worker_start_failed = False
   try:
     port = _auxiliary_device_port(port_value)
     read_size = _auxiliary_device_read_size(read_size_value)
@@ -24513,67 +24630,48 @@ def _request_auxiliary_device_read(port_value, read_size_value):
         )
         auxiliary_device_next_request_id = request.request_id
         auxiliary_device_active_request = request
+        auxiliary_device_active_serial = RUN.get('ser3')
         auxiliary_device_cancel_requested.clear()
         auxiliary_device_worker_active.set()
         auxiliary_device_read_active.set()
+        try:
+          worker = Thread(
+            target=_run_auxiliary_device_read_safe,
+            args=(request,),
+            name=f"ar4-auxiliary-device-{request.request_id}",
+            daemon=True,
+          )
+          worker.start()
+        except Exception:
+          worker_start_failed = True
+          auxiliary_device_active_request = None
+          auxiliary_device_active_serial = None
+          auxiliary_device_cancel_requested.clear()
+          auxiliary_device_worker_active.clear()
+          auxiliary_device_read_active.clear()
+          raise
   except Exception as exc:
-    detail = _auxiliary_device_error_detail(
-      exc,
-      "auxiliary-device request was rejected",
-    )
-    message = f"AUXILIARY COM READ REJECTED: {detail}"
-    logger.error(message)
-    try:
-      _set_application_status(message, "Alarm.TLabel")
-    except Exception:
-      logger.exception("Unable to present an auxiliary-device rejection")
-    return False
-
-  try:
-    worker = Thread(
-      target=_run_auxiliary_device_read_safe,
-      args=(request,),
-      name=f"ar4-auxiliary-device-{request.request_id}",
-      daemon=True,
-    )
-    worker.start()
-  except Exception as exc:
-    rollback_error = None
-    with auxiliary_device_state_lock:
-      if auxiliary_device_active_request is not request:
-        rollback_error = RuntimeError(
-          "auxiliary-device worker startup ownership changed"
-        )
-      elif (
-        auxiliary_device_active_serial is not None
-        or auxiliary_device_pending_result is not None
-      ):
-        rollback_error = RuntimeError(
-          "auxiliary-device worker startup could not roll back safely"
-        )
-      else:
-        auxiliary_device_active_request = None
-        auxiliary_device_cancel_requested.clear()
-        auxiliary_device_worker_active.clear()
-        auxiliary_device_read_active.clear()
-    detail = _auxiliary_device_error_detail(
-      exc,
-      "auxiliary-device worker did not start",
-    )
-    if rollback_error is not None:
-      detail = _combine_auxiliary_device_error_details(
-        detail,
-        _auxiliary_device_error_detail(
-          rollback_error,
-          "auxiliary-device startup rollback failed",
-        ),
+    if worker_start_failed:
+      fallback = "auxiliary-device worker did not start"
+      presentation_error = (
+        "Unable to present an auxiliary-device startup failure"
       )
+    else:
+      fallback = "auxiliary-device request was rejected"
+      presentation_error = "Unable to present an auxiliary-device rejection"
+    detail = _auxiliary_device_error_detail(
+      exc,
+      fallback,
+    )
     message = f"AUXILIARY COM READ REJECTED: {detail}"
-    logger.exception(message)
+    if worker_start_failed:
+      logger.exception(message)
+    else:
+      logger.error(message)
     try:
       _set_application_status(message, "Alarm.TLabel")
     except Exception:
-      logger.exception("Unable to present an auxiliary-device startup failure")
+      logger.exception(presentation_error)
     return False
   try:
     _set_application_status(
