@@ -1,6 +1,6 @@
 # Firmware compilation
 
-Firmware compilation is hardware-free. Do not add `--upload` without the explicit operator authorization, emergency-stop check, cleared work envelope, firmware identity, configuration profile, and procedure required by `AGENTS.md`.
+Firmware compilation is hardware-free. Upload and live verification follow [`SAFETY.md`](../SAFETY.md): record the date, controller and firmware identity, configuration profile, starting state, exact procedure, observed results, and operator confirmation. Powered testing also requires a cleared workspace, verification of the independent physical stop path, and confirmation of physical driver microsteps or measured motion scale.
 
 The tracked line-oriented Teensy compatibility source identifies version
 `6.7.1-ar4hmi.9`, advertises the required `JT_WRIST_CONFIG_V1`,

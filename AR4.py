@@ -75,6 +75,12 @@
 '''
 ##########################################################################
 
+if __name__ != "__main__":
+    raise RuntimeError(
+        "AR4.py is an executable application entry point; "
+        "import ARrobots modules instead"
+    )
+
 import sys
 import os
 import json

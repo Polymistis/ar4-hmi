@@ -171,7 +171,6 @@ from ARrobots.calibration_schema import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 AR4_SOURCE = PROJECT_ROOT / "AR4.py"
-BOOTSTRAP_SOURCE = PROJECT_ROOT / "bootstrap.ps1"
 HOME_PROGRAM_SOURCE = PROJECT_ROOT / "Home.ar4"
 CALIBRATION_SOURCE = PROJECT_ROOT / "ARrobots" / "Calibration.py"
 NATIVE_KINEMATICS_SOURCE = PROJECT_ROOT / "ARrobots" / "src" / "kinematics.cpp"
@@ -392,6 +391,49 @@ class HmiSourceContractTests(unittest.TestCase):
         assignment = self.module_assignments.get(name)
         self.assertIsNotNone(assignment, name)
         return ast.literal_eval(assignment.value)
+
+    def test_application_entry_point_rejects_import_before_imports(self):
+        executable_nodes = [
+            node
+            for node in self.tree.body
+            if not (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            )
+        ]
+        self.assertTrue(executable_nodes)
+        import_guard = executable_nodes[0]
+        self.assertIsInstance(import_guard, ast.If)
+        self.assertEqual(
+            ast.dump(import_guard.test, include_attributes=False),
+            ast.dump(
+                ast.Compare(
+                    left=ast.Name(id="__name__", ctx=ast.Load()),
+                    ops=[ast.NotEq()],
+                    comparators=[ast.Constant(value="__main__")],
+                ),
+                include_attributes=False,
+            ),
+        )
+        self.assertEqual(len(import_guard.body), 1)
+        raise_node = import_guard.body[0]
+        self.assertIsInstance(raise_node, ast.Raise)
+        self.assertIsInstance(raise_node.exc, ast.Call)
+        self.assertIsInstance(raise_node.exc.func, ast.Name)
+        self.assertEqual(raise_node.exc.func.id, "RuntimeError")
+        self.assertFalse(
+            any(
+                isinstance(node, (ast.Import, ast.ImportFrom))
+                for node in ast.walk(import_guard)
+            )
+        )
+        first_import = next(
+            node
+            for node in executable_nodes
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+        )
+        self.assertLess(import_guard.end_lineno, first_import.lineno)
 
     def compile_assignment(self, name, namespace):
         assignment = self.module_assignments.get(name)
@@ -35687,29 +35729,6 @@ class HmiSourceContractTests(unittest.TestCase):
             '$BuildDirectory = Join-Path $sourceDirectory "build-windows-x64"'
         )
         self.assertLess(source_directory, default_directory)
-
-    def test_bootstrap_default_target_resolves_inside_install_boundary(self):
-        source = BOOTSTRAP_SOURCE.read_text(encoding="utf-8")
-        parameter_end = source.index(")\n\nSet-StrictMode")
-        main_try = source.rindex("\ntry {\n")
-        target_resolution = source.index(
-            "$effectiveTargetRepo = Resolve-TargetRepositoryCandidate"
-        )
-        install_call = source.index("      Install-Dispatcher")
-
-        self.assertNotIn("$PSScriptRoot", source[:parameter_end])
-        self.assertIn(
-            "$scriptInvocationPath = $MyInvocation.MyCommand.Path",
-            source,
-        )
-        self.assertIn("-ScriptPath $scriptInvocationPath", source)
-        self.assertIn(
-            "    } else {\n"
-            "      $effectiveTargetRepo = Resolve-TargetRepositoryCandidate",
-            source[main_try:],
-        )
-        self.assertLess(main_try, target_resolution)
-        self.assertLess(target_resolution, install_call)
 
     def test_teensy_reboot_is_target_defined(self):
         firmware = TEENSY_SOURCE.read_text(encoding="utf-8")
