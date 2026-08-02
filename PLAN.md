@@ -1295,7 +1295,15 @@ Implemented foundation:
 - State uncertainty includes per-axis position variance, velocity variance,
   and position-velocity covariance. A bounded constant-velocity predictor
   propagates that covariance and adds configured diagonal position-process
-  variance across the prediction horizon.
+  variance across the prediction horizon. Intercept selection accepts the
+  structural `MotionPredictor` contract rather than requiring inheritance
+  from the constant-velocity implementation. Predictor horizon validity and
+  coverage are checked during construction and again before every candidate
+  prediction. Every returned prediction must preserve the estimate source
+  timestamp and frame. The predicted timestamp must match the candidate within
+  a shared composed-timestamp tolerance, including the predictor's permitted
+  clamp to a source timestamp within that tolerance. Predictor-advertised
+  horizon magnitude cannot widen timestamp validation or past-target clamping.
 - The versioned `ar4.observation-replay.v1` JSONL codec enforces strict UTF-8,
   exact fields, duplicate-key rejection, finite numeric domains, payload and
   record bounds, one coordinate frame, and ordered observation and receipt
@@ -1306,11 +1314,11 @@ Implemented foundation:
   record round trips, and replay failures.
 - `ARrobots.interception` samples a configured bounded lead-time horizon and
   rejects candidates whose predicted covariance, terminal object speed, or
-  arrival margin violates an explicit threshold. Selector construction
-  requires the predictor horizon to cover the permitted estimate age and
-  candidate lead time. Configuration rejects lead-time samples that cannot
-  advance in the host numeric range, and selection rejects indistinguishable
-  absolute candidate timestamps.
+  arrival margin violates an explicit threshold. Construction and
+  per-candidate validation require the predictor horizon to cover the permitted
+  estimate age and candidate lead time. Configuration rejects lead-time samples
+  that cannot advance in the host numeric range, and selection rejects
+  indistinguishable absolute candidate timestamps.
 - A deterministic injected feasibility boundary represents production IK,
   joint-limit, singularity, collision, and minimum-arrival-time decisions.
   Feasible results carry a non-negative application risk score. Selection uses
@@ -1323,14 +1331,27 @@ Implemented foundation:
   invoking feasibility logic, bounds the total record-by-candidate evaluation
   workload, then recomputes an intercept selection after every estimate update
   using the matching receipt timestamp.
+- `ARrobots.trajectory_timing` generates deterministic symmetric seven-phase
+  S-curves for rest-to-rest joint moves under caller-supplied positive velocity,
+  acceleration, and jerk limits. The minimum single-axis profiles cover the
+  jerk-only, acceleration-limited, velocity-limited, and cruise regimes.
+  Multi-axis plans synchronize up to J1-J9 against the slowest minimum profile
+  by uniform time scaling, which can only reduce applied velocity,
+  acceleration, and jerk. Stationary axes hold position for the synchronized
+  duration. Profiles expose deterministic position, velocity, acceleration,
+  and jerk samples plus the synchronized minimum arrival duration for an
+  injected intercept-feasibility evaluator.
 - Hardware-free tests cover selection configuration and result invariants,
-  threshold boundaries, deterministic ranking, explicit feasibility
-  rejections, arrival timing, stale and future estimates, callback failures,
-  numeric precision limits, and replay-driven reselection. The injected
-  feasibility boundary is simulation input, not evidence of physical
-  reachability. No controller command, live motion, calibrated transform,
-  acceleration model, production IK or collision engine, trajectory
-  generation, local path replanning, or grasp behavior is included.
+  per-candidate covariance and speed thresholds, deterministic ranking,
+  explicit feasibility rejections, arrival timing, stale and future estimates,
+  callback and predictor failures, numeric precision limits, replay-driven
+  reselection, analytical trajectory regimes, synchronized time scaling, and
+  trajectory sampling. The injected feasibility boundary and trajectory limits
+  are simulation input, not evidence of physical reachability or timing. No
+  controller command, live motion, calibrated transform, acceleration-aware
+  object prediction, production IK or collision engine, arbitrary-state or
+  online trajectory replacement, local path replanning, or grasp behavior is
+  included.
 
 ### M5 - Controlled hardware validation
 

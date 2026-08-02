@@ -121,7 +121,16 @@ active baseline and estimate unchanged. A gap beyond the configured maximum
 accepts the new observation only as a replacement baseline, making model reset
 visible to the caller. The predictor uses a bounded future timestamp, preserves
 constant velocity, propagates position/velocity covariance, and adds configured
-diagonal position-process variance per second.
+diagonal position-process variance per second. Intercept selection depends on
+the structural `MotionPredictor` contract rather than the constant-velocity
+class. The selector validates the advertised maximum horizon during
+construction and before every candidate prediction, so a mutable predictor
+cannot silently void the coverage check. Every result's type, source timestamp,
+coordinate frame, and requested timestamp within the shared composed-timestamp
+tolerance are also validated. Predictor and selector use that same band for
+numerically earlier requests and returned timestamps. Advertised horizon
+magnitude cannot widen the band, and a request outside the band fails instead
+of clamping to the source timestamp.
 
 Recorded input uses canonical JSONL schema `ar4.observation-replay.v1`. The
 first record is the exact header:
@@ -144,10 +153,10 @@ accepts LF or CRLF, and canonical re-encoding normalizes either form to LF;
 byte-level hashes therefore identify encoded files rather than logical replay
 equivalence.
 
-Current scope stops before acceleration estimation, transforms, innovation
-tests, impacts, production reachability, IK, or collision checking, trajectory
-generation, controller setpoint replacement, or grasp supervision. No live-arm
-result is established by the deterministic module or associated tests.
+Current object-model scope stops before acceleration estimation, transforms,
+innovation tests, impacts, production reachability, IK, collision checking,
+controller setpoint replacement, or grasp supervision. No live-arm result is
+established by the deterministic module or associated tests.
 
 ## Implemented deterministic intercept selection
 
@@ -157,9 +166,9 @@ age and future-skew limits, minimum and maximum lead times, a sampling
 interval, maximum predicted position standard deviation, maximum terminal
 object speed, and minimum arrival margin. Configuration rejects a lead-time
 interval that cannot produce strictly advancing samples. Selector construction
-fails when the predictor cannot cover the permitted estimate age plus lead
-time, and selection fails when absolute timestamps cannot represent strictly
-advancing candidates.
+and per-candidate validation fail when the predictor cannot cover the permitted
+estimate age plus lead time, and selection fails when absolute timestamps
+cannot represent strictly advancing candidates.
 
 Each predicted state first passes the uncertainty and terminal-speed limits.
 A deterministic injected evaluator then classifies production-feasibility
@@ -178,10 +187,42 @@ selection boundary.
 and the bounded record-by-candidate workload before feasibility evaluation,
 then recomputes selection after every estimate update. That behavior exercises
 deterministic target reselection after new observations; no geometric path,
-trajectory, controller setpoint, or grasp is generated. The injected evaluator
-provides simulation decisions only and does not establish physical
-reachability, collision clearance, singularity margin, joint-limit compliance,
-or arrival performance.
+controller setpoint, or grasp is generated. The injected evaluator provides
+simulation decisions only and does not establish physical reachability,
+collision clearance, singularity margin, joint-limit compliance, or arrival
+performance.
+
+## Implemented rest-to-rest trajectory timing
+
+`ARrobots.trajectory_timing` provides a hardware-free joint-space timing and
+sampling foundation for the feasibility boundary. Every joint receives an
+explicit maximum velocity in degrees per second, maximum acceleration in
+degrees per second squared, and maximum jerk in degrees per second cubed. No
+machine defaults or measured AR4 limits are embedded.
+
+A minimum single-axis move starts and ends at zero velocity and zero
+acceleration. The analytical symmetric S-curve contains jerk-up, constant
+acceleration, jerk-down, cruise, mirrored deceleration, and terminal jerk-up
+phases. Short distances use a triangular jerk profile. Longer distances reach
+the acceleration limit, the velocity limit, or both before adding cruise.
+Public profile construction revalidates represented displacement and every
+kinematic limit.
+
+Multi-axis planning first calculates each minimum profile and selects the
+longest duration. Shorter profiles receive uniform time scaling: phase times
+grow by the scale, velocity falls by the scale, acceleration falls by the
+scale squared, and jerk falls by the scale cubed. Stationary axes retain a
+constant position for the common duration. The resulting synchronized duration
+is the minimum arrival time under the supplied independent joint limits and
+the rest-to-rest assumption.
+
+This duration excludes perception age, transport latency, controller response,
+IK, joint-position limits, singularity margin, collision clearance, path
+geometry, settling, and gripper timing. Nonzero initial or terminal velocity
+and acceleration, asymmetric directional limits, continuous setpoint
+replacement, and controller-specific curve tuning remain future work. The
+profiles therefore support deterministic simulation and feasibility plumbing;
+no physical timing or safe path is established.
 
 ## Product constraints requiring later decisions
 

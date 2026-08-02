@@ -10,14 +10,14 @@ from typing import Optional, Tuple
 
 from ARrobots.dynamic_motion import (
     ConstantVelocityEstimatorConfig,
-    ConstantVelocityPredictor,
     DynamicMotionError,
     EstimatorUpdate,
     EstimatorUpdateStatus,
     MotionEstimate,
+    MotionPredictor,
     ObservationReplay,
     PredictedMotionState,
-    PredictionError,
+    prediction_timestamp_tolerance,
 )
 
 
@@ -578,6 +578,24 @@ class InterceptSelectorConfig:
         object.__setattr__(self, "candidate_lead_times", lead_times)
 
 
+def _validated_predictor_horizon(predictor):
+    try:
+        return _positive_number(
+            predictor.maximum_horizon_seconds,
+            "selector predictor maximum_horizon_seconds",
+        )
+    except AttributeError as exc:
+        raise InterceptSelectionError(
+            "selector predictor must provide maximum_horizon_seconds"
+        ) from exc
+    except InterceptSelectionError:
+        raise
+    except Exception as exc:
+        raise InterceptSelectionError(
+            "selector predictor maximum_horizon_seconds is invalid"
+        ) from exc
+
+
 class InterceptSelector:
     """Select a bounded intercept using a deterministic feasibility callback.
 
@@ -585,15 +603,27 @@ class InterceptSelector:
     timestamp, then returns InterceptFeasibility without external mutation.
     """
 
-    def __init__(self, config, predictor, feasibility_evaluator):
+    def __init__(
+        self,
+        config,
+        predictor: MotionPredictor,
+        feasibility_evaluator,
+    ):
         if not isinstance(config, InterceptSelectorConfig):
             raise InterceptSelectionError(
                 "selector config must be InterceptSelectorConfig"
             )
-        if not isinstance(predictor, ConstantVelocityPredictor):
+        try:
+            predict_method = predictor.predict
+        except Exception as exc:
             raise InterceptSelectionError(
-                "selector predictor must be ConstantVelocityPredictor"
+                "selector predictor must provide predict"
+            ) from exc
+        if not callable(predict_method):
+            raise InterceptSelectionError(
+                "selector predictor must provide callable predict"
             )
+        predictor_horizon = _validated_predictor_horizon(predictor)
         if not callable(feasibility_evaluator):
             raise InterceptSelectionError(
                 "feasibility evaluator must be callable"
@@ -613,14 +643,15 @@ class InterceptSelector:
             )
         tolerance = _comparison_tolerance(
             required_horizon,
-            predictor.maximum_horizon_seconds,
+            predictor_horizon,
         )
-        if required_horizon > predictor.maximum_horizon_seconds + tolerance:
+        if required_horizon > predictor_horizon + tolerance:
             raise InterceptSelectionError(
                 "predictor horizon does not cover estimate age and lead time"
             )
         self._config = config
         self._predictor = predictor
+        self._required_prediction_horizon_seconds = required_horizon
         self._feasibility_evaluator = feasibility_evaluator
 
     @property
@@ -641,11 +672,54 @@ class InterceptSelector:
 
     def _predict(self, estimate, target_timestamp, candidate_index):
         try:
-            return self._predictor.predict(estimate, target_timestamp)
-        except PredictionError as exc:
+            predictor_horizon = _validated_predictor_horizon(self._predictor)
+        except InterceptSelectionError as exc:
+            raise InterceptSelectionError(
+                f"candidate {candidate_index} predictor horizon is invalid"
+            ) from exc
+        horizon_tolerance = _comparison_tolerance(
+            self._required_prediction_horizon_seconds,
+            predictor_horizon,
+        )
+        if (
+            self._required_prediction_horizon_seconds
+            > predictor_horizon + horizon_tolerance
+        ):
+            raise InterceptSelectionError(
+                f"candidate {candidate_index} predictor horizon no longer covers "
+                "estimate age and lead time"
+            )
+        try:
+            prediction = self._predictor.predict(estimate, target_timestamp)
+        except Exception as exc:
             raise InterceptSelectionError(
                 f"candidate {candidate_index} prediction failed"
             ) from exc
+        if not isinstance(prediction, PredictedMotionState):
+            raise InterceptSelectionError(
+                f"candidate {candidate_index} prediction output is invalid"
+            )
+        if prediction.source_timestamp_seconds != estimate.timestamp_seconds:
+            raise InterceptSelectionError(
+                f"candidate {candidate_index} prediction source is invalid"
+            )
+        timestamp_tolerance = prediction_timestamp_tolerance(
+            estimate.timestamp_seconds,
+            target_timestamp,
+            prediction.timestamp_seconds,
+        )
+        if (
+            abs(prediction.timestamp_seconds - target_timestamp)
+            > timestamp_tolerance
+        ):
+            raise InterceptSelectionError(
+                f"candidate {candidate_index} prediction timestamp is invalid"
+            )
+        if prediction.frame_id != estimate.frame_id:
+            raise InterceptSelectionError(
+                f"candidate {candidate_index} prediction frame is invalid"
+            )
+        return prediction
 
     def _evaluate_feasibility(
         self,

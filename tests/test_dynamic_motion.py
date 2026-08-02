@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
 import json
 import math
@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from ARrobots.dynamic_motion import (
     OBSERVATION_REPLAY_MAXIMUM_BYTES,
+    PREDICTION_TIMESTAMP_TOLERANCE_ULPS,
     AxisStateCovariance,
     ConstantVelocityEstimator,
     ConstantVelocityEstimatorConfig,
@@ -28,6 +29,7 @@ from ARrobots.dynamic_motion import (
     Vector3,
     decode_observation_replay,
     encode_observation_replay,
+    prediction_timestamp_tolerance,
 )
 
 
@@ -395,6 +397,58 @@ class ConstantVelocityPredictorTests(unittest.TestCase):
             )
         with self.assertRaises(PredictionError):
             ConstantVelocityPredictor(1.0, object())
+
+        huge_horizon = ConstantVelocityPredictor(
+            1e308,
+            DiagonalCovariance3(0.0, 0.0, 0.0),
+        )
+        with self.assertRaisesRegex(
+            PredictionError,
+            "must not precede",
+        ):
+            huge_horizon.predict(self.estimate, 1.0)
+
+    def test_timestamp_tolerance_validates_composed_timestamp_scale(self):
+        unit_ulp = math.ulp(1.0)
+        self.assertEqual(PREDICTION_TIMESTAMP_TOLERANCE_ULPS, 16.0)
+        self.assertEqual(
+            prediction_timestamp_tolerance(1.0, 2.0, 1.5),
+            PREDICTION_TIMESTAMP_TOLERANCE_ULPS * math.ulp(2.0),
+        )
+        huge_horizon = ConstantVelocityPredictor(
+            1e308,
+            DiagonalCovariance3(0.0, 0.0, 0.0),
+        )
+        accepted_estimate = replace(
+            self.estimate,
+            timestamp_seconds=(
+                1.0 + PREDICTION_TIMESTAMP_TOLERANCE_ULPS * unit_ulp
+            ),
+        )
+        rejected_estimate = replace(
+            self.estimate,
+            timestamp_seconds=(
+                1.0
+                + (PREDICTION_TIMESTAMP_TOLERANCE_ULPS + 1.0) * unit_ulp
+            ),
+        )
+
+        accepted = huge_horizon.predict(accepted_estimate, 1.0)
+
+        self.assertEqual(
+            accepted.timestamp_seconds,
+            accepted_estimate.timestamp_seconds,
+        )
+        with self.assertRaisesRegex(PredictionError, "must not precede"):
+            huge_horizon.predict(rejected_estimate, 1.0)
+        for values in (
+            (-1.0, 1.0),
+            (1.0, True),
+            (1.0, 2.0, math.inf),
+        ):
+            with self.subTest(values=values):
+                with self.assertRaises(PredictionError):
+                    prediction_timestamp_tolerance(*values)
 
     def test_prediction_rejects_unrepresentable_projected_state(self):
         zero_axis = AxisStateCovariance(0.0, 0.0, 0.0)

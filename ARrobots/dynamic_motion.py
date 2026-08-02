@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 from numbers import Integral, Real
-from typing import Optional, Tuple
+from typing import Optional, Protocol, Tuple
 
 
 OBSERVATION_REPLAY_SCHEMA = "ar4.observation-replay.v1"
@@ -16,6 +16,11 @@ OBSERVATION_REPLAY_POSITION_UNIT = "millimeter"
 OBSERVATION_REPLAY_MAXIMUM_BYTES = 8 * 1024 * 1024
 OBSERVATION_REPLAY_MAXIMUM_RECORDS = 100_000
 OBSERVATION_REPLAY_MAXIMUM_LINE_BYTES = 4096
+# Lead/skew admission can accumulate two four-ULP comparison bands. Reserving
+# two additional bands for timestamp composition and output validation keeps
+# producer and selector tolerances aligned without letting the advertised
+# horizon widen timestamp validity.
+PREDICTION_TIMESTAMP_TOLERANCE_ULPS = 16.0
 _FRAME_ID_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_.:/-]{0,63}\Z")
 
 
@@ -116,6 +121,32 @@ def _prediction_frame_id(value):
         return _frame_id(value)
     except ObservationValidationError as exc:
         raise PredictionError(str(exc)) from exc
+
+
+def prediction_timestamp_tolerance(
+    source_timestamp_seconds,
+    target_timestamp_seconds,
+    returned_timestamp_seconds=None,
+):
+    """Scale the shared ULP budget to the largest timestamp operand."""
+    values = [
+        _prediction_number(
+            source_timestamp_seconds,
+            "prediction tolerance source_timestamp_seconds",
+        ),
+        _prediction_number(
+            target_timestamp_seconds,
+            "prediction tolerance target_timestamp_seconds",
+        ),
+    ]
+    if returned_timestamp_seconds is not None:
+        values.append(_prediction_number(
+            returned_timestamp_seconds,
+            "prediction tolerance returned_timestamp_seconds",
+        ))
+    return PREDICTION_TIMESTAMP_TOLERANCE_ULPS * max(
+        math.ulp(abs(value)) for value in values
+    )
 
 
 def _fixed_items(values, expected_length, field_name):
@@ -386,6 +417,23 @@ class PredictedMotionState:
     @property
     def horizon_seconds(self):
         return self.timestamp_seconds - self.source_timestamp_seconds
+
+
+class MotionPredictor(Protocol):
+    """Predictor advertising a positive finite maximum future horizon."""
+
+    @property
+    def maximum_horizon_seconds(self) -> float:
+        """Return the current upper bound on the supported future horizon."""
+        ...
+
+    def predict(
+        self,
+        estimate: MotionEstimate,
+        target_timestamp_seconds: float,
+    ) -> PredictedMotionState:
+        """Predict at the request, allowing a tolerated clamp to the source."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -690,18 +738,22 @@ class ConstantVelocityPredictor:
             "target_timestamp_seconds",
         )
         horizon = target_timestamp - estimate.timestamp_seconds
-        horizon_tolerance = _comparison_tolerance(
-            target_timestamp,
+        source_tolerance = prediction_timestamp_tolerance(
             estimate.timestamp_seconds,
-            self.maximum_horizon_seconds,
+            target_timestamp,
         )
-        if horizon < -horizon_tolerance:
+        if horizon < -source_tolerance:
             raise PredictionError(
                 "target timestamp must not precede the estimate"
             )
         if horizon < 0:
             horizon = 0.0
             target_timestamp = estimate.timestamp_seconds
+        horizon_tolerance = _comparison_tolerance(
+            target_timestamp,
+            estimate.timestamp_seconds,
+            self.maximum_horizon_seconds,
+        )
         if horizon > self.maximum_horizon_seconds + horizon_tolerance:
             raise PredictionError(
                 "prediction horizon exceeds the configured maximum"

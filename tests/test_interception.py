@@ -13,6 +13,7 @@ from ARrobots.dynamic_motion import (
     EstimatorUpdateStatus,
     MotionEstimate,
     ObservationReplay,
+    PREDICTION_TIMESTAMP_TOLERANCE_ULPS,
     PositionObservation,
     ReplayObservation,
     StaleObservationError,
@@ -33,6 +34,10 @@ from ARrobots.interception import (
     InterceptSelectorConfig,
     ReplayInterceptStep,
     select_replay_intercepts,
+)
+from ARrobots.trajectory_timing import (
+    JointKinematicLimits,
+    plan_synchronized_rest_to_rest_trajectory,
 )
 
 
@@ -246,6 +251,46 @@ class InterceptContractTests(unittest.TestCase):
         ):
             InterceptSelector(huge, predictor(1e308), evaluator)
 
+        class MissingPredict:
+            maximum_horizon_seconds = 2.0
+
+        class MissingHorizon:
+            def predict(self, estimate, target_timestamp_seconds):
+                raise AssertionError("predict must not run during construction")
+
+        class NonCallablePredictor:
+            maximum_horizon_seconds = 2.0
+            predict = None
+
+        class InvalidHorizon:
+            def predict(self, estimate, target_timestamp_seconds):
+                return object()
+
+            @property
+            def maximum_horizon_seconds(self):
+                raise RuntimeError("unavailable")
+
+        class ZeroHorizon:
+            maximum_horizon_seconds = 0.0
+
+            def predict(self, estimate, target_timestamp_seconds):
+                return object()
+
+        invalid_predictors = (
+            (MissingPredict(), "must provide predict"),
+            (MissingHorizon(), "must provide maximum_horizon_seconds"),
+            (NonCallablePredictor(), "must provide callable predict"),
+            (InvalidHorizon(), "maximum_horizon_seconds is invalid"),
+            (ZeroHorizon(), "maximum_horizon_seconds must be positive"),
+        )
+        for invalid_predictor, message in invalid_predictors:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(
+                    InterceptSelectionError,
+                    message,
+                ):
+                    InterceptSelector(config, invalid_predictor, evaluator)
+
 
 class InterceptSelectorTests(unittest.TestCase):
     def test_lowest_risk_candidate_wins_with_earliest_stable_tie_break(self):
@@ -353,10 +398,55 @@ class InterceptSelectorTests(unittest.TestCase):
             for candidate in speed_result.candidates
         ))
 
+    def test_uncertainty_uses_each_predicted_covariance(self):
+        calls = []
+
+        selector = InterceptSelector(
+            selector_config(
+                maximum_position_standard_deviation_mm=0.21,
+            ),
+            predictor(process_variance=(0.1, 0.0, 0.0)),
+            lambda prediction, evaluated_at: (
+                calls.append(prediction) or feasible()
+            ),
+        )
+
+        result = selector.select(
+            motion_estimate(
+                velocity=(0.0, 0.0, 0.0),
+                position_variance=(0.0, 0.0, 0.0),
+            ),
+            1.0,
+        )
+
+        for candidate, expected_deviation in zip(
+            result.candidates,
+            tuple(math.sqrt(horizon * 0.1) for horizon in (0.2, 0.4, 0.6, 0.8)),
+        ):
+            self.assertAlmostEqual(
+                candidate.maximum_position_standard_deviation_mm,
+                expected_deviation,
+            )
+        self.assertEqual(
+            tuple(candidate.rejection_reason for candidate in result.candidates),
+            (
+                None,
+                None,
+                InterceptRejectionReason.UNCERTAINTY_LIMIT,
+                InterceptRejectionReason.UNCERTAINTY_LIMIT,
+            ),
+        )
+        self.assertEqual(len(calls), 2)
+
     def test_terminal_speed_uses_each_predicted_state(self):
-        class VaryingVelocityPredictor(ConstantVelocityPredictor):
+        class VaryingVelocityPredictor:
+            maximum_horizon_seconds = 2.0
+
+            def __init__(self):
+                self._base = predictor()
+
             def predict(self, estimate, target_timestamp_seconds):
-                prediction = super().predict(
+                prediction = self._base.predict(
                     estimate,
                     target_timestamp_seconds,
                 )
@@ -379,14 +469,7 @@ class InterceptSelectorTests(unittest.TestCase):
             selector_config(
                 maximum_terminal_speed_mm_per_second=5.0,
             ),
-            VaryingVelocityPredictor(
-                maximum_horizon_seconds=2.0,
-                process_position_variance_per_second=DiagonalCovariance3(
-                    0.0,
-                    0.0,
-                    0.0,
-                ),
-            ),
+            VaryingVelocityPredictor(),
             evaluate,
         )
 
@@ -413,6 +496,226 @@ class InterceptSelectorTests(unittest.TestCase):
             ),
         )
         self.assertEqual(len(calls), 2)
+
+    def test_source_timestamp_clamp_within_tolerance_remains_valid(self):
+        target_timestamp = math.fsum((1.0, 0.1))
+        selector = InterceptSelector(
+            selector_config(
+                minimum_lead_time_seconds=0.1,
+                maximum_lead_time_seconds=0.1,
+                maximum_future_skew_seconds=0.1,
+            ),
+            predictor(),
+            lambda prediction, evaluated_at: feasible(),
+        )
+        estimate = motion_estimate(
+            timestamp=target_timestamp + math.ulp(target_timestamp)
+        )
+
+        result = selector.select(estimate, 1.0)
+
+        self.assertIs(result.status, InterceptSelectionStatus.SELECTED)
+        self.assertEqual(
+            result.selected_candidate.prediction.timestamp_seconds,
+            estimate.timestamp_seconds,
+        )
+
+    def test_future_skew_boundary_composes_with_source_clamp(self):
+        unit_ulp = math.ulp(1.0)
+        selector = InterceptSelector(
+            selector_config(
+                minimum_lead_time_seconds=1.0,
+                maximum_lead_time_seconds=1.0,
+                candidate_interval_seconds=1.0,
+                maximum_estimate_age_seconds=0.1,
+                maximum_future_skew_seconds=1.0 + 4.0 * unit_ulp,
+            ),
+            predictor(2.0),
+            lambda prediction, evaluated_at: feasible(),
+        )
+        estimate = motion_estimate(timestamp=1.0 + 8.0 * unit_ulp)
+        future_estimate = motion_estimate(timestamp=1.0 + 9.0 * unit_ulp)
+
+        result = selector.select(estimate, 0.0)
+        future_result = selector.select(future_estimate, 0.0)
+
+        self.assertIs(result.status, InterceptSelectionStatus.SELECTED)
+        self.assertEqual(
+            result.selected_candidate.prediction.timestamp_seconds,
+            estimate.timestamp_seconds,
+        )
+        self.assertIs(
+            future_result.status,
+            InterceptSelectionStatus.FUTURE_ESTIMATE,
+        )
+        self.assertEqual(future_result.candidates, ())
+
+    def test_returned_timestamp_uses_composed_tolerance_boundary(self):
+        class OffsetTimestampPredictor:
+            maximum_horizon_seconds = 2.0
+
+            def __init__(self, offset_ulps):
+                self._base = predictor()
+                self._offset_ulps = offset_ulps
+
+            def predict(self, estimate, target_timestamp_seconds):
+                prediction = self._base.predict(
+                    estimate,
+                    target_timestamp_seconds,
+                )
+                return replace(
+                    prediction,
+                    timestamp_seconds=(
+                        target_timestamp_seconds
+                        + self._offset_ulps
+                        * math.ulp(target_timestamp_seconds)
+                    ),
+                )
+
+        accepted_selector = InterceptSelector(
+            selector_config(),
+            OffsetTimestampPredictor(
+                PREDICTION_TIMESTAMP_TOLERANCE_ULPS
+            ),
+            lambda prediction, evaluated_at: feasible(),
+        )
+        rejected_selector = InterceptSelector(
+            selector_config(),
+            OffsetTimestampPredictor(
+                PREDICTION_TIMESTAMP_TOLERANCE_ULPS + 1.0
+            ),
+            lambda prediction, evaluated_at: feasible(),
+        )
+
+        accepted = accepted_selector.select(motion_estimate(), 1.0)
+
+        self.assertIs(accepted.status, InterceptSelectionStatus.SELECTED)
+        with self.assertRaisesRegex(
+            InterceptSelectionError,
+            "candidate 0 prediction timestamp is invalid",
+        ):
+            rejected_selector.select(motion_estimate(), 1.0)
+
+    def test_predictor_horizon_is_revalidated_before_each_candidate(self):
+        class NarrowingHorizonPredictor:
+            def __init__(self):
+                self.maximum_horizon_seconds = 2.0
+                self._base = predictor()
+                self.calls = 0
+
+            def predict(self, estimate, target_timestamp_seconds):
+                prediction = self._base.predict(
+                    estimate,
+                    target_timestamp_seconds,
+                )
+                self.calls += 1
+                self.maximum_horizon_seconds = 0.5
+                return prediction
+
+        mutable_predictor = NarrowingHorizonPredictor()
+        selector = InterceptSelector(
+            selector_config(),
+            mutable_predictor,
+            lambda prediction, evaluated_at: feasible(),
+        )
+
+        with self.assertRaisesRegex(
+            InterceptSelectionError,
+            "candidate 1 predictor horizon no longer covers",
+        ):
+            selector.select(motion_estimate(), 1.0)
+        self.assertEqual(mutable_predictor.calls, 1)
+
+    def test_invalid_mutated_predictor_horizon_fails_closed(self):
+        class MutableHorizonPredictor:
+            def __init__(self):
+                self.maximum_horizon_seconds = 2.0
+                self._base = predictor()
+
+            def predict(self, estimate, target_timestamp_seconds):
+                return self._base.predict(estimate, target_timestamp_seconds)
+
+        mutable_predictor = MutableHorizonPredictor()
+        selector = InterceptSelector(
+            selector_config(),
+            mutable_predictor,
+            lambda prediction, evaluated_at: feasible(),
+        )
+        mutable_predictor.maximum_horizon_seconds = object()
+
+        with self.assertRaisesRegex(
+            InterceptSelectionError,
+            "candidate 0 predictor horizon is invalid",
+        ):
+            selector.select(motion_estimate(), 1.0)
+
+    def test_advertised_horizon_cannot_relax_timestamp_validation(self):
+        class MutableHorizonPredictor:
+            def __init__(self, initial_horizon):
+                self.maximum_horizon_seconds = initial_horizon
+                self._base = predictor()
+
+            def predict(self, estimate, target_timestamp_seconds):
+                prediction = self._base.predict(
+                    estimate,
+                    target_timestamp_seconds,
+                )
+                return replace(
+                    prediction,
+                    timestamp_seconds=target_timestamp_seconds + 0.5,
+                )
+
+        for initial_horizon in (2.0, 1e308):
+            with self.subTest(initial_horizon=initial_horizon):
+                mutable_predictor = MutableHorizonPredictor(initial_horizon)
+                selector = InterceptSelector(
+                    selector_config(),
+                    mutable_predictor,
+                    lambda prediction, evaluated_at: feasible(),
+                )
+                mutable_predictor.maximum_horizon_seconds = 1e308
+
+                with self.assertRaisesRegex(
+                    InterceptSelectionError,
+                    "candidate 0 prediction timestamp is invalid",
+                ):
+                    selector.select(motion_estimate(), 1.0)
+
+    def test_jerk_limited_plan_supplies_arrival_duration(self):
+        axis_limits = JointKinematicLimits(1.0, 10.0, 4.0)
+        trajectory = plan_synchronized_rest_to_rest_trajectory(
+            (0.0, 5.0),
+            (1.0, 5.0),
+            (axis_limits, axis_limits),
+        )
+        selector = InterceptSelector(
+            selector_config(
+                minimum_lead_time_seconds=1.0,
+                maximum_lead_time_seconds=3.0,
+                candidate_interval_seconds=1.0,
+                minimum_arrival_margin_seconds=0.1,
+            ),
+            predictor(4.0),
+            lambda prediction, evaluated_at: feasible(
+                trajectory.minimum_arrival_time_seconds
+            ),
+        )
+
+        result = selector.select(motion_estimate(), 1.0)
+
+        self.assertAlmostEqual(trajectory.minimum_arrival_time_seconds, 2.0)
+        self.assertEqual(
+            tuple(candidate.rejection_reason for candidate in result.candidates),
+            (
+                InterceptRejectionReason.INSUFFICIENT_ARRIVAL_MARGIN,
+                InterceptRejectionReason.INSUFFICIENT_ARRIVAL_MARGIN,
+                None,
+            ),
+        )
+        self.assertAlmostEqual(
+            result.selected_candidate.prediction.timestamp_seconds,
+            4.0,
+        )
 
     def test_feasibility_rejections_remain_explicit(self):
         expected = {
@@ -588,6 +891,54 @@ class InterceptSelectorTests(unittest.TestCase):
                 ),
                 1.0,
             )
+
+        base_prediction = predictor().predict(estimate, 1.2)
+
+        class InvalidPrediction:
+            maximum_horizon_seconds = 2.0
+
+            def __init__(self, output):
+                self.output = output
+
+            def predict(self, estimate, target_timestamp_seconds):
+                if isinstance(self.output, Exception):
+                    raise self.output
+                return self.output
+
+        invalid_predictions = (
+            (object(), "output is invalid"),
+            (
+                replace(base_prediction, source_timestamp_seconds=0.9),
+                "source is invalid",
+            ),
+            (
+                replace(base_prediction, timestamp_seconds=1.3),
+                "timestamp is invalid",
+            ),
+            (
+                replace(base_prediction, frame_id="camera"),
+                "frame is invalid",
+            ),
+            (RuntimeError("prediction failed"), "prediction failed"),
+        )
+        single_candidate_config = selector_config(
+            minimum_lead_time_seconds=0.2,
+            maximum_lead_time_seconds=0.2,
+            maximum_estimate_age_seconds=0.0,
+            maximum_future_skew_seconds=0.0,
+        )
+        for output, message in invalid_predictions:
+            with self.subTest(message=message):
+                invalid_selector = InterceptSelector(
+                    single_candidate_config,
+                    InvalidPrediction(output),
+                    lambda prediction, evaluated_at: feasible(),
+                )
+                with self.assertRaisesRegex(
+                    InterceptSelectionError,
+                    message,
+                ):
+                    invalid_selector.select(estimate, 1.0)
 
         excessive_speed = InterceptSelector(
             selector_config(
