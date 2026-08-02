@@ -1314,9 +1314,9 @@ Implemented foundation:
 - A deterministic injected feasibility boundary represents production IK,
   joint-limit, singularity, collision, and minimum-arrival-time decisions.
   Feasible results carry a non-negative application risk score. Selection uses
-  the lowest score, then the earliest predicted timestamp, then candidate
-  order as stable tie-breaks. Invalid evaluator output or an evaluator failure
-  aborts selection instead of converting the failure into a feasible result.
+  the lowest score, then the earliest predicted timestamp as the deterministic
+  tie-break. Invalid evaluator output or an evaluator failure aborts selection
+  instead of converting the failure into a feasible result.
 - Selection reports stale estimates, future estimates, unavailable feasible
   candidates, and every configured rejection class explicitly. Recorded
   observation replay validates the complete estimator input sequence before

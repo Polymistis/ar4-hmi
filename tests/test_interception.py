@@ -2,6 +2,7 @@ from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
 import math
 import unittest
+from unittest.mock import patch
 
 from ARrobots.dynamic_motion import (
     AxisStateCovariance,
@@ -330,11 +331,88 @@ class InterceptSelectorTests(unittest.TestCase):
         )
 
         self.assertEqual(calls, [])
+        self.assertEqual(
+            len(speed_result.candidates),
+            len(speed_selector.config.candidate_lead_times),
+        )
+        for candidate, lead_time in zip(
+            speed_result.candidates,
+            speed_selector.config.candidate_lead_times,
+        ):
+            self.assertAlmostEqual(
+                candidate.prediction.timestamp_seconds,
+                1.01 + lead_time,
+            )
+            self.assertAlmostEqual(
+                candidate.terminal_speed_mm_per_second,
+                10.0,
+            )
         self.assertTrue(all(
             candidate.rejection_reason
             is InterceptRejectionReason.TERMINAL_SPEED_LIMIT
             for candidate in speed_result.candidates
         ))
+
+    def test_terminal_speed_uses_each_predicted_state(self):
+        class VaryingVelocityPredictor(ConstantVelocityPredictor):
+            def predict(self, estimate, target_timestamp_seconds):
+                prediction = super().predict(
+                    estimate,
+                    target_timestamp_seconds,
+                )
+                return replace(
+                    prediction,
+                    velocity=Vector3(
+                        10.0 * prediction.horizon_seconds,
+                        0.0,
+                        0.0,
+                    ),
+                )
+
+        calls = []
+
+        def evaluate(prediction, evaluated_at):
+            calls.append(prediction)
+            return feasible()
+
+        selector = InterceptSelector(
+            selector_config(
+                maximum_terminal_speed_mm_per_second=5.0,
+            ),
+            VaryingVelocityPredictor(
+                maximum_horizon_seconds=2.0,
+                process_position_variance_per_second=DiagonalCovariance3(
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
+            ),
+            evaluate,
+        )
+
+        result = selector.select(
+            motion_estimate(velocity=(0.0, 0.0, 0.0)),
+            1.0,
+        )
+
+        for candidate, expected_speed in zip(
+            result.candidates,
+            (2.0, 4.0, 6.0, 8.0),
+        ):
+            self.assertAlmostEqual(
+                candidate.terminal_speed_mm_per_second,
+                expected_speed,
+            )
+        self.assertEqual(
+            tuple(candidate.rejection_reason for candidate in result.candidates),
+            (
+                None,
+                None,
+                InterceptRejectionReason.TERMINAL_SPEED_LIMIT,
+                InterceptRejectionReason.TERMINAL_SPEED_LIMIT,
+            ),
+        )
+        self.assertEqual(len(calls), 2)
 
     def test_feasibility_rejections_remain_explicit(self):
         expected = {
@@ -629,6 +707,13 @@ class InterceptResultValidationTests(unittest.TestCase):
             replace(collision, arrival_margin_seconds=0.1)
 
     def test_selection_validation_enforces_status_payload_contract(self):
+        class BrokenIterator:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise RuntimeError("iteration failed")
+
         selected = InterceptSelection(
             InterceptSelectionStatus.SELECTED,
             1.0,
@@ -765,6 +850,27 @@ class InterceptResultValidationTests(unittest.TestCase):
                 (rejected_candidate,) * (INTERCEPT_MAXIMUM_CANDIDATES + 1),
                 None,
             ),
+            lambda: InterceptSelection(
+                InterceptSelectionStatus.NO_FEASIBLE_CANDIDATE,
+                1.0,
+                self.estimate,
+                "invalid",
+                None,
+            ),
+            lambda: InterceptSelection(
+                InterceptSelectionStatus.NO_FEASIBLE_CANDIDATE,
+                1.0,
+                self.estimate,
+                object(),
+                None,
+            ),
+            lambda: InterceptSelection(
+                InterceptSelectionStatus.NO_FEASIBLE_CANDIDATE,
+                1.0,
+                self.estimate,
+                BrokenIterator(),
+                None,
+            ),
         )
         for constructor in invalid_constructors:
             with self.subTest(constructor=constructor):
@@ -824,6 +930,55 @@ class InterceptReplayTests(unittest.TestCase):
         )
         self.assertEqual(first[2].sample_index, 2)
         self.assertEqual(first[2].received_at_seconds, 1.21)
+
+    def test_replay_baseline_reset_defers_selection_until_next_estimate(self):
+        calls = []
+        replay = ObservationReplay((
+            replay_observation(1.0, (0.0, 0.0, 0.0)),
+            replay_observation(1.1, (1.0, 0.0, 0.0)),
+            replay_observation(1.7, (2.0, 0.0, 0.0)),
+            replay_observation(1.8, (3.0, 0.0, 0.0)),
+        ))
+
+        def evaluate(prediction, evaluated_at):
+            calls.append((prediction, evaluated_at))
+            return feasible()
+
+        selector = InterceptSelector(
+            selector_config(),
+            predictor(),
+            evaluate,
+        )
+
+        candidate_count = len(selector.config.candidate_lead_times)
+        with patch(
+            "ARrobots.interception."
+            "INTERCEPT_REPLAY_MAXIMUM_CANDIDATE_EVALUATIONS",
+            2 * candidate_count,
+        ):
+            steps = select_replay_intercepts(
+                replay,
+                estimator_config(),
+                selector,
+            )
+
+        self.assertEqual(
+            tuple(step.estimator_update.status for step in steps),
+            (
+                EstimatorUpdateStatus.BASELINE_ACCEPTED,
+                EstimatorUpdateStatus.ESTIMATE_UPDATED,
+                EstimatorUpdateStatus.BASELINE_RESET,
+                EstimatorUpdateStatus.ESTIMATE_UPDATED,
+            ),
+        )
+        self.assertIsNone(steps[0].selection)
+        self.assertIsNotNone(steps[1].selection)
+        self.assertIsNone(steps[2].selection)
+        self.assertIsNotNone(steps[3].selection)
+        self.assertEqual(
+            len(calls),
+            2 * candidate_count,
+        )
 
     def test_replay_validates_complete_input_before_feasibility_calls(self):
         calls = []

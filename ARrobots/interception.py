@@ -416,18 +416,17 @@ class InterceptSelection:
                     "selected candidate must be accepted"
                 )
             accepted = tuple(
-                (candidate.feasibility.risk_score, index, candidate)
-                for index, candidate in enumerate(candidates)
+                (candidate.feasibility.risk_score, candidate)
+                for candidate in candidates
                 if candidate.accepted
             )
             expected = min(
                 accepted,
                 key=lambda value: (
                     value[0],
-                    value[2].prediction.timestamp_seconds,
-                    value[1],
+                    value[1].prediction.timestamp_seconds,
                 ),
-            )[2]
+            )[1]
             if self.selected_candidate is not expected:
                 raise InterceptSelectionError(
                     "selected candidate does not satisfy deterministic ranking"
@@ -830,7 +829,6 @@ class InterceptSelector:
                 accepted.append((
                     feasibility.risk_score,
                     prediction.timestamp_seconds,
-                    candidate_index,
                     candidate,
                 ))
 
@@ -842,7 +840,7 @@ class InterceptSelector:
                 estimate=estimate,
                 candidates=candidate_tuple,
             )
-        selected_candidate = min(accepted, key=lambda value: value[:3])[3]
+        selected_candidate = min(accepted, key=lambda value: value[:2])[2]
         return InterceptSelection(
             status=InterceptSelectionStatus.SELECTED,
             evaluated_at_seconds=evaluated_at,
@@ -905,7 +903,7 @@ class ReplayInterceptStep:
 
 
 def select_replay_intercepts(replay, estimator_config, selector):
-    """Re-estimate and reselect after every valid replay observation."""
+    """Re-estimate every replay observation and select after each estimate."""
 
     if not isinstance(replay, ObservationReplay):
         raise InterceptSelectionError("replay must be ObservationReplay")

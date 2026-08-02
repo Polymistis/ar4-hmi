@@ -145,9 +145,9 @@ byte-level hashes therefore identify encoded files rather than logical replay
 equivalence.
 
 Current scope stops before acceleration estimation, transforms, innovation
-tests, impacts, production IK or collision checking, trajectory generation,
-controller setpoint replacement, or grasp supervision. No live-arm result is
-established by the deterministic module or associated tests.
+tests, impacts, production reachability, IK, or collision checking, trajectory
+generation, controller setpoint replacement, or grasp supervision. No live-arm
+result is established by the deterministic module or associated tests.
 
 ## Implemented deterministic intercept selection
 
@@ -169,10 +169,10 @@ arrival duration measured from the selector evaluation timestamp and an
 application-defined non-negative risk score. The selector compares the largest
 per-axis predicted position standard deviation with the uncertainty limit,
 enforces the arrival margin, and ranks accepted candidates by risk, predicted
-timestamp, and original candidate order. The evaluator receives the predicted
-state and selection timestamp. Stale and future estimates return explicit
-non-selected statuses without invoking the evaluator. Exceptions or malformed
-evaluator output fail the selection boundary.
+timestamp. The evaluator receives the predicted state and selection timestamp.
+Stale and future estimates return explicit non-selected statuses without
+invoking the evaluator. Exceptions or malformed evaluator output fail the
+selection boundary.
 
 `select_replay_intercepts` validates the complete recorded estimator sequence
 and the bounded record-by-candidate workload before feasibility evaluation,
