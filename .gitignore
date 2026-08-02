@@ -35,4 +35,4 @@ dist/
 Thumbs.db
 
 # Local development artifacts
-logs/
+/logs/

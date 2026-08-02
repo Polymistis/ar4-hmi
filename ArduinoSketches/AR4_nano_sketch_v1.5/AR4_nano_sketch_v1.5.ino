@@ -42,289 +42,264 @@
 
 #include <Servo.h>
 
-String inData;
+#include "auxiliary_protocol_contract.h"
 
+static const ar4_auxiliary::BoardProfile kBoardProfile =
+  ar4_auxiliary::kNanoBoard;
+static const uint8_t kServoCount = 6;
+static const uint8_t kServoPins[kServoCount] = {
+  A0,
+  A1,
+  A2,
+  A3,
+  A4,
+  A5,
+};
+static const uint8_t kInputPins[] = {2, 3, 4, 5, 6, 7};
+static const uint8_t kOutputPins[] = {8, 9, 10, 11, 12, 13};
 
-Servo servo0;
-Servo servo1;
-Servo servo2;
-Servo servo3;
-Servo servo4;
-Servo servo5;
-Servo servo6;
+static const uint8_t kCurrentSensorPin = A7;
+static const float kAnalogReferenceVolts = 5.0f;
+static const float kCurrentSensorVoltsPerAmp = 0.185f;
+static const uint16_t kCurrentZeroSampleCount = 200;
+static const uint8_t kCurrentReadSampleCount = 20;
 
+Servo servoChannels[kServoCount];
+bool servoAttached[kServoCount] = {false, false, false, false, false, false};
+ar4_auxiliary::FrameBuffer commandFrames;
+int currentSensorZeroRaw = 512;
+ar4_auxiliary::WaitState waitOperation = {false, 0, 0, 0, 0};
 
-const int Input2 = 2;
-const int Input3 = 3;
-const int Input4 = 4;
-const int Input5 = 5;
-const int Input6 = 6;
-const int Input7 = 7;
-
-const int Output8 = 8;
-const int Output9 = 9;
-const int Output10 = 10;
-const int Output11 = 11;
-const int Output12 = 12;
-const int Output13 = 13;
-
-// ---------- ACS712 (5A) current sensor ----------
-const int ACS_PIN = A7;        // ACS712 AOUT wired here
-const float ACS_VCC = 5.0;     // Nano analog reference
-const float ACS_SENS = 0.185;  // 185 mV per amp (5A version)
-
-int acsZeroRaw = 512;  // will be calibrated at startup
-
-// ---- Gripper tracking ----
-int gripperCmd = 20;  // last commanded gripper position
-const int GRIPPER_MIN = 0;
-const int GRIPPER_MAX = 45;
-
-// ---- Current limit behavior ----
-const float CURRENT_LIMIT = 0.8;              // amps
-const unsigned long BACKOFF_INTERVAL = 3000;  // 3 seconds
-
-unsigned long lastBackoffMs = 0;
-
-
-void setup() {
-  // run once:
-  Serial.begin(9600);
-
-  pinMode(A0, OUTPUT);
-  pinMode(A1, OUTPUT);
-  pinMode(A2, OUTPUT);
-  pinMode(A3, OUTPUT);
-  pinMode(A4, OUTPUT);
-  pinMode(A5, OUTPUT);
-  pinMode(A6, OUTPUT);
-  pinMode(A7, INPUT);
-
-
-  pinMode(Input2, INPUT_PULLUP);
-  pinMode(Input3, INPUT_PULLUP);
-  pinMode(Input4, INPUT_PULLUP);
-  pinMode(Input5, INPUT_PULLUP);
-  pinMode(Input6, INPUT_PULLUP);
-  pinMode(Input7, INPUT_PULLUP);
-
-
-  pinMode(Output8, OUTPUT);
-  pinMode(Output9, OUTPUT);
-  pinMode(Output10, OUTPUT);
-  pinMode(Output11, OUTPUT);
-  pinMode(Output12, OUTPUT);
-  pinMode(Output13, OUTPUT);
-
-
-  servo0.attach(A0);
-  servo1.attach(A1);
-  servo2.attach(A2);
-  servo3.attach(A3);
-  servo4.attach(A4);
-  servo5.attach(A5);
-  servo6.attach(A6);
-
-  servo0.write(20);
-
-  // Calibrate ACS712 zero-current offset
-  long sum = 0;
-  for (int i = 0; i < 200; i++) {
-    sum += analogRead(ACS_PIN);
+void calibrateCurrentSensor() {
+  long sampleTotal = 0;
+  for (
+    uint16_t sample = 0;
+    sample < kCurrentZeroSampleCount;
+    ++sample
+  ) {
+    sampleTotal += analogRead(kCurrentSensorPin);
     delay(2);
   }
-  acsZeroRaw = sum / 200;
+  currentSensorZeroRaw = (
+    sampleTotal / static_cast<long>(kCurrentZeroSampleCount)
+  );
 }
 
-float readAcsCurrent() {
-  const int samples = 20;
-  long sum = 0;
-
-  for (int i = 0; i < samples; i++) {
-    sum += analogRead(ACS_PIN);
+float readCurrentAmps() {
+  long sampleTotal = 0;
+  for (
+    uint8_t sample = 0;
+    sample < kCurrentReadSampleCount;
+    ++sample
+  ) {
+    sampleTotal += analogRead(kCurrentSensorPin);
   }
-
-  float raw = sum / (float)samples;
-
-  // Convert ADC reading to voltage
-  float volts = (raw * ACS_VCC) / 1023.0;
-  float zeroVolts = (acsZeroRaw * ACS_VCC) / 1023.0;
-
-  // Convert voltage difference to current
-  float amps = (volts - zeroVolts) / ACS_SENS;
-
-  // amps absolute value - magnitude
-  if (amps < 0) amps = -amps;
-
+  const float raw = (
+    static_cast<float>(sampleTotal)
+    / static_cast<float>(kCurrentReadSampleCount)
+  );
+  const float volts = raw * kAnalogReferenceVolts / 1023.0f;
+  const float zeroVolts = (
+    static_cast<float>(currentSensorZeroRaw)
+    * kAnalogReferenceVolts
+    / 1023.0f
+  );
+  float amps = (
+    (volts - zeroVolts) / kCurrentSensorVoltsPerAmp
+  );
+  if (amps < 0.0f) {
+    amps = -amps;
+  }
   return amps;
 }
 
-void gripperBackoff() {
-  float amps = readAcsCurrent();
-  unsigned long now = millis();
+bool writeServo(uint8_t channel, uint16_t position) {
+  if (channel >= kServoCount) {
+    return false;
+  }
 
-  if (amps > CURRENT_LIMIT) {
-    if (now - lastBackoffMs >= BACKOFF_INTERVAL) {
-      lastBackoffMs = now;
-
-      if (gripperCmd < GRIPPER_MAX) {
-        gripperCmd += .25;
-        if (gripperCmd > GRIPPER_MAX) gripperCmd = GRIPPER_MAX;
-
-        servo0.write(gripperCmd);
-      }
+  if (!servoAttached[channel]) {
+    // Keep the timer ISR masked until the admitted target replaces its default.
+    const uint8_t interruptState = SREG;
+    cli();
+    const uint8_t servoIndex = servoChannels[channel].attach(
+      kServoPins[channel]
+    );
+    if (servoIndex != INVALID_SERVO) {
+      servoChannels[channel].write(position);
     }
+    SREG = interruptState;
+    if (servoIndex == INVALID_SERVO) {
+      return false;
+    }
+    servoAttached[channel] = true;
   } else {
-    // below threshold → reset timer so it must stay high again
-    lastBackoffMs = now;
+    servoChannels[channel].write(position);
+  }
+  return true;
+}
+
+void stopWait() {
+  if (ar4_auxiliary::cancelWait(&waitOperation)) {
+    Serial.println(F("Nano Stopped"));
+  } else {
+    Serial.println(F("Error"));
   }
 }
 
-void loop() {
-  //start loop
-  gripperBackoff();
-  while (Serial.available() > 0) {
-    char recieved = Serial.read();
-    inData += recieved;
-    // Process message when new line character is recieved
-    if (recieved == '\n') {
-      String function = inData.substring(0, 2);
-
-      //-----COMMAND TEST GRIPPER AMPERAGE---------------------------------------------------
-      //-----------------------------------------------------------------------
-      if (function == "TG") {
-        int raw = analogRead(A7);
-        float volts = raw * (5.0 / 1023.0);
-        Serial.println(readAcsCurrent(), 3);
-        //Serial.println(volts, 3);
-      }
-
-
-      //-----COMMAND TO MOVE SERVO---------------------------------------------------
-      //-----------------------------------------------------------------------
-      if (function == "SV") {
-        int SVstart = inData.indexOf('V');
-        int POSstart = inData.indexOf('P');
-        int servoNum = inData.substring(SVstart + 1, POSstart).toInt();
-        int servoPOS = inData.substring(POSstart + 1).toInt();
-        if (servoNum == 0) {
-          gripperCmd = servoPOS;
-          servo0.write(gripperCmd);
-        }
-        if (servoNum == 1) {
-          servo1.write(servoPOS);
-        }
-        if (servoNum == 2) {
-          servo2.write(servoPOS);
-        }
-        if (servoNum == 3) {
-          servo3.write(servoPOS);
-        }
-        if (servoNum == 4) {
-          servo4.write(servoPOS);
-        }
-        if (servoNum == 5) {
-          servo5.write(servoPOS);
-        }
-        if (servoNum == 6) {
-          servo6.write(servoPOS);
-        }
-
-        Serial.print("Servo Done");
-      }
-
-
-      //-----COMMAND IF INPUT THEN JUMP---------------------------------------------------
-      //-----------------------------------------------------------------------
-      if (function == "JF") {
-        int IJstart = inData.indexOf('X');
-        int IJTabstart = inData.indexOf('T');
-        int IJInputNum = inData.substring(IJstart + 1, IJTabstart).toInt();
-        if (digitalRead(IJInputNum) == HIGH) {
-          Serial.println("T");
-        }
-        if (digitalRead(IJInputNum) == LOW) {
-          Serial.println("F");
-        }
-      }
-      //-----COMMAND SET OUTPUT ON---------------------------------------------------
-      //-----------------------------------------------------------------------
-      if (function == "ON") {
-        int ONstart = inData.indexOf('X');
-        int outputNum = inData.substring(ONstart + 1).toInt();
-        digitalWrite(outputNum, HIGH);
-        Serial.print("Done");
-      }
-      //-----COMMAND SET OUTPUT OFF---------------------------------------------------
-      //-----------------------------------------------------------------------
-      if (function == "OF") {
-        int ONstart = inData.indexOf('X');
-        int outputNum = inData.substring(ONstart + 1).toInt();
-        digitalWrite(outputNum, LOW);
-        Serial.print("Done");
-      }
-      //-----COMMAND TO WAIT 5v INPUT---------------------------------------------------
-      //-----------------------------------------------------------------------
-      if (function == "WI") {
-        int inputVal = -1;
-        int inputIndex = inData.indexOf('A');
-        int valueIndex = inData.indexOf('B');
-        int timoutIndex = inData.indexOf('C');
-        int input = inData.substring(inputIndex + 1, valueIndex).toInt();
-        int value = inData.substring(valueIndex + 1, timoutIndex).toInt();
-        int timeout = inData.substring(timoutIndex + 1).toInt();
-
-        unsigned long timeoutMillis = (unsigned long)timeout * 1000;
-        unsigned long startTime = millis();
-        bool aborted = false;
-
-        while ((millis() - startTime < timeoutMillis) && (inputVal != value)) {
-          inputVal = digitalRead(input);
-
-          // Check for incoming serial stop/cancel command
-          if (Serial.available() > 0) {
-            String stopCmd = Serial.readStringUntil('\n');
-            stopCmd.trim();
-
-            if (stopCmd == "STOPWI" || stopCmd == "STOP") {
-              aborted = true;
-              break;
-            }
-          }
-
-          delay(10);
-        }
-
-        delay(5);
-
-        if (aborted) {
-          Serial.println("Nano Stopped");
-        } else if (inputVal == value) {
-          Serial.println("Done");
-        } else {
-          Serial.println("Timeout");
-        }
-      }
-
-      //-----STOP COMMAND ---------------------------------------------------
-      //-----------------------------------------------------------------------
-      if (function == "ST") {
-        Serial.println("Nano Inactive Stopped");
-      }
-
-      //-----COMMAND ECHO TEST MESSAGE---------------------------------------------------
-      //-----------------------------------------------------------------------
-      if (function == "TM") {
-        String echo = inData.substring(2);
-        Serial.println(echo);
-      }
-
-
-
-
-      else {
-        inData = "";  // Clear recieved buffer
-      }
-    }
+void serviceWait() {
+  if (!waitOperation.active) {
+    return;
   }
+
+  const uint32_t now = static_cast<uint32_t>(millis());
+  const uint8_t observedState = (
+    digitalRead(waitOperation.pin) == HIGH ? 1 : 0
+  );
+  const ar4_auxiliary::WaitResult result = ar4_auxiliary::updateWait(
+    &waitOperation,
+    observedState,
+    now
+  );
+  switch (result) {
+    case ar4_auxiliary::kWaitPending:
+      return;
+    case ar4_auxiliary::kWaitMatched:
+      Serial.println(F("Done"));
+      return;
+    case ar4_auxiliary::kWaitTimedOut:
+      Serial.println(F("Timeout"));
+      return;
+    case ar4_auxiliary::kWaitInactive:
+      ar4_auxiliary::cancelWait(&waitOperation);
+      Serial.println(F("Error"));
+      return;
+  }
+}
+
+bool beginWait(const ar4_auxiliary::ParsedCommand& command) {
+  return ar4_auxiliary::startWait(
+    &waitOperation,
+    command.pin,
+    command.state,
+    command.timeoutSeconds,
+    static_cast<uint32_t>(millis())
+  );
+}
+
+void writeEcho(const ar4_auxiliary::ParsedCommand& command) {
+  if (command.payloadLength > 0) {
+    Serial.write(
+      reinterpret_cast<const uint8_t*>(command.payload),
+      command.payloadLength
+    );
+  }
+  Serial.write('\n');
+}
+
+void handleFrame(const ar4_auxiliary::Frame& frame) {
+  ar4_auxiliary::ParsedCommand command;
+  if (
+    !ar4_auxiliary::parseCommand(
+      frame.data,
+      frame.length,
+      kBoardProfile,
+      &command
+    )
+  ) {
+    Serial.println(F("Error"));
+    return;
+  }
+
+  const ar4_auxiliary::CommandDisposition disposition = (
+    ar4_auxiliary::commandDisposition(waitOperation.active, command.kind)
+  );
+  if (disposition == ar4_auxiliary::kStopActiveWait) {
+    stopWait();
+    return;
+  }
+  if (disposition == ar4_auxiliary::kRejectDuringWait) {
+    Serial.println(F("Error"));
+    return;
+  }
+
+  switch (command.kind) {
+    case ar4_auxiliary::kServoCommand:
+      if (writeServo(command.channel, command.position)) {
+        Serial.print(F("Servo Done"));
+      } else {
+        Serial.println(F("Error"));
+      }
+      break;
+    case ar4_auxiliary::kInputReadCommand:
+      Serial.println(digitalRead(command.pin) == HIGH ? F("T") : F("F"));
+      break;
+    case ar4_auxiliary::kOutputOnCommand:
+      digitalWrite(command.pin, HIGH);
+      Serial.print(F("Done"));
+      break;
+    case ar4_auxiliary::kOutputOffCommand:
+      digitalWrite(command.pin, LOW);
+      Serial.print(F("Done"));
+      break;
+    case ar4_auxiliary::kWaitInputCommand:
+      if (!beginWait(command)) {
+        Serial.println(F("Error"));
+      }
+      break;
+    case ar4_auxiliary::kGripperCurrentCommand:
+      Serial.println(readCurrentAmps(), 3);
+      break;
+    case ar4_auxiliary::kStopCommand:
+      Serial.println(F("Nano Inactive Stopped"));
+      break;
+    case ar4_auxiliary::kEchoCommand:
+      writeEcho(command);
+      break;
+  }
+}
+
+void setup() {
+  pinMode(kCurrentSensorPin, INPUT);
+
+  for (
+    size_t index = 0;
+    index < sizeof(kInputPins) / sizeof(kInputPins[0]);
+    ++index
+  ) {
+    pinMode(kInputPins[index], INPUT_PULLUP);
+  }
+  for (
+    size_t index = 0;
+    index < sizeof(kOutputPins) / sizeof(kOutputPins[0]);
+    ++index
+  ) {
+    pinMode(kOutputPins[index], OUTPUT);
+  }
+
+  Serial.begin(9600);
+  calibrateCurrentSensor();
+}
+
+void loop() {
+  serviceWait();
+  while (Serial.available() > 0) {
+    const int received = Serial.read();
+    if (received < 0) {
+      break;
+    }
+
+    ar4_auxiliary::Frame frame;
+    const ar4_auxiliary::FrameStatus status = commandFrames.push(
+      static_cast<char>(received),
+      &frame
+    );
+    if (status == ar4_auxiliary::kFrameReady) {
+      handleFrame(frame);
+    } else if (status == ar4_auxiliary::kFrameRejected) {
+      Serial.println(F("Error"));
+    }
+    serviceWait();
+  }
+  serviceWait();
 }

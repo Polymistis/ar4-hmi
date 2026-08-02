@@ -1,21 +1,22 @@
 # Firmware compilation
 
-Firmware compilation is hardware-free. Upload and live verification follow [`SAFETY.md`](../SAFETY.md): record the date, controller and firmware identity, configuration profile, starting state, exact procedure, observed results, and operator confirmation. Powered testing also requires a cleared workspace, verification of the independent physical stop path, and confirmation of physical driver microsteps or measured motion scale.
+The commands below compile without uploading. Do not add `--upload`. Any firmware upload requires a separate operator-approved procedure under [`SAFETY.md`](../SAFETY.md), and the resulting record must satisfy the complete live-verification field contract there. Powered testing also requires a cleared workspace, verification of the independent physical stop path, and confirmation of physical driver microsteps or measured motion scale.
 
 The tracked line-oriented Teensy compatibility source identifies version
 `6.7.1-ar4hmi.10`, advertises the required `JT_WRIST_CONFIG_V1`,
 `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`,
-`GCODE_WRITE_IDENTITY_V1`, and `CALIBRATION_SWITCH_POLARITY_V1` host
-capabilities plus the optional
-legacy `HOME_REFERENCE_V1`, preferred `HOME_REFERENCE_V2` parking-reference,
-and `JOINT_TELEMETRY_V1` request-scoped J1-J6 encoder telemetry contracts, and
-compiles with Arduino CLI,
+`GCODE_WRITE_IDENTITY_V1`, `ESTOP_ADMISSION_V1`, and
+`CALIBRATION_SWITCH_POLARITY_V1` host capabilities plus the optional legacy
+`HOME_REFERENCE_V1`, preferred `HOME_REFERENCE_V2`
+parking-reference, and `JOINT_TELEMETRY_V1` request-scoped J1-J6 encoder
+telemetry contracts, and compiles with Arduino CLI,
 PJRC Teensy core 1.62.0, bundled SdFat 2.1.2, and ModbusMaster 2.0.1. `HO`
 includes the fixed-width controller hardware identity used to bind storage
-requests to the connected Teensy. Compilation
+requests to the connected Teensy. `RB` performs the Teensy 4.1 target reset
+without consulting mutable controller identity fields. Compilation
 establishes source and toolchain compatibility only; hardware-free fixtures
-cover selected protocol behavior, while correlated JSON parsing,
-Cartesian-bound, and emergency-event work remains a later integration unit.
+cover selected protocol behavior, while correlated JSON parsing and
+Cartesian-bound work remain later integration units.
 
 `CALIBRATION_SWITCH_POLARITY_V1` extends `UP` with a J1-low-bit mask describing
 the active state of each J1-J9 calibration switch. Existing and migrated
@@ -27,13 +28,26 @@ The controller targets ten samples per second, formats signed millidegrees in a
 fixed ASCII frame, and drops a sample unless USB capacity remains for both the
 telemetry frame and a reserved terminal response. J7-J9 remain host estimates
 because the tracked controller has no matching encoder sources. A
-telemetry-enabled `RJ` retains main-loop response ownership across the drive;
-an E-stop latches immediately, then terminal framing follows committed step
-progress and encoder reconciliation. A stop deferred after terminal selection
-becomes an admission block during atomic ownership commit. The next queued
-command receives an `EB` position response before parsing or output activation,
-then the reported block clears. No-upload compilation does not establish encoder
-accuracy or pulse-timing behavior.
+loop-scoped response owner brackets every ordinary, admission, and telemetry
+terminal writer. The E-stop interrupt records assertion state and pending
+output without writing USB serial data. Main-loop code emits pending `EB` only
+after the current terminal frame or at an otherwise empty loop boundary.
+Telemetry-enabled `RJ` retains its specialized terminal decision across the
+drive; an E-stop latches immediately, then terminal framing follows committed
+step progress and encoder reconciliation. `EB` identifies the asynchronous
+physical-stop event. A stop deferred after telemetry terminal selection
+becomes an admission block and emits `EB` immediately after the selected
+terminal frame. Command admission is checked atomically before parsing and
+again after side-effect-free opcode extraction. A blocked command reserves the
+correlated `EA` response against pending `EB` publication. Admission and
+loop-response ownership retire together with interrupts disabled, then a
+released stop clears only when no newer interrupt generation was recorded. An
+asserted or newly reasserted stop continues rejecting commands.
+Calibration command `LL` emits `ER` after every failed motion stage. When the
+stop interrupt occurs during an owned calibration response, the host consumes
+the bounded `ER` terminal and `EB` event pair.
+No-upload compilation does not establish encoder accuracy or pulse-timing
+behavior.
 
 `GCODE_DIRECTORY_FRAMING_V1` reserves comma as the directory separator,
 requires every `.txt` entry to have a reversible controller-command stem, and
@@ -66,6 +80,28 @@ arduino-cli lib install ModbusMaster@2.0.1
 arduino-cli compile --fqbn teensy:avr:teensy41 --clean --build-path <temporary-build-directory> ArduinoSketches/AR4_teensy41_sketch_v6.7.1
 ```
 
+The tracked Nano and Mega compatibility sketches use Arduino AVR core 1.8.8
+and Servo 1.3.0. Both sketches enforce complete fixed-buffer commands before
+mutation. Nano permits servo channels 0-5, inputs 2-7, and outputs 8-13; Mega
+permits servo channels 0-6, inputs 2-27, and outputs 28-53. Servo output remains
+detached through startup. Initial attachment keeps AVR interrupts masked until
+the admitted `SV` target replaces the Servo library default. `TG` reports
+current without autonomous servo correction. `WI` remains nonblocking, and
+requires a positive timeout. Each polling pass samples the input before
+classifying deadline expiry, and only exact `STOP` or `STOPWI` frames interrupt
+an active wait.
+
+Arduino's sketch builder does not expose a header above the selected sketch
+directory. Each auxiliary sketch therefore carries a byte-identical
+`auxiliary_protocol_contract.h`; the source-contract test rejects divergence.
+
+```text
+arduino-cli core install arduino:avr@1.8.8
+arduino-cli lib install Servo@1.3.0
+arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328old --clean --build-path <temporary-nano-build-directory> ArduinoSketches/AR4_nano_sketch_v1.5
+arduino-cli compile --fqbn arduino:avr:mega --clean --build-path <temporary-mega-build-directory> ArduinoSketches/AR4_mega_sketch_v1.5
+```
+
 Arduino library discovery gives sketchbook libraries priority over platform libraries. An unrelated sketchbook `SPI` library can shadow the Teensy core implementation and cause missing `SPISettings` errors in `SdFat`. Preserve the sketchbook and select the platform library explicitly:
 
 ```text
@@ -88,4 +124,9 @@ and SdFat folders under the Teensy 1.62.0 platform, and verifies PJRC Teensy
 core 1.62.0 and ModbusMaster 2.0.1. A kill-on-close Windows Job Object or POSIX
 process group owns the compiler tree, and the timeout path waits for verified
 tree settlement before temporary build cleanup.
+
+`tests/test_auxiliary_firmware_compile.py` runs both AVR no-upload compilations
+when `AR4_ARDUINO_CLI` and `AR4_AUXILIARY_BUILD_DIRECTORY` identify the
+selected executable and an existing external temporary build parent. The test
+requires Arduino AVR core 1.8.8 and Servo 1.3.0 in compiler dependency output.
 

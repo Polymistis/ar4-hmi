@@ -62,7 +62,7 @@ b. Pausing
 
 
 c. IO
-- The set output on or set output off buttons allow you to insert a line of code that will turn Arduino IO of your choice on or off (see bottom on input outputs tab for available IO pins on the Arduino Mega). For example, if you have a pneumatic gripper you would hook up your solenoid per the wiring harness manual to output Arduino pin #38 and ender a line of code "Out On = 38" to control your gripper.
+- Legacy "Out On = N" and "Out Off = N" program rows have no executable handler and are rejected before execution. Use the active 5 V output or Modbus program controls for supported controller I/O.
 
 
 d. Navigation
@@ -84,7 +84,7 @@ f. Servos
 The Servo button allows you to control external servos - it’s not for the robot itself, it’s for use if you have a servo gripper or a servo actuator that you want the robot program to control.  For example, if you had a servo gripper that you had hooked up to Arduino pin A0 per the wiring harness manual you could then insert a line of code "Servo number 0 to position: 180" to open the gripper and "Servo number 0 to position: 0" to close your gripper.
 
 g. Editing lines of code
-You can select a line of code in you command window and then press the "get selected" button,  this will copy that line into the manual entry field.  You can now edit the line of code in the manual entry field, some examples might be: changing the stored position number, changing a position, changing the robot speed or acceleration.  Now with your edited line of code you can reselect the original line of code in your command window and then press the "replace" button and the old line of code will be replaced with the new edited line.  The "insert" button will insert the test from the manual entry field into your program without replacing - you can use this to insert comments or hand written lines of code using the insert button, this can be used to copy a line of code from the program and then paste or insert in in numerous places in the program.
+You can select a line of code in you command window and then press the "get selected" button,  this will copy that line into the manual entry field.  You can now edit the line of code in the manual entry field, some examples might be: changing the stored position number, changing a position, changing the robot speed or acceleration.  Now with your edited line of code you can reselect the original line of code in your command window and then press the "replace" button and the old line of code will be replaced with the new edited line.  The "insert" button inserts text from the manual entry field without replacing the selected row. Insert only supported program instructions, blank rows, numeric "Tab Number" labels, or comments beginning with "##"; unsupported handwritten rows are rejected before execution.
 
 
 

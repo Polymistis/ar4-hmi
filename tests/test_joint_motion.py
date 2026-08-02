@@ -5,21 +5,29 @@ import struct
 import threading
 import time
 import unittest
+from decimal import Decimal
 from unittest.mock import patch
 
 from ARrobots.HMI.joint_motion import (
     AUXILIARY_BOARD_MEGA,
     AUXILIARY_BOARD_NANO,
     AUXILIARY_BOARD_NONE,
+    AUXILIARY_BOARD_INPUT_PINS,
     AUXILIARY_BOARD_OUTPUT_PINS,
+    AUXILIARY_BOARD_SERVO_CHANNELS,
+    AUXILIARY_CURRENT_MAXIMUM_AMPS,
+    AUXILIARY_WAIT_MAXIMUM_SECONDS,
     CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
     CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
     CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
+    CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
     CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
     CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
     CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
     CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+    CONTROLLER_ESTOP_ADMISSION_FLAG,
+    CONTROLLER_ESTOP_EVENT_FLAG,
     CONTROLLER_DIRECTORY_SEPARATOR,
     CONTROLLER_MAXIMUM_RAMP_PERCENT,
     CoalescingJointDispatcher,
@@ -27,6 +35,8 @@ from ARrobots.HMI.joint_motion import (
     CommandedJointTrajectory,
     ControllerIdentity,
     ControllerJointCalibration,
+    ControllerLineExchangeResponse,
+    ControllerModbusExchangeResponse,
     DeferredLiveMotionArbiter,
     LiveMotionScheduleResult,
     MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES,
@@ -51,10 +61,13 @@ from ARrobots.HMI.joint_motion import (
     SerialTransportTimeout,
     VirtualMotionOperation,
     auxiliary_pneumatic_output_pin,
+    build_controller_modbus_command,
     build_robot_joint_command,
     canonicalize_serial_command,
     canonicalize_virtual_command,
+    classify_controller_modbus_terminal_response,
     command_response_timeout,
+    controller_modbus_command_is_write,
     controller_degree_to_native_radians,
     controller_number,
     controller_protocol_decimal,
@@ -68,15 +81,20 @@ from ARrobots.HMI.joint_motion import (
     motion_timing_response_timeout,
     normalize_auxiliary_board_profile,
     parse_auxiliary_output_command,
+    parse_auxiliary_gripper_current_response,
+    parse_auxiliary_input_command,
     parse_auxiliary_servo_command,
+    parse_auxiliary_wait_command,
     parse_command_speed,
     parse_command_timing,
     parse_controller_identity_response,
+    parse_controller_modbus_exchange_frames,
     parse_controller_modbus_response,
     parse_joint_motion_exchange_response,
     parse_joint_telemetry_response,
     parse_motion_wrist_config,
     parse_position_response,
+    position_response_is_physical_estop,
     parse_primary_home_reference_capability_response,
     parse_primary_home_reference_response,
     parse_primary_home_reference_v2_response,
@@ -84,6 +102,10 @@ from ARrobots.HMI.joint_motion import (
     primary_home_reference_command,
     primary_shutdown_position,
     quarantine_serial_transport,
+    read_controller_exact_exchange_response,
+    read_controller_line_exchange_response,
+    read_controller_modbus_exchange_response,
+    read_pending_controller_estop_response,
     read_serial_exact_response,
     read_serial_line_response,
     read_serial_line_response_with_optional_followup,
@@ -91,7 +113,11 @@ from ARrobots.HMI.joint_motion import (
     serial_transport_quarantined,
     validate_controller_filename,
     validate_auxiliary_output_command,
+    validate_auxiliary_gripper_current_command,
+    validate_auxiliary_input_command,
     validate_auxiliary_servo_command,
+    validate_auxiliary_wait_command,
+    validate_controller_modbus_command,
     write_serial_control,
 )
 
@@ -417,25 +443,48 @@ class AuxiliaryBoardProfileTests(unittest.TestCase):
                         AUXILIARY_BOARD_NANO,
                     )
 
-    def test_servo_validation_accepts_supported_channels_and_positions(self):
-        for channel in range(7):
-            for position in (0, 1, 90, 179, 180):
-                command = f"SV{channel}P{position}\n"
-                with self.subTest(channel=channel, position=position):
-                    self.assertEqual(
-                        validate_auxiliary_servo_command(command),
-                        command,
-                    )
-                    self.assertEqual(
-                        parse_auxiliary_servo_command(command),
-                        (channel, position),
-                    )
+    def test_servo_validation_enforces_each_board_profile(self):
+        for profile, channels in AUXILIARY_BOARD_SERVO_CHANNELS.items():
+            for channel in channels:
+                for position in (0, 1, 90, 179, 180):
+                    command = f"SV{channel}P{position}\n"
+                    with self.subTest(
+                        profile=profile,
+                        channel=channel,
+                        position=position,
+                    ):
+                        self.assertEqual(
+                            validate_auxiliary_servo_command(
+                                command,
+                                profile,
+                            ),
+                            command,
+                        )
+                        self.assertEqual(
+                            parse_auxiliary_servo_command(command),
+                            (channel, position),
+                        )
+        self.assertEqual(
+            validate_auxiliary_servo_command(
+                "SV6P90\n",
+                AUXILIARY_BOARD_MEGA,
+            ),
+            "SV6P90\n",
+        )
+        with self.assertRaises(MotionInputError):
+            validate_auxiliary_servo_command(
+                "SV6P90\n",
+                AUXILIARY_BOARD_NANO,
+            )
         self.assertEqual(
             parse_auxiliary_servo_command("SV00P090\n"),
             (0, 90),
         )
         self.assertEqual(
-            validate_auxiliary_servo_command("SV00P090\n"),
+            validate_auxiliary_servo_command(
+                "SV00P090\n",
+                AUXILIARY_BOARD_NANO,
+            ),
             "SV00P090\n",
         )
 
@@ -457,7 +506,152 @@ class AuxiliaryBoardProfileTests(unittest.TestCase):
         for command in malformed_commands:
             with self.subTest(command=command):
                 with self.assertRaises(MotionInputError):
-                    validate_auxiliary_servo_command(command)
+                    validate_auxiliary_servo_command(
+                        command,
+                        AUXILIARY_BOARD_MEGA,
+                    )
+
+    def test_input_validation_enforces_each_board_profile(self):
+        for profile, pins in AUXILIARY_BOARD_INPUT_PINS.items():
+            for input_pin in pins:
+                command = f"JFX{input_pin}\n"
+                with self.subTest(profile=profile, input_pin=input_pin):
+                    self.assertEqual(
+                        validate_auxiliary_input_command(command, profile),
+                        command,
+                    )
+                    self.assertEqual(
+                        parse_auxiliary_input_command(command),
+                        input_pin,
+                    )
+        for input_pin in (0, 1, 8, 27):
+            with self.subTest(nano_rejected_pin=input_pin):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_input_command(
+                        f"JFX{input_pin}\n",
+                        AUXILIARY_BOARD_NANO,
+                    )
+        for input_pin in (0, 1, 28, 53):
+            with self.subTest(mega_rejected_pin=input_pin):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_input_command(
+                        f"JFX{input_pin}\n",
+                        AUXILIARY_BOARD_MEGA,
+                    )
+        for command in (
+            "JFX2",
+            "JFX2\r\n",
+            "JFX-1\n",
+            "JFX+2\n",
+            "JFX2\nJFX3\n",
+            "JFX\n",
+            "",
+            None,
+        ):
+            with self.subTest(command=command):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_input_command(
+                        command,
+                        AUXILIARY_BOARD_MEGA,
+                    )
+
+    def test_wait_validation_enforces_pin_state_and_timeout_domains(self):
+        for profile, input_pin in (
+            (AUXILIARY_BOARD_NANO, 2),
+            (AUXILIARY_BOARD_MEGA, 27),
+        ):
+            for state in (0, 1):
+                for timeout in (1, AUXILIARY_WAIT_MAXIMUM_SECONDS):
+                    command = f"WIA{input_pin}B{state}C{timeout}\n"
+                    with self.subTest(
+                        profile=profile,
+                        state=state,
+                        timeout=timeout,
+                    ):
+                        self.assertEqual(
+                            validate_auxiliary_wait_command(command, profile),
+                            command,
+                        )
+                        self.assertEqual(
+                            parse_auxiliary_wait_command(command),
+                            (input_pin, state, timeout),
+                        )
+        for command in (
+            "WIA2B1C0",
+            "WIA2B1C0\r\n",
+            "WIA2B1C0\n",
+            "WIA2B2C1\n",
+            "WIA2B-1C1\n",
+            "WIA2B1C-1\n",
+            f"WIA2B1C{AUXILIARY_WAIT_MAXIMUM_SECONDS + 1}\n",
+            "WIA2B1C1\nWIA2B1C1\n",
+            "",
+            None,
+        ):
+            with self.subTest(command=command):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_wait_command(
+                        command,
+                        AUXILIARY_BOARD_NANO,
+                    )
+        with self.assertRaises(MotionInputError):
+            validate_auxiliary_wait_command(
+                "WIA8B1C1\n",
+                AUXILIARY_BOARD_NANO,
+            )
+        for command in ("WIA1B1C1\n", "WIA28B1C1\n"):
+            with self.subTest(mega_rejected_wait=command):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_wait_command(
+                        command,
+                        AUXILIARY_BOARD_MEGA,
+                    )
+
+    def test_gripper_current_contract_requires_profile_and_numeric_response(self):
+        for profile in (AUXILIARY_BOARD_NANO, AUXILIARY_BOARD_MEGA):
+            self.assertEqual(
+                validate_auxiliary_gripper_current_command("TG\n", profile),
+                "TG\n",
+            )
+        for command in ("TG", "TG\r\n", " TG\n", "TG\nTG\n", "", None):
+            with self.subTest(command=command):
+                with self.assertRaises(MotionInputError):
+                    validate_auxiliary_gripper_current_command(
+                        command,
+                        AUXILIARY_BOARD_NANO,
+                    )
+        with self.assertRaises(MotionInputError):
+            validate_auxiliary_gripper_current_command(
+                "TG\n",
+                AUXILIARY_BOARD_NONE,
+            )
+
+        for response in ("0", "0.000", "1", "1.25", "27.999", "28.000"):
+            with self.subTest(response=response):
+                self.assertEqual(
+                    parse_auxiliary_gripper_current_response("TG\n", response),
+                    response,
+                )
+        for response in (
+            "-0.1",
+            "+1",
+            ".1",
+            "01.0",
+            "1.",
+            "1.0000",
+            str(AUXILIARY_CURRENT_MAXIMUM_AMPS + 0.001),
+            "nan",
+            "inf",
+            " 1.0",
+            "1.0 ",
+            "",
+            None,
+        ):
+            with self.subTest(response=response):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_auxiliary_gripper_current_response("TG\n", response)
+        with self.assertRaises(ProtocolResponseError):
+            parse_auxiliary_gripper_current_response("TM\n", "1.000")
 
     def test_pneumatic_mapping_uses_a_valid_pin_for_each_board(self):
         expected_pins = {
@@ -808,6 +1002,28 @@ class SerialActivityRegistryTests(unittest.TestCase):
         self.assertFalse(registry.idle())
         registry.finish_control("ser2", mode)
         self.assertTrue(registry.idle())
+
+    def test_emergency_control_remains_admissible_during_shutdown(self):
+        registry = SerialActivityRegistry(("ser2",))
+        registry.begin("ser2", control_injectable=True)
+        registry.begin_shutdown()
+
+        self.assertIsNone(registry.reserve_control("ser2"))
+        mode = registry.reserve_emergency_control("ser2")
+        self.assertEqual(mode, SerialActivityRegistry.CONTROL_INJECT)
+        registry.finish_control("ser2", mode)
+        registry.end("ser2", control_injectable=True)
+
+        mode = registry.reserve_emergency_control("ser2")
+        self.assertEqual(mode, SerialActivityRegistry.CONTROL_EXCLUSIVE)
+        registry.finish_control("ser2", mode)
+        self.assertTrue(registry.idle())
+
+        blocked = SerialActivityRegistry(("ser2",))
+        blocked.begin("ser2")
+        blocked.begin_shutdown()
+        self.assertIsNone(blocked.reserve_emergency_control("ser2"))
+        blocked.end("ser2")
 
     def test_registry_rejects_invalid_names_and_unbalanced_release(self):
         with self.assertRaises(MotionInputError):
@@ -1247,6 +1463,75 @@ class SerialLineExchangeTests(unittest.TestCase):
 
         self.assertEqual(response, "Nano Stopped")
         self.assertEqual(serial_port.timeout, 7.5)
+        self.assertTrue(serial_port.is_open)
+
+    def test_stop_aware_exchange_owns_supported_frame_orders(self):
+        estop = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        admission = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        cases = (
+            (f"{admission}\n", admission, (admission,)),
+            (f"{estop}\n{admission}\n", admission, (estop,)),
+            (f"{estop}\nDone\n", estop, (estop,)),
+            (f"Done\n{estop}\n", estop, (estop,)),
+            ("Done\n", "Done", ()),
+        )
+
+        for framed, expected, expected_publication in cases:
+            with self.subTest(framed=framed):
+                serial_port = BoundedFakeSerial(
+                    response=framed.encode("ascii")
+                )
+                published = []
+
+                response = exchange_serial_line(
+                    serial_port,
+                    "RP\n",
+                    1.0,
+                    estop_callback=lambda position: (
+                        published.append(position.raw) or True
+                    ),
+                )
+
+                self.assertEqual(response, expected)
+                self.assertEqual(
+                    tuple(published),
+                    expected_publication,
+                )
+                self.assertEqual(serial_port.response, b"")
+                self.assertTrue(serial_port.is_open)
+
+    def test_stop_aware_live_exchange_accepts_admission_rejection(self):
+        admission = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        serial_port = BoundedFakeSerial(
+            response=f"{admission}\n".encode("ascii")
+        )
+        published = []
+
+        response = exchange_serial_line(
+            serial_port,
+            "LJV10\n",
+            120,
+            control_event=threading.Event(),
+            control_command="S\n",
+            control_ack_timeout_seconds=5,
+            control_response_timeout_seconds=120,
+            estop_callback=lambda position: (
+                published.append(position.raw) or True
+            ),
+        )
+
+        self.assertEqual(response, admission)
+        self.assertEqual(published, [admission])
+        self.assertEqual(serial_port.commands, [b"LJV10\n"])
         self.assertTrue(serial_port.is_open)
 
     def test_response_owner_quarantines_a_queued_second_line(self):
@@ -1719,6 +2004,74 @@ class SerialLineExchangeTests(unittest.TestCase):
 
         self.assertEqual(response, "complete")
         self.assertEqual(serial_port.commands, [b"PGFndemo.txt\n"])
+        self.assertTrue(serial_port.is_open)
+
+    def test_cancellation_bound_stop_owner_preserves_supported_frames(self):
+        estop = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        admission = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        cases = (
+            (f"{admission}\n", admission, (admission,)),
+            (f"{estop}\n{admission}\n", admission, (estop,)),
+            (f"{estop}\nDone\n", estop, (estop,)),
+            (f"Done\n{estop}\n", estop, (estop,)),
+            ("Done\n", "Done", ()),
+        )
+
+        for framed, expected, expected_publication in cases:
+            with self.subTest(framed=framed):
+                serial_port = BoundedFakeSerial(
+                    response=framed.encode("ascii")
+                )
+                published = []
+
+                response = exchange_serial_line_until_cancelled(
+                    serial_port,
+                    "PGFndemo.txt\n",
+                    threading.Event(),
+                    reset_input=False,
+                    estop_callback=lambda position: (
+                        published.append(position.raw) or True
+                    ),
+                )
+
+                self.assertEqual(response, expected)
+                self.assertEqual(
+                    tuple(published),
+                    expected_publication,
+                )
+                self.assertEqual(serial_port.reset_count, 0)
+                self.assertEqual(serial_port.response, b"")
+                self.assertTrue(serial_port.is_open)
+
+    def test_cancellation_bound_calibration_estop_consumes_error_terminal(self):
+        estop = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        serial_port = BoundedFakeSerial(
+            response=f"{estop}\nER\n".encode("ascii")
+        )
+        published = []
+
+        response = exchange_serial_line_until_cancelled(
+            serial_port,
+            "LLA1\n",
+            threading.Event(),
+            reset_input=False,
+            estop_callback=lambda position: (
+                published.append(position.raw) or True
+            ),
+        )
+
+        self.assertEqual(response, estop)
+        self.assertEqual(published, [estop])
+        self.assertEqual(serial_port.response, b"")
         self.assertTrue(serial_port.is_open)
 
     def test_cancellation_bound_exchange_quarantines_after_transmission(self):
@@ -2496,28 +2849,51 @@ class SerialLineExchangeTests(unittest.TestCase):
         self.assertFalse(serial_port.is_open)
         self.assertTrue(serial_transport_quarantined(serial_port))
 
-    def test_live_physical_estop_accepts_one_controller_terminal_position(self):
-        response = position_response(
+    def test_live_physical_estop_accepts_terminal_then_event(self):
+        normal_response = position_response(
+            (1, 2, 3, 4, 5, 6),
+            external=(7, 8, 9),
+        )
+        estop_response = position_response(
             (1, 2, 3, 4, 5, 6),
             external=(7, 8, 9),
             flag="EB",
         )
-        serial_port = SequenceFakeSerial((b"\n", response.encode() + b"\n"))
+        for command in ("LCV10\n", "LJV10\n", "LTV10\n"):
+            with self.subTest(command=command):
+                serial_port = BoundedFakeSerial(
+                    response=(
+                        b"\n"
+                        + normal_response.encode()
+                        + b"\n"
+                        + estop_response.encode()
+                        + b"\n"
+                    )
+                )
+                published = []
 
-        received = exchange_serial_line(
-            serial_port,
-            "LJV10\n",
-            1,
-            control_event=threading.Event(),
-            control_command="S\n",
-            control_ack_timeout_seconds=0.5,
-            control_response_timeout_seconds=0.5,
-        )
+                received = exchange_serial_line(
+                    serial_port,
+                    command,
+                    1,
+                    control_event=threading.Event(),
+                    control_command="S\n",
+                    control_ack_timeout_seconds=0.5,
+                    control_response_timeout_seconds=0.5,
+                    estop_callback=lambda position: (
+                        published.append(position.raw) or True
+                    ),
+                )
 
-        self.assertEqual(received, response)
-        self.assertEqual(serial_port.commands, [b"LJV10\n"])
-        self.assertTrue(serial_port.is_open)
-        self.assertFalse(serial_transport_quarantined(serial_port))
+                self.assertEqual(received, estop_response)
+                self.assertEqual(published, [estop_response])
+                self.assertEqual(
+                    serial_port.commands,
+                    [command.encode("ascii")],
+                )
+                self.assertEqual(serial_port.response, b"")
+                self.assertTrue(serial_port.is_open)
+                self.assertFalse(serial_transport_quarantined(serial_port))
 
     def test_live_blank_acknowledgement_detects_transport_closure(self):
         serial_port = CloseAfterBlankAcknowledgementSerial((b"\n",))
@@ -2540,7 +2916,39 @@ class SerialLineExchangeTests(unittest.TestCase):
         self.assertFalse(serial_port.is_open)
         self.assertTrue(serial_transport_quarantined(serial_port))
 
-    def test_live_physical_estop_rejects_a_second_terminal_position(self):
+    def test_live_unrequested_terminal_without_estop_sends_fail_safe_stop(self):
+        normal_response = position_response(
+            (1, 2, 3, 4, 5, 6),
+            external=(7, 8, 9),
+        )
+        serial_port = BoundedFakeSerial(
+            response=b"\n" + normal_response.encode() + b"\n"
+        )
+        published = []
+
+        with self.assertRaisesRegex(
+            SerialTransportQuarantinedError,
+            "terminal data before live stop",
+        ):
+            exchange_serial_line(
+                serial_port,
+                "LJV10\n",
+                1,
+                control_event=threading.Event(),
+                control_command="S\n",
+                control_ack_timeout_seconds=0.5,
+                control_response_timeout_seconds=0.5,
+                estop_callback=lambda position: (
+                    published.append(position.raw) or True
+                ),
+            )
+
+        self.assertEqual(published, [])
+        self.assertEqual(serial_port.commands, [b"LJV10\n", b"S\n"])
+        self.assertFalse(serial_port.is_open)
+        self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_live_estop_publishes_before_trailing_frame_quarantine(self):
         estop_response = position_response(
             (1, 2, 3, 4, 5, 6),
             external=(7, 8, 9),
@@ -2550,15 +2958,18 @@ class SerialLineExchangeTests(unittest.TestCase):
             (1, 2, 3, 4, 5, 6),
             external=(7, 8, 9),
         )
-        serial_port = FakeSerial(
+        serial_port = BoundedFakeSerial(
             response=(
                 b"\n"
+                + normal_response.encode()
+                + b"\n"
                 + estop_response.encode()
                 + b"\n"
                 + normal_response.encode()
                 + b"\n"
             )
         )
+        published = []
 
         with self.assertRaisesRegex(
             SerialTransportQuarantinedError,
@@ -2572,8 +2983,12 @@ class SerialLineExchangeTests(unittest.TestCase):
                 control_command="S\n",
                 control_ack_timeout_seconds=0.5,
                 control_response_timeout_seconds=0.5,
+                estop_callback=lambda position: (
+                    published.append(position.raw) or True
+                ),
             )
 
+        self.assertEqual(published, [estop_response])
         self.assertEqual(serial_port.commands, [b"LJV10\n", b"S\n"])
         self.assertFalse(serial_port.is_open)
         self.assertTrue(serial_transport_quarantined(serial_port))
@@ -2931,6 +3346,74 @@ class SerialLineExchangeTests(unittest.TestCase):
 
 
 class CommandResponseTimeoutTests(unittest.TestCase):
+    def test_modbus_command_builder_matches_firmware_request_domain(self):
+        accepted = {
+            ("BA", "1", "0", "1"): "BAA1B0C1\n",
+            ("BB", 1, 65535, 1): "BBA1B65535C1\n",
+            ("BC", 247, 65535, 1): "BCA247B65535C1\n",
+            ("BH", 1, 65535, 1): "BHA1B65535C1\n",
+            ("BD", 1, 65472, 1): "BDA1B65472C1\n",
+            ("BE", 1, 0, 0): "BEA1B0C0\n",
+            ("BF", 247, 65535, 65535): "BFA247B65535C65535\n",
+            ("SC", 1, 0, 1): "SCA1B0C1\n",
+            ("SO", 247, 65535, 65535): "SOA247B65535C65535\n",
+        }
+        for arguments, expected in accepted.items():
+            with self.subTest(arguments=arguments):
+                command = build_controller_modbus_command(*arguments)
+                self.assertEqual(command, expected)
+                self.assertEqual(
+                    validate_controller_modbus_command(command),
+                    command,
+                )
+        self.assertEqual(
+            build_controller_modbus_command(
+                "BF",
+                "0" * 10000 + "1",
+                "0" * 10000,
+                "0" * 10000 + "1",
+            ),
+            "BFA1B0C1\n",
+        )
+
+        rejected = (
+            (("BG", 1, 0, 1), "opcode"),
+            (("BA", 0, 0, 1), "slave ID"),
+            (("BA", 248, 0, 1), "slave ID"),
+            (("BA", 1, -1, 1), "address"),
+            (("BA", 1, 65536, 1), "address"),
+            (("BA", 1, 0, 0), "quantity"),
+            (("BA", 1, 0, 2), "quantity"),
+            (("BH", 1, 0, 64), "quantity"),
+            (("BD", 1, 0, 65), "quantity"),
+            (("BA", 1, 0, 65), "quantity"),
+            (("BB", 1, 0, 0), "must be 1"),
+            (("BC", 1, 0, 2), "must be 1"),
+            (("BE", 1, 0, 2), "must be 0 or 1"),
+            (("SC", 1, 0, 2), "must be 0 or 1"),
+            (("BF", 1, 0, 65536), "register value"),
+            (("SO", 1, 0, 65536), "register value"),
+            (("BF", " 1", 0, 1), "unsigned decimal"),
+            (("BF", "9" * 10000, 0, 1), "protocol range"),
+            (("BF", True, 0, 1), "must be an integer"),
+        )
+        for arguments, message in rejected:
+            with self.subTest(arguments=arguments):
+                with self.assertRaisesRegex(MotionInputError, message):
+                    build_controller_modbus_command(*arguments)
+
+        for command in (
+            "BAA01B0C1\n",
+            "BAA1B00C1\n",
+            "BAA1B0C01\n",
+            "BAA1B0C1",
+            "BAA1B0C1\r\n",
+            "BAA1B0C1\nextra",
+        ):
+            with self.subTest(command=command):
+                with self.assertRaises(MotionInputError):
+                    validate_controller_modbus_command(command)
+
     def test_modbus_response_contract_rejects_every_non_success_shape(self):
         accepted = {
             "BA": "65535",
@@ -2971,6 +3454,817 @@ class CommandResponseTimeoutTests(unittest.TestCase):
                         f"{opcode}A1B0C1\n",
                         response,
                     )
+
+    def test_generic_line_owner_correlates_event_and_admission_frames(self):
+        estop = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        admission = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        telemetry = "TMA1B2C3D4E5F6"
+        serial_port = BoundedFakeSerial(
+            response=(
+                f"{telemetry}\n{estop}\n{admission}\n"
+            ).encode("ascii")
+        )
+        published = []
+        observed = []
+
+        def consume_interim(frame):
+            if not frame.startswith("TM"):
+                return False
+            observed.append(parse_joint_telemetry_response(frame))
+            return True
+
+        response = read_controller_line_exchange_response(
+            serial_port,
+            1.0,
+            estop_callback=lambda position: (
+                published.append(position) or True
+            ),
+            interim_response_handler=consume_interim,
+            interim_response_limit=2,
+            context="test joint response",
+        )
+
+        self.assertIsInstance(response, ControllerLineExchangeResponse)
+        self.assertEqual(response.frame_order, "estop-admission")
+        self.assertEqual(response.estop_position.raw, estop)
+        self.assertEqual(response.admission_position.raw, admission)
+        self.assertEqual(response.authoritative_response, admission)
+        self.assertEqual(
+            observed,
+            [parse_joint_telemetry_response(telemetry)],
+        )
+        self.assertEqual(
+            tuple(position.raw for position in published),
+            (estop,),
+        )
+        self.assertEqual(serial_port.response, b"")
+        self.assertTrue(serial_port.is_open)
+
+    def test_interim_handler_cannot_consume_physical_stop_frames(self):
+        estop = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        admission = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        telemetry = "TMA1B2C3D4E5F6"
+        serial_port = BoundedFakeSerial(
+            response=(
+                f"{telemetry}\n{estop}\n{admission}\n"
+            ).encode("ascii")
+        )
+        offered = []
+        published = []
+
+        response = read_controller_line_exchange_response(
+            serial_port,
+            1.0,
+            estop_callback=lambda position: (
+                published.append(position) or True
+            ),
+            interim_response_handler=lambda frame: (
+                offered.append(frame) or True
+            ),
+            interim_response_limit=2,
+            context="test joint response",
+        )
+
+        self.assertEqual(offered, [telemetry])
+        self.assertEqual(response.frame_order, "estop-admission")
+        self.assertEqual(
+            tuple(position.raw for position in published),
+            (estop,),
+        )
+        self.assertEqual(serial_port.response, b"")
+        self.assertTrue(serial_port.is_open)
+
+    def test_generic_line_owner_accepts_position_terminals(self):
+        terminals = (
+            position_response((1, 2, 3, 4, 5, 6)),
+            position_response(
+                (1, 2, 3, 4, 5, 6),
+                flag="EC000001",
+            ),
+        )
+
+        for terminal in terminals:
+            with self.subTest(terminal=terminal):
+                serial_port = BoundedFakeSerial(
+                    response=f"{terminal}\n".encode("ascii")
+                )
+                validated = []
+                published = []
+                response = read_controller_line_exchange_response(
+                    serial_port,
+                    1.0,
+                    estop_callback=lambda position: (
+                        published.append(position) or True
+                    ),
+                    terminal_validator=lambda frame: validated.append(
+                        parse_position_response(frame)
+                    ),
+                    context="test position response",
+                )
+
+                self.assertEqual(response.frame_order, "terminal-only")
+                self.assertEqual(response.terminal_response, terminal)
+                self.assertEqual(response.authoritative_response, terminal)
+                self.assertEqual(
+                    validated,
+                    [parse_position_response(terminal)],
+                )
+                self.assertEqual(published, [])
+                self.assertEqual(serial_port.response, b"")
+                self.assertTrue(serial_port.is_open)
+
+    def test_generic_response_owners_require_stop_publication(self):
+        line_port = BoundedFakeSerial(response=b"Done\n")
+        with self.assertRaises(TypeError):
+            read_controller_line_exchange_response(
+                line_port,
+                1.0,
+            )
+        with self.assertRaises(MotionInputError):
+            read_controller_line_exchange_response(
+                line_port,
+                1.0,
+                estop_callback=None,
+            )
+        self.assertEqual(line_port.response, b"Done\n")
+        self.assertTrue(line_port.is_open)
+
+        exact_port = BoundedFakeSerial(response=b"Done")
+        with self.assertRaises(TypeError):
+            read_controller_exact_exchange_response(
+                exact_port,
+                b"Done",
+                1.0,
+            )
+        with self.assertRaises(MotionInputError):
+            read_controller_exact_exchange_response(
+                exact_port,
+                b"Done",
+                1.0,
+                estop_callback=None,
+            )
+        self.assertEqual(exact_port.response, b"Done")
+        self.assertTrue(exact_port.is_open)
+
+    def test_generic_line_owner_accepts_supported_stop_orders(self):
+        estop = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        admission = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        cases = (
+            (f"{admission}\n", "admission-estop", admission),
+            (
+                f"{estop}\n{admission}\n",
+                "estop-admission",
+                admission,
+            ),
+            (f"{estop}\nDone\n", "estop-terminal", estop),
+            (f"Done\n{estop}\n", "terminal-estop", estop),
+            ("Done\n", "terminal-only", "Done"),
+        )
+
+        for framed, frame_order, authoritative in cases:
+            with self.subTest(frame_order=frame_order):
+                serial_port = BoundedFakeSerial(
+                    response=framed.encode("ascii")
+                )
+                published = []
+                response = read_controller_line_exchange_response(
+                    serial_port,
+                    1.0,
+                    estop_callback=lambda position: (
+                        published.append(position) or True
+                    ),
+                    accepted_responses={"Done"},
+                    context="test line response",
+                )
+                self.assertEqual(response.frame_order, frame_order)
+                self.assertEqual(
+                    response.authoritative_response,
+                    authoritative,
+                )
+                expected_publication = (
+                    ()
+                    if frame_order == "terminal-only"
+                    else (
+                        admission
+                        if frame_order == "admission-estop"
+                        else estop,
+                    )
+                )
+                self.assertEqual(
+                    tuple(position.raw for position in published),
+                    expected_publication,
+                )
+                self.assertEqual(serial_port.response, b"")
+                self.assertTrue(serial_port.is_open)
+
+    def test_telemetry_line_owner_closes_before_delayed_estop_admission(self):
+        estop = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        admission = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+
+        class DelayedAdmissionSerial(BoundedFakeSerial):
+            def close(self):
+                super().close()
+                self.response += f"{admission}\n".encode("ascii")
+
+        serial_port = DelayedAdmissionSerial(
+            response=f"{estop}\n".encode("ascii")
+        )
+        published = []
+
+        response = read_controller_line_exchange_response(
+            serial_port,
+            1.0,
+            estop_callback=lambda position: (
+                published.append(position) or True
+            ),
+            allow_standalone_estop_event=True,
+            context="test telemetry response",
+        )
+
+        self.assertEqual(response.frame_order, "estop-only")
+        self.assertEqual(response.estop_position.raw, estop)
+        self.assertEqual(response.authoritative_response, estop)
+        self.assertEqual(
+            tuple(position.raw for position in published),
+            (estop,),
+        )
+        self.assertEqual(
+            serial_port.response,
+            f"{admission}\n".encode("ascii"),
+        )
+        self.assertFalse(serial_port.is_open)
+        self.assertTrue(serial_transport_quarantined(serial_port))
+        with self.assertRaises(ConnectionError):
+            read_controller_line_exchange_response(
+                serial_port,
+                1.0,
+                estop_callback=lambda position: True,
+                context="test later response owner",
+            )
+
+    def test_generic_line_owner_rejects_standalone_estop_event(self):
+        estop = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        serial_port = BoundedFakeSerial(
+            response=f"{estop}\n".encode("ascii")
+        )
+        published = []
+
+        with self.assertRaises(
+            (SerialTransportQuarantinedError, SerialTransportTimeout)
+        ):
+            read_controller_line_exchange_response(
+                serial_port,
+                1.0,
+                estop_callback=lambda position: (
+                    published.append(position) or True
+                ),
+                context="test generic response",
+            )
+
+        self.assertEqual(
+            tuple(position.raw for position in published),
+            (estop,),
+        )
+        self.assertFalse(serial_port.is_open)
+        self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_exact_response_owner_accepts_supported_stop_orders(self):
+        estop = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        admission = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        cases = (
+            (b"Done", "terminal-only", "Done"),
+            (
+                f"{estop}\n".encode("ascii") + b"Done",
+                "estop-terminal",
+                estop,
+            ),
+            (
+                b"Done" + f"{estop}\n".encode("ascii"),
+                "terminal-estop",
+                estop,
+            ),
+            (
+                f"{estop}\n{admission}\n".encode("ascii"),
+                "estop-admission",
+                admission,
+            ),
+            (
+                f"{admission}\n".encode("ascii"),
+                "admission-estop",
+                admission,
+            ),
+        )
+
+        for framed, frame_order, authoritative in cases:
+            with self.subTest(frame_order=frame_order):
+                serial_port = BoundedFakeSerial(response=framed)
+                published = []
+                response = read_controller_exact_exchange_response(
+                    serial_port,
+                    b"Done",
+                    1.0,
+                    estop_callback=lambda position: (
+                        published.append(position) or True
+                    ),
+                    context="test exact response",
+                )
+                self.assertEqual(response.frame_order, frame_order)
+                self.assertEqual(
+                    response.authoritative_response,
+                    authoritative,
+                )
+                expected_publication = {
+                    "terminal-only": (),
+                    "estop-terminal": (estop,),
+                    "terminal-estop": (estop,),
+                    "estop-admission": (estop,),
+                    "admission-estop": (admission,),
+                }[frame_order]
+                self.assertEqual(
+                    tuple(position.raw for position in published),
+                    expected_publication,
+                )
+                self.assertEqual(serial_port.response, b"")
+                self.assertTrue(serial_port.is_open)
+
+    def test_modbus_exchange_accepts_terminal_and_estop_frame_orders(self):
+        command = "BAA1B0C1\n"
+        estop = position_response((1, 2, 3, 4, 5, 6), flag="EB")
+        admission = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag="EA",
+        )
+        expected = {
+            (estop,): ("estop-only", estop, None),
+            (admission,): ("admission-estop", admission, None),
+            (estop, admission): (
+                "estop-admission",
+                estop,
+                None,
+            ),
+            ("42",): ("terminal-only", None, "42"),
+            (estop, "42"): ("estop-terminal", estop, "42"),
+            ("42", estop): ("terminal-estop", estop, "42"),
+            ("Modbus Error",): (
+                "terminal-only",
+                None,
+                "Modbus Error",
+            ),
+        }
+
+        for frames, values in expected.items():
+            with self.subTest(frames=frames):
+                response = parse_controller_modbus_exchange_frames(
+                    command,
+                    frames,
+                )
+                self.assertIsInstance(
+                    response,
+                    ControllerModbusExchangeResponse,
+                )
+                self.assertEqual(response.frame_order, values[0])
+                self.assertEqual(
+                    (
+                        response.estop_position.raw
+                        if response.estop_position is not None
+                        else None
+                    ),
+                    values[1],
+                )
+                self.assertEqual(response.terminal_response, values[2])
+                self.assertEqual(
+                    (
+                        response.admission_position.raw
+                        if response.admission_position is not None
+                        else None
+                    ),
+                    admission if frames == (estop, admission) else None,
+                )
+
+        for frames in (
+            ("42", "43"),
+            (estop, estop),
+            (admission, "42"),
+            ("42", admission),
+            ("unexpected",),
+            ("42", estop, "extra"),
+        ):
+            with self.subTest(invalid_frames=frames):
+                with self.assertRaises(ProtocolResponseError):
+                    parse_controller_modbus_exchange_frames(command, frames)
+
+    def test_modbus_response_owner_accepts_correlated_admission_estop(self):
+        command = "BAA1B0C1\n"
+        admission = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        serial_port = BoundedFakeSerial(
+            response=f"{admission}\n".encode("ascii")
+        )
+        published = []
+
+        response = read_controller_modbus_exchange_response(
+            serial_port,
+            command,
+            20,
+            lambda position: published.append(position) or True,
+        )
+
+        self.assertEqual(response.frame_order, "admission-estop")
+        self.assertIsNone(response.terminal_response)
+        self.assertEqual(response.estop_position.raw, admission)
+        self.assertEqual(
+            tuple(position.raw for position in published),
+            (admission,),
+        )
+        self.assertTrue(serial_port.is_open)
+        self.assertEqual(serial_port.response, b"")
+
+    def test_modbus_response_owner_correlates_event_before_admission_stop(self):
+        command = "BAA1B0C1\n"
+        estop = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        admission = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_ADMISSION_FLAG,
+        )
+        serial_port = BoundedFakeSerial(
+            response=f"{estop}\n{admission}\n".encode("ascii")
+        )
+        published = []
+
+        response = read_controller_modbus_exchange_response(
+            serial_port,
+            command,
+            20,
+            lambda position: published.append(position) or True,
+        )
+
+        self.assertEqual(response.frame_order, "estop-admission")
+        self.assertEqual(response.estop_position.raw, estop)
+        self.assertEqual(response.admission_position.raw, admission)
+        self.assertIsNone(response.terminal_response)
+        self.assertEqual(
+            tuple(position.raw for position in published),
+            (estop,),
+        )
+        self.assertTrue(serial_port.is_open)
+
+    def test_modbus_response_owner_consumes_complete_estop_transactions(self):
+        command = "BAA1B0C1\n"
+        estop = position_response((1, 2, 3, 4, 5, 6), flag="EB")
+        transactions = (
+            (f"{estop}\n42\n", "estop-terminal"),
+            (f"42\n{estop}\n", "terminal-estop"),
+            ("42\n", "terminal-only"),
+        )
+
+        for framed, frame_order in transactions:
+            with self.subTest(frame_order=frame_order):
+                published = []
+                unread_at_publication = []
+                serial_port = BoundedFakeSerial(
+                    response=framed.encode("ascii")
+                )
+                original_timeout = serial_port.timeout
+
+                def publish_estop(position):
+                    published.append(position)
+                    unread_at_publication.append(bytes(serial_port.response))
+                    return True
+
+                response = read_controller_modbus_exchange_response(
+                    serial_port,
+                    command,
+                    20,
+                    publish_estop,
+                )
+
+                self.assertEqual(response.frame_order, frame_order)
+                self.assertEqual(response.terminal_response, "42")
+                self.assertEqual(serial_port.response, b"")
+                self.assertEqual(serial_port.timeout, original_timeout)
+                self.assertTrue(serial_port.is_open)
+                self.assertEqual(
+                    tuple(position.raw for position in published),
+                    (() if frame_order == "terminal-only" else (estop,)),
+                )
+                expected_unread = {
+                    "estop-terminal": (b"42\n",),
+                    "terminal-estop": (b"",),
+                    "terminal-only": (),
+                }
+                self.assertEqual(
+                    tuple(unread_at_publication),
+                    expected_unread[frame_order],
+                )
+
+    def test_modbus_response_owner_quarantines_incomplete_or_extra_frames(self):
+        command = "BAA1B0C1\n"
+        estop = position_response((1, 2, 3, 4, 5, 6), flag="EB")
+        transactions = (
+            f"{estop}\n",
+            "42\nunexpected\n",
+            f"{estop}\n42\nextra\n",
+        )
+
+        for framed in transactions:
+            with self.subTest(framed=framed):
+                published = []
+                serial_port = BoundedFakeSerial(
+                    response=framed.encode("ascii")
+                )
+                with self.assertRaises(
+                    (SerialTransportQuarantinedError, SerialTransportTimeout)
+                ):
+                    read_controller_modbus_exchange_response(
+                        serial_port,
+                        command,
+                        20,
+                        lambda position: published.append(position) or True,
+                    )
+                self.assertFalse(serial_port.is_open)
+                self.assertTrue(serial_transport_quarantined(serial_port))
+                self.assertEqual(
+                    tuple(position.raw for position in published),
+                    ((estop,) if framed.startswith(estop) else ()),
+                )
+
+    def test_modbus_response_owner_requires_confirmed_estop_publication(self):
+        command = "BAA1B0C1\n"
+        estop = position_response((1, 2, 3, 4, 5, 6), flag="EB")
+
+        def raise_publication_error(position):
+            raise RuntimeError("event queue unavailable")
+
+        for callback in (
+            lambda position: None,
+            raise_publication_error,
+        ):
+            with self.subTest(callback=callback):
+                serial_port = BoundedFakeSerial(
+                    response=f"{estop}\n42\n".encode("ascii")
+                )
+                with self.assertRaises(SerialTransportQuarantinedError):
+                    read_controller_modbus_exchange_response(
+                        serial_port,
+                        command,
+                        20,
+                        callback,
+                    )
+                self.assertFalse(serial_port.is_open)
+                self.assertTrue(serial_transport_quarantined(serial_port))
+
+    def test_modbus_terminal_classification_preserves_write_uncertainty(self):
+        for command, response, expected in (
+            ("BAA1B0C1\n", "42", "completed"),
+            ("BAA1B0C1\n", "ER", "rejected"),
+            ("BAA1B0C1\n", "Modbus Error", "rejected"),
+            ("BEA1B0C1\n", "ER", "rejected"),
+            ("BEA1B0C1\n", "Modbus Error", "indeterminate"),
+            ("BFA1B0C1\n", "Write Success", "completed"),
+            ("SCA1B0C1\n", "-1", "indeterminate"),
+            ("SOA1B0C1\n", "-2", "rejected"),
+        ):
+            with self.subTest(command=command, response=response):
+                self.assertEqual(
+                    classify_controller_modbus_terminal_response(
+                        command,
+                        response,
+                    ),
+                    expected,
+                )
+        self.assertFalse(
+            controller_modbus_command_is_write("BAA1B0C1\n")
+        )
+        self.assertTrue(
+            controller_modbus_command_is_write("BEA1B0C1\n")
+        )
+        self.assertTrue(
+            controller_modbus_command_is_write("SCA1B0C1\n")
+        )
+
+        estop = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        for opcode in ("BE", "BF"):
+            command = f"{opcode}A1B0C1\n"
+            for frames in (("ER", estop), (estop, "ER")):
+                with self.subTest(
+                    paired_write_opcode=opcode,
+                    frames=frames,
+                ):
+                    exchange = parse_controller_modbus_exchange_frames(
+                        command,
+                        frames,
+                    )
+                    self.assertIsNotNone(exchange.estop_position)
+                    self.assertEqual(
+                        classify_controller_modbus_terminal_response(
+                            command,
+                            exchange.terminal_response,
+                            paired_with_estop=True,
+                        ),
+                        "indeterminate",
+                    )
+        self.assertEqual(
+            classify_controller_modbus_terminal_response(
+                "BAA1B0C1\n",
+                "ER",
+                paired_with_estop=True,
+            ),
+            "rejected",
+        )
+        with self.assertRaisesRegex(TypeError, "paired Modbus E-stop"):
+            classify_controller_modbus_terminal_response(
+                "BEA1B0C1\n",
+                "ER",
+                paired_with_estop=1,
+            )
+
+    def test_modbus_sc_so_terminals_cross_exchange_and_classification(self):
+        estop = position_response(
+            (1, 2, 3, 4, 5, 6),
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+        cases = (
+            ("SCA1B0C1\n", "-1", "indeterminate"),
+            ("SCA1B0C1\n", "-2", "rejected"),
+            ("SOA1B0C1\n", "-1", "indeterminate"),
+            ("SOA1B0C1\n", "-2", "rejected"),
+        )
+        for command, terminal, expected in cases:
+            for frames, frame_order in (
+                ((terminal,), "terminal-only"),
+                ((estop, terminal), "estop-terminal"),
+                ((terminal, estop), "terminal-estop"),
+            ):
+                with self.subTest(
+                    command=command,
+                    terminal=terminal,
+                    frame_order=frame_order,
+                ):
+                    parsed = parse_controller_modbus_exchange_frames(
+                        command,
+                        frames,
+                    )
+                    self.assertEqual(parsed.frame_order, frame_order)
+                    self.assertEqual(parsed.terminal_response, terminal)
+                    self.assertEqual(
+                        classify_controller_modbus_terminal_response(
+                            command,
+                            parsed.terminal_response,
+                            paired_with_estop=(
+                                parsed.estop_position is not None
+                            ),
+                        ),
+                        expected,
+                    )
+
+                    published = []
+                    serial_port = BoundedFakeSerial(
+                        response=(
+                            "\n".join(frames) + "\n"
+                        ).encode("ascii")
+                    )
+                    owned = read_controller_modbus_exchange_response(
+                        serial_port,
+                        command,
+                        20,
+                        lambda position: (
+                            published.append(position) or True
+                        ),
+                    )
+                    self.assertEqual(owned.frame_order, frame_order)
+                    self.assertEqual(owned.terminal_response, terminal)
+                    self.assertEqual(
+                        tuple(position.raw for position in published),
+                        (
+                            ()
+                            if frame_order == "terminal-only"
+                            else (estop,)
+                        ),
+                    )
+                    self.assertTrue(serial_port.is_open)
+                    self.assertEqual(serial_port.response, b"")
+
+    def test_pending_estop_owner_consumes_standalone_stop_before_write(self):
+        for flag in (
+            CONTROLLER_ESTOP_EVENT_FLAG,
+            CONTROLLER_ESTOP_ADMISSION_FLAG,
+        ):
+            with self.subTest(flag=flag):
+                estop = position_response(
+                    (1, 2, 3, 4, 5, 6),
+                    flag=flag,
+                )
+                serial_port = BoundedFakeSerial(
+                    response=f"{estop}\n".encode("ascii")
+                )
+                published = []
+
+                position = read_pending_controller_estop_response(
+                    serial_port,
+                    lambda event: published.append(event) or True,
+                )
+
+                self.assertEqual(position.raw, estop)
+                self.assertTrue(
+                    position_response_is_physical_estop(position)
+                )
+                self.assertEqual(
+                    tuple(event.raw for event in published),
+                    (estop,),
+                )
+                self.assertEqual(serial_port.response, b"")
+                self.assertTrue(serial_port.is_open)
+
+        quiet_port = BoundedFakeSerial(response=b"")
+        self.assertIsNone(
+            read_pending_controller_estop_response(
+                quiet_port,
+                lambda event: True,
+            )
+        )
+        self.assertTrue(quiet_port.is_open)
+
+    def test_pending_estop_owner_quarantines_non_stop_or_extra_data(self):
+        estop = position_response((1, 2, 3, 4, 5, 6), flag="EB")
+        for framed in ("42\n", f"{estop}\nextra\n"):
+            with self.subTest(framed=framed):
+                published = []
+                serial_port = BoundedFakeSerial(
+                    response=framed.encode("ascii")
+                )
+                with self.assertRaises(SerialTransportQuarantinedError):
+                    read_pending_controller_estop_response(
+                        serial_port,
+                        lambda event: published.append(event) or True,
+                    )
+                self.assertFalse(serial_port.is_open)
+                self.assertEqual(
+                    tuple(event.raw for event in published),
+                    ((estop,) if framed.startswith(estop) else ()),
+                )
+
+    def test_pending_estop_owner_requires_confirmed_publication(self):
+        estop = position_response((1, 2, 3, 4, 5, 6), flag="EB")
+
+        def raise_publication_error(position):
+            raise RuntimeError("event queue unavailable")
+
+        for callback in (
+            lambda position: None,
+            raise_publication_error,
+        ):
+            with self.subTest(callback=callback):
+                serial_port = BoundedFakeSerial(
+                    response=f"{estop}\n".encode("ascii")
+                )
+                with self.assertRaises(SerialTransportQuarantinedError):
+                    read_pending_controller_estop_response(
+                        serial_port,
+                        callback,
+                    )
+                self.assertFalse(serial_port.is_open)
+                self.assertTrue(serial_transport_quarantined(serial_port))
 
     @staticmethod
     def joint_command(timing):
@@ -3570,6 +4864,8 @@ class CommandResponseTimeoutTests(unittest.TestCase):
             ), controller_calibration())
 
     def test_rejects_values_outside_the_controller_float_range(self):
+        with self.assertRaisesRegex(MotionInputError, "host numeric range"):
+            finite_number(10**400, "test value")
         with self.assertRaisesRegex(MotionInputError, "finite float range"):
             controller_number("1e39", "test value")
         with self.assertRaisesRegex(MotionInputError, "finite float range"):
@@ -3583,6 +4879,54 @@ class CommandResponseTimeoutTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(MotionInputError, "represented by the controller"):
             controller_number("1e-50", "test value")
+
+    def test_rejects_exact_nonzero_values_lost_during_host_float_conversion(self):
+        values = (
+            Decimal("1e-10000"),
+            "1e-10000",
+            "0." + ("0" * 10000) + "1",
+        )
+        for value in values:
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "represented by the controller",
+                ):
+                    controller_number(value, "test value")
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "host numeric range",
+                ):
+                    finite_number(value, "test value")
+
+    def test_rejects_exact_finite_values_above_the_host_float_range(self):
+        values = (Decimal("1e10000"), "1e10000")
+        for value in values:
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "host numeric range",
+                ):
+                    finite_number(value, "test value")
+                with self.assertRaisesRegex(
+                    MotionInputError,
+                    "host numeric range",
+                ):
+                    controller_number(value, "test value")
+
+    def test_rejects_nonfinite_decimal_values_as_nonfinite(self):
+        values = (
+            Decimal("NaN"),
+            Decimal("sNaN"),
+            Decimal("Infinity"),
+            "NaN",
+            "sNaN",
+            "-Infinity",
+        )
+        for value in values:
+            with self.subTest(value=str(value)):
+                with self.assertRaisesRegex(MotionInputError, "must be finite"):
+                    finite_number(value, "test value")
 
     def test_controller_decimal_format_cannot_collide_with_field_markers(self):
         values = ("1e-5", "-2.5e10", 3.4028234663852886e38)
@@ -5006,7 +6350,7 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         self.assertIn("invalid markers or values", events[-1].error)
 
     def test_out_of_range_success_and_fault_responses_never_mutate_dispatcher_state(self):
-        for flag in ("", "EB"):
+        for flag in ("", "EA", "EB"):
             with self.subTest(flag=flag):
                 dispatcher = self.make_dispatcher(
                     lambda command, response_flag=flag: position_response(
@@ -5213,6 +6557,310 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         completed.acknowledge()
         wait_until(lambda: not dispatcher.active)
         self.assertTrue(registry.idle())
+
+    def test_admission_failure_retains_failed_transport_rollback(self):
+        class FailOnceReleaseLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.release_attempts = 0
+
+            def acquire(self, blocking=True):
+                return self.lock.acquire(blocking)
+
+            def release(self):
+                self.release_attempts += 1
+                if self.release_attempts == 1:
+                    raise RuntimeError("injected transport release failure")
+                self.lock.release()
+
+            def locked(self):
+                return self.lock.locked()
+
+        def reject_activity_admission():
+            raise MotionInputError("injected activity admission failure")
+
+        def return_invalid_activity_lease():
+            return object()
+
+        admission_cases = (
+            (
+                reject_activity_admission,
+                "injected activity admission failure",
+            ),
+            (
+                return_invalid_activity_lease,
+                "activity_factory must return a closeable lease or None",
+            ),
+        )
+        for activity_factory, admission_detail in admission_cases:
+            with self.subTest(admission_detail=admission_detail):
+                transport_lock = FailOnceReleaseLock()
+                dispatcher = self.make_dispatcher(
+                    lambda command: position_response((1, 0, 0, 0, 0, 0)),
+                    transport_lock=transport_lock,
+                    activity_factory=activity_factory,
+                )
+
+                with self.assertRaises(MotionQueueFault) as raised:
+                    dispatcher.submit_delta(0, 1, self.actual, self.profile)
+                self.assertIn(admission_detail, str(raised.exception))
+                self.assertIn(
+                    "injected transport release failure",
+                    str(raised.exception),
+                )
+                self.assertTrue(transport_lock.locked())
+                self.assertTrue(dispatcher._transport_reserved)
+                self.assertIsNone(dispatcher._activity_lease)
+                self.assertIn(
+                    "ownership release failed",
+                    dispatcher.fault_reason,
+                )
+                events = dispatcher.drain_events()
+                self.assertEqual(
+                    [event.kind for event in events],
+                    ["transport-failed"],
+                )
+                self.assertIn(admission_detail, events[0].error)
+                self.assertIn(
+                    "injected transport release failure",
+                    events[0].error,
+                )
+
+                with self.assertRaisesRegex(
+                    MotionQueueFault,
+                    "ownership release failed",
+                ):
+                    dispatcher.submit_delta(0, 1, self.actual, self.profile)
+
+                self.assertTrue(dispatcher.synchronize(self.actual))
+                self.assertFalse(transport_lock.locked())
+                self.assertFalse(dispatcher._transport_reserved)
+                self.assertIsNone(dispatcher.fault_reason)
+
+    def test_activity_release_failure_releases_mutex_and_retries_lease(self):
+        class FailOnceRegistry(SerialActivityRegistry):
+            def __init__(self):
+                super().__init__(("ser",))
+                self.release_attempts = 0
+
+            def end(self, serial_name, control_injectable=False):
+                self.release_attempts += 1
+                if self.release_attempts == 1:
+                    raise RuntimeError("injected registry release failure")
+                return super().end(
+                    serial_name,
+                    control_injectable=control_injectable,
+                )
+
+        transport_lock = threading.Lock()
+        registry = FailOnceRegistry()
+        dispatcher = self.make_dispatcher(
+            lambda command: position_response((1, 0, 0, 0, 0, 0)),
+            transport_lock=transport_lock,
+            activity_factory=lambda: registry.lease("ser"),
+        )
+
+        dispatcher.submit_delta(0, 1, self.actual, self.profile)
+        events = collect_events_until_idle(dispatcher)
+
+        self.assertEqual(
+            [event.kind for event in events],
+            ["started", "completed", "transport-failed"],
+        )
+        self.assertIn(
+            "injected registry release failure",
+            events[-1].error,
+        )
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(registry.active("ser"))
+        self.assertFalse(dispatcher._transport_reserved)
+        self.assertIsNotNone(dispatcher._activity_lease)
+        self.assertIn("ownership release failed", dispatcher.fault_reason)
+        self.assertIsNone(dispatcher.desired_target)
+        self.assertTrue(transport_lock.acquire(blocking=False))
+        transport_lock.release()
+        with self.assertRaisesRegex(
+            MotionQueueFault,
+            "ownership release failed",
+        ):
+            dispatcher.submit_delta(0, 1, self.actual, self.profile)
+
+        with registry.operations(("ser",)):
+            self.assertTrue(dispatcher.synchronize(self.actual))
+            self.assertTrue(registry.active("ser"))
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(registry.idle())
+        self.assertFalse(dispatcher._transport_reserved)
+        self.assertIsNone(dispatcher._activity_lease)
+        self.assertIsNone(dispatcher.fault_reason)
+
+        dispatcher.submit_delta(0, 1, self.actual, self.profile)
+        recovered_events = collect_events_until_idle(dispatcher)
+        self.assertEqual(
+            [event.kind for event in recovered_events],
+            ["started", "completed"],
+        )
+        self.assertTrue(registry.idle())
+
+    def test_release_reports_and_recovers_multiple_ownership_failures(self):
+        class FailOnceRegistry(SerialActivityRegistry):
+            def __init__(self):
+                super().__init__(("ser",))
+                self.release_attempts = 0
+
+            def end(self, serial_name, control_injectable=False):
+                self.release_attempts += 1
+                if self.release_attempts == 1:
+                    raise RuntimeError("injected registry release failure")
+                return super().end(
+                    serial_name,
+                    control_injectable=control_injectable,
+                )
+
+        class FailOnceReleaseLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.release_attempts = 0
+
+            def acquire(self, blocking=True):
+                return self.lock.acquire(blocking)
+
+            def release(self):
+                self.release_attempts += 1
+                if self.release_attempts == 1:
+                    raise RuntimeError("injected transport release failure")
+                self.lock.release()
+
+            def locked(self):
+                return self.lock.locked()
+
+        transport_lock = FailOnceReleaseLock()
+        registry = FailOnceRegistry()
+        dispatcher = self.make_dispatcher(
+            lambda command: position_response((1, 0, 0, 0, 0, 0)),
+            transport_lock=transport_lock,
+            activity_factory=lambda: registry.lease("ser"),
+        )
+
+        dispatcher.submit_delta(0, 1, self.actual, self.profile)
+        events = collect_events_until_idle(dispatcher)
+
+        self.assertEqual(
+            [event.kind for event in events],
+            ["started", "completed", "transport-failed"],
+        )
+        self.assertIn("serial activity lease", events[-1].error)
+        self.assertIn("controller transport lock", events[-1].error)
+        self.assertTrue(transport_lock.locked())
+        self.assertTrue(registry.active("ser"))
+        self.assertTrue(dispatcher._transport_reserved)
+        self.assertIsNotNone(dispatcher._activity_lease)
+
+        self.assertTrue(dispatcher.synchronize(self.actual))
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(registry.idle())
+        self.assertFalse(dispatcher._transport_reserved)
+        self.assertIsNone(dispatcher._activity_lease)
+        self.assertIsNone(dispatcher.fault_reason)
+
+    def test_close_reports_retained_lease_failure_without_raising(self):
+        class FailTwiceRegistry(SerialActivityRegistry):
+            def __init__(self):
+                super().__init__(("ser",))
+                self.release_attempts = 0
+
+            def end(self, serial_name, control_injectable=False):
+                self.release_attempts += 1
+                if self.release_attempts <= 2:
+                    raise RuntimeError("injected retained lease failure")
+                return super().end(
+                    serial_name,
+                    control_injectable=control_injectable,
+                )
+
+        registry = FailTwiceRegistry()
+        dispatcher = self.make_dispatcher(
+            lambda command: position_response((1, 0, 0, 0, 0, 0)),
+            activity_factory=lambda: registry.lease("ser"),
+        )
+
+        dispatcher.submit_delta(0, 1, self.actual, self.profile)
+        initial_events = collect_events_until_idle(dispatcher)
+        self.assertEqual(
+            [event.kind for event in initial_events],
+            ["started", "completed", "transport-failed"],
+        )
+        self.assertTrue(registry.active("ser"))
+        self.assertFalse(dispatcher.closed)
+
+        self.assertFalse(dispatcher.close())
+        self.assertTrue(dispatcher.closed)
+        close_events = dispatcher.drain_events()
+        self.assertEqual(close_events, [])
+        self.assertTrue(registry.active("ser"))
+        self.assertIsNotNone(dispatcher._activity_lease)
+
+        self.assertTrue(dispatcher.close())
+        self.assertTrue(registry.idle())
+        self.assertIsNone(dispatcher._activity_lease)
+        self.assertFalse(dispatcher.synchronize(self.actual))
+
+    def test_idle_worker_release_failure_publishes_without_a_move(self):
+        class FailOnceRegistry(SerialActivityRegistry):
+            def __init__(self):
+                super().__init__(("ser",))
+                self.release_attempts = 0
+
+            def end(self, serial_name, control_injectable=False):
+                self.release_attempts += 1
+                if self.release_attempts == 1:
+                    raise RuntimeError("injected idle release failure")
+                return super().end(
+                    serial_name,
+                    control_injectable=control_injectable,
+                )
+
+        class DeferredWorker:
+            instance = None
+
+            def __init__(self, target, **_kwargs):
+                self.target = target
+                type(self).instance = self
+
+            def start(self):
+                pass
+
+            def run(self):
+                self.target()
+
+        transport_lock = threading.Lock()
+        registry = FailOnceRegistry()
+        dispatcher = self.make_dispatcher(
+            lambda command: position_response((1, 0, 0, 0, 0, 0)),
+            transport_lock=transport_lock,
+            activity_factory=lambda: registry.lease("ser"),
+        )
+
+        with patch(
+            "ARrobots.HMI.joint_motion.threading.Thread",
+            DeferredWorker,
+        ):
+            dispatcher.submit_delta(0, 1, self.actual, self.profile)
+        self.assertTrue(dispatcher.invalidate("external invalidation"))
+        DeferredWorker.instance.run()
+
+        events = dispatcher.drain_events()
+        self.assertEqual([event.kind for event in events], ["transport-failed"])
+        self.assertIsNone(events[0].move)
+        self.assertIn("injected idle release failure", events[0].error)
+        self.assertFalse(dispatcher.active)
+        self.assertFalse(transport_lock.locked())
+        self.assertTrue(registry.active("ser"))
+        self.assertIn("ownership release failed", dispatcher.fault_reason)
+
+        self.assertTrue(dispatcher.synchronize(self.actual))
+        self.assertTrue(registry.idle())
+        self.assertIsNone(dispatcher.fault_reason)
 
     def test_idle_publication_waits_for_transport_release(self):
         transport_lock = ReleaseBarrierLock()

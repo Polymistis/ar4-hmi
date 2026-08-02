@@ -75,6 +75,12 @@
 '''
 ##########################################################################
 
+if __name__ != "__main__":
+    raise RuntimeError(
+        "AR4.py is an executable application entry point; "
+        "import ARrobots modules instead"
+    )
+
 import sys
 import os
 import json
@@ -189,18 +195,26 @@ from ARrobots.HMI.joint_motion import (
   AUXILIARY_BOARD_MEGA,
   AUXILIARY_BOARD_NANO,
   AUXILIARY_BOARD_NONE,
+  AUXILIARY_WAIT_MAXIMUM_SECONDS,
   CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
   CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
   CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
   CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
+  CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
   CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
   CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
+  CONTROLLER_ESTOP_ADMISSION_FLAG,
+  CONTROLLER_ESTOP_EVENT_FLAG,
+  CONTROLLER_PHYSICAL_ESTOP_FLAGS,
   CONTROLLER_HARDWARE_ID_LENGTH,
   CONTROLLER_MEDIA_ID_LENGTH,
   CoalescingJointDispatcher,
   CONTROL_POLL_INTERVAL_SECONDS,
   ControllerIdentity,
   ControllerJointCalibration,
+  ControllerLineExchangeResponse,
+  ControllerModbusExchangeResponse,
+  DeferredJointDispatchOutcome,
   DeferredLiveMotionArbiter,
   LiveMotionScheduleResult,
   DeferredJointAdjustments,
@@ -224,10 +238,13 @@ from ARrobots.HMI.joint_motion import (
   SerialActivityRejected,
   VirtualMotionOperation,
   auxiliary_pneumatic_output_pin,
+  build_controller_modbus_command,
   build_virtual_joint_command,
   canonicalize_serial_command,
   canonicalize_virtual_command,
+  classify_controller_modbus_terminal_response,
   command_response_timeout,
+  controller_modbus_command_is_write,
   controller_degree_to_native_radians,
   controller_number,
   controller_protocol_decimal,
@@ -241,25 +258,36 @@ from ARrobots.HMI.joint_motion import (
   motion_timing_response_timeout,
   normalize_auxiliary_board_profile,
   parse_auxiliary_output_command,
+  parse_auxiliary_gripper_current_response,
   parse_auxiliary_servo_command,
   parse_command_timing,
   parse_controller_identity_response,
+  parse_controller_modbus_exchange_frames,
   parse_controller_modbus_response,
   parse_joint_motion_exchange_response,
   parse_motion_wrist_config,
   parse_position_response,
+  position_response_is_physical_estop,
   parse_primary_home_reference_capability_response,
   parse_virtual_command_timing,
   primary_home_reference_command,
   primary_shutdown_position,
   quarantine_serial_transport,
+  read_controller_exact_exchange_response,
+  read_controller_line_exchange_response,
+  read_controller_modbus_exchange_response,
+  read_pending_controller_estop_response,
   read_serial_exact_response,
   read_serial_line_response,
   read_serial_line_response_with_optional_followup,
   request_joint_telemetry,
   serial_transport_quarantined,
   validate_auxiliary_output_command,
+  validate_auxiliary_gripper_current_command,
+  validate_auxiliary_input_command,
   validate_auxiliary_servo_command,
+  validate_auxiliary_wait_command,
+  validate_controller_modbus_command,
   validate_controller_filename,
   validate_controller_hardware_id,
   validate_controller_media_id,
@@ -272,6 +300,37 @@ from ARrobots.HMI.joint_visualization import (
   GhostSliderMarker,
   JointMotionVisualization,
   set_joint_slider_positions,
+)
+from ARrobots.HMI.vision_io import (
+  MAX_CAMERA_PREVIEW_EVENT_DETAIL,
+  VISION_TEMPLATE_PREVIEW_SIZE,
+  CameraPreviewEvent,
+  CameraPreviewFrame,
+  CameraPreviewLifecycleState,
+  CameraPreviewWorker,
+  VisionCaptureResult,
+  VisionCaptureSettings,
+  VisionCoordinateMapping,
+  VisionMatchOperationResult,
+  VisionMatchOptions,
+  VisionMatchResult,
+  VisionMatchSettings,
+  VisionOperationDrainState,
+  VisionOperationEvent,
+  VisionOperationSubmission,
+  VisionOperationWorker,
+  VisionSelectionResult,
+  VisionSelectionSettings,
+  fit_vision_preview_square,
+  load_bounded_vision_image,
+  normalize_camera_exception_detail,
+  prepare_camera_preview_frame,
+  prepare_vision_capture_result,
+  prepare_vision_mask_selection_result,
+  prepare_vision_match_result,
+  prepare_vision_selection_image,
+  prepare_vision_template_selection_result,
+  select_vision_region,
 )
 
 #####################################################################################
@@ -320,9 +379,8 @@ else:
 
 os.chdir(DIR)    
 
-RUN['cropping'] = False
-
 root = Tk()
+application_tk_thread_id = threading.get_ident()
 root.wm_title("AR4 Software Ver 6.7")
 root.iconphoto(True, tk.PhotoImage(file="AR.png"))
 
@@ -392,7 +450,125 @@ nb.add(tab8, text='      Log      ')
 tab9 = ttk_bootstrap.Frame(nb)
 #nb.add(tab9, text='   Info    ')
 
+
+_joint_motion_shutdown_cleanup_diagnostics = set()
+
+
+def _report_joint_motion_shutdown_cleanup_once(
+  diagnostic_key,
+  message,
+  *args,
+  include_traceback=False,
+):
+  if diagnostic_key in _joint_motion_shutdown_cleanup_diagnostics:
+    return False
+  _joint_motion_shutdown_cleanup_diagnostics.add(diagnostic_key)
+  if include_traceback:
+    logger.exception(message, *args)
+  else:
+    logger.error(message, *args)
+  return True
+
+
+def _close_joint_motion_dispatcher_for_shutdown():
+  dispatcher = globals().get('joint_motion_dispatcher')
+  if dispatcher is None:
+    return True
+  for cleanup_attempt in range(2):
+    try:
+      cleanup_complete = dispatcher.close()
+    except Exception as exc:
+      try:
+        detail = " ".join(str(exc).split())
+      except Exception:
+        detail = type(exc).__name__
+      detail = detail or type(exc).__name__
+      _report_joint_motion_shutdown_cleanup_once(
+        "close-exception",
+        "Joint-motion dispatcher shutdown cleanup failed: %s",
+        detail,
+        include_traceback=True,
+      )
+      return False
+    if cleanup_complete is True:
+      return True
+    if cleanup_complete is not False:
+      _report_joint_motion_shutdown_cleanup_once(
+        "invalid-return",
+        "Joint-motion dispatcher returned an invalid shutdown cleanup state",
+      )
+      return False
+    try:
+      dispatcher_active = dispatcher.active
+    except Exception:
+      _report_joint_motion_shutdown_cleanup_once(
+        "cleanup-status-exception",
+        "Unable to inspect incomplete joint-motion dispatcher cleanup",
+        include_traceback=True,
+      )
+      return False
+    if not isinstance(dispatcher_active, bool):
+      _report_joint_motion_shutdown_cleanup_once(
+        "invalid-active-state",
+        "Joint-motion dispatcher returned an invalid active state during shutdown",
+      )
+      return False
+    if dispatcher_active:
+      _report_joint_motion_shutdown_cleanup_once(
+        "cleanup-incomplete-active",
+        "Joint-motion dispatcher shutdown cleanup is waiting for the active worker",
+      )
+      return False
+    try:
+      dispatcher_fault = dispatcher.fault_reason
+    except Exception:
+      _report_joint_motion_shutdown_cleanup_once(
+        "cleanup-status-exception",
+        "Unable to inspect incomplete joint-motion dispatcher cleanup",
+        include_traceback=True,
+      )
+      return False
+    if dispatcher_fault is None or dispatcher_fault == "":
+      if cleanup_attempt == 0:
+        continue
+      _report_joint_motion_shutdown_cleanup_once(
+        "cleanup-incomplete-without-fault",
+        "Joint-motion dispatcher shutdown cleanup remains incomplete without a fault reason",
+      )
+      return False
+    if not isinstance(dispatcher_fault, str):
+      _report_joint_motion_shutdown_cleanup_once(
+        "invalid-fault-state",
+        "Joint-motion dispatcher returned an invalid fault state during shutdown",
+      )
+      return False
+    fault_detail = " ".join(dispatcher_fault.split())
+    if not fault_detail:
+      if cleanup_attempt == 0:
+        continue
+      _report_joint_motion_shutdown_cleanup_once(
+        "cleanup-incomplete-without-fault",
+        "Joint-motion dispatcher shutdown cleanup remains incomplete without a fault reason",
+      )
+      return False
+    fault_category = (
+      "ownership-release"
+      if "controller ownership release failed:" in fault_detail
+      else "other-fault"
+    )
+    _report_joint_motion_shutdown_cleanup_once(
+      f"cleanup-incomplete-{fault_category}",
+      "Joint-motion dispatcher shutdown cleanup remains incomplete: %s",
+      fault_detail,
+    )
+    return False
+  return False
+
+
 def on_closing():
+  global camera_preview_shutdown_started_at
+  global camera_preview_shutdown_timeout_reported
+
   closing_event = globals().get('application_closing')
   with application_lifecycle_lock:
     if closing_event is not None and closing_event.is_set():
@@ -403,6 +579,15 @@ def on_closing():
   runtime_state = globals().get('RUN')
   if isinstance(runtime_state, dict):
     runtime_state['xboxUse'] = 0
+
+  try:
+    _cancel_active_program_execution()
+  except Exception:
+    logger.exception("Unable to cancel program execution during shutdown")
+  try:
+    _cancel_auxiliary_device_read()
+  except Exception:
+    logger.exception("Unable to cancel auxiliary-device I/O during shutdown")
 
   conversion_active = globals().get('gcode_conversion_active')
   conversion_tab = globals().get('tab7')
@@ -437,12 +622,74 @@ def on_closing():
     with offline_state_lock:
       offline_stop.set()
 
-  dispatcher = globals().get('joint_motion_dispatcher')
-  if dispatcher is not None and dispatcher.active:
-    dispatcher.close()
+  camera_worker = globals().get('camera_preview_worker')
+  if camera_worker is not None:
+    try:
+      camera_state = camera_worker.close_state()
+      if not isinstance(camera_state, CameraPreviewLifecycleState):
+        raise RuntimeError("camera preview returned an invalid close state")
+      if not camera_state.closed:
+        raise RuntimeError("camera preview did not enter the closed state")
+      if camera_state.fault_reason is not None:
+        logger.error(
+          "Camera preview shutdown retained a cleanup fault: %s",
+          camera_state.fault_reason,
+        )
+      if camera_state.active:
+        camera_preview_shutdown_started_at = time.monotonic()
+    except Exception:
+      logger.exception("Unable to stop camera preview during shutdown")
+  capture_worker = globals().get('vision_capture_worker')
+  if capture_worker is not None:
+    try:
+      capture_closed = capture_worker.close()
+      if not isinstance(capture_closed, bool):
+        raise RuntimeError("vision capture returned an invalid close state")
+      if not capture_closed:
+        camera_preview_shutdown_started_at = time.monotonic()
+    except Exception:
+      logger.exception("Unable to stop vision capture during shutdown")
+  match_worker = globals().get('vision_match_worker')
+  if match_worker is not None:
+    try:
+      match_closed = match_worker.close()
+      if not isinstance(match_closed, bool):
+        raise RuntimeError("vision matching returned an invalid close state")
+      if not match_closed:
+        camera_preview_shutdown_started_at = time.monotonic()
+    except Exception:
+      logger.exception("Unable to stop vision matching during shutdown")
+  selection_worker = globals().get('vision_selection_worker')
+  if selection_worker is not None:
+    try:
+      selection_closed = selection_worker.close()
+      if not isinstance(selection_closed, bool):
+        raise RuntimeError("vision selection returned an invalid close state")
+      if not selection_closed:
+        camera_preview_shutdown_started_at = time.monotonic()
+    except Exception:
+      logger.exception("Unable to stop vision selection during shutdown")
+  try:
+    program_vision_settled = _settle_program_vision_shutdown_operations()
+    if not isinstance(program_vision_settled, bool):
+      raise RuntimeError(
+        "program vision shutdown returned an invalid settlement state"
+      )
+    if not program_vision_settled:
+      logger.error("Program vision shutdown settlement was incomplete")
+  except Exception:
+    logger.exception("Unable to settle program vision during shutdown")
+  camera_preview_shutdown_timeout_reported = False
+  if isinstance(runtime_state, dict):
+    runtime_state['cam_on'] = False
+    runtime_state['visionCaptureRequestId'] = None
+    runtime_state['visionMatchRequestId'] = None
+    runtime_state['visionSelectionRequestId'] = None
+    runtime_state['visionSelectionKind'] = None
 
-  almStatusLab.config(text="SHUTDOWN WAITING FOR CONTROLLER", style="Warn.TLabel")
-  almStatusLab2.config(text="SHUTDOWN WAITING FOR CONTROLLER", style="Warn.TLabel")
+  _close_joint_motion_dispatcher_for_shutdown()
+
+  _set_application_status(text="SHUTDOWN WAITING FOR CONTROLLER", style="Warn.TLabel")
   _poll_application_close()
   return True
 
@@ -459,6 +706,18 @@ live_jog_lock = threading.Lock()
 live_cartesian_lock = threading.Lock()
 live_tool_lock = threading.Lock()
 application_lifecycle_lock = threading.Lock()
+camera_selection_lock = threading.Lock()
+camera_preview_request_lock = threading.Lock()
+vision_capture_request_lock = threading.Lock()
+vision_match_request_lock = threading.Lock()
+vision_selection_request_lock = threading.Lock()
+program_vision_operation_lock = threading.Lock()
+vision_artifact_lock = threading.Lock()
+selected_vision_camera_source = None
+program_camera_completion_queue = Queue()
+program_vision_start_queue = Queue()
+program_vision_operations = {}
+program_vision_retired_request_ids = set()
 offline_live_jog_lock = threading.Lock()
 offline_live_jog_state_lock = threading.Lock()
 offline_live_jog_stop_event = threading.Event()
@@ -471,6 +730,8 @@ manual_motion_request_state = threading.local()
 motion_request_admission_state = threading.local()
 serial_write_lock = threading.Lock()
 serial_event_queue = Queue()
+called_program_navigation_event_queue = Queue()
+program_selection_event_queue = Queue()
 calibration_serial_event_queue = Queue()
 calibration_operation_lock = threading.Lock()
 calibration_operation = None
@@ -482,12 +743,37 @@ auxiliary_serial_lock = threading.Lock()
 auxiliary_serial_write_lock = threading.Lock()
 auxiliary_serial_event_queue = Queue()
 program_stop_status_event_queue = Queue()
+program_stop_status_pending_event = None
+main_controller_stop_event_queue = Queue()
+main_controller_stop_pending_event = None
+main_controller_idle_stop_result_queue = Queue()
+main_controller_idle_stop_pending_result = None
 manual_auxiliary_event_queue = Queue()
 manual_auxiliary_request_queue = []
 manual_auxiliary_active_request = None
 manual_auxiliary_next_request_id = 0
 manual_auxiliary_state_lock = threading.Lock()
 manual_auxiliary_stop_barrier = threading.Event()
+auxiliary_device_event_queue = Queue()
+auxiliary_device_state_lock = threading.Lock()
+auxiliary_device_read_active = threading.Event()
+auxiliary_device_worker_active = threading.Event()
+auxiliary_device_cancel_requested = threading.Event()
+auxiliary_device_active_request = None
+auxiliary_device_active_serial = None
+auxiliary_device_retained_serials = []
+auxiliary_device_pending_result = None
+auxiliary_device_next_request_id = 0
+manual_controller_event_queue = Queue()
+manual_controller_active_request = None
+manual_controller_activity_lease = None
+manual_controller_next_request_id = 0
+manual_controller_state_lock = threading.Lock()
+manual_controller_pending_stop_event = None
+manual_controller_estop_applied_request_id = None
+manual_controller_estop_applied_position = None
+manual_controller_cleanup_lock = threading.Lock()
+manual_controller_cleanup_pending = None
 gcode_storage_event_queue = Queue()
 gcode_storage_state_lock = threading.Lock()
 gcode_storage_active_request = None
@@ -503,6 +789,7 @@ gcode_storage_persistent_state_error = None
 gcode_storage_state_path_override = None
 controller_identity_state_lock = threading.Lock()
 main_controller_identity_binding = None
+main_controller_connection_epoch = 0
 joint_actual_position_source_snapshot = None
 gcode_storage_media_binding = None
 gcode_view_generation = 0
@@ -512,7 +799,10 @@ gcode_conversion_cancel_lock = threading.Lock()
 program_execution_state_lock = threading.Lock()
 program_execution_next_request_id = 0
 program_execution_active_request = None
+program_execution_cancelled = threading.Event()
+program_return_state_clear_requested = threading.Event()
 gcode_storage_program_admission_active = False
+manual_controller_program_admission_active = False
 event_poll_retry_lock = threading.Lock()
 event_poll_retry_pending = set()
 startup_auxiliary_cleanup_lock = threading.Lock()
@@ -528,6 +818,7 @@ program_stop_state_lock = threading.RLock()
 auxiliary_stop_next_request_id = 0
 auxiliary_stop_pending_request_id = None
 auxiliary_stop_active_request_id = None
+main_controller_auxiliary_stop_request_id = None
 auxiliary_stop_owner_waiting = False
 auxiliary_stop_owner_result = None
 auxiliary_stop_owner_result_event = threading.Event()
@@ -548,6 +839,8 @@ live_serial_result_pending = threading.Event()
 live_jog_stop_requested = threading.Event()
 application_closing = threading.Event()
 application_shutdown_started_at = None
+camera_preview_shutdown_started_at = None
+camera_preview_shutdown_timeout_reported = False
 shutdown_serial_cancel_requested = set()
 serial_activity_registry = SerialActivityRegistry(
   ("ser", "ser2"),
@@ -557,6 +850,67 @@ motion_request_registry = MotionRequestRegistry()
 joint_motion_request_lock = threading.Lock()
 joint_motion_request_lease = None
 offline_live_jog_motion_lease = None
+
+
+class SerialWriteCancellationBoundary:
+  """Order cancellation against the final serial write-admission check."""
+
+  def __init__(self, context):
+    if (
+      not isinstance(context, str)
+      or not context
+      or context != context.strip()
+      or "\r" in context
+      or "\n" in context
+    ):
+      raise TypeError("serial cancellation context must be normalized text")
+    self._context = context
+    self._event = threading.Event()
+    self._lock = threading.Lock()
+
+  def is_set(self):
+    cancelled = self._event.is_set()
+    if not isinstance(cancelled, bool):
+      raise RuntimeError(
+        f"{self._context} cancellation state must be boolean"
+      )
+    return cancelled
+
+  def cancel(self):
+    acquired = self._lock.acquire()
+    if acquired is False:
+      raise RuntimeError(
+        f"{self._context} cancellation boundary acquisition failed"
+      )
+    try:
+      self._event.set()
+    finally:
+      self._lock.release()
+    return True
+
+  def set(self):
+    return self.cancel()
+
+  def clear(self):
+    acquired = self._lock.acquire()
+    if acquired is False:
+      raise RuntimeError(
+        f"{self._context} cancellation boundary acquisition failed"
+      )
+    try:
+      self._event.clear()
+    finally:
+      self._lock.release()
+    return True
+
+  def wait(self, timeout=None):
+    return self._event.wait(timeout)
+
+  def acquire(self):
+    return self._lock.acquire()
+
+  def release(self):
+    return self._lock.release()
 
 
 class CalibrationCancellationBoundary:
@@ -611,6 +965,13 @@ SERIAL_EVENT_APPLICATION_MARGIN_SECONDS = 5
 SERIAL_WRITE_TIMEOUT_SECONDS = 5
 SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS = 5
 SERIAL_AUXILIARY_WAIT_MARGIN_SECONDS = 5
+AUXILIARY_DEVICE_BAUD_RATE = 9600
+AUXILIARY_DEVICE_READ_TIMEOUT_SECONDS = 5
+AUXILIARY_DEVICE_MAX_READ_BYTES = 4096
+AUXILIARY_DEVICE_MAX_PORT_NUMBER = 65535
+AUXILIARY_DEVICE_MAX_ERROR_DETAIL = 512
+AUXILIARY_DEVICE_CLEANUP_RETRY_SECONDS = 1.0
+AUXILIARY_DEVICE_SHUTDOWN_CLOSE_ATTEMPTS = 3
 # Teensy WJ, WK, and WT convert seconds to signed 32-bit milliseconds.
 MAIN_FIRMWARE_WAIT_MAX_SECONDS = 2147483
 # Firmware emits the live acknowledgement before entering segment execution.
@@ -622,7 +983,6 @@ SERIAL_SHUTDOWN_ACTIVITY_GRACE_SECONDS = 1.0
 FIRMWARE_AXIS_COUNT = 9
 FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS = 30
 FIRMWARE_MAX_MILLIMETERS_PER_SECOND = 192
-AUXILIARY_FIRMWARE_SIGNED_INT_MAX = 32767
 AUXILIARY_WAIT_TERMINAL_RESPONSES = ("Done", "Timeout", "Nano Stopped")
 AUXILIARY_WAIT_NATURAL_RESPONSES = ("Done", "Timeout")
 AUXILIARY_INACTIVE_STOP_RESPONSE = "Nano Inactive Stopped"
@@ -654,6 +1014,17 @@ XBOX_AUXILIARY_FIXED_EXCHANGES = frozenset(
 )
 MANUAL_AUXILIARY_QUEUE_LIMIT = 64
 PROGRAM_EXECUTION_MODES = frozenset(("run", "step-forward", "step-reverse"))
+PROGRAM_CAMERA_OPERATIONS = frozenset(("on", "off"))
+PROGRAM_SELECTION_INITIALIZE_RUN = "initialize-run"
+PROGRAM_SELECTION_PREPARE_RUN = "prepare-run"
+PROGRAM_SELECTION_ADVANCE = "advance"
+PROGRAM_SELECTION_ACTIONS = frozenset(
+  (
+    PROGRAM_SELECTION_INITIALIZE_RUN,
+    PROGRAM_SELECTION_PREPARE_RUN,
+    PROGRAM_SELECTION_ADVANCE,
+  )
+)
 GCODE_STORAGE_OPERATIONS = frozenset(("delete", "list"))
 GCODE_STORAGE_DELETE_TERMINAL_RESPONSES = frozenset(("P", "F", "ER"))
 GCODE_STORAGE_DETAILED_ERROR_PREFIX = "EG: "
@@ -670,6 +1041,9 @@ GCODE_STORAGE_STATE_TEMPORARY_ATTEMPTS = 16
 MAX_LOCAL_GCODE_PROGRAM_BYTES = 8 * 1024 * 1024
 MAX_LOCAL_GCODE_PROGRAM_ROWS = 10000
 MAX_LOCAL_GCODE_SOURCE_LINE_BYTES = MAX_COMMAND_LENGTH + 2
+MAX_LOCAL_ROBOT_PROGRAM_BYTES = 8 * 1024 * 1024
+MAX_LOCAL_ROBOT_PROGRAM_ROWS = 10000
+MAX_LOCAL_ROBOT_SOURCE_LINE_BYTES = MAX_COMMAND_LENGTH + 2
 GCODE_LISTBOX_STYLE_OPTIONS = (
   "background",
   "foreground",
@@ -682,13 +1056,21 @@ CONTROLLER_STARTUP_REQUIRED_CAPABILITIES = (
   CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
   CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
   CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
+  CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
 )
 EVENT_POLL_INTERVAL_MS = 25
+CAMERA_PREVIEW_SHUTDOWN_GRACE_SECONDS = 2.0
+CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS = 10.0
 EVENT_POLL_CALLBACK_NAMES = {
+  "camera-preview": "_poll_camera_preview_events",
   "serial": "_poll_serial_events",
+  "manual-controller": "_poll_manual_controller_events",
   "auxiliary-serial": "_poll_auxiliary_serial_events",
   "manual-auxiliary": "_poll_manual_auxiliary_events",
+  "auxiliary-device": "_poll_auxiliary_device_events",
   "gcode-storage": "_poll_gcode_storage_events",
+  "called-program": "_poll_called_program_navigation_events",
+  "program-selection": "_poll_program_selection_events",
   "xbox-auxiliary": "_poll_xbox_auxiliary_events",
   "virtual-motion": "_poll_virtual_motion_events",
   "joint-motion": "_poll_joint_motion_events",
@@ -702,10 +1084,79 @@ MANUAL_AUXILIARY_CALIBRATION_KEYS = frozenset(
 )
 
 
+def _validate_called_program_filename(value, field_name):
+  if not isinstance(field_name, str) or not field_name:
+    raise TypeError("called-program filename field is invalid")
+  if (
+    not isinstance(value, str)
+    or not value
+    or "\x00" in value
+    or "\r" in value
+    or "\n" in value
+    or "/" in value
+    or "\\" in value
+    or ":" in value
+    or os.path.basename(value) != value
+    or os.path.splitext(value)[1].casefold() != ".ar4"
+  ):
+    raise MotionInputError(f"{field_name} is invalid")
+  return value
+
+
+def _validate_robot_program_source_path(value, field_name):
+  if not isinstance(field_name, str) or not field_name:
+    raise TypeError("robot program source-path field is invalid")
+  if (
+    not isinstance(value, str)
+    or not value
+    or "\x00" in value
+    or "\r" in value
+    or "\n" in value
+    or os.path.splitext(value)[1].casefold() != ".ar4"
+  ):
+    raise MotionInputError(f"{field_name} is invalid")
+  return value
+
+
+def _resolve_called_program_source_path(
+  program_target,
+  *,
+  caller_program=None,
+  return_to_caller=False,
+):
+  if not isinstance(return_to_caller, bool):
+    raise TypeError("called-program return-path option must be boolean")
+  if return_to_caller:
+    if caller_program is not None:
+      raise MotionInputError(
+        "called-program return path cannot include caller state"
+      )
+    return _validate_robot_program_source_path(
+      program_target,
+      "called-program return path",
+    )
+
+  _validate_called_program_filename(
+    program_target,
+    "called-program filename",
+  )
+  if caller_program is None:
+    return program_target
+  _validate_robot_program_source_path(
+    caller_program,
+    "called-program caller path",
+  )
+  caller_directory = os.path.dirname(caller_program)
+  if not caller_directory:
+    return program_target
+  return os.path.join(caller_directory, program_target)
+
+
 @dataclass(frozen=True)
 class ProgramExecutionRequest:
   request_id: int
   mode: str
+  cancellation_boundary: SerialWriteCancellationBoundary
 
   def __post_init__(self):
     if (
@@ -716,6 +1167,452 @@ class ProgramExecutionRequest:
       raise MotionInputError("program execution request ID must be positive")
     if self.mode not in PROGRAM_EXECUTION_MODES:
       raise MotionInputError("program execution mode is invalid")
+    if not isinstance(
+      self.cancellation_boundary,
+      SerialWriteCancellationBoundary,
+    ):
+      raise MotionInputError(
+        "program execution cancellation boundary is invalid"
+      )
+
+
+@dataclass(frozen=True)
+class AuxiliaryDeviceReadRequest:
+  request_id: int
+  port: str
+  read_size: int
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError("auxiliary-device request ID must be positive")
+    if (
+      not isinstance(self.port, str)
+      or len(self.port) > 3 + len(str(AUXILIARY_DEVICE_MAX_PORT_NUMBER))
+    ):
+      raise MotionInputError("auxiliary-device port is invalid")
+    match = re.fullmatch(r"COM([1-9][0-9]*)", self.port)
+    if (
+      match is None
+      or int(match.group(1)) > AUXILIARY_DEVICE_MAX_PORT_NUMBER
+    ):
+      raise MotionInputError("auxiliary-device port is invalid")
+    if (
+      isinstance(self.read_size, bool)
+      or not isinstance(self.read_size, int)
+      or not 1 <= self.read_size <= AUXILIARY_DEVICE_MAX_READ_BYTES
+    ):
+      raise MotionInputError("auxiliary-device read size is invalid")
+
+
+@dataclass(frozen=True)
+class AuxiliaryDeviceReadResult:
+  request_id: int
+  outcome: str
+  value: str
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError("auxiliary-device result ID must be positive")
+    if self.outcome not in ("completed", "failed", "cancelled"):
+      raise MotionInputError("auxiliary-device result outcome is invalid")
+    if not isinstance(self.value, str):
+      raise MotionInputError("auxiliary-device result value must be text")
+    try:
+      encoded_value = self.value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+      raise MotionInputError(
+        "auxiliary-device result value must be valid UTF-8"
+      ) from exc
+    if self.outcome == "completed":
+      if (
+        len(encoded_value) > AUXILIARY_DEVICE_MAX_READ_BYTES
+        or any(not character.isprintable() for character in self.value)
+      ):
+        raise MotionInputError("auxiliary-device response text is invalid")
+      return
+    if (
+      not self.value
+      or self.value != self.value.strip()
+      or " ".join(self.value.split()) != self.value
+      or len(encoded_value) > AUXILIARY_DEVICE_MAX_ERROR_DETAIL
+    ):
+      raise MotionInputError("auxiliary-device error detail is invalid")
+
+
+@dataclass(frozen=True)
+class ProgramCameraCompletionEvent:
+  execution_request: ProgramExecutionRequest
+  operation: str
+  completion_callback: object
+  succeeded: bool
+  error_detail: Optional[str] = None
+
+  def __post_init__(self):
+    if not isinstance(self.execution_request, ProgramExecutionRequest):
+      raise MotionInputError("program camera execution request is invalid")
+    if self.operation not in PROGRAM_CAMERA_OPERATIONS:
+      raise MotionInputError("program camera operation is invalid")
+    if not callable(self.completion_callback):
+      raise MotionInputError("program camera completion callback is invalid")
+    if not isinstance(self.succeeded, bool):
+      raise MotionInputError("program camera completion state is invalid")
+    if self.error_detail is not None and (
+      not isinstance(self.error_detail, str)
+      or not self.error_detail
+      or self.error_detail != self.error_detail.strip()
+      or " ".join(self.error_detail.split()) != self.error_detail
+      or "\r" in self.error_detail
+      or "\n" in self.error_detail
+      or len(self.error_detail) > MAX_CAMERA_PREVIEW_EVENT_DETAIL
+    ):
+      raise MotionInputError("program camera error detail is invalid")
+    if self.succeeded and self.error_detail is not None:
+      raise MotionInputError(
+        "successful program camera completion cannot contain an error"
+      )
+
+
+@dataclass(frozen=True)
+class ProgramVisionCommand:
+  template_filename: str
+  background_override: object
+  minimum_score: float
+  pass_tab: str
+  fail_tab: str
+
+  def __post_init__(self):
+    if (
+      not isinstance(self.template_filename, str)
+      or not self.template_filename
+      or self.template_filename != self.template_filename.strip()
+    ):
+      raise MotionInputError("vision program template is invalid")
+    background = self.background_override
+    automatic_background = (
+      isinstance(background, str) and background == "Auto"
+    )
+    if not automatic_background and (
+      not isinstance(background, tuple)
+      or len(background) != 3
+      or any(
+        isinstance(component, bool)
+        or not isinstance(component, int)
+        or component < 0
+        or component > 255
+        for component in background
+      )
+    ):
+      raise MotionInputError("vision program background is invalid")
+    if (
+      isinstance(self.minimum_score, bool)
+      or not isinstance(self.minimum_score, (int, float))
+      or not math.isfinite(self.minimum_score)
+      or self.minimum_score < 0
+      or self.minimum_score > 1
+    ):
+      raise MotionInputError(
+        "vision program minimum score must be between zero and one"
+      )
+    for label, tab_number in (
+      ("vision pass tab", self.pass_tab),
+      ("vision fail tab", self.fail_tab),
+    ):
+      if (
+        not isinstance(tab_number, str)
+        or not tab_number
+        or not tab_number.isdecimal()
+      ):
+        raise MotionInputError(f"{label} is invalid")
+
+
+class ProgramVisionOperation:
+  """Carry one program vision row through worker and Tk settlement."""
+
+  def __init__(
+    self,
+    execution_request,
+    command,
+    completion_callback=None,
+  ):
+    if not isinstance(execution_request, ProgramExecutionRequest):
+      raise TypeError("program vision execution request is invalid")
+    if not isinstance(command, ProgramVisionCommand):
+      raise TypeError("program vision command is invalid")
+    if completion_callback is not None and not callable(completion_callback):
+      raise TypeError("program vision completion callback is invalid")
+    self.execution_request = execution_request
+    self.command = command
+    self.completion_callback = completion_callback
+    self._completion = threading.Event()
+    self._settlement_lock = threading.Lock()
+    self._settled = False
+    self._succeeded = None
+    self._worker_request_id = None
+    self._program_rows = None
+
+  @property
+  def worker_request_id(self):
+    with self._settlement_lock:
+      return self._worker_request_id
+
+  @property
+  def program_rows(self):
+    with self._settlement_lock:
+      return self._program_rows
+
+  def bind_program_rows(self, rows):
+    if (
+      not isinstance(rows, tuple)
+      or not rows
+      or any(not isinstance(row, (str, bytes, bytearray)) for row in rows)
+    ):
+      raise TypeError("program vision row snapshot is invalid")
+    with self._settlement_lock:
+      if self._settled:
+        raise RuntimeError("settled program vision operation cannot start")
+      if self._program_rows is not None:
+        raise RuntimeError("program vision row snapshot was bound twice")
+      self._program_rows = tuple(
+        bytes(row) if isinstance(row, bytearray) else row
+        for row in rows
+      )
+    return True
+
+  def bind_worker_request(self, request_id):
+    if (
+      isinstance(request_id, bool)
+      or not isinstance(request_id, int)
+      or request_id < 0
+    ):
+      raise TypeError("program vision worker request ID is invalid")
+    with self._settlement_lock:
+      if self._settled:
+        raise RuntimeError("settled program vision operation cannot start")
+      if self._worker_request_id is not None:
+        raise RuntimeError("program vision operation started more than once")
+      self._worker_request_id = request_id
+    return True
+
+  def settle(self, succeeded):
+    if not isinstance(succeeded, bool):
+      raise TypeError("program vision settlement state is invalid")
+    with self._settlement_lock:
+      if self._settled:
+        raise RuntimeError("program vision operation settled more than once")
+      self._settled = True
+      self._succeeded = succeeded
+      self._completion.set()
+    return True
+
+  def wait(self):
+    while not self._completion.wait(CONTROL_POLL_INTERVAL_SECONDS):
+      if self.execution_request.cancellation_boundary.is_set():
+        return False
+    with self._settlement_lock:
+      if not self._settled or not isinstance(self._succeeded, bool):
+        raise RuntimeError(
+          "program vision completion was signaled before settlement"
+        )
+      return self._succeeded
+
+
+class ProgramSelectionResult:
+  """Describe one Tk-owned program-selection transition."""
+
+  def __init__(self, ready, return_program=None):
+    if not isinstance(ready, bool):
+      raise TypeError("program selection readiness must be boolean")
+    if return_program is not None:
+      if not ready:
+        raise ValueError(
+          "an unavailable program selection cannot return to a caller"
+        )
+      if (
+        not isinstance(return_program, tuple)
+        or len(return_program) != 2
+        or not isinstance(return_program[0], str)
+        or not return_program[0]
+        or isinstance(return_program[1], bool)
+        or not isinstance(return_program[1], int)
+        or return_program[1] < 0
+      ):
+        raise TypeError("program selection return state is invalid")
+    self.ready = ready
+    self.return_program = return_program
+
+
+class ProgramSelectionEvent:
+  """Carry one program-selection operation to the Tk event owner."""
+
+  def __init__(self, execution_request, action, style_rows=False):
+    if not isinstance(execution_request, ProgramExecutionRequest):
+      raise TypeError("program selection request is invalid")
+    if (
+      not isinstance(action, str)
+      or action not in PROGRAM_SELECTION_ACTIONS
+    ):
+      raise TypeError("program selection action is invalid")
+    if not isinstance(style_rows, bool):
+      raise TypeError("program row-style option must be boolean")
+    if action != PROGRAM_SELECTION_ADVANCE and style_rows:
+      raise ValueError(
+        "program row styling is valid only while advancing a row"
+      )
+    self.execution_request = execution_request
+    self.action = action
+    self.style_rows = style_rows
+    self._completion = threading.Event()
+    self._settlement_lock = threading.Lock()
+    self._settled = False
+    self._result = None
+    self._error = None
+
+  def settle(self, result=None, error=None):
+    if result is not None and not isinstance(result, ProgramSelectionResult):
+      raise TypeError("program selection settlement result is invalid")
+    if error is not None and not isinstance(error, Exception):
+      raise TypeError("program selection settlement error is invalid")
+    if (result is None) == (error is None):
+      raise ValueError(
+        "program selection settlement requires one result or error"
+      )
+    with self._settlement_lock:
+      if self._settled:
+        raise RuntimeError("program selection settled more than once")
+      self._settled = True
+      self._result = result
+      self._error = error
+      self._completion.set()
+    return True
+
+  def wait(self):
+    self._completion.wait()
+    with self._settlement_lock:
+      if not self._settled:
+        raise RuntimeError(
+          "program selection completion was signaled before settlement"
+        )
+      result = self._result
+      error = self._error
+    if error is not None:
+      raise RuntimeError(
+        f"program selection event failed: {error}"
+      ) from error
+    if not isinstance(result, ProgramSelectionResult):
+      raise RuntimeError("program selection settled without a valid result")
+    return result
+
+
+class CalledProgramNavigation:
+  """Carry one worker-to-Tk program-view transition to settlement."""
+
+  def __init__(
+    self,
+    execution_request,
+    program_name,
+    program_rows,
+    selected_row,
+    *,
+    caller_row=None,
+    caller_program=None,
+    clear_return_state=False,
+    update_current_row=False,
+  ):
+    if not isinstance(execution_request, ProgramExecutionRequest):
+      raise TypeError("called-program execution request is invalid")
+    _validate_robot_program_source_path(
+      program_name,
+      "called-program source path",
+    )
+    if (
+      not isinstance(program_rows, tuple)
+      or not program_rows
+      or any(not isinstance(row, bytes) for row in program_rows)
+    ):
+      raise MotionInputError("called-program rows are invalid")
+    if (
+      isinstance(selected_row, bool)
+      or not isinstance(selected_row, int)
+      or not 0 <= selected_row < len(program_rows)
+    ):
+      raise MotionInputError("called-program selected row is out of range")
+    if not isinstance(clear_return_state, bool):
+      raise TypeError("called-program return-state option must be boolean")
+    if not isinstance(update_current_row, bool):
+      raise TypeError("called-program current-row option must be boolean")
+    caller_state_supplied = (
+      caller_row is not None or caller_program is not None
+    )
+    if caller_state_supplied and (
+      isinstance(caller_row, bool)
+      or not isinstance(caller_row, int)
+      or caller_row < 0
+    ):
+      raise MotionInputError("called-program caller state is invalid")
+    if caller_state_supplied:
+      _validate_robot_program_source_path(
+        caller_program,
+        "called-program caller path",
+      )
+    if caller_state_supplied and clear_return_state:
+      raise MotionInputError(
+        "called-program navigation cannot save and clear return state"
+      )
+
+    self.execution_request = execution_request
+    self.program_name = program_name
+    self.program_rows = program_rows
+    self.selected_row = selected_row
+    self.caller_row = caller_row
+    self.caller_program = caller_program
+    self.clear_return_state = clear_return_state
+    self.update_current_row = update_current_row
+    self._completion = threading.Event()
+    self._settlement_lock = threading.Lock()
+    self._settled = False
+    self._succeeded = False
+    self._error = None
+
+  def settle(self, succeeded, error=None):
+    if not isinstance(succeeded, bool):
+      raise TypeError("called-program settlement state must be boolean")
+    if error is not None and not isinstance(error, Exception):
+      raise TypeError("called-program settlement error is invalid")
+    if succeeded and error is not None:
+      raise ValueError(
+        "successful called-program settlement cannot contain an error"
+      )
+    with self._settlement_lock:
+      if self._settled:
+        raise RuntimeError("called-program navigation settled more than once")
+      self._settled = True
+      self._succeeded = succeeded
+      self._error = error
+      self._completion.set()
+    return True
+
+  def wait(self):
+    self._completion.wait()
+    with self._settlement_lock:
+      if not self._settled:
+        raise RuntimeError(
+          "called-program completion was signaled before settlement"
+        )
+      succeeded = self._succeeded
+      error = self._error
+    if error is not None:
+      raise RuntimeError(
+        f"called-program navigation failed: {error}"
+      ) from error
+    return succeeded
 
 
 @dataclass(frozen=True)
@@ -760,7 +1657,8 @@ class ManualAuxiliaryRequest:
       raise MotionInputError("manual auxiliary calibration value is invalid")
 
     if self.expected_response == b"Servo Done":
-      _connected_auxiliary_board_profile(self.serial_port)
+      board_profile = _connected_auxiliary_board_profile(self.serial_port)
+      validate_auxiliary_servo_command(self.command, board_profile)
       channel, position = parse_auxiliary_servo_command(self.command)
       if (
         self.calibration_key
@@ -809,6 +1707,486 @@ class ManualAuxiliaryResult:
 
 
 @dataclass(frozen=True)
+class ManualControllerRequest:
+  request_id: int
+  serial_port: object
+  command: str
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError("manual controller request ID must be positive")
+    if (
+      self.serial_port is None
+      or not getattr(self.serial_port, "is_open", False)
+    ):
+      raise ConnectionError(
+        "manual controller request requires an open connection"
+      )
+    validate_controller_modbus_command(self.command)
+
+
+@dataclass(frozen=True)
+class ManualControllerStopEvent:
+  request_id: int
+  position: PositionResponse
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError(
+        "manual controller E-stop event ID must be positive"
+      )
+    if (
+      not isinstance(self.position, PositionResponse)
+      or not position_response_is_physical_estop(self.position)
+    ):
+      raise MotionInputError(
+        "manual controller E-stop event position is invalid"
+      )
+    try:
+      parsed_position = parse_position_response(self.position.raw)
+    except ProtocolResponseError as exc:
+      raise MotionInputError(
+        "manual controller E-stop event framing is invalid"
+      ) from exc
+    if parsed_position != self.position:
+      raise MotionInputError(
+        "manual controller E-stop event fields do not match the frame"
+      )
+
+
+@dataclass(frozen=True)
+class ManualControllerResult:
+  request_id: int
+  outcome: str
+  value: str
+  serial_write_started: bool
+  position: Optional[PositionResponse] = None
+  frame_order: Optional[str] = None
+  admission_position: Optional[PositionResponse] = None
+
+  def __post_init__(self):
+    if (
+      isinstance(self.request_id, bool)
+      or not isinstance(self.request_id, int)
+      or self.request_id <= 0
+    ):
+      raise MotionInputError("manual controller result ID must be positive")
+    if self.outcome not in (
+      "completed",
+      "estop",
+      "rejected",
+      "indeterminate",
+      "failed",
+    ):
+      raise MotionInputError("manual controller result outcome is invalid")
+    if not isinstance(self.serial_write_started, bool):
+      raise MotionInputError(
+        "manual controller serial write state must be boolean"
+      )
+    if (
+      not isinstance(self.value, str)
+      or not self.value.strip()
+      or self.value != self.value.strip()
+      or "\r" in self.value
+      or "\n" in self.value
+      or len(self.value) > MAX_RESPONSE_PAYLOAD_LENGTH
+    ):
+      raise MotionInputError("manual controller result value is invalid")
+    if self.outcome == "estop":
+      if (
+        not isinstance(self.position, PositionResponse)
+        or not position_response_is_physical_estop(self.position)
+        or self.frame_order not in (
+          "estop-only",
+          "admission-estop",
+          "estop-admission",
+          "estop-terminal",
+          "terminal-estop",
+        )
+      ):
+        raise MotionInputError(
+          "manual controller E-stop result position is invalid"
+        )
+      if self.frame_order == "estop-only" and (
+        self.serial_write_started
+        or self.position.flag != CONTROLLER_ESTOP_EVENT_FLAG
+      ):
+        raise MotionInputError(
+          "manual controller E-stop write state is invalid"
+        )
+      if self.frame_order == "admission-estop" and (
+        self.position.flag != CONTROLLER_ESTOP_ADMISSION_FLAG
+        or self.admission_position is not None
+      ):
+        raise MotionInputError(
+          "manual controller E-stop write state is invalid"
+        )
+      if self.frame_order in (
+        "estop-terminal",
+        "terminal-estop",
+      ) and (
+        not self.serial_write_started
+        or self.position.flag != CONTROLLER_ESTOP_EVENT_FLAG
+        or self.admission_position is not None
+      ):
+        raise MotionInputError(
+          "manual controller E-stop write state is invalid"
+        )
+      if self.frame_order == "estop-only" and (
+        self.admission_position is not None
+      ):
+        raise MotionInputError(
+          "manual controller E-stop write state is invalid"
+        )
+      if self.frame_order == "estop-admission" and (
+        not self.serial_write_started
+        or self.position.flag != CONTROLLER_ESTOP_EVENT_FLAG
+        or not isinstance(
+          self.admission_position,
+          PositionResponse,
+        )
+        or self.admission_position.flag
+          != CONTROLLER_ESTOP_ADMISSION_FLAG
+      ):
+        raise MotionInputError(
+          "manual controller E-stop admission pair is invalid"
+        )
+    elif (
+      self.position is not None
+      or self.frame_order is not None
+      or self.admission_position is not None
+    ):
+      raise MotionInputError(
+        "manual controller non-position result contains a position"
+      )
+    if (
+      self.outcome in ("completed", "rejected", "indeterminate")
+      and not self.serial_write_started
+    ):
+      raise MotionInputError(
+        "manual controller terminal result lacks a serial write"
+      )
+
+
+@dataclass(frozen=True)
+class ManualControllerPresentation:
+  feedback: str
+  status: str
+  style: str
+
+  def __post_init__(self):
+    for name, value in (
+      ("feedback", self.feedback),
+      ("status", self.status),
+    ):
+      if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+        or "\r" in value
+        or "\n" in value
+        or len(value) > MAX_RESPONSE_PAYLOAD_LENGTH + 256
+      ):
+        raise MotionInputError(
+          f"manual controller presentation {name} is invalid"
+        )
+    if self.style not in ("OK.TLabel", "Warn.TLabel", "Alarm.TLabel"):
+      raise MotionInputError(
+        "manual controller presentation style is invalid"
+      )
+
+
+class ManualControllerCleanup:
+  def __init__(
+    self,
+    request,
+    activity_lease,
+    *,
+    close_required=False,
+    close_context="manual controller cleanup",
+    settlement_action="none",
+    settlement_presentation=None,
+  ):
+    if not isinstance(request, ManualControllerRequest):
+      raise MotionInputError("manual controller cleanup request is invalid")
+    if not callable(getattr(activity_lease, "close", None)):
+      raise MotionInputError(
+        "manual controller cleanup activity lease is invalid"
+      )
+    if not isinstance(close_required, bool):
+      raise MotionInputError(
+        "manual controller cleanup close requirement must be boolean"
+      )
+    if (
+      not isinstance(settlement_action, str)
+      or settlement_action not in ("none", "dispatch", "dispatch-ready")
+    ):
+      raise MotionInputError(
+        "manual controller cleanup settlement action is invalid"
+      )
+    if (
+      settlement_presentation is not None
+      and not isinstance(
+        settlement_presentation,
+        ManualControllerPresentation,
+      )
+    ):
+      raise MotionInputError(
+        "manual controller cleanup presentation is invalid"
+      )
+    if (
+      not isinstance(close_context, str)
+      or not close_context.strip()
+      or close_context != close_context.strip()
+      or "\r" in close_context
+      or "\n" in close_context
+    ):
+      raise MotionInputError(
+        "manual controller cleanup context is invalid"
+      )
+    if not serial_lock.locked():
+      raise RuntimeError(
+        "manual controller cleanup requires transport ownership"
+      )
+
+    self.request = request
+    self._activity_registration = activity_lease
+    self._activity_lease = activity_lease
+    self._serial_lock_owned = True
+    self._active_request_owned = True
+    self._program_admission_owned = True
+    self._pending_event_owned = True
+    self._close_required = close_required
+    self._close_context = close_context
+    self._settlement_action = settlement_action
+    self._settlement_presentation = settlement_presentation
+    self._last_error = None
+    self._state_lock = threading.Lock()
+
+  @property
+  def complete(self):
+    with self._state_lock:
+      return not (
+        self._close_required
+        or self._activity_lease is not None
+        or self._serial_lock_owned
+        or self._active_request_owned
+        or self._program_admission_owned
+        or self._pending_event_owned
+      )
+
+  @property
+  def last_error(self):
+    with self._state_lock:
+      return self._last_error
+
+  @property
+  def settlement_action(self):
+    with self._state_lock:
+      return self._settlement_action
+
+  @property
+  def settlement_presentation(self):
+    with self._state_lock:
+      return self._settlement_presentation
+
+  @property
+  def resources_released(self):
+    with self._state_lock:
+      return not (
+        self._close_required
+        or self._activity_lease is not None
+        or self._serial_lock_owned
+        or self._active_request_owned
+      )
+
+  def record_failure(self, error):
+    detail = _manual_controller_error_detail(
+      error,
+      "manual controller cleanup failed without details",
+    )
+    with self._state_lock:
+      self._last_error = detail
+    return detail
+
+  def require_close(self, context):
+    if (
+      not isinstance(context, str)
+      or not context.strip()
+      or context != context.strip()
+      or "\r" in context
+      or "\n" in context
+    ):
+      raise MotionInputError(
+        "manual controller cleanup context is invalid"
+      )
+    with self._state_lock:
+      if not self._serial_lock_owned or not serial_lock.locked():
+        raise RuntimeError(
+          "manual controller cleanup cannot add close without "
+          "transport ownership"
+        )
+      self._close_required = True
+      self._close_context = context
+      self._settlement_action = "none"
+    return True
+
+  def replace_settlement(self, action, presentation):
+    if action not in ("none", "dispatch", "dispatch-ready"):
+      raise MotionInputError(
+        "manual controller replacement settlement action is invalid"
+      )
+    if (
+      presentation is not None
+      and not isinstance(presentation, ManualControllerPresentation)
+    ):
+      raise MotionInputError(
+        "manual controller replacement presentation is invalid"
+      )
+    with self._state_lock:
+      if not self._pending_event_owned:
+        raise RuntimeError(
+          "settled manual controller cleanup cannot be replaced"
+        )
+      self._settlement_action = action
+      self._settlement_presentation = presentation
+    return True
+
+  def settle(self):
+    global manual_controller_program_admission_active
+
+    with self._state_lock:
+      if not self._pending_event_owned:
+        return False
+      if (
+        self._close_required
+        or self._activity_lease is not None
+        or self._serial_lock_owned
+        or self._active_request_owned
+      ):
+        raise RuntimeError(
+          "manual controller settlement requires released resources"
+        )
+      if not self._program_admission_owned:
+        raise RuntimeError(
+          "manual controller program admission was already settled"
+        )
+      with program_execution_state_lock:
+        if not manual_controller_program_admission_active:
+          raise RuntimeError(
+            "manual controller program admission was already released"
+          )
+        legacy_serial_result_pending.clear()
+        manual_controller_program_admission_active = False
+      self._program_admission_owned = False
+      self._pending_event_owned = False
+    return True
+
+  def release(self):
+    global manual_controller_active_request
+    global manual_controller_activity_lease
+    global manual_controller_estop_applied_request_id
+    global manual_controller_estop_applied_position
+    global manual_controller_pending_stop_event
+    global manual_controller_program_admission_active
+
+    with self._state_lock:
+      # Failure preserves the failed step and later release steps for retry.
+      if self._close_required:
+        _close_manual_controller_cleanup_transport(
+          self.request,
+          self._close_context,
+        )
+        self._close_required = False
+      if self._activity_lease is not None:
+        if self._activity_lease.close() is not True:
+          raise RuntimeError(
+            "manual controller cleanup activity lease was already released"
+          )
+        self._activity_lease = None
+      if self._active_request_owned:
+        with program_execution_state_lock:
+          if not manual_controller_program_admission_active:
+            raise RuntimeError(
+              "manual controller program admission was already released"
+            )
+          with manual_controller_state_lock:
+            if (
+              manual_controller_active_request is not self.request
+              or manual_controller_activity_lease
+                is not self._activity_registration
+            ):
+              raise RuntimeError(
+                "manual controller cleanup request ownership changed"
+              )
+            applied_request_id = manual_controller_estop_applied_request_id
+            pending_stop_event = manual_controller_pending_stop_event
+            if pending_stop_event is not None:
+              if (
+                not isinstance(
+                  pending_stop_event,
+                  ManualControllerStopEvent,
+                )
+                or pending_stop_event.request_id != self.request.request_id
+              ):
+                raise RuntimeError(
+                  "manual controller cleanup pending E-stop ownership changed"
+                )
+              raise RuntimeError(
+                "manual controller cleanup cannot release an unapplied "
+                "E-stop event"
+              )
+            if (
+              applied_request_id is not None
+              and (
+                isinstance(applied_request_id, bool)
+                or not isinstance(applied_request_id, int)
+                or applied_request_id != self.request.request_id
+              )
+            ):
+              raise RuntimeError(
+                "manual controller cleanup E-stop ownership changed"
+              )
+            applied_position = manual_controller_estop_applied_position
+            if (
+              (applied_request_id is None) != (applied_position is None)
+              or (
+                applied_position is not None
+                and (
+                  not isinstance(applied_position, PositionResponse)
+                  or not position_response_is_physical_estop(
+                    applied_position
+                  )
+                )
+              )
+            ):
+              raise RuntimeError(
+                "manual controller cleanup E-stop position is invalid"
+              )
+            manual_controller_active_request = None
+            manual_controller_activity_lease = None
+            manual_controller_estop_applied_request_id = None
+            manual_controller_estop_applied_position = None
+        self._active_request_owned = False
+      if self._serial_lock_owned:
+        if not serial_lock.locked():
+          raise RuntimeError(
+            "manual controller cleanup transport was already released"
+          )
+        serial_lock.release()
+        self._serial_lock_owned = False
+      return True
+
+
+@dataclass(frozen=True)
 class MainControllerIdentityBinding:
   serial_port: object
   identity: ControllerIdentity
@@ -845,6 +2223,22 @@ class MainControllerIdentityBinding:
 
 class GCodeStorageStateLockError(RuntimeError):
   pass
+
+
+class GCodeStorageAdmissionRejected(ProtocolResponseError):
+  def __init__(self, position):
+    if (
+      not position_response_is_physical_estop(position)
+      or position.flag != CONTROLLER_ESTOP_ADMISSION_FLAG
+    ):
+      raise MotionInputError(
+        "G-code storage admission rejection requires an EA position"
+      )
+    self.position = position
+    super().__init__(
+      "physical E-stop blocked G-code storage command admission; "
+      "command not executed"
+    )
 
 
 class GCodeStorageCleanupRetainedError(RuntimeError):
@@ -1132,6 +2526,7 @@ class GCodeStorageResult:
   media_id: Optional[str] = None
   pending_delete: object = None
   reconciliation: object = None
+  admission_position: Optional[PositionResponse] = None
 
   def __post_init__(self):
     if (
@@ -1149,6 +2544,33 @@ class GCodeStorageResult:
       raise MotionInputError(
         "G-code storage result write state must be boolean"
       )
+    if self.admission_position is not None:
+      if (
+        not position_response_is_physical_estop(self.admission_position)
+        or (
+          self.admission_position.flag
+          != CONTROLLER_ESTOP_ADMISSION_FLAG
+        )
+      ):
+        raise MotionInputError(
+          "G-code storage admission position must contain EA"
+        )
+      try:
+        parsed_admission = parse_position_response(
+          self.admission_position.raw
+        )
+      except ProtocolResponseError as exc:
+        raise MotionInputError(
+          "G-code storage admission position framing is invalid"
+        ) from exc
+      if parsed_admission != self.admission_position:
+        raise MotionInputError(
+          "G-code storage admission position fields do not match the frame"
+        )
+      if self.outcome != "failed" or not self.write_started:
+        raise MotionInputError(
+          "definitive G-code non-execution requires a committed failed result"
+        )
     if (
       self.outcome in ("completed", "indeterminate")
       and not self.write_started
@@ -1355,6 +2777,113 @@ class GCodeProgramViewSnapshot:
     if self.program_path_state not in ("normal", "readonly", "disabled"):
       raise MotionInputError(
         "G-code view snapshot program path state is invalid"
+      )
+
+
+@dataclass(frozen=True)
+class RobotProgramViewSnapshot:
+  rows: tuple
+  row_styles: tuple
+  selected_rows: tuple
+  active_row: Optional[int]
+  anchor_row: Optional[int]
+  xview: tuple
+  yview: tuple
+  program_path: str
+  current_row: str
+  last_row_present: bool
+  last_row: Optional[int]
+  last_program: str
+
+  def __post_init__(self):
+    if not isinstance(self.rows, tuple) or any(
+      not isinstance(row, (str, bytes))
+      for row in self.rows
+    ):
+      raise MotionInputError("robot program view snapshot rows are invalid")
+    if (
+      not isinstance(self.row_styles, tuple)
+      or len(self.row_styles) != len(self.rows)
+      or any(
+        not isinstance(style, tuple)
+        or len(style) != len(GCODE_LISTBOX_STYLE_OPTIONS)
+        or any(not isinstance(value, str) for value in style)
+        for style in self.row_styles
+      )
+    ):
+      raise MotionInputError(
+        "robot program view snapshot styles are invalid"
+      )
+    if (
+      not isinstance(self.selected_rows, tuple)
+      or any(
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or not 0 <= index < len(self.rows)
+        for index in self.selected_rows
+      )
+      or len(set(self.selected_rows)) != len(self.selected_rows)
+    ):
+      raise MotionInputError(
+        "robot program view snapshot selection is invalid"
+      )
+    for field_name, index in (
+      ("active row", self.active_row),
+      ("anchor row", self.anchor_row),
+    ):
+      if index is not None and (
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or not 0 <= index < len(self.rows)
+      ):
+        raise MotionInputError(
+          f"robot program view snapshot {field_name} is invalid"
+        )
+    for field_name, values in (("xview", self.xview), ("yview", self.yview)):
+      if (
+        not isinstance(values, tuple)
+        or len(values) != 2
+        or any(
+          isinstance(value, bool)
+          or not isinstance(value, (int, float))
+          or not math.isfinite(float(value))
+          or not 0.0 <= float(value) <= 1.0
+          for value in values
+        )
+        or float(values[0]) > float(values[1])
+      ):
+        raise MotionInputError(
+          f"robot program view snapshot {field_name} is invalid"
+        )
+    for field_name, value in (
+      ("program path", self.program_path),
+      ("current row", self.current_row),
+      ("last program", self.last_program),
+    ):
+      if (
+        not isinstance(value, str)
+        or "\x00" in value
+        or "\r" in value
+        or "\n" in value
+      ):
+        raise MotionInputError(
+          f"robot program view snapshot {field_name} is invalid"
+        )
+    if not isinstance(self.last_row_present, bool):
+      raise MotionInputError(
+        "robot program view snapshot last-row state is invalid"
+      )
+    if self.last_row_present != (self.last_row is not None):
+      raise MotionInputError(
+        "robot program view snapshot last-row value is invalid"
+      )
+    if self.last_row is not None and (
+      isinstance(self.last_row, bool)
+      or not isinstance(self.last_row, int)
+      or self.last_row < 0
+    ):
+      raise MotionInputError(
+        "robot program view snapshot last row is invalid"
       )
 
 
@@ -1676,34 +3205,48 @@ def _tracked_auxiliary_operation(control_injectable=False):
 
 
 def _write_legacy_auxiliary_command(command):
-  serial_port = RUN.get('ser2')
-  try:
-    if isinstance(command, str) and command[:2] in ("ON", "OF", "SV"):
-      if command[:2] == "SV":
-        _connected_auxiliary_board_profile(serial_port)
-        validate_auxiliary_servo_command(command)
-      else:
-        board_profile = _connected_auxiliary_board_profile(serial_port)
+  with manual_auxiliary_state_lock:
+    if _manual_auxiliary_stop_in_progress():
+      raise SerialActivityRejected(
+        "auxiliary command cancelled by stop admission"
+      )
+    serial_port = RUN.get('ser2')
+    try:
+      board_profile = _connected_auxiliary_board_profile(serial_port)
+      if isinstance(command, str) and command.startswith("SV"):
+        validate_auxiliary_servo_command(command, board_profile)
+      elif isinstance(command, str) and command[:2] in ("ON", "OF"):
         validate_auxiliary_output_command(command, board_profile)
-    return write_serial_control(
-      serial_port,
-      command,
-      write_lock=auxiliary_serial_write_lock,
-      reset_input=True,
-    )
-  finally:
-    if (
-      RUN.get('ser2') is serial_port
-      and not getattr(serial_port, "is_open", False)
-    ):
-      RUN['ser2'] = None
-      _clear_auxiliary_board_profile(serial_port)
+      elif isinstance(command, str) and command.startswith("JF"):
+        validate_auxiliary_input_command(command, board_profile)
+      elif isinstance(command, str) and command.startswith("WI"):
+        validate_auxiliary_wait_command(command, board_profile)
+      elif command == "TG\n":
+        validate_auxiliary_gripper_current_command(
+          command,
+          board_profile,
+        )
+      else:
+        raise MotionInputError("unsupported auxiliary controller command")
+      return write_serial_control(
+        serial_port,
+        command,
+        write_lock=auxiliary_serial_write_lock,
+        reset_input=True,
+      )
+    finally:
+      if (
+        RUN.get('ser2') is serial_port
+        and not getattr(serial_port, "is_open", False)
+      ):
+        RUN['ser2'] = None
+        _clear_auxiliary_board_profile(serial_port)
 
 
 def _manual_auxiliary_expected_response(command, serial_port=None):
   if isinstance(command, str) and command.startswith("SV"):
-    _connected_auxiliary_board_profile(serial_port)
-    validate_auxiliary_servo_command(command)
+    board_profile = _connected_auxiliary_board_profile(serial_port)
+    validate_auxiliary_servo_command(command, board_profile)
     return b"Servo Done"
   profile = _connected_auxiliary_board_profile(serial_port)
   validate_auxiliary_output_command(command, profile)
@@ -1903,22 +3446,50 @@ def _request_xbox_auxiliary_toggle(state_name):
 
 def _manual_auxiliary_stop_in_progress():
   with auxiliary_stop_state_lock:
-    controller_stop_pending = (
-      auxiliary_stop_pending_request_id is not None
-      or auxiliary_stop_active_request_id is not None
-    )
-  with program_stop_state_lock:
-    program_stop_pending = RUN.get('programStopRequestId') is not None
-    estop_active = bool(RUN.get('estopActive'))
-    position_fault = bool(RUN.get('posOutreach'))
-  return (
+    with program_stop_state_lock:
+      return (
+        manual_auxiliary_stop_barrier.is_set()
+        or auxiliary_stop_requested.is_set()
+        or auxiliary_stop_pending_request_id is not None
+        or auxiliary_stop_active_request_id is not None
+        or main_controller_auxiliary_stop_request_id is not None
+        or RUN.get('programStopRequestId') is not None
+        or bool(RUN.get('estopActive'))
+        or bool(RUN.get('posOutreach'))
+      )
+
+
+def _stop_admission_reason_locked(operation):
+  if operation not in (
+    "PROGRAM EXECUTION",
+    "CONTROLLER WRITE",
+    "AUXILIARY CONFIGURATION",
+  ):
+    raise MotionInputError("stop admission operation is invalid")
+  estop_active = RUN.get('estopActive')
+  position_fault = RUN.get('posOutreach')
+  if not isinstance(estop_active, bool):
+    raise RuntimeError("E-stop latch state is invalid")
+  if not isinstance(position_fault, bool):
+    raise RuntimeError("position-fault latch state is invalid")
+  if estop_active:
+    return f"{operation} REJECTED WHILE E-STOP LATCH IS ACTIVE"
+  if position_fault:
+    return f"{operation} REJECTED WHILE POSITION-FAULT LATCH IS ACTIVE"
+  if (
     manual_auxiliary_stop_barrier.is_set()
     or auxiliary_stop_requested.is_set()
-    or controller_stop_pending
-    or program_stop_pending
-    or estop_active
-    or position_fault
-  )
+    or auxiliary_stop_pending_request_id is not None
+    or auxiliary_stop_active_request_id is not None
+    or main_controller_auxiliary_stop_request_id is not None
+    or RUN.get('programStopRequestId') is not None
+  ):
+    return f"{operation} REJECTED WHILE STOP SETTLEMENT IS ACTIVE"
+  return None
+
+
+def _program_execution_stop_admission_reason_locked():
+  return _stop_admission_reason_locked("PROGRAM EXECUTION")
 
 
 def _manual_auxiliary_status_reserved():
@@ -1928,6 +3499,43 @@ def _manual_auxiliary_status_reserved():
     return bool(RUN.get('programStopStatusLatched'))
 
 
+def _set_application_status(
+  message=None,
+  style=None,
+  *,
+  stop_authoritative=False,
+  text=None,
+):
+  if text is not None:
+    if message is not None:
+      raise TypeError(
+        "application status cannot contain both message and text"
+      )
+    message = text
+  if (
+    not isinstance(message, str)
+    or not message.strip()
+    or message != message.strip()
+  ):
+    raise TypeError("application status must be normalized text")
+  if not isinstance(style, str) or not style:
+    raise TypeError("application status style must be non-empty text")
+  if not isinstance(stop_authoritative, bool):
+    raise TypeError("application stop authority must be boolean")
+  if not stop_authoritative and _manual_auxiliary_status_reserved():
+    return False
+  for status_label in (almStatusLab, almStatusLab2):
+    configure = getattr(status_label, "configure", None)
+    if not callable(configure):
+      configure = getattr(status_label, "config", None)
+    if not callable(configure):
+      raise TypeError(
+        "application status label does not support configuration"
+      )
+    configure(text=message, style=style)
+  return True
+
+
 def _begin_program_execution(mode):
   global program_execution_next_request_id
   global program_execution_active_request
@@ -1935,12 +3543,37 @@ def _begin_program_execution(mode):
   if mode not in PROGRAM_EXECUTION_MODES:
     raise MotionInputError("program execution mode is invalid")
   with program_execution_state_lock:
+    if program_return_state_clear_requested.is_set():
+      return None
     if not isinstance(gcode_storage_program_admission_active, bool):
       raise RuntimeError("G-code storage program admission state is invalid")
+    if not isinstance(manual_controller_program_admission_active, bool):
+      raise RuntimeError(
+        "manual controller program admission state is invalid"
+      )
     if gcode_conversion_active.is_set():
       return None
     if gcode_storage_program_admission_active:
       return None
+    if manual_controller_program_admission_active:
+      return None
+    with auxiliary_device_state_lock:
+      auxiliary_device_active = auxiliary_device_read_active.is_set()
+      if not isinstance(auxiliary_device_active, bool):
+        raise RuntimeError("auxiliary-device active state is invalid")
+      if auxiliary_device_active != (
+        auxiliary_device_active_request is not None
+      ):
+        raise RuntimeError(
+          "auxiliary-device request ownership is inconsistent"
+        )
+      if auxiliary_device_active and not isinstance(
+        auxiliary_device_active_request,
+        AuxiliaryDeviceReadRequest,
+      ):
+        raise RuntimeError("active auxiliary-device request is invalid")
+      if auxiliary_device_active:
+        return None
     if program_execution_active_request is not None:
       if not isinstance(
         program_execution_active_request,
@@ -1948,18 +3581,28 @@ def _begin_program_execution(mode):
       ):
         raise RuntimeError("active program execution request is invalid")
       return None
-    if (
-      isinstance(program_execution_next_request_id, bool)
-      or not isinstance(program_execution_next_request_id, int)
-      or program_execution_next_request_id < 0
-    ):
-      raise RuntimeError("program execution request counter is invalid")
-    request = ProgramExecutionRequest(
-      program_execution_next_request_id + 1,
-      mode,
-    )
-    program_execution_next_request_id = request.request_id
-    program_execution_active_request = request
+    with auxiliary_stop_state_lock:
+      with program_stop_state_lock:
+        if _program_execution_stop_admission_reason_locked() is not None:
+          return None
+        if (
+          isinstance(program_execution_next_request_id, bool)
+          or not isinstance(program_execution_next_request_id, int)
+          or program_execution_next_request_id < 0
+        ):
+          raise RuntimeError("program execution request counter is invalid")
+        request = ProgramExecutionRequest(
+          program_execution_next_request_id + 1,
+          mode,
+          SerialWriteCancellationBoundary(
+            f"program execution request {program_execution_next_request_id + 1}"
+          ),
+        )
+        program_execution_cancelled.clear()
+        program_execution_next_request_id = request.request_id
+        program_execution_active_request = request
+        RUN['programStopStatusLatched'] = False
+        RUN['programStopState'] = "completed"
   return request
 
 
@@ -1971,6 +3614,7 @@ def _finish_program_execution(request):
   with program_execution_state_lock:
     if program_execution_active_request is not request:
       return False
+    request.cancellation_boundary.cancel()
     program_execution_active_request = None
   return True
 
@@ -1998,16 +3642,111 @@ def _program_execution_request_active(request):
     return active_request is request
 
 
+def _program_execution_request_cancelled(request):
+  if not isinstance(request, ProgramExecutionRequest):
+    raise TypeError("program execution cancellation request is invalid")
+  if application_closing.is_set():
+    return True
+  if program_execution_cancelled.is_set():
+    return True
+  if request.cancellation_boundary.is_set():
+    return True
+  return not _program_execution_request_active(request)
+
+
+def _active_program_execution_cancelled():
+  if program_execution_cancelled.is_set():
+    return True
+  with program_execution_state_lock:
+    request = program_execution_active_request
+    if request is None:
+      return False
+    if not isinstance(request, ProgramExecutionRequest):
+      raise RuntimeError("active program execution request is invalid")
+    return request.cancellation_boundary.is_set()
+
+
+def _active_program_execution_request():
+  with program_execution_state_lock:
+    request = program_execution_active_request
+    if not isinstance(request, ProgramExecutionRequest):
+      raise RuntimeError("active program execution request is unavailable")
+    return request
+
+
+def _clear_robot_program_return_state():
+  tab1.lastProg = ""
+  if hasattr(tab1, "lastRow"):
+    delattr(tab1, "lastRow")
+  return True
+
+
+def _apply_requested_robot_program_return_state_clear():
+  with program_execution_state_lock:
+    if not program_return_state_clear_requested.is_set():
+      return False
+    program_return_state_clear_requested.clear()
+    try:
+      _clear_robot_program_return_state()
+    except Exception:
+      program_return_state_clear_requested.set()
+      raise
+  return True
+
+
+def _cancel_active_program_execution():
+  with program_execution_state_lock:
+    program_execution_cancelled.set()
+    program_return_state_clear_requested.set()
+    request = program_execution_active_request
+    if request is None:
+      return False
+    if not isinstance(request, ProgramExecutionRequest):
+      raise RuntimeError("active program execution request is invalid")
+    request.cancellation_boundary.cancel()
+  return True
+
+
 def _program_execution_busy_message():
   with program_execution_state_lock:
     if not isinstance(gcode_storage_program_admission_active, bool):
       raise RuntimeError("G-code storage program admission state is invalid")
+    if not isinstance(manual_controller_program_admission_active, bool):
+      raise RuntimeError(
+        "manual controller program admission state is invalid"
+      )
     request = program_execution_active_request
     if request is None:
+      if manual_controller_program_admission_active:
+        return (
+          "PROGRAM EXECUTION REJECTED DURING MANUAL CONTROLLER I/O"
+        )
       if gcode_conversion_active.is_set():
         return "PROGRAM EXECUTION REJECTED DURING G-CODE CONVERSION"
       if gcode_storage_program_admission_active:
         return "PROGRAM EXECUTION REJECTED DURING G-CODE STORAGE"
+      with auxiliary_device_state_lock:
+        auxiliary_device_active = auxiliary_device_read_active.is_set()
+        if not isinstance(auxiliary_device_active, bool):
+          raise RuntimeError("auxiliary-device active state is invalid")
+        if auxiliary_device_active != (
+          auxiliary_device_active_request is not None
+        ):
+          raise RuntimeError(
+            "auxiliary-device request ownership is inconsistent"
+          )
+        if auxiliary_device_active and not isinstance(
+          auxiliary_device_active_request,
+          AuxiliaryDeviceReadRequest,
+        ):
+          raise RuntimeError("active auxiliary-device request is invalid")
+        if auxiliary_device_active:
+          return "PROGRAM EXECUTION REJECTED DURING AUXILIARY COM READ"
+      with auxiliary_stop_state_lock:
+        with program_stop_state_lock:
+          stop_reason = _program_execution_stop_admission_reason_locked()
+      if stop_reason is not None:
+        return stop_reason
       return "PROGRAM EXECUTION STATE CHANGED; RETRY"
     if not isinstance(request, ProgramExecutionRequest):
       raise RuntimeError("active program execution request is invalid")
@@ -2019,6 +3758,10 @@ def _begin_gcode_conversion_admission():
   with program_execution_state_lock:
     if not isinstance(gcode_storage_program_admission_active, bool):
       raise RuntimeError("G-code storage program admission state is invalid")
+    if not isinstance(manual_controller_program_admission_active, bool):
+      raise RuntimeError(
+        "manual controller program admission state is invalid"
+      )
     request = program_execution_active_request
     if request is not None and not isinstance(
       request,
@@ -2027,6 +3770,8 @@ def _begin_gcode_conversion_admission():
       raise RuntimeError("active program execution request is invalid")
     if request is not None:
       return "program-active"
+    if manual_controller_program_admission_active:
+      return "manual-controller-active"
     if gcode_conversion_active.is_set():
       return "conversion-active"
     if gcode_storage_program_admission_active:
@@ -2039,8 +3784,16 @@ def _finish_gcode_conversion_admission():
   with program_execution_state_lock:
     if not isinstance(gcode_storage_program_admission_active, bool):
       raise RuntimeError("G-code storage program admission state is invalid")
+    if not isinstance(manual_controller_program_admission_active, bool):
+      raise RuntimeError(
+        "manual controller program admission state is invalid"
+      )
     if not gcode_conversion_active.is_set():
       raise RuntimeError("G-code conversion admission is not active")
+    if manual_controller_program_admission_active:
+      raise RuntimeError(
+        "G-code conversion overlaps manual controller I/O"
+      )
     if gcode_storage_program_admission_active:
       raise RuntimeError(
         "G-code conversion cannot finish during a storage request"
@@ -2059,6 +3812,10 @@ def _begin_gcode_storage_program_admission(conversion_request):
   with program_execution_state_lock:
     if not isinstance(gcode_storage_program_admission_active, bool):
       raise RuntimeError("G-code storage program admission state is invalid")
+    if not isinstance(manual_controller_program_admission_active, bool):
+      raise RuntimeError(
+        "manual controller program admission state is invalid"
+      )
     request = program_execution_active_request
     if request is not None and not isinstance(
       request,
@@ -2067,6 +3824,8 @@ def _begin_gcode_storage_program_admission(conversion_request):
       raise RuntimeError("active program execution request is invalid")
     if request is not None:
       return "program-active"
+    if manual_controller_program_admission_active:
+      return "manual-controller-active"
     conversion_active = gcode_conversion_active.is_set()
     if conversion_active and not conversion_request:
       return "conversion-active"
@@ -2084,8 +3843,16 @@ def _finish_gcode_storage_program_admission():
   with program_execution_state_lock:
     if not isinstance(gcode_storage_program_admission_active, bool):
       raise RuntimeError("G-code storage program admission state is invalid")
+    if not isinstance(manual_controller_program_admission_active, bool):
+      raise RuntimeError(
+        "manual controller program admission state is invalid"
+      )
     if not gcode_storage_program_admission_active:
       raise RuntimeError("G-code storage program admission is not active")
+    if manual_controller_program_admission_active:
+      raise RuntimeError(
+        "G-code storage overlaps manual controller I/O"
+      )
     request = program_execution_active_request
     if request is not None and not isinstance(
       request,
@@ -2125,19 +3892,7 @@ def _acknowledge_program_stop_status_for_manual_auxiliary():
 
 
 def _set_manual_auxiliary_status(message, style):
-  if (
-    not isinstance(message, str)
-    or not message.strip()
-    or message != message.strip()
-  ):
-    raise TypeError("manual auxiliary status must be normalized text")
-  if not isinstance(style, str) or not style:
-    raise TypeError("manual auxiliary status style must be non-empty text")
-  if _manual_auxiliary_status_reserved():
-    return False
-  almStatusLab.config(text=message, style=style)
-  almStatusLab2.config(text=message, style=style)
-  return True
+  return _set_application_status(message, style)
 
 
 def _queue_program_execution_status(message, style):
@@ -2151,7 +3906,7 @@ def _queue_program_execution_status(message, style):
     raise TypeError("program execution status style must be non-empty text")
   if _manual_auxiliary_status_reserved():
     return False
-  program_stop_status_event_queue.put((message, style))
+  program_stop_status_event_queue.put((message, style, False))
   return True
 
 
@@ -2283,7 +4038,10 @@ def _try_dispatch_manual_auxiliary_request():
     return False
 
   with manual_auxiliary_state_lock:
-    if application_closing.is_set() or manual_auxiliary_stop_barrier.is_set():
+    if (
+      application_closing.is_set()
+      or _manual_auxiliary_stop_in_progress()
+    ):
       return False
     if manual_auxiliary_active_request is not None:
       if not isinstance(
@@ -2381,8 +4139,7 @@ def _queue_manual_auxiliary_command(
     with manual_auxiliary_state_lock:
       if (
         application_closing.is_set()
-        or manual_auxiliary_stop_barrier.is_set()
-        or auxiliary_stop_requested.is_set()
+        or _manual_auxiliary_stop_in_progress()
       ):
         raise SerialActivityRejected(
           "manual auxiliary command rejected while a stop is active"
@@ -2509,6 +4266,7 @@ def _bind_main_controller_identity(
   identity,
   home_reference=None,
 ):
+  global main_controller_connection_epoch
   global main_controller_identity_binding
   global joint_actual_position_source_snapshot
   global gcode_storage_media_binding
@@ -2518,11 +4276,20 @@ def _bind_main_controller_identity(
     identity,
     home_reference,
   )
-  if RUN.get('ser') is not serial_port:
-    raise ConnectionError(
-      "main controller changed before identity binding"
-    )
   with controller_identity_state_lock:
+    if RUN.get('ser') is not serial_port:
+      raise ConnectionError(
+        "main controller changed before identity binding"
+      )
+    if (
+      isinstance(main_controller_connection_epoch, bool)
+      or not isinstance(main_controller_connection_epoch, int)
+      or main_controller_connection_epoch < 0
+    ):
+      raise RuntimeError(
+        "main controller connection epoch is invalid"
+      )
+    main_controller_connection_epoch += 1
     joint_actual_position_source_snapshot = None
     main_controller_identity_binding = binding
     gcode_storage_media_binding = None
@@ -2728,15 +4495,33 @@ def _current_gcode_storage_media(serial_port=None):
   return binding
 
 
-def _close_serial_port(serial_name, context="application shutdown"):
+def _close_serial_port(
+  serial_name,
+  context="application shutdown",
+  *,
+  quarantine=False,
+):
+  if not isinstance(quarantine, bool):
+    raise TypeError("serial close quarantine option must be boolean")
   serial_port = RUN.get(serial_name)
   if serial_port is None:
     return True
-  try:
-    serial_port.close()
-  except Exception:
-    logger.exception("Unable to close %s during %s", serial_name, context)
-    return False
+  if quarantine:
+    try:
+      quarantine_serial_transport(serial_port, context)
+    except Exception:
+      logger.exception(
+        "Unable to quarantine %s during %s",
+        serial_name,
+        context,
+      )
+      return False
+  else:
+    try:
+      serial_port.close()
+    except Exception:
+      logger.exception("Unable to close %s during %s", serial_name, context)
+      return False
   if getattr(serial_port, "is_open", False):
     logger.error("Serial port %s remained open during %s", serial_name, context)
     return False
@@ -3124,8 +4909,7 @@ def _poll_failed_controller_close(
 
   message = "CONTROLLER CONNECTION CLEANUP PENDING"
   try:
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
   except Exception:
     logger.exception("Unable to report pending controller connection cleanup")
   try:
@@ -3168,15 +4952,51 @@ def _abandon_failed_controller_startup(
 
 def _poll_application_close():
   global application_shutdown_started_at
+  global camera_preview_shutdown_started_at
+  global camera_preview_shutdown_timeout_reported
 
+  _poll_camera_preview_events()
   _poll_serial_events()
+  _poll_manual_controller_events()
   _poll_calibration_events()
   _poll_auxiliary_serial_events()
   _poll_manual_auxiliary_events()
+  _poll_auxiliary_device_events()
   _poll_gcode_storage_events()
+  _poll_called_program_navigation_events()
+  _poll_program_selection_events()
   _poll_joint_motion_events()
   _poll_virtual_motion_events()
   _poll_xbox_auxiliary_events()
+  _close_joint_motion_dispatcher_for_shutdown()
+
+  try:
+    _cancel_auxiliary_device_read()
+    auxiliary_device_pending = _auxiliary_device_read_pending()
+  except Exception:
+    logger.exception("Unable to settle auxiliary-device I/O during shutdown")
+    auxiliary_device_pending = True
+  if auxiliary_device_pending:
+    _set_application_status(
+      "SHUTDOWN WAITING FOR AUXILIARY COM READ",
+      "Warn.TLabel",
+    )
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
+
+  with manual_controller_cleanup_lock:
+    controller_io_cleanup_pending = (
+      manual_controller_cleanup_pending is not None
+    )
+  if controller_io_cleanup_pending:
+    _retry_manual_controller_cleanup()
+    with manual_controller_cleanup_lock:
+      controller_io_cleanup_pending = (
+        manual_controller_cleanup_pending is not None
+      )
+    if controller_io_cleanup_pending:
+      root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+      return False
 
   with gcode_storage_cleanup_lock:
     storage_cleanup_pending = bool(gcode_storage_cleanup_pending)
@@ -3214,10 +5034,15 @@ def _poll_application_close():
           continue
         _interrupt_tracked_serial_activity(serial_name)
 
+  if _auxiliary_stop_shutdown_pending():
+    message = "SHUTDOWN WAITING FOR AUXILIARY STOP"
+    _set_application_status(message, "Warn.TLabel")
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
+
   if calibration_shutdown_pending:
     message = "SHUTDOWN WAITING FOR CALIBRATION RESPONSE"
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(text=message, style="Warn.TLabel")
     root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
     return False
 
@@ -3232,6 +5057,73 @@ def _poll_application_close():
     root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
     return False
 
+  camera_worker = globals().get('camera_preview_worker')
+  camera_worker_active = False
+  if camera_worker is not None:
+    try:
+      camera_worker_active = camera_worker.active
+      if not isinstance(camera_worker_active, bool):
+        raise RuntimeError("camera preview returned an invalid active state")
+    except Exception:
+      logger.exception("Unable to inspect camera preview shutdown state")
+      camera_worker_active = False
+  capture_worker = globals().get('vision_capture_worker')
+  capture_worker_active = False
+  if capture_worker is not None:
+    try:
+      capture_worker_active = capture_worker.active
+      if not isinstance(capture_worker_active, bool):
+        raise RuntimeError("vision capture returned an invalid active state")
+    except Exception:
+      logger.exception("Unable to inspect vision capture shutdown state")
+      capture_worker_active = False
+  match_worker = globals().get('vision_match_worker')
+  match_worker_active = False
+  if match_worker is not None:
+    try:
+      match_worker_active = match_worker.active
+      if not isinstance(match_worker_active, bool):
+        raise RuntimeError("vision matching returned an invalid active state")
+    except Exception:
+      logger.exception("Unable to inspect vision matching shutdown state")
+      match_worker_active = False
+  selection_worker = globals().get('vision_selection_worker')
+  selection_worker_active = False
+  if selection_worker is not None:
+    try:
+      selection_worker_active = selection_worker.active
+      if not isinstance(selection_worker_active, bool):
+        raise RuntimeError("vision selection returned an invalid active state")
+    except Exception:
+      logger.exception("Unable to inspect vision selection shutdown state")
+      selection_worker_active = False
+  camera_worker_active = (
+    camera_worker_active
+    or capture_worker_active
+    or match_worker_active
+    or selection_worker_active
+  )
+  if camera_worker_active:
+    now = time.monotonic()
+    if camera_preview_shutdown_started_at is None:
+      camera_preview_shutdown_started_at = now
+    if (
+      now - camera_preview_shutdown_started_at
+      < CAMERA_PREVIEW_SHUTDOWN_GRACE_SECONDS
+    ):
+      _set_application_status(
+        "SHUTDOWN WAITING FOR CAMERA WORKERS",
+        "Warn.TLabel",
+      )
+      root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+      return False
+    if not camera_preview_shutdown_timeout_reported:
+      camera_preview_shutdown_timeout_reported = True
+      logger.error(
+        "Camera work did not stop before the shutdown grace period; "
+        "process exit will retire remaining daemon workers"
+      )
+
   if not serial_lock.acquire(blocking=False):
     root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
     return False
@@ -3239,7 +5131,7 @@ def _poll_application_close():
     serial_lock.release()
     root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
     return False
-  if not serial_activity_registry.idle():
+  if not _serial_shutdown_ready_for_close():
     auxiliary_serial_lock.release()
     serial_lock.release()
     root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
@@ -3248,7 +5140,6 @@ def _poll_application_close():
   persisted = False
   closed = False
   try:
-    joint_motion_dispatcher.close()
     try:
       persisted = _flush_calibration_save() is True
     except Exception:
@@ -3256,16 +5147,31 @@ def _poll_application_close():
     if persisted:
       closed = _close_serial_port('ser')
       closed = _close_serial_port('ser2') and closed
+      if not _close_serial_port('ser3'):
+        logger.error(
+          "Auxiliary-device serial close remained incomplete; process exit "
+          "will retire the read-only handle"
+        )
+      try:
+        retained_auxiliary_closed = (
+          _close_retained_auxiliary_device_serials()
+        )
+      except Exception:
+        logger.exception(
+          "Unable to close retained auxiliary-device serial handles"
+        )
+        retained_auxiliary_closed = False
+      if not retained_auxiliary_closed:
+        logger.error(
+          "Retained auxiliary-device serial cleanup remained incomplete; "
+          "process exit will retire the read-only handles"
+        )
   finally:
     auxiliary_serial_lock.release()
     serial_lock.release()
 
   if not persisted:
-    almStatusLab.config(
-      text="SHUTDOWN WAITING FOR CALIBRATION SAVE",
-      style="Alarm.TLabel",
-    )
-    almStatusLab2.config(
+    _set_application_status(
       text="SHUTDOWN WAITING FOR CALIBRATION SAVE",
       style="Alarm.TLabel",
     )
@@ -3273,11 +5179,7 @@ def _poll_application_close():
     return False
 
   if not closed:
-    almStatusLab.config(
-      text="SHUTDOWN WAITING FOR SERIAL CLOSE",
-      style="Alarm.TLabel",
-    )
-    almStatusLab2.config(
+    _set_application_status(
       text="SHUTDOWN WAITING FOR SERIAL CLOSE",
       style="Alarm.TLabel",
     )
@@ -3338,7 +5240,6 @@ RUN['J4StepM'] = None
 RUN['J5StepM'] = None
 RUN['J6StepM'] = None
 
-RUN['oriImage'] = None
 RUN['StepMonitors'] = [0] * 6
 RUN['minSpeedDelay'] = 200 #µs
 RUN['speedViolation'] = "0"
@@ -3347,7 +5248,12 @@ RUN['xyzuvw_In'] = np.zeros(6)
 RUN['KinematicError'] = 0
 
 RUN['cam_on'] = False
-RUN['cap'] = None
+RUN['cameraPreviewRequestId'] = None
+RUN['visionCaptureRequestId'] = None
+RUN['visionMatchRequestId'] = None
+RUN['visionMatchResult'] = None
+RUN['visionSelectionRequestId'] = None
+RUN['visionSelectionKind'] = None
 
 # Migrated global variables to RUN dictionary
 # Robot State & Control
@@ -3403,13 +5309,6 @@ RUN['cmdType'] = None
 RUN['cmdTypeLong'] = None
 
 # Vision System
-RUN['cropping'] = False
-RUN['button_down'] = None
-RUN['box_points'] = None
-RUN['x_start'] = None
-RUN['y_start'] = None
-RUN['x_end'] = None
-RUN['y_end'] = None
 RUN['mX1'] = None
 RUN['mY1'] = None
 RUN['mX2'] = None
@@ -3434,7 +5333,6 @@ RUN['render_window'] = None
 # Input Devices
 RUN['xboxUse'] = None
 RUN['selectedTemplate'] = None
-RUN['selectedCam'] = None
 
 
 #declare axis limit vars
@@ -5053,8 +6951,7 @@ def _mode_change_is_blocked(request_lease=None, transport_reserved=False):
     else:
         return False
     logger.warning(message)
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(text=message, style="Warn.TLabel")
     return True
 
 
@@ -5067,8 +6964,7 @@ def _set_offline_mode_status(offline):
         offline_button.config(text="Run Offline", style="Online.TButton")
         message = "SYSTEM IN ONLINE MODE"
         style = "OK.TLabel"
-    almStatusLab.config(text=message, style=style)
-    almStatusLab2.config(text=message, style=style)
+    _set_application_status(text=message, style=style)
 
 
 def toggle_offline_mode():
@@ -5078,8 +6974,7 @@ def toggle_offline_mode():
             "Mode change rejected while motion or recovery ownership is active"
         )
         logger.warning(message)
-        almStatusLab.config(text=message, style="Warn.TLabel")
-        almStatusLab2.config(text=message, style="Warn.TLabel")
+        _set_application_status(text=message, style="Warn.TLabel")
         return False
     try:
         with _reserve_main_serial_operation():
@@ -5131,15 +7026,13 @@ def toggle_offline_mode():
                     _set_offline_mode_status(False)
                     message = f"Mode change rejected during virtual refresh: {exc}"
                     logger.error(message)
-                    almStatusLab.config(text=message, style="Alarm.TLabel")
-                    almStatusLab2.config(text=message, style="Alarm.TLabel")
+                    _set_application_status(text=message, style="Alarm.TLabel")
                     return False
             return True
     except SerialActivityRejected as exc:
         message = f"Mode change rejected: {exc}"
         logger.warning(message)
-        almStatusLab.config(text=message, style="Warn.TLabel")
-        almStatusLab2.config(text=message, style="Warn.TLabel")
+        _set_application_status(text=message, style="Warn.TLabel")
         return False
     finally:
         _finish_motion_request(request_lease)
@@ -5865,16 +7758,21 @@ def _startup_visual_options():
     ))
 
 
-def _startup_exchange_response(
+def _startup_controller_exchange(
     command,
-    cancel_event,
+    cancellation_boundary,
     expected_response=None,
 ):
     if not isinstance(command, str):
         raise MotionInputError("controller startup command must be text")
     command = _validated_startup_command(command, command[:2])
-    if not callable(getattr(cancel_event, "is_set", None)):
-        raise TypeError("controller startup cancellation must satisfy the event contract")
+    if not isinstance(
+        cancellation_boundary,
+        SerialWriteCancellationBoundary,
+    ):
+        raise TypeError(
+            "controller startup cancellation boundary is invalid"
+        )
     if expected_response is not None and (
         not isinstance(expected_response, bytes) or not expected_response
     ):
@@ -5902,12 +7800,6 @@ def _startup_exchange_response(
         raise MotionInputError(
             "expected startup response must contain normalized unframed ASCII bytes"
         )
-    response_limit = (
-        MAX_RESPONSE_FRAME_LENGTH
-        if expected_response is None or framed_expected_response
-        else MAX_RESPONSE_PAYLOAD_LENGTH
-    )
-
     serial_port = RUN.get('ser')
     if serial_port is None or not getattr(serial_port, "is_open", False):
         raise ConnectionError("controller serial connection is not open")
@@ -5915,168 +7807,104 @@ def _startup_exchange_response(
         raise SerialTransportQuarantinedError(
             "controller serial connection is quarantined; reconnect required"
         )
-    try:
-        original_timeout = serial_port.timeout
-    except Exception as exc:
-        raise TypeError("controller serial connection has no read timeout") from exc
-
-    reset_input = getattr(serial_port, "reset_input_buffer", None)
-    if not callable(reset_input):
-        reset_input = getattr(serial_port, "flushInput", None)
-    write = getattr(serial_port, "write", None)
-    flush = getattr(serial_port, "flush", None)
-    read = getattr(serial_port, "read", None)
-    read_until = getattr(serial_port, "read_until", None)
-    if not all(callable(method) for method in (reset_input, write, flush, read)):
-        raise TypeError("controller serial connection lacks the startup I/O contract")
 
     def cancellation_requested():
-        requested = cancel_event.is_set()
+        requested = cancellation_boundary.is_set()
         if not isinstance(requested, bool):
             raise ProtocolResponseError(
                 "controller startup cancellation state must be boolean"
             )
         return requested
 
-    command_bytes = command.encode("ascii")
-    acquired = serial_write_lock.acquire()
-    if acquired is False:
-        raise RuntimeError("controller startup write lock acquisition failed")
-    try:
-        if cancellation_requested():
-            raise TimeoutError("controller startup cancelled")
-        reset_input()
-        if cancellation_requested():
-            raise TimeoutError("controller startup cancelled")
-        written = write(command_bytes)
-        if written != len(command_bytes):
-            raise OSError(
-                "controller startup write was incomplete: "
-                f"expected {len(command_bytes)} bytes, wrote {written!r}"
-            )
-        flush()
-    finally:
-        serial_write_lock.release()
+    if cancellation_requested():
+        raise TimeoutError("controller startup cancelled")
+    publish_stop = _prepare_startup_main_controller_stop_exchange(
+        serial_port
+    )
+    if cancellation_requested():
+        raise TimeoutError("controller startup cancelled")
+    write_started_event = threading.Event()
+    write_serial_control(
+        serial_port,
+        command,
+        write_lock=serial_write_lock,
+        reset_input=False,
+        write_started_event=write_started_event,
+        cancellation_event=cancellation_boundary,
+        write_boundary_lock=cancellation_boundary,
+    )
 
-    response = bytearray()
-    deadline = time.monotonic() + SERIAL_STARTUP_READ_TIMEOUT_SECONDS
-    operation_error = None
-    try:
-        while True:
-            if cancellation_requested():
-                raise TimeoutError("controller startup cancelled")
-            remaining_time = deadline - time.monotonic()
-            if remaining_time <= 0:
-                raise SerialTransportTimeout(
-                    "controller startup response deadline expired"
-                )
-            serial_port.timeout = min(
-                CONTROL_POLL_INTERVAL_SECONDS,
-                remaining_time,
-            )
-            remaining_size = response_limit + 1 - len(response)
-            if expected_response is not None and not framed_expected_response:
-                remaining_size = len(expected_response) - len(response)
-                chunk = read(remaining_size)
-            elif callable(read_until):
-                chunk = read_until(b"\n", remaining_size)
-            else:
-                chunk = read(remaining_size)
-            if not isinstance(chunk, (bytes, bytearray)):
-                raise ProtocolResponseError(
-                    "controller startup reader returned a non-bytes response"
-                )
-            if not chunk:
-                continue
-            response.extend(chunk)
-            if len(response) > response_limit:
-                raise ProtocolResponseError(
-                    "controller startup response exceeds the size limit"
-                )
-            if expected_response is not None and not framed_expected_response:
-                if len(response) < len(expected_response):
-                    continue
-                if bytes(response) != expected_response:
-                    raise ProtocolResponseError(
-                        "controller startup returned an unexpected acknowledgement"
-                    )
-                if cancellation_requested():
-                    raise TimeoutError("controller startup cancelled")
-                remaining_time = deadline - time.monotonic()
-                if remaining_time < CONTROL_POLL_INTERVAL_SECONDS:
-                    raise SerialTransportTimeout(
-                      "controller startup quiet-boundary deadline expired"
-                    )
-                serial_port.timeout = CONTROL_POLL_INTERVAL_SECONDS
-                trailing = read(1)
-                if not isinstance(trailing, (bytes, bytearray)):
-                    raise ProtocolResponseError(
-                        "controller startup quiet-boundary reader returned non-bytes"
-                    )
-                if trailing:
-                    raise ProtocolResponseError(
-                        "controller startup returned trailing unframed data"
-                    )
-                if cancellation_requested():
-                    raise TimeoutError("controller startup cancelled")
-                if not getattr(serial_port, "is_open", False):
-                    raise ConnectionError(
-                        "controller startup connection closed before the quiet boundary"
-                    )
-                return bytes(response).decode("ascii")
-            if b"\n" not in response:
-                continue
-            if response.find(b"\n") != len(response) - 1:
-                raise ProtocolResponseError(
-                    "controller startup returned trailing framed data"
-                )
-            framed_payload = bytes(response[:-1])
-            if framed_payload.endswith(b"\r"):
-                framed_payload = framed_payload[:-1]
-            if (
-                framed_expected_response
-                and framed_payload != expected_payload
-            ):
-                raise ProtocolResponseError(
-                    "controller startup returned an unexpected acknowledgement"
-                )
-            decoded = decode_serial_response_line(response)
-            if cancellation_requested():
-                raise TimeoutError("controller startup cancelled")
-            remaining_time = deadline - time.monotonic()
-            if remaining_time < CONTROL_POLL_INTERVAL_SECONDS:
-                raise SerialTransportTimeout(
-                  "controller startup quiet-boundary deadline expired"
-                )
-            serial_port.timeout = CONTROL_POLL_INTERVAL_SECONDS
-            trailing = read(1)
-            if not isinstance(trailing, (bytes, bytearray)):
-                raise ProtocolResponseError(
-                    "controller startup quiet-boundary reader returned non-bytes"
-                )
-            if trailing:
-                raise ProtocolResponseError(
-                    "controller startup returned queued trailing framed data"
-                )
-            if not getattr(serial_port, "is_open", False):
-                raise ConnectionError(
-                    "controller startup connection closed before the quiet boundary"
-                )
-            return decoded
-    except Exception as exc:
-        operation_error = exc
-        raise
-    finally:
-        try:
-            serial_port.timeout = original_timeout
-        except Exception as exc:
-            if operation_error is None:
-                raise TypeError(
-                    "unable to restore the controller startup read timeout"
-                ) from exc
-            raise TypeError(
-                f"{operation_error}; unable to restore the controller startup read timeout"
-            ) from exc
+    if expected_response is not None and not framed_expected_response:
+        response = read_controller_exact_exchange_response(
+            serial_port,
+            expected_response,
+            SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+            estop_callback=publish_stop,
+            context="controller startup exact response",
+        )
+    else:
+        accepted_responses = (
+            None
+            if expected_payload is None
+            else (expected_payload.decode("ascii"),)
+        )
+        response = read_controller_line_exchange_response(
+            serial_port,
+            SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+            accepted_responses=accepted_responses,
+            estop_callback=publish_stop,
+            context="controller startup line response",
+        )
+    if cancellation_requested():
+        raise TimeoutError("controller startup cancelled")
+    return response
+
+
+def _startup_exchange_response(
+    command,
+    cancellation_boundary,
+    expected_response=None,
+):
+    response = _startup_controller_exchange(
+        command,
+        cancellation_boundary,
+        expected_response,
+    )
+    if (
+        response.estop_position is not None
+        or response.admission_position is not None
+    ):
+        _raise_legacy_controller_stop(RUN.get('ser'), response)
+    return response.terminal_response
+
+
+def _startup_controller_identity(cancellation_boundary):
+  response = _startup_controller_exchange(
+    "HO\n",
+    cancellation_boundary,
+  )
+  released_latch_retry = response.frame_order == "admission-estop"
+  if released_latch_retry:
+    response = _startup_controller_exchange(
+      "HO\n",
+      cancellation_boundary,
+    )
+  if (
+    response.estop_position is not None
+    or response.admission_position is not None
+  ):
+    _raise_legacy_controller_stop(RUN.get('ser'), response)
+  try:
+    return parse_controller_identity_response(response.terminal_response)
+  except Exception:
+    if released_latch_retry:
+      serial_port = RUN.get('ser')
+      if serial_port is not None:
+        quarantine_serial_transport(
+          serial_port,
+          "controller identity retry returned a non-identity response",
+        )
+    raise
 
 
 def _close_startup_auxiliary(serial_port):
@@ -6223,7 +8051,9 @@ def startup_with_spinner(
 
     spinner, pb = startup_spinner(root, "Please Wait.. System Starting")
     q = Queue()
-    cancel_event = threading.Event()
+    cancellation_boundary = SerialWriteCancellationBoundary(
+      "controller startup"
+    )
     missing = object()
     pending_result = missing
     timed_out = False
@@ -6235,7 +8065,7 @@ def startup_with_spinner(
 
     def worker():
         try:
-            result = startup(startup_request, cancel_event)
+            result = startup(startup_request, cancellation_boundary)
         except BaseException as exc:
             result = exc
         q.put((time.monotonic(), result))
@@ -6297,7 +8127,7 @@ def startup_with_spinner(
         )
         if not timed_out and deadline_exceeded:
             timed_out = True
-            cancel_event.set()
+            cancellation_boundary.cancel()
             close_spinner()
             try:
                 on_timeout()
@@ -6318,7 +8148,7 @@ def startup_with_spinner(
             root.after(10, poll_worker)
         except Exception:
             logger.exception("Unable to continue controller startup polling")
-            cancel_event.set()
+            cancellation_boundary.cancel()
             if not timed_out:
                 timed_out = True
                 close_spinner()
@@ -6347,18 +8177,23 @@ def startup_with_spinner(
     return worker_thread
 
 
-def startup(startup_request, cancel_event=None):
+def startup(startup_request, cancellation_boundary=None):
   if not isinstance(startup_request, ControllerStartupRequest):
     raise MotionInputError("startup_request must be a ControllerStartupRequest")
-  if cancel_event is None:
-    cancel_event = threading.Event()
-  if not callable(getattr(cancel_event, "is_set", None)):
-    raise TypeError("controller startup cancellation must satisfy the event contract")
+  if cancellation_boundary is None:
+    cancellation_boundary = SerialWriteCancellationBoundary(
+      "controller startup"
+    )
+  if not isinstance(
+    cancellation_boundary,
+    SerialWriteCancellationBoundary,
+  ):
+    raise TypeError("controller startup cancellation boundary is invalid")
   auxiliary_serial = None
   auxiliary_error = None
   try:
-    controller_identity = parse_controller_identity_response(
-      _startup_exchange_response("HO\n", cancel_event)
+    controller_identity = _startup_controller_identity(
+      cancellation_boundary
     )
     missing_capabilities = tuple(
       capability
@@ -6386,17 +8221,17 @@ def startup(startup_request, cancel_event=None):
         auxiliary_error = str(exc).strip() or type(exc).__name__
     _startup_exchange_response(
       startup_request.update_parameters_command,
-      cancel_event,
+      cancellation_boundary,
       expected_response=b"Done",
     )
     _startup_exchange_response(
       startup_request.external_axis_command,
-      cancel_event,
+      cancellation_boundary,
       expected_response=b"Done",
     )
     _startup_exchange_response(
       startup_request.position_command,
-      cancel_event,
+      cancellation_boundary,
       expected_response=b"Done\n",
     )
     home_reference_command = primary_home_reference_command(
@@ -6407,11 +8242,14 @@ def startup(startup_request, cancel_event=None):
       home_reference = parse_primary_home_reference_capability_response(
         _startup_exchange_response(
           home_reference_command,
-          cancel_event,
+          cancellation_boundary,
         ),
         controller_identity.protocol_capabilities,
       )
-    position_text = _startup_exchange_response("RP\n", cancel_event)
+    position_text = _startup_exchange_response(
+      "RP\n",
+      cancellation_boundary,
+    )
     position = parse_position_response(position_text)
     if position.flag:
       raise ProtocolResponseError(
@@ -6461,6 +8299,28 @@ def _prepare_controller_startup():
   return request, update_values, external_values
 
 
+def _clear_controller_fault_latches_after_confirmed_startup(
+  serial_port,
+  position,
+):
+  if (
+    not isinstance(position, PositionResponse)
+    or position.flag
+    or _current_main_controller_identity(serial_port) is None
+  ):
+    raise ProtocolResponseError(
+      "controller fault latches require a bound fault-free startup position"
+    )
+  with auxiliary_stop_state_lock:
+    with program_stop_state_lock:
+      RUN['estopActive'] = False
+      RUN['posOutreach'] = False
+      if _program_execution_stop_admission_reason_locked() is None:
+        RUN['programStopStatusLatched'] = False
+        RUN['programStopState'] = "completed"
+  return True
+
+
 def _apply_controller_startup_result(
   startup_request,
   result,
@@ -6503,6 +8363,10 @@ def _apply_controller_startup_result(
       result.controller_identity,
       result.home_reference,
     )
+    _clear_controller_fault_latches_after_confirmed_startup(
+      startup_serial,
+      result.position,
+    )
   except Exception:
     if calibration_applied:
       try:
@@ -6518,7 +8382,58 @@ def _apply_controller_startup_result(
   return applied_position
 
 
+def _main_port_selector_value(port):
+  if (
+    not isinstance(port, str)
+    or not port
+    or port != port.strip()
+  ):
+    raise MotionInputError(
+      "accepted main-controller port selection must be normalized text"
+    )
+  if (
+    not isinstance(port_choices, (tuple, list))
+    or "None" not in port_choices
+    or any(
+      not isinstance(choice, str)
+      or not choice
+      or choice != choice.strip()
+      for choice in port_choices
+    )
+  ):
+    raise RuntimeError("available main-controller ports are invalid")
+  return port if port in port_choices else "None"
+
+
+def _startup_port_selector_values(calibration):
+  if not isinstance(calibration, dict):
+    raise TypeError("startup calibration must be a dictionary")
+  main_port = calibration.get('comPort')
+  auxiliary_port = calibration.get('com2Port')
+  if isinstance(main_port, str):
+    main_port = main_port.strip()
+  else:
+    main_port = "None"
+  if isinstance(auxiliary_port, str):
+    auxiliary_port = auxiliary_port.strip()
+  else:
+    auxiliary_port = "None"
+  if not main_port:
+    main_port = "None"
+  if auxiliary_port not in port_choices:
+    auxiliary_port = "None"
+  return _main_port_selector_value(main_port), auxiliary_port
+
+
 def setCom(misc=None):
+  previous_main_port = CAL.get('comPort', "None")
+  if isinstance(previous_main_port, str):
+    previous_main_port = previous_main_port.strip()
+  else:
+    previous_main_port = "None"
+  if not previous_main_port:
+    previous_main_port = "None"
+  restored_main_port = _main_port_selector_value(previous_main_port)
   request_lease = _acquire_motion_request(
     "Controller connection change",
     allow_position_recovery=True,
@@ -6528,12 +8443,22 @@ def setCom(misc=None):
     message = _motion_request_rejection_message(
       "Controller connection change not started"
     )
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    try:
+      com1SelectedValue.set(restored_main_port)
+    except Exception:
+      logger.exception(
+        "Unable to restore the accepted main-controller port selection"
+      )
+    _set_application_status(message, "Warn.TLabel")
     return False
   request_state = {"transferred": False}
   try:
-    return _set_com_admitted(request_lease, request_state, misc)
+    return _set_com_admitted(
+      request_lease,
+      request_state,
+      misc,
+      previous_main_port=previous_main_port,
+    )
   finally:
     if (
       not request_state["transferred"]
@@ -6542,27 +8467,66 @@ def setCom(misc=None):
       _finish_motion_request(request_lease)
 
 
-def _set_com_admitted(request_lease, request_state, misc=None):
+def _set_com_admitted(
+  request_lease,
+  request_state,
+  misc=None,
+  *,
+  previous_main_port,
+):
+  if (
+    not isinstance(previous_main_port, str)
+    or not previous_main_port
+    or previous_main_port != previous_main_port.strip()
+  ):
+    raise MotionInputError(
+      "accepted main-controller port selection must be normalized text"
+    )
+  restored_main_port = _main_port_selector_value(previous_main_port)
+
+  def restore_port_selection():
+    try:
+      com1SelectedValue.set(restored_main_port)
+    except Exception:
+      logger.exception(
+        "Unable to restore the accepted main-controller port selection"
+      )
+
   if application_closing.is_set():
+    restore_port_selection()
     logger.warning("Controller connection change rejected during application shutdown")
     return False
   if not serial_lock.acquire(blocking=False):
+    restore_port_selection()
     message = "Controller connection change rejected while the transport is busy"
     logger.warning(message)
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(message, "Warn.TLabel")
+    return False
+  with manual_controller_cleanup_lock:
+    cleanup_pending = manual_controller_cleanup_pending is not None
+  if cleanup_pending:
+    serial_lock.release()
+    restore_port_selection()
+    message = (
+      "Controller connection change rejected while controller I/O "
+      "cleanup is pending"
+    )
+    logger.warning(message)
+    _set_application_status(message, "Warn.TLabel")
     return False
   try:
     activity_lease = serial_activity_registry.lease("ser")
   except SerialActivityRejected as exc:
     serial_lock.release()
-    message = f"Controller connection change rejected: {exc}"
+    restore_port_selection()
+    detail = str(exc).strip() or type(exc).__name__
+    message = f"Controller connection change rejected: {detail}"
     logger.warning(message)
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(message, "Warn.TLabel")
     return False
   except Exception:
     serial_lock.release()
+    restore_port_selection()
     raise
   release_transport = True
   try:
@@ -6600,8 +8564,7 @@ def _set_com_admitted(request_lease, request_state, misc=None):
       selected_main_port,
     )
 
-    almStatusLab.config(text="CONTROLLER STARTING", style="Warn.TLabel")
-    almStatusLab2.config(text="CONTROLLER STARTING", style="Warn.TLabel")
+    _set_application_status("CONTROLLER STARTING", "Warn.TLabel")
 
     time.sleep(.1)
     # Prefer reset_input_buffer over deprecated flushInput
@@ -6622,18 +8585,19 @@ def _set_com_admitted(request_lease, request_state, misc=None):
 
     def set_startup_status(message, style):
       try:
-        almStatusLab.config(text=message, style=style)
-        almStatusLab2.config(text=message, style=style)
+        _set_application_status(message, style)
       except Exception:
         logger.exception("Unable to update controller startup status")
 
     def report_startup_timeout():
+      restore_port_selection()
       message = "CONTROLLER STARTUP TIMED OUT; WAITING FOR CLEANUP"
       logger.error(message)
       set_startup_status(message, "Alarm.TLabel")
 
     def finish_startup(result, timed_out):
       if RUN.get('ser') is not startup_serial:
+        restore_port_selection()
         logger.error("Main serial reference changed during controller startup")
         if isinstance(result, ControllerStartupResult):
           _request_startup_auxiliary_cleanup(result.auxiliary_serial)
@@ -6649,6 +8613,7 @@ def _set_com_admitted(request_lease, request_state, misc=None):
         or isinstance(result, BaseException)
         or not isinstance(result, ControllerStartupResult)
       ):
+        restore_port_selection()
         if isinstance(result, BaseException) and not (
           timed_out and isinstance(result, TimeoutError)
         ):
@@ -6685,6 +8650,7 @@ def _set_com_admitted(request_lease, request_state, misc=None):
           original_startup_timeout,
         )
       except Exception:
+        restore_port_selection()
         logger.exception("Unable to finalize the Teensy 4.1 controller connection")
         _request_startup_auxiliary_cleanup(result.auxiliary_serial)
         message = "UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER"
@@ -6744,6 +8710,7 @@ def _set_com_admitted(request_lease, request_state, misc=None):
     return True
 
   except Exception:
+    restore_port_selection()
     failed_serial = RUN.get('ser')
     if failed_serial is not None:
       release_transport = False
@@ -6758,8 +8725,10 @@ def _set_com_admitted(request_lease, request_state, misc=None):
       "UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER"
     )
 
-    almStatusLab.config(text="UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER", style="Alarm.TLabel")
-    almStatusLab2.config(text="UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER", style="Alarm.TLabel")
+    _set_application_status(
+      "UNABLE TO ESTABLISH COMMUNICATIONS WITH TEENSY 4.1 CONTROLLER",
+      "Alarm.TLabel",
+    )
 
     try:
       value = tab8.ElogView.get(0, END)
@@ -7060,7 +9029,7 @@ def _finish_auxiliary_calibration_persistence_fence(
   _calibration_save_snapshot = None
 
 
-def _apply_auxiliary_configuration_snapshot(
+def _apply_auxiliary_configuration_snapshot_contents(
   calibration_snapshot,
   output_values,
   port,
@@ -7083,6 +9052,7 @@ def _apply_auxiliary_configuration_snapshot(
     key: str(output_values.get(key, ""))
     for key, _ in _auxiliary_output_field_bindings()
   }
+
   errors = []
   try:
     apply_calibration(normalized_calibration, CAL)
@@ -7106,6 +9076,39 @@ def _apply_auxiliary_configuration_snapshot(
   if errors:
     raise RuntimeError("; ".join(errors))
   return True
+
+
+def _apply_auxiliary_configuration_snapshot(
+  calibration_snapshot,
+  output_values,
+  port,
+  board,
+  require_stop_admission=False,
+):
+  if not isinstance(require_stop_admission, bool):
+    raise TypeError("auxiliary stop-admission requirement must be boolean")
+
+  with manual_auxiliary_state_lock:
+    if not require_stop_admission:
+      return _apply_auxiliary_configuration_snapshot_contents(
+        calibration_snapshot,
+        output_values,
+        port,
+        board,
+      )
+    with auxiliary_stop_state_lock:
+      with program_stop_state_lock:
+        stop_reason = _stop_admission_reason_locked(
+          "AUXILIARY CONFIGURATION"
+        )
+        if stop_reason is not None:
+          raise MotionInputError(stop_reason)
+        return _apply_auxiliary_configuration_snapshot_contents(
+          calibration_snapshot,
+          output_values,
+          port,
+          board,
+        )
 
 
 def _verify_auxiliary_configuration_snapshot(
@@ -7165,6 +9168,23 @@ def setCom2(misc=None):
     logger.warning("Auxiliary connection change rejected while the transport is busy")
     return False
   try:
+    with manual_auxiliary_state_lock:
+      with auxiliary_stop_state_lock:
+        with program_stop_state_lock:
+          stop_reason = _stop_admission_reason_locked(
+            "AUXILIARY CONFIGURATION"
+          )
+  except Exception:
+    logger.exception(
+      "Auxiliary connection change could not verify stop admission"
+    )
+    auxiliary_serial_lock.release()
+    return False
+  if stop_reason is not None:
+    logger.warning(stop_reason)
+    auxiliary_serial_lock.release()
+    return False
+  try:
     previous_calibration = normalize_calibration_data(
       snapshot_calibration_values(CAL)
     )
@@ -7214,34 +9234,49 @@ def setCom2(misc=None):
       committed_board,
     )
     staged_calibration = normalize_calibration_data(staged_calibration)
-    _apply_auxiliary_configuration_snapshot(
-      staged_calibration,
-      staged_calibration,
-      committed_port,
-      committed_board,
-    )
-    _verify_auxiliary_configuration_snapshot(
-      staged_calibration,
-      staged_calibration,
-      committed_port,
-      committed_board,
-    )
+    with manual_auxiliary_state_lock:
+      with auxiliary_stop_state_lock:
+        with program_stop_state_lock:
+          stop_reason = _stop_admission_reason_locked(
+            "AUXILIARY CONFIGURATION"
+          )
+          if stop_reason is not None:
+            raise MotionInputError(stop_reason)
+
+          # Stop admission, transport replacement, and live publication share
+          # one boundary. A physical stop therefore observes either the prior
+          # bound controller or the verified replacement, never staged UI data.
+          if selected_port is None or selected_board is None:
+            if RUN.get('ser2') is not None and not _close_serial_port(
+              'ser2',
+              "auxiliary configuration change",
+            ):
+              raise OSError("Unable to close the prior auxiliary connection")
+            _clear_auxiliary_board_profile()
+            connection_change_completed = True
+          else:
+            _replace_auxiliary_serial(selected_port, selected_board)
+            connection_change_completed = True
+
+          _apply_auxiliary_configuration_snapshot_contents(
+            staged_calibration,
+            staged_calibration,
+            committed_port,
+            committed_board,
+          )
+          _verify_auxiliary_configuration_snapshot(
+            staged_calibration,
+            staged_calibration,
+            committed_port,
+            committed_board,
+          )
 
     if selected_port is None or selected_board is None:
-      if RUN.get('ser2') is not None and not _close_serial_port(
-        'ser2',
-        "auxiliary configuration change",
-      ):
-        raise OSError("Unable to close the prior auxiliary connection")
-      _clear_auxiliary_board_profile()
-      connection_change_completed = True
       logger.warning(
         "Auxiliary controller disabled until both a COM port and board profile "
         "are selected"
       )
     else:
-      _replace_auxiliary_serial(selected_port, selected_board)
-      connection_change_completed = True
       logger.info(
         "COMMUNICATIONS STARTED WITH %s ARDUINO IO BOARD on port: %s",
         selected_board,
@@ -7498,12 +9533,6 @@ def lightTheme():
   style.configure("TMenubutton", 
                   padding=(5, 3, 5, 3))     # Match button padding for proportional scaling
 
-
-
-###############################################################################################################################################################  
-### EXECUTION DEFS ######################################################################################################################### EXECUTION DEFS ###  
-############################################################################################################################################################### 
-
 ROW_EXECUTION_COMPLETE = "complete"
 ROW_EXECUTION_PENDING = "pending"
 ROW_EXECUTION_REJECTED = "rejected"
@@ -7514,12 +9543,176 @@ VIRTUAL_JOINT_SECONDS_SCALE = 4.5
 VIRTUAL_CARTESIAN_SECONDS_SCALE = 4.7
 VIRTUAL_TOOL_SECONDS_SCALE = 5.1
 LIVE_TOOL_JOG_INCREMENT = 0.25
+PROGRAM_ROW_COMMAND_PREFIXES = frozenset({
+  "Call P", "Run Gc", "Stop P", "Test L", "Test G", "Set En",
+  "Read E", "Servo ", "If Inp", "Read C", "If Reg", "If COM",
+  "If MBc", "If MBi", "If MBh", "If MBI", "Jump T", "Wait T",
+  "Regist", "Positi", "Calibr", "Cal_J1", "Cal_J2", "Cal_J3",
+  "Cal_J4", "Cal_J5", "Cal_J6", "Cal_J7", "Cal_J8", "Cal_J9",
+  "Tool S", "Move J", "OFF J ", "Move V", "Move P", "OFF PR",
+  "Move L", "Move R", "Move A", "Move C", "Start ", "End Sp",
+  "Cam On", "Cam Of", "Vis Fi",
+})
+PROGRAM_ROW_LONG_COMMAND_PREFIXES = frozenset({
+  "Wait 5v Inp",
+  "Wait MBcoil",
+  "Wait MBinpu",
+  "Set 5v Outp",
+  "Set MBcoil ",
+  "Set MBoutpu",
+})
 
 
 @dataclass(frozen=True)
 class ProgramMotionPoseSnapshot:
   controller_positions: Optional[tuple]
   virtual_pose: tuple
+
+
+@dataclass(frozen=True)
+class MainControllerStopContext:
+  serial_port: object
+  connection_epoch: int
+  confirmed_position_generation: int
+
+  def __post_init__(self):
+    if self.serial_port is None:
+      raise MotionInputError(
+        "main controller stop context requires a serial connection"
+      )
+    for name, value in (
+      ("connection epoch", self.connection_epoch),
+      (
+        "confirmed position generation",
+        self.confirmed_position_generation,
+      ),
+    ):
+      if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+      ):
+        raise MotionInputError(
+          f"main controller stop {name} is invalid"
+        )
+
+
+@dataclass(frozen=True)
+class MainControllerStopEvent:
+  context: MainControllerStopContext
+  position: PositionResponse
+
+  def __post_init__(self):
+    if not isinstance(self.context, MainControllerStopContext):
+      raise MotionInputError(
+        "main controller stop event requires a session context"
+      )
+    if not position_response_is_physical_estop(self.position):
+      raise MotionInputError(
+        "main controller stop event requires a physical-stop position"
+      )
+
+
+class MainControllerIdleStopOwnership:
+  def __init__(self, activity_registry, transport_lock, control_mode):
+    if not callable(getattr(activity_registry, "finish_control", None)):
+      raise TypeError(
+        "idle main-controller stop ownership requires an activity registry"
+      )
+    if not all(
+      callable(getattr(transport_lock, method, None))
+      for method in ("locked", "release")
+    ):
+      raise TypeError(
+        "idle main-controller stop ownership requires a transport lock"
+      )
+    if control_mode != SerialActivityRegistry.CONTROL_EXCLUSIVE:
+      raise MotionInputError(
+        "idle main-controller stop ownership must be exclusive"
+      )
+    self._activity_registry = activity_registry
+    self._transport_lock = transport_lock
+    self._control_mode = control_mode
+    self._transport_owned = True
+    self._state_lock = threading.Lock()
+
+  @property
+  def complete(self):
+    with self._state_lock:
+      return self._control_mode is None and not self._transport_owned
+
+  def release(self):
+    with self._state_lock:
+      if self._control_mode is None and not self._transport_owned:
+        return False
+      if self._control_mode is not None:
+        self._activity_registry.finish_control(
+          "ser",
+          self._control_mode,
+        )
+        self._control_mode = None
+      if self._transport_owned:
+        if not self._transport_lock.locked():
+          raise RuntimeError(
+            "idle main-controller stop transport was already released"
+          )
+        self._transport_lock.release()
+        self._transport_owned = False
+    return True
+
+
+@dataclass(frozen=True)
+class MainControllerIdleStopReadResult:
+  serial_port: object
+  ownership: MainControllerIdleStopOwnership
+  position: Optional[PositionResponse] = None
+  error: Optional[str] = None
+
+  def __post_init__(self):
+    if self.serial_port is None:
+      raise MotionInputError(
+        "idle main-controller stop result requires a serial connection"
+      )
+    if not isinstance(self.ownership, MainControllerIdleStopOwnership):
+      raise MotionInputError(
+        "idle main-controller stop result requires transport ownership"
+      )
+    if (
+      self.position is not None
+      and (
+        not position_response_is_physical_estop(self.position)
+        or self.position.flag != CONTROLLER_ESTOP_EVENT_FLAG
+      )
+    ):
+      raise MotionInputError(
+        "idle main-controller stop result position is invalid"
+      )
+    if self.error is not None and (
+      not isinstance(self.error, str)
+      or not self.error
+      or self.error != self.error.strip()
+      or "\r" in self.error
+      or "\n" in self.error
+    ):
+      raise MotionInputError(
+        "idle main-controller stop result error is invalid"
+      )
+    if self.position is None and self.error is None:
+      raise MotionInputError(
+        "idle main-controller stop result requires a position or error"
+      )
+
+
+class LegacyControllerPhysicalStop(ProtocolResponseError):
+  def __init__(self, position):
+    if not position_response_is_physical_estop(position):
+      raise MotionInputError(
+        "legacy controller stop requires a physical-stop position"
+      )
+    self.position = position
+    super().__init__(
+      f"physical E-stop received ({position.flag}); reconnect required"
+    )
 
 
 def _apply_valid_position_response(response):
@@ -7534,6 +9727,631 @@ def _apply_valid_position_response(response):
   return applied_position
 
 
+def _capture_main_controller_stop_context(serial_port):
+  with controller_identity_state_lock:
+    binding = main_controller_identity_binding
+    connection_epoch = main_controller_connection_epoch
+    generation = confirmed_position_generation
+    if (
+      not isinstance(binding, MainControllerIdentityBinding)
+      or binding.serial_port is not serial_port
+      or RUN.get('ser') is not serial_port
+      or not getattr(serial_port, "is_open", False)
+    ):
+      raise ConnectionError(
+        "main controller stop context requires the active bound connection"
+      )
+    for name, value in (
+      ("connection epoch", connection_epoch),
+      ("confirmed position generation", generation),
+    ):
+      if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+      ):
+        raise RuntimeError(
+          f"main controller stop {name} is invalid"
+        )
+  return MainControllerStopContext(
+    serial_port,
+    connection_epoch,
+    generation,
+  )
+
+
+def _capture_startup_main_controller_stop_context(serial_port):
+  with controller_identity_state_lock:
+    binding = main_controller_identity_binding
+    connection_epoch = main_controller_connection_epoch
+    generation = confirmed_position_generation
+    if (
+      binding is not None
+      or RUN.get('ser') is not serial_port
+      or not getattr(serial_port, "is_open", False)
+    ):
+      raise ConnectionError(
+        "startup stop context requires the active unbound connection"
+      )
+    for name, value in (
+      ("connection epoch", connection_epoch),
+      ("confirmed position generation", generation),
+    ):
+      if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+      ):
+        raise RuntimeError(
+          f"startup main controller stop {name} is invalid"
+        )
+  return MainControllerStopContext(
+    serial_port,
+    connection_epoch,
+    generation,
+  )
+
+
+def _reserve_auxiliary_stop_request_locked(on_reserved=None):
+  global auxiliary_stop_next_request_id
+  global auxiliary_stop_pending_request_id
+
+  if on_reserved is not None and not callable(on_reserved):
+    raise TypeError("auxiliary stop reservation callback must be callable")
+  for name, request_id in (
+    ("pending", auxiliary_stop_pending_request_id),
+    ("active", auxiliary_stop_active_request_id),
+    ("main-controller", main_controller_auxiliary_stop_request_id),
+  ):
+    if (
+      request_id is not None
+      and (
+        isinstance(request_id, bool)
+        or not isinstance(request_id, int)
+        or request_id <= 0
+      )
+    ):
+      raise RuntimeError(f"auxiliary stop {name} request ID is invalid")
+  if (
+    auxiliary_stop_pending_request_id is not None
+    and auxiliary_stop_active_request_id is not None
+  ):
+    raise RuntimeError(
+      "auxiliary stop cannot be pending and active simultaneously"
+    )
+  if (
+    isinstance(auxiliary_stop_next_request_id, bool)
+    or not isinstance(auxiliary_stop_next_request_id, int)
+    or auxiliary_stop_next_request_id < 0
+  ):
+    raise RuntimeError("auxiliary stop request counter is invalid")
+
+  request_id = (
+    auxiliary_stop_active_request_id
+    if auxiliary_stop_active_request_id is not None
+    else auxiliary_stop_pending_request_id
+  )
+  if (
+    request_id is not None
+    and main_controller_auxiliary_stop_request_id is not None
+    and request_id != main_controller_auxiliary_stop_request_id
+  ):
+    raise RuntimeError(
+      "auxiliary stop ownership conflicts with the main-controller "
+      "physical-stop request"
+    )
+  if (
+    request_id is None
+    and main_controller_auxiliary_stop_request_id is not None
+  ):
+    request_id = main_controller_auxiliary_stop_request_id
+    if on_reserved is not None:
+      on_reserved(request_id)
+    auxiliary_stop_pending_request_id = request_id
+    auxiliary_stop_requested.set()
+    return request_id
+  if request_id is None:
+    request_id = auxiliary_stop_next_request_id + 1
+    if on_reserved is not None:
+      on_reserved(request_id)
+    auxiliary_stop_next_request_id = request_id
+    auxiliary_stop_pending_request_id = request_id
+    auxiliary_stop_requested.set()
+  elif on_reserved is not None:
+    on_reserved(request_id)
+  return request_id
+
+
+def _clear_manual_auxiliary_stop_barrier_if_settled():
+  with manual_auxiliary_state_lock:
+    with auxiliary_stop_state_lock:
+      with program_stop_state_lock:
+        program_request_id = RUN.get('programStopRequestId')
+        if (
+          program_request_id is not None
+          and (
+            isinstance(program_request_id, bool)
+            or not isinstance(program_request_id, int)
+            or program_request_id <= 0
+          )
+        ):
+          raise RuntimeError("program stop request ID is invalid")
+        settled = (
+          auxiliary_stop_pending_request_id is None
+          and auxiliary_stop_active_request_id is None
+          and main_controller_auxiliary_stop_request_id is None
+          and not auxiliary_stop_requested.is_set()
+          and program_request_id is None
+        )
+        if settled:
+          manual_auxiliary_stop_barrier.clear()
+  return settled
+
+
+def _latch_main_controller_stop_state(position):
+  global main_controller_auxiliary_stop_request_id
+
+  if not position_response_is_physical_estop(position):
+    raise MotionInputError(
+      "main controller stop state requires a physical-stop position"
+    )
+  discarded = 0
+  repaired_program_request = False
+  with manual_auxiliary_state_lock:
+    # Share the final auxiliary-write boundary so barrier publication orders
+    # before every later ordinary write commitment.
+    manual_auxiliary_stop_barrier.set()
+    _cancel_active_program_execution()
+    with auxiliary_stop_state_lock:
+      with program_stop_state_lock:
+        # Configuration commits hold the same outer lock, so this snapshot is
+        # always wholly before or wholly after a port/profile transition.
+        try:
+          auxiliary_stop_not_required = _auxiliary_stop_not_required()
+        except Exception:
+          auxiliary_stop_not_required = False
+          logger.exception(
+            "Unable to determine whether the physical E-stop requires an "
+            "auxiliary STOP; fail-safe reservation retained"
+          )
+
+        RUN['estopActive'] = True
+        manual_auxiliary_stop_barrier.set()
+        if not isinstance(manual_auxiliary_request_queue, list):
+          raise RuntimeError("manual auxiliary request queue is invalid")
+        discarded = len(manual_auxiliary_request_queue)
+        manual_auxiliary_request_queue.clear()
+        program_request_id = RUN.get('programStopRequestId')
+        if (
+          program_request_id is not None
+          and (
+            isinstance(program_request_id, bool)
+            or not isinstance(program_request_id, int)
+            or program_request_id <= 0
+          )
+        ):
+          RUN['programStopRequestId'] = None
+          repaired_program_request = True
+        physical_request_id = main_controller_auxiliary_stop_request_id
+        if (
+          physical_request_id is not None
+          and (
+            isinstance(physical_request_id, bool)
+            or not isinstance(physical_request_id, int)
+            or physical_request_id <= 0
+          )
+        ):
+          raise RuntimeError(
+            "main-controller auxiliary stop request ID is invalid"
+          )
+        should_reserve_auxiliary_stop = (
+          not auxiliary_stop_not_required
+          or physical_request_id is not None
+          or auxiliary_stop_pending_request_id is not None
+          or auxiliary_stop_active_request_id is not None
+        )
+        if should_reserve_auxiliary_stop:
+          request_id = _reserve_auxiliary_stop_request_locked()
+          if physical_request_id is None:
+            main_controller_auxiliary_stop_request_id = request_id
+        else:
+          request_id = None
+
+        if request_id is not None:
+          RUN['programStopRequestId'] = request_id
+          stop_state = "pending"
+        elif RUN.get('programStopRequestId') is not None:
+          stop_state = "pending"
+        else:
+          stop_state = "completed"
+
+  if discarded:
+    logger.warning(
+      "Discarded %s queued manual auxiliary command(s): "
+      "main controller reported a physical E-stop",
+      discarded,
+    )
+  if repaired_program_request:
+    logger.error(
+      "Discarded an invalid prior program-stop request ID while "
+      "latching a physical E-stop"
+    )
+  try:
+    _set_program_stop_status(stop_state)
+  except Exception:
+    logger.exception(
+      "Unable to publish the latched physical E-stop status"
+    )
+  return True
+
+
+def _publish_main_controller_stop(context, position):
+  event = MainControllerStopEvent(context, position)
+  _latch_main_controller_stop_state(position)
+  main_controller_stop_event_queue.put(event)
+  try:
+    _try_dispatch_auxiliary_stop()
+  except Exception:
+    logger.exception(
+      "Unable to dispatch the reserved physical E-stop auxiliary STOP"
+    )
+  try:
+    _invalidate_joint_motion_state(
+      f"controller reported physical E-stop: {position.flag}"
+    )
+  except Exception:
+    logger.exception(
+      "Unable to invalidate joint motion after physical E-stop publication"
+    )
+  return True
+
+
+def _main_controller_idle_stop_error_detail(error):
+  if not isinstance(error, BaseException):
+    raise TypeError("idle main-controller stop error must be an exception")
+  detail = " ".join(str(error).split())
+  return detail or type(error).__name__
+
+
+def _queue_main_controller_idle_stop_result(
+  serial_port,
+  ownership,
+  *,
+  position=None,
+  error=None,
+):
+  if not isinstance(ownership, MainControllerIdleStopOwnership):
+    raise TypeError(
+      "idle main-controller stop result ownership is invalid"
+    )
+  error_detail = (
+    None
+    if error is None
+    else _main_controller_idle_stop_error_detail(error)
+  )
+  if position is None and error_detail is None and not ownership.complete:
+    try:
+      if ownership.release() is not True:
+        raise RuntimeError(
+          "idle main-controller stop ownership was already released"
+        )
+    except Exception as cleanup_error:
+      cleanup_detail = _main_controller_idle_stop_error_detail(cleanup_error)
+      error_detail = (
+        f"{error_detail}; ownership cleanup failed: {cleanup_detail}"
+        if error_detail is not None
+        else f"ownership cleanup failed: {cleanup_detail}"
+      )
+  if position is None and error_detail is None:
+    return False
+  try:
+    main_controller_idle_stop_result_queue.put(
+      MainControllerIdleStopReadResult(
+        serial_port,
+        ownership,
+        position=position,
+        error=error_detail,
+      )
+    )
+  except Exception:
+    if not ownership.complete:
+      try:
+        ownership.release()
+      except Exception:
+        logger.exception(
+          "Unable to release idle main-controller event ownership "
+          "after result publication failed"
+        )
+    raise
+  return True
+
+
+def _quarantine_main_controller_idle_stop_failure(serial_port, error):
+  detail = _main_controller_idle_stop_error_detail(error)
+  try:
+    quarantine_serial_transport(
+      serial_port,
+      "idle main-controller event framing is untrusted",
+    )
+  except Exception as quarantine_error:
+    quarantine_detail = _main_controller_idle_stop_error_detail(
+      quarantine_error
+    )
+    return RuntimeError(
+      f"{detail}; transport quarantine failed: {quarantine_detail}"
+    )
+  return RuntimeError(detail)
+
+
+def _consume_main_controller_idle_stop(serial_port, context):
+  def publish_idle_stop(candidate):
+    if (
+      not isinstance(candidate, PositionResponse)
+      or candidate.flag != CONTROLLER_ESTOP_EVENT_FLAG
+    ):
+      raise ProtocolResponseError(
+        "idle main-controller frame is not a standalone physical E-stop event"
+      )
+    return _publish_main_controller_stop(context, candidate)
+
+  position = read_pending_controller_estop_response(
+    serial_port,
+    publish_idle_stop,
+  )
+  if position is None:
+    raise ProtocolResponseError(
+      "idle main-controller buffer reported data without a complete frame"
+    )
+  if position.flag != CONTROLLER_ESTOP_EVENT_FLAG:
+    raise ProtocolResponseError(
+      "idle main-controller reader returned a non-event E-stop frame"
+    )
+  quarantine_serial_transport(
+    serial_port,
+    "idle main-controller physical E-stop requires reconnection",
+  )
+  return position
+
+
+def _run_main_controller_idle_stop_reader(
+  serial_port,
+  context,
+  ownership,
+):
+  position = None
+  error = None
+  try:
+    position = _consume_main_controller_idle_stop(serial_port, context)
+  except Exception as exc:
+    error = exc
+  _queue_main_controller_idle_stop_result(
+    serial_port,
+    ownership,
+    position=position,
+    error=error,
+  )
+
+
+def _try_start_main_controller_idle_stop_reader():
+  serial_port = RUN.get('ser')
+  if (
+    serial_port is None
+    or not getattr(serial_port, "is_open", False)
+    or serial_transport_quarantined(serial_port)
+  ):
+    return False
+  if not serial_lock.acquire(blocking=False):
+    return False
+
+  try:
+    if (
+      RUN.get('ser') is not serial_port
+      or not getattr(serial_port, "is_open", False)
+      or serial_transport_quarantined(serial_port)
+    ):
+      serial_lock.release()
+      return False
+    control_mode = serial_activity_registry.reserve_emergency_control("ser")
+  except Exception:
+    serial_lock.release()
+    raise
+  if control_mode is None:
+    serial_lock.release()
+    return False
+  if control_mode != SerialActivityRegistry.CONTROL_EXCLUSIVE:
+    try:
+      serial_activity_registry.finish_control("ser", control_mode)
+    finally:
+      serial_lock.release()
+    return False
+
+  ownership = MainControllerIdleStopOwnership(
+    serial_activity_registry,
+    serial_lock,
+    control_mode,
+  )
+  try:
+    context = _capture_main_controller_stop_context(serial_port)
+  except ConnectionError:
+    _queue_main_controller_idle_stop_result(serial_port, ownership)
+    return False
+  except Exception as exc:
+    failure = _quarantine_main_controller_idle_stop_failure(
+      serial_port,
+      exc,
+    )
+    _queue_main_controller_idle_stop_result(
+      serial_port,
+      ownership,
+      error=failure,
+    )
+    return False
+
+  try:
+    pending_bytes = serial_port.in_waiting
+    if (
+      isinstance(pending_bytes, bool)
+      or not isinstance(pending_bytes, int)
+      or pending_bytes < 0
+    ):
+      raise ProtocolResponseError(
+        "idle main-controller byte count is invalid"
+      )
+  except Exception as exc:
+    failure = _quarantine_main_controller_idle_stop_failure(
+      serial_port,
+      exc,
+    )
+    _queue_main_controller_idle_stop_result(
+      serial_port,
+      ownership,
+      error=failure,
+    )
+    return False
+  if pending_bytes == 0:
+    _queue_main_controller_idle_stop_result(serial_port, ownership)
+    return False
+
+  try:
+    worker = threading.Thread(
+      target=_run_main_controller_idle_stop_reader,
+      args=(serial_port, context, ownership),
+      name="ar4-main-controller-idle-stop",
+      daemon=True,
+    )
+    worker.start()
+  except Exception as exc:
+    failure = _quarantine_main_controller_idle_stop_failure(
+      serial_port,
+      exc,
+    )
+    _queue_main_controller_idle_stop_result(
+      serial_port,
+      ownership,
+      error=failure,
+    )
+    return False
+  return True
+
+
+def _apply_main_controller_idle_stop_results():
+  global main_controller_idle_stop_pending_result
+
+  applied = False
+  while True:
+    result = main_controller_idle_stop_pending_result
+    if result is None:
+      try:
+        result = main_controller_idle_stop_result_queue.get_nowait()
+      except Empty:
+        break
+      main_controller_idle_stop_pending_result = result
+    if not isinstance(result, MainControllerIdleStopReadResult):
+      raise RuntimeError(
+        "idle main-controller stop reader emitted an invalid result"
+      )
+    if not result.ownership.complete:
+      if result.ownership.release() is not True:
+        raise RuntimeError(
+          "idle main-controller stop ownership could not be settled"
+        )
+    if (
+      RUN.get('ser') is result.serial_port
+      and not getattr(result.serial_port, "is_open", False)
+    ):
+      _require_main_controller_identity_cleanup(
+        result.serial_port,
+        "idle main-controller stop handling",
+      )
+      RUN['ser'] = None
+    if result.error is not None:
+      message = (
+        "IDLE MAIN-CONTROLLER EVENT MONITOR FAILED: "
+        f"{result.error}"
+      )
+      logger.error(message)
+      _set_application_status(message, "Alarm.TLabel")
+      _invalidate_joint_motion_state(message)
+    applied = True
+    main_controller_idle_stop_pending_result = None
+  return applied
+
+
+def _raise_legacy_controller_stop(serial_port, response):
+  if not isinstance(response, ControllerLineExchangeResponse):
+    raise TypeError(
+      "legacy controller stop exchange response is invalid"
+    )
+  position = (
+    response.admission_position
+    if response.admission_position is not None
+    else response.estop_position
+  )
+  if not position_response_is_physical_estop(position):
+    raise TypeError(
+      "legacy controller stop exchange omitted a physical-stop position"
+    )
+  quarantine_serial_transport(
+    serial_port,
+    "legacy controller physical E-stop requires reconnection",
+  )
+  raise LegacyControllerPhysicalStop(position)
+
+
+def _prepare_main_controller_stop_exchange(serial_port):
+  stop_context = _capture_main_controller_stop_context(serial_port)
+
+  def publish_stop(position):
+    return _publish_main_controller_stop(stop_context, position)
+
+  pending_stop = read_pending_controller_estop_response(
+    serial_port,
+    publish_stop,
+  )
+  if pending_stop is not None:
+    _raise_legacy_controller_stop(
+      serial_port,
+      ControllerLineExchangeResponse(
+        None,
+        pending_stop,
+        (
+          "admission-estop"
+          if pending_stop.flag == CONTROLLER_ESTOP_ADMISSION_FLAG
+          else "estop-only"
+        ),
+      ),
+    )
+  return publish_stop
+
+
+def _prepare_startup_main_controller_stop_exchange(serial_port):
+  stop_context = _capture_startup_main_controller_stop_context(
+    serial_port
+  )
+
+  def publish_stop(position):
+    return _publish_main_controller_stop(stop_context, position)
+
+  pending_stop = read_pending_controller_estop_response(
+    serial_port,
+    publish_stop,
+  )
+  if pending_stop is not None:
+    _raise_legacy_controller_stop(
+      serial_port,
+      ControllerLineExchangeResponse(
+        None,
+        pending_stop,
+        (
+          "admission-estop"
+          if pending_stop.flag == CONTROLLER_ESTOP_ADMISSION_FLAG
+          else "estop-only"
+        ),
+      ),
+    )
+  return publish_stop
+
+
 def _exchange_legacy_main_command(
   command,
   *,
@@ -7541,6 +10359,13 @@ def _exchange_legacy_main_command(
   response_timeout=SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
   accepted_responses=None,
   expected_response=None,
+  write_started_event=None,
+  cancellation_event=None,
+  write_boundary_lock=None,
+  interim_response_handler=None,
+  interim_response_limit=None,
+  terminal_validator=None,
+  expected_serial_port=None,
 ):
   if not isinstance(read_line, bool):
     raise TypeError("read_line must be boolean")
@@ -7558,26 +10383,61 @@ def _exchange_legacy_main_command(
     raise MotionInputError(
       "accepted legacy responses require line-response ownership"
     )
+  if not read_line and (
+    interim_response_handler is not None
+    or interim_response_limit is not None
+    or terminal_validator is not None
+  ):
+    raise MotionInputError(
+      "exact legacy responses cannot use line-response handlers"
+    )
 
   serial_port = RUN.get('ser')
+  if (
+    expected_serial_port is not None
+    and serial_port is not expected_serial_port
+  ):
+    raise ConnectionError(
+      "main controller connection changed before legacy exchange"
+    )
   try:
+    publish_stop = _prepare_main_controller_stop_exchange(serial_port)
+    write_options = {
+      "write_lock": serial_write_lock,
+      "reset_input": False,
+      "write_started_event": write_started_event,
+    }
+    if cancellation_event is not None:
+      write_options["cancellation_event"] = cancellation_event
+    if write_boundary_lock is not None:
+      write_options["write_boundary_lock"] = write_boundary_lock
     write_serial_control(
       serial_port,
       command,
-      write_lock=serial_write_lock,
-      reset_input=True,
+      **write_options,
     )
     if read_line:
-      return read_serial_line_response(
+      response = read_controller_line_exchange_response(
         serial_port,
         response_timeout,
         accepted_responses=accepted_responses,
+        estop_callback=publish_stop,
+        interim_response_handler=interim_response_handler,
+        interim_response_limit=interim_response_limit,
+        terminal_validator=terminal_validator,
+        context="legacy controller line response",
       )
-    return read_serial_exact_response(
-      serial_port,
-      expected_response,
-      response_timeout,
-    )
+    else:
+      response = read_controller_exact_exchange_response(
+        serial_port,
+        expected_response,
+        response_timeout,
+        estop_callback=publish_stop,
+        context="legacy controller exact response",
+      )
+    if response.estop_position is not None:
+      _raise_legacy_controller_stop(serial_port, response)
+    return response.terminal_response
   finally:
     if (
       RUN.get('ser') is serial_port
@@ -7590,6 +10450,663 @@ def _exchange_legacy_main_command(
       )
 
 
+def _exchange_main_controller_line_until_cancelled(
+  serial_port,
+  command,
+  cancellation_event,
+  *,
+  write_started_event=None,
+  write_boundary_lock=None,
+  write_cancellation_event=None,
+):
+  publish_stop = _prepare_main_controller_stop_exchange(serial_port)
+  response = exchange_serial_line_until_cancelled(
+    serial_port,
+    command,
+    cancellation_event,
+    write_lock=serial_write_lock,
+    write_started_event=write_started_event,
+    write_boundary_lock=write_boundary_lock,
+    write_cancellation_event=write_cancellation_event,
+    reset_input=False,
+    estop_callback=publish_stop,
+  )
+  try:
+    position = parse_position_response(response)
+  except ProtocolResponseError:
+    return response
+  if position_response_is_physical_estop(position):
+    _raise_legacy_controller_stop(
+      serial_port,
+      ControllerLineExchangeResponse(
+        None,
+        position,
+        (
+          "admission-estop"
+          if position.flag == CONTROLLER_ESTOP_ADMISSION_FLAG
+          else "estop-only"
+        ),
+      ),
+    )
+  return response
+
+
+def _manual_controller_error_detail(error, fallback):
+  if (
+    not isinstance(fallback, str)
+    or not fallback.strip()
+    or fallback != fallback.strip()
+    or len(fallback) > MAX_RESPONSE_PAYLOAD_LENGTH
+  ):
+    raise TypeError("manual controller error fallback must be normalized text")
+  try:
+    detail = " ".join(str(error).split())
+  except Exception:
+    return fallback
+  if not detail or len(detail) > MAX_RESPONSE_PAYLOAD_LENGTH:
+    return fallback
+  return detail
+
+
+def _set_manual_controller_feedback(message):
+  if (
+    not isinstance(message, str)
+    or not message.strip()
+    or message != message.strip()
+    or "\r" in message
+    or "\n" in message
+  ):
+    raise TypeError("manual controller feedback must be normalized text")
+  MBoutputEntryField.delete(0, 'end')
+  MBoutputEntryField.insert(0, message)
+  return True
+
+
+def _render_manual_controller_rejection(message):
+  _set_manual_controller_feedback(message)
+  _set_manual_controller_status(message, "Alarm.TLabel")
+  return False
+
+
+def _set_manual_controller_status(message, style):
+  return _set_manual_auxiliary_status(message, style)
+
+
+def _manual_controller_operation():
+  with manual_controller_state_lock:
+    request = manual_controller_active_request
+    activity_lease = manual_controller_activity_lease
+  if not isinstance(request, ManualControllerRequest):
+    raise RuntimeError("manual controller active request is invalid")
+  if not callable(getattr(activity_lease, "close", None)):
+    raise RuntimeError("manual controller activity lease is invalid")
+  return request, activity_lease
+
+
+def _close_manual_controller_cleanup_transport(request, context):
+  if not isinstance(request, ManualControllerRequest):
+    raise TypeError("manual controller cleanup request is invalid")
+  if (
+    not isinstance(context, str)
+    or not context.strip()
+    or context != context.strip()
+    or "\r" in context
+    or "\n" in context
+  ):
+    raise TypeError("manual controller cleanup context is invalid")
+  quarantine_serial_transport(
+    request.serial_port,
+    f"{context} requires controller reconnection",
+  )
+  if getattr(request.serial_port, "is_open", False):
+    raise RuntimeError(
+      "manual controller cleanup transport remained open"
+    )
+  current_port = RUN.get('ser')
+  if current_port is not None and current_port is not request.serial_port:
+    raise RuntimeError(
+      "manual controller cleanup connection ownership changed"
+    )
+  if current_port is request.serial_port:
+    RUN['ser'] = None
+  _require_main_controller_identity_cleanup(
+    request.serial_port,
+    context,
+  )
+  return True
+
+
+def _retain_manual_controller_cleanup(cleanup):
+  global manual_controller_cleanup_pending
+
+  if not isinstance(cleanup, ManualControllerCleanup):
+    raise TypeError("retained manual controller cleanup is invalid")
+  if cleanup.complete:
+    raise RuntimeError(
+      "completed manual controller cleanup cannot be retained"
+    )
+  with manual_controller_cleanup_lock:
+    existing = manual_controller_cleanup_pending
+    if existing is not None and existing is not cleanup:
+      raise RuntimeError("manual controller cleanup ownership collided")
+    manual_controller_cleanup_pending = cleanup
+  return True
+
+
+def _manual_controller_connection_trusted(request):
+  if not isinstance(request, ManualControllerRequest):
+    raise TypeError("manual controller trust request is invalid")
+  return (
+    RUN.get('ser') is request.serial_port
+    and getattr(request.serial_port, "is_open", False)
+    and not serial_transport_quarantined(request.serial_port)
+  )
+
+
+def _finalize_manual_controller_cleanup(cleanup):
+  if not isinstance(cleanup, ManualControllerCleanup):
+    raise TypeError("manual controller settlement cleanup is invalid")
+  if not cleanup.resources_released:
+    raise RuntimeError(
+      "manual controller settlement requires released resources"
+    )
+
+  def replace_connection_loss():
+    current_port = RUN.get('ser')
+    if current_port not in (None, cleanup.request.serial_port):
+      raise RuntimeError(
+        "manual controller connection changed during settlement"
+      )
+    if getattr(cleanup.request.serial_port, "is_open", False):
+      quarantine_serial_transport(
+        cleanup.request.serial_port,
+        "manual controller connection lost during settlement",
+      )
+    if RUN.get('ser') is cleanup.request.serial_port:
+      RUN['ser'] = None
+    _require_main_controller_identity_cleanup(
+      cleanup.request.serial_port,
+      "manual controller connection-loss settlement",
+    )
+    _invalidate_joint_motion_state(
+      "manual controller connection lost during result settlement"
+    )
+    cleanup.replace_settlement(
+      "none",
+      ManualControllerPresentation(
+        (
+          "Controller connection lost during result settlement; "
+          "reconnect required"
+        ),
+        "CONTROLLER CONNECTION LOST; RECONNECTION REQUIRED",
+        "Alarm.TLabel",
+      ),
+    )
+
+  action = cleanup.settlement_action
+  if (
+    action in ("dispatch", "dispatch-ready")
+    and not _manual_controller_connection_trusted(cleanup.request)
+  ):
+    replace_connection_loss()
+
+  presentation = cleanup.settlement_presentation
+  if presentation is not None:
+    _set_manual_controller_feedback(presentation.feedback)
+    _set_manual_controller_status(
+      presentation.status,
+      presentation.style,
+    )
+
+  action = cleanup.settlement_action
+  if (
+    action in ("dispatch", "dispatch-ready")
+    and not _manual_controller_connection_trusted(cleanup.request)
+  ):
+    replace_connection_loss()
+    presentation = cleanup.settlement_presentation
+    _set_manual_controller_feedback(presentation.feedback)
+    _set_manual_controller_status(
+      presentation.status,
+      presentation.style,
+    )
+
+  if cleanup.settle() is not True:
+    raise RuntimeError(
+      "manual controller settlement ownership was already released"
+    )
+  return True
+
+
+def _retry_manual_controller_cleanup():
+  global manual_controller_cleanup_pending
+
+  with manual_controller_cleanup_lock:
+    cleanup = manual_controller_cleanup_pending
+  if cleanup is None:
+    return True
+  if not isinstance(cleanup, ManualControllerCleanup):
+    raise RuntimeError("pending manual controller cleanup is invalid")
+  try:
+    if cleanup.release() is not True:
+      raise RuntimeError("manual controller resource cleanup did not settle")
+    if _finalize_manual_controller_cleanup(cleanup) is not True:
+      raise RuntimeError("manual controller result settlement did not finish")
+    if not cleanup.complete:
+      raise RuntimeError("manual controller cleanup remained incomplete")
+  except Exception as exc:
+    cleanup.record_failure(exc)
+    return False
+  with manual_controller_cleanup_lock:
+    if manual_controller_cleanup_pending is not cleanup:
+      raise RuntimeError("manual controller cleanup ownership changed")
+    manual_controller_cleanup_pending = None
+  return True
+
+
+def _release_manual_controller_operation(
+  *,
+  close_required=False,
+  close_context="manual controller cleanup",
+  settlement_action="none",
+  settlement_presentation=None,
+):
+  with manual_controller_cleanup_lock:
+    pending_cleanup = manual_controller_cleanup_pending
+  if pending_cleanup is not None:
+    if not isinstance(pending_cleanup, ManualControllerCleanup):
+      raise RuntimeError("pending manual controller cleanup is invalid")
+    request = pending_cleanup.request
+    if close_required:
+      pending_cleanup.require_close(close_context)
+    if not _retry_manual_controller_cleanup():
+      detail = (
+        pending_cleanup.last_error
+        or "cleanup retry failed without details"
+      )
+      raise RuntimeError(
+        f"manual controller cleanup remains pending: {detail}"
+      )
+    return request
+
+  request, activity_lease = _manual_controller_operation()
+  cleanup = ManualControllerCleanup(
+    request,
+    activity_lease,
+    close_required=close_required,
+    close_context=close_context,
+    settlement_action=settlement_action,
+    settlement_presentation=settlement_presentation,
+  )
+  _retain_manual_controller_cleanup(cleanup)
+  if not _retry_manual_controller_cleanup():
+    detail = (
+      cleanup.last_error
+      or "cleanup retry failed without details"
+    )
+    raise RuntimeError(
+      f"manual controller cleanup retained for retry: {detail}"
+    )
+  return request
+
+
+def _publish_manual_controller_estop(request, position):
+  global manual_controller_pending_stop_event
+
+  if not isinstance(request, ManualControllerRequest):
+    raise TypeError("manual controller E-stop request is invalid")
+  event = ManualControllerStopEvent(request.request_id, position)
+  _latch_main_controller_stop_state(position)
+  with manual_controller_state_lock:
+    if manual_controller_active_request is not request:
+      raise RuntimeError(
+        "manual controller E-stop request ownership changed"
+      )
+    if (
+      manual_controller_pending_stop_event is not None
+      or manual_controller_estop_applied_request_id is not None
+      or manual_controller_estop_applied_position is not None
+    ):
+      raise RuntimeError("manual controller E-stop event was duplicated")
+    manual_controller_pending_stop_event = event
+  try:
+    _try_dispatch_auxiliary_stop()
+  except Exception:
+    logger.exception(
+      "Unable to dispatch the reserved manual-controller E-stop "
+      "auxiliary STOP"
+    )
+  try:
+    _invalidate_joint_motion_state(
+      f"controller reported physical E-stop: {position.flag}"
+    )
+  except Exception:
+    logger.exception(
+      "Unable to invalidate joint motion after manual-controller "
+      "E-stop publication"
+    )
+  return True
+
+
+def _exchange_manual_controller_request(request, serial_write_started_event):
+  if not isinstance(request, ManualControllerRequest):
+    raise TypeError("manual controller worker request is invalid")
+  if (
+    not callable(getattr(serial_write_started_event, "set", None))
+    or not callable(getattr(serial_write_started_event, "is_set", None))
+  ):
+    raise TypeError(
+      "manual controller serial write event is invalid"
+    )
+  if RUN.get('ser') is not request.serial_port:
+    raise ConnectionError(
+      "manual controller connection changed before request dispatch"
+    )
+  try:
+    pending_estop = read_pending_controller_estop_response(
+      request.serial_port,
+      lambda position: _publish_manual_controller_estop(
+        request,
+        position,
+      ),
+    )
+    if (
+      pending_estop is not None
+      and (
+        not isinstance(pending_estop, PositionResponse)
+        or not position_response_is_physical_estop(pending_estop)
+      )
+    ):
+      raise TypeError(
+        "pending manual controller E-stop response is invalid"
+      )
+  except (SerialTransportQuarantinedError, SerialTransportTimeout):
+    raise
+  except Exception as exc:
+    detail = _manual_controller_error_detail(
+      exc,
+      "pre-write response ownership failed without details",
+    )
+    try:
+      quarantine_serial_transport(
+        request.serial_port,
+        f"manual controller pre-write ownership failed: {detail}",
+      )
+    except SerialTransportQuarantinedError as quarantine_error:
+      raise quarantine_error from exc
+    raise
+  if pending_estop is not None:
+    frame_order = (
+      "admission-estop"
+      if pending_estop.flag == CONTROLLER_ESTOP_ADMISSION_FLAG
+      else "estop-only"
+    )
+    return ManualControllerResult(
+      request.request_id,
+      "estop",
+      "PHYSICAL E-STOP RECEIVED BEFORE COMMAND TRANSMISSION",
+      False,
+      pending_estop,
+      frame_order,
+    )
+  write_serial_control(
+    request.serial_port,
+    request.command,
+    write_lock=serial_write_lock,
+    reset_input=False,
+    write_started_event=serial_write_started_event,
+  )
+  try:
+    exchange = read_controller_modbus_exchange_response(
+      request.serial_port,
+      request.command,
+      SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+      lambda position: _publish_manual_controller_estop(
+        request,
+        position,
+      ),
+    )
+    if not isinstance(exchange, ControllerModbusExchangeResponse):
+      raise TypeError("manual controller exchange response is invalid")
+  except (SerialTransportQuarantinedError, SerialTransportTimeout):
+    raise
+  except Exception as exc:
+    detail = _manual_controller_error_detail(
+      exc,
+      "response ownership failed without details",
+    )
+    try:
+      quarantine_serial_transport(
+        request.serial_port,
+        f"manual controller response ownership failed: {detail}",
+      )
+    except SerialTransportQuarantinedError as quarantine_error:
+      raise quarantine_error from exc
+    raise
+  if exchange.estop_position is not None:
+    response_value = exchange.terminal_response
+    if response_value is None:
+      response_value = "PHYSICAL E-STOP BLOCKED COMMAND ADMISSION"
+    return ManualControllerResult(
+      request.request_id,
+      "estop",
+      response_value,
+      True,
+      exchange.estop_position,
+      exchange.frame_order,
+      exchange.admission_position,
+    )
+  outcome = classify_controller_modbus_terminal_response(
+    request.command,
+    exchange.terminal_response,
+  )
+  return ManualControllerResult(
+    request.request_id,
+    outcome,
+    exchange.terminal_response,
+    True,
+  )
+
+
+def _run_manual_controller_request(request):
+  serial_write_started_event = threading.Event()
+  try:
+    result = _exchange_manual_controller_request(
+      request,
+      serial_write_started_event,
+    )
+  except Exception as exc:
+    message = _manual_controller_error_detail(
+      exc,
+      "manual controller command failed without details",
+    )
+    request_id = getattr(request, "request_id", None)
+    if (
+      isinstance(request_id, bool)
+      or not isinstance(request_id, int)
+      or request_id <= 0
+    ):
+      manual_controller_event_queue.put(None)
+      return
+    serial_write_started = serial_write_started_event.is_set()
+    outcome = "failed"
+    if (
+      serial_write_started
+      and isinstance(request, ManualControllerRequest)
+      and controller_modbus_command_is_write(request.command)
+    ):
+      outcome = "indeterminate"
+    result = ManualControllerResult(
+      request_id,
+      outcome,
+      message,
+      serial_write_started,
+    )
+  manual_controller_event_queue.put(result)
+
+
+def _start_manual_controller_request(command):
+  global manual_controller_active_request
+  global manual_controller_activity_lease
+  global manual_controller_next_request_id
+  global manual_controller_program_admission_active
+
+  if application_closing.is_set():
+    return _render_manual_controller_rejection(
+      "CONTROLLER I/O REJECTED DURING SHUTDOWN"
+    )
+  if RUN['offlineMode']:
+    return _render_manual_controller_rejection(
+      "CONTROLLER I/O REQUIRES AN ONLINE CONTROLLER"
+    )
+  if _program_execution_active():
+    return _render_manual_controller_rejection(
+      "CONTROLLER I/O REJECTED WHILE A PROGRAM IS RUNNING"
+    )
+  with manual_controller_cleanup_lock:
+    cleanup_pending = manual_controller_cleanup_pending is not None
+  if cleanup_pending:
+    return _render_manual_controller_rejection(
+      "CONTROLLER I/O REJECTED WHILE CLEANUP IS PENDING"
+    )
+  try:
+    validate_controller_modbus_command(command)
+    mutates_external_state = controller_modbus_command_is_write(command)
+  except Exception as exc:
+    detail = _manual_controller_error_detail(
+      exc,
+      "command validation failed without details",
+    )
+    return _render_manual_controller_rejection(
+      f"Controller I/O rejected: {detail}"
+    )
+
+  if not serial_lock.acquire(blocking=False):
+    return _render_manual_controller_rejection(
+      "CONTROLLER I/O REJECTED WHILE TRANSPORT IS BUSY"
+    )
+
+  activity_lease = None
+  state_assigned = False
+  program_admission_assigned = False
+  try:
+    with program_execution_state_lock:
+      if (
+        program_execution_active_request is not None
+        or gcode_conversion_active.is_set()
+        or gcode_storage_program_admission_active
+        or manual_controller_program_admission_active
+      ):
+        raise SerialActivityRejected(
+          "manual controller I/O rejected during program activity"
+        )
+      if mutates_external_state:
+        with auxiliary_stop_state_lock:
+          with program_stop_state_lock:
+            stop_reason = _stop_admission_reason_locked(
+              "CONTROLLER WRITE"
+            )
+        if stop_reason is not None:
+          raise SerialActivityRejected(stop_reason)
+      manual_controller_program_admission_active = True
+      program_admission_assigned = True
+    serial_port = RUN.get('ser')
+    with manual_controller_state_lock:
+      if (
+        manual_controller_active_request is not None
+        or manual_controller_activity_lease is not None
+      ):
+        raise RuntimeError("manual controller request ownership is already active")
+      if (
+        manual_controller_pending_stop_event is not None
+        or manual_controller_estop_applied_request_id is not None
+        or manual_controller_estop_applied_position is not None
+      ):
+        raise RuntimeError(
+          "manual controller E-stop application state is already active"
+        )
+      if (
+        isinstance(manual_controller_next_request_id, bool)
+        or not isinstance(manual_controller_next_request_id, int)
+        or manual_controller_next_request_id < 0
+      ):
+        raise RuntimeError("manual controller request counter is invalid")
+      request_id = manual_controller_next_request_id + 1
+      request = ManualControllerRequest(
+        request_id,
+        serial_port,
+        command,
+      )
+      worker = threading.Thread(
+        target=_run_manual_controller_request,
+        args=(request,),
+        daemon=True,
+      )
+      activity_lease = serial_activity_registry.lease("ser")
+      manual_controller_next_request_id = request_id
+      manual_controller_active_request = request
+      manual_controller_activity_lease = activity_lease
+      state_assigned = True
+    legacy_serial_result_pending.set()
+    worker.start()
+  except Exception as exc:
+    if state_assigned:
+      try:
+        _release_manual_controller_operation()
+      except Exception:
+        logger.exception(
+          "Unable to release failed manual controller startup ownership"
+        )
+    else:
+      if serial_lock.locked():
+        serial_lock.release()
+      if activity_lease is not None:
+        try:
+          if activity_lease.close() is not True:
+            raise RuntimeError("serial activity lease was already released")
+        except Exception:
+          logger.exception(
+            "Unable to release failed manual controller startup activity"
+          )
+      if program_admission_assigned:
+        with program_execution_state_lock:
+          manual_controller_program_admission_active = False
+    detail = _manual_controller_error_detail(
+      exc,
+      "worker startup failed without details",
+    )
+    message = f"Unable to start controller I/O worker: {detail}"
+    logger.exception(message)
+    return _render_manual_controller_rejection(message)
+
+  cmdSentEntryField.delete(0, 'end')
+  cmdSentEntryField.insert(0, command)
+  _set_manual_controller_status(
+    "CONTROLLER I/O IN PROGRESS",
+    "Warn.TLabel",
+  )
+  return True
+
+
+def _request_manual_modbus(opcode):
+  try:
+    command = build_controller_modbus_command(
+      opcode,
+      MBslaveEntryField.get(),
+      MBaddressEntryField.get(),
+      MBoperValEntryField.get(),
+    )
+  except Exception as exc:
+    detail = _manual_controller_error_detail(
+      exc,
+      "entry validation failed without details",
+    )
+    message = f"Controller I/O rejected: {detail}"
+    logger.error(message)
+    return _render_manual_controller_rejection(message)
+  return _start_manual_controller_request(command)
+
+
 @_synchronous_motion_request(
   "Program controller command",
   rejection_result=(ROW_EXECUTION_REJECTED, None),
@@ -7600,13 +11117,40 @@ def _exchange_legacy_main_command(
   rejection_result=(ROW_EXECUTION_REJECTED, None),
 )
 def _execute_row_main_command(command, **response_contract):
+  execution_request = _active_program_execution_request()
+  if _program_execution_request_cancelled(execution_request):
+    _abort_program_row_execution()
+    return ROW_EXECUTION_REJECTED, None
+  cancellation_options = (
+    "write_started_event",
+    "cancellation_event",
+    "write_boundary_lock",
+  )
+  if any(option in response_contract for option in cancellation_options):
+    raise MotionInputError(
+      "program row response contract cannot replace cancellation ownership"
+    )
+  write_started_event = threading.Event()
   try:
-    response = _exchange_legacy_main_command(command, **response_contract)
+    response = _exchange_legacy_main_command(
+      command,
+      write_started_event=write_started_event,
+      cancellation_event=execution_request.cancellation_boundary,
+      write_boundary_lock=execution_request.cancellation_boundary,
+      **response_contract,
+    )
+  except LegacyControllerPhysicalStop:
+    logger.warning(
+      "Program controller command stopped by the physical E-stop"
+    )
+    return ROW_EXECUTION_REJECTED, None
   except Exception as exc:
     message = f"Program controller command failed: {exc}"
     logger.exception(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
+    return ROW_EXECUTION_REJECTED, None
+  if _program_execution_request_cancelled(execution_request):
+    _abort_program_row_execution()
     return ROW_EXECUTION_REJECTED, None
   return ROW_EXECUTION_COMPLETE, response
 
@@ -7632,11 +11176,104 @@ def _execute_row_main_response(
     except ProtocolResponseError as exc:
       message = f"Program controller response rejected: {exc}"
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(message, "Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED, None
   return execution_state, response
+
+
+def _reject_indeterminate_program_modbus_write(command, response):
+  if not controller_modbus_command_is_write(command):
+    raise MotionInputError(
+      "indeterminate program Modbus settlement requires a write command"
+    )
+  if (
+    not isinstance(response, str)
+    or not response
+    or response != response.strip()
+    or "\r" in response
+    or "\n" in response
+    or len(response) > MAX_RESPONSE_PAYLOAD_LENGTH
+  ):
+    raise ProtocolResponseError(
+      "indeterminate program Modbus response is invalid"
+    )
+  try:
+    response.encode("ascii")
+  except UnicodeEncodeError as exc:
+    raise ProtocolResponseError(
+      "indeterminate program Modbus response must contain ASCII text"
+    ) from exc
+
+  opcode = command[:2]
+  reason = f"program Modbus {opcode} external write outcome is unknown"
+  cleanup_errors = []
+  try:
+    if not _close_serial_port(
+      'ser',
+      reason,
+      quarantine=True,
+    ):
+      cleanup_errors.append(
+        "main controller quarantine remains pending"
+      )
+  except Exception as exc:
+    detail = " ".join(str(exc).split()) or type(exc).__name__
+    cleanup_errors.append(detail)
+  try:
+    _invalidate_joint_motion_state(reason)
+  except Exception as exc:
+    detail = " ".join(str(exc).split()) or type(exc).__name__
+    cleanup_errors.append(detail)
+
+  message = (
+    f"Program Modbus {opcode} write outcome unknown ({response}); "
+    "reconnect and verify external device state"
+  )
+  if cleanup_errors:
+    message = f"{message}; cleanup pending: {'; '.join(cleanup_errors)}"
+  logger.error(message)
+  _set_application_status(message, "Alarm.TLabel")
+  _finish_execute_row()
+  return ROW_EXECUTION_REJECTED, None
+
+
+def _execute_row_main_modbus_write_response(command):
+  if (
+    not controller_modbus_command_is_write(command)
+    or command[:2] not in ("SC", "SO")
+  ):
+    raise MotionInputError(
+      "program Modbus write response requires an SC or SO command"
+    )
+  execution_state, response = _execute_row_main_command(command)
+  if execution_state != ROW_EXECUTION_COMPLETE:
+    _finish_execute_row()
+    return execution_state, None
+  try:
+    outcome = classify_controller_modbus_terminal_response(
+      command,
+      response,
+    )
+  except ProtocolResponseError:
+    return _reject_indeterminate_program_modbus_write(
+      command,
+      response,
+    )
+  if outcome == "completed":
+    return execution_state, response
+  if outcome == "indeterminate":
+    return _reject_indeterminate_program_modbus_write(
+      command,
+      response,
+    )
+  if outcome != "rejected":
+    raise RuntimeError("program Modbus write outcome is invalid")
+  message = f"Program controller write rejected: {response}"
+  logger.error(message)
+  _set_application_status(message, "Alarm.TLabel")
+  _finish_execute_row()
+  return ROW_EXECUTION_REJECTED, None
 
 
 def _apply_controller_position_response(response):
@@ -7668,6 +11305,13 @@ def _abort_program_row_execution():
     RUN['rowinproc'] = 0
 
 
+def _reject_cancelled_program_row(execution_request):
+  if not _program_execution_request_cancelled(execution_request):
+    return False
+  _abort_program_row_execution()
+  return True
+
+
 def _execute_row_auxiliary_command(
   command,
   *,
@@ -7677,6 +11321,7 @@ def _execute_row_auxiliary_command(
   response_timeout=SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
   accepted_responses=None,
   expected_response=None,
+  response_parser=None,
 ):
   if not isinstance(read_line, bool):
     raise TypeError("read_line must be boolean")
@@ -7705,6 +11350,16 @@ def _execute_row_auxiliary_command(
     raise MotionInputError(
       "accepted auxiliary responses require line-response ownership"
     )
+  if response_parser is not None and not callable(response_parser):
+    raise TypeError("auxiliary response parser must be callable")
+  if not read_line and response_parser is not None:
+    raise MotionInputError(
+      "auxiliary response parsers require line-response ownership"
+    )
+  if accepted_responses is not None and response_parser is not None:
+    raise MotionInputError(
+      "auxiliary line responses require one validation contract"
+    )
   if expected_response is not None and (
     not isinstance(expected_response, bytes)
     or not expected_response
@@ -7721,6 +11376,10 @@ def _execute_row_auxiliary_command(
     with _tracked_auxiliary_operation(
       control_injectable=control_injectable,
     ):
+      if _active_program_execution_cancelled():
+        raise SerialActivityRejected(
+          "program auxiliary command cancelled by stop admission"
+        )
       _write_legacy_auxiliary_command(command)
       time.sleep(response_delay)
       serial_port = RUN.get('ser2')
@@ -7755,6 +11414,8 @@ def _execute_row_auxiliary_command(
                 accepted_responses=accepted_responses,
               )
               stop_response = None
+            if response_parser is not None:
+              response = response_parser(command, response)
           except Exception as exc:
             if control_injectable:
               _publish_auxiliary_stop_owner_result(False, str(exc))
@@ -7790,11 +11451,16 @@ def _execute_row_auxiliary_command(
     logger.warning("Program auxiliary command rejected: %s", exc)
     _finish_execute_row()
     return ROW_EXECUTION_REJECTED, None
+  except ProtocolResponseError as exc:
+    message = f"Program auxiliary response rejected: {exc}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    _finish_execute_row()
+    return ROW_EXECUTION_REJECTED, None
   except Exception as exc:
     message = f"Program auxiliary command failed: {exc}"
     logger.exception(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
     _finish_execute_row()
     return ROW_EXECUTION_REJECTED, None
   return ROW_EXECUTION_COMPLETE, response
@@ -7806,10 +11472,12 @@ def _auxiliary_wait_timeout_seconds(value):
   text = str(value).strip()
   if not re.fullmatch(r"[0-9]+", text):
     raise MotionInputError(
-      "auxiliary wait timeout must be a non-negative integer"
+      "auxiliary wait timeout must be a positive integer"
     )
   timeout = int(text)
-  if timeout > AUXILIARY_FIRMWARE_SIGNED_INT_MAX:
+  if timeout == 0:
+    raise MotionInputError("auxiliary wait timeout must be a positive integer")
+  if timeout > AUXILIARY_WAIT_MAXIMUM_SECONDS:
     raise MotionInputError("auxiliary wait timeout exceeds the firmware range")
   return timeout
 
@@ -7832,6 +11500,36 @@ def _main_modbus_wait_timeout_seconds(value):
       "controller Modbus wait timeout exceeds the firmware range"
     )
   return timeout
+
+
+def _build_program_modbus_register_read(
+  opcode,
+  slave_id,
+  address,
+  quantity,
+):
+  if opcode not in ("BH", "BD"):
+    raise MotionInputError(
+      "program Modbus register-read opcode is unsupported"
+    )
+  try:
+    return build_controller_modbus_command(
+      opcode,
+      slave_id,
+      address,
+      quantity,
+    )
+  except MotionInputError as exc:
+    quantity_text = str(quantity).strip()
+    if (
+      re.fullmatch(r"[0-9]+", quantity_text) is not None
+      and int(quantity_text) > 1
+    ):
+      raise MotionInputError(
+        "legacy multi-register read requires migration: split the row "
+        "into one row per register with Num Reg's (1)"
+      ) from exc
+    raise
 
 
 def _main_timed_wait_seconds(value):
@@ -7862,6 +11560,170 @@ def _finish_step_reverse_selection(sel_row):
   except Exception:
     curRowEntryField.delete(0, 'end')
     curRowEntryField.insert(0, "---")
+
+
+def _apply_program_selection_event(event):
+  if not isinstance(event, ProgramSelectionEvent):
+    raise TypeError("program selection event is invalid")
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "program selection commitment must run on the Tk event thread"
+    )
+  if (
+    application_closing.is_set()
+    or _program_execution_request_cancelled(event.execution_request)
+  ):
+    return ProgramSelectionResult(False)
+
+  selected_rows = tuple(tab1.progView.curselection())
+  if len(selected_rows) > 1:
+    raise RuntimeError(
+      "program execution requires at most one selected row"
+    )
+  last_row = tab1.progView.index('end')
+  if (
+    isinstance(last_row, bool)
+    or not isinstance(last_row, int)
+    or last_row <= 0
+  ):
+    raise RuntimeError("robot program view has no executable rows")
+  if selected_rows and (
+    isinstance(selected_rows[0], bool)
+    or not isinstance(selected_rows[0], int)
+    or not 0 <= selected_rows[0] < last_row
+  ):
+    raise RuntimeError("robot program selection is out of range")
+
+  if event.action == PROGRAM_SELECTION_INITIALIZE_RUN:
+    for row in range(0, last_row):
+      tab1.progView.itemconfig(row, {'fg': "#FFFFFF"})
+    if not selected_rows:
+      if last_row <= 1:
+        raise RuntimeError("robot program view has no executable row")
+      tab1.progView.selection_clear(0, END)
+      tab1.progView.select_set(1)
+      if tuple(tab1.progView.curselection()) != (1,):
+        raise RuntimeError("program execution could not select the first row")
+    return ProgramSelectionResult(True)
+
+  if event.action == PROGRAM_SELECTION_PREPARE_RUN:
+    if selected_rows:
+      return ProgramSelectionResult(True)
+    if tab1.lastProg == "":
+      index = _program_row_index(
+        tab1.progView.get(0, "end"),
+        "## START PROGRAM LOOP ##",
+      )
+      tab1.progView.selection_clear(0, END)
+      tab1.progView.select_set(index)
+      if tuple(tab1.progView.curselection()) != (index,):
+        raise RuntimeError(
+          "program execution could not select the program-loop entry"
+        )
+      return ProgramSelectionResult(True)
+    if (
+      not isinstance(tab1.lastProg, str)
+      or not tab1.lastProg
+      or "\r" in tab1.lastProg
+      or "\n" in tab1.lastProg
+      or isinstance(tab1.lastRow, bool)
+      or not isinstance(tab1.lastRow, int)
+      or tab1.lastRow < -1
+    ):
+      raise RuntimeError("program caller return state is invalid")
+    return ProgramSelectionResult(
+      True,
+      (tab1.lastProg, tab1.lastRow + 1),
+    )
+
+  if event.action != PROGRAM_SELECTION_ADVANCE:
+    raise RuntimeError("program selection action was not implemented")
+  if len(selected_rows) != 1:
+    raise RuntimeError(
+      "completed program row does not have one selected row"
+    )
+  selected_row = selected_rows[0]
+
+  next_row = selected_row + 1
+  tab1.progView.selection_clear(0, END)
+  if next_row < last_row:
+    tab1.progView.select_set(next_row)
+    expected_selection = (next_row,)
+    displayed_row = next_row
+  else:
+    expected_selection = ()
+    displayed_row = "---"
+  if tuple(tab1.progView.curselection()) != expected_selection:
+    raise RuntimeError(
+      "program selection did not advance after the completed row"
+    )
+
+  try:
+    curRowEntryField.delete(0, 'end')
+    curRowEntryField.insert(0, displayed_row)
+  except Exception:
+    logger.exception("Unable to update the current program-row display")
+
+  if event.style_rows:
+    try:
+      for row in range(0, selected_row):
+        tab1.progView.itemconfig(row, {'fg': "#1E90FF"})
+      tab1.progView.itemconfig(selected_row, {'fg': "#0561BD"})
+      for row in range(selected_row + 1, last_row):
+        tab1.progView.itemconfig(row, {'fg': "#9E9E9E"})
+    except Exception:
+      logger.exception("Unable to update Step Forward row styling")
+  return ProgramSelectionResult(True)
+
+
+def _settle_program_selection(event):
+  if not isinstance(event, ProgramSelectionEvent):
+    raise TypeError("program selection event is invalid")
+  try:
+    result = _apply_program_selection_event(event)
+  except Exception as exc:
+    event.settle(error=exc)
+    logger.exception("Unable to apply a program selection event")
+    return False
+  except BaseException as exc:
+    event.settle(
+      error=RuntimeError(
+        "program selection event aborted by "
+        f"{type(exc).__name__}"
+      )
+    )
+    raise
+  event.settle(result=result)
+  return True
+
+
+def _poll_program_selection_events():
+  try:
+    _apply_requested_robot_program_return_state_clear()
+    while True:
+      try:
+        event = program_selection_event_queue.get_nowait()
+      except Empty:
+        break
+      _settle_program_selection(event)
+  except Exception:
+    logger.exception("Unable to settle a program selection event")
+  finally:
+    _reschedule_event_poll("program-selection")
+
+
+def _dispatch_program_selection(event):
+  if not isinstance(event, ProgramSelectionEvent):
+    raise TypeError("program selection dispatch is invalid")
+  if threading.get_ident() == application_tk_thread_id:
+    _settle_program_selection(event)
+    return event.wait()
+  with application_lifecycle_lock:
+    if application_closing.is_set():
+      event.settle(result=ProgramSelectionResult(False))
+    else:
+      program_selection_event_queue.put(event)
+  return event.wait()
 
 
 def _virtual_motion_active(ignored_request_lease=None):
@@ -7983,8 +11845,7 @@ def _manual_motion_request(name):
         message = _motion_request_rejection_message(
           f"{name} not started; another motion request is active"
         )
-        almStatusLab.config(text=message, style="Warn.TLabel")
-        almStatusLab2.config(text=message, style="Warn.TLabel")
+        _set_application_status(message, "Warn.TLabel")
         return False
       if getattr(manual_motion_request_state, "lease", None) is not None:
         _finish_motion_request(request_lease)
@@ -8032,8 +11893,7 @@ def _start_manual_motion(
   except (TypeError, ValueError, MotionInputError) as exc:
     message = f"{motion_name} rejected because the wrist mode is invalid: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
     return False
 
   try:
@@ -8051,8 +11911,7 @@ def _start_manual_motion(
   except (KeyError, TypeError, ValueError, MotionInputError) as exc:
     message = f"{motion_name} rejected because the confirmed pose is invalid: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
     return False
 
   def apply_confirmed_pose(controller_positions, virtual_pose):
@@ -8092,15 +11951,13 @@ def _start_manual_motion(
     restore_untransmitted_preview()
     message = f"{motion_name} virtual preview did not start: {exc}"
     logger.exception(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
     return False
   if not isinstance(virtual_operation, VirtualMotionOperation):
     restore_untransmitted_preview()
     message = f"{motion_name} virtual preview did not publish an operation"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
     return False
   if virtual_operation.completed:
     virtual_succeeded, virtual_error = virtual_operation.result()
@@ -8108,8 +11965,7 @@ def _start_manual_motion(
       restore_untransmitted_preview()
       message = f"{motion_name} virtual preview failed: {virtual_error}"
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(message, "Alarm.TLabel")
       return False
 
   virtual_completion_deadline = time.monotonic() + virtual_completion_timeout
@@ -8165,8 +12021,7 @@ def _start_manual_motion(
   def complete_manual_motion(succeeded):
     if succeeded:
       if not controller_state["speed_violation"]:
-        almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
-        almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+        _set_application_status("SYSTEM READY", "OK.TLabel")
       return
     if controller_position_resynchronization_required.is_set():
       message = (
@@ -8175,8 +12030,7 @@ def _start_manual_motion(
     else:
       message = f"{motion_name} failed during controller or virtual settlement"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
 
   def settle(controller_position):
     if physical_command is None:
@@ -8466,6 +12320,7 @@ def _start_legacy_motion(
   completion_callback=None,
   request_lease=None,
   write_started_event=None,
+  write_cancellation_boundary=None,
 ):
   if not motion_request_registry.owns(request_lease):
     raise RuntimeError("legacy motion requires matching request ownership")
@@ -8473,12 +12328,12 @@ def _start_legacy_motion(
     command,
     completion_callback=completion_callback,
     write_started_event=write_started_event,
+    write_cancellation_boundary=write_cancellation_boundary,
   ):
     return True
   message = f"{motion_name} not started; controller transport is unavailable"
   logger.warning(message)
-  almStatusLab.config(text=message, style="Warn.TLabel")
-  almStatusLab2.config(text=message, style="Warn.TLabel")
+  _set_application_status(text=message, style="Warn.TLabel")
   return False
 
 
@@ -8594,13 +12449,11 @@ def _reconcile_program_motion_pose(
       )
       _invalidate_joint_motion_state(message)
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
   elif not pose_confirmed:
     message = "Offline program motion could not restore the confirmed virtual pose"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
 
   return motion_succeeded and pose_confirmed
 
@@ -8608,11 +12461,13 @@ def _reconcile_program_motion_pose(
 def _dispatch_program_controller_sequence(commands, completion_callback):
   if completion_callback is not None and not callable(completion_callback):
     raise TypeError("program motion completion callback must be callable")
+  execution_request = _active_program_execution_request()
+  if _program_execution_request_cancelled(execution_request):
+    return ROW_EXECUTION_REJECTED
   if RUN['offlineMode']:
     message = "Program motion requires virtual playback while offline"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return ROW_EXECUTION_REJECTED
   if isinstance(commands, (str, bytes)):
     commands = (commands,)
@@ -8639,8 +12494,7 @@ def _dispatch_program_controller_sequence(commands, completion_callback):
   except Exception as exc:
     message = f"Program motion sequence rejected: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return ROW_EXECUTION_REJECTED
 
   request_lease = _acquire_motion_request("Program motion")
@@ -8649,8 +12503,7 @@ def _dispatch_program_controller_sequence(commands, completion_callback):
       "Program motion not started; another motion request is active"
     )
     logger.warning(message)
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(text=message, style="Warn.TLabel")
     return ROW_EXECUTION_REJECTED
 
   try:
@@ -8658,8 +12511,7 @@ def _dispatch_program_controller_sequence(commands, completion_callback):
   except (KeyError, TypeError, ValueError, MotionInputError) as exc:
     message = f"Program motion rejected because the confirmed pose is invalid: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     _finish_motion_request(request_lease)
     return ROW_EXECUTION_REJECTED
 
@@ -8695,6 +12547,8 @@ def _dispatch_program_controller_sequence(commands, completion_callback):
     )
 
   def start_command(index):
+    if _program_execution_request_cancelled(execution_request):
+      return False
     controller_write_started.clear()
 
     def complete_command(controller_position):
@@ -8713,6 +12567,9 @@ def _dispatch_program_controller_sequence(commands, completion_callback):
         finalize_sequence(False)
         return
       controller_result["position"] = controller_position
+      if _program_execution_request_cancelled(execution_request):
+        finalize_sequence(False)
+        return
       next_index = index + 1
       if next_index >= len(commands):
         finalize_sequence(True)
@@ -8727,6 +12584,9 @@ def _dispatch_program_controller_sequence(commands, completion_callback):
         completion_callback=complete_command,
         request_lease=request_lease,
         write_started_event=controller_write_started,
+        write_cancellation_boundary=(
+          execution_request.cancellation_boundary
+        ),
       )
     except Exception:
       logger.exception("Program motion controller worker failed during startup")
@@ -8758,6 +12618,9 @@ def _dispatch_program_motion(
   virtual_command,
   completion_callback,
 ):
+  execution_request = _active_program_execution_request()
+  if _program_execution_request_cancelled(execution_request):
+    return ROW_EXECUTION_REJECTED
   if virtual_dispatch is None:
     if virtual_command is not None:
       raise MotionInputError(
@@ -8790,8 +12653,7 @@ def _dispatch_program_motion(
   except Exception as exc:
     message = f"Program motion timing rejected: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return ROW_EXECUTION_REJECTED
 
   request_lease = _acquire_motion_request("Program motion")
@@ -8800,8 +12662,7 @@ def _dispatch_program_motion(
       "Program motion not started; another motion request is active"
     )
     logger.warning(message)
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(text=message, style="Warn.TLabel")
     return ROW_EXECUTION_REJECTED
 
   try:
@@ -8809,8 +12670,7 @@ def _dispatch_program_motion(
   except (KeyError, TypeError, ValueError, MotionInputError) as exc:
     message = f"Program motion rejected because the confirmed pose is invalid: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     _finish_motion_request(request_lease)
     return ROW_EXECUTION_REJECTED
 
@@ -8830,6 +12690,10 @@ def _dispatch_program_motion(
     )
 
   try:
+    if _program_execution_request_cancelled(execution_request):
+      raise SerialActivityRejected(
+        "program motion cancelled before virtual preview"
+      )
     virtual_operation = virtual_dispatch(virtual_command)
   except Exception:
     logger.exception("Virtual program preview failed during startup")
@@ -8839,8 +12703,15 @@ def _dispatch_program_motion(
   if virtual_operation is None:
     message = "Program motion stopped because virtual preview did not start"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
+    _finish_settled_motion_request(
+      None,
+      request_lease,
+      False,
+      settle_program_pose,
+    )
+    return ROW_EXECUTION_REJECTED
+  if _program_execution_request_cancelled(execution_request):
     _finish_settled_motion_request(
       None,
       request_lease,
@@ -8855,8 +12726,7 @@ def _dispatch_program_motion(
     if not virtual_succeeded:
       message = f"Program motion stopped after virtual preview failed: {virtual_error}"
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
       _finish_settled_motion_request(
         None,
         request_lease,
@@ -8873,12 +12743,14 @@ def _dispatch_program_motion(
         completion_callback=callback,
         request_lease=request_lease,
         write_started_event=controller_write_started,
+        write_cancellation_boundary=(
+          execution_request.cancellation_boundary
+        ),
       )
     except Exception as exc:
       message = f"Program motion controller worker failed during startup: {exc}"
       logger.exception(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
       return False
 
   if completion_callback is not None:
@@ -8979,8 +12851,7 @@ def _dispatch_program_motion(
       else:
         message = "Program motion stopped because pose reconciliation failed"
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
       return ROW_EXECUTION_REJECTED
     return ROW_EXECUTION_COMPLETE
   finally:
@@ -9246,7 +13117,7 @@ def _gcode_storage_estop_position(response):
     parsed = parse_position_response(response)
   except ProtocolResponseError:
     return None
-  if parsed.flag != "EB":
+  if not position_response_is_physical_estop(parsed):
     return None
   return parsed
 
@@ -9279,21 +13150,20 @@ def _render_gcode_storage_detailed_error(response):
   return False
 
 
-def _validate_gcode_storage_response(request, response):
+def _validate_gcode_storage_response(
+  request,
+  response,
+):
   if not isinstance(request, GCodeStorageRequest):
     raise TypeError("G-code storage response requires a valid request")
   if not isinstance(response, str):
     raise ProtocolResponseError(
       "G-code storage response must be text"
     )
-  if _gcode_storage_estop_position(response) is not None:
-    reason = (
-      "G-code storage response was interrupted by a physical E-stop; "
-      "additional controller output remains possible"
-    )
-    quarantine_serial_transport(request.serial_port, reason)
-    raise SerialTransportQuarantinedError(
-      f"{reason}; reconnect required"
+  estop_position = _gcode_storage_estop_position(response)
+  if estop_position is not None:
+    raise RuntimeError(
+      "G-code storage physical-stop response escaped framed ownership"
     )
   if _is_gcode_storage_controller_error(request, response):
     if (
@@ -10431,10 +14301,19 @@ def _run_gcode_storage_request(request):
       "G-code storage command failed without details",
     )
     committed = write_started.is_set()
+    definitive_non_execution = isinstance(
+      exc,
+      GCodeStorageAdmissionRejected,
+    )
+    admission_position = (
+      exc.position
+      if definitive_non_execution
+      else None
+    )
     if (
       request.operation == "delete"
       and pending_delete is not None
-      and not committed
+      and (not committed or definitive_non_execution)
     ):
       try:
         if state_path is None:
@@ -10448,13 +14327,17 @@ def _run_gcode_storage_request(request):
       except Exception as clear_exc:
         clear_detail = _gcode_storage_error_detail(
           clear_exc,
-          "pre-write reconciliation cleanup failed without details",
+          "delete reconciliation cleanup failed without details",
         )
         detail = _gcode_storage_error_detail(
           RuntimeError(f"{detail}; {clear_detail}"),
           detail,
         )
-    if committed and not serial_transport_quarantined(request.serial_port):
+    if (
+      committed
+      and not definitive_non_execution
+      and not serial_transport_quarantined(request.serial_port)
+    ):
       try:
         quarantine_serial_transport(
           request.serial_port,
@@ -10474,7 +14357,11 @@ def _run_gcode_storage_request(request):
         )
     outcome = (
       "indeterminate"
-      if request.operation == "delete" and committed
+      if (
+        request.operation == "delete"
+        and committed
+        and not definitive_non_execution
+      )
       else "failed"
     )
     return GCodeStorageResult(
@@ -10484,6 +14371,7 @@ def _run_gcode_storage_request(request):
       (),
       committed,
       pending_delete=pending_delete,
+      admission_position=admission_position,
     )
 
   result = None
@@ -10526,9 +14414,12 @@ def _run_gcode_storage_request(request):
             request,
             state_path,
           )
+        publish_stop = _prepare_main_controller_stop_exchange(
+          request.serial_port
+        )
         write_options = {
           "write_lock": serial_write_lock,
-          "reset_input": True,
+          "reset_input": False,
           "write_started_event": write_started,
         }
         if request.cancellation_event is not None:
@@ -10541,11 +14432,46 @@ def _run_gcode_storage_request(request):
           request.command,
           **write_options,
         )
-        response = read_serial_line_response(
+        exchange_response = read_controller_line_exchange_response(
           request.serial_port,
           SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
-          allow_empty_terminal_response=False,
+          estop_callback=publish_stop,
+          context="G-code storage controller response",
         )
+        admission_position = exchange_response.admission_position
+        if (
+          admission_position is None
+          and exchange_response.estop_position is not None
+          and (
+            exchange_response.estop_position.flag
+            == CONTROLLER_ESTOP_ADMISSION_FLAG
+          )
+        ):
+          admission_position = exchange_response.estop_position
+        if admission_position is not None:
+          try:
+            quarantine_serial_transport(
+              request.serial_port,
+              "physical E-stop blocked G-code storage command admission",
+            )
+          except Exception as exc:
+            raise GCodeStorageAdmissionRejected(
+              admission_position
+            ) from exc
+          raise GCodeStorageAdmissionRejected(admission_position)
+        if exchange_response.estop_position is not None:
+          reason = (
+            "G-code storage response was interrupted by a physical E-stop"
+          )
+          quarantine_serial_transport(request.serial_port, reason)
+          raise SerialTransportQuarantinedError(
+            f"{reason}; reconnect required"
+          )
+        response = exchange_response.terminal_response
+        if response is None:
+          raise ProtocolResponseError(
+            "G-code storage exchange lacks a terminal response"
+          )
         media_id, filenames = _validate_gcode_storage_response(
           request,
           response,
@@ -10686,6 +14612,10 @@ def _start_gcode_storage_request(
   if storage_admission == "program-active":
     return _render_gcode_storage_rejection(
       "G-CODE STORAGE REJECTED DURING PROGRAM EXECUTION"
+    )
+  if storage_admission == "manual-controller-active":
+    return _render_gcode_storage_rejection(
+      "G-CODE STORAGE REJECTED DURING MANUAL CONTROLLER I/O"
     )
   if storage_admission == "conversion-active":
     return _render_gcode_storage_rejection(
@@ -11195,7 +15125,11 @@ def _apply_gcode_storage_result(result):
         raise RuntimeError(
           "failed G-code storage result contains filenames"
         )
-      if request.operation == "delete" and result.write_started:
+      if (
+        request.operation == "delete"
+        and result.write_started
+        and result.admission_position is None
+      ):
         raise RuntimeError(
           "committed G-code delete failure was not marked indeterminate"
         )
@@ -11230,6 +15164,11 @@ def _apply_gcode_storage_result(result):
         raise RuntimeError(
           "completed G-code storage result lacks a committed write"
         )
+      estop_position = _gcode_storage_estop_position(result.value)
+      if estop_position is not None:
+        raise RuntimeError(
+          "G-code storage E-stop response escaped worker handling"
+        )
       media_id, filenames = _validate_gcode_storage_response(
         request,
         result.value,
@@ -11241,15 +15180,10 @@ def _apply_gcode_storage_result(result):
         raise RuntimeError(
           "G-code storage result does not match the controller response"
         )
-      estop_position = _gcode_storage_estop_position(result.value)
       controller_error = _is_gcode_storage_controller_error(
         request,
         result.value
       )
-      if estop_position is not None:
-        raise RuntimeError(
-          "G-code storage E-stop response escaped worker quarantine"
-        )
       if request.operation == "delete":
         if result.pending_delete is not None:
           raise RuntimeError(
@@ -11468,11 +15402,16 @@ def _gcode_feed_rate_mm_per_second(value, imperial):
 
 
 def _dispatch_program_gcode(filename, completion_callback):
+  execution_request = _active_program_execution_request()
   controller_completion = None
   controller_result = None
   controller_callback = completion_callback
 
   try:
+    if _program_execution_request_cancelled(execution_request):
+      raise MotionInputError(
+        "G-code playback cancelled by stop admission"
+      )
     _gcode_playback_command(filename)
     if completion_callback is None:
       controller_completion = threading.Event()
@@ -11486,15 +15425,17 @@ def _dispatch_program_gcode(filename, completion_callback):
   except Exception as exc:
     message = f"G-code playback rejected: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
     return ROW_EXECUTION_REJECTED
 
-  if not GCplayProg(filename, completion_callback=controller_callback):
+  if not GCplayProg(
+    filename,
+    completion_callback=controller_callback,
+    execution_request=execution_request,
+  ):
     message = "G-code playback not started; controller transport is unavailable"
     logger.warning(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
     return ROW_EXECUTION_REJECTED
 
   if completion_callback is not None:
@@ -11507,8 +15448,7 @@ def _dispatch_program_gcode(filename, completion_callback):
   if not controller_succeeded:
     message = "G-code playback stopped after controller completion failed"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
     return ROW_EXECUTION_REJECTED
   return ROW_EXECUTION_COMPLETE
 
@@ -11552,14 +15492,19 @@ def _program_row_index(rows, expected_row):
   raise MotionInputError(f"program row {expected_row!r} does not exist")
 
 
-def _program_tab_row_index(rows, tab_number):
+def _normalize_program_tab_number(tab_number):
   if not isinstance(tab_number, str):
     raise MotionInputError("program tab number must be text")
-  tab_number = tab_number.strip()
-  if re.fullmatch(r"\d+", tab_number) is None:
+  normalized = tab_number.strip()
+  if not normalized or not normalized.isdecimal():
     raise MotionInputError(
-      "program tab number must be a non-negative integer"
+      "program tab number must contain decimal digits"
     )
+  return normalized
+
+
+def _program_tab_row_index(rows, tab_number):
+  tab_number = _normalize_program_tab_number(tab_number)
   return _program_row_index(rows, f"Tab Number {tab_number}")
 
 
@@ -11646,6 +15591,109 @@ def _program_position_register_values(register_number):
   )
 
 
+def _selected_program_row(allow_empty=False):
+  if not isinstance(allow_empty, bool):
+    raise TypeError("program empty-selection policy must be boolean")
+  selected_rows = tuple(tab1.progView.curselection())
+  if len(selected_rows) > 1:
+    raise MotionInputError(
+      "program execution requires exactly one selected row"
+    )
+  if not selected_rows:
+    if allow_empty:
+      return None
+    raise MotionInputError("robot program view has no selected row")
+  selected_row = selected_rows[0]
+  if (
+    isinstance(selected_row, bool)
+    or not isinstance(selected_row, int)
+    or selected_row < 0
+  ):
+    raise MotionInputError(
+      "robot program selection must be a non-negative integer"
+    )
+  row_count = tab1.progView.size()
+  if (
+    isinstance(row_count, bool)
+    or not isinstance(row_count, int)
+    or row_count < 0
+  ):
+    raise MotionInputError(
+      "robot program view size must be a non-negative integer"
+    )
+  if selected_row >= row_count:
+    raise MotionInputError("selected robot program row is out of range")
+  return selected_row
+
+
+def _read_selected_program_command():
+  selected_row = _selected_program_row()
+  raw_command = tab1.progView.get(selected_row)
+  try:
+    command = _decode_program_row_content(raw_command)
+  except MotionInputError as exc:
+    raise MotionInputError(
+      f"selected robot program row is invalid: {exc}"
+    ) from exc
+  return selected_row, command.strip()
+
+
+def _program_row_is_supported(command):
+  if not isinstance(command, str):
+    raise TypeError("robot program command must be text")
+  if not command or command.startswith("##"):
+    return True
+  if command.startswith("Tab Number "):
+    tab_number = command[len("Tab Number "):]
+    try:
+      normalized_tab_number = _normalize_program_tab_number(tab_number)
+    except MotionInputError:
+      return False
+    return tab_number == normalized_tab_number
+  return (
+    command[:6] in PROGRAM_ROW_COMMAND_PREFIXES
+    or command[:11] in PROGRAM_ROW_LONG_COMMAND_PREFIXES
+  )
+
+
+def _program_row_error_detail(error):
+  try:
+    detail = " ".join(str(error).split())
+  except Exception:
+    return type(error).__name__
+  return detail or type(error).__name__
+
+
+def _reject_program_row_before_execution(error):
+  detail = _program_row_error_detail(error)
+  message = f"Program row rejected before execution: {detail}"
+  logger.error(message)
+  _abort_program_row_execution()
+  try:
+    _set_application_status(message, "Alarm.TLabel")
+  except Exception:
+    logger.exception("Unable to publish the program-row rejection")
+  return ROW_EXECUTION_REJECTED
+
+
+def _call_program_from_current_row(
+  program_name,
+  execution_request,
+  caller_row,
+):
+  caller_program = ProgEntryField.get()
+  if callProg(
+    program_name,
+    execution_request,
+    0,
+    caller_row=caller_row,
+    caller_program=caller_program,
+  ):
+    return True
+  _abort_program_row_execution()
+  return False
+
+
 def runProg():
   execution_request = _begin_program_execution("run")
   if execution_request is None:
@@ -11654,97 +15702,81 @@ def runProg():
     _set_manual_auxiliary_status(message, "Warn.TLabel")
     return False
 
-  try:
-    with program_stop_state_lock:
-      stop_pending = RUN.get('programStopRequestId') is not None
-      if stop_pending:
-        _set_program_stop_status("pending")
-      else:
-        RUN['programStopStatusLatched'] = False
-        RUN['programStopState'] = "completed"
-        RUN['estopActive'] = False
-        RUN['posOutreach'] = False
-  except Exception:
-    _finish_program_execution(execution_request)
-    logger.exception("Program execution admission failed")
-    return False
-  if stop_pending:
-    _finish_program_execution(execution_request)
-    return False
-
   def threadProg():
-    last = tab1.progView.index('end')
-    for row in range (0,last):
-      tab1.progView.itemconfig(row, {'fg': "#FFFFFF"})
-
-    try:
-      curRow = tab1.progView.curselection()[0]
-      if (curRow == 0):
-        curRow=1
-    except:
-      curRow=1
-      tab1.progView.selection_clear(0, END)
-      tab1.progView.select_set(curRow)
-    while tab1.runTrue == 1:
+    selection_result = _dispatch_program_selection(
+      ProgramSelectionEvent(
+        execution_request,
+        PROGRAM_SELECTION_INITIALIZE_RUN,
+      )
+    )
+    if not selection_result.ready:
+      _abort_program_row_execution()
+      return
+    while (
+      tab1.runTrue == 1
+      and not _program_execution_request_cancelled(execution_request)
+    ):
+      selection_result = _dispatch_program_selection(
+        ProgramSelectionEvent(
+          execution_request,
+          PROGRAM_SELECTION_PREPARE_RUN,
+        )
+      )
+      if not selection_result.ready:
+        _abort_program_row_execution()
+        break
+      if selection_result.return_program is not None and not callProg(
+        selection_result.return_program[0],
+        execution_request,
+        selection_result.return_program[1],
+        clear_return_state=True,
+        update_current_row=True,
+      ):
+        _abort_program_row_execution()
+        break
+      if _program_execution_request_cancelled(execution_request):
+        _abort_program_row_execution()
+        break
       if (tab1.runTrue == 0):
         _set_program_stop_status(RUN['programStopState'])
       else:
-        almStatusLab.config(text="PROGRAM RUNNING",  style="OK.TLabel")
-        almStatusLab2.config(text="PROGRAM RUNNING",  style="OK.TLabel")
+        _set_application_status("PROGRAM RUNNING", "OK.TLabel")
       with program_stop_state_lock:
         RUN['rowinproc'] = 1
-      try:
-        selRow = tab1.progView.curselection()[0]
-      except:
-        if(tab1.lastProg == ""):
-          selRow = 1
-          try:
-            index = _program_row_index(
-              tab1.progView.get(0, "end"),
-              "## START PROGRAM LOOP ##",
-            )
-            tab1.progView.selection_clear(0, END)
-            tab1.progView.select_set(index)
-          except:
-            stopProg()
-        else:
-          lastRow = tab1.lastRow + 1
-          lastProg = tab1.lastProg
-          ProgEntryField.delete(0, 'end')
-          ProgEntryField.insert(0,lastProg)
-          callProg(lastProg)
-          time.sleep(.4)
-          tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(lastRow)
-          curRowEntryField.delete(0, 'end')
-          curRowEntryField.insert(0,lastRow)
-          tab1.lastProg = ""
-      if(tab1.runTrue == 1):
-        execution_state = executeRow()
+      if (
+        tab1.runTrue == 1
+        and not _program_execution_request_cancelled(execution_request)
+      ):
+        execution_state = executeRow(
+          execution_request=execution_request
+        )
         if execution_state == ROW_EXECUTION_REJECTED:
           tab1.runTrue = 0
           _abort_program_row_execution()
           break
 
         while True:
+          if _program_execution_request_cancelled(execution_request):
+            _abort_program_row_execution()
+            break
           with program_stop_state_lock:
             row_in_process = RUN['rowinproc']
           if row_in_process != 1:
             break
           time.sleep(.1)
 
-        try:
-          selRow = tab1.progView.curselection()[0]
-          selRow += 1
-          tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(selRow)
-          curRowEntryField.delete(0, 'end')
-          curRowEntryField.insert(0,selRow)
-        except:
-          curRow=1
-          tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(curRow)
-        time.sleep(.1)
+        if _program_execution_request_cancelled(execution_request):
+          _abort_program_row_execution()
+          break
+        selection_result = _dispatch_program_selection(
+          ProgramSelectionEvent(
+            execution_request,
+            PROGRAM_SELECTION_ADVANCE,
+          )
+        )
+        if not selection_result.ready:
+          _abort_program_row_execution()
+          break
 
     _set_program_stop_status(RUN['programStopState'])
 
@@ -11753,6 +15785,12 @@ def runProg():
       threadProg()
     except Exception:
       tab1.runTrue = 0
+      try:
+        stopProg()
+      except Exception:
+        logger.exception(
+          "Unable to dispatch the auxiliary stop after program failure"
+        )
       _abort_program_row_execution()
       logger.exception("Program execution worker failed")
       _queue_program_execution_status(
@@ -11784,81 +15822,141 @@ def stepFwd():
       _set_manual_auxiliary_status(message, "Warn.TLabel")
       return False
 
-    try:
-      with program_stop_state_lock:
-        stop_pending = RUN.get('programStopRequestId') is not None
-        if stop_pending:
-          _set_program_stop_status("pending")
-        else:
-          RUN['programStopStatusLatched'] = False
-          RUN['estopActive'] = False
-          RUN['posOutreach'] = False
-    except Exception:
-      _finish_program_execution(execution_request)
-      logger.exception("Program step-forward admission failed")
-      return False
-    if stop_pending:
+    setup_failure_publish_attempted = False
+
+    def publish_setup_failure():
+      nonlocal setup_failure_publish_attempted
+      if setup_failure_publish_attempted:
+        return False
+      setup_failure_publish_attempted = True
+      try:
+        return _set_manual_auxiliary_status(
+          "PROGRAM STEP FORWARD SETUP FAILED",
+          "Alarm.TLabel",
+        )
+      except Exception:
+        logger.exception(
+          "Unable to publish the Step Forward setup failure"
+        )
+        return False
+
+    if _program_execution_request_cancelled(execution_request):
+      _abort_program_row_execution()
       _finish_program_execution(execution_request)
       return False
 
-    def threadProg():
-      almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-      almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-      try:
-        selRow = tab1.progView.curselection()[0]
-      except:
-        if(tab1.lastProg == ""):
-          selRow = 1
+    return_program = None
+    try:
+      selected_rows = tuple(tab1.progView.curselection())
+      if len(selected_rows) > 1:
+        raise RuntimeError("Step Forward requires at most one selected row")
+      last_row = tab1.progView.index('end')
+      if (
+        isinstance(last_row, bool)
+        or not isinstance(last_row, int)
+        or last_row <= 0
+      ):
+        raise RuntimeError("robot program view has no executable rows")
+      if selected_rows and (
+        isinstance(selected_rows[0], bool)
+        or not isinstance(selected_rows[0], int)
+        or not 0 <= selected_rows[0] < last_row
+      ):
+        raise RuntimeError("Step Forward selection is out of range")
+      if not selected_rows:
+        if tab1.lastProg == "":
+          program_rows = tab1.progView.get(0, "end")
           try:
             index = _program_row_index(
-              tab1.progView.get(0, "end"),
+              program_rows,
               "## START PROGRAM LOOP ##",
             )
-            tab1.progView.selection_clear(0, END)
-            tab1.progView.select_set(index)
-          except:
-            stopProg()
+          except Exception:
+            publish_setup_failure()
+            try:
+              stopProg()
+            except Exception:
+              logger.exception(
+                "Unable to dispatch the auxiliary stop after Step Forward "
+                "loop-marker lookup failure"
+              )
+            raise
+          tab1.progView.selection_clear(0, END)
+          tab1.progView.select_set(index)
+          if tuple(tab1.progView.curselection()) != (index,):
+            raise RuntimeError(
+              "Step Forward could not select the program-loop entry"
+            )
         else:
-          lastRow = tab1.lastRow + 1
-          lastProg = tab1.lastProg
-          ProgEntryField.delete(0, 'end')
-          ProgEntryField.insert(0,lastProg)
-          callProg(lastProg)
-          time.sleep(.4)
-          tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(lastRow)
-          curRowEntryField.delete(0, 'end')
-          curRowEntryField.insert(0,lastRow)
-          tab1.lastProg = ""
-      if executeRow() == ROW_EXECUTION_REJECTED:
+          if (
+            not isinstance(tab1.lastProg, str)
+            or not tab1.lastProg
+            or "\r" in tab1.lastProg
+            or "\n" in tab1.lastProg
+            or isinstance(tab1.lastRow, bool)
+            or not isinstance(tab1.lastRow, int)
+            or tab1.lastRow < -1
+          ):
+            raise RuntimeError(
+              "Step Forward caller return state is invalid"
+            )
+          return_program = (tab1.lastProg, tab1.lastRow + 1)
+      if _program_execution_request_cancelled(execution_request):
+        _abort_program_row_execution()
+        _finish_program_execution(execution_request)
+        return False
+      _set_application_status("SYSTEM READY", "OK.TLabel")
+    except Exception:
+      _abort_program_row_execution()
+      _finish_program_execution(execution_request)
+      logger.exception("Program step-forward setup failed")
+      publish_setup_failure()
+      return False
+
+    def threadProg():
+      if _program_execution_request_cancelled(execution_request):
+        _abort_program_row_execution()
         return
-      try:
-        last = tab1.progView.index('end')
-        selRow = tab1.progView.curselection()[0]
-        for row in range (0,selRow):
-          tab1.progView.itemconfig(row, {'fg': "#1E90FF"})
-        tab1.progView.itemconfig(selRow, {'fg': "#0561BD"})
-        for row in range (selRow+1,last):
-          tab1.progView.itemconfig(row, {'fg': "#9E9E9E"})
-        try:
-          selRow = tab1.progView.curselection()[0]
-          selRow += 1
-          tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(selRow)
-          curRowEntryField.delete(0, 'end')
-          curRowEntryField.insert(0,selRow)
-        except:
-          curRow=1
-          tab1.progView.selection_clear(0, END)
-          tab1.progView.select_set(curRow)
-        time.sleep(.1)
-      except Exception:
-        pass
+      if return_program is not None and not callProg(
+        return_program[0],
+        execution_request,
+        return_program[1],
+        clear_return_state=True,
+        update_current_row=True,
+      ):
+        _abort_program_row_execution()
+        return
+      if _program_execution_request_cancelled(execution_request):
+        _abort_program_row_execution()
+        return
+      if executeRow(
+        execution_request=execution_request
+      ) == ROW_EXECUTION_REJECTED:
+        return
+      if _program_execution_request_cancelled(execution_request):
+        _abort_program_row_execution()
+        return
+      selection_result = _dispatch_program_selection(
+        ProgramSelectionEvent(
+          execution_request,
+          PROGRAM_SELECTION_ADVANCE,
+          style_rows=True,
+        )
+      )
+      if not selection_result.ready:
+        _abort_program_row_execution()
+        return
 
     def step_forward_worker():
       try:
         threadProg()
       except Exception:
+        try:
+          stopProg()
+        except Exception:
+          logger.exception(
+            "Unable to dispatch the auxiliary stop after Step Forward failure"
+          )
         _abort_program_row_execution()
         logger.exception("Program step-forward worker failed")
         _queue_program_execution_status(
@@ -11889,35 +15987,25 @@ def stepRev():
       return False
 
     try:
-      with program_stop_state_lock:
-        stop_pending = RUN.get('programStopRequestId') is not None
-        if stop_pending:
-          _set_program_stop_status("pending")
-        else:
-          RUN['programStopStatusLatched'] = False
-          RUN['estopActive'] = False
-          RUN['posOutreach'] = False
-    except Exception:
-      _finish_program_execution(execution_request)
-      logger.exception("Program step-reverse admission failed")
-      return False
-    if stop_pending:
-      _finish_program_execution(execution_request)
-      return False
-
-    try:
       completion_callback_invoked = threading.Event()
-      almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-      almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
-      try:
-        selRow = tab1.progView.curselection()[0]
-      except Exception:
-        selRow = 1
+      selRow = _selected_program_row(allow_empty=True)
+      if selRow is None:
         tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(selRow)
-    except Exception:
+        tab1.progView.select_set(1)
+        selRow = _selected_program_row()
+      _set_application_status("SYSTEM READY", "OK.TLabel")
+    except Exception as exc:
+      _abort_program_row_execution()
       _finish_program_execution(execution_request)
-      logger.exception("Program step-reverse setup failed")
+      detail = _program_row_error_detail(exc)
+      message = f"Program step-reverse setup failed: {detail}"
+      logger.exception(message)
+      try:
+        _set_manual_auxiliary_status(message, "Alarm.TLabel")
+      except Exception:
+        logger.exception(
+          "Unable to publish the program step-reverse setup failure"
+        )
       return False
 
     def complete_step_reverse(succeeded):
@@ -11926,7 +16014,10 @@ def stepRev():
         return
       completion_callback_invoked.set()
       try:
-        _complete_step_reverse_motion(selRow, succeeded)
+        if _program_execution_request_cancelled(execution_request):
+          _abort_program_row_execution()
+        else:
+          _complete_step_reverse_motion(selRow, succeeded)
       except Exception:
         logger.exception("Unable to complete program step reverse")
       finally:
@@ -11934,10 +16025,19 @@ def stepRev():
           logger.error("Program step-reverse owner was already released")
 
     try:
+      if _program_execution_request_cancelled(execution_request):
+        _abort_program_row_execution()
+        _finish_program_execution(execution_request)
+        return False
       execution_state = executeRow(
-        motion_complete=complete_step_reverse
+        motion_complete=complete_step_reverse,
+        execution_request=execution_request,
       )
       if execution_state == ROW_EXECUTION_COMPLETE:
+        if _program_execution_request_cancelled(execution_request):
+          _abort_program_row_execution()
+          _finish_program_execution(execution_request)
+          return False
         _finish_step_reverse_selection(selRow)
       elif execution_state == ROW_EXECUTION_PENDING:
         return True
@@ -11989,31 +16089,134 @@ def _set_program_stop_status(auxiliary_state):
         "PROGRAM SCHEDULING HALTED; ACTIVE MAIN MOTION NOT PREEMPTED"
       )
       style = "Alarm.TLabel"
-    program_stop_status_event_queue.put((message, style))
+    program_stop_status_event_queue.put((message, style, True))
   return True
 
 
 def _apply_program_stop_status_events():
+  global program_stop_status_pending_event
+
   applied = False
   while True:
-    try:
-      event = program_stop_status_event_queue.get_nowait()
-    except Empty:
-      break
+    event = program_stop_status_pending_event
+    if event is None:
+      try:
+        event = program_stop_status_event_queue.get_nowait()
+      except Empty:
+        break
+      program_stop_status_pending_event = event
     if (
       not isinstance(event, tuple)
-      or len(event) != 2
+      or len(event) != 3
       or not isinstance(event[0], str)
       or not event[0].strip()
       or event[0] != event[0].strip()
       or not isinstance(event[1], str)
       or not event[1]
+      or not isinstance(event[2], bool)
     ):
       raise RuntimeError("program stop status queue emitted an invalid event")
-    message, style = event
-    almStatusLab.config(text=message, style=style)
-    almStatusLab2.config(text=message, style=style)
+    message, style, stop_authoritative = event
+    _set_application_status(
+      message,
+      style,
+      stop_authoritative=stop_authoritative,
+    )
+    program_stop_status_pending_event = None
     applied = True
+  return applied
+
+
+def _main_controller_stop_event_stale_reason(event):
+  if not isinstance(event, MainControllerStopEvent):
+    raise TypeError(
+      "main controller stop staleness check requires a stop event"
+    )
+  with controller_identity_state_lock:
+    connection_epoch = main_controller_connection_epoch
+    generation = confirmed_position_generation
+    binding = main_controller_identity_binding
+    active_port = RUN.get('ser')
+    for name, value in (
+      ("connection epoch", connection_epoch),
+      ("confirmed position generation", generation),
+    ):
+      if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+      ):
+        raise RuntimeError(
+          f"current main controller {name} is invalid"
+        )
+    if (
+      binding is not None
+      and not isinstance(binding, MainControllerIdentityBinding)
+    ):
+      raise RuntimeError(
+        "current main controller identity binding is invalid"
+      )
+    if event.context.connection_epoch != connection_epoch:
+      return "controller connection epoch changed"
+    if event.context.confirmed_position_generation != generation:
+      return "confirmed position generation changed"
+    if (
+      active_port is not None
+      and active_port is not event.context.serial_port
+    ):
+      return "active controller connection changed"
+    if (
+      isinstance(binding, MainControllerIdentityBinding)
+      and binding.serial_port is not event.context.serial_port
+    ):
+      return "bound controller connection changed"
+  return None
+
+
+def _apply_main_controller_stop_events():
+  global main_controller_stop_pending_event
+
+  applied = False
+  while True:
+    event = main_controller_stop_pending_event
+    if event is None:
+      try:
+        event = main_controller_stop_event_queue.get_nowait()
+      except Empty:
+        break
+      main_controller_stop_pending_event = event
+    if not isinstance(event, MainControllerStopEvent):
+      raise RuntimeError(
+        "main controller stop queue emitted an invalid event"
+      )
+    stale_reason = _main_controller_stop_event_stale_reason(event)
+    if stale_reason is not None:
+      message = (
+        "Stale controller E-stop presentation retired; "
+        f"{stale_reason}; current controller fault state unchanged"
+      )
+      logger.warning(message)
+      _set_application_status(message, "Warn.TLabel")
+      _clear_manual_auxiliary_stop_barrier_if_settled()
+      applied = True
+      main_controller_stop_pending_event = None
+      continue
+    position = displayPosition(
+      event.position.raw,
+      parsed=event.position,
+    )
+    if position is None:
+      ErrorHandler(event.position.flag)
+    elif (
+      not position_response_is_physical_estop(position)
+      or position != event.position
+    ):
+      raise RuntimeError(
+        "main controller physical-stop position application is invalid"
+      )
+    _clear_manual_auxiliary_stop_barrier_if_settled()
+    applied = True
+    main_controller_stop_pending_event = None
   return applied
 
 
@@ -12024,6 +16227,7 @@ def stopProg():
     logger.exception(
       "Unable to cancel queued manual auxiliary commands during program stop"
     )
+  _cancel_active_program_execution()
   tab1.runTrue = 0
   with program_stop_state_lock:
     if RUN.get('programStopRequestId') is not None:
@@ -12049,55 +16253,76 @@ def stopProg():
     logger.exception("Unable to dispatch the auxiliary program stop")
     with program_stop_state_lock:
       RUN['programStopRequestId'] = None
-      manual_auxiliary_stop_barrier.clear()
       _set_program_stop_status("failed")
+    try:
+      _clear_manual_auxiliary_stop_barrier_if_settled()
+    except Exception:
+      logger.exception(
+        "Unable to settle the manual auxiliary stop barrier"
+      )
     return
   if auxiliary_state == AUXILIARY_STOP_NOT_REQUIRED:
     with program_stop_state_lock:
       RUN['programStopRequestId'] = None
-      manual_auxiliary_stop_barrier.clear()
       _set_program_stop_status("completed")
+    try:
+      _clear_manual_auxiliary_stop_barrier_if_settled()
+    except Exception:
+      logger.exception(
+        "Unable to settle the manual auxiliary stop barrier"
+      )
 
 
 
-def executeRow(motion_complete=None):
+def executeRow(motion_complete=None, execution_request=None):
+  if execution_request is None:
+    with program_execution_state_lock:
+      execution_request = program_execution_active_request
+  if not isinstance(execution_request, ProgramExecutionRequest):
+    raise TypeError(
+      "program row execution requires an active execution request"
+    )
+  if _reject_cancelled_program_row(execution_request):
+    return ROW_EXECUTION_REJECTED
   with program_stop_state_lock:
     RUN['progRunning'] = True
   try:
-    selRow = tab1.progView.curselection()[0]
+    selRow, command = _read_selected_program_command()
+  except Exception as exc:
+    return _reject_program_row_before_execution(exc)
+  try:
     tab1.progView.see(selRow+2)
   except Exception:
-    pass
+    logger.exception("Unable to scroll the robot program view")
 
-  try: 
-    data = list(map(int, tab1.progView.curselection()))
-    command=tab1.progView.get(data[0]).decode().strip()
-    RUN['cmdType'] =command[:6]
-    RUN['cmdTypeLong']=command[:11]
-  except:
-    RUN['cmdType'] = "Stop P"
-    RUN['cmdTypeLong'] = "Stop P"
+  RUN['cmdType'] = command[:6]
+  RUN['cmdTypeLong'] = command[:11]
+  if not _program_row_is_supported(command):
+    return _reject_program_row_before_execution(
+      MotionInputError(f"unsupported robot program row: {command[:80]!r}")
+    )
 
   if (RUN['cmdType'] == "Call P"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
-    tab1.lastRow = tab1.progView.curselection()[0]
-    tab1.lastProg = ProgEntryField.get()
     programIndex = command.find("Program -")
     progName = str(command[programIndex+10:])
-    ProgEntryField.delete(0, 'end')
-    ProgEntryField.insert(0,progName)
-    callProg(progName)
-    time.sleep(.4) 
-    index = 0
-    tab1.progView.selection_clear(0, END)
-    tab1.progView.select_set(index)
+    if not _call_program_from_current_row(
+      progName,
+      execution_request,
+      selRow,
+    ):
+      return ROW_EXECUTION_REJECTED
     
 
 
   if (RUN['cmdType'] == "Run Gc"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="Gcode not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="Gcode not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12114,14 +16339,18 @@ def executeRow(motion_complete=None):
       return motion_state
 
   if (RUN['cmdType'] == "Stop P"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     stopProg()
 
 
   if (RUN['cmdType'] == "Test L"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="Test limit switches not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="Test limit switches not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12136,8 +16365,10 @@ def executeRow(motion_complete=None):
     manEntryField.insert(0,response)
 
   if (RUN['cmdType'] == "Test G"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="Test limit switches not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="Gripper-current testing not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12149,6 +16380,7 @@ def executeRow(motion_complete=None):
       command,
       read_line=True,
       response_delay=.05,
+      response_parser=parse_auxiliary_gripper_current_response,
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
@@ -12156,8 +16388,10 @@ def executeRow(motion_complete=None):
     manEntryField.insert(0,response)
 
   if (RUN['cmdType'] == "Set En"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="Encoder testing not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="Encoder testing not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12174,8 +16408,10 @@ def executeRow(motion_complete=None):
       return execution_state
 
   if (RUN['cmdType'] == "Read E"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="Read Encoders not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="Read Encoders not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12190,8 +16426,10 @@ def executeRow(motion_complete=None):
     manEntryField.insert(0,response)
 
   if (RUN['cmdType'] == "Servo "):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="Servo control not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="Servo control not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12211,8 +16449,10 @@ def executeRow(motion_complete=None):
       return execution_state
 
   if (RUN['cmdType'] == "If Inp"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12220,7 +16460,7 @@ def executeRow(motion_complete=None):
     inputIndex = command.find("# ")
     valIndex = command.find("= ")
     actionIndex = command.find(": ")
-    inputNum = str(command[inputIndex+2:valIndex])
+    inputNum = str(command[inputIndex+2:valIndex-1])
     valNum = int(command[valIndex+2:actionIndex-1])
     action = str(command[actionIndex+2:actionIndex+6])
     cmd = "JFX"+inputNum+"\n"
@@ -12233,21 +16473,22 @@ def executeRow(motion_complete=None):
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (response == "T"):
       querry = 1
     elif(response == "F"):
       querry = 0
     if(querry == valNum):
       if(action == "Call"):
-        tab1.lastRow = tab1.progView.curselection()[0]
-        tab1.lastProg = ProgEntryField.get()
         progIndex = command.find("Prog")
         progName = str(command[progIndex+5:]) + ".ar4" 
-        callProg(progName)
-        time.sleep(.4) 
-        index = 0  
-        tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(index) 
+        if not _call_program_from_current_row(
+          progName,
+          execution_request,
+          selRow,
+        ):
+          return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
@@ -12264,8 +16505,10 @@ def executeRow(motion_complete=None):
 
 
   if (RUN['cmdType'] == "Read C"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     comIndex = command.find("# ")
@@ -12294,6 +16537,8 @@ def executeRow(motion_complete=None):
 
   
   if (RUN['cmdType'] == "If Reg"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     inputIndex = command.find("# ")
@@ -12305,15 +16550,14 @@ def executeRow(motion_complete=None):
     curRegVal = _program_register_entry(inputNum).get()
     if (int(curRegVal) == valNum):
       if(action == "Call"):
-        tab1.lastRow = tab1.progView.curselection()[0]
-        tab1.lastProg = ProgEntryField.get()
         progIndex = command.find("Prog")
         progName = str(command[progIndex+5:]) + ".ar4" 
-        callProg(progName)
-        time.sleep(.4) 
-        index = 0  
-        tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(index) 
+        if not _call_program_from_current_row(
+          progName,
+          execution_request,
+          selRow,
+        ):
+          return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
@@ -12328,8 +16572,10 @@ def executeRow(motion_complete=None):
         stopProg()  
 
   if (RUN['cmdType'] == "If COM"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12343,15 +16589,14 @@ def executeRow(motion_complete=None):
     curCOMVal = com3outPortEntryField.get()
     if (curCOMVal == valNum):
       if(action == "Call"):
-        tab1.lastRow = tab1.progView.curselection()[0]
-        tab1.lastProg = ProgEntryField.get()
         progIndex = command.find("Prog")
         progName = str(command[actionIndex+12:]) + ".ar4" 
-        callProg(progName)
-        time.sleep(.4) 
-        index = 0  
-        tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(index) 
+        if not _call_program_from_current_row(
+          progName,
+          execution_request,
+          selRow,
+        ):
+          return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
@@ -12366,8 +16611,10 @@ def executeRow(motion_complete=None):
         stopProg()           
 
   if (RUN['cmdType'] == "If MBc"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12389,17 +16636,18 @@ def executeRow(motion_complete=None):
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (response == valNum):
       if(action == "Call"):
-        tab1.lastRow = tab1.progView.curselection()[0]
-        tab1.lastProg = ProgEntryField.get()
         progIndex = command.find("Prog")
         progName = str(command[actionIndex+12:]) + ".ar4" 
-        callProg(progName)
-        time.sleep(.4) 
-        index = 0  
-        tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(index) 
+        if not _call_program_from_current_row(
+          progName,
+          execution_request,
+          selRow,
+        ):
+          return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
@@ -12414,8 +16662,10 @@ def executeRow(motion_complete=None):
         stopProg()   
 
   if (RUN['cmdType'] == "If MBi"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12437,17 +16687,18 @@ def executeRow(motion_complete=None):
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (response == valNum):
       if(action == "Call"):
-        tab1.lastRow = tab1.progView.curselection()[0]
-        tab1.lastProg = ProgEntryField.get()
         progIndex = command.find("Prog")
         progName = str(command[actionIndex+12:]) + ".ar4" 
-        callProg(progName)
-        time.sleep(.4) 
-        index = 0  
-        tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(index) 
+        if not _call_program_from_current_row(
+          progName,
+          execution_request,
+          selRow,
+        ):
+          return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
@@ -12462,8 +16713,10 @@ def executeRow(motion_complete=None):
         stopProg()
 
   if (RUN['cmdType'] == "If MBh"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12478,24 +16731,37 @@ def executeRow(motion_complete=None):
     action = str(command[actionIndex+2:actionIndex+6])
     slaveID = str(command[slavestartIndex+9:regNumstartIndex-2])
     opVal = str(command[regNumstartIndex+11:inputIndex-8])
-    subcommand = "BH"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
+    try:
+      subcommand = _build_program_modbus_register_read(
+        "BH",
+        slaveID,
+        inputNum,
+        opVal,
+      )
+    except MotionInputError as exc:
+      message = f"Program Modbus row rejected: {exc}"
+      logger.error(message)
+      _set_application_status(message, "Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     execution_state, response = _execute_row_main_response(
       subcommand,
       response_parser=parse_controller_modbus_response,
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (response == valNum):
       if(action == "Call"):
-        tab1.lastRow = tab1.progView.curselection()[0]
-        tab1.lastProg = ProgEntryField.get()
         progIndex = command.find("Prog")
         progName = str(command[actionIndex+12:]) + ".ar4" 
-        callProg(progName)
-        time.sleep(.4) 
-        index = 0  
-        tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(index) 
+        if not _call_program_from_current_row(
+          progName,
+          execution_request,
+          selRow,
+        ):
+          return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
@@ -12510,8 +16776,10 @@ def executeRow(motion_complete=None):
         stopProg()  
 
   if (RUN['cmdType'] == "If MBI"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12526,24 +16794,37 @@ def executeRow(motion_complete=None):
     action = str(command[actionIndex+2:actionIndex+6])
     slaveID = str(command[slavestartIndex+9:regNumstartIndex-2])
     opVal = str(command[regNumstartIndex+11:inputIndex-14])
-    subcommand = "BD"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
+    try:
+      subcommand = _build_program_modbus_register_read(
+        "BD",
+        slaveID,
+        inputNum,
+        opVal,
+      )
+    except MotionInputError as exc:
+      message = f"Program Modbus row rejected: {exc}"
+      logger.error(message)
+      _set_application_status(message, "Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     execution_state, response = _execute_row_main_response(
       subcommand,
       response_parser=parse_controller_modbus_response,
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (response == valNum):
       if(action == "Call"):
-        tab1.lastRow = tab1.progView.curselection()[0]
-        tab1.lastProg = ProgEntryField.get()
         progIndex = command.find("Prog")
         progName = str(command[actionIndex+12:]) + ".ar4" 
-        callProg(progName)
-        time.sleep(.4) 
-        index = 0  
-        tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(index) 
+        if not _call_program_from_current_row(
+          progName,
+          execution_request,
+          selRow,
+        ):
+          return ROW_EXECUTION_REJECTED
       elif(action == "Jump"):
         tabIndex = command.find("Tab")
         tabNum = str(command[tabIndex+4:])
@@ -12558,8 +16839,10 @@ def executeRow(motion_complete=None):
         stopProg()
 
   if (RUN['cmdTypeLong'] == "Wait 5v Inp"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12574,8 +16857,7 @@ def executeRow(motion_complete=None):
     except MotionInputError as exc:
       message = f"Wait command rejected: {exc}"
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     command = "WI"+"A"+inputNum+"B"+valNum+"C"+str(timeout)+"\n"
@@ -12593,8 +16875,10 @@ def executeRow(motion_complete=None):
  
 
   if (RUN['cmdTypeLong'] == "Wait MBcoil"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12611,8 +16895,7 @@ def executeRow(motion_complete=None):
     except MotionInputError as exc:
       message = f"Controller Modbus wait rejected: {exc}"
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     command = "WJ"+"A"+slaveID+"B"+inputNum+"C"+valNum+"D"+str(timeout)+"\n"
@@ -12627,8 +16910,10 @@ def executeRow(motion_complete=None):
       return execution_state
 
   if (RUN['cmdTypeLong'] == "Wait MBinpu"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12645,8 +16930,7 @@ def executeRow(motion_complete=None):
     except MotionInputError as exc:
       message = f"Controller Modbus wait rejected: {exc}"
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     command = "WK"+"A"+slaveID+"B"+inputNum+"C"+valNum+"D"+str(timeout)+"\n"
@@ -12663,14 +16947,15 @@ def executeRow(motion_complete=None):
               
 
   if RUN['cmdType'] == "Jump T":
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     tabIndex = command.find("Tab-")
     if tabIndex == -1:
       message = "Jump command rejected: missing Tab- target"
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     try:
@@ -12681,8 +16966,7 @@ def executeRow(motion_complete=None):
     except MotionInputError as exc:
       message = f"Jump command rejected: {exc}"
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     tab1.progView.selection_clear(0, END)
@@ -12692,8 +16976,10 @@ def executeRow(motion_complete=None):
 
 
   if (RUN['cmdTypeLong'] == "Set 5v Outp"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12716,8 +17002,10 @@ def executeRow(motion_complete=None):
       return execution_state
 
   if (RUN['cmdTypeLong'] == "Set MBcoil "):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12728,19 +17016,32 @@ def executeRow(motion_complete=None):
     slaveID = str(command[slavestartIndex+9:inputIndex-9])
     inputNum = str(command[inputIndex+2:valIndex-1])
     valNum = str(command[valIndex+2:])
-    command = "SC"+"A"+slaveID+"B"+inputNum+"C"+valNum+"\n"
+    try:
+      command = build_controller_modbus_command(
+        "SC",
+        slaveID,
+        inputNum,
+        valNum,
+      )
+    except MotionInputError as exc:
+      message = f"Program Modbus row rejected: {exc}"
+      logger.error(message)
+      _set_application_status(message, "Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    execution_state, _ = _execute_row_main_response(
+    execution_state, _ = _execute_row_main_modbus_write_response(
       command,
-      response_parser=parse_controller_modbus_response,
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
 
   if (RUN['cmdTypeLong'] == "Set MBoutpu"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12751,12 +17052,23 @@ def executeRow(motion_complete=None):
     slaveID = str(command[slavestartIndex+9:inputIndex-9])
     inputNum = str(command[inputIndex+2:valIndex-1])
     valNum = str(command[valIndex+2:])
-    command = "SO"+"A"+slaveID+"B"+inputNum+"C"+valNum+"\n"
+    try:
+      command = build_controller_modbus_command(
+        "SO",
+        slaveID,
+        inputNum,
+        valNum,
+      )
+    except MotionInputError as exc:
+      message = f"Program Modbus row rejected: {exc}"
+      logger.error(message)
+      _set_application_status(message, "Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    execution_state, _ = _execute_row_main_response(
+    execution_state, _ = _execute_row_main_modbus_write_response(
       command,
-      response_parser=parse_controller_modbus_response,
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
@@ -12764,8 +17076,10 @@ def executeRow(motion_complete=None):
 
 
   if (RUN['cmdType'] == "Wait T"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="Wait time not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="Wait time not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
@@ -12778,8 +17092,7 @@ def executeRow(motion_complete=None):
     except MotionInputError as exc:
       message = f"Controller timed wait rejected: {exc}"
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     command = "WTS"+encoded_wait+"\n"
@@ -12794,6 +17107,8 @@ def executeRow(motion_complete=None):
       return execution_state
 
   if (RUN['cmdType'] == "Regist"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     regNumIndex = command.find("Register ")
@@ -12815,6 +17130,8 @@ def executeRow(motion_complete=None):
     register_entry.insert(0,regEqVal)
 
   if (RUN['cmdType'] == "Positi"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
     regNumIndex = command.find("Position Register ")
@@ -12845,6 +17162,8 @@ def executeRow(motion_complete=None):
     "Calibr", "Cal_J1", "Cal_J2", "Cal_J3", "Cal_J4",
     "Cal_J5", "Cal_J6", "Cal_J7", "Cal_J8", "Cal_J9",
   }:
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     calibration_action = {
       "Calibr": _run_program_calibration_all,
       "Cal_J1": _run_program_calibration_j1,
@@ -12864,19 +17183,22 @@ def executeRow(motion_complete=None):
       return ROW_EXECUTION_REJECTED
 
   if (RUN['cmdType'] == "Tool S"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
-      almStatusLab.config(text="Set tool not supported in offline programming mode", style="Alarm.TLabel")
+      _set_application_status(text="Set tool not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
     message = "Set tool program rows are unsupported by the Teensy 6.7.1 protocol"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     _finish_execute_row()
     return ROW_EXECUTION_REJECTED
      
   
   if (RUN['cmdType'] == "Move J"): 
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
     xIndex = command.find(" X ")
@@ -12925,6 +17247,8 @@ def executeRow(motion_complete=None):
 
 
   if (RUN['cmdType'] == "OFF J "): 
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
     SPnewInex = command.find("[ PR: ")  
@@ -12975,6 +17299,16 @@ def executeRow(motion_complete=None):
       return motion_state
 
   if (RUN['cmdType'] == "Move V"): 
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
+    try:
+      vision_result = _validated_current_vision_match_result()
+    except MotionInputError as exc:
+      message = f"Move Vision program row rejected: {exc}"
+      logger.error(message)
+      _publish_program_vision_status(message, "Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
     SPnewInex = command.find("[ PR: ")  
@@ -12995,8 +17329,9 @@ def executeRow(motion_complete=None):
     WristConfIndex = command.find(" $")
     SP = str(command[SPnewInex+6:SPendInex])
     cx, cy, cz, crz, cry, crx = _program_position_register_values(SP)
-    RUN['xVal'] = str(float(cx) + float(VisRetXrobEntryField.get()))
-    RUN['yVal'] = str(float(cy) + float(VisRetYrobEntryField.get()))
+    vision_first, vision_second = vision_result.robot_position
+    RUN['xVal'] = str(float(cx) + vision_first)
+    RUN['yVal'] = str(float(cy) + vision_second)
     RUN['zVal'] = str(float(cz) + float(command[zIndex+3:rzIndex]))
     rzVal = str(float(crz) + float(command[rzIndex+4:ryIndex]))
     ryVal = str(float(cry) + float(command[ryIndex+4:rxIndex]))
@@ -13010,7 +17345,7 @@ def executeRow(motion_complete=None):
     DECspd = command[DECspdIndex+4:ACCrampIndex]
     ACCramp = command[ACCrampIndex+4:WristConfIndex]
     RUN['WC'] = command[WristConfIndex+3:]
-    visRot = VisRetAngleEntryField.get()
+    visRot = str(vision_result.angle_degrees)
     LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
     command = "MV"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Vr"+visRot+"Lm"+LoopMode+"\n"
     commandVR = "MV"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Vr"+visRot+"Lm"+LoopMode+"\n"
@@ -13026,6 +17361,8 @@ def executeRow(motion_complete=None):
       return motion_state
 
   if (RUN['cmdType'] == "Move P"): 
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
     SPnewInex = command.find("[ PR: ")  
@@ -13070,6 +17407,8 @@ def executeRow(motion_complete=None):
       return motion_state
 
   if (RUN['cmdType'] == "OFF PR"): 
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
     SPnewInex = command.find("[ PR: ")  
@@ -13118,6 +17457,8 @@ def executeRow(motion_complete=None):
       return motion_state
 
   if (RUN['cmdType'] == "Move L"): 
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
     xIndex = command.find(" X ")
@@ -13172,6 +17513,8 @@ def executeRow(motion_complete=None):
 
 
   if (RUN['cmdType'] == "Move R"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1 
     J1Index = command.find(" J1 ")
@@ -13218,130 +17561,123 @@ def executeRow(motion_complete=None):
       return motion_state
       
   if (RUN['cmdType'] == "Move A"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     message = (
       "Arc program motion is disabled pending a safe Teensy MA protocol"
     )
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     _finish_execute_row()
     return ROW_EXECUTION_REJECTED
 
   if (RUN['cmdType'] == "Move C"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     message = (
       "Circle program motion is disabled pending a safe Teensy MC protocol"
     )
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     _finish_execute_row()
     return ROW_EXECUTION_REJECTED
 
   if (RUN['cmdType'] == "Start "):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     message = "Spline program motion is disabled pending an owned response protocol"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     _finish_execute_row()
     return ROW_EXECUTION_REJECTED
 
   if (RUN['cmdType'] == "End Sp"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     message = "Spline program motion is disabled pending an owned response protocol"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     _finish_execute_row()
     return ROW_EXECUTION_REJECTED
 
   if(RUN['cmdType'] == "Cam On"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
-    start_vid()
+    try:
+      camera_result = _dispatch_program_camera_operation(
+        "on",
+        execution_request,
+        motion_complete,
+      )
+      if camera_result == ROW_EXECUTION_PENDING:
+        return ROW_EXECUTION_PENDING
+      if camera_result is not True:
+        if _reject_cancelled_program_row(execution_request):
+          return ROW_EXECUTION_REJECTED
+        raise RuntimeError("camera preview readiness result is invalid")
+    except Exception as exc:
+      detail = normalize_camera_exception_detail(exc)
+      message = f"Camera-on program row rejected: {detail}"
+      logger.error(message)
+      _set_application_status(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
 
   if(RUN['cmdType'] == "Cam Of"):
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
-    stop_vid()  
+    try:
+      camera_result = _dispatch_program_camera_operation(
+        "off",
+        execution_request,
+        motion_complete,
+      )
+      if camera_result == ROW_EXECUTION_PENDING:
+        return ROW_EXECUTION_PENDING
+      if camera_result is not True:
+        if _reject_cancelled_program_row(execution_request):
+          return ROW_EXECUTION_REJECTED
+        raise RuntimeError("camera preview stop result is invalid")
+    except Exception as exc:
+      detail = normalize_camera_exception_detail(exc)
+      message = f"Camera-off program row rejected: {detail}"
+      logger.error(message)
+      _set_application_status(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
 
   if(RUN['cmdType'] == "Vis Fi"):
-    #if (RUN['moveInProc'] == 1):
-      #RUN['moveInProc'] = 2
+    if _reject_cancelled_program_row(execution_request):
+      return ROW_EXECUTION_REJECTED
     try:
-      templateIndex = command.find("Vis Find - ")
-      bgColorIndex = command.find(" - BGcolor ")
-      scoreIndex = command.find(" Score ")
-      passIndex = command.find(" Pass ")
-      failIndex = command.find(" Fail ")
-      if (
-        templateIndex != 0
-        or not (
-          templateIndex < bgColorIndex < scoreIndex < passIndex < failIndex
-        )
-      ):
-        raise MotionInputError("vision program row delimiters are invalid")
-      template = command[templateIndex+11:bgColorIndex]
-      if not template:
-        raise MotionInputError("vision program template must not be empty")
-      checkBG = command[bgColorIndex+11:scoreIndex]
-      if(checkBG == "(Auto)"):
-        background = None
-        capture_background = "Auto"
-      else:
-        capture_background = normalize_vision_background_color(checkBG)
-        background = _vision_background_grayscale(capture_background)
-      score = finite_number(
-        command[scoreIndex+7:passIndex],
-        "vision program score",
+      vision_command = _parse_program_vision_command(command)
+      vision_result = _dispatch_program_vision_operation(
+        vision_command,
+        execution_request,
+        motion_complete,
       )
-      if score < 0 or score > 100:
-        raise MotionInputError(
-          "vision program score must be between 0 and 100"
-        )
-      pass_tab = command[passIndex+6:failIndex].strip()
-      fail_tab = command[failIndex+6:].strip()
-      for label, value in (
-        ("vision pass tab", pass_tab),
-        ("vision fail tab", fail_tab),
-      ):
-        if re.fullmatch(r"\d+", value) is None:
-          raise MotionInputError(
-            f"{label} must be a non-negative integer"
-          )
-      min_score = score*.01
-      if take_pic(capture_background) is not True:
-        raise MotionInputError("vision capture failed")
-      if background is None:
-        background = _vision_background_grayscale(RUN['BGavg'])
-      status = visFind(template,min_score,background)
-      if status == "pass":
-        selected_tab = pass_tab
-      elif status == "fail":
-        selected_tab = fail_tab
-      else:
-        raise MotionInputError(
-          "vision matching returned an invalid result"
-        )
-      try:
-        index = _program_tab_row_index(
-          tab1.progView.get(0, "end"),
-          selected_tab,
-        )
-      except MotionInputError as exc:
-        raise MotionInputError(
-          f"vision result tab {selected_tab} does not exist"
-        ) from exc
-      tab1.progView.selection_clear(0, END)
-      tab1.progView.select_set(index)
+      if vision_result == ROW_EXECUTION_PENDING:
+        return ROW_EXECUTION_PENDING
+      if vision_result is not True:
+        if _reject_cancelled_program_row(execution_request):
+          return ROW_EXECUTION_REJECTED
+        _finish_execute_row()
+        return ROW_EXECUTION_REJECTED
     except Exception as exc:
-      message = f"Vision program row rejected: {exc}"
+      detail = normalize_camera_exception_detail(exc)
+      message = f"Vision program row rejected: {detail}"
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _publish_program_vision_status(message, "Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
   
 
-
+  if _reject_cancelled_program_row(execution_request):
+    return ROW_EXECUTION_REJECTED
   _finish_execute_row()
   return ROW_EXECUTION_COMPLETE
   
@@ -13415,8 +17751,10 @@ if CE['Platform']['IS_WINDOWS']:
 
   def _lbl(text, style="Warn.TLabel"):
       try:
-          root.after(0, lambda: almStatusLab.config(text=text, style=style))
-          root.after(0, lambda: almStatusLab2.config(text=text, style=style))
+          root.after(
+              0,
+              lambda: _set_application_status(text, style),
+          )
       except Exception:
           pass
 
@@ -13860,14 +18198,12 @@ else:
         mainMode = 1
         jogMode = 1
         grip = 0
-        almStatusLab.config(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
-        almStatusLab2.config(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
+        _set_application_status(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
         #xbcStatusLab.config(text='Xbox ON', )
         ChgDis(2)
       else:
         RUN['xboxUse'] = 0
-        almStatusLab.config(text='XBOX CONTROLLER OFF', style="Warn.TLabel")
-        almStatusLab2.config(text='XBOX CONTROLLER OFF', style="Warn.TLabel")
+        _set_application_status(text='XBOX CONTROLLER OFF', style="Warn.TLabel")
         #xbcStatusLab.config(text='Xbox OFF', )
       while RUN['xboxUse'] == 1 and not application_closing.is_set():
         try:
@@ -13891,20 +18227,16 @@ else:
               if mainMode != 1:
                 mainMode = 1
                 jogMode = 1
-                almStatusLab.config(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
-                almStatusLab2.config(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
+                _set_application_status(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
               else:                
                 jogMode +=1        
               if jogMode == 2:
-                almStatusLab.config(text='JOGGING JOINTS 3 & 4', style="Warn.TLabel")
-                almStatusLab2.config(text='JOGGING JOINTS 3 & 4', style="Warn.TLabel")
+                _set_application_status(text='JOGGING JOINTS 3 & 4', style="Warn.TLabel")
               elif jogMode == 3:
-                almStatusLab.config(text='JOGGING JOINTS 5 & 6', style="Warn.TLabel")
-                almStatusLab2.config(text='JOGGING JOINTS 5 & 6', style="Warn.TLabel")
+                _set_application_status(text='JOGGING JOINTS 5 & 6', style="Warn.TLabel")
               elif jogMode == 4:
                 jogMode = 1
-                almStatusLab.config(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
-                almStatusLab2.config(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
+                _set_application_status(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
             ##JOINT JOG
             elif (mainMode == 1 and event.code == 'ABS_HAT0X' and event.state == 1 and jogMode == 1): 
               J1jogNeg(float(incrementEntryField.get()))    
@@ -13935,17 +18267,14 @@ else:
               if mainMode != 2:
                 mainMode = 2
                 jogMode = 1
-                almStatusLab.config(text='JOGGING X & Y AXIS', style="Warn.TLabel")
-                almStatusLab2.config(text='JOGGING X & Y AXIS', style="Warn.TLabel")
+                _set_application_status(text='JOGGING X & Y AXIS', style="Warn.TLabel")
               else:                
                 jogMode +=1        
               if jogMode == 2:
-                almStatusLab.config(text='JOGGING Z AXIS', style="Warn.TLabel")
-                almStatusLab2.config(text='JOGGING Z AXIS', style="Warn.TLabel")
+                _set_application_status(text='JOGGING Z AXIS', style="Warn.TLabel")
               elif jogMode == 3:
                 jogMode = 1
-                almStatusLab.config(text='JOGGING X & Y AXIS', style="Warn.TLabel")
-                almStatusLab2.config(text='JOGGING X & Y AXIS', style="Warn.TLabel")
+                _set_application_status(text='JOGGING X & Y AXIS', style="Warn.TLabel")
             ##CARTESIAN DIR JOG
             elif (mainMode == 2 and event.code == 'ABS_HAT0Y' and event.state == -1 and jogMode == 1): 
               XjogNeg(float(incrementEntryField.get()))    
@@ -13964,17 +18293,14 @@ else:
               if mainMode != 3:
                 mainMode = 3
                 jogMode = 1
-                almStatusLab.config(text='JOGGING Rx & Ry AXIS', style="Warn.TLabel")
-                almStatusLab2.config(text='JOGGING Rx & Ry AXIS', style="Warn.TLabel")
+                _set_application_status(text='JOGGING Rx & Ry AXIS', style="Warn.TLabel")
               else:                
                 jogMode +=1        
               if jogMode == 2:
-                almStatusLab.config(text='JOGGING Rz AXIS', style="Warn.TLabel")
-                almStatusLab2.config(text='JOGGING Rz AXIS', style="Warn.TLabel")
+                _set_application_status(text='JOGGING Rz AXIS', style="Warn.TLabel")
               elif jogMode == 3:
                 jogMode = 1
-                almStatusLab.config(text='JOGGING Rx & Ry AXIS', style="Warn.TLabel")
-                almStatusLab2.config(text='JOGGING Rx & Ry AXIS', style="Warn.TLabel")
+                _set_application_status(text='JOGGING Rx & Ry AXIS', style="Warn.TLabel")
             ##CARTESIAN ORIENTATION JOG
             elif (mainMode == 3 and event.code == 'ABS_HAT0X' and event.state == -1 and jogMode == 1): 
               RxjogNeg(float(incrementEntryField.get()))    
@@ -13991,8 +18317,7 @@ else:
             ##J7 MODE
             elif (event.code == 'BTN_START' and event.state == 1): 
               mainMode = 4
-              almStatusLab.config(text='JOGGING TRACK', style="Warn.TLabel")
-              almStatusLab2.config(text='JOGGING TRACK', style="Warn.TLabel")
+              _set_application_status(text='JOGGING TRACK', style="Warn.TLabel")
             ##TRACK JOG
             elif (mainMode == 4 and event.code == 'ABS_HAT0X' and event.state == 1): 
               J7jogPos(float(incrementEntryField.get()))    
@@ -14018,8 +18343,7 @@ else:
               pass   
         except:
         #else:
-          almStatusLab.config(text='XBOX CONTROLLER NOT RESPONDING', style="Alarm.TLabel")
-          almStatusLab2.config(text='XBOX CONTROLLER NOT RESPONDING', style="Alarm.TLabel")        
+          _set_application_status(text='XBOX CONTROLLER NOT RESPONDING', style="Alarm.TLabel")
     t = threading.Thread(target=threadxbox)
     t.start()
 
@@ -14178,9 +18502,16 @@ def _exchange_serial_line(
   command,
   control_event=None,
   write_started_event=None,
+  write_cancellation_event=None,
+  write_boundary_lock=None,
   interim_response_handler=None,
   interim_response_limit=None,
+  reset_input=False,
 ):
+  if reset_input is not False:
+    raise MotionInputError(
+      "main controller exchanges must preserve pending input"
+    )
   command = _canonicalize_main_serial_command(command)
   serial_port = RUN.get('ser')
   try:
@@ -14197,35 +18528,60 @@ def _exchange_serial_line(
           "G-code playback does not support interim response handling"
         )
       parse_command_timing(command)
-      return exchange_serial_line_until_cancelled(
+      return _exchange_main_controller_line_until_cancelled(
         serial_port,
         command,
         application_closing,
-        write_lock=serial_write_lock,
         write_started_event=write_started_event,
+        write_boundary_lock=write_boundary_lock,
+        write_cancellation_event=write_cancellation_event,
       )
-    response_timeout = _controller_response_timeout(command)
-    return exchange_serial_line(
-      serial_port,
-      command,
-      response_timeout,
-      write_lock=serial_write_lock,
-      control_event=control_event,
-      control_command="S\n" if control_event is not None else None,
-      control_ack_timeout_seconds=(
-        SERIAL_LIVE_ACK_TIMEOUT_SECONDS
-        if control_event is not None
-        else None
-      ),
-      control_response_timeout_seconds=(
-        response_timeout
-        if control_event is not None
-        else None
-      ),
-      write_started_event=write_started_event,
-      interim_response_handler=interim_response_handler,
-      interim_response_limit=interim_response_limit,
-    )
+    else:
+      response_timeout = _controller_response_timeout(command)
+      publish_stop = _prepare_main_controller_stop_exchange(serial_port)
+      response = exchange_serial_line(
+        serial_port,
+        command,
+        response_timeout,
+        write_lock=serial_write_lock,
+        control_event=control_event,
+        control_command="S\n" if control_event is not None else None,
+        control_ack_timeout_seconds=(
+          SERIAL_LIVE_ACK_TIMEOUT_SECONDS
+          if control_event is not None
+          else None
+        ),
+        control_response_timeout_seconds=(
+          response_timeout
+          if control_event is not None
+          else None
+        ),
+        write_started_event=write_started_event,
+        cancellation_event=write_cancellation_event,
+        write_boundary_lock=write_boundary_lock,
+        reset_input=False,
+        interim_response_handler=interim_response_handler,
+        interim_response_limit=interim_response_limit,
+        estop_callback=publish_stop,
+      )
+    try:
+      position = parse_position_response(response)
+    except ProtocolResponseError:
+      return response
+    if position_response_is_physical_estop(position):
+      _raise_legacy_controller_stop(
+        serial_port,
+        ControllerLineExchangeResponse(
+          None,
+          position,
+          (
+            "admission-estop"
+            if position.flag == CONTROLLER_ESTOP_ADMISSION_FLAG
+            else "estop-only"
+          ),
+        ),
+      )
+    return response
   finally:
     if (
       RUN.get('ser') is serial_port
@@ -14390,10 +18746,6 @@ def _run_auxiliary_stop_safe(request_id, control_mode):
           min(CONTROL_POLL_INTERVAL_SECONDS, remaining)
         ):
           break
-        if application_closing.is_set():
-          raise SerialActivityRejected(
-            "application shutdown interrupted auxiliary stop acknowledgement"
-          )
       with auxiliary_stop_state_lock:
         owner_result = auxiliary_stop_owner_result
         if (
@@ -14467,6 +18819,16 @@ def _run_auxiliary_stop_safe(request_id, control_mode):
     ):
       auxiliary_stop_injected_event.clear()
       auxiliary_stop_acknowledgement_deadline = None
+    try:
+      _settle_main_controller_auxiliary_stop_request_locked(
+        request_id,
+        terminal_type == "completed" and not cleanup_errors,
+      )
+    except Exception as exc:
+      cleanup_errors.append(
+        "main-controller auxiliary stop settlement failed: "
+        f"{exc}"
+      )
   if cleanup_errors:
     terminal_type = "failed"
     cleanup_message = "; ".join(cleanup_errors)
@@ -14481,7 +18843,12 @@ def _run_auxiliary_stop_safe(request_id, control_mode):
 
 
 def _auxiliary_stop_not_required():
-  if application_closing.is_set() or RUN['offlineMode']:
+  # A live or retained handle remains stop-relevant even if persisted
+  # configuration is absent or damaged. The configuration fallback preserves
+  # a required-stop failure when a configured controller is unavailable.
+  if RUN.get('ser2') is not None:
+    return False
+  if RUN['offlineMode']:
     return True
   configured_port = CAL.get('com2Port')
   configured_board = CAL.get('auxiliaryBoard')
@@ -14495,9 +18862,104 @@ def _auxiliary_stop_not_required():
   )
 
 
+def _auxiliary_stop_shutdown_pending():
+  with auxiliary_stop_state_lock:
+    return (
+      auxiliary_stop_requested.is_set()
+      or auxiliary_stop_pending_request_id is not None
+      or auxiliary_stop_active_request_id is not None
+      or main_controller_auxiliary_stop_request_id is not None
+    )
+
+
+def _serial_shutdown_ready_for_close():
+  if not serial_lock.locked() or not auxiliary_serial_lock.locked():
+    raise RuntimeError(
+      "serial shutdown readiness requires both transport reservations"
+    )
+  if (
+    main_controller_stop_pending_event is not None
+    or not main_controller_stop_event_queue.empty()
+  ):
+    return False
+  with auxiliary_stop_state_lock:
+    stop_pending = (
+      auxiliary_stop_requested.is_set()
+      or auxiliary_stop_pending_request_id is not None
+      or auxiliary_stop_active_request_id is not None
+      or main_controller_auxiliary_stop_request_id is not None
+    )
+    return not stop_pending and serial_activity_registry.idle()
+
+
+def _settle_main_controller_auxiliary_stop_request_locked(
+  request_id,
+  acknowledged,
+):
+  global auxiliary_stop_pending_request_id
+  global main_controller_auxiliary_stop_request_id
+
+  if (
+    isinstance(request_id, bool)
+    or not isinstance(request_id, int)
+    or request_id <= 0
+  ):
+    raise MotionInputError(
+      "main-controller auxiliary stop settlement ID is invalid"
+    )
+  if not isinstance(acknowledged, bool):
+    raise MotionInputError(
+      "main-controller auxiliary stop acknowledgement must be boolean"
+    )
+  if main_controller_auxiliary_stop_request_id != request_id:
+    return False
+  if acknowledged:
+    if (
+      auxiliary_stop_active_request_id is not None
+      or auxiliary_stop_pending_request_id is not None
+    ):
+      raise RuntimeError(
+        "main-controller auxiliary stop acknowledgement preceded "
+        "request release"
+      )
+    main_controller_auxiliary_stop_request_id = None
+    return True
+  if (
+    auxiliary_stop_active_request_id is not None
+    and auxiliary_stop_active_request_id != request_id
+  ):
+    raise RuntimeError(
+      "main-controller auxiliary stop retry conflicts with an active "
+      "request"
+    )
+  if (
+    auxiliary_stop_pending_request_id is not None
+    and auxiliary_stop_pending_request_id != request_id
+  ):
+    raise RuntimeError(
+      "main-controller auxiliary stop retry conflicts with a pending "
+      "request"
+    )
+  auxiliary_stop_pending_request_id = request_id
+  auxiliary_stop_requested.set()
+  return True
+
+
+def _settle_main_controller_auxiliary_stop_request(
+  request_id,
+  acknowledged,
+):
+  with auxiliary_stop_state_lock:
+    return _settle_main_controller_auxiliary_stop_request_locked(
+      request_id,
+      acknowledged,
+    )
+
+
 def _try_dispatch_auxiliary_stop():
   global auxiliary_stop_acknowledgement_deadline
   global auxiliary_stop_active_request_id
+  global main_controller_auxiliary_stop_request_id
   global auxiliary_stop_owner_result
   global auxiliary_stop_pending_request_id
 
@@ -14512,11 +18974,13 @@ def _try_dispatch_auxiliary_stop():
     if _auxiliary_stop_not_required():
       auxiliary_stop_pending_request_id = None
       auxiliary_stop_requested.clear()
+      if main_controller_auxiliary_stop_request_id == request_id:
+        main_controller_auxiliary_stop_request_id = None
       auxiliary_serial_event_queue.put(
         ("completed", request_id, "AUXILIARY STOP NOT REQUIRED")
       )
       return False
-    control_mode = serial_activity_registry.reserve_control("ser2")
+    control_mode = serial_activity_registry.reserve_emergency_control("ser2")
     if control_mode is None:
       return False
     if (
@@ -14553,35 +19017,32 @@ def _try_dispatch_auxiliary_stop():
       auxiliary_stop_owner_result_event.clear()
       auxiliary_stop_injected_event.clear()
       auxiliary_stop_acknowledgement_deadline = None
+      try:
+        _settle_main_controller_auxiliary_stop_request_locked(
+          request_id,
+          False,
+        )
+      except Exception as settlement_exc:
+        failure = (
+          f"{failure}; main-controller auxiliary stop retry failed: "
+          f"{settlement_exc}"
+        )
     auxiliary_serial_event_queue.put(("failed", request_id, failure))
   return True
 
 
 def _request_auxiliary_stop(on_reserved=None):
-  global auxiliary_stop_next_request_id
-  global auxiliary_stop_pending_request_id
-
   if on_reserved is not None and not callable(on_reserved):
     raise TypeError("auxiliary stop reservation callback must be callable")
   if _auxiliary_stop_not_required():
     return AUXILIARY_STOP_NOT_REQUIRED, None
   with auxiliary_stop_state_lock:
-    if auxiliary_stop_active_request_id is not None:
-      request_id = auxiliary_stop_active_request_id
-      if on_reserved is not None:
-        on_reserved(request_id)
-      return AUXILIARY_STOP_DISPATCHED, request_id
-    if auxiliary_stop_pending_request_id is None:
-      request_id = auxiliary_stop_next_request_id + 1
-      if on_reserved is not None:
-        on_reserved(request_id)
-      auxiliary_stop_next_request_id = request_id
-      auxiliary_stop_pending_request_id = request_id
-      auxiliary_stop_requested.set()
-    else:
-      request_id = auxiliary_stop_pending_request_id
-      if on_reserved is not None:
-        on_reserved(request_id)
+    request_id = _reserve_auxiliary_stop_request_locked(on_reserved)
+    already_dispatched = (
+      auxiliary_stop_active_request_id == request_id
+    )
+  if already_dispatched:
+    return AUXILIARY_STOP_DISPATCHED, request_id
 
   if _try_dispatch_auxiliary_stop():
     return AUXILIARY_STOP_DISPATCHED, request_id
@@ -14599,6 +19060,7 @@ def start_send_serial_thread(
   completion_callback=None,
   controller_recovery=False,
   write_started_event=None,
+  write_cancellation_boundary=None,
 ):
   if completion_callback is not None and not callable(completion_callback):
     raise TypeError("completion_callback must be callable")
@@ -14609,6 +19071,16 @@ def start_send_serial_thread(
     for method in ("set", "is_set")
   ):
     raise TypeError("write_started_event must satisfy the event contract")
+  if write_cancellation_boundary is not None:
+    if not isinstance(
+      write_cancellation_boundary,
+      SerialWriteCancellationBoundary,
+    ):
+      raise TypeError("write cancellation boundary is invalid")
+    if write_started_event is None:
+      raise TypeError(
+        "write cancellation boundary requires a write-start event"
+      )
   if application_closing.is_set():
     logger.warning("Serial command rejected during application shutdown")
     return False
@@ -14648,6 +19120,7 @@ def start_send_serial_thread(
         completion_callback,
         activity_lease,
         write_started_event,
+        write_cancellation_boundary,
       ),
       daemon=True,
     )
@@ -14743,6 +19216,7 @@ def run_send_serial_safe(
   completion_callback=None,
   activity_lease=None,
   write_started_event=None,
+  write_cancellation_boundary=None,
 ):
   serial_event_queue.put(
     (
@@ -14760,6 +19234,8 @@ def run_send_serial_safe(
       command,
       control_event=live_jog_stop_requested if live_jog else None,
       write_started_event=write_started_event,
+      write_cancellation_event=write_cancellation_boundary,
+      write_boundary_lock=write_cancellation_boundary,
     )
     serial_event_queue.put(
       (
@@ -14914,8 +19390,7 @@ def _poll_serial_events():
         cmdSentEntryField.delete(0, 'end')
         cmdSentEntryField.insert(0, command)
         if live_jog:
-          almStatusLab.config(text="LIVE JOG IN PROGRESS", style="OK.TLabel")
-          almStatusLab2.config(text="LIVE JOG IN PROGRESS", style="OK.TLabel")
+          _set_application_status("LIVE JOG IN PROGRESS", "OK.TLabel")
         continue
 
       if event_type not in ("completed", "failed"):
@@ -14926,8 +19401,7 @@ def _poll_serial_events():
         if event_type == "failed":
           message = f"Serial command failed: {error}"
           logger.error(message)
-          almStatusLab.config(text=message, style="Alarm.TLabel")
-          almStatusLab2.config(text=message, style="Alarm.TLabel")
+          _set_application_status(message, "Alarm.TLabel")
           _invalidate_joint_motion_state(message)
         else:
           applied_position = _apply_legacy_serial_response(response)
@@ -14945,8 +19419,7 @@ def _poll_serial_events():
             ]
             setStepMonitorsVR()
             if not applied_position.speed_violation:
-              almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
-              almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+              _set_application_status("SYSTEM READY", "OK.TLabel")
       except Exception as exc:
         message = f"Unable to apply serial worker result: {exc}"
         logger.exception(message)
@@ -14978,27 +19451,582 @@ def _poll_serial_events():
           if deferred_joint_adjustments.pending:
             logger.warning(
               "Deferred joint target discarded after a controller speed violation"
-            )
+          )
           _clear_deferred_joint_adjustments()
-          deferred_dispatched = False
+          deferred_dispatch = DeferredJointDispatchOutcome.BLOCKED
         else:
-          deferred_dispatched = _try_dispatch_deferred_joint_adjustments(
+          deferred_dispatch = _try_dispatch_deferred_joint_adjustments(
             allow_current_generation=True,
           )
         if (
           applied_position is not None
           and not applied_position.speed_violation
-          and not deferred_dispatched
+          and deferred_dispatch is DeferredJointDispatchOutcome.IDLE
           and not joint_motion_dispatcher.active
           and not motion_request_registry.active
           and not application_closing.is_set()
         ):
-          almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
-          almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+          _set_application_status("SYSTEM READY", "OK.TLabel")
   except Exception:
     logger.exception("Unable to apply a serial worker result on the Tk event thread")
   finally:
-    _reschedule_event_poll("serial")
+    try:
+      try:
+        _apply_main_controller_idle_stop_results()
+      except Exception:
+        logger.exception(
+          "Unable to apply an idle main-controller event result"
+        )
+      try:
+        _try_start_main_controller_idle_stop_reader()
+      except Exception:
+        logger.exception(
+          "Unable to supervise idle main-controller events"
+        )
+    finally:
+      _reschedule_event_poll("serial")
+
+
+def _apply_pending_manual_controller_stop_event():
+  global manual_controller_estop_applied_position
+  global manual_controller_estop_applied_request_id
+  global manual_controller_pending_stop_event
+
+  with manual_controller_state_lock:
+    event = manual_controller_pending_stop_event
+  if event is None:
+    return True
+  if not isinstance(event, ManualControllerStopEvent):
+    raise RuntimeError(
+      "manual controller pending E-stop event is invalid"
+    )
+
+  request, _ = _manual_controller_operation()
+  if request.request_id != event.request_id:
+    raise RuntimeError(
+      "manual controller pending E-stop ownership is invalid"
+    )
+  with manual_controller_state_lock:
+    if (
+      manual_controller_active_request is not request
+      or manual_controller_pending_stop_event is not event
+      or manual_controller_estop_applied_request_id is not None
+      or manual_controller_estop_applied_position is not None
+    ):
+      raise RuntimeError(
+        "manual controller pending E-stop ownership changed"
+      )
+
+  try:
+    applied_position = displayPosition(
+      event.position.raw,
+      parsed=event.position,
+    )
+    if applied_position is None:
+      ErrorHandler(event.position.flag)
+    elif (
+      not isinstance(applied_position, PositionResponse)
+      or not position_response_is_physical_estop(applied_position)
+      or applied_position != event.position
+    ):
+      raise RuntimeError(
+        "manual controller E-stop position could not be applied"
+      )
+    _invalidate_joint_motion_state(
+      "manual controller physical E-stop received"
+    )
+    _set_manual_controller_feedback(
+      "PHYSICAL E-STOP RECEIVED; CONTROLLER RESPONSE SETTLING"
+    )
+    _set_manual_controller_status(
+      "PHYSICAL E-STOP RECEIVED",
+      "Alarm.TLabel",
+    )
+    _clear_manual_auxiliary_stop_barrier_if_settled()
+  except Exception:
+    logger.exception(
+      "Unable to apply a retained manual-controller E-stop event"
+    )
+    try:
+      _set_manual_controller_status(
+        "PHYSICAL E-STOP PRESENTATION PENDING",
+        "Alarm.TLabel",
+      )
+    except Exception:
+      logger.exception(
+        "Unable to render the pending manual-controller E-stop status"
+      )
+    return False
+
+  with manual_controller_state_lock:
+    if (
+      manual_controller_active_request is not request
+      or manual_controller_pending_stop_event is not event
+      or manual_controller_estop_applied_request_id is not None
+      or manual_controller_estop_applied_position is not None
+    ):
+      raise RuntimeError(
+        "manual controller E-stop ownership changed during application"
+      )
+    manual_controller_pending_stop_event = None
+    manual_controller_estop_applied_request_id = request.request_id
+    manual_controller_estop_applied_position = event.position
+  return True
+
+
+def _poll_manual_controller_events():
+  global manual_controller_estop_applied_request_id
+  global manual_controller_estop_applied_position
+
+  try:
+    with manual_controller_cleanup_lock:
+      pending_cleanup = manual_controller_cleanup_pending
+    if pending_cleanup is not None:
+      pending_request = pending_cleanup.request
+      if not _retry_manual_controller_cleanup():
+        detail = (
+          pending_cleanup.last_error
+          or "cleanup retry failed without details"
+        )
+        _set_manual_controller_status(
+          f"CONTROLLER I/O CLEANUP PENDING: {detail}",
+          "Alarm.TLabel",
+        )
+        return
+      settlement_action = pending_cleanup.settlement_action
+      connection_trusted = _manual_controller_connection_trusted(
+        pending_request
+      )
+      if (
+        connection_trusted
+        and settlement_action in ("dispatch", "dispatch-ready")
+      ):
+        deferred_dispatch = _try_dispatch_deferred_joint_adjustments(
+          allow_current_generation=True,
+        )
+        if (
+          settlement_action == "dispatch-ready"
+          and deferred_dispatch is DeferredJointDispatchOutcome.IDLE
+          and not joint_motion_dispatcher.active
+          and not motion_request_registry.active
+          and not application_closing.is_set()
+        ):
+          _set_manual_controller_status("SYSTEM READY", "OK.TLabel")
+
+    if not _apply_pending_manual_controller_stop_event():
+      return
+
+    while True:
+      try:
+        event = manual_controller_event_queue.get_nowait()
+      except Empty:
+        break
+      request, _ = _manual_controller_operation()
+      if not isinstance(event, ManualControllerResult):
+        raise RuntimeError("manual controller worker emitted an invalid result")
+      result = event
+      if request.request_id != result.request_id:
+        raise RuntimeError(
+          "manual controller worker result ownership is invalid"
+        )
+      with manual_controller_state_lock:
+        applied_request_id = manual_controller_estop_applied_request_id
+        applied_estop_position = manual_controller_estop_applied_position
+      if (
+        (applied_request_id is None) != (applied_estop_position is None)
+        or (
+          applied_request_id is not None
+          and applied_request_id != request.request_id
+        )
+        or (
+          applied_estop_position is not None
+          and (
+            not isinstance(applied_estop_position, PositionResponse)
+            or not position_response_is_physical_estop(
+              applied_estop_position
+            )
+          )
+        )
+      ):
+        raise RuntimeError(
+          "manual controller applied E-stop ownership is invalid"
+        )
+      physical_estop_received = applied_request_id == request.request_id
+      command_is_write = controller_modbus_command_is_write(
+        request.command
+      )
+      terminal_classification = None
+
+      if result.outcome == "estop":
+        if (
+          not physical_estop_received
+          or result.position != applied_estop_position
+        ):
+          raise RuntimeError(
+            "manual controller E-stop result was not independently applied"
+          )
+        if result.frame_order == "estop-terminal":
+          frames = (result.position.raw, result.value)
+        elif result.frame_order == "terminal-estop":
+          frames = (result.value, result.position.raw)
+        elif result.frame_order == "estop-admission":
+          frames = (
+            result.position.raw,
+            result.admission_position.raw,
+          )
+        else:
+          frames = (result.position.raw,)
+        parsed_exchange = parse_controller_modbus_exchange_frames(
+          request.command,
+          frames,
+        )
+        if (
+          (
+            result.frame_order in (
+              "estop-terminal",
+              "terminal-estop",
+            )
+            and parsed_exchange.terminal_response != result.value
+          )
+          or (
+            result.frame_order in (
+              "estop-only",
+              "admission-estop",
+            )
+            and parsed_exchange.terminal_response is not None
+          )
+          or parsed_exchange.estop_position != result.position
+          or (
+            parsed_exchange.admission_position
+            != result.admission_position
+          )
+          or parsed_exchange.frame_order != result.frame_order
+        ):
+          raise RuntimeError(
+            "manual controller E-stop result exchange is invalid"
+          )
+        if parsed_exchange.terminal_response is not None:
+          terminal_classification = (
+            classify_controller_modbus_terminal_response(
+              request.command,
+              parsed_exchange.terminal_response,
+              paired_with_estop=(
+                parsed_exchange.estop_position is not None
+              ),
+            )
+          )
+      elif result.outcome in ("completed", "rejected", "indeterminate"):
+        try:
+          terminal_classification = (
+            classify_controller_modbus_terminal_response(
+              request.command,
+              result.value,
+            )
+          )
+        except ProtocolResponseError:
+          if not (
+            result.outcome == "indeterminate"
+            and command_is_write
+            and result.serial_write_started
+            and serial_transport_quarantined(request.serial_port)
+          ):
+            raise
+        else:
+          if terminal_classification != result.outcome:
+            raise RuntimeError(
+              "manual controller terminal classification is invalid"
+            )
+        if result.outcome == "indeterminate" and not command_is_write:
+          raise RuntimeError(
+            "manual controller read result cannot be indeterminate"
+          )
+      else:
+        if result.serial_write_started and command_is_write:
+          raise RuntimeError(
+            "manual controller write failure lost indeterminate state"
+          )
+        try:
+          classify_controller_modbus_terminal_response(
+            request.command,
+            result.value,
+          )
+        except ProtocolResponseError:
+          pass
+        else:
+          raise RuntimeError(
+            "manual controller framed terminal was reported as failed"
+          )
+
+      application_error = None
+      settlement_presentation = None
+      try:
+        if physical_estop_received:
+          if not result.serial_write_started:
+            feedback = (
+              "Physical E-stop received before command transmission; "
+              "command not sent"
+            )
+          elif result.frame_order in (
+            "admission-estop",
+            "estop-admission",
+          ):
+            feedback = (
+              "Physical E-stop blocked command admission; command not "
+              "executed; reconnect before further commands"
+            )
+          elif (
+            command_is_write
+            and (
+              result.outcome == "indeterminate"
+              or terminal_classification == "indeterminate"
+            )
+          ):
+            feedback = (
+              "Physical E-stop received; external write outcome unknown "
+              f"({result.value}); "
+              "reconnect and verify external device state"
+            )
+          elif command_is_write and terminal_classification == "completed":
+            feedback = (
+              "Physical E-stop received after external write completion "
+              f"({result.value}); "
+              "reconnect before further commands"
+            )
+          elif command_is_write and terminal_classification == "rejected":
+            feedback = (
+              "Physical E-stop received; external write rejected "
+              f"({result.value}); "
+              "reconnect before further commands"
+            )
+          elif terminal_classification == "rejected":
+            feedback = (
+              "Physical E-stop received; controller request rejected: "
+              f"{result.value}; reconnect before further commands"
+            )
+          elif terminal_classification == "completed":
+            feedback = (
+              "Physical E-stop received after controller response: "
+              f"{result.value}; reconnect before further commands"
+            )
+          else:
+            feedback = (
+              "Physical E-stop received; controller response ownership "
+              "closed"
+            )
+          status = (
+            "PHYSICAL E-STOP RECEIVED; CONTROLLER RECONNECTION REQUIRED"
+          )
+          style = "Alarm.TLabel"
+        elif result.outcome == "completed":
+          feedback = result.value
+          status = "CONTROLLER I/O COMPLETE"
+          style = "OK.TLabel"
+        elif result.outcome == "rejected":
+          feedback = f"Controller request rejected: {result.value}"
+          status = feedback
+          style = "Alarm.TLabel"
+        elif result.outcome == "indeterminate":
+          feedback = (
+            f"Controller write outcome unknown: {result.value}; "
+            "reconnect and verify external device state"
+          )
+          status = (
+            "CONTROLLER WRITE OUTCOME UNKNOWN; RECONNECTION REQUIRED"
+          )
+          style = "Alarm.TLabel"
+        else:
+          feedback = f"Manual controller command failed: {result.value}"
+          status = feedback
+          style = "Alarm.TLabel"
+        settlement_presentation = ManualControllerPresentation(
+          feedback,
+          status,
+          style,
+        )
+        _set_manual_controller_feedback(feedback)
+        _set_manual_controller_status(status, style)
+      except Exception as exc:
+        application_error = exc
+
+      connection_trusted = (
+        RUN.get('ser') is request.serial_port
+        and getattr(request.serial_port, "is_open", False)
+        and not serial_transport_quarantined(request.serial_port)
+      )
+      if application_error is not None:
+        detail = _manual_controller_error_detail(
+          application_error,
+          "result application failed without details",
+        )
+        message = f"Unable to apply manual controller result: {detail}"
+        settlement_presentation = ManualControllerPresentation(
+          message,
+          message,
+          "Alarm.TLabel",
+        )
+      elif (
+        not connection_trusted
+        and not physical_estop_received
+        and result.outcome != "indeterminate"
+      ):
+        settlement_presentation = ManualControllerPresentation(
+          (
+            "Controller connection lost during result settlement "
+            f"({result.value}); reconnect required"
+          ),
+          "CONTROLLER CONNECTION LOST; RECONNECTION REQUIRED",
+          "Alarm.TLabel",
+        )
+      try:
+        _set_manual_controller_feedback(
+          settlement_presentation.feedback
+        )
+        _set_manual_controller_status(
+          settlement_presentation.status,
+          settlement_presentation.style,
+        )
+      except Exception:
+        logger.exception(
+          "Unable to render the final manual controller presentation"
+        )
+      close_required = (
+        physical_estop_received
+        or result.outcome == "indeterminate"
+        or application_error is not None
+        or not connection_trusted
+      )
+      if close_required:
+        _invalidate_joint_motion_state(
+          "manual controller exchange ended without a trusted connection"
+        )
+      cleanup_error = None
+      try:
+        settlement_action = "none"
+        if not close_required:
+          settlement_action = (
+            "dispatch-ready"
+            if result.outcome == "completed"
+            else "dispatch"
+          )
+        _release_manual_controller_operation(
+          close_required=close_required,
+          close_context=(
+            "manual controller physical E-stop response"
+            if physical_estop_received
+            else (
+              "manual controller indeterminate external write"
+              if result.outcome == "indeterminate"
+              else "manual controller result settlement"
+            )
+          ),
+          settlement_action=settlement_action,
+          settlement_presentation=settlement_presentation,
+        )
+      except Exception as exc:
+        cleanup_error = exc
+
+      if cleanup_error is not None:
+        deferred_dispatch = DeferredJointDispatchOutcome.BLOCKED
+        detail = _manual_controller_error_detail(
+          cleanup_error,
+          "cleanup failed without details",
+        )
+        message = f"Controller I/O cleanup pending: {detail}"
+        logger.error(
+          message,
+          exc_info=(
+            type(cleanup_error),
+            cleanup_error,
+            cleanup_error.__traceback__,
+          ),
+        )
+        _render_manual_controller_rejection(message)
+      else:
+        connection_trusted = (
+          RUN.get('ser') is request.serial_port
+          and getattr(request.serial_port, "is_open", False)
+          and not serial_transport_quarantined(request.serial_port)
+        )
+        if not connection_trusted:
+          deferred_dispatch = DeferredJointDispatchOutcome.BLOCKED
+        else:
+          deferred_dispatch = _try_dispatch_deferred_joint_adjustments(
+            allow_current_generation=True,
+          )
+
+      if application_error is not None:
+        detail = _manual_controller_error_detail(
+          application_error,
+          "result application failed without details",
+        )
+        message = f"Unable to apply manual controller result: {detail}"
+        logger.error(
+          message,
+          exc_info=(
+            type(application_error),
+            application_error,
+            application_error.__traceback__,
+          ),
+        )
+        try:
+          _render_manual_controller_rejection(message)
+        except Exception:
+          logger.exception(
+            "Unable to render a manual controller application failure"
+          )
+      elif (
+        cleanup_error is None
+        and result.outcome == "completed"
+        and not physical_estop_received
+        and connection_trusted
+        and deferred_dispatch is DeferredJointDispatchOutcome.IDLE
+        and not joint_motion_dispatcher.active
+        and not motion_request_registry.active
+        and not application_closing.is_set()
+      ):
+        _set_manual_controller_status("SYSTEM READY", "OK.TLabel")
+  except Exception as exc:
+    logger.exception(
+      "Unable to apply a manual controller result on the Tk event thread"
+    )
+    with manual_controller_state_lock:
+      request = manual_controller_active_request
+      activity_lease = manual_controller_activity_lease
+    operation_active = request is not None or activity_lease is not None
+    if operation_active:
+      try:
+        _invalidate_joint_motion_state(
+          "manual controller worker result ownership became invalid"
+        )
+      except Exception:
+        logger.exception(
+          "Unable to invalidate motion after an invalid manual result"
+        )
+      try:
+        released_request = _release_manual_controller_operation(
+          close_required=True,
+          close_context="invalid manual controller worker result",
+        )
+        if isinstance(released_request, ManualControllerRequest):
+          request = released_request
+      except Exception:
+        logger.exception(
+          "Unable to release invalid manual controller result ownership"
+        )
+    detail = _manual_controller_error_detail(
+      exc,
+      "manual controller result handling failed",
+    )
+    message = f"Manual controller command failed: {detail}"
+    logger.error(message)
+    try:
+      _render_manual_controller_rejection(message)
+    except Exception:
+      logger.exception(
+        "Unable to render an invalid manual controller result"
+      )
+  finally:
+    _reschedule_event_poll("manual-controller")
 
 
 def _poll_auxiliary_serial_events():
@@ -15021,6 +20049,7 @@ def _poll_auxiliary_serial_events():
         raise RuntimeError("auxiliary serial worker emitted an invalid event")
 
       event_type, request_id, value = event
+      release_stop_barrier = False
       with program_stop_state_lock:
         current_request_id = RUN.get('programStopRequestId')
         if event_type == "started":
@@ -15029,15 +20058,20 @@ def _poll_auxiliary_serial_events():
         elif event_type == "completed":
           if current_request_id == request_id:
             RUN['programStopRequestId'] = None
-            manual_auxiliary_stop_barrier.clear()
             _set_program_stop_status("completed")
+            release_stop_barrier = True
         else:
           message = f"Auxiliary stop failed: {value}"
           logger.error(message)
           if current_request_id == request_id:
-            RUN['programStopRequestId'] = None
-            manual_auxiliary_stop_barrier.clear()
-            _set_program_stop_status("failed")
+            if RUN.get('estopActive'):
+              _set_program_stop_status("pending")
+            else:
+              RUN['programStopRequestId'] = None
+              _set_program_stop_status("failed")
+              release_stop_barrier = True
+      if release_stop_barrier:
+        _clear_manual_auxiliary_stop_barrier_if_settled()
       if event_type == "started":
         cmdSentEntryField.delete(0, 'end')
         cmdSentEntryField.insert(0, value)
@@ -15048,6 +20082,12 @@ def _poll_auxiliary_serial_events():
     logger.exception("Unable to apply an auxiliary serial result on the Tk event thread")
   finally:
     _reschedule_event_poll("auxiliary-serial")
+    try:
+      _apply_main_controller_stop_events()
+    except Exception:
+      logger.exception(
+        "Unable to apply a main-controller stop on the Tk event thread"
+      )
     try:
       _apply_program_stop_status_events()
     except Exception:
@@ -15257,8 +20297,7 @@ def _poll_xbox_auxiliary_events():
         message = f"Xbox auxiliary command rejected: {value}"
         style = "Warn.TLabel"
         logger.warning(message)
-      almStatusLab.config(text=message, style=style)
-      almStatusLab2.config(text=message, style=style)
+      _set_application_status(message, style)
   except Exception:
     logger.exception("Unable to apply an Xbox auxiliary result on the Tk event thread")
   finally:
@@ -15417,28 +20456,93 @@ def _current_joint_motion_profile():
 
 
 def _exchange_joint_motion(command):
-  binding = _current_main_controller_identity()
-  if (
-    binding is None
-    or CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1
-      not in binding.identity.protocol_capabilities
-  ):
-    return _exchange_serial_line(command)
+  serial_port = RUN.get('ser')
+  try:
+    binding = _current_main_controller_identity(serial_port)
+    stop_context = _capture_main_controller_stop_context(serial_port)
+    telemetry_enabled = (
+      binding is not None
+      and CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1
+        in binding.identity.protocol_capabilities
+    )
+    response_timeout = _controller_response_timeout(command)
 
-  def consume_joint_telemetry(response):
-    telemetry = parse_joint_motion_exchange_response(response)
-    if telemetry is None:
-      return False
-    joint_motion_dispatcher.publish_telemetry(telemetry)
-    return True
+    def publish_stop(position):
+      return _publish_main_controller_stop(stop_context, position)
 
-  return _exchange_serial_line(
-    request_joint_telemetry(command),
-    interim_response_handler=consume_joint_telemetry,
-    interim_response_limit=joint_telemetry_response_budget(
-      _controller_response_timeout(command)
-    ),
-  )
+    def consume_joint_telemetry(response):
+      telemetry = parse_joint_motion_exchange_response(response)
+      if telemetry is None:
+        return False
+      joint_motion_dispatcher.publish_telemetry(telemetry)
+      return True
+
+    def validate_joint_terminal(response):
+      if parse_joint_motion_exchange_response(response) is not None:
+        raise ProtocolResponseError(
+          "joint telemetry cannot terminate a motion exchange"
+        )
+
+    outbound_command = (
+      request_joint_telemetry(command)
+      if telemetry_enabled
+      else command
+    )
+    outbound_command = _canonicalize_main_serial_command(outbound_command)
+    write_serial_control(
+      serial_port,
+      outbound_command,
+      write_lock=serial_write_lock,
+      reset_input=False,
+    )
+    response = read_controller_line_exchange_response(
+      serial_port,
+      response_timeout,
+      estop_callback=publish_stop,
+      allow_standalone_estop_event=telemetry_enabled,
+      interim_response_handler=(
+        consume_joint_telemetry
+        if telemetry_enabled
+        else None
+      ),
+      interim_response_limit=(
+        joint_telemetry_response_budget(response_timeout)
+        if telemetry_enabled
+        else None
+      ),
+      terminal_validator=validate_joint_terminal,
+      context="joint-motion controller response",
+    )
+    if (
+      response.estop_position is not None
+      or response.admission_position is not None
+    ):
+      try:
+        quarantine_serial_transport(
+          serial_port,
+          "joint-motion physical E-stop requires reconnection",
+        )
+      finally:
+        _require_main_controller_identity_cleanup(
+          serial_port,
+          "joint-motion physical-stop quarantine",
+        )
+        if (
+          RUN.get('ser') is serial_port
+          and not getattr(serial_port, "is_open", False)
+        ):
+          RUN['ser'] = None
+    return response.authoritative_response
+  finally:
+    if (
+      RUN.get('ser') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      RUN['ser'] = None
+      _require_main_controller_identity_cleanup(
+        serial_port,
+        "joint-motion controller exchange cleanup",
+      )
 
 
 joint_motion_dispatcher = CoalescingJointDispatcher(
@@ -15598,9 +20702,11 @@ def _defer_joint_target(axis, target, profile):
 
 def _try_dispatch_deferred_joint_adjustments(allow_current_generation=False):
   if application_closing.is_set():
-    return False
+    return DeferredJointDispatchOutcome.BLOCKED
+  if _manual_auxiliary_status_reserved():
+    return DeferredJointDispatchOutcome.BLOCKED
   if not deferred_joint_adjustments.pending:
-    return False
+    return DeferredJointDispatchOutcome.IDLE
   if (
     controller_correction_requested.is_set()
     or legacy_serial_result_pending.is_set()
@@ -15608,12 +20714,12 @@ def _try_dispatch_deferred_joint_adjustments(allow_current_generation=False):
     or joint_motion_dispatcher.active
     or motion_request_registry.active
   ):
-    return False
+    return DeferredJointDispatchOutcome.BLOCKED
   if not deferred_joint_adjustments.ready(
     confirmed_position_generation,
     allow_current_generation=allow_current_generation,
   ):
-    return False
+    return DeferredJointDispatchOutcome.BLOCKED
 
   request_lease = None
   lease_created = False
@@ -15642,7 +20748,7 @@ def _try_dispatch_deferred_joint_adjustments(allow_current_generation=False):
   except MotionTransportBusy:
     if lease_created and not joint_motion_dispatcher.active:
       _abandon_joint_motion_request(request_lease)
-    return False
+    return DeferredJointDispatchOutcome.BLOCKED
   except (KeyError, TypeError, ValueError, MotionInputError, MotionQueueFault) as exc:
     if (
       lease_created
@@ -15653,16 +20759,14 @@ def _try_dispatch_deferred_joint_adjustments(allow_current_generation=False):
     _clear_deferred_joint_adjustments()
     message = f"Deferred joint jog rejected: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
-    return False
+    _set_manual_auxiliary_status(message, "Alarm.TLabel")
+    return DeferredJointDispatchOutcome.REJECTED
 
   status = "JOINT TARGET QUEUED" if submission.coalesced else "JOINT MOVE IN PROGRESS"
-  almStatusLab.config(text=status, style="OK.TLabel")
-  almStatusLab2.config(text=status, style="OK.TLabel")
+  _set_manual_auxiliary_status(status, "OK.TLabel")
   _try_set_virtual_joint_target(submission.target)
   _set_joint_motion_target_display(submission.target)
-  return True
+  return DeferredJointDispatchOutcome.DISPATCHED
 
 
 def _set_virtual_joint_target(target_positions):
@@ -15688,8 +20792,7 @@ def _try_set_virtual_joint_target(target_positions):
   except (KeyError, TypeError, ValueError, MotionInputError) as exc:
     message = f"Virtual model update failed; controller state remains authoritative: {exc}"
     logger.exception(message)
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(message, "Warn.TLabel")
     return False
   return True
 
@@ -15715,8 +20818,7 @@ def _start_offline_joint_motion(command):
     _finish_motion_request(request_lease)
     message = f"Offline virtual joint motion rejected: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
     return False
 
   def reconcile_offline_joint(succeeded):
@@ -15755,13 +20857,11 @@ def _start_offline_joint_motion(command):
 
   def complete_offline_joint(succeeded):
     if succeeded:
-      almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
-      almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+      _set_application_status("SYSTEM READY", "OK.TLabel")
       return
     message = "Offline virtual joint motion failed"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
 
   _complete_program_motion_when_virtual_idle(
     complete_offline_joint,
@@ -15782,8 +20882,7 @@ def _poll_joint_motion_events():
           if event.kind == "started":
             cmdSentEntryField.delete(0, 'end')
             cmdSentEntryField.insert(0, event.move.command)
-            almStatusLab.config(text="JOINT MOVE IN PROGRESS", style="OK.TLabel")
-            almStatusLab2.config(text="JOINT MOVE IN PROGRESS", style="OK.TLabel")
+            _set_application_status("JOINT MOVE IN PROGRESS", "OK.TLabel")
             _start_joint_motion_visualization(
               event.move,
               event.started_at_seconds,
@@ -15840,8 +20939,7 @@ def _poll_joint_motion_events():
                 if joint_motion_dispatcher.pending
                 else "SYSTEM READY"
               )
-              almStatusLab.config(text=status, style="OK.TLabel")
-              almStatusLab2.config(text=status, style="OK.TLabel")
+              _set_application_status(status, "OK.TLabel")
               desired_target = joint_motion_dispatcher.desired_target
               if (
                 joint_motion_dispatcher.pending
@@ -15850,7 +20948,31 @@ def _poll_joint_motion_events():
                 _set_joint_motion_target_display(desired_target)
             continue
 
+          if event.kind == "transport-failed":
+            _try_set_virtual_joint_target(_current_joint_positions())
+            if isinstance(event.error, str) and event.error.strip():
+              detail = event.error.strip()
+            else:
+              detail = "unknown controller ownership release failure"
+            message = f"Joint-motion transport fault: {detail}"
+            _invalidate_joint_motion_state(message)
+            logger.error(message)
+            _set_application_status(message, "Alarm.TLabel")
+            if event.pending_discarded:
+              logger.warning(
+                "Pending joint target discarded because controller state is unknown"
+              )
+            continue
+
           if event.position is not None:
+            if position_response_is_physical_estop(event.position):
+              if not RUN.get('estopActive'):
+                raise RuntimeError(
+                  "joint physical-stop result lacks prior stop publication"
+                )
+              # The transport callback owns physical-stop presentation so a
+              # framing failure after publication cannot lose the stop event.
+              continue
             applied_position = displayPosition(
               event.response,
               parsed=event.position,
@@ -15883,8 +21005,7 @@ def _poll_joint_motion_events():
             message = f"Joint motion failed: {event.error}"
             _invalidate_joint_motion_state(message)
             logger.error(message)
-            almStatusLab.config(text=message, style="Alarm.TLabel")
-            almStatusLab2.config(text=message, style="Alarm.TLabel")
+            _set_application_status(message, "Alarm.TLabel")
           if event.pending_discarded:
             logger.warning("Pending joint target discarded because controller state is unknown")
         except Exception as exc:
@@ -15892,8 +21013,7 @@ def _poll_joint_motion_events():
           message = f"Unable to apply joint-motion result: {exc}"
           logger.exception(message)
           _invalidate_joint_motion_state(message)
-          almStatusLab.config(text=message, style="Alarm.TLabel")
-          almStatusLab2.config(text=message, style="Alarm.TLabel")
+          _set_application_status(message, "Alarm.TLabel")
       finally:
         if event.kind not in ("started", "telemetry"):
           _finish_joint_motion_visualization(
@@ -15915,8 +21035,7 @@ def _queue_joint_motion(axis, value, absolute):
     if controller_correction_requested.is_set():
       raise MotionQueueFault("joint motion is unavailable during controller correction")
     if RUN['xboxUse'] != 1:
-      almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
-      almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+      _set_application_status("SYSTEM READY", "OK.TLabel")
 
     if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis < 9:
       raise MotionInputError("joint axis must be an integer in [0, 8]")
@@ -16019,8 +21138,7 @@ def _queue_joint_motion(axis, value, absolute):
           status = "SYSTEM READY"
       else:
         status = "JOINT TARGET QUEUED" if coalesced else "JOINT MOVE IN PROGRESS"
-      almStatusLab.config(text=status, style="OK.TLabel")
-      almStatusLab2.config(text=status, style="OK.TLabel")
+      _set_application_status(status, "OK.TLabel")
       if submission is not None:
         _try_set_virtual_joint_target(submission.target)
         _set_joint_motion_target_display(submission.target)
@@ -16028,8 +21146,7 @@ def _queue_joint_motion(axis, value, absolute):
   except (KeyError, TypeError, ValueError, MotionInputError, MotionQueueFault) as exc:
     message = f"Joint motion rejected: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(message, "Alarm.TLabel")
     return False
 
 
@@ -16088,8 +21205,7 @@ def _queue_primary_joint_position(
     submission = None
 
     if RUN['xboxUse'] != 1:
-      almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
-      almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+      _set_application_status(text="SYSTEM READY", style="OK.TLabel")
 
     if RUN['offlineMode']:
       if not _start_offline_joint_motion(
@@ -16176,8 +21292,7 @@ def _queue_primary_joint_position(
           if coalesced
           else "JOINT MOVE IN PROGRESS"
         )
-      almStatusLab.config(text=status, style="OK.TLabel")
-      almStatusLab2.config(text=status, style="OK.TLabel")
+      _set_application_status(text=status, style="OK.TLabel")
       if submission is not None:
         _try_set_virtual_joint_target(submission.target)
         _set_joint_motion_target_display(submission.target)
@@ -16191,8 +21306,7 @@ def _queue_primary_joint_position(
   ) as exc:
     message = f"Named joint position rejected: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return False
 
 
@@ -16212,8 +21326,7 @@ def MoveToShutdownPosition():
   except (KeyError, TypeError, ValueError, MotionInputError) as exc:
     message = f"Shutdown position rejected: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return False
   return _queue_primary_joint_position(
     target,
@@ -16390,8 +21503,7 @@ def _live_jog_start_is_blocked():
     else:
       return False
   logger.warning(message)
-  almStatusLab.config(text=message, style="Warn.TLabel")
-  almStatusLab2.config(text=message, style="Warn.TLabel")
+  _set_application_status(text=message, style="Warn.TLabel")
   return True
 
 
@@ -16453,8 +21565,7 @@ def _prepare_live_jog(value, allowed_vectors, default_percent):
   except (KeyError, TypeError, ValueError, tk.TclError) as exc:
     message = f"Live jog rejected: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return None
   return (
     controller_protocol_decimal(vector, "live-jog vector"),
@@ -16469,8 +21580,7 @@ def _dispatch_live_jog(command, motion_name):
     message = _motion_request_rejection_message(
       f"Controller busy; {motion_name} not started"
     )
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(text=message, style="Warn.TLabel")
     return False
   cmdSentEntryField.delete(0, 'end')
   cmdSentEntryField.insert(0, command)
@@ -16494,8 +21604,7 @@ def _dispatch_live_jog(command, motion_name):
   if not live_serial_result_pending.is_set():
     RUN['liveJog'] = False
   message = f"Controller busy; {motion_name} not started"
-  almStatusLab.config(text=message, style="Warn.TLabel")
-  almStatusLab2.config(text=message, style="Warn.TLabel")
+  _set_application_status(text=message, style="Warn.TLabel")
   return False
 
 
@@ -16535,8 +21644,7 @@ def _settle_offline_live_jog(operation):
     message = error or "offline live-jog GUI settlement failed"
     message = f"Offline live jog failed: {message}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return False
   return True
 
@@ -16636,8 +21744,7 @@ def start_live_joint_jog_thread(command):
 def LiveJointJog(value):
   if _live_jog_start_is_blocked():
     return False
-  almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
-  almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+  _set_application_status(text="SYSTEM READY", style="OK.TLabel")
   prepared = _prepare_live_jog(
     value,
     LIVE_JOINT_VECTORS,
@@ -16649,8 +21756,7 @@ def LiveJointJog(value):
   if RUN['offlineMode'] and finite_number(vector, "live-jog vector") >= 70:
     message = "Offline live motion supports J1-J6 only; J7-J9 require a controller"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return False
   command = (
     f"LJV{vector}{speed_prefix}{speed}Ac{acceleration}"
@@ -16661,8 +21767,7 @@ def LiveJointJog(value):
       "Offline live joint jog not started; another live jog is active"
     )
     logger.warning(message)
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(text=message, style="Warn.TLabel")
     return False
   return _dispatch_live_jog(command, "live joint jog")
 
@@ -16683,11 +21788,9 @@ def LiveCarJog(value):
   except MotionInputError as exc:
     message = f"Live Cartesian jog rejected: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return False
-  almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
-  almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+  _set_application_status(text="SYSTEM READY", style="OK.TLabel")
   prepared = _prepare_live_jog(
     value,
     LIVE_CARTESIAN_VECTORS,
@@ -16705,8 +21808,7 @@ def LiveCarJog(value):
       "Offline live Cartesian jog not started; another live jog is active"
     )
     logger.warning(message)
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(text=message, style="Warn.TLabel")
     return False
   return _dispatch_live_jog(command, "live Cartesian jog")
 
@@ -16727,11 +21829,9 @@ def LiveToolJog(value):
   except MotionInputError as exc:
     message = f"Live tool jog rejected: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return False
-  almStatusLab.config(text="SYSTEM READY", style="OK.TLabel")
-  almStatusLab2.config(text="SYSTEM READY", style="OK.TLabel")
+  _set_application_status(text="SYSTEM READY", style="OK.TLabel")
   prepared = _prepare_live_jog(
     value,
     LIVE_CARTESIAN_VECTORS,
@@ -16745,8 +21845,7 @@ def LiveToolJog(value):
   except (KeyError, TypeError, ValueError, MotionInputError) as exc:
     message = f"Live tool jog rejected: {exc}"
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return False
   command = (
     f"LTV{vector}{speed_prefix}{speed}Ac{acceleration}"
@@ -16760,8 +21859,7 @@ def LiveToolJog(value):
       "Offline live tool jog not started; another live jog is active"
     )
     logger.warning(message)
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(text=message, style="Warn.TLabel")
     return False
   return _dispatch_live_jog(command, "live tool jog")
 
@@ -16771,21 +21869,18 @@ def StopJog(self):
     if offline_operation is not None:
       offline_live_jog_stop_event.set()
   if offline_operation is not None:
-    almStatusLab.config(text="OFFLINE LIVE JOG STOP REQUESTED", style="Warn.TLabel")
-    almStatusLab2.config(text="OFFLINE LIVE JOG STOP REQUESTED", style="Warn.TLabel")
+    _set_application_status(text="OFFLINE LIVE JOG STOP REQUESTED", style="Warn.TLabel")
     return
   if not RUN['liveJog'] and not live_serial_result_pending.is_set():
     return
   RUN['liveJog'] = False
   if live_serial_result_pending.is_set():
     live_jog_stop_requested.set()
-    almStatusLab.config(text="LIVE JOG STOP REQUESTED", style="Warn.TLabel")
-    almStatusLab2.config(text="LIVE JOG STOP REQUESTED", style="Warn.TLabel")
+    _set_application_status(text="LIVE JOG STOP REQUESTED", style="Warn.TLabel")
   else:
     message = "Live jog has no active controller request"
     logger.warning(message)
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(text=message, style="Warn.TLabel")
 
 
 
@@ -16812,8 +21907,7 @@ def XjogNeg(value):
   # global WC, RUN['VR_angles']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #mm/sec
   if(speedtype == "mm per Sec"):
@@ -16879,8 +21973,7 @@ def YjogNeg(value):
   # global WC, RUN['VR_angles']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #mm/sec
   if(speedtype == "mm per Sec"):
@@ -16946,8 +22039,7 @@ def ZjogNeg(value):
   # global WC, RUN['VR_angles']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #mm/sec
   if(speedtype == "mm per Sec"):
@@ -17009,8 +22101,7 @@ def RxjogNeg(value):
   # global WC, RUN['VR_angles']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #mm/sec
   if(speedtype == "mm per Sec"):
@@ -17073,8 +22164,7 @@ def RyjogNeg(value):
   # global WC, RUN['VR_angles']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #mm/sec
   if(speedtype == "mm per Sec"):
@@ -17136,8 +22226,7 @@ def RzjogNeg(value):
   # global WC, RUN['VR_angles']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #mm/sec
   if(speedtype == "mm per Sec"):
@@ -17199,8 +22288,7 @@ def XjogPos(value):
   # global WC, RUN['VR_angles']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #mm/sec
   if(speedtype == "mm per Sec"):
@@ -17262,8 +22350,7 @@ def YjogPos(value):
   # global WC, RUN['VR_angles']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #mm/sec
   if(speedtype == "mm per Sec"):
@@ -17326,8 +22413,7 @@ def ZjogPos(value):
   # global WC, RUN['VR_angles']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #mm/sec
   if(speedtype == "mm per Sec"):
@@ -17390,8 +22476,7 @@ def RxjogPos(value):
   # global WC, RUN['VR_angles']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #mm/sec
   if(speedtype == "mm per Sec"):
@@ -17453,8 +22538,7 @@ def RyjogPos(value):
   # global WC, RUN['VR_angles']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #mm/sec
   if(speedtype == "mm per Sec"):
@@ -17516,8 +22600,7 @@ def RzjogPos(value):
   # global WC, RUN['VR_angles']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #mm/sec
   if(speedtype == "mm per Sec"):
@@ -17580,8 +22663,7 @@ def TXjogNeg(value):
   # global RUN['xboxUse']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #dont allow mm/sec - switch to sec
   if(speedtype == "mm per Sec"):
@@ -17623,8 +22705,7 @@ def TYjogNeg(value):
   # global RUN['xboxUse']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #dont allow mm/sec - switch to sec
   if(speedtype == "mm per Sec"):
@@ -17665,8 +22746,7 @@ def TZjogNeg(value):
   # global RUN['xboxUse']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #dont allow mm/sec - switch to sec
   if(speedtype == "mm per Sec"):
@@ -17710,8 +22790,7 @@ def TRxjogNeg(value):
   # global RUN['xboxUse']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #dont allow mm/sec - switch to sec
   if(speedtype == "mm per Sec"):
@@ -17752,8 +22831,7 @@ def TRyjogNeg(value):
   # global RUN['xboxUse']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #dont allow mm/sec - switch to sec
   if(speedtype == "mm per Sec"):
@@ -17794,8 +22872,7 @@ def TRzjogNeg(value):
   # global RUN['xboxUse']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #dont allow mm/sec - switch to sec
   if(speedtype == "mm per Sec"):
@@ -17836,8 +22913,7 @@ def TXjogPos(value):
   # global RUN['xboxUse']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #dont allow mm/sec - switch to sec
   if(speedtype == "mm per Sec"):
@@ -17878,8 +22954,7 @@ def TYjogPos(value):
   # global RUN['xboxUse']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #dont allow mm/sec - switch to sec
   if(speedtype == "mm per Sec"):
@@ -17920,8 +22995,7 @@ def TZjogPos(value):
   # global RUN['xboxUse']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #dont allow mm/sec - switch to sec
   if(speedtype == "mm per Sec"):
@@ -17962,8 +23036,7 @@ def TRxjogPos(value):
   # global RUN['xboxUse']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #dont allow mm/sec - switch to sec
   if(speedtype == "mm per Sec"):
@@ -18004,8 +23077,7 @@ def TRyjogPos(value):
   # global RUN['xboxUse']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #dont allow mm/sec - switch to sec
   if(speedtype == "mm per Sec"):
@@ -18046,8 +23118,7 @@ def TRzjogPos(value):
   # global RUN['xboxUse']
   checkSpeedVals()
   if RUN['xboxUse'] != 1:
-    almStatusLab.config(text="SYSTEM READY",  style="OK.TLabel")
-    almStatusLab2.config(text="SYSTEM READY",  style="OK.TLabel")
+    _set_application_status(text="SYSTEM READY",  style="OK.TLabel")
   speedtype = speedOption.get()
   #dont allow mm/sec - switch to sec
   if(speedtype == "mm per Sec"):
@@ -18340,66 +23411,23 @@ def teachReplaceSelected():
 ############################################################################################################################################################## 
 
 
-@_tracked_serial_operation("ser")
 def MBreadHoldReg():
-  slaveID = MBslaveEntryField.get()
-  address = MBaddressEntryField.get()
-  opVal = MBoperValEntryField.get()
-  command = "BA"+"A"+slaveID+"B"+address+"C"+opVal+"\n"
-  response = _exchange_legacy_main_command(command)
-  MBoutputEntryField.delete(0, 'end')
-  MBoutputEntryField.insert(0,response)
+  return _request_manual_modbus("BA")
 
-@_tracked_serial_operation("ser")
 def MBreadCoil():
-  slaveID = MBslaveEntryField.get()
-  address = MBaddressEntryField.get()
-  opVal = MBoperValEntryField.get()
-  command = "BB"+"A"+slaveID+"B"+address+"C"+opVal+"\n"
-  response = _exchange_legacy_main_command(command)
-  MBoutputEntryField.delete(0, 'end')
-  MBoutputEntryField.insert(0,response)
+  return _request_manual_modbus("BB")
 
-@_tracked_serial_operation("ser")
 def MBreadInput():
-  slaveID = MBslaveEntryField.get()
-  address = MBaddressEntryField.get()
-  opVal = MBoperValEntryField.get()
-  command = "BC"+"A"+slaveID+"B"+address+"C"+opVal+"\n"
-  response = _exchange_legacy_main_command(command)
-  MBoutputEntryField.delete(0, 'end')
-  MBoutputEntryField.insert(0,response)
+  return _request_manual_modbus("BC")
 
-@_tracked_serial_operation("ser")
 def MBreadInputReg():
-  slaveID = MBslaveEntryField.get()
-  address = MBaddressEntryField.get()
-  opVal = MBoperValEntryField.get()
-  command = "BD"+"A"+slaveID+"B"+address+"C"+opVal+"\n"
-  response = _exchange_legacy_main_command(command)
-  MBoutputEntryField.delete(0, 'end')
-  MBoutputEntryField.insert(0,response) 
+  return _request_manual_modbus("BD")
 
-@_tracked_serial_operation("ser")
 def MBwriteCoil():
-  slaveID = MBslaveEntryField.get()
-  address = MBaddressEntryField.get()
-  opVal = MBoperValEntryField.get()
-  command = "BE"+"A"+slaveID+"B"+address+"C"+opVal+"\n"
-  response = _exchange_legacy_main_command(command)
-  MBoutputEntryField.delete(0, 'end')
-  MBoutputEntryField.insert(0,response) 
+  return _request_manual_modbus("BE")
 
-   
-@_tracked_serial_operation("ser")
 def MBwriteReg():
-  slaveID = MBslaveEntryField.get()
-  address = MBaddressEntryField.get()
-  opVal = MBoperValEntryField.get()
-  command = "BF"+"A"+slaveID+"B"+address+"C"+opVal+"\n"
-  response = _exchange_legacy_main_command(command)
-  MBoutputEntryField.delete(0, 'end')
-  MBoutputEntryField.insert(0,response)          
+  return _request_manual_modbus("BF")
 
 @_tracked_serial_operation("ser")
 def QueryModbus():
@@ -18543,13 +23571,19 @@ def setOutputOff():
 
 def tabNumber():
   try:
+    tabNum = _normalize_program_tab_number(tabNumEntryField.get())
+  except MotionInputError as exc:
+    message = f"Program tab label rejected: {exc}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  try:
     selRow = tab1.progView.curselection()[0]
     selRow += 1
   except:
     last = tab1.progView.index('end')
     selRow = last
     tab1.progView.select_set(selRow)
-  tabNum = tabNumEntryField.get()
   tabins = "Tab Number "+tabNum              
   tab1.progView.insert(selRow, bytes(tabins + '\n', 'utf-8')) 
   tab1.progView.selection_clear(0, END)
@@ -18561,6 +23595,7 @@ def tabNumber():
       f.write(str(item.strip(), encoding='utf-8'))
       f.write('\n')
     f.close()
+  return True
 
 
 
@@ -18569,13 +23604,19 @@ def tabNumber():
 
 def jumpTab():
   try:
+    tabNum = _normalize_program_tab_number(jumpTabEntryField.get())
+  except MotionInputError as exc:
+    message = f"Program tab jump rejected: {exc}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  try:
     selRow = tab1.progView.curselection()[0]
     selRow += 1
   except:
     last = tab1.progView.index('end')
     selRow = last
     tab1.progView.select_set(selRow)
-  tabNum = jumpTabEntryField.get()
   tabjmp = "Jump Tab-"+tabNum              
   tab1.progView.insert(selRow, bytes(tabjmp + '\n', 'utf-8')) 
   tab1.progView.selection_clear(0, END)
@@ -18587,6 +23628,7 @@ def jumpTab():
       f.write(str(item.strip(), encoding='utf-8'))
       f.write('\n')
     f.close()
+  return True
  
 def cameraOn():
   try:
@@ -18645,7 +23687,7 @@ def IfCMDInsert():
   if (variable == ""):
     localErrorFlag = True
     message = "Please enter an input, register number or COM Port" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
   inputVal = IfInputEntryField.get()
   destVal = IfDestEntryField.get()
   if(option == "5v Input"):
@@ -18654,67 +23696,69 @@ def IfCMDInsert():
     else:
       localErrorFlag = True
       message = "Please enter a 1 or 0 for the = value" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
 
   elif (option == "Register"):
     if(inputVal == ""):
       localErrorFlag = True
       message = "Please enter a register number" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
     prefix = "If Register # " + variable + " = " + inputVal + " :"
 
   elif (option == "COM Device"):
     if(inputVal == ""):
       localErrorFlag = True
       message = "Please enter expected COM device input" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
     prefix = "If COM Device # " + variable + " = " + inputVal + " :"
 
   elif (option == "MB Coil"):
     if(inputVal == ""):
       localErrorFlag = True
       message = "Please enter expected Modbus Coil" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
     prefix = "If MBcoil - SlaveID (1) - Coil # " + variable + " = " + inputVal + " :"
 
   elif (option == "MB Input"):
     if(inputVal == ""):
       localErrorFlag = True
       message = "Please enter expected Modbus Input" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
     prefix = "If MBinput - SlaveID (1) - Input # " + variable + " = " + inputVal + " :"
 
   elif (option == "MB Hold Reg"):
     if(inputVal == ""):
       localErrorFlag = True
       message = "Please enter expected Modbus Holding Register" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
     prefix = "If MBhold reg - SlaveID (1) Num Reg's (1) - Reg # " + variable + " = " + inputVal + " :"
 
   elif (option == "MB Input Reg"):
     if(inputVal == ""):
       localErrorFlag = True
       message = "Please enter expected Modbus Holding Register" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
     prefix = "If MBInput Reg - SlaveID (1) Num Reg's (1) - Input Reg # " + variable + " = " + inputVal + " :"          
 
   if(selection == "Call Prog"):
     if (destVal == ""):
       localErrorFlag = True
       message = "Please enter a program name" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
     value = prefix  + " Call Prog " + destVal
   elif(selection == "Jump Tab"):
-    if (destVal == ""):
+    try:
+      destVal = _normalize_program_tab_number(destVal)
+    except MotionInputError as exc:
       localErrorFlag = True
-      message = "Please enter a destination tab" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      message = f"Program conditional jump rejected: {exc}"
+      _set_application_status(text=message, style="Alarm.TLabel")
     value = prefix + " Jump to Tab " + destVal
   elif(selection == "Stop"):
     value = prefix + " Stop " 
 
-  if(not localErrorFlag):        
-    tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8')) 
+  if(not localErrorFlag):
+    tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8'))
     tab1.progView.selection_clear(0, END)
     tab1.progView.select_set(selRow)
     items = tab1.progView.get(0,END)
@@ -18742,7 +23786,7 @@ def WaitCMDInsert():
   if (variable == ""):
     localErrorFlag = True
     message = "Please enter an input or Modbus address" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
   inputVal = waitInputEntryField.get()
   timoutVal = waitTimeoutEntryField.get()
   if(option == "5v Input"):
@@ -18751,20 +23795,20 @@ def WaitCMDInsert():
     else:
       localErrorFlag = True
       message = "Please enter a 1 or 0 for the = value" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
 
   elif (option == "MB Coil"):
     if(inputVal == ""):
       localErrorFlag = True
       message = "Please enter expected Modbus Coil" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
     value = "Wait MBcoil - SlaveID (1) - Coil # " + variable + " = " + inputVal + " : Timeout = " + timoutVal 
 
   elif (option == "MB Input"):
     if(inputVal == ""):
       localErrorFlag = True
       message = "Please enter expected Modbus Input" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
     value = "Wait MBinput - SlaveID (1) - Input # " + variable + " = " + inputVal + " : Timeout = " + timoutVal  
 
   if(not localErrorFlag):        
@@ -18796,7 +23840,7 @@ def SetCMDInsert():
   if (variable == ""):
     localErrorFlag = True
     message = "Please enter an input or Modbus address" 
-    almStatusLab.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
   inputVal = setInputEntryField.get()
   if(option == "5v Output"):
     if(inputVal == "1" or inputVal == "0"):
@@ -18804,24 +23848,24 @@ def SetCMDInsert():
     else:
       localErrorFlag = True
       message = "Please enter a 1 or 0 for the = value" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
 
   elif (option == "MB Coil"):
     if(inputVal == ""):
       localErrorFlag = True
       message = "Please enter expected Modbus Coil" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
     value = "Set MBcoil - SlaveID (1) - Coil # " + variable + " = " + inputVal
 
   elif (option == "MB Register"):
     if(inputVal == ""):
       localErrorFlag = True
       message = "Please enter expected Modbus Register" 
-      almStatusLab.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
     value = "Set MBoutput - SlaveID (1) - Input # " + variable + " = " + inputVal
 
-  if(not localErrorFlag):        
-    tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8')) 
+  if(not localErrorFlag):
+    tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8'))
     tab1.progView.selection_clear(0, END)
     tab1.progView.select_set(selRow)
     items = tab1.progView.get(0,END)
@@ -18830,7 +23874,7 @@ def SetCMDInsert():
       for item in items:
         f.write(str(item.strip(), encoding='utf-8'))
         f.write('\n')
-      f.close()          
+      f.close()
 
 
 def ReadAuxCom():
@@ -18843,8 +23887,8 @@ def ReadAuxCom():
     tab1.progView.select_set(selRow)
   comNum = auxPortEntryField .get()
   comChar = auxCharEntryField .get()
-  servoins = "Read COM # "+comNum+" Char: "+comChar              
-  tab1.progView.insert(selRow, bytes(servoins + '\n', 'utf-8')) 
+  servoins = "Read COM # "+comNum+" Char: "+comChar
+  tab1.progView.insert(selRow, bytes(servoins + '\n', 'utf-8'))
   tab1.progView.selection_clear(0, END)
   tab1.progView.select_set(selRow)
   items = tab1.progView.get(0,END)
@@ -18856,23 +23900,1170 @@ def ReadAuxCom():
     f.close()
 
 
+def _auxiliary_device_port(value):
+  if (
+    not isinstance(value, str)
+    or not value
+    or value != value.strip()
+    or len(value) > len(str(AUXILIARY_DEVICE_MAX_PORT_NUMBER))
+    or re.fullmatch(r"[0-9]+", value) is None
+  ):
+    raise MotionInputError(
+      "auxiliary-device port must be a positive COM number"
+    )
+  port_number = int(value)
+  if not 1 <= port_number <= AUXILIARY_DEVICE_MAX_PORT_NUMBER:
+    raise MotionInputError(
+      "auxiliary-device port number is outside the supported range"
+    )
+  return f"COM{port_number}"
+
+
+def _auxiliary_device_read_size(value):
+  if (
+    not isinstance(value, str)
+    or not value
+    or value != value.strip()
+    or len(value) > len(str(AUXILIARY_DEVICE_MAX_READ_BYTES))
+    or re.fullmatch(r"[0-9]+", value) is None
+  ):
+    raise MotionInputError(
+      "auxiliary-device character count must be a positive integer"
+    )
+  read_size = int(value)
+  if not 1 <= read_size <= AUXILIARY_DEVICE_MAX_READ_BYTES:
+    raise MotionInputError(
+      "auxiliary-device character count is outside the supported range"
+    )
+  return read_size
+
+
+def _auxiliary_device_detail_prefix(value, maximum_bytes):
+  if not isinstance(value, str) or not value:
+    raise TypeError("auxiliary-device detail text is invalid")
+  if (
+    isinstance(maximum_bytes, bool)
+    or not isinstance(maximum_bytes, int)
+    or maximum_bytes <= 0
+  ):
+    raise TypeError("auxiliary-device detail limit is invalid")
+  encoded = value[:maximum_bytes].encode("utf-8", errors="replace")
+  return encoded[:maximum_bytes].decode(
+    "utf-8",
+    errors="ignore",
+  ).rstrip()
+
+
+def _auxiliary_device_error_detail(error, fallback):
+  if not isinstance(error, Exception):
+    raise TypeError("auxiliary-device error must be an exception")
+  if (
+    not isinstance(fallback, str)
+    or not fallback
+    or " ".join(fallback.split()) != fallback
+  ):
+    raise TypeError("auxiliary-device error fallback is invalid")
+  try:
+    detail = " ".join(str(error).split())
+  except Exception:
+    detail = type(error).__name__
+  detail = "".join(
+    character if character.isprintable() else "\uFFFD"
+    for character in detail
+  )
+  detail = " ".join(detail.split())
+  detail = detail or fallback
+  return _auxiliary_device_detail_prefix(
+    detail,
+    AUXILIARY_DEVICE_MAX_ERROR_DETAIL,
+  )
+
+
+def _combine_auxiliary_device_error_details(primary, cleanup):
+  if (
+    not isinstance(primary, str)
+    or not primary
+    or " ".join(primary.split()) != primary
+  ):
+    raise TypeError("auxiliary-device primary error detail is invalid")
+  if (
+    not isinstance(cleanup, str)
+    or not cleanup
+    or " ".join(cleanup.split()) != cleanup
+  ):
+    raise TypeError("auxiliary-device cleanup error detail is invalid")
+  separator = "; serial cleanup failed: "
+  available = (
+    AUXILIARY_DEVICE_MAX_ERROR_DETAIL - len(separator.encode("utf-8"))
+  )
+  half = available // 2
+  primary_bytes = len(primary.encode("utf-8"))
+  cleanup_bytes = len(cleanup.encode("utf-8"))
+  if primary_bytes < half:
+    primary_limit = primary_bytes
+    cleanup_limit = available - primary_limit
+  elif cleanup_bytes < half:
+    cleanup_limit = cleanup_bytes
+    primary_limit = available - cleanup_limit
+  else:
+    primary_limit = half
+    cleanup_limit = available - primary_limit
+  return (
+    _auxiliary_device_detail_prefix(primary, primary_limit)
+    + separator
+    + _auxiliary_device_detail_prefix(cleanup, cleanup_limit)
+  )
+
+
+def _auxiliary_device_read_cancelled():
+  closing = application_closing.is_set()
+  cancelled = auxiliary_device_cancel_requested.is_set()
+  if not isinstance(closing, bool) or not isinstance(cancelled, bool):
+    raise RuntimeError("auxiliary-device cancellation state is invalid")
+  return closing or cancelled
+
+
+def _close_auxiliary_device_serial(serial_port, context):
+  global auxiliary_device_active_serial
+
+  if serial_port is None:
+    return True, ()
+  if (
+    not isinstance(context, str)
+    or not context
+    or context != context.strip()
+  ):
+    raise TypeError("auxiliary-device serial close context is invalid")
+
+  with auxiliary_device_state_lock:
+    bound_port = RUN.get('ser3')
+    active_port = auxiliary_device_active_serial
+    bound_here = bound_port is serial_port
+    active_here = active_port is serial_port
+    if bound_here != active_here:
+      raise RuntimeError(
+        "auxiliary-device serial ownership is only partially bound"
+      )
+    if bound_port is not None and not bound_here:
+      raise RuntimeError("auxiliary-device runtime serial ownership changed")
+    if active_port is not None and not active_here:
+      raise RuntimeError("auxiliary-device active serial ownership changed")
+    was_bound = bound_here
+
+  errors = []
+  try:
+    close = getattr(serial_port, "close", None)
+    if not callable(close):
+      raise TypeError("auxiliary-device serial close is unavailable")
+    close()
+  except Exception as exc:
+    errors.append(exc)
+  try:
+    is_open = getattr(serial_port, "is_open", None)
+    if not isinstance(is_open, bool):
+      raise TypeError("auxiliary-device serial open state is invalid")
+  except Exception as exc:
+    errors.append(exc)
+    is_open = True
+
+  closed = not is_open
+  if closed:
+    with auxiliary_device_state_lock:
+      if was_bound:
+        if (
+          RUN.get('ser3') is not serial_port
+          or auxiliary_device_active_serial is not serial_port
+        ):
+          raise RuntimeError(
+            "auxiliary-device serial ownership changed during close"
+          )
+        RUN['ser3'] = None
+        auxiliary_device_active_serial = None
+      elif (
+        RUN.get('ser3') is not None
+        or auxiliary_device_active_serial is not None
+      ):
+        raise RuntimeError(
+          "unbound auxiliary-device serial ownership changed during close"
+        )
+    return True, tuple(errors)
+
+  if not was_bound:
+    with auxiliary_device_state_lock:
+      if auxiliary_device_active_request is None:
+        raise RuntimeError(
+          "auxiliary-device failed close has no request owner"
+        )
+      if (
+        RUN.get('ser3') is not None
+        or auxiliary_device_active_serial is not None
+      ):
+        raise RuntimeError(
+          "auxiliary-device failed close conflicts with serial ownership"
+        )
+      RUN['ser3'] = serial_port
+      auxiliary_device_active_serial = serial_port
+  if not errors:
+    errors.append(OSError("auxiliary-device serial port did not close"))
+  return False, tuple(errors)
+
+
+def _settle_auxiliary_device_serial(serial_port, context):
+  if serial_port is None:
+    return True, None
+  first_error = None
+  shutdown_attempts = 0
+
+  def retain_error(error):
+    nonlocal first_error
+
+    if not isinstance(error, Exception):
+      error = RuntimeError(
+        "auxiliary-device serial cleanup raised a nonstandard exception"
+      )
+    if first_error is None:
+      first_error = error
+      return
+    logger.error(
+      "Additional auxiliary-device serial cleanup error during %s: %s",
+      context,
+      _auxiliary_device_error_detail(
+        error,
+        "additional serial cleanup failure",
+      ),
+    )
+
+  while True:
+    try:
+      closed, close_errors = _close_auxiliary_device_serial(
+        serial_port,
+        context,
+      )
+      if not isinstance(closed, bool) or not isinstance(close_errors, tuple):
+        raise RuntimeError(
+          "auxiliary-device serial close returned invalid state"
+        )
+      for close_error in close_errors:
+        retain_error(close_error)
+    except Exception as exc:
+      closed = False
+      retain_error(exc)
+    if closed:
+      return True, first_error
+
+    try:
+      cancelled = _auxiliary_device_read_cancelled()
+    except Exception as exc:
+      retain_error(exc)
+      cancelled = True
+    if cancelled:
+      shutdown_attempts += 1
+      if shutdown_attempts >= AUXILIARY_DEVICE_SHUTDOWN_CLOSE_ATTEMPTS:
+        if first_error is None:
+          first_error = OSError(
+            "auxiliary-device serial cleanup did not settle during shutdown"
+          )
+        logger.error(
+          "Auxiliary-device serial cleanup remained incomplete after %s "
+          "shutdown attempts; process exit will retire the read-only handle",
+          shutdown_attempts,
+        )
+        return False, first_error
+    try:
+      time.sleep(AUXILIARY_DEVICE_CLEANUP_RETRY_SECONDS)
+    except Exception as exc:
+      retain_error(exc)
+      return False, first_error
+
+
+def _reconcile_auxiliary_device_serial_ownership(request, context):
+  global auxiliary_device_active_serial
+
+  if not isinstance(request, AuxiliaryDeviceReadRequest):
+    raise TypeError("auxiliary-device ownership request is invalid")
+  if (
+    not isinstance(context, str)
+    or not context
+    or context != context.strip()
+  ):
+    raise TypeError("auxiliary-device ownership context is invalid")
+
+  with auxiliary_device_state_lock:
+    if auxiliary_device_active_request is not request:
+      raise RuntimeError("auxiliary-device request ownership changed")
+    if not isinstance(auxiliary_device_retained_serials, list):
+      raise RuntimeError("retained auxiliary-device serial state is invalid")
+    active_serial = auxiliary_device_active_serial
+    bound_serial = RUN.get('ser3')
+    if active_serial is bound_serial:
+      return bound_serial, False, ()
+    serial_ports = tuple(
+      serial_port
+      for serial_port in (active_serial, bound_serial)
+      if serial_port is not None
+    )
+    RUN['ser3'] = None
+    auxiliary_device_active_serial = None
+
+  errors = []
+  retained_serials = []
+  for serial_port in serial_ports:
+    with auxiliary_device_state_lock:
+      if auxiliary_device_active_request is not request:
+        raise RuntimeError(
+          "auxiliary-device request changed during ownership recovery"
+        )
+      if (
+        RUN.get('ser3') is not None
+        or auxiliary_device_active_serial is not None
+      ):
+        raise RuntimeError(
+          "auxiliary-device serial recovery found an unexpected owner"
+        )
+      RUN['ser3'] = serial_port
+      auxiliary_device_active_serial = serial_port
+    closed = False
+    cleanup_error = None
+    try:
+      closed, cleanup_error = _settle_auxiliary_device_serial(
+        serial_port,
+        context,
+      )
+      if not isinstance(closed, bool) or (
+        cleanup_error is not None
+        and not isinstance(cleanup_error, Exception)
+      ):
+        raise RuntimeError(
+          "auxiliary-device serial recovery returned invalid state"
+        )
+      if cleanup_error is not None:
+        errors.append(cleanup_error)
+      if not closed:
+        if cleanup_error is None:
+          errors.append(
+            OSError("auxiliary-device serial recovery did not settle")
+          )
+    except Exception as exc:
+      errors.append(exc)
+    if closed:
+      continue
+    with auxiliary_device_state_lock:
+      if (
+        auxiliary_device_active_request is not request
+        or RUN.get('ser3') is not serial_port
+        or auxiliary_device_active_serial is not serial_port
+      ):
+        raise RuntimeError(
+          "auxiliary-device failed recovery lost serial ownership"
+        )
+      RUN['ser3'] = None
+      auxiliary_device_active_serial = None
+    retained_serials.append(serial_port)
+
+  with auxiliary_device_state_lock:
+    if auxiliary_device_active_request is not request:
+      raise RuntimeError(
+        "auxiliary-device request changed after ownership recovery"
+      )
+    if auxiliary_device_active_serial is not RUN.get('ser3'):
+      raise RuntimeError(
+        "auxiliary-device serial recovery left inconsistent ownership"
+      )
+    for serial_port in retained_serials:
+      if all(
+        retained_port is not serial_port
+        for retained_port in auxiliary_device_retained_serials
+      ):
+        auxiliary_device_retained_serials.append(serial_port)
+    retained_serial = auxiliary_device_active_serial
+  return retained_serial, True, tuple(errors)
+
+
+def _close_retained_auxiliary_device_serials():
+  with auxiliary_device_state_lock:
+    if (
+      auxiliary_device_active_request is not None
+      or auxiliary_device_active_serial is not None
+    ):
+      raise RuntimeError(
+        "retained auxiliary-device cleanup found active ownership"
+      )
+    if not isinstance(auxiliary_device_retained_serials, list):
+      raise RuntimeError("retained auxiliary-device serial state is invalid")
+    retained_serials = tuple(auxiliary_device_retained_serials)
+
+  all_closed = True
+  for serial_port in retained_serials:
+    errors = []
+    try:
+      close = getattr(serial_port, "close", None)
+      if not callable(close):
+        raise TypeError("retained auxiliary-device serial close is unavailable")
+      close()
+    except Exception as exc:
+      errors.append(exc)
+    try:
+      is_open = getattr(serial_port, "is_open", None)
+      if not isinstance(is_open, bool):
+        raise TypeError(
+          "retained auxiliary-device serial open state is invalid"
+        )
+    except Exception as exc:
+      errors.append(exc)
+      is_open = True
+    if is_open:
+      all_closed = False
+      if not errors:
+        errors.append(OSError("retained auxiliary-device serial did not close"))
+    else:
+      with auxiliary_device_state_lock:
+        for index, retained_port in enumerate(
+          auxiliary_device_retained_serials
+        ):
+          if retained_port is serial_port:
+            auxiliary_device_retained_serials.pop(index)
+            break
+        else:
+          raise RuntimeError(
+            "retained auxiliary-device serial ownership changed during close"
+          )
+    for error in errors:
+      logger.error(
+        "Retained auxiliary-device serial cleanup error: %s",
+        _auxiliary_device_error_detail(
+          error,
+          "retained auxiliary-device serial cleanup failed",
+        ),
+      )
+  return all_closed
+
+
+def _publish_auxiliary_device_result(request, result):
+  global auxiliary_device_pending_result
+
+  if not isinstance(request, AuxiliaryDeviceReadRequest):
+    raise TypeError("auxiliary-device result request is invalid")
+  if (
+    not isinstance(result, AuxiliaryDeviceReadResult)
+    or result.request_id != request.request_id
+  ):
+    raise TypeError("auxiliary-device worker result is invalid")
+  try:
+    auxiliary_device_event_queue.put_nowait(result)
+    return True
+  except Exception:
+    logger.exception("Unable to queue an auxiliary-device worker result")
+  with auxiliary_device_state_lock:
+    if (
+      auxiliary_device_active_request is request
+      and auxiliary_device_pending_result is None
+    ):
+      auxiliary_device_pending_result = result
+      return True
+  raise RuntimeError(
+    "auxiliary-device worker result could not retain ownership"
+  )
+
+
+def _run_auxiliary_device_read(request):
+  global auxiliary_device_active_serial
+
+  if not isinstance(request, AuxiliaryDeviceReadRequest):
+    raise TypeError("auxiliary-device worker request is invalid")
+  serial_port = None
+  cleanup_attempted = False
+  operation_error = None
+  cleanup_error = None
+  response = None
+
+  def retain_error(error, *, cleanup):
+    nonlocal operation_error
+    nonlocal cleanup_error
+
+    if not isinstance(error, Exception):
+      error = RuntimeError(
+        "auxiliary-device worker raised a nonstandard exception"
+      )
+    if cleanup:
+      if cleanup_error is None:
+        cleanup_error = error
+        return
+      category = "cleanup"
+    else:
+      if operation_error is None:
+        operation_error = error
+        return
+      category = "operation"
+    logger.error(
+      "Additional auxiliary-device %s error: %s",
+      category,
+      _auxiliary_device_error_detail(
+        error,
+        f"additional auxiliary-device {category} failure",
+      ),
+    )
+
+  try:
+    (
+      serial_port,
+      ownership_recovered,
+      ownership_errors,
+    ) = _reconcile_auxiliary_device_serial_ownership(
+      request,
+      "auxiliary-device worker ownership recovery",
+    )
+    for ownership_error in ownership_errors:
+      retain_error(ownership_error, cleanup=True)
+    if ownership_recovered:
+      recovery_error = RuntimeError(
+        "auxiliary-device worker recovered inconsistent serial ownership"
+      )
+      retain_error(recovery_error, cleanup=True)
+      cleanup_attempted = True
+      raise recovery_error
+    if serial_port is not None:
+      cleanup_attempted = True
+      closed, stale_cleanup_error = _settle_auxiliary_device_serial(
+        serial_port,
+        "previous auxiliary-device program read",
+      )
+      if stale_cleanup_error is not None:
+        retain_error(stale_cleanup_error, cleanup=True)
+      if not closed:
+        raise MotionInputError(
+          "previous auxiliary-device serial cleanup did not settle"
+        )
+      serial_port = None
+      if cleanup_error is not None:
+        raise MotionInputError(
+          "previous auxiliary-device serial cleanup reported an error"
+        )
+    if _auxiliary_device_read_cancelled():
+      raise MotionInputError("auxiliary-device read was cancelled")
+    cleanup_attempted = False
+    serial_port = serial.Serial(
+      request.port,
+      baudrate=AUXILIARY_DEVICE_BAUD_RATE,
+      timeout=AUXILIARY_DEVICE_READ_TIMEOUT_SECONDS,
+    )
+    with auxiliary_device_state_lock:
+      if auxiliary_device_active_request is not request:
+        raise RuntimeError("auxiliary-device worker ownership changed")
+      if RUN.get('ser3') is not None:
+        raise RuntimeError("auxiliary-device serial ownership is already bound")
+      RUN['ser3'] = serial_port
+      auxiliary_device_active_serial = serial_port
+    is_open = getattr(serial_port, "is_open", None)
+    if not isinstance(is_open, bool) or not is_open:
+      raise OSError("auxiliary-device serial port did not open")
+    if _auxiliary_device_read_cancelled():
+      raise MotionInputError("auxiliary-device read was cancelled")
+    reset_input = getattr(serial_port, "reset_input_buffer", None)
+    if not callable(reset_input):
+      reset_input = getattr(serial_port, "flushInput", None)
+    if not callable(reset_input):
+      raise TypeError("auxiliary-device serial input reset is unavailable")
+    reset_input()
+    if _auxiliary_device_read_cancelled():
+      raise MotionInputError("auxiliary-device read was cancelled")
+    payload = serial_port.read(request.read_size)
+    if not isinstance(payload, (bytes, bytearray)):
+      raise MotionInputError("auxiliary-device read returned invalid bytes")
+    if len(payload) != request.read_size:
+      raise MotionInputError(
+        "auxiliary-device read returned "
+        f"{len(payload)} of {request.read_size} requested bytes"
+      )
+    payload = bytes(payload)
+    if _auxiliary_device_read_cancelled():
+      raise MotionInputError("auxiliary-device read was cancelled")
+    try:
+      response = payload.strip().decode("utf-8")
+    except UnicodeDecodeError as exc:
+      raise MotionInputError(
+        "auxiliary-device response is not valid UTF-8"
+      ) from exc
+    if any(not character.isprintable() for character in response):
+      raise MotionInputError(
+        "auxiliary-device response contains unsupported control characters"
+      )
+  except Exception as exc:
+    retain_error(exc, cleanup=False)
+  finally:
+    if serial_port is not None and not cleanup_attempted:
+      try:
+        closed, serial_cleanup_error = _settle_auxiliary_device_serial(
+          serial_port,
+          "auxiliary-device one-shot read",
+        )
+        if serial_cleanup_error is not None:
+          retain_error(serial_cleanup_error, cleanup=True)
+        if not closed and serial_cleanup_error is None:
+          retain_error(
+            OSError("auxiliary-device serial cleanup did not settle"),
+            cleanup=True,
+          )
+      except Exception as exc:
+        retain_error(exc, cleanup=True)
+    try:
+      with auxiliary_device_state_lock:
+        if auxiliary_device_active_request is not request:
+          raise RuntimeError(
+            "auxiliary-device request ownership changed during cleanup"
+          )
+        if auxiliary_device_active_serial is not RUN.get('ser3'):
+          raise RuntimeError(
+            "auxiliary-device serial ownership changed during cleanup"
+          )
+    except Exception as exc:
+      retain_error(exc, cleanup=True)
+
+  cancelled = False
+  try:
+    cancelled = _auxiliary_device_read_cancelled()
+  except Exception as exc:
+    retain_error(exc, cleanup=False)
+  if operation_error is None and cleanup_error is None:
+    result = AuxiliaryDeviceReadResult(
+      request.request_id,
+      "completed",
+      response,
+    )
+  else:
+    detail = _auxiliary_device_error_detail(
+      operation_error or cleanup_error,
+      "auxiliary-device read failed",
+    )
+    if cleanup_error is not None and cleanup_error is not operation_error:
+      cleanup_detail = _auxiliary_device_error_detail(
+        cleanup_error,
+        "serial cleanup failed",
+      )
+      detail = _combine_auxiliary_device_error_details(
+        detail,
+        cleanup_detail,
+      )
+    result = AuxiliaryDeviceReadResult(
+      request.request_id,
+      "cancelled" if cancelled else "failed",
+      detail,
+    )
+  _publish_auxiliary_device_result(request, result)
+  return result.outcome == "completed"
+
+
+def _run_auxiliary_device_read_safe(request):
+  try:
+    return _run_auxiliary_device_read(request)
+  except BaseException as failure:
+    logger.exception("Auxiliary-device worker terminated unexpectedly")
+    if isinstance(failure, Exception):
+      operation_error = failure
+    else:
+      operation_error = RuntimeError(
+        "auxiliary-device worker terminated with "
+        f"{type(failure).__name__}"
+      )
+    cleanup_error = None
+    try:
+      (
+        serial_port,
+        ownership_recovered,
+        ownership_errors,
+      ) = _reconcile_auxiliary_device_serial_ownership(
+        request,
+        "unexpected auxiliary-device worker termination",
+      )
+      for ownership_error in ownership_errors:
+        if cleanup_error is None:
+          cleanup_error = ownership_error
+        else:
+          logger.error(
+            "Additional auxiliary-device ownership cleanup error: %s",
+            _auxiliary_device_error_detail(
+              ownership_error,
+              "auxiliary-device ownership cleanup failed",
+            ),
+          )
+      if not ownership_recovered and serial_port is not None:
+        closed, serial_cleanup_error = _settle_auxiliary_device_serial(
+          serial_port,
+          "unexpected auxiliary-device worker termination",
+        )
+        if serial_cleanup_error is not None:
+          if cleanup_error is None:
+            cleanup_error = serial_cleanup_error
+          else:
+            logger.error(
+              "Additional auxiliary-device serial cleanup error: %s",
+              _auxiliary_device_error_detail(
+                serial_cleanup_error,
+                "auxiliary-device serial cleanup failed",
+              ),
+            )
+        if not closed and cleanup_error is None:
+          cleanup_error = OSError(
+            "auxiliary-device serial cleanup did not settle"
+          )
+      if ownership_recovered:
+        recovery_error = RuntimeError(
+          "auxiliary-device worker failure recovered inconsistent serial "
+          "ownership"
+        )
+        if cleanup_error is None:
+          cleanup_error = recovery_error
+        else:
+          logger.error(
+            "Additional auxiliary-device recovery error: %s",
+            _auxiliary_device_error_detail(
+              recovery_error,
+              "auxiliary-device serial ownership recovery occurred",
+            ),
+          )
+    except BaseException as cleanup_failure:
+      logger.exception(
+        "Unable to settle auxiliary-device serial ownership after worker "
+        "termination"
+      )
+      if isinstance(cleanup_failure, Exception):
+        cleanup_error = cleanup_failure
+      else:
+        cleanup_error = RuntimeError(
+          "auxiliary-device cleanup terminated with "
+          f"{type(cleanup_failure).__name__}"
+        )
+    try:
+      cancelled = _auxiliary_device_read_cancelled()
+    except Exception as cancellation_error:
+      logger.exception(
+        "Unable to inspect auxiliary-device cancellation after worker "
+        "termination"
+      )
+      cancelled = False
+      if cleanup_error is None:
+        cleanup_error = cancellation_error
+      else:
+        logger.error(
+          "Additional auxiliary-device failure-state error: %s",
+          _auxiliary_device_error_detail(
+            cancellation_error,
+            "auxiliary-device cancellation inspection failed",
+          ),
+        )
+    detail = _auxiliary_device_error_detail(
+      operation_error,
+      "auxiliary-device worker terminated unexpectedly",
+    )
+    if cleanup_error is not None:
+      detail = _combine_auxiliary_device_error_details(
+        detail,
+        _auxiliary_device_error_detail(
+          cleanup_error,
+          "serial cleanup failed",
+        ),
+      )
+    result = AuxiliaryDeviceReadResult(
+      request.request_id,
+      "cancelled" if cancelled else "failed",
+      detail,
+    )
+    try:
+      _publish_auxiliary_device_result(request, result)
+    except BaseException:
+      logger.exception(
+        "Unable to retain a terminal auxiliary-device worker failure"
+      )
+    return False
+  finally:
+    auxiliary_device_worker_active.clear()
+
+
+def _request_auxiliary_device_read(port_value, read_size_value):
+  global auxiliary_device_active_request
+  global auxiliary_device_active_serial
+  global auxiliary_device_next_request_id
+
+  worker_start_failed = False
+  try:
+    port = _auxiliary_device_port(port_value)
+    read_size = _auxiliary_device_read_size(read_size_value)
+    with program_execution_state_lock:
+      closing = application_closing.is_set()
+      if not isinstance(closing, bool):
+        raise RuntimeError("application shutdown state is invalid")
+      if closing:
+        raise MotionInputError("application shutdown is active")
+      if program_execution_active_request is not None:
+        if not isinstance(
+          program_execution_active_request,
+          ProgramExecutionRequest,
+        ):
+          raise RuntimeError("active program execution request is invalid")
+        raise MotionInputError("robot program execution is active")
+      with auxiliary_device_state_lock:
+        active = auxiliary_device_read_active.is_set()
+        worker_active = auxiliary_device_worker_active.is_set()
+        if not isinstance(active, bool) or not isinstance(worker_active, bool):
+          raise RuntimeError("auxiliary-device worker state is invalid")
+        if active != (auxiliary_device_active_request is not None):
+          raise RuntimeError(
+            "auxiliary-device request ownership is inconsistent"
+          )
+        if worker_active and not active:
+          raise RuntimeError("auxiliary-device worker has no request owner")
+        if active and not isinstance(
+          auxiliary_device_active_request,
+          AuxiliaryDeviceReadRequest,
+        ):
+          raise RuntimeError("active auxiliary-device request is invalid")
+        if active:
+          raise MotionInputError("another auxiliary-device read is active")
+        if auxiliary_device_pending_result is not None:
+          raise RuntimeError("auxiliary-device result has no request owner")
+        if auxiliary_device_active_serial is not None:
+          raise RuntimeError(
+            "inactive auxiliary-device request retained a serial owner"
+          )
+        if not isinstance(auxiliary_device_retained_serials, list):
+          raise RuntimeError(
+            "retained auxiliary-device serial state is invalid"
+          )
+        if auxiliary_device_retained_serials:
+          raise MotionInputError(
+            "previous auxiliary-device serial cleanup remains pending"
+          )
+        if (
+          isinstance(auxiliary_device_next_request_id, bool)
+          or not isinstance(auxiliary_device_next_request_id, int)
+          or auxiliary_device_next_request_id < 0
+        ):
+          raise RuntimeError("auxiliary-device request counter is invalid")
+        request = AuxiliaryDeviceReadRequest(
+          auxiliary_device_next_request_id + 1,
+          port,
+          read_size,
+        )
+        auxiliary_device_next_request_id = request.request_id
+        auxiliary_device_active_request = request
+        auxiliary_device_active_serial = RUN.get('ser3')
+        auxiliary_device_cancel_requested.clear()
+        auxiliary_device_worker_active.set()
+        auxiliary_device_read_active.set()
+        try:
+          worker = Thread(
+            target=_run_auxiliary_device_read_safe,
+            args=(request,),
+            name=f"ar4-auxiliary-device-{request.request_id}",
+            daemon=True,
+          )
+          worker.start()
+        except Exception:
+          worker_start_failed = True
+          auxiliary_device_active_request = None
+          auxiliary_device_active_serial = None
+          auxiliary_device_cancel_requested.clear()
+          auxiliary_device_worker_active.clear()
+          auxiliary_device_read_active.clear()
+          raise
+  except Exception as exc:
+    if worker_start_failed:
+      fallback = "auxiliary-device worker did not start"
+      presentation_error = (
+        "Unable to present an auxiliary-device startup failure"
+      )
+    else:
+      fallback = "auxiliary-device request was rejected"
+      presentation_error = "Unable to present an auxiliary-device rejection"
+    detail = _auxiliary_device_error_detail(
+      exc,
+      fallback,
+    )
+    message = f"AUXILIARY COM READ REJECTED: {detail}"
+    if worker_start_failed:
+      logger.exception(message)
+    else:
+      logger.error(message)
+    try:
+      _set_application_status(message, "Alarm.TLabel")
+    except Exception:
+      logger.exception(presentation_error)
+    return False
+  try:
+    _set_application_status(
+      f"AUXILIARY COM READ IN PROGRESS: {request.port}",
+      "Warn.TLabel",
+    )
+  except Exception:
+    logger.exception("Unable to present auxiliary-device progress")
+  return True
+
+
+def _auxiliary_device_read_pending():
+  with auxiliary_device_state_lock:
+    active = auxiliary_device_read_active.is_set()
+    worker_active = auxiliary_device_worker_active.is_set()
+    if not isinstance(active, bool) or not isinstance(worker_active, bool):
+      raise RuntimeError("auxiliary-device worker state is invalid")
+    if active != (auxiliary_device_active_request is not None):
+      raise RuntimeError("auxiliary-device request ownership is inconsistent")
+    if worker_active and not active:
+      raise RuntimeError("auxiliary-device worker has no request owner")
+    if active and not isinstance(
+      auxiliary_device_active_request,
+      AuxiliaryDeviceReadRequest,
+    ):
+      raise RuntimeError("active auxiliary-device request is invalid")
+    if auxiliary_device_pending_result is not None:
+      if not active:
+        raise RuntimeError("auxiliary-device result has no request owner")
+      if (
+        not isinstance(
+          auxiliary_device_pending_result,
+          AuxiliaryDeviceReadResult,
+        )
+        or auxiliary_device_pending_result.request_id
+        != auxiliary_device_active_request.request_id
+      ):
+        raise RuntimeError("auxiliary-device pending result is invalid")
+    if active:
+      if auxiliary_device_active_serial is not RUN.get('ser3'):
+        raise RuntimeError(
+          "auxiliary-device serial ownership is inconsistent"
+        )
+    elif auxiliary_device_active_serial is not None:
+      raise RuntimeError(
+        "inactive auxiliary-device request retained a serial owner"
+      )
+    return active
+
+
+def _cancel_auxiliary_device_read():
+  with auxiliary_device_state_lock:
+    request = auxiliary_device_active_request
+    serial_port = auxiliary_device_active_serial
+    active = auxiliary_device_read_active.is_set()
+    worker_active = auxiliary_device_worker_active.is_set()
+    if not isinstance(active, bool) or not isinstance(worker_active, bool):
+      raise RuntimeError("auxiliary-device worker state is invalid")
+    if request is None:
+      if active or worker_active:
+        raise RuntimeError(
+          "auxiliary-device cancellation found unowned activity"
+        )
+      return False
+    if not isinstance(request, AuxiliaryDeviceReadRequest):
+      raise RuntimeError("active auxiliary-device request is invalid")
+    if not active:
+      raise RuntimeError(
+        "auxiliary-device cancellation found an inactive request"
+      )
+    cancellation_already_requested = auxiliary_device_cancel_requested.is_set()
+    if not isinstance(cancellation_already_requested, bool):
+      raise RuntimeError("auxiliary-device cancellation state is invalid")
+    if cancellation_already_requested:
+      return False
+    if serial_port is not RUN.get('ser3'):
+      raise RuntimeError(
+        "auxiliary-device serial ownership is inconsistent"
+      )
+    auxiliary_device_cancel_requested.set()
+  cancel_read = getattr(serial_port, "cancel_read", None)
+  if (
+    worker_active
+    and callable(cancel_read)
+  ):
+    try:
+      cancel_read()
+    except Exception:
+      logger.exception("Unable to cancel the auxiliary-device serial read")
+  return True
+
+
+def _apply_auxiliary_device_result(result):
+  global auxiliary_device_active_request
+  global auxiliary_device_active_serial
+  global auxiliary_device_pending_result
+
+  if not isinstance(result, AuxiliaryDeviceReadResult):
+    raise RuntimeError("auxiliary-device worker emitted an invalid result")
+  with auxiliary_device_state_lock:
+    request = auxiliary_device_active_request
+    if (
+      not isinstance(request, AuxiliaryDeviceReadRequest)
+      or request.request_id != result.request_id
+      or auxiliary_device_pending_result is not result
+    ):
+      raise RuntimeError(
+        "auxiliary-device worker result ownership is invalid"
+      )
+    worker_active = auxiliary_device_worker_active.is_set()
+    active = auxiliary_device_read_active.is_set()
+    if not isinstance(worker_active, bool) or not isinstance(active, bool):
+      raise RuntimeError("auxiliary-device worker state is invalid")
+    if not active:
+      raise RuntimeError("auxiliary-device result has no active request")
+    if worker_active:
+      return False
+    closing = application_closing.is_set()
+    if not isinstance(closing, bool):
+      raise RuntimeError("application shutdown state is invalid")
+    serial_port = auxiliary_device_active_serial
+    if serial_port is not RUN.get('ser3'):
+      raise RuntimeError(
+        "auxiliary-device serial ownership is inconsistent"
+      )
+
+  if serial_port is not None and not closing:
+    raise RuntimeError(
+      "auxiliary-device worker result retained serial ownership"
+    )
+
+  if result.outcome == "completed":
+    com3outPortEntryField.delete(0, 'end')
+    com3outPortEntryField.insert(0, result.value)
+    message = "AUXILIARY COM READ COMPLETE"
+    style = "OK.TLabel"
+  elif result.outcome == "cancelled":
+    message = f"AUXILIARY COM READ CANCELLED: {result.value}"
+    style = "Warn.TLabel"
+    logger.warning(message)
+  else:
+    message = f"AUXILIARY COM READ FAILED: {result.value}"
+    style = "Alarm.TLabel"
+    logger.error(message)
+  _set_application_status(message, style)
+  if serial_port is not None:
+    logger.error(
+      "Auxiliary-device serial cleanup remains pending at process exit"
+    )
+
+  with auxiliary_device_state_lock:
+    if (
+      auxiliary_device_active_request is not request
+      or auxiliary_device_pending_result is not result
+      or auxiliary_device_worker_active.is_set()
+      or auxiliary_device_active_serial is not serial_port
+      or RUN.get('ser3') is not serial_port
+    ):
+      raise RuntimeError(
+        "auxiliary-device result ownership changed during presentation"
+      )
+    if serial_port is not None:
+      auxiliary_device_active_serial = None
+    auxiliary_device_active_request = None
+    auxiliary_device_pending_result = None
+    auxiliary_device_cancel_requested.clear()
+    auxiliary_device_read_active.clear()
+  return True
+
+
+def _drain_auxiliary_device_events():
+  global auxiliary_device_pending_result
+
+  applied = False
+  while True:
+    with auxiliary_device_state_lock:
+      result = auxiliary_device_pending_result
+      if result is not None and not isinstance(
+        result,
+        AuxiliaryDeviceReadResult,
+      ):
+        request = auxiliary_device_active_request
+        if not isinstance(request, AuxiliaryDeviceReadRequest):
+          raise RuntimeError(
+            "invalid auxiliary-device result has no request owner"
+          )
+        result = AuxiliaryDeviceReadResult(
+          request.request_id,
+          "failed",
+          "auxiliary-device pending result is invalid",
+        )
+        auxiliary_device_pending_result = result
+    if result is None:
+      try:
+        result = auxiliary_device_event_queue.get_nowait()
+      except Empty:
+        break
+      if not isinstance(result, AuxiliaryDeviceReadResult):
+        with auxiliary_device_state_lock:
+          request = auxiliary_device_active_request
+        if request is None:
+          logger.warning(
+            "Discarding an unowned invalid auxiliary-device result"
+          )
+          continue
+        if not isinstance(request, AuxiliaryDeviceReadRequest):
+          raise RuntimeError(
+            "active auxiliary-device request is invalid"
+          )
+        result = AuxiliaryDeviceReadResult(
+          request.request_id,
+          "failed",
+          "auxiliary-device worker emitted an invalid result",
+        )
+      with auxiliary_device_state_lock:
+        request = auxiliary_device_active_request
+        if request is None:
+          logger.warning(
+            "Discarding stale auxiliary-device result %s",
+            result.request_id,
+          )
+          continue
+        if not isinstance(request, AuxiliaryDeviceReadRequest):
+          raise RuntimeError("active auxiliary-device request is invalid")
+        if result.request_id != request.request_id:
+          logger.warning(
+            "Discarding stale auxiliary-device result %s for request %s",
+            result.request_id,
+            request.request_id,
+          )
+          continue
+        if auxiliary_device_pending_result is not None:
+          raise RuntimeError(
+            "auxiliary-device result ownership changed during dequeue"
+          )
+        auxiliary_device_pending_result = result
+    if not _apply_auxiliary_device_result(result):
+      break
+    applied = True
+  return applied
+
+
+def _poll_auxiliary_device_events():
+  try:
+    _drain_auxiliary_device_events()
+  except Exception:
+    logger.exception(
+      "Unable to apply an auxiliary-device result on the Tk event thread"
+    )
+    try:
+      _set_application_status(
+        "AUXILIARY COM READ RESULT FAILED",
+        "Alarm.TLabel",
+      )
+    except Exception:
+      logger.exception("Unable to present auxiliary-device result failure")
+  finally:
+    _reschedule_event_poll("auxiliary-device")
+
+
 def TestAuxCom():
   try:
-    # global RUN['ser3']    
-    port = "COM" + com3PortEntryField.get()     
-    baud = 9600    
-    RUN['ser3'] = serial.Serial(port,baud,timeout=5)
-  except:
-    #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-    #tab8.ElogView.insert(END, Curtime+" - UNABLE TO ESTABLISH COMMUNICATIONS WITH SERIAL DEVICE")
-    logger.error("UNABLE TO ESTABLISH COMMUNICATIONS WITH SERIAL DEVICE")
-    value=tab8.ElogView.get(0,END)
-    pickle.dump(value,open("ErrorLog","wb"))
-  RUN['ser3'].flushInput()
-  numChar = int(com3charPortEntryField.get())
-  response = str(RUN['ser3'].read(numChar).strip(),'utf-8')    
-  com3outPortEntryField .delete(0, 'end')
-  com3outPortEntryField .insert(0,response)
+    port_value = com3PortEntryField.get()
+    read_size_value = com3charPortEntryField.get()
+  except Exception as exc:
+    detail = _auxiliary_device_error_detail(
+      exc,
+      "auxiliary-device controls are unavailable",
+    )
+    message = f"AUXILIARY COM READ REJECTED: {detail}"
+    logger.exception(message)
+    try:
+      _set_application_status(message, "Alarm.TLabel")
+    except Exception:
+      logger.exception("Unable to present an auxiliary-device control failure")
+    return False
+  return _request_auxiliary_device_read(port_value, read_size_value)
 
 
 
@@ -18886,8 +25077,8 @@ def Servo():
     tab1.progView.select_set(selRow)
   servoNum = servoNumEntryField.get()
   servoPos = servoPosEntryField.get()
-  servoins = "Servo number "+servoNum+" to position: "+servoPos              
-  tab1.progView.insert(selRow, bytes(servoins + '\n', 'utf-8')) 
+  servoins = "Servo number "+servoNum+" to position: "+servoPos
+  tab1.progView.insert(selRow, bytes(servoins + '\n', 'utf-8'))
   tab1.progView.selection_clear(0, END)
   tab1.progView.select_set(selRow)
   items = tab1.progView.get(0,END)
@@ -18898,43 +25089,590 @@ def Servo():
       f.write('\n')
     f.close()
 
+def _robot_program_view_index(value, field_name, row_count):
+  if (
+    isinstance(row_count, bool)
+    or not isinstance(row_count, int)
+    or row_count < 0
+  ):
+    raise TypeError("robot program view row count is invalid")
+  if row_count == 0:
+    return None
+  if isinstance(value, bool):
+    raise MotionInputError(f"robot program view {field_name} is invalid")
+  try:
+    index = int(value)
+  except (TypeError, ValueError, OverflowError) as exc:
+    raise MotionInputError(
+      f"robot program view {field_name} is invalid"
+    ) from exc
+  if not 0 <= index < row_count:
+    raise MotionInputError(
+      f"robot program view {field_name} is out of range"
+    )
+  return index
+
+
+def _robot_program_view_fractions(values, field_name):
+  if isinstance(values, (str, bytes)):
+    raise MotionInputError(
+      f"robot program view {field_name} is invalid"
+    )
+  try:
+    values = tuple(values)
+  except TypeError as exc:
+    raise MotionInputError(
+      f"robot program view {field_name} is invalid"
+    ) from exc
+  if len(values) != 2 or any(isinstance(value, bool) for value in values):
+    raise MotionInputError(
+      f"robot program view {field_name} is invalid"
+    )
+  try:
+    fractions = tuple(float(value) for value in values)
+  except (TypeError, ValueError, OverflowError) as exc:
+    raise MotionInputError(
+      f"robot program view {field_name} is invalid"
+    ) from exc
+  return fractions
+
+
+def _capture_robot_program_view():
+  rows = tab1.progView.get(0, END)
+  if not isinstance(rows, tuple):
+    raise MotionInputError("robot program view returned invalid rows")
+  row_count = len(rows)
+  row_styles = tuple(
+    tuple(
+      tab1.progView.itemcget(index, option)
+      for option in GCODE_LISTBOX_STYLE_OPTIONS
+    )
+    for index in range(row_count)
+  )
+  selection = tab1.progView.curselection()
+  if not isinstance(selection, tuple):
+    raise MotionInputError(
+      "robot program view returned an invalid selection"
+    )
+  selected_rows = tuple(
+    _robot_program_view_index(index, "selected row", row_count)
+    for index in selection
+  )
+  if any(index is None for index in selected_rows):
+    raise MotionInputError(
+      "empty robot program view returned selected rows"
+    )
+  active_row = None
+  anchor_row = None
+  if row_count:
+    active_row = _robot_program_view_index(
+      tab1.progView.index(ACTIVE),
+      "active row",
+      row_count,
+    )
+    anchor_row = _robot_program_view_index(
+      tab1.progView.index(ANCHOR),
+      "selection anchor",
+      row_count,
+    )
+  last_row_present = hasattr(tab1, "lastRow")
+  last_row = getattr(tab1, "lastRow", None)
+  return RobotProgramViewSnapshot(
+    rows,
+    row_styles,
+    selected_rows,
+    active_row,
+    anchor_row,
+    _robot_program_view_fractions(
+      tab1.progView.xview(),
+      "xview",
+    ),
+    _robot_program_view_fractions(
+      tab1.progView.yview(),
+      "yview",
+    ),
+    ProgEntryField.get(),
+    curRowEntryField.get(),
+    last_row_present,
+    last_row,
+    tab1.lastProg,
+  )
+
+
+def _robot_program_view_error_detail(error, fallback):
+  if not isinstance(error, Exception):
+    raise TypeError("robot program view error must be an exception")
+  if not isinstance(fallback, str) or not fallback:
+    raise TypeError("robot program view error fallback is invalid")
+  detail = " ".join(str(error).split())
+  return detail or fallback
+
+
+def _restore_robot_program_view(snapshot):
+  if not isinstance(snapshot, RobotProgramViewSnapshot):
+    raise TypeError(
+      "robot program view restoration requires a valid snapshot"
+    )
+  errors = []
+  try:
+    tab1.progView.delete(0, END)
+    for row in snapshot.rows:
+      tab1.progView.insert(END, row)
+    for index, style in enumerate(snapshot.row_styles):
+      tab1.progView.itemconfig(
+        index,
+        dict(zip(GCODE_LISTBOX_STYLE_OPTIONS, style)),
+      )
+  except Exception as exc:
+    errors.append(
+      _robot_program_view_error_detail(
+        exc,
+        "robot program rows and styles could not be restored",
+      )
+    )
+  try:
+    tab1.progView.selection_clear(0, END)
+    for index in snapshot.selected_rows:
+      tab1.progView.selection_set(index)
+    if snapshot.anchor_row is not None:
+      tab1.progView.selection_anchor(snapshot.anchor_row)
+    if snapshot.active_row is not None:
+      tab1.progView.activate(snapshot.active_row)
+  except Exception as exc:
+    errors.append(
+      _robot_program_view_error_detail(
+        exc,
+        "robot program selection could not be restored",
+      )
+    )
+  try:
+    tab1.progView.xview_moveto(snapshot.xview[0])
+    tab1.progView.yview_moveto(snapshot.yview[0])
+  except Exception as exc:
+    errors.append(
+      _robot_program_view_error_detail(
+        exc,
+        "robot program scroll position could not be restored",
+      )
+    )
+  try:
+    ProgEntryField.delete(0, 'end')
+    ProgEntryField.insert(0, snapshot.program_path)
+    curRowEntryField.delete(0, 'end')
+    curRowEntryField.insert(0, snapshot.current_row)
+  except Exception as exc:
+    errors.append(
+      _robot_program_view_error_detail(
+        exc,
+        "robot program fields could not be restored",
+      )
+    )
+  try:
+    if snapshot.last_row_present:
+      tab1.lastRow = snapshot.last_row
+    elif hasattr(tab1, "lastRow"):
+      delattr(tab1, "lastRow")
+    tab1.lastProg = snapshot.last_program
+  except Exception as exc:
+    errors.append(
+      _robot_program_view_error_detail(
+        exc,
+        "robot program return state could not be restored",
+      )
+    )
+  if errors:
+    raise RuntimeError(
+      "robot program view rollback was incomplete: "
+      f"{'; '.join(errors)}"
+    )
+  return True
+
+
+def _replace_robot_program_view(
+  program_name,
+  program_rows,
+  *,
+  selected_row=None,
+  caller_row=None,
+  caller_program=None,
+  clear_return_state=False,
+  update_current_row=False,
+):
+  _validate_robot_program_source_path(
+    program_name,
+    "robot program source path",
+  )
+  if (
+    not isinstance(program_rows, tuple)
+    or any(not isinstance(row, bytes) for row in program_rows)
+  ):
+    raise MotionInputError("robot program replacement rows are invalid")
+  if selected_row is not None and (
+    isinstance(selected_row, bool)
+    or not isinstance(selected_row, int)
+    or not 0 <= selected_row < len(program_rows)
+  ):
+    raise MotionInputError("robot program selected row is out of range")
+  caller_state_supplied = (
+    caller_row is not None or caller_program is not None
+  )
+  if caller_state_supplied:
+    if (
+      isinstance(caller_row, bool)
+      or not isinstance(caller_row, int)
+      or caller_row < 0
+    ):
+      raise MotionInputError("robot program caller state is invalid")
+    _validate_robot_program_source_path(
+      caller_program,
+      "robot program caller path",
+    )
+  if not isinstance(clear_return_state, bool):
+    raise TypeError("robot program return-state option must be boolean")
+  if not isinstance(update_current_row, bool):
+    raise TypeError("robot program current-row option must be boolean")
+  if caller_state_supplied and clear_return_state:
+    raise MotionInputError(
+      "robot program navigation cannot save and clear return state"
+    )
+  if caller_state_supplied and tab1.lastProg != "":
+    raise MotionInputError(
+      "nested robot program calls are not supported"
+    )
+
+  snapshot = _capture_robot_program_view()
+  try:
+    tab1.progView.delete(0, END)
+    for row in program_rows:
+      tab1.progView.insert(END, row)
+    ProgEntryField.delete(0, 'end')
+    ProgEntryField.insert(0, program_name)
+    tab1.progView.selection_clear(0, END)
+    if selected_row is not None:
+      tab1.progView.select_set(selected_row)
+    if caller_state_supplied:
+      tab1.lastRow = caller_row
+      tab1.lastProg = caller_program
+    if clear_return_state:
+      _clear_robot_program_return_state()
+    if update_current_row:
+      curRowEntryField.delete(0, 'end')
+      curRowEntryField.insert(0, selected_row)
+  except Exception as exc:
+    try:
+      _restore_robot_program_view(snapshot)
+    except Exception as rollback_exc:
+      raise RuntimeError(
+        "robot program view replacement failed and rollback was "
+        f"incomplete: {rollback_exc}"
+      ) from exc
+    raise
+  return True
+
+
+def _open_local_robot_program(filename):
+  import stat as stat_module
+
+  if (
+    not isinstance(filename, str)
+    or not filename
+    or "\x00" in filename
+    or "\r" in filename
+    or "\n" in filename
+    or os.path.splitext(filename)[1].casefold() != ".ar4"
+  ):
+    raise MotionInputError("robot program path is invalid")
+  flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+  if os.name == "posix":
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if not isinstance(nonblocking, int):
+      raise OSError(
+        "robot program loading requires nonblocking file opening"
+      )
+    flags |= nonblocking | getattr(os, "O_CLOEXEC", 0)
+  elif os.name == "nt":
+    flags |= getattr(os, "O_NOINHERIT", 0)
+  else:
+    raise OSError(
+      f"robot program loading is unsupported on {os.name!r}"
+    )
+
+  descriptor = os.open(filename, flags)
+  try:
+    metadata = os.fstat(descriptor)
+    if not stat_module.S_ISREG(metadata.st_mode):
+      raise MotionInputError(
+        "robot program source must be a regular file"
+      )
+    if metadata.st_size > MAX_LOCAL_ROBOT_PROGRAM_BYTES:
+      raise MotionInputError(
+        "robot program exceeds the supported file size"
+      )
+    program_file = os.fdopen(descriptor, "rb")
+  except Exception:
+    os.close(descriptor)
+    raise
+  return program_file
+
+
+def _parse_local_robot_program(program_file, execution_request=None):
+  if (
+    execution_request is not None
+    and not isinstance(execution_request, ProgramExecutionRequest)
+  ):
+    raise TypeError("robot program load request is invalid")
+  readline = getattr(program_file, "readline", None)
+  if not callable(readline):
+    raise MotionInputError(
+      "robot program source must provide bounded binary rows"
+    )
+  rows = []
+  source_bytes = 0
+  while True:
+    if (
+      execution_request is not None
+      and _program_execution_request_cancelled(execution_request)
+    ):
+      raise MotionInputError(
+        "robot program loading was cancelled by stop admission"
+      )
+    raw_row = readline(MAX_LOCAL_ROBOT_SOURCE_LINE_BYTES + 1)
+    if not isinstance(raw_row, bytes):
+      raise MotionInputError("robot program rows must be binary data")
+    if not raw_row:
+      break
+    source_bytes += len(raw_row)
+    if source_bytes > MAX_LOCAL_ROBOT_PROGRAM_BYTES:
+      raise MotionInputError(
+        "robot program exceeds the supported file size"
+      )
+    if len(rows) >= MAX_LOCAL_ROBOT_PROGRAM_ROWS:
+      raise MotionInputError(
+        "robot program exceeds the supported row count"
+      )
+    if len(raw_row) > MAX_LOCAL_ROBOT_SOURCE_LINE_BYTES:
+      raise MotionInputError(
+        "robot program row exceeds the supported source length"
+      )
+    text = _decode_program_row_content(raw_row)
+    if "\x00" in text or any(
+      (ord(character) < 32 and character != "\t")
+      or ord(character) == 127
+      for character in text
+    ):
+      raise MotionInputError(
+        "robot program row contains an unsupported control character"
+      )
+    rows.append(raw_row)
+  if (
+    execution_request is not None
+    and _program_execution_request_cancelled(execution_request)
+  ):
+    raise MotionInputError(
+      "robot program loading was cancelled by stop admission"
+    )
+  return tuple(rows)
+
+
 def loadProg():
   if getattr(sys, 'frozen', False):
     folder = os.path.dirname(sys.executable)
-  elif __file__:
+  else:
     folder = os.path.dirname(os.path.realpath(__file__))
-  #folder = os.path.dirname(os.path.realpath(__file__))
-  filetypes = (('robot program', '*.ar4'),("all files", "*.*"))
-  filename = fd.askopenfilename(title='Open files',initialdir=folder,filetypes=filetypes)
-  name = os.path.basename(filename)
-  ProgEntryField.delete(0, 'end')
-  ProgEntryField.insert(0,name)
-  tab1.progView.delete(0,END)
-  if filename == "":
-    return
+  filetypes = (('robot program', '*.ar4'), ("all files", "*.*"))
+  filename = fd.askopenfilename(
+    title='Open files',
+    initialdir=folder,
+    filetypes=filetypes,
+  )
+  if not filename:
+    return False
   try:
-    Prog = open(filename,"rb")
-    time.sleep(.1)
-    for item in Prog:
-      tab1.progView.insert(END,item)
-    tab1.progView.pack()
-    scrollbar.config(command=tab1.progView.yview)
+    with _open_local_robot_program(filename) as program_file:
+      program_rows = _parse_local_robot_program(program_file)
+    _replace_robot_program_view(
+      filename,
+      program_rows,
+      clear_return_state=True,
+    )
     save_calibration(CAL)
-  except FileNotFoundError:
-    logger.warning("File not found. Please check the file path and try again.")
-  except Exception as e:
-    logger.error(f"An error occurred: {e}")
+  except Exception as exc:
+    logger.exception(f"Unable to load robot program: {exc}")
+    return False
+  return True
 
-def callProg(name):  
-  ProgEntryField.delete(0, 'end')
-  ProgEntryField.insert(0,name)
-  tab1.progView.delete(0,END)
-  Prog = open(name,"rb")
-  time.sleep(.1)
-  for item in Prog:
-    tab1.progView.insert(END,item)
-  tab1.progView.pack()
-  scrollbar.config(command=tab1.progView.yview)
+
+def _commit_called_program_navigation(navigation):
+  if not isinstance(navigation, CalledProgramNavigation):
+    raise TypeError("called-program navigation request is invalid")
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "called-program navigation must run on the Tk event thread"
+    )
+  cancellation_boundary = (
+    navigation.execution_request.cancellation_boundary
+  )
+  def cancellation_requested():
+    acquired = cancellation_boundary.acquire()
+    if acquired is False:
+      raise RuntimeError(
+        "called-program cancellation boundary acquisition failed"
+      )
+    try:
+      return (
+        application_closing.is_set()
+        or program_execution_cancelled.is_set()
+        or cancellation_boundary.is_set()
+      )
+    finally:
+      cancellation_boundary.release()
+
+  cancelled = cancellation_requested()
+  if cancelled:
+    return False
+  try:
+    replaced = _replace_robot_program_view(
+      navigation.program_name,
+      navigation.program_rows,
+      selected_row=navigation.selected_row,
+      caller_row=navigation.caller_row,
+      caller_program=navigation.caller_program,
+      clear_return_state=navigation.clear_return_state,
+      update_current_row=navigation.update_current_row,
+    )
+  except Exception:
+    if cancellation_requested():
+      _clear_robot_program_return_state()
+    raise
+  cancelled = cancellation_requested()
+  if cancelled:
+    _clear_robot_program_return_state()
+    return False
+  return replaced
+
+
+def _settle_called_program_navigation(navigation):
+  if not isinstance(navigation, CalledProgramNavigation):
+    raise TypeError("called-program navigation event is invalid")
+  try:
+    succeeded = _commit_called_program_navigation(navigation)
+  except Exception as exc:
+    navigation.settle(False, exc)
+    logger.exception("Unable to apply called-program navigation")
+    return False
+  except BaseException as exc:
+    navigation.settle(
+      False,
+      RuntimeError(
+        "called-program navigation aborted by "
+        f"{type(exc).__name__}"
+      ),
+    )
+    raise
+  navigation.settle(succeeded)
+  return succeeded
+
+
+def _poll_called_program_navigation_events():
+  try:
+    while True:
+      try:
+        navigation = called_program_navigation_event_queue.get_nowait()
+      except Empty:
+        break
+      _settle_called_program_navigation(navigation)
+  except Exception:
+    logger.exception(
+      "Unable to settle a called-program navigation event"
+    )
+  finally:
+    _reschedule_event_poll("called-program")
+
+
+def _dispatch_called_program_navigation(navigation):
+  if not isinstance(navigation, CalledProgramNavigation):
+    raise TypeError("called-program navigation dispatch is invalid")
+  if threading.get_ident() == application_tk_thread_id:
+    _settle_called_program_navigation(navigation)
+    return navigation.wait()
+  with application_lifecycle_lock:
+    if application_closing.is_set():
+      return False
+    called_program_navigation_event_queue.put(navigation)
+  return navigation.wait()
+
+def callProg(
+  name,
+  execution_request,
+  selected_row,
+  *,
+  caller_row=None,
+  caller_program=None,
+  clear_return_state=False,
+  update_current_row=False,
+):
+  """Load a called program and marshal view mutation onto the Tk thread."""
+  if not isinstance(execution_request, ProgramExecutionRequest):
+    raise TypeError("called-program execution request is invalid")
+  if (
+    isinstance(selected_row, bool)
+    or not isinstance(selected_row, int)
+    or selected_row < 0
+  ):
+    raise MotionInputError("called-program selected row must be nonnegative")
+  if not isinstance(clear_return_state, bool):
+    raise TypeError("called-program return-state option must be boolean")
+  if not isinstance(update_current_row, bool):
+    raise TypeError("called-program current-row option must be boolean")
+  caller_state_supplied = (
+    caller_row is not None or caller_program is not None
+  )
+  if caller_state_supplied:
+    if (
+      isinstance(caller_row, bool)
+      or not isinstance(caller_row, int)
+      or caller_row < 0
+    ):
+      raise MotionInputError("called-program caller state is invalid")
+    if clear_return_state:
+      raise MotionInputError(
+        "called-program navigation cannot save and clear return state"
+      )
+    _validate_robot_program_source_path(
+      caller_program,
+      "called-program caller path",
+    )
+  program_source_path = _resolve_called_program_source_path(
+    name,
+    caller_program=caller_program if caller_state_supplied else None,
+    return_to_caller=clear_return_state,
+  )
+  if _program_execution_request_cancelled(execution_request):
+    return False
+
+  try:
+    with _open_local_robot_program(program_source_path) as program_file:
+      program_rows = _parse_local_robot_program(
+        program_file,
+        execution_request,
+      )
+  except MotionInputError:
+    if _program_execution_request_cancelled(execution_request):
+      return False
+    raise
+  if _program_execution_request_cancelled(execution_request):
+    return False
+  navigation = CalledProgramNavigation(
+    execution_request,
+    program_source_path,
+    program_rows,
+    selected_row,
+    caller_row=caller_row,
+    caller_program=caller_program,
+    clear_return_state=clear_return_state,
+    update_current_row=update_current_row,
+  )
+  return _dispatch_called_program_navigation(navigation)
 
 def CreateProg():
   user_input = simpledialog.askstring(title="New Program", prompt="New Program Name:")
@@ -18949,10 +25687,11 @@ def CreateProg():
   ProgEntryField.delete(0, 'end')
   ProgEntryField.insert(0,file_path)
   tab1.progView.delete(0,END)
-  Prog = open(file_path,"rb")
-  time.sleep(.1)
-  for item in Prog:
-    tab1.progView.insert(END,item)
+  with open(file_path,"rb") as program_file:
+    time.sleep(.1)
+    for item in program_file:
+      tab1.progView.insert(END,item)
+  _clear_robot_program_return_state()
   tab1.progView.pack()
   scrollbar.config(command=tab1.progView.yview)
   save_calibration(CAL) 
@@ -19045,10 +25784,11 @@ def reloadProg():
   ProgEntryField.delete(0, 'end')
   ProgEntryField.insert(0,file_path)
   tab1.progView.delete(0,END)
-  Prog = open(file_path,"rb")
-  time.sleep(.1)
-  for item in Prog:
-    tab1.progView.insert(END,item)
+  with open(file_path,"rb") as program_file:
+    time.sleep(.1)
+    for item in program_file:
+      tab1.progView.insert(END,item)
+  _clear_robot_program_return_state()
   tab1.progView.pack()
   scrollbar.config(command=tab1.progView.yview)
   save_calibration(CAL)      
@@ -19193,11 +25933,10 @@ def insertvisFind():
         )
     message = f"Vision program insertion failed: {exc}"
     logger.exception(message)
-    for status_label in (almStatusLab, almStatusLab2):
-      try:
-        status_label.config(text=message, style="Alarm.TLabel")
-      except Exception:
-        logger.exception("Unable to display the vision insertion failure")
+    try:
+      _set_application_status(message, "Alarm.TLabel")
+    except Exception:
+      logger.exception("Unable to display the vision insertion failure")
     return False
 
 def insertRegister():  
@@ -19388,8 +26127,7 @@ def _calibration_available():
   if not RUN['offlineMode']:
     return True
   message = "Calibration not supported in offline mode"
-  almStatusLab.config(text=message, style="Alarm.TLabel")
-  almStatusLab2.config(text=message, style="Alarm.TLabel")
+  _set_application_status(message, "Alarm.TLabel")
   return False
 
 
@@ -19404,12 +26142,10 @@ def _query_primary_home_reference(serial_port):
   )
   if command is None:
     return None
-  response = exchange_serial_line(
-    serial_port,
+  response = _exchange_legacy_main_command(
     command,
-    SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
-    write_lock=serial_write_lock,
-    reset_input=False,
+    response_timeout=SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+    expected_serial_port=serial_port,
   )
   try:
     return parse_primary_home_reference_capability_response(
@@ -19563,8 +26299,7 @@ def _record_calibration_response(
     succeeded
     and applied_position.speed_violation
   ):
-    almStatusLab.config(text=message, style=style)
-    almStatusLab2.config(text=message, style=style)
+    _set_application_status(message, style)
   if succeeded and update_virtual:
     RUN['VR_angles'] = [
       float(CAL['J1AngCur']),
@@ -19707,16 +26442,7 @@ class CalibrationOperation:
 
 
 def _set_calibration_status(message, style):
-  if (
-    not isinstance(message, str)
-    or not message.strip()
-    or message != message.strip()
-  ):
-    raise TypeError("calibration status must be normalized text")
-  if not isinstance(style, str) or not style:
-    raise TypeError("calibration status style must be non-empty text")
-  almStatusLab.config(text=message, style=style)
-  almStatusLab2.config(text=message, style=style)
+  return _set_application_status(message, style)
 
 
 def _calibration_pose_widget_groups():
@@ -20077,11 +26803,10 @@ def _run_calibration_stage_safe(
     with _require_calibration_terminal_response(
       write_commitment
     ) as response_requirement:
-      response = exchange_serial_line_until_cancelled(
+      response = _exchange_main_controller_line_until_cancelled(
         serial_port,
         command,
         response_requirement,
-        write_lock=serial_write_lock,
         write_boundary_lock=application_lifecycle_lock,
         write_started_event=write_commitment,
       )
@@ -20509,11 +27234,10 @@ def _execute_calibration_command(
       ) as response_requirement:
         cmdSentEntryField.delete(0, 'end')
         cmdSentEntryField.insert(0, command)
-        response = exchange_serial_line_until_cancelled(
+        response = _exchange_main_controller_line_until_cancelled(
           serial_port,
           command,
           response_requirement,
-          write_lock=serial_write_lock,
           write_boundary_lock=application_lifecycle_lock,
           write_started_event=write_commitment,
         )
@@ -21068,17 +27792,12 @@ def _exchange_controller_calibration_acknowledgement(
     write_started_event = threading.Event()
   serial_port = RUN.get('ser')
   try:
-    write_serial_control(
-      serial_port,
+    return _exchange_legacy_main_command(
       command,
-      write_lock=serial_write_lock,
-      reset_input=True,
+      read_line=False,
+      expected_response=b"Done",
+      response_timeout=SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
       write_started_event=write_started_event,
-    )
-    return read_serial_exact_response(
-      serial_port,
-      b"Done",
-      SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
     ) == "Done"
   finally:
     try:
@@ -21357,8 +28076,7 @@ def zeroAxis7():
   response = _exchange_legacy_main_command(command)
   if not _apply_controller_position_response(response):
     return False
-  almStatusLab.config(text="J7 Calibration Forced to Zero", style="Warn.TLabel")
-  almStatusLab2.config(text="J7 Calibration Forced to Zero", style="Warn.TLabel")
+  _set_application_status(text="J7 Calibration Forced to Zero", style="Warn.TLabel")
   message = "J7 Calibration Forced to Zero - this is for commissioning and testing - be careful!"
   #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
   #tab8.ElogView.insert(END, Curtime+" - "+message)
@@ -21374,8 +28092,7 @@ def zeroAxis8():
   response = _exchange_legacy_main_command(command)
   if not _apply_controller_position_response(response):
     return False
-  almStatusLab.config(text="J8 Calibration Forced to Zero", style="Warn.TLabel")
-  almStatusLab2.config(text="J8 Calibration Forced to Zero", style="Warn.TLabel")
+  _set_application_status(text="J8 Calibration Forced to Zero", style="Warn.TLabel")
   message = "J8 Calibration Forced to Zero - this is for commissioning and testing - be careful!"
   #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
   #tab8.ElogView.insert(END, Curtime+" - "+message)
@@ -21391,8 +28108,7 @@ def zeroAxis9():
   response = _exchange_legacy_main_command(command)
   if not _apply_controller_position_response(response):
     return False
-  almStatusLab.config(text="J9 Calibration Forced to Zero", style="Warn.TLabel")
-  almStatusLab2.config(text="J9 Calibration Forced to Zero", style="Warn.TLabel")
+  _set_application_status(text="J9 Calibration Forced to Zero", style="Warn.TLabel")
   message = "J9 Calibration Forced to Zero - this is for commissioning and testing - be careful!"
   #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
   #tab8.ElogView.insert(END, Curtime+" - "+message)
@@ -21498,8 +28214,7 @@ def _force_controller_position(primary_positions):
   except Exception as exc:
     message = f"Forced controller position requires recovery: {exc}"
     logger.exception(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return False
 
 
@@ -21509,17 +28224,11 @@ def _exchange_position_acknowledgement(command):
   serial_port = RUN.get('ser')
   write_started = threading.Event()
   try:
-    write_serial_control(
-      serial_port,
+    response = _exchange_legacy_main_command(
       command,
-      write_lock=serial_write_lock,
-      reset_input=True,
-      write_started_event=write_started,
-    )
-    response = read_serial_line_response(
-      serial_port,
-      SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+      response_timeout=SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
       accepted_responses=("Done",),
+      write_started_event=write_started,
     )
     if response != "Done":
       raise ProtocolResponseError(
@@ -21573,8 +28282,7 @@ def CalZeroPos():
   #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
   if _force_controller_position((0, 0, 0, 0, 45, 0)) is not True:
     return False
-  almStatusLab.config(text="Calibration Forced to Home", style="Warn.TLabel")
-  almStatusLab2.config(text="Calibration Forced to Home", style="Warn.TLabel")
+  _set_application_status(text="Calibration Forced to Home", style="Warn.TLabel")
   message = "Calibration Forced to Home - this is for commissioning and testing - be careful!"
   #tab8.ElogView.insert(END, Curtime+" - "+message)
   logger.warning(message)
@@ -21591,8 +28299,7 @@ def CalRestPos():
   #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
   if _force_controller_position((0, 0, -89, 0, 0, 0)) is not True:
     return False
-  almStatusLab.config(text="Calibration Forced to Vertical Rest Pos", style="Warn.TLabel")
-  almStatusLab2.config(text="Calibration Forced to Vertical Rest Pos", style="Warn.TLabel")
+  _set_application_status(text="Calibration Forced to Vertical Rest Pos", style="Warn.TLabel")
   message = "Calibration Forced to Vertical - this is for commissioning and testing - be careful!"
   #tab8.ElogView.insert(END, Curtime+" - "+message)
   logger.warning(message)
@@ -21711,8 +28418,7 @@ def displayPosition(response, parsed=None, synchronize_dispatcher=True):
     message = f"Invalid controller position response: {exc}"
     _invalidate_joint_motion_state(message)
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return None
 
   if parsed.flag:
@@ -21723,11 +28429,36 @@ def displayPosition(response, parsed=None, synchronize_dispatcher=True):
     if joint_motion_dispatcher.synchronize(
       parsed.joints + parsed.external
     ) is not True:
-      message = "Controller position response rejected while joint motion is active"
+      dispatcher_closed = joint_motion_dispatcher.closed
+      dispatcher_active = joint_motion_dispatcher.active
+      dispatcher_fault = joint_motion_dispatcher.fault_reason
+      if dispatcher_closed:
+        message = (
+          "Controller position response rejected because the joint "
+          "dispatcher is closed"
+        )
+      elif dispatcher_active:
+        message = (
+          "Controller position response rejected while joint motion is active"
+        )
+      elif (
+        dispatcher_fault
+        and "controller ownership release failed:" in dispatcher_fault
+      ):
+        message = (
+          "Controller position response could not release joint-motion "
+          f"ownership: {dispatcher_fault}"
+        )
+      elif isinstance(dispatcher_fault, str) and dispatcher_fault.strip():
+        message = (
+          "Controller position response rejected by the joint dispatcher: "
+          f"{dispatcher_fault.strip()}"
+        )
+      else:
+        message = "Controller position response rejected by the joint dispatcher"
       _invalidate_joint_motion_state(message)
       logger.error(message)
-      almStatusLab.config(text=message, style="Alarm.TLabel")
-      almStatusLab2.config(text=message, style="Alarm.TLabel")
+      _set_application_status(text=message, style="Alarm.TLabel")
       return None
 
   resynchronizing_virtual_pose = (
@@ -21740,8 +28471,7 @@ def displayPosition(response, parsed=None, synchronize_dispatcher=True):
     message = "Controller position could not resynchronize the virtual model"
     _invalidate_joint_motion_state(message)
     logger.error(message)
-    almStatusLab.config(text=message, style="Alarm.TLabel")
-    almStatusLab2.config(text=message, style="Alarm.TLabel")
+    _set_application_status(text=message, style="Alarm.TLabel")
     return None
 
   cmdRecEntryField.delete(0, 'end')
@@ -21782,8 +28512,7 @@ def displayPosition(response, parsed=None, synchronize_dispatcher=True):
     logger.warning(message)
     value = tab8.ElogView.get(0, END)
     pickle.dump(value, open("ErrorLog", "wb"))
-    almStatusLab.config(text=message, style="Warn.TLabel")
-    almStatusLab2.config(text=message, style="Warn.TLabel")
+    _set_application_status(text=message, style="Warn.TLabel")
 
   return parsed
 
@@ -22576,8 +29305,7 @@ def _invalidate_uncertain_controller_calibration(reason):
     "controller quarantined and reconnection is required"
   )
   logger.error("%s: %s", message, reason)
-  almStatusLab.config(text=message, style="Alarm.TLabel")
-  almStatusLab2.config(text=message, style="Alarm.TLabel")
+  _set_application_status(text=message, style="Alarm.TLabel")
   return False
 
 
@@ -22820,10 +29548,13 @@ def ErrorHandler(response):
     alarm_message = message
 
   ##ESTOP BUTTON   
-  elif (response[1:2] == 'B'):
+  elif response in CONTROLLER_PHYSICAL_ESTOP_FLAGS:
     with program_stop_state_lock:
+      stop_already_latched = bool(RUN.get('estopActive'))
       RUN['estopActive'] = TRUE
-    stopProg()
+    tab1.runTrue = 0
+    if not stop_already_latched:
+      stopProg()
     message = "Estop Button was Pressed"
     messages.append(message)
     alarm_message = message    
@@ -22873,8 +29604,7 @@ def ErrorHandler(response):
   pickle.dump(value,open("ErrorLog","wb"))
 
   # Update the alarm status label once
-  almStatusLab.config(text=alarm_message, style="Alarm.TLabel")
-  almStatusLab2.config(text=alarm_message, style="Alarm.TLabel")
+  _set_application_status(text=alarm_message, style="Alarm.TLabel")
   GCalmStatusLab.config(text=alarm_message, style="Alarm.TLabel")
       
 	
@@ -22882,88 +29612,788 @@ def ErrorHandler(response):
 
 ###VISION DEFS###################################################################
 #################################################################################	
- 
-def viscalc():
-  # global RUN['xMMpos']
-  # global RUN['yMMpos']
-  #origin x1 y1
-  CAL['VisOrigXpix'] = float(VisX1PixEntryField.get())
-  CAL['VisOrigXmm'] = float(VisX1RobEntryField.get()) 
-  CAL['VisOrigYpix'] = float(VisY1PixEntryField.get()) 
-  CAL['VisOrigYmm'] = float(VisY1RobEntryField.get()) 
-  # x2 y2
-  CAL['VisEndXpix'] = float(VisX2PixEntryField.get())
-  CAL['VisEndXmm'] = float(VisX2RobEntryField.get()) 
-  CAL['VisEndYpix'] = float(VisY2PixEntryField.get()) 
-  CAL['VisEndYmm'] = float(VisY2RobEntryField.get())
 
-  x = float(VisRetXpixEntryField.get()) 
-  y = float(VisRetYpixEntryField.get()) 
-
-  XPrange = float(CAL['VisEndXpix']) - float(CAL['VisOrigXpix'])
-  XPratio = (x-float(CAL['VisOrigXpix'])) / XPrange
-  XMrange = float(CAL['VisEndXmm']) - float(CAL['VisOrigXmm'])
-  XMpos = float(XMrange) * float(XPratio)
-  RUN['xMMpos'] = float(CAL['VisOrigXmm']) + XMpos
-  ##
-  YPrange = float(CAL['VisEndYpix']) - float(CAL['VisOrigYpix'])
-  YPratio = (y-float(CAL['VisOrigYpix'])) / YPrange
-  YMrange = float(CAL['VisEndYmm']) - float(CAL['VisOrigYmm'])
-  YMpos = float(YMrange) * float(YPratio)
-  RUN['yMMpos'] = float(CAL['VisOrigYmm']) + YMpos
-  return (RUN['xMMpos'],RUN['yMMpos'])
-
-
-
+def _vision_camera_source_for_selection(selection):
+  if not isinstance(selection, str) or not selection.strip():
+    raise MotionInputError("camera selection must be non-empty text")
+  platform_config = CE.get('Platform')
+  if not isinstance(platform_config, dict):
+    raise MotionInputError("camera platform configuration is invalid")
+  platform_name = platform_config.get('OS')
+  if not isinstance(platform_name, str) or not platform_name:
+    raise MotionInputError("camera platform identity is invalid")
+  camera_sources = globals().get('label_to_id')
+  if not isinstance(camera_sources, dict):
+    raise MotionInputError("camera source mapping is unavailable")
+  camera_source = camera_sources.get(selection)
+  if platform_name == "Windows":
+    if (
+      isinstance(camera_source, bool)
+      or not isinstance(camera_source, int)
+      or camera_source < 0
+    ):
+      raise MotionInputError("selected camera is unavailable")
+    return camera_source
+  if platform_name == "Linux":
+    if not isinstance(camera_source, str) or not camera_source:
+      raise MotionInputError("selected camera is unavailable")
+    if camera_source.startswith("rpicam:"):
+      camera_index = camera_source.removeprefix("rpicam:")
+      if re.fullmatch(r"[0-9]+", camera_index) is None:
+        raise MotionInputError("CSI camera source identity is invalid")
+    return camera_source
+  raise MotionInputError("camera platform is unsupported")
 
 
-# Define function to show frame
-def show_frame():
+def _camera_labels_for_sources(camera_entries):
+  if not isinstance(camera_entries, (tuple, list)):
+    raise MotionInputError("camera entries are invalid")
+  normalized = []
+  source_identities = set()
+  name_counts = {}
+  for entry in camera_entries:
+    if not isinstance(entry, (tuple, list)) or len(entry) != 2:
+      raise MotionInputError("camera entry is invalid")
+    camera_source, name = entry
+    valid_integer_source = (
+      isinstance(camera_source, int)
+      and not isinstance(camera_source, bool)
+      and camera_source >= 0
+    )
+    valid_text_source = (
+      isinstance(camera_source, str)
+      and bool(camera_source)
+      and camera_source == camera_source.strip()
+      and "\r" not in camera_source
+      and "\n" not in camera_source
+      and "\x00" not in camera_source
+      and len(camera_source) <= MAX_CAMERA_PREVIEW_EVENT_DETAIL
+    )
+    if (
+      not (valid_integer_source or valid_text_source)
+      or camera_source in source_identities
+    ):
+      raise MotionInputError("camera source identity is invalid")
+    if (
+      not isinstance(name, str)
+      or not name
+      or name != name.strip()
+      or "\r" in name
+      or "\n" in name
+      or "\x00" in name
+      or len(name) > MAX_CAMERA_PREVIEW_EVENT_DETAIL
+    ):
+      raise MotionInputError("camera name is invalid")
+    source_identities.add(camera_source)
+    name_counts[name] = name_counts.get(name, 0) + 1
+    normalized.append((camera_source, name))
 
-    if RUN['cam_on']:
+  def source_label(camera_source):
+    prefix = "index" if isinstance(camera_source, int) else "source"
+    return f"{prefix} {camera_source}"
 
-        ret, frame = RUN['cap'].read()    
+  labels = [
+    name
+    if name_counts[name] == 1
+    else f"{source_label(camera_source)}: {name}"
+    for camera_source, name in normalized
+  ]
+  if len(set(labels)) != len(labels):
+    labels = [
+      f"{source_label(camera_source)}: {name}"
+      for camera_source, name in normalized
+    ]
+  return labels, {
+    label: normalized[index][0]
+    for index, label in enumerate(labels)
+  }
 
-        if ret:
-            cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)    
-            img = Image.fromarray(cv2image).resize((480,320))
-            imgtk = ImageTk.PhotoImage(image=img)        
-            live_lbl.imgtk = imgtk    
-            live_lbl.configure(image=imgtk)    
-        
-        live_lbl.after(10, show_frame)
+
+def _cache_vision_camera_selection(selection):
+  global selected_vision_camera_source
+
+  with camera_selection_lock:
+    selected_vision_camera_source = None
+    camera_source = _vision_camera_source_for_selection(selection)
+    selected_vision_camera_source = camera_source
+  return camera_source
+
+
+def _cached_vision_camera_source():
+  with camera_selection_lock:
+    camera_source = selected_vision_camera_source
+  if isinstance(camera_source, int) and not isinstance(camera_source, bool):
+    if camera_source < 0:
+      raise MotionInputError("cached camera device index is invalid")
+    return camera_source
+  if (
+    not isinstance(camera_source, str)
+    or not camera_source
+    or camera_source != camera_source.strip()
+    or "\r" in camera_source
+    or "\n" in camera_source
+    or "\x00" in camera_source
+  ):
+    raise MotionInputError("camera selection has not been configured")
+  return camera_source
+
+
+def _on_vision_camera_select(selection):
+  try:
+    camera_source = _cache_vision_camera_selection(selection)
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"CAMERA SELECTION REJECTED: {detail}"
+    logger.exception("Unable to apply the selected camera")
+    try:
+      _set_application_status(message, "Alarm.TLabel")
+    except Exception:
+      logger.exception("Unable to present the rejected camera selection")
+    return False
+  logger.debug(
+    "Selected camera %r with source %r",
+    selection,
+    camera_source,
+  )
+  return True
+
+
+def _open_camera_preview_capture(camera_source):
+  if CE['Platform']['OS'] == "Windows":
+    if isinstance(camera_source, bool) or not isinstance(camera_source, int):
+      raise MotionInputError("Windows camera source must be a device index")
+    return cv2.VideoCapture(camera_source, cv2.CAP_DSHOW)
+  if isinstance(camera_source, str) and camera_source.startswith("rpicam:"):
+    raise MotionInputError(
+      "CSI camera capture requires a Picamera2 or libcamera adapter"
+    )
+  return cv2.VideoCapture(camera_source)
+
+
+camera_preview_worker = CameraPreviewWorker(
+  _open_camera_preview_capture,
+  prepare_camera_preview_frame,
+)
+
+
+def show_frame(preview_frame):
+  if not isinstance(preview_frame, CameraPreviewFrame):
+    raise MotionInputError("camera preview supplied an invalid frame record")
+  image = Image.fromarray(preview_frame.image)
+  imgtk = ImageTk.PhotoImage(image=image)
+  live_lbl.imgtk = imgtk
+  live_lbl.configure(image=imgtk)
+  return True
+
+
+def _apply_camera_preview_event(event):
+  if not isinstance(event, CameraPreviewEvent):
+    raise RuntimeError("camera preview worker emitted an invalid event")
+  stale_failure = False
+  current_failure = False
+  with camera_preview_request_lock:
+    request_id = RUN.get('cameraPreviewRequestId')
+    if event.request_id != request_id:
+      stale_failure = event.kind == "failed"
+    elif event.kind == "started":
+      RUN['cam_on'] = True
+      return True
+    elif event.kind in ("starting", "stopping"):
+      RUN['cam_on'] = False
+      return True
+    elif event.kind == "stopped":
+      RUN['cam_on'] = False
+      RUN['cameraPreviewRequestId'] = None
+      return True
+    elif event.kind == "failed":
+      RUN['cam_on'] = False
+      RUN['cameraPreviewRequestId'] = None
+      current_failure = True
+    else:
+      raise RuntimeError("camera preview worker emitted an unknown event")
+  if stale_failure:
+    message = (
+      f"CAMERA PREVIEW REQUEST {event.request_id} FAILED AFTER "
+      "REQUEST OWNERSHIP CHANGED"
+    )
+    if event.detail:
+      message += f": {event.detail}"
+    logger.error(message)
+    return True
+  if current_failure:
+    message = "CAMERA PREVIEW FAILED"
+    if event.detail:
+      message += f": {event.detail}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return True
+  return False
+
+
+def _apply_program_camera_completion_event(event):
+  if not isinstance(event, ProgramCameraCompletionEvent):
+    raise RuntimeError("program camera worker emitted an invalid event")
+  if not _program_execution_request_active(event.execution_request):
+    logger.warning("Ignoring a stale program camera completion")
+    return False
+  succeeded = event.succeeded
+  if event.error_detail is not None:
+    message = (
+      f"Camera-{event.operation} program row rejected: "
+      f"{event.error_detail}"
+    )
+    logger.error(message)
+    try:
+      _set_application_status(text=message, style="Alarm.TLabel")
+    except Exception:
+      logger.exception("Unable to present a program camera failure")
+  event.completion_callback(succeeded)
+  return True
+
+
+def _drain_program_camera_completion_events():
+  while True:
+    try:
+      event = program_camera_completion_queue.get_nowait()
+    except Empty:
+      return True
+    try:
+      _apply_program_camera_completion_event(event)
+    except Exception:
+      logger.exception("Unable to apply a program camera completion")
+
+
+def _poll_camera_preview_events():
+  try:
+    _drain_program_camera_completion_events()
+    _drain_vision_capture_events()
+    _drain_vision_match_events()
+    _drain_vision_selection_events()
+    _drain_program_vision_start_events()
+    for event in camera_preview_worker.drain_events():
+      _apply_camera_preview_event(event)
+    with camera_preview_request_lock:
+      request_id = RUN.get('cameraPreviewRequestId')
+      if (
+        isinstance(request_id, int)
+        and not isinstance(request_id, bool)
+        and request_id >= 0
+      ):
+        preview_frame = camera_preview_worker.take_latest_frame(request_id)
+      else:
+        preview_frame = None
+      if (
+        preview_frame is not None
+        and RUN.get('cameraPreviewRequestId') == preview_frame.request_id
+      ):
+        show_frame(preview_frame)
+        RUN['cam_on'] = True
+  except Exception:
+    RUN['cam_on'] = False
+    logger.exception("Unable to apply camera preview worker results")
+    _set_application_status(
+      "CAMERA PREVIEW RESULT FAILED",
+      "Alarm.TLabel",
+    )
+  finally:
+    _reschedule_event_poll("camera-preview")
+
 
 def start_vid():
-    #global cam_on, cap
-    #global cap
-    stop_vid()
-    RUN['cam_on'] = True
-    curVisStringSel = visoptions.get()
-    for i in range(len(camList)):
-      if curVisStringSel == camList[i]:
-          RUN['selectedCam'] = i
-          break
-    #RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
-    RUN['cap'] = cv2.VideoCapture(RUN['selectedCam'], cv2.CAP_DSHOW)
-    for _ in range(5):
-      RUN['cap'].read()
-    show_frame()
-
-
+  try:
+    camera_source = _cache_vision_camera_selection(visoptions.get())
+    _submit_camera_preview_start(camera_source)
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"CAMERA PREVIEW START REJECTED: {detail}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  return True
 
 
 def stop_vid():
-    #global cam_on
+  try:
+    request_id, stopped = _request_camera_preview_stop()
+    if not isinstance(stopped, bool):
+      raise RuntimeError("camera preview returned an invalid stop result")
+    if request_id is None:
+      _set_application_status(
+        "CAMERA PREVIEW STOP REJECTED: no preview request is active",
+        "Warn.TLabel",
+      )
+      return False
+    return stopped
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"CAMERA PREVIEW STOP FAILED: {detail}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+  return False
+
+
+def _request_camera_preview_stop():
+  with camera_preview_request_lock:
+    request_id = RUN.get('cameraPreviewRequestId')
+    if request_id is not None and (
+      isinstance(request_id, bool)
+      or not isinstance(request_id, int)
+      or request_id < 0
+    ):
+      raise MotionInputError("camera preview has no valid request owner")
     RUN['cam_on'] = False
-    
-    if RUN['cap']:
-        RUN['cap'].release()
+    stopped = (
+      False
+      if request_id is None
+      else camera_preview_worker.request_stop(request_id)
+    )
+  return request_id, stopped
 
-#vismenu.size
 
-def _vision_background_bgr(value):
-  red, green, blue = normalize_vision_background_color(value)
-  return blue, green, red
+def _submit_camera_preview_start(camera_source):
+  if application_closing.is_set():
+    raise MotionInputError("application shutdown is active")
+  with camera_preview_request_lock:
+    request_id = camera_preview_worker.request_start(camera_source)
+    RUN['cameraPreviewRequestId'] = request_id
+    RUN['cam_on'] = False
+  return request_id
+
+
+def _wait_for_program_camera_start(execution_request):
+  camera_source = _cached_vision_camera_source()
+  request_id = _submit_camera_preview_start(camera_source)
+  ready = camera_preview_worker.wait_ready(
+    request_id,
+    CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+    execution_request.cancellation_boundary,
+  )
+  if not isinstance(ready, bool):
+    raise RuntimeError("camera preview returned an invalid readiness result")
+  if ready:
+    return True
+  cancelled = _program_execution_request_cancelled(execution_request)
+  with camera_preview_request_lock:
+    stop_requested = camera_preview_worker.request_stop(request_id)
+  if not isinstance(stop_requested, bool):
+    raise RuntimeError("camera preview returned an invalid stop result")
+  cleanup_settled = camera_preview_worker.wait_request_stopped(
+    request_id,
+    CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+  )
+  if not isinstance(cleanup_settled, bool):
+    raise RuntimeError("camera preview returned an invalid cleanup result")
+  if not cleanup_settled:
+    close_result = camera_preview_worker.close()
+    if not isinstance(close_result, bool):
+      raise RuntimeError("camera preview returned an invalid close result")
+    with camera_preview_request_lock:
+      if RUN.get('cameraPreviewRequestId') == request_id:
+        RUN['cameraPreviewRequestId'] = None
+        RUN['cam_on'] = False
+    raise MotionInputError(
+      "camera preview cleanup timed out after readiness timeout"
+    )
+  with camera_preview_request_lock:
+    if RUN.get('cameraPreviewRequestId') == request_id:
+      RUN['cameraPreviewRequestId'] = None
+      RUN['cam_on'] = False
+  if cancelled:
+    return False
+  raise MotionInputError(
+    "camera preview did not become ready before timeout"
+  )
+
+
+def _wait_for_program_camera_stop(execution_request):
+  request_id, stopped = _request_camera_preview_stop()
+  if not isinstance(stopped, bool):
+    raise RuntimeError("camera preview returned an invalid stop result")
+  if request_id is None:
+    camera_active = camera_preview_worker.active
+    if not isinstance(camera_active, bool):
+      raise RuntimeError("camera preview returned an invalid active state")
+    if camera_active:
+      settled = camera_preview_worker.wait_stopped(
+        CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+        execution_request.cancellation_boundary,
+      )
+      if not isinstance(settled, bool):
+        raise RuntimeError("camera preview returned an invalid stop result")
+      if not settled:
+        if _program_execution_request_cancelled(execution_request):
+          return False
+        raise MotionInputError("camera capture did not stop before timeout")
+    camera_fault = camera_preview_worker.fault_reason
+    if camera_fault is not None:
+      if (
+        not isinstance(camera_fault, str)
+        or not camera_fault
+        or camera_fault != camera_fault.strip()
+      ):
+        raise RuntimeError("camera preview returned an invalid fault state")
+      raise MotionInputError(
+        "camera preview cleanup requires an application restart: "
+        + camera_fault
+      )
+    return True
+  if (
+    isinstance(request_id, bool)
+    or not isinstance(request_id, int)
+    or request_id < 0
+  ):
+    raise MotionInputError("camera preview has no valid request owner")
+  settled = camera_preview_worker.wait_request_stopped(
+    request_id,
+    CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+    execution_request.cancellation_boundary,
+    require_idle=True,
+  )
+  if not isinstance(settled, bool):
+    raise RuntimeError("camera preview returned an invalid stop result")
+  if settled:
+    with camera_preview_request_lock:
+      if RUN.get('cameraPreviewRequestId') == request_id:
+        RUN['cameraPreviewRequestId'] = None
+    return True
+  if _program_execution_request_cancelled(execution_request):
+    return False
+  close_result = camera_preview_worker.close()
+  if not isinstance(close_result, bool):
+    raise RuntimeError("camera preview returned an invalid close result")
+  with camera_preview_request_lock:
+    if RUN.get('cameraPreviewRequestId') == request_id:
+      RUN['cameraPreviewRequestId'] = None
+  raise MotionInputError("camera preview did not stop before timeout")
+
+
+def _perform_program_camera_operation(operation, execution_request):
+  if operation not in PROGRAM_CAMERA_OPERATIONS:
+    raise MotionInputError("program camera operation is invalid")
+  if not isinstance(execution_request, ProgramExecutionRequest):
+    raise MotionInputError("program camera execution request is invalid")
+  if operation == "on":
+    result = _wait_for_program_camera_start(execution_request)
+    failure_message = "camera preview readiness result is invalid"
+  else:
+    result = _wait_for_program_camera_stop(execution_request)
+    failure_message = "camera preview stop result is invalid"
+  if not isinstance(result, bool):
+    raise RuntimeError(failure_message)
+  if not result and not _program_execution_request_cancelled(
+    execution_request
+  ):
+    raise RuntimeError(failure_message)
+  return result
+
+
+def _run_program_camera_operation(
+  operation,
+  execution_request,
+  completion_callback,
+):
+  succeeded = False
+  error_detail = None
+  try:
+    succeeded = _perform_program_camera_operation(
+      operation,
+      execution_request,
+    )
+  except BaseException as exc:
+    error_detail = normalize_camera_exception_detail(exc)
+  event = ProgramCameraCompletionEvent(
+    execution_request=execution_request,
+    operation=operation,
+    completion_callback=completion_callback,
+    succeeded=succeeded,
+    error_detail=error_detail,
+  )
+  program_camera_completion_queue.put(event)
+
+
+def _dispatch_program_camera_operation(
+  operation,
+  execution_request,
+  completion_callback,
+):
+  if operation not in PROGRAM_CAMERA_OPERATIONS:
+    raise MotionInputError("program camera operation is invalid")
+  if not isinstance(execution_request, ProgramExecutionRequest):
+    raise MotionInputError("program camera execution request is invalid")
+  if completion_callback is None:
+    return _perform_program_camera_operation(
+      operation,
+      execution_request,
+    )
+  if not callable(completion_callback):
+    raise MotionInputError("program camera completion callback is invalid")
+  try:
+    worker = threading.Thread(
+      target=_run_program_camera_operation,
+      args=(operation, execution_request, completion_callback),
+      name=f"ar4-program-camera-{operation}",
+      daemon=True,
+    )
+    worker.start()
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(
+      exc,
+      "program camera worker startup failed: ",
+    )
+    raise RuntimeError(detail) from exc
+  return ROW_EXECUTION_PENDING
+
+
+def _parse_program_vision_command(command):
+  if not isinstance(command, str):
+    raise MotionInputError("vision program row must be text")
+  template_index = command.find("Vis Find - ")
+  background_index = command.find(" - BGcolor ")
+  score_index = command.find(" Score ")
+  pass_index = command.find(" Pass ")
+  fail_index = command.find(" Fail ")
+  if (
+    template_index != 0
+    or not (
+      template_index
+      < background_index
+      < score_index
+      < pass_index
+      < fail_index
+    )
+  ):
+    raise MotionInputError("vision program row delimiters are invalid")
+
+  template = command[template_index + 11:background_index]
+  if not template:
+    raise MotionInputError("vision program template must not be empty")
+  background_text = command[background_index + 11:score_index]
+  background_override = (
+    "Auto"
+    if background_text == "(Auto)"
+    else tuple(normalize_vision_background_color(background_text))
+  )
+  score = finite_number(
+    command[score_index + 7:pass_index],
+    "vision program score",
+  )
+  if score < 0 or score > 100:
+    raise MotionInputError(
+      "vision program score must be between 0 and 100"
+    )
+  return ProgramVisionCommand(
+    template_filename=template,
+    background_override=background_override,
+    minimum_score=score * 0.01,
+    pass_tab=_normalize_program_tab_number(
+      command[pass_index + 6:fail_index]
+    ),
+    fail_tab=_normalize_program_tab_number(command[fail_index + 6:]),
+  )
+
+
+def _validated_current_vision_match_result():
+  result = RUN.get('visionMatchResult')
+  if (
+    not isinstance(result, VisionMatchResult)
+    or not result.matched
+    or result.robot_position is None
+    or result.angle_degrees is None
+  ):
+    raise MotionInputError(
+      "Move Vision requires a valid completed vision match"
+    )
+  return result
+
+
+def _publish_program_vision_status(message, style):
+  if threading.get_ident() == application_tk_thread_id:
+    return _set_application_status(message, style)
+  return _queue_program_execution_status(message, style)
+
+
+def _snapshot_program_vision_match_settings(command):
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "program vision settings must be captured on the Tk event thread"
+    )
+  if not isinstance(command, ProgramVisionCommand):
+    raise TypeError("program vision settings command is invalid")
+  return VisionMatchSettings(
+    capture_settings=_snapshot_vision_capture_settings(
+      command.background_override
+    ),
+    match_options=_snapshot_vision_match_options(
+      command.template_filename,
+      command.minimum_score,
+    ),
+  )
+
+
+def _settle_program_vision_operation(
+  operation,
+  succeeded,
+  error_detail=None,
+):
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "program vision settlement must run on the Tk event thread"
+    )
+  if not isinstance(operation, ProgramVisionOperation):
+    raise TypeError("program vision settlement is invalid")
+  if not isinstance(succeeded, bool):
+    raise TypeError("program vision settlement state is invalid")
+  if error_detail is not None:
+    detail = normalize_camera_exception_detail(error_detail)
+    request_cancelled = _program_execution_request_cancelled(
+      operation.execution_request
+    )
+    if not request_cancelled:
+      message = f"Vision program row rejected: {detail}"
+      logger.error(message)
+      try:
+        _set_application_status(message, "Alarm.TLabel")
+      except Exception:
+        logger.exception("Unable to present a program vision failure")
+    else:
+      logger.warning(
+        "Discarding program vision failure after request cancellation or "
+        "ownership change: %s",
+        detail,
+      )
+  operation.settle(succeeded)
+  if operation.completion_callback is not None:
+    operation.completion_callback(succeeded)
+  return succeeded
+
+
+def _settle_program_vision_shutdown_operations():
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "program vision shutdown settlement must run on the Tk event thread"
+    )
+  if not application_closing.is_set():
+    raise RuntimeError(
+      "program vision shutdown settlement requires active shutdown"
+    )
+
+  operations = []
+  while True:
+    try:
+      operations.append(program_vision_start_queue.get_nowait())
+    except Empty:
+      break
+  with program_vision_operation_lock:
+    operations.extend(program_vision_operations.values())
+    program_vision_retired_request_ids.update(program_vision_operations)
+    program_vision_operations.clear()
+
+  settled = True
+  for operation in operations:
+    try:
+      _settle_program_vision_operation(operation, False)
+    except Exception:
+      settled = False
+      logger.exception(
+        "Unable to settle a program vision owner during shutdown"
+      )
+  return settled
+
+
+def _start_program_vision_operation(operation):
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "program vision startup must run on the Tk event thread"
+    )
+  if not isinstance(operation, ProgramVisionOperation):
+    raise TypeError("program vision startup operation is invalid")
+  if _program_execution_request_cancelled(operation.execution_request):
+    _settle_program_vision_operation(operation, False)
+    return False
+
+  with vision_match_request_lock:
+    manual_request_id = RUN.get('visionMatchRequestId')
+    if manual_request_id is not None:
+      if (
+        isinstance(manual_request_id, bool)
+        or not isinstance(manual_request_id, int)
+        or manual_request_id < 0
+      ):
+        raise MotionInputError("manual vision matching owner is invalid")
+      raise MotionInputError(
+        "manual vision matching result settlement is pending"
+      )
+  settings = _snapshot_program_vision_match_settings(operation.command)
+  operation.bind_program_rows(tuple(tab1.progView.get(0, "end")))
+  submission = vision_match_worker.submit(
+    settings,
+    operation.execution_request.cancellation_boundary,
+  )
+  if not isinstance(submission, VisionOperationSubmission):
+    raise RuntimeError("program vision returned an invalid submission")
+  if submission.coalesced:
+    raise RuntimeError("program vision unexpectedly coalesced a request")
+  operation.bind_worker_request(submission.request_id)
+  with program_vision_operation_lock:
+    if submission.request_id in program_vision_operations:
+      raise RuntimeError("program vision worker request ID was reused")
+    program_vision_operations[submission.request_id] = operation
+  RUN['visionMatchResult'] = None
+  try:
+    _set_application_status(
+      "VISION PROGRAM MATCHING IN PROGRESS",
+      "Warn.TLabel",
+    )
+  except Exception:
+    logger.exception("Unable to present program vision progress")
+  return True
+
+
+def _drain_program_vision_start_events():
+  while True:
+    try:
+      operation = program_vision_start_queue.get_nowait()
+    except Empty:
+      return True
+    try:
+      _start_program_vision_operation(operation)
+    except Exception as exc:
+      logger.exception("Unable to start a program vision operation")
+      _settle_program_vision_operation(
+        operation,
+        False,
+        normalize_camera_exception_detail(exc),
+      )
+
+
+def _dispatch_program_vision_operation(
+  command,
+  execution_request,
+  completion_callback,
+):
+  operation = ProgramVisionOperation(
+    execution_request,
+    command,
+    completion_callback,
+  )
+  on_tk_thread = threading.get_ident() == application_tk_thread_id
+  if on_tk_thread:
+    if completion_callback is None:
+      raise MotionInputError(
+        "program vision requires asynchronous Tk completion"
+      )
+    started = _start_program_vision_operation(operation)
+    return ROW_EXECUTION_PENDING if started else False
+  if completion_callback is not None:
+    raise MotionInputError(
+      "program vision callback dispatch must originate on Tk"
+    )
+  with application_lifecycle_lock:
+    if application_closing.is_set():
+      operation.settle(False)
+    else:
+      program_vision_start_queue.put(operation)
+  return operation.wait()
 
 
 def _vision_background_grayscale(value):
@@ -22973,52 +30403,6 @@ def _vision_background_grayscale(value):
   )
   grayscale = cv2.cvtColor(rgb_pixel, cv2.COLOR_RGB2GRAY)
   return int(grayscale[0][0])
-
-
-def _average_vision_grayscale_samples(samples):
-  try:
-    sample_values = np.asarray(samples, dtype=np.float64)
-  except (TypeError, ValueError, OverflowError) as exc:
-    raise MotionInputError(
-      "vision grayscale samples must be numeric"
-    ) from exc
-  if (
-    sample_values.ndim != 1
-    or sample_values.size == 0
-    or not np.all(np.isfinite(sample_values))
-    or np.any(sample_values < 0)
-    or np.any(sample_values > 255)
-  ):
-    raise MotionInputError(
-      "vision grayscale samples must contain finite byte values"
-    )
-  return int(np.rint(np.mean(sample_values)))
-
-
-def _average_vision_bgr_samples(samples):
-  try:
-    sample_values = np.asarray(samples, dtype=np.float64)
-  except (TypeError, ValueError, OverflowError) as exc:
-    raise MotionInputError(
-      "vision BGR samples must be numeric"
-    ) from exc
-  if (
-    sample_values.ndim != 2
-    or sample_values.shape[0] == 0
-    or sample_values.shape[1] != 3
-    or not np.all(np.isfinite(sample_values))
-    or np.any(sample_values < 0)
-    or np.any(sample_values > 255)
-  ):
-    raise MotionInputError(
-      "vision BGR samples must contain finite three-channel byte values"
-    )
-  averaged_bgr = tuple(
-    int(component)
-    for component in np.rint(np.mean(sample_values, axis=0))
-  )
-  averaged_rgb = tuple(reversed(averaged_bgr))
-  return averaged_bgr, averaged_rgb
 
 
 def _vision_sample_coordinate(value, label):
@@ -23035,765 +30419,1011 @@ def _vision_sample_coordinate(value, label):
   return int(number)
 
 
-def _validated_vision_sample_pixels(image, points):
-  shape = getattr(image, "shape", None)
-  if (
-    not isinstance(shape, (tuple, list))
-    or len(shape) < 2
-  ):
-    raise MotionInputError("vision sample image has no two-dimensional shape")
-  first_limit = _vision_sample_coordinate(
-    shape[0],
-    "vision image first dimension",
-  )
-  second_limit = _vision_sample_coordinate(
-    shape[1],
-    "vision image second dimension",
-  )
-  if first_limit <= 0 or second_limit <= 0:
-    raise MotionInputError("vision sample image dimensions must be positive")
-  if (
-    isinstance(points, (str, bytes))
-    or not isinstance(points, (tuple, list))
-    or not points
-  ):
-    raise MotionInputError("vision sample points must be a non-empty sequence")
-
-  samples = []
-  for index, point in enumerate(points, start=1):
-    if not isinstance(point, (tuple, list)) or len(point) != 2:
-      raise MotionInputError(
-        f"vision sample point {index} must contain two coordinates"
-      )
-    first = _vision_sample_coordinate(
-      point[0],
-      f"vision sample point {index} first coordinate",
-    )
-    second = _vision_sample_coordinate(
-      point[1],
-      f"vision sample point {index} second coordinate",
-    )
-    if first >= first_limit or second >= second_limit:
-      raise MotionInputError(
-        f"vision sample point {index} is outside the current image"
-      )
-    samples.append(image[first][second])
-  return tuple(samples)
-
-
-def take_pic(background_override=None):
-  # global RUN['selectedCam']
-  #global cap
-  # global RUN['BGavg']
-  # global RUN['mX1']
-  # global RUN['mY1']
-  # global RUN['mX2']
-  # global RUN['mY2']
-
-  try:
-    if(RUN['cam_on']):
-      ret, frame = RUN['cap'].read()
-    else:
-      curVisStingSel = visoptions.get()
-      l = len(camList)
-      for i in range(l):
-        if (visoptions.get() == camList[i]):
-          RUN['selectedCam'] = i
-      RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
-      ret, frame = RUN['cap'].read()
-    if not ret or frame is None:
-      raise MotionInputError("camera did not return a captured frame")
-
-    brightness = int(VisBrightSlide.get())
-    contrast = int(VisContrastSlide.get())
-    CAL['zoom'] = int(VisZoomSlide.get())
-
-    frame = np.int16(frame)
-    frame = frame * (contrast/127+1) - contrast + brightness
-    frame = np.clip(frame, 0, 255)
-    frame = np.uint8(frame) 
-    cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
-    
-
-    #get the webcam size
-    height, width = cv2image.shape
-
-    #prepare the crop
-    centerX,centerY=int(height/2),int(width/2)
-    radiusX,radiusY= int(CAL['zoom']*height/100),int(CAL['zoom']*width/100)
-
-    minX,maxX=centerX-radiusX,centerX+radiusX
-    minY,maxY=centerY-radiusY,centerY+radiusY
-
-    cropped = cv2image[minX:maxX, minY:maxY]
-    cv2image = cv2.resize(cropped, (width, height))
-
-    if background_override is None:
-      auto_background = int(RUN['autoBG'].get())
-      CAL['autoBGVal'] = auto_background
-      manual_background = VisBacColorEntryField.get()
-    elif background_override == "Auto":
-      auto_background = 1
-      manual_background = None
-    else:
-      auto_background = 0
-      manual_background = normalize_vision_background_color(
-        background_override
-      )
-    if(auto_background==1):
-      BG1, BG2, BG3 = _validated_vision_sample_pixels(
-        cv2image,
-        (
-          (VisX1PixEntryField.get(), VisY1PixEntryField.get()),
-          (VisX2PixEntryField.get(), VisY1PixEntryField.get()),
-          (VisX1PixEntryField.get(), VisY2PixEntryField.get()),
-        ),
-      )
-      avg = _average_vision_grayscale_samples((BG1, BG2, BG3))
-      RUN['BGavg'] = (avg,avg,avg) 
-      background = avg
-      VisBacColorEntryField.configure(state='enabled')  
-      VisBacColorEntryField.delete(0, 'end')
-      VisBacColorEntryField.insert(0,str(RUN['BGavg']))
-      VisBacColorEntryField.configure(state='disabled')  
-    else:
-      background = _vision_background_grayscale(
-        manual_background
-      )
-
-    h = cv2image.shape[0]
-    w = cv2image.shape[1]
-    # loop over the image
-    for y in range(0, h):
-      for x in range(0, w):
-        # change the pixel
-        cv2image[y, x] = background if x >= RUN['mX2'] or x <= RUN['mX1'] or y <= RUN['mY1'] or y >= RUN['mY2'] else cv2image[y, x]  
-
-    img = Image.fromarray(cv2image).resize((640,480))
-
-    
-
-    imgtk = ImageTk.PhotoImage(image=img) 
-    vid_lbl.imgtk = imgtk    
-    vid_lbl.configure(image=imgtk) 
-    filename = 'curImage.jpg'
-    if not cv2.imwrite(filename, cv2image):
-      raise OSError("captured vision frame could not be persisted")
-    return True
-  except Exception:
-    logger.exception("Vision capture failed")
-    return False
-
-def mask_pic():
-  # global RUN['selectedCam']
-  #global cap
-  # global RUN['BGavg']
-  # global RUN['mX1']
-  # global RUN['mY1']
-  # global RUN['mX2']
-  # global RUN['mY2']
-
-  if(RUN['cam_on']):
-    ret, frame = RUN['cap'].read()
-  else:
-    curVisStingSel = visoptions.get()
-    l = len(camList)
-    for i in range(l):
-      if (visoptions.get() == camList[i]):
-        RUN['selectedCam'] = i
-    RUN['cap'] = cv2.VideoCapture(RUN['selectedCam']) 
-    ret, frame = RUN['cap'].read()
-  if not ret or frame is None:
-    raise MotionInputError("camera did not return a mask frame")
+def _snapshot_vision_capture_settings(background_override=None):
   brightness = int(VisBrightSlide.get())
   contrast = int(VisContrastSlide.get())
-  CAL['zoom'] = int(VisZoomSlide.get())
-  frame = np.int16(frame)
-  frame = frame * (contrast/127+1) - contrast + brightness
-  frame = np.clip(frame, 0, 255)
-  frame = np.uint8(frame) 
-  cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
-  #get the webcam size
-  height, width = cv2image.shape
-  #prepare the crop
-  centerX,centerY=int(height/2),int(width/2)
-  radiusX,radiusY= int(CAL['zoom']*height/100),int(CAL['zoom']*width/100)
-  minX,maxX=centerX-radiusX,centerX+radiusX
-  minY,maxY=centerY-radiusY,centerY+radiusY
-  cropped = cv2image[minX:maxX, minY:maxY]
-  cv2image = cv2.resize(cropped, (width, height))
-  #img = Image.fromarray(cv2image).resize((640,480))
-  #imgtk = ImageTk.PhotoImage(image=img) 
-  #vid_lbl.imgtk = imgtk    
-  #vid_lbl.configure(image=imgtk) 
-  filename = 'curImage.jpg'
-  if not cv2.imwrite(filename, cv2image):
-    raise OSError("captured mask frame could not be persisted")
+  zoom_percent = int(VisZoomSlide.get())
+  mask_bounds = tuple(
+    _vision_sample_coordinate(RUN[key], label)
+    for key, label in (
+      ('mX1', "vision mask minimum X"),
+      ('mY1', "vision mask minimum Y"),
+      ('mX2', "vision mask maximum X"),
+      ('mY2', "vision mask maximum Y"),
+    )
+  )
+  if background_override is None:
+    auto_background_value = int(RUN['autoBG'].get())
+    if auto_background_value not in (0, 1):
+      raise MotionInputError(
+        "vision automatic-background state must be zero or one"
+      )
+    auto_background = auto_background_value == 1
+    persist_auto_background = True
+    manual_background = VisBacColorEntryField.get()
+  elif background_override == "Auto":
+    auto_background = True
+    persist_auto_background = False
+    manual_background = None
+  else:
+    auto_background = False
+    persist_auto_background = False
+    manual_background = normalize_vision_background_color(
+      background_override
+    )
+  if auto_background:
+    background_grayscale = None
+    sample_points = tuple(
+      (
+        _vision_sample_coordinate(first, first_label),
+        _vision_sample_coordinate(second, second_label),
+      )
+      for first, second, first_label, second_label in (
+        (
+          VisX1PixEntryField.get(),
+          VisY1PixEntryField.get(),
+          "vision background point 1 first coordinate",
+          "vision background point 1 second coordinate",
+        ),
+        (
+          VisX2PixEntryField.get(),
+          VisY1PixEntryField.get(),
+          "vision background point 2 first coordinate",
+          "vision background point 2 second coordinate",
+        ),
+        (
+          VisX1PixEntryField.get(),
+          VisY2PixEntryField.get(),
+          "vision background point 3 first coordinate",
+          "vision background point 3 second coordinate",
+        ),
+      )
+    )
+  else:
+    background_grayscale = _vision_background_grayscale(manual_background)
+    sample_points = ()
+  return VisionCaptureSettings(
+    brightness=brightness,
+    contrast=contrast,
+    zoom_percent=zoom_percent,
+    mask_bounds=mask_bounds,
+    auto_background=auto_background,
+    persist_auto_background=persist_auto_background,
+    background_grayscale=background_grayscale,
+    sample_points=sample_points,
+  )
+
+
+def _vision_binary_option(variable, label):
+  value = int(variable.get())
+  if value not in (0, 1):
+    raise MotionInputError(f"{label} must be zero or one")
+  return value == 1
+
+
+def _snapshot_vision_match_options(template=None, minimum_score=None):
+  if template is None:
+    template = RUN['selectedTemplate'].get()
+  if minimum_score is None:
+    minimum_score = finite_number(
+      VisScoreEntryField.get(),
+      "vision score",
+    ) * 0.01
+  else:
+    minimum_score = finite_number(
+      minimum_score,
+      "vision minimum score",
+    )
+  coordinate_mapping = VisionCoordinateMapping(
+    first_pixel_origin=finite_number(
+      VisX1PixEntryField.get(),
+      "vision first-pixel origin",
+    ),
+    first_robot_origin=finite_number(
+      VisX1RobEntryField.get(),
+      "vision first-robot origin",
+    ),
+    second_pixel_origin=finite_number(
+      VisY1PixEntryField.get(),
+      "vision second-pixel origin",
+    ),
+    second_robot_origin=finite_number(
+      VisY1RobEntryField.get(),
+      "vision second-robot origin",
+    ),
+    first_pixel_end=finite_number(
+      VisX2PixEntryField.get(),
+      "vision first-pixel end",
+    ),
+    first_robot_end=finite_number(
+      VisX2RobEntryField.get(),
+      "vision first-robot end",
+    ),
+    second_pixel_end=finite_number(
+      VisY2PixEntryField.get(),
+      "vision second-pixel end",
+    ),
+    second_robot_end=finite_number(
+      VisY2RobEntryField.get(),
+      "vision second-robot end",
+    ),
+  )
+  return VisionMatchOptions(
+    template_filename=template,
+    minimum_score=minimum_score,
+    full_rotation_search=_vision_binary_option(
+      RUN['fullRot'],
+      "vision full-rotation state",
+    ),
+    pick_closest_180=_vision_binary_option(
+      RUN['pick180'],
+      "vision closest-180 state",
+    ),
+    try_closest_out_of_range=_vision_binary_option(
+      RUN['pickClosest'],
+      "vision out-of-range fallback state",
+    ),
+    joint6_positive_limit=finite_number(
+      CAL['J6PosLim'],
+      "vision J6 positive limit",
+    ),
+    joint6_negative_limit=finite_number(
+      CAL['J6NegLim'],
+      "vision J6 negative limit",
+    ),
+    coordinate_mapping=coordinate_mapping,
+  )
+
+
+def _snapshot_vision_match_settings():
+  return VisionMatchSettings(
+    capture_settings=_snapshot_vision_capture_settings(),
+    match_options=_snapshot_vision_match_options(),
+  )
+
+
+def _vision_capture_cancelled(cancellation_event):
+  if cancellation_event is None:
+    return False
+  is_set = getattr(cancellation_event, "is_set", None)
+  if not callable(is_set):
+    raise MotionInputError(
+      "vision capture cancellation event does not satisfy the event contract"
+    )
+  cancelled = is_set()
+  if not isinstance(cancelled, bool):
+    raise MotionInputError("vision capture cancellation state must be boolean")
+  return cancelled
+
+
+@contextmanager
+def _vision_artifact_operation(context):
+  if (
+    not isinstance(context, str)
+    or not context
+    or context != context.strip()
+    or "\r" in context
+    or "\n" in context
+  ):
+    raise TypeError("vision artifact context must be normalized text")
+  acquired = vision_artifact_lock.acquire(blocking=False)
+  if acquired is not True:
+    raise MotionInputError(
+      f"{context} is unavailable while another vision artifact operation is active"
+    )
+  try:
+    yield
+  finally:
+    vision_artifact_lock.release()
+
+
+def _capture_vision_result_under_artifact_owner(
+  settings,
+  cancellation_event=None,
+):
+  if not isinstance(settings, VisionCaptureSettings):
+    raise MotionInputError("vision capture settings are invalid")
+  if _vision_capture_cancelled(cancellation_event):
+    raise MotionInputError("vision capture was cancelled")
+  frame = _capture_current_vision_frame(cancellation_event)
+  if _vision_capture_cancelled(cancellation_event):
+    raise MotionInputError("vision capture was cancelled")
+  result = prepare_vision_capture_result(frame, settings)
+  if _vision_capture_cancelled(cancellation_event):
+    raise MotionInputError("vision capture was cancelled")
+  if not cv2.imwrite('curImage.jpg', result.image):
+    raise OSError("captured vision frame could not be persisted")
+  return result
+
+
+def _perform_vision_capture(settings, cancellation_event=None):
+  with _vision_artifact_operation("vision capture"):
+    return _capture_vision_result_under_artifact_owner(
+      settings,
+      cancellation_event,
+    )
+
+
+def _perform_vision_match(settings, cancellation_event=None):
+  if not isinstance(settings, VisionMatchSettings):
+    raise MotionInputError("vision match settings are invalid")
+  with _vision_artifact_operation("vision capture and matching"):
+    capture_result = _capture_vision_result_under_artifact_owner(
+      settings.capture_settings,
+      cancellation_event,
+    )
+    template = load_bounded_vision_image(
+      settings.match_options.template_filename,
+      cv2.IMREAD_GRAYSCALE,
+      "vision template",
+    )
+    match_result = prepare_vision_match_result(
+      capture_result.image,
+      template,
+      capture_result.background_grayscale,
+      settings.match_options,
+      cancellation_event,
+    )
+    if _vision_capture_cancelled(cancellation_event):
+      raise MotionInputError("vision matching was cancelled")
+    if not cv2.imwrite('temp.jpg', match_result.annotated_image):
+      raise OSError("vision result frame could not be persisted")
+    return VisionMatchOperationResult(
+      capture_result=capture_result,
+      match_result=match_result,
+      match_options=settings.match_options,
+    )
+
+
+def _perform_vision_selection(settings, cancellation_event=None):
+  if not isinstance(settings, VisionSelectionSettings):
+    raise MotionInputError("vision selection settings are invalid")
+  if _vision_capture_cancelled(cancellation_event):
+    raise MotionInputError(
+      f"vision {settings.kind} selection was cancelled"
+    )
+  with _vision_artifact_operation(f"vision {settings.kind} selection"):
+    if settings.kind == "mask":
+      frame = _capture_current_vision_frame(cancellation_event)
+      if _vision_capture_cancelled(cancellation_event):
+        raise MotionInputError("vision mask selection was cancelled")
+      selection_image = prepare_vision_selection_image(
+        frame,
+        settings.capture_settings,
+      )
+      bounds = select_vision_region(
+        selection_image,
+        "AR4 Vision Mask",
+        cancellation_event,
+      )
+      result = prepare_vision_mask_selection_result(
+        frame,
+        settings,
+        bounds,
+      )
+      if _vision_capture_cancelled(cancellation_event):
+        raise MotionInputError("vision mask selection was cancelled")
+      if not cv2.imwrite('curImage.jpg', result.capture_result.image):
+        raise OSError("masked vision frame could not be persisted")
+      return result
+
+    image = load_bounded_vision_image(
+      'curImage.jpg',
+      cv2.IMREAD_COLOR,
+      "captured template frame",
+    )
+    bounds = select_vision_region(
+      image,
+      "AR4 Vision Template",
+      cancellation_event,
+    )
+    visual_options = tuple(sorted(set(
+      _startup_visual_options() + (settings.template_filename,)
+    )))
+    result = prepare_vision_template_selection_result(
+      image,
+      settings,
+      bounds,
+      visual_options,
+    )
+    if _vision_capture_cancelled(cancellation_event):
+      raise MotionInputError("vision template selection was cancelled")
+    if not cv2.imwrite(settings.template_filename, result.template_image):
+      raise OSError("vision template could not be persisted")
+    return result
+
+
+vision_capture_worker = VisionOperationWorker(
+  _perform_vision_capture,
+  VisionCaptureSettings,
+  VisionCaptureResult,
+  "vision capture",
+  "ar4-vision-capture",
+)
+
+
+vision_match_worker = VisionOperationWorker(
+  _perform_vision_match,
+  VisionMatchSettings,
+  VisionMatchOperationResult,
+  "vision matching",
+  "ar4-vision-match",
+  coalesce=False,
+)
+
+
+vision_selection_worker = VisionOperationWorker(
+  _perform_vision_selection,
+  VisionSelectionSettings,
+  VisionSelectionResult,
+  "vision selection",
+  "ar4-vision-selection",
+  coalesce=False,
+)
+
+
+def _apply_vision_capture_state(result):
+  if not isinstance(result, VisionCaptureResult):
+    raise MotionInputError("vision capture supplied an invalid result")
+  CAL['zoom'] = result.zoom_percent
+  if result.persist_auto_background:
+    CAL['autoBGVal'] = int(result.auto_background)
+  if result.auto_background:
+    RUN['BGavg'] = result.auto_background_rgb
+    VisBacColorEntryField.configure(state='enabled')
+    VisBacColorEntryField.delete(0, 'end')
+    VisBacColorEntryField.insert(0, str(RUN['BGavg']))
+    VisBacColorEntryField.configure(state='disabled')
   return True
 
-  
+
+def _apply_vision_capture_result(result):
+  _apply_vision_capture_state(result)
+  img = Image.fromarray(result.display_image)
+  imgtk = ImageTk.PhotoImage(image=img)
+  vid_lbl.imgtk = imgtk
+  vid_lbl.configure(image=imgtk)
+  return True
 
 
-
-def _mask_crop(event, x, y, flags, param):
-    # global RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'], RUN['cropping']
-    #global oriImage
-    # global RUN['box_points']
-    # global RUN['button_down']
-    # global RUN['mX1']
-    # global RUN['mY1']
-    # global RUN['mX2']
-    # global RUN['mY2']
+def _replace_vision_result_field(field, value):
+  field.delete(0, 'end')
+  field.insert(0, value)
+  return True
 
 
-    cropDone = False
-    
+def _apply_vision_match_presentation(result, options):
+  if not isinstance(result, VisionMatchResult):
+    raise MotionInputError("vision matching supplied an invalid result")
+  if not isinstance(options, VisionMatchOptions):
+    raise MotionInputError("vision match options are invalid")
+  CAL['fullRotVal'] = int(options.full_rotation_search)
+  CAL['pick180Val'] = int(options.pick_closest_180)
+  CAL['pickClosestVal'] = int(options.try_closest_out_of_range)
+  image = Image.fromarray(result.display_image)
+  imgtk = ImageTk.PhotoImage(image=image)
+  vid_lbl.imgtk = imgtk
+  vid_lbl.configure(image=imgtk)
+  _replace_vision_result_field(
+    VisRetScoreEntryField,
+    str(round(result.score * 100, 2)),
+  )
+  if not result.matched:
+    for field in (
+      VisRetAngleEntryField,
+      VisRetXpixEntryField,
+      VisRetYpixEntryField,
+      VisRetXrobEntryField,
+      VisRetYrobEntryField,
+    ):
+      _replace_vision_result_field(field, "NA")
+    RUN['xMMpos'] = None
+    RUN['yMMpos'] = None
+    RUN['visionMatchResult'] = None
+    return "fail"
 
-    if (not RUN['button_down']) and (event == cv2.EVENT_LBUTTONDOWN):
-        RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = x, y, x, y
-        RUN['cropping'] = True
-        RUN['button_down'] = True
-        RUN['box_points'] = [(x, y)]
-        
-    # Mouse is Moving
-    elif (RUN['button_down']) and (event == cv2.EVENT_MOUSEMOVE):
-        if RUN['cropping']:
-            image_copy = RUN['oriImage'].copy()
-            RUN['x_end'], RUN['y_end'] = x, y
-            point = (x, y)
-            cv2.rectangle(image_copy, RUN['box_points'][0], point, (0, 255, 0), 2)
-            cv2.imshow("image", image_copy)
+  first_pixel, second_pixel = result.pixel_position
+  first_robot, second_robot = result.robot_position
+  RUN['xMMpos'] = first_robot
+  RUN['yMMpos'] = second_robot
+  for field, value in (
+    (VisRetAngleEntryField, result.angle_degrees),
+    (VisRetXpixEntryField, first_pixel),
+    (VisRetYpixEntryField, second_pixel),
+    (VisRetXrobEntryField, round(first_robot, 2)),
+    (VisRetYrobEntryField, round(second_robot, 2)),
+  ):
+    _replace_vision_result_field(field, str(value))
+  RUN['visionMatchResult'] = result
+  return "pass"
 
-    # if the left mouse button was released
-    elif event == cv2.EVENT_LBUTTONUP:
-        RUN['button_down'] = False
-        RUN['box_points'].append((x, y))
-        cv2.rectangle(RUN['oriImage'], RUN['box_points'][0], RUN['box_points'][1], (0, 255, 0), 2)
-        cv2.imshow("image", RUN['oriImage'])
-        # record the ending (x, y) coordinates
-        RUN['x_end'], RUN['y_end'] = x, y
-        RUN['cropping'] = False # cropping is finished
 
-        RUN['mX1'] = RUN['x_start']+3
-        RUN['mY1'] = RUN['y_start']+3
-        RUN['mX2'] = RUN['x_end']-3
-        RUN['mY2'] = RUN['y_end']-3
+def _apply_vision_match_operation_result(result):
+  if not isinstance(result, VisionMatchOperationResult):
+    raise MotionInputError("vision matching supplied an invalid operation result")
+  _apply_vision_capture_state(result.capture_result)
+  return _apply_vision_match_presentation(
+    result.match_result,
+    result.match_options,
+  )
 
-        CAL['autoBGVal'] = int(RUN['autoBG'].get())
-        if(CAL['autoBGVal']==1):
-          BG1, BG2, BG3 = _validated_vision_sample_pixels(
-            RUN['oriImage'],
-            (
-              (VisX1PixEntryField.get(), VisY1PixEntryField.get()),
-              (VisX1PixEntryField.get(), VisY2PixEntryField.get()),
-              (VisX2PixEntryField.get(), VisY2PixEntryField.get()),
-            ),
-          )
-          background, canonical_rgb = _average_vision_bgr_samples(
-            (BG1, BG2, BG3)
-          )
-          RUN['BGavg'] = canonical_rgb
-          VisBacColorEntryField.configure(state='enabled')  
-          VisBacColorEntryField.delete(0, 'end')
-          VisBacColorEntryField.insert(0,str(RUN['BGavg']))
-          VisBacColorEntryField.configure(state='disabled')   
-        else:  
-          background = _vision_background_bgr(
-            VisBacColorEntryField.get()
-          )
 
-        h = RUN['oriImage'].shape[0]
-        w = RUN['oriImage'].shape[1]
-        # loop over the image
-        for y in range(0, h):
-            for x in range(0, w):
-                # change the pixel
-                RUN['oriImage'][y, x] = background if x >= RUN['mX2'] or x <= RUN['mX1'] or y <= RUN['mY1'] or y >= RUN['mY2'] else RUN['oriImage'][y, x]
+def _apply_vision_match_event(event):
+  if not isinstance(event, VisionOperationEvent):
+    raise RuntimeError("vision matching worker emitted an invalid event")
+  with vision_match_request_lock:
+    request_id = RUN.get('visionMatchRequestId')
+    current = request_id == event.request_id
+    if current:
+      RUN['visionMatchRequestId'] = None
+  if not current:
+    if event.error_detail is not None:
+      logger.error(
+        "Vision match request %s failed after ownership changed: %s",
+        event.request_id,
+        event.error_detail,
+      )
+    else:
+      logger.warning(
+        "Ignoring vision match request %s after ownership changed",
+        event.request_id,
+      )
+    return False
+  if event.error_detail is not None:
+    RUN['visionMatchResult'] = None
+    message = f"VISION MATCHING FAILED: {event.error_detail}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  status = _apply_vision_match_operation_result(event.result)
+  if status == "pass":
+    _set_application_status("VISION MATCH PASSED", "OK.TLabel")
+  elif status == "fail":
+    _set_application_status("VISION MATCH FAILED", "Warn.TLabel")
+  else:
+    raise RuntimeError("vision matching returned an invalid result")
+  return True
 
-        display_image = cv2.cvtColor(
-            RUN['oriImage'],
-            cv2.COLOR_BGR2RGB,
+
+def _apply_program_vision_match_event(operation, event):
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError(
+      "program vision commitment must run on the Tk event thread"
+    )
+  if not isinstance(operation, ProgramVisionOperation):
+    raise RuntimeError("program vision worker has no valid operation owner")
+  if not isinstance(event, VisionOperationEvent):
+    raise RuntimeError("program vision worker emitted an invalid event")
+  if operation.worker_request_id != event.request_id:
+    raise RuntimeError("program vision worker request ownership changed")
+  if not _program_execution_request_active(operation.execution_request):
+    logger.warning("Ignoring a stale program vision result")
+    return False
+  if _program_execution_request_cancelled(operation.execution_request):
+    logger.warning(
+      "Discarding a program vision result after request cancellation"
+    )
+    return False
+  if event.error_detail is not None:
+    raise MotionInputError(event.error_detail)
+  if not isinstance(event.result, VisionMatchOperationResult):
+    raise MotionInputError("program vision returned an invalid result")
+
+  expected_status = "pass" if event.result.match_result.matched else "fail"
+  selected_tab = (
+    operation.command.pass_tab
+    if expected_status == "pass"
+    else operation.command.fail_tab
+  )
+  program_rows = operation.program_rows
+  if program_rows is None:
+    raise RuntimeError("program vision has no program-row snapshot")
+  try:
+    index = _program_tab_row_index(
+      program_rows,
+      selected_tab,
+    )
+  except MotionInputError as exc:
+    raise MotionInputError(
+      f"vision result tab {selected_tab} does not exist"
+    ) from exc
+  if _program_execution_request_cancelled(operation.execution_request):
+    logger.warning(
+      "Discarding a program vision result cancelled before commitment"
+    )
+    return False
+  if tuple(tab1.progView.get(0, "end")) != program_rows:
+    raise MotionInputError(
+      "robot program changed during the vision operation"
+    )
+
+  status = _apply_vision_match_operation_result(event.result)
+  if status != expected_status:
+    raise RuntimeError("program vision returned an inconsistent result")
+  tab1.progView.selection_clear(0, END)
+  tab1.progView.select_set(index)
+  if tuple(tab1.progView.curselection()) != (index,):
+    raise RuntimeError("program vision could not select the result tab")
+  if status == "pass":
+    _set_application_status("VISION PROGRAM MATCH PASSED", "OK.TLabel")
+  else:
+    _set_application_status("VISION PROGRAM MATCH FAILED", "Warn.TLabel")
+  return True
+
+
+def _drain_vision_match_events():
+  drain_state = vision_match_worker.drain_events_state()
+  if not isinstance(drain_state, VisionOperationDrainState):
+    raise RuntimeError("vision matching worker returned an invalid drain state")
+  for event in drain_state.events:
+    if not isinstance(event, VisionOperationEvent):
+      with program_vision_operation_lock:
+        orphaned_operations = tuple(program_vision_operations.values())
+        program_vision_operations.clear()
+      with vision_match_request_lock:
+        manual_request_pending = RUN.get('visionMatchRequestId') is not None
+        RUN['visionMatchRequestId'] = None
+      for operation in orphaned_operations:
+        _settle_program_vision_operation(
+          operation,
+          False,
+          "vision matching worker emitted an invalid event",
         )
-        img = Image.fromarray(display_image)
-        imgtk = ImageTk.PhotoImage(image=img) 
-        vid_lbl.imgtk = imgtk    
-        vid_lbl.configure(image=imgtk) 
-        filename = 'curImage.jpg'
-        if not cv2.imwrite(filename, RUN['oriImage']):
-            raise OSError("masked vision frame could not be persisted")
-        cv2.destroyAllWindows()
+      logger.error("Vision matching worker emitted an invalid event")
+      RUN['visionMatchResult'] = None
+      if manual_request_pending:
+        _set_application_status(
+          "VISION MATCH RESULT FAILED",
+          "Alarm.TLabel",
+        )
+      continue
+    with program_vision_operation_lock:
+      operation = program_vision_operations.pop(event.request_id, None)
+      retired = event.request_id in program_vision_retired_request_ids
+      if retired:
+        program_vision_retired_request_ids.discard(event.request_id)
+    if operation is None:
+      if retired:
+        if event.error_detail is None:
+          logger.warning(
+            "Discarding retired program vision request %s result after "
+            "shutdown settlement",
+            event.request_id,
+          )
+        else:
+          logger.warning(
+            "Discarding retired program vision request %s failure after "
+            "shutdown settlement: %s",
+            event.request_id,
+            event.error_detail,
+          )
+        continue
+      try:
+        _apply_vision_match_event(event)
+      except Exception:
+        RUN['visionMatchResult'] = None
+        logger.exception("Unable to apply a vision match result")
+        _set_application_status(
+          "VISION MATCH RESULT FAILED",
+          "Alarm.TLabel",
+        )
+      continue
+
+    succeeded = False
+    error_detail = None
+    try:
+      succeeded = _apply_program_vision_match_event(operation, event)
+    except Exception as exc:
+      RUN['visionMatchResult'] = None
+      error_detail = normalize_camera_exception_detail(exc)
+      logger.exception("Unable to apply a program vision result")
+    try:
+      _settle_program_vision_operation(
+        operation,
+        succeeded,
+        error_detail,
+      )
+    except Exception:
+      logger.exception("Unable to settle a program vision result")
+  owned_request_ids = {
+    request_id
+    for request_id in (
+      drain_state.active_request_id,
+      drain_state.pending_request_id,
+    )
+    if request_id is not None
+  }
+  with program_vision_operation_lock:
+    orphaned_operations = tuple(
+      program_vision_operations.pop(request_id)
+      for request_id in tuple(program_vision_operations)
+      if request_id not in owned_request_ids
+    )
+  if orphaned_operations:
+    for operation in orphaned_operations:
+      try:
+        _settle_program_vision_operation(
+          operation,
+          False,
+          "vision matching worker lost request ownership without a "
+          "terminal event",
+        )
+      except Exception:
+        logger.exception("Unable to settle an orphaned program vision result")
+  return True
+
+
+def _apply_vision_capture_event(event):
+  if not isinstance(event, VisionOperationEvent):
+    raise RuntimeError("vision capture worker emitted an invalid event")
+  with vision_capture_request_lock:
+    request_id = RUN.get('visionCaptureRequestId')
+    current = request_id == event.request_id
+    if current:
+      RUN['visionCaptureRequestId'] = None
+  if not current:
+    if event.error_detail is not None:
+      logger.error(
+        "Vision capture request %s failed after ownership changed: %s",
+        event.request_id,
+        event.error_detail,
+      )
+    else:
+      _apply_vision_capture_result(event.result)
+    return False
+  if event.error_detail is not None:
+    message = f"VISION CAPTURE FAILED: {event.error_detail}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  _apply_vision_capture_result(event.result)
+  _set_application_status("VISION CAPTURE COMPLETE", "OK.TLabel")
+  return True
+
+
+def _drain_vision_capture_events():
+  for event in vision_capture_worker.drain_events():
+    try:
+      _apply_vision_capture_event(event)
+    except Exception:
+      logger.exception("Unable to apply a vision capture result")
+      _set_application_status(
+        "VISION CAPTURE RESULT FAILED",
+        "Alarm.TLabel",
+      )
+  return True
+
+
+def request_vision_capture(background_override=None):
+  try:
+    if application_closing.is_set():
+      raise MotionInputError("application shutdown is active")
+    settings = _snapshot_vision_capture_settings(background_override)
+    submission = vision_capture_worker.submit(settings)
+    if not isinstance(submission, VisionOperationSubmission):
+      raise RuntimeError("vision capture returned an invalid submission")
+    with vision_capture_request_lock:
+      RUN['visionCaptureRequestId'] = submission.request_id
+    message = (
+      "VISION CAPTURE QUEUED"
+      if submission.coalesced
+      else "VISION CAPTURE IN PROGRESS"
+    )
+    _set_application_status(message, "Warn.TLabel")
+    return True
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"VISION CAPTURE REJECTED: {detail}"
+    logger.exception(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+
+
+def request_vision_match():
+  try:
+    if application_closing.is_set():
+      raise MotionInputError("application shutdown is active")
+    with vision_match_request_lock:
+      request_id = RUN.get('visionMatchRequestId')
+      if request_id is not None:
+        if (
+          isinstance(request_id, bool)
+          or not isinstance(request_id, int)
+          or request_id < 0
+        ):
+          raise MotionInputError("vision matching has an invalid request owner")
+        raise MotionInputError("vision matching is already active")
+      settings = _snapshot_vision_match_settings()
+      submission = vision_match_worker.submit(
+        settings,
+        application_closing,
+      )
+      if not isinstance(submission, VisionOperationSubmission):
+        raise RuntimeError("vision matching returned an invalid submission")
+      if submission.coalesced:
+        raise RuntimeError("vision matching unexpectedly coalesced a request")
+      RUN['visionMatchRequestId'] = submission.request_id
+      RUN['visionMatchResult'] = None
+    _set_application_status(
+      "VISION MATCHING IN PROGRESS",
+      "Warn.TLabel",
+    )
+    return True
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"VISION MATCHING REJECTED: {detail}"
+    logger.exception(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+
+
+def _capture_current_vision_frame(cancellation_event=None):
+  with camera_preview_request_lock:
+    request_id = RUN.get('cameraPreviewRequestId')
+    valid_request_id = (
+      isinstance(request_id, int)
+      and not isinstance(request_id, bool)
+      and request_id >= 0
+    )
+    frame = (
+      camera_preview_worker.snapshot_raw_frame(request_id)
+      if valid_request_id
+      else None
+    )
+    camera_on = RUN.get('cam_on') is True
+  if frame is not None:
+    return frame
+  if camera_on:
+    if not valid_request_id:
+      raise MotionInputError("camera preview has no valid request owner")
+    raise MotionInputError("camera preview has no captured frame")
+  if valid_request_id:
+    transitional_frame = camera_preview_worker.wait_snapshot_or_stopped(
+      request_id,
+      CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+      cancellation_event,
+    )
+    if transitional_frame is not None:
+      return transitional_frame
+    with camera_preview_request_lock:
+      current_request_id = RUN.get('cameraPreviewRequestId')
+      if current_request_id == request_id:
+        RUN['cameraPreviewRequestId'] = None
+        RUN['cam_on'] = False
+      elif current_request_id is not None:
+        raise MotionInputError(
+          "camera preview ownership changed during vision capture"
+        )
+  camera_active = camera_preview_worker.active
+  if not isinstance(camera_active, bool):
+    raise RuntimeError("camera preview returned an invalid active state")
+  if camera_active:
+    settled = camera_preview_worker.wait_stopped(
+      CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+      cancellation_event,
+    )
+    if not isinstance(settled, bool):
+      raise RuntimeError("camera preview returned an invalid stop result")
+    if not settled:
+      if _vision_capture_cancelled(cancellation_event):
+        raise MotionInputError("vision capture was cancelled")
+      raise MotionInputError("camera capture did not stop before timeout")
+  camera_fault = camera_preview_worker.fault_reason
+  if camera_fault is not None:
+    if (
+      not isinstance(camera_fault, str)
+      or not camera_fault
+      or camera_fault != camera_fault.strip()
+    ):
+      raise RuntimeError("camera preview returned an invalid fault state")
+    raise MotionInputError(
+      "camera preview cleanup requires an application restart: "
+      + camera_fault
+    )
+
+  camera_source = _cached_vision_camera_source()
+  return camera_preview_worker.capture_once(
+    camera_source,
+    CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS,
+    cancellation_event,
+  )
+
+
+def _vision_selection_owner_locked():
+  request_id = RUN.get('visionSelectionRequestId')
+  selection_kind = RUN.get('visionSelectionKind')
+  if request_id is not None and (
+    isinstance(request_id, bool)
+    or not isinstance(request_id, int)
+    or request_id < 0
+  ):
+    raise RuntimeError("vision selection owner is invalid")
+  if selection_kind is not None and selection_kind not in (
+    "mask",
+    "template",
+  ):
+    raise RuntimeError("vision selection owner kind is invalid")
+  if (request_id is None) != (selection_kind is None):
+    raise RuntimeError("vision selection ownership is incomplete")
+  return request_id, selection_kind
+
+
+def _request_vision_selection(settings):
+  label = "UNKNOWN"
+  try:
+    if not isinstance(settings, VisionSelectionSettings):
+      raise MotionInputError("vision selection settings are invalid")
+    label = settings.kind.upper()
+    if application_closing.is_set():
+      raise MotionInputError("application shutdown is active")
+    with vision_selection_request_lock:
+      request_id, _ = _vision_selection_owner_locked()
+      if request_id is not None:
+        raise MotionInputError("vision selection is already active")
+      submission = vision_selection_worker.submit(
+        settings,
+        application_closing,
+      )
+      if not isinstance(submission, VisionOperationSubmission):
+        raise RuntimeError("vision selection returned an invalid submission")
+      if submission.coalesced:
+        raise RuntimeError("vision selection unexpectedly coalesced a request")
+      RUN['visionSelectionRequestId'] = submission.request_id
+      RUN['visionSelectionKind'] = settings.kind
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"VISION {label} SELECTION REJECTED: {detail}"
+    logger.exception(message)
+    try:
+      _set_application_status(message, "Alarm.TLabel")
+    except Exception:
+      logger.exception("Unable to present a vision selection rejection")
+    return False
+  try:
+    _set_application_status(
+      f"VISION {label} SELECTION IN PROGRESS",
+      "Warn.TLabel",
+    )
+  except Exception:
+    logger.exception("Unable to present vision selection progress")
+  return True
+
+
+def _apply_vision_selection_result(result):
+  if not isinstance(result, VisionSelectionResult):
+    raise MotionInputError("vision selection supplied an invalid result")
+  if result.kind == "mask":
+    (
+      RUN['mX1'],
+      RUN['mY1'],
+      RUN['mX2'],
+      RUN['mY2'],
+    ) = result.mask_bounds
+    _apply_vision_capture_result(result.capture_result)
     return True
 
+  updateVisOp(result.visual_options)
+  RUN['selectedTemplate'].set(result.template_filename)
+  image = Image.fromarray(result.template_preview)
+  imgtk = ImageTk.PhotoImage(image=image)
+  template_lbl.imgtk = imgtk
+  template_lbl.configure(image=imgtk, anchor='center')
+  return True
 
-def mask_crop(event, x, y, flags, param):
+
+def _apply_vision_selection_event(event):
+  if not isinstance(event, VisionOperationEvent):
+    raise RuntimeError("vision selection worker emitted an invalid event")
+  with vision_selection_request_lock:
+    request_id, selection_kind = _vision_selection_owner_locked()
+    current = request_id == event.request_id
+    if current:
+      RUN['visionSelectionRequestId'] = None
+      RUN['visionSelectionKind'] = None
+  if not current:
+    detail = (
+      f": {event.error_detail}"
+      if event.error_detail is not None
+      else ""
+    )
+    logger.warning(
+      "Ignoring stale vision selection request %s%s",
+      event.request_id,
+      detail,
+    )
+    return False
+  if event.error_detail is not None:
+    message = (
+      f"VISION {selection_kind.upper()} SELECTION FAILED: "
+      f"{event.error_detail}"
+    )
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  if (
+    not isinstance(event.result, VisionSelectionResult)
+    or event.result.kind != selection_kind
+  ):
+    raise RuntimeError("vision selection result ownership changed")
+  _apply_vision_selection_result(event.result)
+  _set_application_status(
+    f"VISION {selection_kind.upper()} SELECTION COMPLETE",
+    "OK.TLabel",
+  )
+  return True
+
+
+def _drain_vision_selection_events():
+  for event in vision_selection_worker.drain_events():
     try:
-        return _mask_crop(event, x, y, flags, param)
+      _apply_vision_selection_event(event)
     except Exception:
-        logger.exception("Vision mask processing failed")
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            logger.exception("Unable to close vision mask windows")
-        return False
+      logger.exception("Unable to apply a vision selection result")
+      _set_application_status(
+        "VISION SELECTION RESULT FAILED",
+        "Alarm.TLabel",
+      )
+  return True
 
 
 def selectMask():
   try:
-    RUN['button_down'] = False
-    RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
-    if mask_pic() is not True:
-      raise MotionInputError("vision mask capture failed")
-
-    image = cv2.imread('curImage.jpg')
-    if image is None:
-      raise MotionInputError("captured mask frame could not be reloaded")
-    RUN['oriImage'] = image.copy()
-
-    cv2.namedWindow("image")
-    cv2.setMouseCallback("image", mask_crop)
-    cv2.imshow("image", image)
-    return True
-  except Exception:
-    logger.exception("Vision mask selection failed")
-    try:
-      cv2.destroyAllWindows()
-    except Exception:
-      logger.exception("Unable to close vision mask windows")
+    settings = VisionSelectionSettings(
+      kind="mask",
+      capture_settings=_snapshot_vision_capture_settings(),
+    )
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"VISION MASK SELECTION REJECTED: {detail}"
+    logger.exception(message)
+    _set_application_status(message, "Alarm.TLabel")
     return False
+  return _request_vision_selection(settings)
 
 
-
-def mouse_crop(event, x, y, flags, param):
-    # global RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'], RUN['cropping']
-    #global oriImage
-    # global RUN['box_points']
-    # global RUN['button_down']
-
-    cropDone = False
-    
-
-    if (not RUN['button_down']) and (event == cv2.EVENT_LBUTTONDOWN):
-        RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = x, y, x, y
-        RUN['cropping'] = True
-        RUN['button_down'] = True
-        RUN['box_points'] = [(x, y)]
-        
-    # Mouse is Moving
-    elif (RUN['button_down']) and (event == cv2.EVENT_MOUSEMOVE):
-        if RUN['cropping']:
-            image_copy = RUN['oriImage'].copy()
-            RUN['x_end'], RUN['y_end'] = x, y
-            point = (x, y)
-            cv2.rectangle(image_copy, RUN['box_points'][0], point, (0, 255, 0), 2)
-            cv2.imshow("image", image_copy)
-
-    # if the left mouse button was released
-    elif event == cv2.EVENT_LBUTTONUP:
-        RUN['button_down'] = False
-        RUN['box_points'].append((x, y))
-        cv2.rectangle(RUN['oriImage'], RUN['box_points'][0], RUN['box_points'][1], (0, 255, 0), 2)
-        cv2.imshow("image", RUN['oriImage'])
-        # record the ending (x, y) coordinates
-        RUN['x_end'], RUN['y_end'] = x, y
-        RUN['cropping'] = False # cropping is finished
-
-        refPoint = [(RUN['x_start']+3, RUN['y_start']+3), (RUN['x_end']-3, RUN['y_end']-3)]
-
-        if len(refPoint) == 2: #when two points were found
-            roi = RUN['oriImage'][refPoint[0][1]:refPoint[1][1], refPoint[0][0]:refPoint[1][0]]
-            
-            cv2.imshow("Cropped", roi)
-            USER_INP = simpledialog.askstring(title="Teach Vision Object",
-                                  prompt="Save Object As:")
-            templateName = USER_INP+".jpg"                      
-            cv2.imwrite(templateName, roi)
-            cv2.destroyAllWindows()
-            updateVisOp()  
 
 
 
 def selectTemplate():
-  #global oriImage
-  # global RUN['button_down']
-  RUN['button_down'] = False
-  RUN['x_start'], RUN['y_start'], RUN['x_end'], RUN['y_end'] = 0, 0, 0, 0
-  image = cv2.imread('curImage.jpg')
-  RUN['oriImage'] = image.copy()
-  
-  cv2.namedWindow("image")
-  cv2.setMouseCallback("image", mouse_crop)
-  cv2.imshow("image", image)
+  try:
+    template_name = simpledialog.askstring(
+      title="Teach Vision Object",
+      prompt="Save Object As:",
+    )
+    if template_name is None:
+      _set_application_status(
+        "VISION TEMPLATE SELECTION CANCELLED",
+        "Warn.TLabel",
+      )
+      return False
+    if (
+      not isinstance(template_name, str)
+      or not template_name
+      or template_name != template_name.strip()
+    ):
+      raise MotionInputError("vision template name is invalid")
+    settings = VisionSelectionSettings(
+      kind="template",
+      template_filename=template_name + ".jpg",
+    )
+  except Exception as exc:
+    detail = normalize_camera_exception_detail(exc)
+    message = f"VISION TEMPLATE SELECTION REJECTED: {detail}"
+    logger.exception(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+  return _request_vision_selection(settings)
+
+
 
 
 
 
 def snapFind():
-  # global RUN['selectedTemplate']
-  # global RUN['BGavg']
-  try:
-    if take_pic() is not True:
-      return False
-    template = RUN['selectedTemplate'].get()
-    min_score = float(VisScoreEntryField.get())*.01
-    CAL['autoBGVal'] = int(RUN['autoBG'].get())
-    if(CAL['autoBGVal']==1):
-      background = _vision_background_grayscale(RUN['BGavg'])
-      VisBacColorEntryField.configure(state='enabled')
-      VisBacColorEntryField.delete(0, 'end')
-      VisBacColorEntryField.insert(0,str(RUN['BGavg']))
-      VisBacColorEntryField.configure(state='disabled')
-    else:
-      background = _vision_background_grayscale(
-        VisBacColorEntryField.get()
-      )
-    return visFind(template,min_score,background)
-  except Exception:
-    logger.exception("Vision matching failed")
-    return False
-
-
-
-
-def rotate_image(img,angle,background):
-    image_center = tuple(np.array(img.shape[1::-1]) / 2)
-    rot_mat = cv2.getRotationMatrix2D(image_center, -angle, 1.0)
-    result = cv2.warpAffine(img, rot_mat, img.shape[1::-1],borderMode=cv2.BORDER_CONSTANT, borderValue=background, flags=cv2.INTER_LINEAR)
-    return result
-
-
-def _vision_match_maximum(result):
-    _, maximum, _, location = cv2.minMaxLoc(result)
-    maximum = finite_number(maximum, "vision template score")
-    if maximum < -1 or maximum > 1:
-        raise MotionInputError(
-            "vision template score must be between -1 and 1"
-        )
-    return maximum, location
-
-
-def visFind(template,min_score,background):
-    # global RUN['xMMpos']
-    # global RUN['yMMpos']
-    #global autoBG
-
-    green = (0,255,0)
-    red = (0,0,255)
-    blue = (0,0,255)
-    dkgreen = (0,128,0)
-    status = "fail"
-    highscore = -math.inf
-    min_score = finite_number(min_score, "vision minimum score")
-    if min_score < 0 or min_score > 1:
-      raise MotionInputError(
-        "vision minimum score must be between 0 and 1"
-      )
-    background = _average_vision_grayscale_samples((background,))
-    img1 = cv2.imread('curImage.jpg', cv2.IMREAD_GRAYSCALE)
-    if img1 is None:
-      raise MotionInputError("captured vision frame could not be loaded")
-    img2 = cv2.imread(template, cv2.IMREAD_GRAYSCALE)
-    if img2 is None:
-      raise MotionInputError("vision template could not be loaded")
-    if img2.shape[0] > img1.shape[0] or img2.shape[1] > img1.shape[1]:
-      raise MotionInputError(
-        "vision template must not exceed the captured frame dimensions"
-      )
-    
-    #method = cv2.TM_CCOEFF_NORMED
-    #method = cv2.TM_CCORR_NORMED
-
-    img = img1.copy()
-
-    CAL['fullRotVal'] = int(RUN['fullRot'].get())
-
-    for i in range (1):
-      if(i==0):
-        method = cv2.TM_CCOEFF_NORMED
-      else:
-        #method = cv2.TM_CCOEFF_NORMED
-        method = cv2.TM_CCORR_NORMED  
-
-      #USE 1/3 - EACH SIDE SEARCH
-      if (CAL['fullRotVal'] == 0): 
-        ## fist pass 1/3rds
-        curangle = 0
-        highangle = 0
-        highscore = -math.inf
-        highmax_loc = (0, 0)
-        for x in range(3):
-          template = img2
-          template = rotate_image(img2,curangle,background)
-          w, h = template.shape[1::-1]
-          res = cv2.matchTemplate(img,template,method)
-          max_val, max_loc = _vision_match_maximum(res)
-          if(max_val>highscore):
-            highscore=max_val
-            highangle=curangle
-            highmax_loc=max_loc
-            highw,highh = w,h
-          curangle += 120
-        
-        #check each side and narrow in
-        while True:
-          curangle=curangle/2
-          if(curangle<.9):
-            break
-          nextangle1 = highangle+curangle
-          nextangle2 = highangle-curangle
-          template = img2
-          template = rotate_image(img2,nextangle1,background)
-          w, h = template.shape[1::-1]
-          res = cv2.matchTemplate(img,template,method)
-          max_val, max_loc = _vision_match_maximum(res)
-          if(max_val>highscore):
-            highscore=max_val
-            highangle=nextangle1
-            highmax_loc=max_loc
-            highw,highh = w,h
-          template = img2
-          template = rotate_image(img2,nextangle2,background)
-          w, h = template.shape[1::-1]
-          res = cv2.matchTemplate(img,template,method)
-          max_val, max_loc = _vision_match_maximum(res)
-          if(max_val>highscore):
-            highscore=max_val
-            highangle=nextangle2
-            highmax_loc=max_loc
-            highw,highh = w,h     
-    
-      #USE FULL 360 SEARCh
-      else:
-        for i in range (720):
-          template = rotate_image(img2,i,background)
-          w, h = template.shape[1::-1]
-
-          img = img1.copy()
-          # Apply template Matching
-          res = cv2.matchTemplate(img,template,method)
-          max_val, max_loc = _vision_match_maximum(res)
-          highscore=max_val
-          highangle=i
-          highmax_loc=max_loc
-          highw,highh = w,h
-          if highscore >= min_score:
-            break
-      if(i==1):
-        highscore = highscore*.5    
-      if highscore >= min_score:
-        break         
-
-    display_image = cv2.cvtColor(img1, cv2.COLOR_GRAY2BGR)
-    if highscore >= min_score:
-      status = "pass"
-      #normalize angle to increment of +180 to -180
-      if(highangle>180):
-        highangle = -360 + highangle
-      #pick closest 180   
-      CAL['pick180Val'] = int(RUN['pick180'].get())  
-      if (CAL['pick180Val'] == 1):
-        if (highangle>90):
-          highangle = -180 + highangle
-        elif (highangle<-90):
-          highangle = 180 + highangle
-      #try closest
-      CAL['pickClosestVal'] = int(RUN['pickClosest'].get())
-      if (CAL['pickClosestVal'] == highangle and highangle>int(CAL['J6PosLim'])):
-        highangle=CAL['J6PosLim']
-      elif (CAL['pickClosestVal'] == 0 and highangle>int(CAL['J6PosLim'])):    
-        status = "fail"
-      if (CAL['pickClosestVal'] == 1 and highangle<(int(CAL['J6NegLim'])*-1)):
-        highangle=CAL['J6NegLim']*-1
-      elif (CAL['pickClosestVal'] == 0 and highangle<(int(CAL['J6NegLim'])*-1)):  
-        status = "fail"
-
-      top_left = highmax_loc
-      #find center
-      center = (top_left[0] + highw/2, top_left[1] + highh/2)
-      xPos = int(center[1])
-      yPos = int(center[0])
-
-      imgxPos = int(center[0])
-      imgyPos = int(center[1])
-
-      #find line 1 end
-      line1x = int(imgxPos + 60*math.cos(math.radians(highangle-90)))
-      line1y = int(imgyPos + 60*math.sin(math.radians(highangle-90)))
-      cv2.line(display_image, (imgxPos,imgyPos), (line1x,line1y), green, 3)
-
-      #find line 2 end
-      line2x = int(imgxPos + 60*math.cos(math.radians(highangle+90)))
-      line2y = int(imgyPos + 60*math.sin(math.radians(highangle+90)))
-      cv2.line(display_image, (imgxPos,imgyPos), (line2x,line2y), green, 3)
-
-      #find line 3 end
-      line3x = int(imgxPos + 30*math.cos(math.radians(highangle)))
-      line3y = int(imgyPos + 30*math.sin(math.radians(highangle)))
-      cv2.line(display_image, (imgxPos,imgyPos), (line3x,line3y), green, 3)
-
-      #find line 4 end
-      line4x = int(imgxPos + 30*math.cos(math.radians(highangle+180)))
-      line4y = int(imgyPos + 30*math.sin(math.radians(highangle+180)))
-      cv2.line(display_image, (imgxPos,imgyPos), (line4x,line4y), green, 3)
-
-      #find tip start
-      lineTx = int(imgxPos + 56*math.cos(math.radians(highangle-90)))
-      lineTy = int(imgyPos + 56*math.sin(math.radians(highangle-90)))
-      cv2.line(display_image, (lineTx,lineTy), (line1x,line1y), dkgreen, 2)
-
-
-
-      cv2.circle(display_image, (imgxPos,imgyPos), 20, green, 1)
-      if not cv2.imwrite('temp.jpg', display_image):
-        raise OSError("vision result frame could not be persisted")
-      display_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
-      display = Image.fromarray(display_rgb).resize((640,480))
-      imgtk = ImageTk.PhotoImage(image=display)
-      vid_lbl.imgtk = imgtk    
-      vid_lbl.configure(image=imgtk)
-      VisRetScoreEntryField.delete(0, 'end')
-      VisRetScoreEntryField.insert(0,str(round((highscore*100),2))) 
-      VisRetAngleEntryField.delete(0, 'end')
-      VisRetAngleEntryField.insert(0,str(highangle)) 
-      VisRetXpixEntryField.delete(0, 'end')
-      VisRetXpixEntryField.insert(0,str(xPos))
-      VisRetYpixEntryField.delete(0, 'end')
-      VisRetYpixEntryField.insert(0,str(yPos))           
-      viscalc()
-      VisRetXrobEntryField .delete(0, 'end')
-      VisRetXrobEntryField .insert(0,str(round(RUN['xMMpos'],2)))  
-      VisRetYrobEntryField .delete(0, 'end')
-      VisRetYrobEntryField .insert(0,str(round(RUN['yMMpos'],2)))  
-
-      
-
-
-          #break
-        #if (score > highscore):
-          #highscore=score
-
-
-    if status == "fail":
-      cv2.rectangle(display_image,(5,5), (635,475), red, 5)
-      if not cv2.imwrite('temp.jpg', display_image):
-        raise OSError("vision result frame could not be persisted")
-      display_rgb = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
-      display = Image.fromarray(display_rgb).resize((640,480))
-      imgtk = ImageTk.PhotoImage(image=display)
-      vid_lbl.imgtk = imgtk    
-      vid_lbl.configure(image=imgtk)
-      VisRetScoreEntryField.delete(0, 'end')
-      VisRetScoreEntryField.insert(0,str(round((highscore*100),2)))
-      VisRetAngleEntryField.delete(0, 'end')
-      VisRetAngleEntryField.insert(0,"NA")
-      VisRetXpixEntryField.delete(0, 'end')
-      VisRetXpixEntryField.insert(0,"NA")
-      VisRetYpixEntryField.delete(0, 'end')
-      VisRetYpixEntryField.insert(0,"NA") 
-
-    return (status)    
-    
-
-
-
-
-
-# initial vis attempt using sift with flann pattern match
-#def visFind(template):
-#  take_pic()
-#  MIN_MATCH_COUNT = 10
-#  img1 = cv2.imread(template)  # query Image
-#  img2 = cv2.imread('curImage.jpg')  # target Image
-#  # Initiate SIFT detector
-#  sift = cv2.SIFT_create()
-#  # find the keypoints and descriptors with SIFT
-#  kp1, des1 = sift.detectAndCompute(img1,None)
-#  kp2, des2 = sift.detectAndCompute(img2,None)
-#  FLANN_INDEX_KDTREE = 1
-#  index_params = dict(algorithm = FLANN_INDEX_KDTREE, trees = 5)
-#  search_params = dict(checks = 50)
-#  flann = cv2.FlannBasedMatcher(index_params, search_params)
-#  matches = flann.knnMatch(des1,des2,k=2)
-#  # store all the good matches as per Lowe's ratio test.
-#  good = []
-#  for m,n in matches:
-#      if m.distance < 1.1*n.distance:
-#          good.append(m)
-
-#  if len(good)>MIN_MATCH_COUNT:
-#      src_pts = np.float32([ kp1[m.queryIdx].pt for m in good ]).reshape(-1,1,2)
-#      dst_pts = np.float32([ kp2[m.trainIdx].pt for m in good ]).reshape(-1,1,2)
-#      M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC,5.0)
-#      matchesMask = mask.ravel().tolist()
-#      h,w,c = img1.shape
-#      pts = np.float32([ [0,0],[0,h-1],[w-1,h-1],[w-1,0] ]).reshape(-1,1,2)
-#      dst = cv2.perspectiveTransform(pts,M)
-#      #img2 = cv.polylines(img2,[np.int32(dst)],True,255,3, cv.LINE_AA)
-#
-#      pts = np.float32([ [0,0],[0,h-1],[w-1,h-1],[w-1,0] ]).reshape(-1,1,2)
-#      dst = cv2.perspectiveTransform(pts,M)
-#
-#      crosspts = np.float32([ [w/2,0],[w/2,h-1],[0,h/2],[w-1,h/2] ]).reshape(-1,1,2)
-#      crossCoord = cv2.perspectiveTransform(crosspts,M)
-#
-#      cenPt = np.float32([w/2,h/2]).reshape(-1,1,2)
-#      cenCoord = cv2.perspectiveTransform(cenPt,M)
-#
-#      cenResult = cenCoord[0].reshape(1,-1).flatten().tolist()
-#      theta = - math.atan2(M[0,1], M[0,0]) * 180 / math.pi
-#
-#      xPos = cenResult[0]
-#      yPos = cenResult[1]
-#
-#      cross1Result = crossCoord[0].reshape(2,-1).flatten().tolist()
-#      cross2Result = crossCoord[1].reshape(2,-1).flatten().tolist()
-#      cross3Result = crossCoord[2].reshape(2,-1).flatten().tolist()
-#      cross4Result = crossCoord[3].reshape(2,-1).flatten().tolist()
-#
-#      x1Pos = int(cross1Result[0])
-#      y1Pos = int(cross1Result[1])
-#      x2Pos = int(cross2Result[0])
-#      y2Pos = int(cross2Result[1])
-#      x3Pos = int(cross3Result[0])
-#      y3Pos = int(cross3Result[1])
-#      x4Pos = int(cross4Result[0])
-#      y4Pos = int(cross4Result[1])
-#
-#
-#      print(xPos)
-#      print(yPos)
-#      print(theta)
-#
-#
-#      #draw bounding box
-#      #img2 = cv2.polylines(img2, [np.int32(dst)], True, (0,255,0),3, cv2.LINE_AA)
-#
-#      #draw circle
-#      img2 = cv2.circle(img2, (int(xPos),int(yPos)), radius=30, color=(0, 255, 0), thickness=3)
-#
-#      #draw line 1
-#      cv2.line(img2, (x1Pos,y1Pos), (x2Pos,y2Pos), (0,255,0), 3) 
-#      #draw line 2
-#      cv2.line(img2, (x3Pos,y3Pos), (x4Pos,y4Pos), (0,255,0), 3)
-#
-#      #save image
-#      cv2.imwrite('curImage.jpg', img2)
-#      img = Image.fromarray(img2)
-#      imgtk = ImageTk.PhotoImage(image=img)        
-#      vid_lbl.imgtk = imgtk    
-#      vid_lbl.configure(image=imgtk) 
-#
-#
-#
-#
-#  else:
-#      print( "Not enough matches are found - {}/{}".format(len(good), MIN_MATCH_COUNT) )
-#      matchesMask = None 
-
-
+  return request_vision_match()
 
 
 def updateVisOp(filelist=None):
-  # global RUN['selectedTemplate']
   RUN['selectedTemplate'] = StringVar()
   if filelist is None:
     filelist = _startup_visual_options()
@@ -23818,58 +31448,43 @@ def updateVisOp(filelist=None):
 def VisOpUpdate(foo):
     file = RUN['selectedTemplate'].get()
     logger.info(file)
-
-    # Load image
-    img = cv2.imread(file, cv2.IMREAD_COLOR)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # --- Square preview settings ---
-    TARGET_SIZE = 150   # final image will be 150x150
-
-    h, w = img.shape[:2]
-
-    # Scale so the longest side fits TARGET_SIZE
-    scale = TARGET_SIZE / max(w, h)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-
-    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-    # Create square canvas (background color can be changed)
-    square = np.zeros((TARGET_SIZE, TARGET_SIZE, 3), dtype=np.uint8)
-    # Example gray background instead of black:
-    # square[:] = (40, 40, 40)
-
-    # Center the resized image
-    x = (TARGET_SIZE - new_w) // 2
-    y = (TARGET_SIZE - new_h) // 2
-    square[y:y+new_h, x:x+new_w] = img
-
-    # Convert to Tk image
-    img = Image.fromarray(square)
-    imgtk = ImageTk.PhotoImage(image=img)
-
-    template_lbl.imgtk = imgtk
-    template_lbl.configure(image=imgtk, anchor='center')
+    try:
+      with _vision_artifact_operation("vision template preview"):
+        img = load_bounded_vision_image(
+          file,
+          cv2.IMREAD_COLOR,
+          "vision template",
+        )
+      img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+      square = fit_vision_preview_square(
+        img,
+        VISION_TEMPLATE_PREVIEW_SIZE,
+      )
+      img = Image.fromarray(square)
+      imgtk = ImageTk.PhotoImage(image=img)
+      template_lbl.imgtk = imgtk
+      template_lbl.configure(image=imgtk, anchor='center')
+    except Exception as exc:
+      detail = str(exc).strip() or type(exc).__name__
+      message = f"VISION TEMPLATE PREVIEW FAILED: {detail}"
+      logger.exception(message)
+      _set_application_status(message, "Alarm.TLabel")
+      return False
+    return True
 
 
 
 def zeroBrCn():
-  # global RUN['mX1']
-  # global RUN['mY1']
-  # global RUN['mX2']
-  # global RUN['mY2']
   RUN['mX1'] = 0
   RUN['mY1'] = 0
   RUN['mX2'] = 640
   RUN['mY2'] = 480
   VisBrightSlide.set(0)
   VisContrastSlide.set(0)
-  #VisZoomSlide.set(50)
-  return take_pic()
+  return request_vision_capture()
 
 def VisUpdateBriCon(foo):
-  return take_pic()
+  return request_vision_capture()
 
   
   
@@ -24165,9 +31780,18 @@ def GCplay():
 
   
 
-def GCplayProg(Filename, completion_callback=None):
+def GCplayProg(
+  Filename,
+  completion_callback=None,
+  execution_request=None,
+):
   if completion_callback is not None and not callable(completion_callback):
     raise TypeError("G-code completion callback must be callable")
+  if execution_request is not None:
+    if not isinstance(execution_request, ProgramExecutionRequest):
+      raise TypeError("G-code program execution request is invalid")
+    if _program_execution_request_cancelled(execution_request):
+      return False
   if RUN['offlineMode']:
     message = "G-code playback is unavailable while offline"
     logger.error(message)
@@ -24220,9 +31844,20 @@ def GCplayProg(Filename, completion_callback=None):
       )
 
   try:
+    write_started_event = (
+      threading.Event()
+      if execution_request is not None
+      else None
+    )
     started = start_send_serial_thread(
       command,
       completion_callback=complete_playback,
+      write_started_event=write_started_event,
+      write_cancellation_boundary=(
+        execution_request.cancellation_boundary
+        if execution_request is not None
+        else None
+      ),
     )
   except Exception:
     logger.exception("Unable to start G-code playback worker")
@@ -24530,6 +32165,10 @@ def GCconvertProg():
           message = (
             "G-CODE CONVERSION REJECTED DURING PROGRAM EXECUTION"
           )
+        elif admission_result == "manual-controller-active":
+          message = (
+            "G-CODE CONVERSION REJECTED DURING MANUAL CONTROLLER I/O"
+          )
         elif admission_result == "conversion-active":
           message = "G-CODE CONVERSION IS ALREADY ACTIVE"
         elif admission_result == "storage-active":
@@ -24605,18 +32244,15 @@ def _exchange_gcode_row(command):
 
     try:
       try:
-        write_serial_control(
-          serial_port,
+        return _exchange_legacy_main_command(
           command,
-          write_lock=serial_write_lock,
-          reset_input=True,
+          response_timeout=response_timeout,
           write_started_event=threading.Event(),
           cancellation_event=GCodeRowCancellationBoundary(),
           write_boundary_lock=gcode_conversion_cancel_lock,
         )
       except SerialActivityRejected:
         return None
-      return read_serial_line_response(serial_port, response_timeout)
     finally:
       if (
         RUN.get('ser') is serial_port
@@ -26569,32 +34205,34 @@ commFrame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
 
 commFrame.grid_columnconfigure(0, weight=1)
 
-# COM port detection function (from original)
 def detect_ports():
   from serial.tools import list_ports
   ports = list(list_ports.comports())
-  choices = [p.device for p in ports]
-  choices.insert(0, "None")
-  if globals().get('CAL', {}).get('comPort') not in ("", None, "None"):
-    port1_default = CAL['comPort']
-  else:
-    port1_default = "None"
-  
-  if globals().get('CAL', {}).get('com2Port') not in ("", None, "None"):
-    port2_default = CAL['com2Port']
-  else:
-    port2_default = "None"
-  
-  return choices, port1_default, port2_default
+  choices = ["None"]
+  for index, port in enumerate(ports):
+    device = getattr(port, "device", None)
+    if (
+      not isinstance(device, str)
+      or not device
+      or device != device.strip()
+    ):
+      logger.warning(
+        "Ignoring invalid serial-port enumeration entry at index %s",
+        index,
+      )
+      continue
+    if device not in choices:
+      choices.append(device)
+  return choices
 
-port_choices, default_comport1, default_comport2 = detect_ports()
+port_choices = detect_ports()
 logger.debug(f"Available Comm Ports: {port_choices}")
 
 # Teensy COM Port
 ComPortLab = Label(commFrame, text="TEENSY COM PORT:")
 ComPortLab.grid(row=0, column=0, sticky="w", padx=5, pady=(5, 2))
 
-com1SelectedValue = tk.StringVar(value=default_comport1 or "None")
+com1SelectedValue = tk.StringVar(value="None")
 com1Select = tk.OptionMenu(commFrame, com1SelectedValue, *port_choices, command=setCom)
 com1Select.grid(row=1, column=0, sticky="ew", padx=5, pady=2)
 
@@ -26616,7 +34254,7 @@ auxiliaryBoardSelect.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
 ComPortLab2 = Label(commFrame, text="5v IO BOARD COM PORT:")
 ComPortLab2.grid(row=4, column=0, sticky="w", padx=5, pady=(15, 2))
 
-com2SelectedValue = tk.StringVar(value=default_comport2 or "None")
+com2SelectedValue = tk.StringVar(value="None")
 com2Select = tk.OptionMenu(commFrame, com2SelectedValue, *port_choices, command=setCom2)
 com2Select.grid(row=5, column=0, sticky="ew", padx=5, pady=2)
 
@@ -28174,9 +35812,9 @@ infoFrame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
 
 infoFrame.grid_columnconfigure(0, weight=1)
 
-Label(infoFrame, text="The following IO are available when using the default 5v Nano board for IO:   Inputs = 2-7  /  Outputs = 8-13  /  Servos = A0-A7").grid(row=0, column=0, sticky="w", padx=5, pady=2)
+Label(infoFrame, text="The following IO are available when using the default 5v Nano board for IO:   Inputs = 2-7  /  Outputs = 8-13  /  Servos = A0-A5").grid(row=0, column=0, sticky="w", padx=5, pady=2)
 
-Label(infoFrame, text="The following IO are available when using the default 5v Mega board for IO:   Inputs = 0-27  /  Outputs = 28-53  /  Servos = A0-A7").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+Label(infoFrame, text="The following IO are available when using the default 5v Mega board for IO:   Inputs = 2-27  /  Outputs = 28-53  /  Servos = A0-A6").grid(row=1, column=0, sticky="w", padx=5, pady=2)
 
 Label(infoFrame, text="Please review this tutorial video on using 5v IO boards:").grid(row=2, column=0, sticky="w", padx=5, pady=2)
 
@@ -28284,10 +35922,10 @@ Label(infoFrame, text="5v board inputs are high impedance and susceptable to flo
 # 
 # 
 # 
-# inoutavailLab = Label(tab4, text = "The following IO are available when using the default 5v Nano board for IO:   Inputs = 2-7  /  Outputs = 8-13  /  Servos = A0-A7")
+# inoutavailLab = Label(tab4, text = "The following IO are available when using the default 5v Nano board for IO:   Inputs = 2-7  /  Outputs = 8-13  /  Servos = A0-A5")
 # inoutavailLab.place(x=10, y=640)
 # 
-# inoutavailLab = Label(tab4, text = "The following IO are available when using the default 5v Mega board for IO:   Inputs = 0-27  /  Outputs = 28-53  /  Servos = A0-A7")
+# inoutavailLab = Label(tab4, text = "The following IO are available when using the default 5v Mega board for IO:   Inputs = 2-27  /  Outputs = 28-53  /  Servos = A0-A6")
 # inoutavailLab.place(x=10, y=655)
 # 
 # inoutavailLab = Label(tab4, text = "Please review this tutorial video on using 5v IO boards:")
@@ -29110,17 +36748,39 @@ CalValuesLab.place(x=900, y=30)
 match CE['Platform']['OS']:
 
   case "Windows":
-    graph = FilterGraph()
     try:
+      graph = FilterGraph()
       allcams = graph.get_input_devices()
     except Exception:
-      allcams = ["Select a Camera"]
+      logger.exception("Unable to enumerate Windows cameras")
+      allcams = []
+    if not isinstance(allcams, (tuple, list)) or any(
+      not isinstance(camera_name, str)
+      or not camera_name
+      or camera_name != camera_name.strip()
+      or "\r" in camera_name
+      or "\n" in camera_name
+      or "\x00" in camera_name
+      or len(camera_name) > MAX_CAMERA_PREVIEW_EVENT_DETAIL
+      for camera_name in allcams
+    ):
+      logger.error("Windows camera enumeration returned invalid data")
+      allcams = []
 
     # --- filter out virtual/fake cameras (case-insensitive) ---
     _ban = ("iriun", "droidcam", "obs", "virtual", "manycam", "snap camera", "ndi", "xsplit", "mmhmm")
-    camList = [n for n in allcams if not any(b in n.lower() for b in _ban)]
+    indexed_cameras = [
+      (index, name)
+      for index, name in enumerate(allcams)
+      if not any(blocked in name.lower() for blocked in _ban)
+    ]
+    if not indexed_cameras:
+      indexed_cameras = list(enumerate(allcams))
+    camList, label_to_id = _camera_labels_for_sources(
+      indexed_cameras
+    )
     if not camList:
-      camList = allcams[:]  # fallback if everything got filtered
+      camList = ["Select a Camera"]
     # ----------------------------------------------------------
 
     visoptions = StringVar(tab6)
@@ -29129,31 +36789,51 @@ match CE['Platform']['OS']:
     try:
       # If we have real cams, preselect the first real one; otherwise keep the placeholder
       if camList and camList[0] != "Select a Camera":
-        vismenu = OptionMenu(tab6, visoptions, camList[0], *camList)
+        vismenu = OptionMenu(
+          tab6,
+          visoptions,
+          camList[0],
+          *camList,
+          command=_on_vision_camera_select,
+        )
         visoptions.set(camList[0])  # ensures the real cam (e.g., Logi C270) is selected
       else:
-        vismenu = OptionMenu(tab6, visoptions, "Select a Camera")
+        vismenu = OptionMenu(
+          tab6,
+          visoptions,
+          "Select a Camera",
+          command=_on_vision_camera_select,
+        )
       vismenu.config(width=20)
       vismenu.place(x=10, y=10)
     except Exception:
       logger.error("no camera")
 
   case "Linux":
-    # Build label->id map
-    label_to_id = {c.label: c.id for c in CE['Cameras']['Enum']}
-    camList = list(label_to_id.keys())
+    try:
+      camera_entries = [
+        (camera.id, camera.label)
+        for camera in CE['Cameras']['Enum']
+      ]
+      camList, label_to_id = _camera_labels_for_sources(camera_entries)
+    except Exception:
+      logger.exception("Unable to enumerate Linux cameras")
+      camList = []
+      label_to_id = {}
 
-    selected_label = tk.StringVar(value=(camList[0] if camList else "Select a Camera"))
+    selected_label = camList[0] if camList else "Select a Camera"
 
     visoptions = StringVar(tab6)
     visoptions.set("Select a Camera")
 
-    def on_camera_select(chosen_label):
-      cam_id = label_to_id.get(chosen_label, "None")
-      logger.debug("Debug - User picked:", chosen_label, " -> using id:", cam_id)
-
     try:
-      vismenu = OptionMenu(tab6, visoptions, selected_label.get(), *camList, command=on_camera_select)
+      vismenu = OptionMenu(
+        tab6,
+        visoptions,
+        selected_label,
+        *camList,
+        command=_on_vision_camera_select,
+      )
       vismenu.config(width=20)
       vismenu.place(x=10, y=10)
     except Exception:
@@ -29169,7 +36849,12 @@ StartCamBut.place(x=200, y=10)
 StopCamBut = Button(tab6,  text="Stop Camera",  width=12, command = stop_vid)
 StopCamBut.place(x=315, y=10)
 
-CapImgBut = Button(tab6,  text="Snap Image",  width=12, command = take_pic)
+CapImgBut = Button(
+  tab6,
+  text="Snap Image",
+  width=12,
+  command=request_vision_capture,
+)
 CapImgBut.place(x=10, y=50)
 
 TeachImgBut = Button(tab6,  text="Teach Object",  width=12, command = selectTemplate)
@@ -29577,11 +37262,9 @@ apply_calibration(loaded_calibration, CAL)
 logger.debug(f"Comport 1 restored value is: {CAL['comPort']}")
 logger.debug(f"Comport 1 restored value is: {CAL['com2Port']}")
 
-if CAL['comPort'] in port_choices:
-  com1SelectedValue.set(CAL['comPort'])
-
-if CAL['com2Port'] in port_choices:
-  com2SelectedValue.set(CAL['com2Port'])
+saved_main_port, saved_auxiliary_port = _startup_port_selector_values(CAL)
+com1SelectedValue.set(saved_main_port)
+com2SelectedValue.set(saved_auxiliary_port)
 
 try:
   restored_auxiliary_board = normalize_auxiliary_board_profile(
@@ -29817,6 +37500,13 @@ if (CAL['pickClosestVal'] == 1):
 if (CAL['pick180Val'] == 1):
   RUN['pick180'].set(True)  
 visoptions.set(CAL['curCam'])
+try:
+  _cache_vision_camera_selection(visoptions.get())
+except MotionInputError:
+  logger.warning(
+    "Configured camera selection is unavailable: %r",
+    visoptions.get(),
+  )
 if (CAL['fullRotVal'] == 1):
   RUN['fullRot'].set(True)
 if (CAL['autoBGVal'] == 1):
@@ -29929,8 +37619,7 @@ J6aEntryField.insert(0,str(CAL['J6aDHpar']))
 if not update_CPP_kin_from_entries():
   message = "MOTION DISABLED: NATIVE KINEMATICS CONFIGURATION FAILED"
   logger.error(message)
-  almStatusLab.config(text=message, style="Alarm.TLabel")
-  almStatusLab2.config(text=message, style="Alarm.TLabel")
+  _set_application_status(text=message, style="Alarm.TLabel")
 RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
 RUN['JangleOut'] = np.array([float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])])
 RUN['negLim'] = [float(CAL['J1NegLim']), float(CAL['J2NegLim']), float(CAL['J3NegLim']), float(CAL['J4NegLim']), float(CAL['J5NegLim']), float(CAL['J6NegLim'])]
@@ -29998,12 +37687,17 @@ Copyright © 2022 by Annin Robotics. All Rights Reserved"
 RUN['xboxUse'] = 0
 
 tab1.lastProg = ""
+_schedule_event_poll("camera-preview")
 _schedule_event_poll("joint-motion")
 _schedule_event_poll("serial")
+_schedule_event_poll("manual-controller")
 _schedule_event_poll("calibration")
 _schedule_event_poll("auxiliary-serial")
 _schedule_event_poll("manual-auxiliary")
+_schedule_event_poll("auxiliary-device")
 _schedule_event_poll("gcode-storage")
+_schedule_event_poll("called-program")
+_schedule_event_poll("program-selection")
 _schedule_event_poll("xbox-auxiliary")
 _schedule_event_poll("virtual-motion")
 tab1.after(100, setCom)

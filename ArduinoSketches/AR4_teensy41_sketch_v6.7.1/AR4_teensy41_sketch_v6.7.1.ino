@@ -74,6 +74,7 @@ const char *GCODE_WRITE_IDENTITY_CAPABILITY = "GCODE_WRITE_IDENTITY_V1";
 const char *HOME_REFERENCE_V1_CAPABILITY = "HOME_REFERENCE_V1";
 const char *HOME_REFERENCE_V2_CAPABILITY = "HOME_REFERENCE_V2";
 const char *JOINT_TELEMETRY_CAPABILITY = "JOINT_TELEMETRY_V1";
+const char *ESTOP_ADMISSION_CAPABILITY = "ESTOP_ADMISSION_V1";
 const char *CALIBRATION_SWITCH_POLARITY_CAPABILITY =
   "CALIBRATION_SWITCH_POLARITY_V1";
 
@@ -117,6 +118,7 @@ const char *const PROTOCOL_CAPABILITIES[] = {
   HOME_REFERENCE_V1_CAPABILITY,
   HOME_REFERENCE_V2_CAPABILITY,
   JOINT_TELEMETRY_CAPABILITY,
+  ESTOP_ADMISSION_CAPABILITY,
   CALIBRATION_SWITCH_POLARITY_CAPABILITY,
 };
 constexpr size_t PROTOCOL_CAPABILITY_COUNT =
@@ -436,6 +438,10 @@ bool splineEndReceived;
 volatile bool estopActive;
 volatile ar4_protocol::JointTelemetryResponseOwnership
   telemetryResponseOwnership = { false, false, false };
+volatile ar4_protocol::ControllerResponseOwnership
+  controllerResponseOwnership = { false, false };
+volatile ar4_protocol::EstopAdmissionOwnership
+  estopAdmissionOwnership = { 0, false };
 
 float Xtool = 0;
 float Ytool = 0;
@@ -1063,17 +1069,9 @@ bool save_robot_id_to_eeprom(const String robot_model, const String robot_versio
 }
 
 void reboot() {
-  DEBUG_PRINT("Rebooting Driver Board: ");
-  DEBUG_PRINTLN(driver_board);
-  if (driver_board.indexOf("Teensy") >= 0) {
-    DEBUG_PRINTLN("Teensy 3.x / 4.x: ARM system reset");
-    SCB_AIRCR = 0x05FA0004;
-    while (true)
-      ;
-  } else {
-    // Unknown type — fallback or safe no-op
-    Serial.println("Unknown board type, no reboot performed.");
-  }
+  SCB_AIRCR = 0x05FA0004;
+  while (true)
+    ;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2732,20 +2730,33 @@ bool complete_telemetry_joint_response(
     case ar4_protocol::JointTelemetryTerminalKind::kPosition:
       if (decision.emergency_stop) flag = "EB";
       sendRobotPos();
+      if (decision.emergency_stop) {
+        ar4_protocol::acknowledge_controller_estop_response(
+          controllerResponseOwnership
+        );
+      }
       break;
     case ar4_protocol::JointTelemetryTerminalKind::kError:
       Serial.println("ER");
       break;
   }
 
-  // A stop deferred after terminal selection must survive this response.
-  // Commit converts that race into an admission block for the next command.
+  // Preserve admission blocking and publish a late stop after terminal framing
+  // so an idle host can consume the asynchronous event without another command.
   noInterrupts();
-  ar4_protocol::commit_joint_telemetry_terminal(
-    decision,
-    telemetryResponseOwnership
-  );
+  const bool publishLateEstop =
+    ar4_protocol::commit_joint_telemetry_terminal(
+      decision,
+      telemetryResponseOwnership
+    );
   interrupts();
+  if (publishLateEstop) {
+    ar4_protocol::acknowledge_controller_estop_response(
+      controllerResponseOwnership
+    );
+    flag = "EB";
+    sendRobotPos();
+  }
   return true;
 }
 
@@ -3766,6 +3777,11 @@ void consume_current_command() {
   );
 }
 
+void finish_calibration_failure_response() {
+  Serial.println("ER");
+  consume_current_command();
+}
+
 
 ar4_protocol::LiveControlFrameStatus read_live_control_frame() {
   const ar4_protocol::SerialFrameReadStatus status =
@@ -3805,16 +3821,115 @@ void send_live_terminal_response(
 
 
 void EstopProg() {
-  if (estopActive) return;
-  estopActive = true;
-  if (ar4_protocol::defer_joint_telemetry_estop_response(
-      telemetryResponseOwnership
-  )) {
-    return;
+  ar4_protocol::record_estop_interrupt(
+    estopAdmissionOwnership,
+    estopActive,
+    controllerResponseOwnership,
+    telemetryResponseOwnership
+  );
+}
+
+
+bool interruptible_command_delay(
+  uint32_t duration_ms,
+  bool terminal_response_sent,
+  bool external_write_started = false
+) {
+  const unsigned long started_at = millis();
+  while (millis() - started_at < duration_ms) {
+    if (estopActive) break;
+    delay(1);
   }
+  if (!estopActive) return true;
+
+  // End the active response scope so EB can follow either the existing
+  // terminal or an ER terminal without leaving the command queued.
+  if (!terminal_response_sent) {
+    Serial.println(external_write_started ? "Modbus Error" : "ER");
+  }
+  consume_current_command();
+  return false;
+}
+
+
+bool reject_current_command_for_estop() {
+  noInterrupts();
+  const bool deferredTelemetryEstop =
+    ar4_protocol::joint_telemetry_estop_admission_blocked(
+      telemetryResponseOwnership
+    );
+  const bool estopInputAsserted = digitalRead(EstopPin) == LOW;
+  const ar4_protocol::EstopAdmissionDecision decision =
+    ar4_protocol::begin_estop_admission(
+      deferredTelemetryEstop,
+      estopActive,
+      estopInputAsserted,
+      estopAdmissionOwnership
+    );
+  interrupts();
+  if (!decision.blocked) return false;
+
+  // Admission retires pending generic output after the correlated EA frame.
+  flag = "EA";
+  sendRobotPos();
+  flag = "";
+
+  // Admission and loop-response ownership must retire atomically. Otherwise
+  // a reassertion can publish EB after the correlated EA response.
+  noInterrupts();
+  if (deferredTelemetryEstop) {
+    ar4_protocol::clear_joint_telemetry_estop_admission_block(
+      telemetryResponseOwnership
+    );
+  }
+  const bool clearEstopLatch =
+    ar4_protocol::complete_estop_admission_response(
+      decision,
+      digitalRead(EstopPin) == LOW,
+      estopAdmissionOwnership,
+      controllerResponseOwnership
+    );
+  if (clearEstopLatch) estopActive = false;
+  interrupts();
+  consume_current_command();
+  return true;
+}
+
+void complete_controller_response_scope() {
+  noInterrupts();
+  const bool completed =
+    ar4_protocol::complete_controller_response_ownership(
+      controllerResponseOwnership
+    );
+  const bool publishEstop =
+    completed
+    && ar4_protocol::acknowledge_controller_estop_response(
+      controllerResponseOwnership
+    );
+  interrupts();
+  if (!publishEstop) return;
   flag = "EB";
   sendRobotPos();
 }
+
+
+class ControllerResponseScope {
+ public:
+  ControllerResponseScope() : active_(false) {
+    noInterrupts();
+    active_ = ar4_protocol::begin_controller_response_ownership(
+      controllerResponseOwnership
+    );
+    interrupts();
+  }
+
+  ~ControllerResponseScope() {
+    if (active_) complete_controller_response_scope();
+  }
+
+ private:
+  bool active_;
+};
 
 
 
@@ -3900,6 +4015,7 @@ void setup() {
 }
 
 void loop() {
+  ControllerResponseScope responseScope;
 
   ////////////////////////////////////
   ///////////start loop///////////////
@@ -3909,25 +4025,7 @@ void loop() {
   }
   //dont start unless at least one command has been read in
   if (cmdBuffer1 != "") {
-    //process data
-    noInterrupts();
-    const bool deferredTelemetryEstop =
-      ar4_protocol::joint_telemetry_estop_admission_blocked(
-        telemetryResponseOwnership
-      );
-    interrupts();
-    if (deferredTelemetryEstop) {
-      flag = "EB";
-      sendRobotPos();
-      noInterrupts();
-      ar4_protocol::clear_joint_telemetry_estop_admission_block(
-        telemetryResponseOwnership
-      );
-      interrupts();
-      consume_current_command();
-      return;
-    }
-    estopActive = false;
+    if (reject_current_command_for_estop()) return;
     if (!ar4_protocol::extract_serial_command_payload(cmdBuffer1, inData)) {
       Serial.println("ER");
       consume_current_command();
@@ -3935,6 +4033,9 @@ void loop() {
     }
     String function = inData.substring(0, 2);
     inData = inData.substring(2);
+    // Parsing is side-effect free; the post-parse atomic gate catches an interrupt
+    // arriving after the queue-boundary admission check.
+    if (reject_current_command_for_estop()) return;
     KinematicError = 0;
     debug = "";
 
@@ -3951,7 +4052,6 @@ void loop() {
     }
 
     if (function == "RB") {
-      Serial.println("System Restarting");
       reboot();
     }
 
@@ -4029,6 +4129,7 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "BA") {
       int32_t result = modbusQuerry(inData, 3);
+      if (!interruptible_command_delay(0, false)) return;
       if (result == MODBUS_PARSE_ERROR) {
         Serial.println("ER");
       } else if (result == -1) {
@@ -4042,6 +4143,7 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "BB") {
       int32_t result = modbusQuerry(inData, 1);
+      if (!interruptible_command_delay(0, false)) return;
       if (result == MODBUS_PARSE_ERROR) {
         Serial.println("ER");
       } else if (result == -1) {
@@ -4055,6 +4157,7 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "BC") {
       int32_t result = modbusQuerry(inData, 2);
+      if (!interruptible_command_delay(0, false)) return;
       if (result == MODBUS_PARSE_ERROR) {
         Serial.println("ER");
       } else if (result == -1) {
@@ -4068,6 +4171,7 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "BH") {
       int32_t result = modbusQuerry(inData, 3);
+      if (!interruptible_command_delay(0, false)) return;
       if (result == MODBUS_PARSE_ERROR) {
         Serial.println("ER");
       } else if (result == -1) {
@@ -4081,6 +4185,7 @@ void loop() {
     //-----------------------------------------------------------------------
     if (function == "BD") {
       int32_t result = modbusQuerry(inData, 4);
+      if (!interruptible_command_delay(0, false)) return;
       if (result == MODBUS_PARSE_ERROR) {
         Serial.println("ER");
       } else if (result == -1) {
@@ -4101,6 +4206,7 @@ void loop() {
       } else {
         Serial.println("Write Success");
       }
+      if (!interruptible_command_delay(0, true)) return;
     }
 
     //-----MODBUS WRITE REGISTER - FUNCTION 6--------------------------------------------
@@ -4114,6 +4220,7 @@ void loop() {
       } else {
         Serial.println("Write Success");
       }
+      if (!interruptible_command_delay(0, true)) return;
     }
 
     //-----QUERRY DRIVE MODBUS--------------------------------------------
@@ -4124,6 +4231,7 @@ void loop() {
 
       // Modbus read
       result = node.readHoldingRegisters(0x1207, 2);
+      if (!interruptible_command_delay(0, false)) return;
 
       if (result == node.ku8MBSuccess) {
 
@@ -4135,13 +4243,14 @@ void loop() {
         //Serial.println(result, HEX);
       }
 
-      delay(1000);
+      if (!interruptible_command_delay(1000, true)) return;
     }
 
     //-----HOME MOTOR DRIVE MODBUS--------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "HD") {
       uint8_t result;
+      bool writeFailed = false;
 
       // Address and value to write
       uint16_t registerAddress1 = 0x020D;  // P0213 - DI3
@@ -4152,27 +4261,32 @@ void loop() {
 
       // Write the value to the register
       result = node.writeSingleRegister(registerAddress1, valueOn);
-      delay(50);
+      writeFailed = writeFailed || result != node.ku8MBSuccess;
+      if (!interruptible_command_delay(50, false, true)) return;
       result = node.writeSingleRegister(registerAddress2, valueOn);
-      delay(50);
+      writeFailed = writeFailed || result != node.ku8MBSuccess;
+      if (!interruptible_command_delay(50, false, true)) return;
       result = node.writeSingleRegister(registerAddress1, valueOff);
-      delay(50);
+      writeFailed = writeFailed || result != node.ku8MBSuccess;
+      if (!interruptible_command_delay(50, false, true)) return;
       result = node.writeSingleRegister(registerAddress2, valueOff);
+      writeFailed = writeFailed || result != node.ku8MBSuccess;
+      if (!interruptible_command_delay(0, false, true)) return;
 
-      if (result == node.ku8MBSuccess) {
+      if (!writeFailed) {
         Serial.println("Write successful");
       } else {
-        //Serial.println("Modbus Error: ");
-        Serial.println(result, HEX);
+        Serial.println("Modbus Error");
       }
 
-      delay(50);
+      if (!interruptible_command_delay(50, true)) return;
     }
 
     //-----RESET DRIVE MODBUS--------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "RR") {
       uint8_t result;
+      bool writeFailed = false;
 
       // Address and value to write
       uint16_t registerAddress1 = 0x020D;  // P0213 - DI3 INPUT
@@ -4185,26 +4299,30 @@ void loop() {
 
 
       result = node.writeSingleRegister(registerAddress2, resetMode);
-      delay(50);
+      writeFailed = writeFailed || result != node.ku8MBSuccess;
+      if (!interruptible_command_delay(50, false, true)) return;
       result = node.writeSingleRegister(registerAddress1, valueOn);
-      delay(50);
+      writeFailed = writeFailed || result != node.ku8MBSuccess;
+      if (!interruptible_command_delay(50, false, true)) return;
       result = node.writeSingleRegister(registerAddress2, homingMode);
-      delay(50);
+      writeFailed = writeFailed || result != node.ku8MBSuccess;
+      if (!interruptible_command_delay(50, false, true)) return;
 
 
-      if (result == node.ku8MBSuccess) {
+      if (!writeFailed) {
         Serial.println("Write successful");
       } else {
-        Serial.println("fail");
+        Serial.println("Modbus Error");
       }
 
-      delay(50);
+      if (!interruptible_command_delay(50, true)) return;
     }
 
     //-----RESET DRIVE MODBUS--------------------------------------------
     //-----------------------------------------------------------------------
     if (function == "FR") {
       uint8_t result;
+      bool writeFailed = false;
 
       // Address and value to write
       uint16_t registerAddress1 = 0x0B01;  // P1101 - fault reset
@@ -4213,18 +4331,20 @@ void loop() {
       uint16_t valueOff = 0;
 
       result = node.writeSingleRegister(registerAddress1, valueOn);
-      delay(50);
+      writeFailed = writeFailed || result != node.ku8MBSuccess;
+      if (!interruptible_command_delay(50, false, true)) return;
       result = node.writeSingleRegister(registerAddress1, valueOff);
-      delay(50);
+      writeFailed = writeFailed || result != node.ku8MBSuccess;
+      if (!interruptible_command_delay(50, false, true)) return;
 
 
-      if (result == node.ku8MBSuccess) {
+      if (!writeFailed) {
         Serial.println("Write successful");
       } else {
-        Serial.println("fail");
+        Serial.println("Modbus Error");
       }
 
-      delay(50);
+      if (!interruptible_command_delay(50, true)) return;
     }
 
     //-----SPLINE START------------------------------------------------------
@@ -4936,7 +5056,7 @@ void loop() {
         consume_current_command();
         return;
       }
-      delay(WaitTimeMS);
+      if (!interruptible_command_delay(WaitTimeMS, false)) return;
       Serial.println("WTdone");
     }
 
@@ -4991,11 +5111,15 @@ void loop() {
       int value = parsed[2];
       unsigned long startTime = millis();
       MBquery = "A" + String(slaveID) + "B" + String(input) + "C1";
-      while ((millis() - startTime < timeoutMillis) && (result != value)) {
+      while (
+        (millis() - startTime < timeoutMillis)
+        && (result != value)
+        && !estopActive
+      ) {
         result = modbusQuerry(MBquery, 1);
-        delay(100);
+        if (!interruptible_command_delay(100, false)) return;
       }
-      delay(5);
+      if (!interruptible_command_delay(5, false)) return;
       if (result == value) {
         Serial.println("Done");
       } else if (result == -1) {
@@ -5047,11 +5171,15 @@ void loop() {
       int value = parsed[2];
       unsigned long startTime = millis();
       MBquery = "A" + String(slaveID) + "B" + String(input) + "C1";
-      while ((millis() - startTime < timeoutMillis) && (result != value)) {
+      while (
+        (millis() - startTime < timeoutMillis)
+        && (result != value)
+        && !estopActive
+      ) {
         result = modbusQuerry(MBquery, 2);
-        delay(100);
+        if (!interruptible_command_delay(100, false)) return;
       }
-      delay(5);
+      if (!interruptible_command_delay(5, false)) return;
       if (result == value) {
         Serial.println("Done");
       } else if (result == -1) {
@@ -5098,8 +5226,8 @@ void loop() {
       int value = parsed[2];
       MBquery = "A" + String(slaveID) + "B" + String(input) + "C" + String(value);
       result = modbusQuerry(MBquery, 15);
-      delay(5);
       Serial.println(result);
+      if (!interruptible_command_delay(5, true)) return;
     }
 
     //-----COMMAND TO SET MODBUS OUTPUT REGISTER---------------------------------------------------
@@ -5139,8 +5267,8 @@ void loop() {
       int value = parsed[2];
       MBquery = "A" + String(slaveID) + "B" + String(input) + "C" + String(value);
       result = modbusQuerry(MBquery, 6);
-      delay(5);
       Serial.println(result);
+      if (!interruptible_command_delay(5, true)) return;
     }
 
 
@@ -5457,8 +5585,7 @@ void loop() {
       //DRIVE TO LIMITS FAST
       SpeedIn = 25;
       if (!driveLimit(JStep, Jreq, SpeedIn)) {
-        if (!estopActive) Serial.println("ER");
-        consume_current_command();
+        finish_calibration_failure_response();
         return;
       }
 
@@ -5469,16 +5596,14 @@ void loop() {
           5,
           CALIBRATION_RELEASE_MAXIMUM_TRAVEL_UNITS
       )) {
-        if (!estopActive) Serial.println("ER");
-        consume_current_command();
+        finish_calibration_failure_response();
         return;
       }
 
       //DRIVE TO LIMITS MED
       SpeedIn = 2;
       if (!driveLimit(JStep, Jreq, SpeedIn)) {
-        if (!estopActive) Serial.println("ER");
-        consume_current_command();
+        finish_calibration_failure_response();
         return;
       }
 
@@ -5569,12 +5694,11 @@ void loop() {
       float ACCramp = 50;
 
       if (!driveMotorsJ(J1stepCen, J2stepCen, J3stepCen, J4stepCen, J5step45, J6stepCen, J7stepCen, J8stepCen, J9stepCen, J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, nullptr, false)) {
-        if (!estopActive) Serial.println("ER");
-        consume_current_command();
+        finish_calibration_failure_response();
         return;
       }
       if (estopActive) {
-        consume_current_command();
+        finish_calibration_failure_response();
         return;
       }
       ar4_protocol::PrimaryHomeReferenceState committedHomeReference =

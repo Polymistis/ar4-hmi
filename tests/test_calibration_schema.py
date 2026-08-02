@@ -1056,11 +1056,12 @@ class LegacyCalibrationConversionTests(unittest.TestCase):
             self.assertTrue(backup_path.exists())
 
     def test_legacy_conversion_default_backup_matches_source_name_case(self):
-        backup_default = inspect.signature(
-            convert_calibration
-        ).parameters["backup_file"].default
+        parameters = inspect.signature(convert_calibration).parameters
+        legacy_default = parameters["legacy_file"].default
+        backup_default = parameters["backup_file"].default
 
-        self.assertEqual(backup_default, "ARbot.cal.bak")
+        self.assertEqual(legacy_default, "ARbot.cal")
+        self.assertEqual(backup_default, f"{legacy_default}.bak")
 
     def test_backup_failure_does_not_misreport_committed_conversion(self):
         with BoundedTemporaryDirectory(prefix="ar4-legacy-backup-") as directory:

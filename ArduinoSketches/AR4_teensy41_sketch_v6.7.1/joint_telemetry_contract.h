@@ -23,6 +23,21 @@ struct JointTelemetryResponseOwnership {
     volatile bool estop_admission_blocked;
 };
 
+struct ControllerResponseOwnership {
+    volatile bool active;
+    volatile bool estop_response_pending;
+};
+
+struct EstopAdmissionOwnership {
+    volatile uint32_t assertion_generation;
+    volatile bool response_active;
+};
+
+struct EstopAdmissionDecision {
+    bool blocked;
+    uint32_t assertion_generation;
+};
+
 enum class JointTelemetryTerminalKind : uint8_t {
     kNotOwned,
     kAlreadySent,
@@ -34,6 +49,78 @@ struct JointTelemetryTerminalDecision {
     JointTelemetryTerminalKind kind;
     bool emergency_stop;
 };
+
+inline bool begin_controller_response_ownership(
+    volatile ControllerResponseOwnership& ownership
+) {
+    if (ownership.active) return false;
+    ownership.active = true;
+    return true;
+}
+
+inline void record_controller_estop_response(
+    volatile ControllerResponseOwnership& ownership
+) {
+    ownership.estop_response_pending = true;
+}
+
+inline bool acknowledge_controller_estop_response(
+    volatile ControllerResponseOwnership& ownership
+) {
+    if (!ownership.estop_response_pending) return false;
+    ownership.estop_response_pending = false;
+    return true;
+}
+
+inline bool complete_controller_response_ownership(
+    volatile ControllerResponseOwnership& ownership
+) {
+    if (!ownership.active) return false;
+    ownership.active = false;
+    return true;
+}
+
+inline void record_estop_assertion(
+    volatile EstopAdmissionOwnership& ownership
+) {
+    ++ownership.assertion_generation;
+}
+
+inline EstopAdmissionDecision begin_estop_admission(
+    bool telemetry_blocked,
+    bool estop_latched,
+    bool estop_input_asserted,
+    volatile EstopAdmissionOwnership& ownership
+) {
+    const bool blocked =
+        ownership.response_active
+        || telemetry_blocked
+        || estop_latched
+        || estop_input_asserted;
+    if (blocked) ownership.response_active = true;
+    return {
+        blocked,
+        ownership.assertion_generation,
+    };
+}
+
+inline bool complete_estop_admission_response(
+    const EstopAdmissionDecision& decision,
+    bool estop_input_asserted,
+    volatile EstopAdmissionOwnership& admission_ownership,
+    volatile ControllerResponseOwnership& controller_ownership
+) {
+    if (!decision.blocked || !admission_ownership.response_active) {
+        return false;
+    }
+    const bool newer_assertion =
+        admission_ownership.assertion_generation
+        != decision.assertion_generation;
+    admission_ownership.response_active = false;
+    acknowledge_controller_estop_response(controller_ownership);
+    complete_controller_response_ownership(controller_ownership);
+    return !newer_assertion && !estop_input_asserted;
+}
 
 inline void begin_joint_telemetry_response_ownership(
     bool telemetry_requested,
@@ -49,6 +136,20 @@ inline bool defer_joint_telemetry_estop_response(
 ) {
     if (!ownership.active) return false;
     ownership.estop_response_pending = true;
+    return true;
+}
+
+inline bool record_estop_interrupt(
+    volatile EstopAdmissionOwnership& admission_ownership,
+    volatile bool& estop_active,
+    volatile ControllerResponseOwnership& controller_ownership,
+    volatile JointTelemetryResponseOwnership& telemetry_ownership
+) {
+    record_estop_assertion(admission_ownership);
+    if (estop_active) return false;
+    estop_active = true;
+    record_controller_estop_response(controller_ownership);
+    defer_joint_telemetry_estop_response(telemetry_ownership);
     return true;
 }
 
