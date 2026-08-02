@@ -38,7 +38,7 @@ Status terms and complete acceptance criteria are defined in the detailed-contra
 | M4A5 - Desired-versus-estimated-and-encoder joint display | `Tested` | Keep desired, active-target, estimate, and encoder channels distinct. |
 | M4A6 - Main-control workspace and named positions | `Tested` | Maintain tabbed controls and validated Start and Shutdown positions. |
 | M4A7 - Low-priority joint encoder telemetry | `Blocked` | Implementation remains in progress; powered acceptance prerequisites remain unmet. |
-| M4B - Repeatability and dynamic interception pass | `Proposed` | Define measurement, simulation, prediction, trajectory, and replanning work. |
+| M4B - Repeatability and dynamic interception pass | `In progress` | Exercise deterministic observation replay, state estimation, and bounded prediction. |
 | M5 - Controlled hardware validation | `Blocked` | Await the prerequisites defined by the controlled verification contract. |
 
 ## Verification records
@@ -1260,7 +1260,7 @@ Acceptance criteria:
 
 ### M4B - Repeatability and dynamic interception pass
 
-Status: `Proposed`
+Status: `In progress`
 
 Research direction:
 
@@ -1282,6 +1282,30 @@ Acceptance criteria:
 - Hardware experiments follow M5 and distinguish observed results from simulation.
 
 Research and staged decisions are tracked in `docs/dynamic-motion-research.md`.
+
+Implemented foundation:
+
+- `ARrobots.dynamic_motion` defines immutable, finite three-dimensional
+  millimeter observations in an explicit coordinate frame with diagonal
+  square-millimeter measurement variance and monotonic timestamps.
+- A bounded two-observation constant-velocity estimator rejects stale, future,
+  out-of-order, undersampled, and frame-mismatched input before state mutation.
+  Long observation gaps explicitly replace the baseline instead of extending
+  an obsolete velocity estimate.
+- State uncertainty includes per-axis position variance, velocity variance,
+  and position-velocity covariance. A bounded constant-velocity predictor
+  propagates that covariance and adds configured diagonal position-process
+  variance across the prediction horizon.
+- The versioned `ar4.observation-replay.v1` JSONL codec enforces strict UTF-8,
+  exact fields, duplicate-key rejection, finite numeric domains, payload and
+  record bounds, one coordinate frame, and ordered observation and receipt
+  timestamps. Replay creates an internally owned estimator so a rejected
+  record cannot leave a caller-owned estimator partially advanced.
+- Deterministic hardware-free tests cover validation, estimator reset and
+  rejection behavior, covariance propagation, bounded prediction, canonical
+  record round trips, and replay failures. No controller command, live motion,
+  acceleration model, reachability decision, trajectory generation, or grasp
+  behavior is included in the current foundation.
 
 ### M5 - Controlled hardware validation
 

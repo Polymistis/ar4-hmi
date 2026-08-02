@@ -105,6 +105,50 @@ Repeat targets from consistent and reversed approach directions to expose hyster
 7. Add local replanning, collision checking, and terminal visual servoing.
 8. Authorize conservative hardware validation only after stop, watchdog, limit, and fault behavior pass software and bench checks.
 
+## Implemented deterministic foundation
+
+`ARrobots.dynamic_motion` provides a hardware-free object-state estimator and
+replay boundary. The current model uses two ordered position observations to
+calculate constant velocity. Each observation carries an explicit
+coordinate-frame name, monotonic source timestamp, and diagonal position
+variance. Measurement errors are assumed independent across observations and
+coordinate axes; later camera calibration and estimator work must replace that
+assumption when correlated uncertainty becomes available.
+
+Estimator configuration bounds observation age, future clock skew, minimum
+sample interval, and maximum sample interval. Rejected observations leave the
+active baseline and estimate unchanged. A gap beyond the configured maximum
+accepts the new observation only as a replacement baseline, making model reset
+visible to the caller. The predictor uses a bounded future timestamp, preserves
+constant velocity, propagates position/velocity covariance, and adds configured
+diagonal position-process variance per second.
+
+Recorded input uses canonical JSONL schema `ar4.observation-replay.v1`. The
+first record is the exact header:
+
+```json
+{"position_unit":"millimeter","schema":"ar4.observation-replay.v1","timebase":"monotonic-seconds"}
+```
+
+Each following record contains exactly `timestamp_seconds`,
+`received_at_seconds`, `frame_id`, `position`, and `position_variance`.
+Positions and variances contain three numeric components in X/Y/Z order. The
+position unit is millimeters, velocity is millimeters per second, and position
+variance is square millimeters. The codec rejects invalid UTF-8, NUL bytes,
+blank or malformed lines, duplicate keys, non-finite values, invalid
+dimensions, mixed frames, unordered source or receipt timestamps, and
+configured size-limit violations. Replay owns a fresh estimator instance and
+therefore cannot partially mutate an external estimator when a recorded
+observation is rejected. Canonical encoding emits LF line endings. Decoding
+accepts LF or CRLF, and canonical re-encoding normalizes either form to LF;
+byte-level hashes therefore identify encoded files rather than logical replay
+equivalence.
+
+Current scope stops before acceleration estimation, transforms, innovation
+tests, impacts, reachability, IK, collision checking, trajectory generation,
+controller setpoint replacement, or grasp supervision. No live-arm result is
+established by the deterministic module or associated tests.
+
 ## Product constraints requiring later decisions
 
 - Camera count, placement, frame rate, exposure, depth source, and calibration method.
