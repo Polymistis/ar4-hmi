@@ -159,6 +159,11 @@ class DynamicMotionValueTests(unittest.TestCase):
             "positive semidefinite",
         ):
             AxisStateCovariance(0.0, 0.0, 1e-13)
+        with self.assertRaisesRegex(
+            ObservationValidationError,
+            "positive semidefinite",
+        ):
+            AxisStateCovariance(0.0, 0.0, math.ulp(0.0))
 
     def test_observation_requires_typed_values_and_bounded_frame_id(self):
         valid = observation(1.0, frame_id="camera/table_1")

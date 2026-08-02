@@ -38,7 +38,7 @@ Status terms and complete acceptance criteria are defined in the detailed-contra
 | M4A5 - Desired-versus-estimated-and-encoder joint display | `Tested` | Keep desired, active-target, estimate, and encoder channels distinct. |
 | M4A6 - Main-control workspace and named positions | `Tested` | Maintain tabbed controls and validated Start and Shutdown positions. |
 | M4A7 - Low-priority joint encoder telemetry | `Blocked` | Implementation remains in progress; powered acceptance prerequisites remain unmet. |
-| M4B - Repeatability and dynamic interception pass | `In progress` | Extend deterministic observation replay through bounded intercept selection. |
+| M4B - Repeatability and dynamic interception pass | `In progress` | Extend acceleration-aware replay toward local replanning. |
 | M5 - Controlled hardware validation | `Blocked` | Await the prerequisites defined by the controlled verification contract. |
 
 ## Verification records
@@ -1304,6 +1304,22 @@ Implemented foundation:
   a shared composed-timestamp tolerance, including the predictor's permitted
   clamp to a source timestamp within that tolerance. Predictor-advertised
   horizon magnitude cannot widen timestamp validation or past-target clamping.
+- `ConstantAccelerationEstimator` shares the validated observation-admission
+  boundary and requires three ordered samples before publishing an estimate.
+  The second accepted sample reports explicit warmup state. A long sample gap
+  resets the window, while rejected input and unrepresentable state leave the
+  accepted window unchanged. Unequal sample intervals produce acceleration and
+  terminal velocity at the newest observation timestamp.
+- Acceleration-aware estimates carry a positive-semidefinite per-axis
+  position, velocity, and acceleration covariance with every cross-covariance.
+  `ConstantAccelerationPredictor` propagates that full covariance under the
+  constant-acceleration state transition and adds caller-supplied independent
+  continuous white-jerk process noise. The bounded predictor preserves the
+  structural predictor timestamp, frame, horizon, and failure contracts. An
+  accelerated estimate requires acceleration-aware prediction output before
+  feasibility evaluation, so a velocity-only predictor fails explicitly. The
+  constant-velocity predictor also rejects accelerated estimates at its direct
+  call boundary instead of discarding acceleration state.
 - The versioned `ar4.observation-replay.v1` JSONL codec enforces strict UTF-8,
   exact fields, duplicate-key rejection, finite numeric domains, payload and
   record bounds, one coordinate frame, and ordered observation and receipt
@@ -1331,6 +1347,10 @@ Implemented foundation:
   invoking feasibility logic, bounds the total record-by-candidate evaluation
   workload, then recomputes an intercept selection after every estimate update
   using the matching receipt timestamp.
+- Recorded observation replay can own either the constant-velocity estimator
+  or the constant-acceleration estimator. Acceleration replay exposes warmup
+  steps without selection and recomputes intercept candidates only after a
+  complete acceleration estimate becomes available.
 - `ARrobots.trajectory_timing` generates deterministic symmetric seven-phase
   S-curves for rest-to-rest joint moves under caller-supplied positive velocity,
   acceleration, and jerk limits. The minimum single-axis profiles cover the
@@ -1345,13 +1365,13 @@ Implemented foundation:
   per-candidate covariance and speed thresholds, deterministic ranking,
   explicit feasibility rejections, arrival timing, stale and future estimates,
   callback and predictor failures, numeric precision limits, replay-driven
-  reselection, analytical trajectory regimes, synchronized time scaling, and
+  reselection, three-sample acceleration estimation, full covariance
+  propagation, analytical trajectory regimes, synchronized time scaling, and
   trajectory sampling. The injected feasibility boundary and trajectory limits
   are simulation input, not evidence of physical reachability or timing. No
-  controller command, live motion, calibrated transform, acceleration-aware
-  object prediction, production IK or collision engine, arbitrary-state or
-  online trajectory replacement, local path replanning, or grasp behavior is
-  included.
+  controller command, live motion, calibrated transform, production IK or
+  collision engine, impact-aware state filtering, arbitrary-state or online
+  trajectory replacement, local path replanning, or grasp behavior is included.
 
 ### M5 - Controlled hardware validation
 

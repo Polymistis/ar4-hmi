@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 from numbers import Integral, Real
-from typing import Optional, Protocol, Tuple
+from typing import Optional, Protocol, Tuple, TypeVar
 
 
 OBSERVATION_REPLAY_SCHEMA = "ar4.observation-replay.v1"
@@ -261,6 +261,10 @@ class AxisStateCovariance:
         covariance_limit = (
             math.sqrt(position_variance) * math.sqrt(velocity_variance)
         )
+        if covariance_limit == 0 and cross_covariance != 0:
+            raise ObservationValidationError(
+                "axis state covariance must be positive semidefinite"
+            )
         tolerance = _comparison_tolerance(
             covariance_limit,
             cross_covariance,
@@ -275,6 +279,97 @@ class AxisStateCovariance:
             self,
             "position_velocity_covariance",
             cross_covariance,
+        )
+
+
+def _bounded_correlation(first_variance, second_variance, covariance):
+    covariance_limit = (
+        math.sqrt(first_variance) * math.sqrt(second_variance)
+    )
+    if covariance_limit == 0:
+        if covariance != 0:
+            raise ObservationValidationError(
+                "axis acceleration covariance must be positive semidefinite"
+            )
+        return 0.0
+    tolerance = _comparison_tolerance(covariance_limit, covariance)
+    if abs(covariance) > covariance_limit + tolerance:
+        raise ObservationValidationError(
+            "axis acceleration covariance must be positive semidefinite"
+        )
+    return max(-1.0, min(1.0, covariance / covariance_limit))
+
+
+@dataclass(frozen=True)
+class AxisAccelerationStateCovariance(AxisStateCovariance):
+    acceleration_variance: float
+    position_acceleration_covariance: float
+    velocity_acceleration_covariance: float
+
+    def __post_init__(self):
+        super().__post_init__()
+        acceleration_variance = _nonnegative_number(
+            self.acceleration_variance,
+            "acceleration_variance",
+        )
+        position_acceleration_covariance = _finite_number(
+            self.position_acceleration_covariance,
+            "position_acceleration_covariance",
+        )
+        velocity_acceleration_covariance = _finite_number(
+            self.velocity_acceleration_covariance,
+            "velocity_acceleration_covariance",
+        )
+        correlations = (
+            _bounded_correlation(
+                self.position_variance,
+                self.velocity_variance,
+                self.position_velocity_covariance,
+            ),
+            _bounded_correlation(
+                self.position_variance,
+                acceleration_variance,
+                position_acceleration_covariance,
+            ),
+            _bounded_correlation(
+                self.velocity_variance,
+                acceleration_variance,
+                velocity_acceleration_covariance,
+            ),
+        )
+        position_velocity, position_acceleration, velocity_acceleration = (
+            correlations
+        )
+        determinant_terms = (
+            1.0,
+            2.0
+            * position_velocity
+            * position_acceleration
+            * velocity_acceleration,
+            -(position_velocity * position_velocity),
+            -(position_acceleration * position_acceleration),
+            -(velocity_acceleration * velocity_acceleration),
+        )
+        determinant = math.fsum(determinant_terms)
+        determinant_tolerance = _comparison_tolerance(*determinant_terms)
+        if determinant < -determinant_tolerance:
+            raise ObservationValidationError(
+                "axis acceleration covariance must be positive semidefinite"
+            )
+        object.__setattr__(
+            self,
+            "acceleration_variance",
+            acceleration_variance,
+        )
+        object.__setattr__(
+            self,
+            "position_acceleration_covariance",
+            position_acceleration_covariance,
+        )
+        object.__setattr__(
+            self,
+            "velocity_acceleration_covariance",
+            velocity_acceleration_covariance,
         )
 
 
@@ -300,6 +395,23 @@ class StateCovariance3:
         return DiagonalCovariance3(*(
             axis.position_variance for axis in self.axes()
         ))
+
+
+@dataclass(frozen=True)
+class AccelerationStateCovariance3(StateCovariance3):
+    x_axis: AxisAccelerationStateCovariance
+    y_axis: AxisAccelerationStateCovariance
+    z_axis: AxisAccelerationStateCovariance
+
+    def __post_init__(self):
+        if any(
+            not isinstance(axis, AxisAccelerationStateCovariance)
+            for axis in self.axes()
+        ):
+            raise ObservationValidationError(
+                "acceleration state covariance must contain three axis "
+                "covariances"
+            )
 
 
 @dataclass(frozen=True)
@@ -373,6 +485,33 @@ class MotionEstimate:
 
 
 @dataclass(frozen=True)
+class AcceleratedMotionEstimate(MotionEstimate):
+    covariance: AccelerationStateCovariance3
+    acceleration: Vector3
+    previous_sample_interval_seconds: float
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not isinstance(self.covariance, AccelerationStateCovariance3):
+            raise ObservationValidationError(
+                "accelerated estimate covariance must be "
+                "AccelerationStateCovariance3"
+            )
+        if not isinstance(self.acceleration, Vector3):
+            raise ObservationValidationError(
+                "accelerated estimate acceleration must be Vector3"
+            )
+        object.__setattr__(
+            self,
+            "previous_sample_interval_seconds",
+            _positive_number(
+                self.previous_sample_interval_seconds,
+                "estimate previous_sample_interval_seconds",
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class PredictedMotionState:
     source_timestamp_seconds: float
     timestamp_seconds: float
@@ -419,7 +558,37 @@ class PredictedMotionState:
         return self.timestamp_seconds - self.source_timestamp_seconds
 
 
-class MotionPredictor(Protocol):
+@dataclass(frozen=True)
+class AcceleratedPredictedMotionState(PredictedMotionState):
+    covariance: AccelerationStateCovariance3
+    acceleration: Vector3
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not isinstance(self.covariance, AccelerationStateCovariance3):
+            raise PredictionError(
+                "accelerated prediction covariance must be "
+                "AccelerationStateCovariance3"
+            )
+        if not isinstance(self.acceleration, Vector3):
+            raise PredictionError(
+                "accelerated prediction acceleration must be Vector3"
+            )
+
+
+_EstimateT = TypeVar(
+    "_EstimateT",
+    bound=MotionEstimate,
+    contravariant=True,
+)
+_PredictionT = TypeVar(
+    "_PredictionT",
+    bound=PredictedMotionState,
+    covariant=True,
+)
+
+
+class MotionPredictor(Protocol[_EstimateT, _PredictionT]):
     """Predictor advertising a positive finite maximum future horizon."""
 
     @property
@@ -429,15 +598,17 @@ class MotionPredictor(Protocol):
 
     def predict(
         self,
-        estimate: MotionEstimate,
+        estimate: _EstimateT,
         target_timestamp_seconds: float,
-    ) -> PredictedMotionState:
+    ) -> _PredictionT:
         """Predict at the request, allowing a tolerated clamp to the source."""
         ...
 
 
 @dataclass(frozen=True)
 class ConstantVelocityEstimatorConfig:
+    """Observation-admission timing shared by both deterministic estimators."""
+
     frame_id: str
     maximum_observation_age_seconds: float
     minimum_sample_interval_seconds: float
@@ -488,6 +659,7 @@ class ConstantVelocityEstimatorConfig:
 
 class EstimatorUpdateStatus(Enum):
     BASELINE_ACCEPTED = "baseline-accepted"
+    WARMUP_ACCEPTED = "warmup-accepted"
     BASELINE_RESET = "baseline-reset"
     ESTIMATE_UPDATED = "estimate-updated"
 
@@ -573,6 +745,74 @@ def _motion_estimate(previous, current):
     )
 
 
+def _validated_estimator_observation(
+    config,
+    previous,
+    previous_receipt,
+    observation,
+    received_at_seconds,
+):
+    if not isinstance(observation, PositionObservation):
+        raise ObservationValidationError(
+            "observation must be PositionObservation"
+        )
+    if observation.frame_id != config.frame_id:
+        raise ObservationValidationError(
+            "observation frame_id does not match the estimator frame"
+        )
+    received_at = _nonnegative_number(
+        received_at_seconds,
+        "received_at_seconds",
+    )
+    age = received_at - observation.timestamp_seconds
+    age_tolerance = _comparison_tolerance(
+        received_at,
+        observation.timestamp_seconds,
+        config.maximum_observation_age_seconds,
+        config.maximum_future_skew_seconds,
+    )
+    if age < -config.maximum_future_skew_seconds - age_tolerance:
+        raise FutureObservationError(
+            "observation timestamp exceeds the future-skew bound"
+        )
+    if age > config.maximum_observation_age_seconds + age_tolerance:
+        raise StaleObservationError(
+            "observation exceeds the maximum age"
+        )
+    if previous_receipt is not None:
+        receipt_tolerance = _comparison_tolerance(
+            received_at,
+            previous_receipt,
+        )
+        if received_at < previous_receipt - receipt_tolerance:
+            raise OutOfOrderObservationError(
+                "observation receipt timestamps must not move backward"
+            )
+        if received_at < previous_receipt:
+            received_at = previous_receipt
+    if previous is None:
+        return received_at, EstimatorUpdateStatus.BASELINE_ACCEPTED
+
+    interval = observation.timestamp_seconds - previous.timestamp_seconds
+    if interval <= 0:
+        raise OutOfOrderObservationError(
+            "observation timestamps must advance strictly"
+        )
+    interval_tolerance = _comparison_tolerance(
+        observation.timestamp_seconds,
+        previous.timestamp_seconds,
+        config.minimum_sample_interval_seconds,
+        config.maximum_sample_interval_seconds,
+    )
+    if interval < config.minimum_sample_interval_seconds - interval_tolerance:
+        raise ObservationValidationError(
+            "observation interval is below the configured minimum"
+        )
+    if interval > config.maximum_sample_interval_seconds + interval_tolerance:
+        return received_at, EstimatorUpdateStatus.BASELINE_RESET
+    return received_at, None
+
+
 class ConstantVelocityEstimator:
     """Single-owner, bounded two-observation constant-velocity estimator."""
 
@@ -608,95 +848,23 @@ class ConstantVelocityEstimator:
         self._estimate = None
 
     def add_observation(self, observation, received_at_seconds):
-        if not isinstance(observation, PositionObservation):
-            raise ObservationValidationError(
-                "observation must be PositionObservation"
-            )
-        if observation.frame_id != self._config.frame_id:
-            raise ObservationValidationError(
-                "observation frame_id does not match the estimator frame"
-            )
-        received_at = _nonnegative_number(
+        received_at, baseline_status = _validated_estimator_observation(
+            self._config,
+            self._last_observation,
+            self._last_received_at_seconds,
+            observation,
             received_at_seconds,
-            "received_at_seconds",
         )
-        age = received_at - observation.timestamp_seconds
-        age_tolerance = _comparison_tolerance(
-            received_at,
-            observation.timestamp_seconds,
-            self._config.maximum_observation_age_seconds,
-            self._config.maximum_future_skew_seconds,
-        )
-        if (
-            age
-            < -self._config.maximum_future_skew_seconds - age_tolerance
-        ):
-            raise FutureObservationError(
-                "observation timestamp exceeds the future-skew bound"
-            )
-        if (
-            age
-            > self._config.maximum_observation_age_seconds + age_tolerance
-        ):
-            raise StaleObservationError(
-                "observation exceeds the maximum age"
-            )
-        previous_receipt = self._last_received_at_seconds
-        if previous_receipt is not None:
-            receipt_tolerance = _comparison_tolerance(
-                received_at,
-                previous_receipt,
-            )
-            if received_at < previous_receipt - receipt_tolerance:
-                raise OutOfOrderObservationError(
-                    "observation receipt timestamps must not move backward"
-                )
-            if received_at < previous_receipt:
-                received_at = previous_receipt
-
-        previous = self._last_observation
-        if previous is None:
+        if baseline_status is not None:
             self._last_observation = observation
             self._last_received_at_seconds = received_at
             self._estimate = None
             return EstimatorUpdate(
-                EstimatorUpdateStatus.BASELINE_ACCEPTED,
+                baseline_status,
                 observation,
             )
 
-        interval = observation.timestamp_seconds - previous.timestamp_seconds
-        if interval <= 0:
-            raise OutOfOrderObservationError(
-                "observation timestamps must advance strictly"
-            )
-        interval_tolerance = _comparison_tolerance(
-            observation.timestamp_seconds,
-            previous.timestamp_seconds,
-            self._config.minimum_sample_interval_seconds,
-            self._config.maximum_sample_interval_seconds,
-        )
-        if (
-            interval
-            < self._config.minimum_sample_interval_seconds
-            - interval_tolerance
-        ):
-            raise ObservationValidationError(
-                "observation interval is below the configured minimum"
-            )
-        if (
-            interval
-            > self._config.maximum_sample_interval_seconds
-            + interval_tolerance
-        ):
-            self._last_observation = observation
-            self._last_received_at_seconds = received_at
-            self._estimate = None
-            return EstimatorUpdate(
-                EstimatorUpdateStatus.BASELINE_RESET,
-                observation,
-            )
-
-        estimate = _motion_estimate(previous, observation)
+        estimate = _motion_estimate(self._last_observation, observation)
         self._last_observation = observation
         self._last_received_at_seconds = received_at
         self._estimate = estimate
@@ -705,6 +873,406 @@ class ConstantVelocityEstimator:
             observation,
             estimate,
         )
+
+
+def _finite_sum(values, field_name):
+    terms = tuple(_finite_number(value, field_name) for value in values)
+    try:
+        total = math.fsum(terms)
+    except (OverflowError, ValueError) as exc:
+        raise ObservationValidationError(
+            f"{field_name} is outside the host numeric range"
+        ) from exc
+    return _finite_number(total, field_name)
+
+
+def _finite_nonzero_product(values, field_name):
+    """Return an exact-zero product and reject nonzero range loss."""
+
+    factors = tuple(_finite_number(value, field_name) for value in values)
+    if any(factor == 0 for factor in factors):
+        return 0.0
+    sign = 1.0
+    significand = 1.0
+    exponent = 0
+    for factor in factors:
+        if factor < 0:
+            sign = -sign
+        factor_significand, factor_exponent = math.frexp(abs(factor))
+        significand *= factor_significand
+        significand, normalization_exponent = math.frexp(significand)
+        exponent += factor_exponent + normalization_exponent
+    try:
+        product = math.ldexp(sign * significand, exponent)
+    except OverflowError as exc:
+        raise ObservationValidationError(
+            f"{field_name} is outside the host numeric range"
+        ) from exc
+    product = _finite_number(product, field_name)
+    if product == 0:
+        raise ObservationValidationError(
+            f"{field_name} is outside the host numeric range"
+        )
+    return product
+
+
+def _finite_ratio(numerator, denominator, field_name):
+    numerator = _finite_number(numerator, field_name)
+    denominator = _finite_number(denominator, field_name)
+    if denominator == 0:
+        raise ObservationValidationError(f"{field_name} divisor must be nonzero")
+    result = _finite_number(numerator / denominator, field_name)
+    if numerator != 0 and result == 0:
+        raise ObservationValidationError(
+            f"{field_name} is outside the host numeric range"
+        )
+    return result
+
+
+def _linear_variance(coefficients, variances, field_name):
+    terms = []
+    for coefficient, variance in zip(coefficients, variances):
+        term = _finite_nonzero_product(
+            (coefficient, coefficient, variance),
+            field_name,
+        )
+        terms.append(term)
+    return _finite_sum(terms, field_name)
+
+
+def _linear_covariance(
+    first_coefficients,
+    second_coefficients,
+    variances,
+    field_name,
+):
+    terms = []
+    for first, second, variance in zip(
+        first_coefficients,
+        second_coefficients,
+        variances,
+    ):
+        term = _finite_nonzero_product(
+            (first, second, variance),
+            field_name,
+        )
+        terms.append(term)
+    return _finite_sum(terms, field_name)
+
+
+def _acceleration_estimate_coefficients(previous_interval, current_interval):
+    span = _finite_sum(
+        (previous_interval, current_interval),
+        "acceleration sample span",
+    )
+    previous_inverse = _finite_number(
+        1.0 / previous_interval,
+        "previous sample interval reciprocal",
+    )
+    current_inverse = _finite_number(
+        1.0 / current_interval,
+        "current sample interval reciprocal",
+    )
+    acceleration_scale = _finite_number(
+        2.0 / span,
+        "acceleration sample scale",
+    )
+    acceleration_coefficients = (
+        _finite_nonzero_product(
+            (acceleration_scale, previous_inverse),
+            "acceleration coefficient",
+        ),
+        -_finite_nonzero_product(
+            (
+                acceleration_scale,
+                _finite_sum(
+                    (previous_inverse, current_inverse),
+                    "acceleration reciprocal sum",
+                ),
+            ),
+            "acceleration coefficient",
+        ),
+        _finite_nonzero_product(
+            (acceleration_scale, current_inverse),
+            "acceleration coefficient",
+        ),
+    )
+    half_current_interval = _finite_nonzero_product(
+        (0.5, current_interval),
+        "half current sample interval",
+    )
+    velocity_coefficients = (
+        _finite_nonzero_product(
+            (half_current_interval, acceleration_coefficients[0]),
+            "velocity coefficient",
+        ),
+        _finite_sum(
+            (
+                -current_inverse,
+                _finite_nonzero_product(
+                    (half_current_interval, acceleration_coefficients[1]),
+                    "velocity coefficient",
+                ),
+            ),
+            "velocity coefficient",
+        ),
+        _finite_sum(
+            (
+                current_inverse,
+                _finite_nonzero_product(
+                    (half_current_interval, acceleration_coefficients[2]),
+                    "velocity coefficient",
+                ),
+            ),
+            "velocity coefficient",
+        ),
+    )
+    return velocity_coefficients, acceleration_coefficients
+
+
+def _accelerated_axis_state(
+    first_position,
+    second_position,
+    current_position,
+    previous_interval,
+    current_interval,
+):
+    previous_velocity = _finite_ratio(
+        _finite_sum(
+            (second_position, -first_position),
+            "previous position delta",
+        ),
+        previous_interval,
+        "previous interval velocity",
+    )
+    current_velocity = _finite_ratio(
+        _finite_sum(
+            (current_position, -second_position),
+            "current position delta",
+        ),
+        current_interval,
+        "current interval velocity",
+    )
+    sample_span = _finite_sum(
+        (previous_interval, current_interval),
+        "acceleration sample span",
+    )
+    acceleration = _finite_ratio(
+        _finite_nonzero_product(
+            (
+                2.0,
+                _finite_sum(
+                    (current_velocity, -previous_velocity),
+                    "interval velocity delta",
+                ),
+            ),
+            "estimated acceleration",
+        ),
+        sample_span,
+        "estimated acceleration",
+    )
+    terminal_velocity = _finite_sum(
+        (
+            current_velocity,
+            _finite_nonzero_product(
+                (0.5, acceleration, current_interval),
+                "estimated terminal velocity",
+            ),
+        ),
+        "estimated terminal velocity",
+    )
+    return terminal_velocity, acceleration
+
+
+def _axis_acceleration_covariance(
+    variances,
+    velocity_coefficients,
+    acceleration_coefficients,
+):
+    position_coefficients = (0.0, 0.0, 1.0)
+    return AxisAccelerationStateCovariance(
+        position_variance=variances[2],
+        velocity_variance=_linear_variance(
+            velocity_coefficients,
+            variances,
+            "estimated velocity variance",
+        ),
+        position_velocity_covariance=_linear_covariance(
+            position_coefficients,
+            velocity_coefficients,
+            variances,
+            "estimated position-velocity covariance",
+        ),
+        acceleration_variance=_linear_variance(
+            acceleration_coefficients,
+            variances,
+            "estimated acceleration variance",
+        ),
+        position_acceleration_covariance=_linear_covariance(
+            position_coefficients,
+            acceleration_coefficients,
+            variances,
+            "estimated position-acceleration covariance",
+        ),
+        velocity_acceleration_covariance=_linear_covariance(
+            velocity_coefficients,
+            acceleration_coefficients,
+            variances,
+            "estimated velocity-acceleration covariance",
+        ),
+    )
+
+
+def _accelerated_motion_estimate(first, second, current):
+    previous_interval = second.timestamp_seconds - first.timestamp_seconds
+    current_interval = current.timestamp_seconds - second.timestamp_seconds
+    velocity_coefficients, acceleration_coefficients = (
+        _acceleration_estimate_coefficients(
+            previous_interval,
+            current_interval,
+        )
+    )
+    states = tuple(
+        _accelerated_axis_state(
+            first_position,
+            second_position,
+            current_position,
+            previous_interval,
+            current_interval,
+        )
+        for first_position, second_position, current_position in zip(
+            first.position.components(),
+            second.position.components(),
+            current.position.components(),
+        )
+    )
+    covariance = AccelerationStateCovariance3(*(
+        _axis_acceleration_covariance(
+            variances,
+            velocity_coefficients,
+            acceleration_coefficients,
+        )
+        for variances in zip(
+            first.position_variance.components(),
+            second.position_variance.components(),
+            current.position_variance.components(),
+        )
+    ))
+    return AcceleratedMotionEstimate(
+        timestamp_seconds=current.timestamp_seconds,
+        frame_id=current.frame_id,
+        position=current.position,
+        velocity=Vector3(*(state[0] for state in states)),
+        covariance=covariance,
+        sample_interval_seconds=current_interval,
+        acceleration=Vector3(*(state[1] for state in states)),
+        previous_sample_interval_seconds=previous_interval,
+    )
+
+
+class ConstantAccelerationEstimator:
+    """Single-owner, bounded three-observation acceleration estimator."""
+
+    def __init__(self, config):
+        if not isinstance(config, ConstantVelocityEstimatorConfig):
+            raise ObservationValidationError(
+                "estimator config must be ConstantVelocityEstimatorConfig, "
+                "the shared observation-admission config"
+            )
+        self._config = config
+        self._observations = ()
+        self._last_received_at_seconds = None
+        self._estimate = None
+
+    @property
+    def config(self):
+        return self._config
+
+    @property
+    def last_observation(self):
+        if not self._observations:
+            return None
+        return self._observations[-1]
+
+    @property
+    def estimate(self):
+        return self._estimate
+
+    @property
+    def last_received_at_seconds(self):
+        return self._last_received_at_seconds
+
+    def reset(self):
+        self._observations = ()
+        self._last_received_at_seconds = None
+        self._estimate = None
+
+    def add_observation(self, observation, received_at_seconds):
+        received_at, baseline_status = _validated_estimator_observation(
+            self._config,
+            self.last_observation,
+            self._last_received_at_seconds,
+            observation,
+            received_at_seconds,
+        )
+        if baseline_status is not None:
+            self._observations = (observation,)
+            self._last_received_at_seconds = received_at
+            self._estimate = None
+            return EstimatorUpdate(baseline_status, observation)
+
+        candidate_observations = (*self._observations, observation)
+        if len(candidate_observations) < 3:
+            self._observations = candidate_observations
+            self._last_received_at_seconds = received_at
+            self._estimate = None
+            return EstimatorUpdate(
+                EstimatorUpdateStatus.WARMUP_ACCEPTED,
+                observation,
+            )
+
+        estimate = _accelerated_motion_estimate(*candidate_observations)
+        self._observations = candidate_observations[-2:]
+        self._last_received_at_seconds = received_at
+        self._estimate = estimate
+        return EstimatorUpdate(
+            EstimatorUpdateStatus.ESTIMATE_UPDATED,
+            observation,
+            estimate,
+        )
+
+
+def _validated_prediction_request(
+    source_timestamp_seconds,
+    target_timestamp_seconds,
+    maximum_horizon_seconds,
+):
+    target_timestamp = _prediction_number(
+        target_timestamp_seconds,
+        "target_timestamp_seconds",
+    )
+    horizon = target_timestamp - source_timestamp_seconds
+    source_tolerance = prediction_timestamp_tolerance(
+        source_timestamp_seconds,
+        target_timestamp,
+    )
+    if horizon < -source_tolerance:
+        raise PredictionError(
+            "target timestamp must not precede the estimate"
+        )
+    if horizon < 0:
+        horizon = 0.0
+        target_timestamp = source_timestamp_seconds
+    horizon_tolerance = _comparison_tolerance(
+        target_timestamp,
+        source_timestamp_seconds,
+        maximum_horizon_seconds,
+    )
+    if horizon > maximum_horizon_seconds + horizon_tolerance:
+        raise PredictionError(
+            "prediction horizon exceeds the configured maximum"
+        )
+    return target_timestamp, horizon
 
 
 @dataclass(frozen=True)
@@ -731,33 +1299,18 @@ class ConstantVelocityPredictor:
             )
 
     def predict(self, estimate, target_timestamp_seconds):
-        if not isinstance(estimate, MotionEstimate):
-            raise PredictionError("estimate must be MotionEstimate")
-        target_timestamp = _prediction_number(
-            target_timestamp_seconds,
-            "target_timestamp_seconds",
-        )
-        horizon = target_timestamp - estimate.timestamp_seconds
-        source_tolerance = prediction_timestamp_tolerance(
-            estimate.timestamp_seconds,
-            target_timestamp,
-        )
-        if horizon < -source_tolerance:
+        if (
+            not isinstance(estimate, MotionEstimate)
+            or isinstance(estimate, AcceleratedMotionEstimate)
+        ):
             raise PredictionError(
-                "target timestamp must not precede the estimate"
+                "estimate must be a non-accelerated MotionEstimate"
             )
-        if horizon < 0:
-            horizon = 0.0
-            target_timestamp = estimate.timestamp_seconds
-        horizon_tolerance = _comparison_tolerance(
-            target_timestamp,
+        target_timestamp, horizon = _validated_prediction_request(
             estimate.timestamp_seconds,
+            target_timestamp_seconds,
             self.maximum_horizon_seconds,
         )
-        if horizon > self.maximum_horizon_seconds + horizon_tolerance:
-            raise PredictionError(
-                "prediction horizon exceeds the configured maximum"
-            )
 
         try:
             position = Vector3(*(
@@ -817,6 +1370,285 @@ class ConstantVelocityPredictor:
                 position=position,
                 velocity=estimate.velocity,
                 covariance=StateCovariance3(*predicted_axes),
+            )
+        except ObservationValidationError as exc:
+            raise PredictionError(
+                f"predicted state cannot be represented: {exc}"
+            ) from exc
+
+
+def _nonnegative_covariance_sum(values, field_name):
+    terms = tuple(_finite_number(value, field_name) for value in values)
+    total = _finite_sum(terms, field_name)
+    tolerance = _comparison_tolerance(*terms)
+    if total < -tolerance:
+        raise ObservationValidationError(
+            f"{field_name} must be non-negative"
+        )
+    return max(0.0, total)
+
+
+def _predicted_acceleration_covariance(
+    axis,
+    process_variance,
+    horizon,
+):
+    horizon_squared = _finite_nonzero_product(
+        (horizon, horizon),
+        "prediction horizon power",
+    )
+    horizon_cubed = _finite_nonzero_product(
+        (horizon_squared, horizon),
+        "prediction horizon power",
+    )
+    horizon_fourth = _finite_nonzero_product(
+        (horizon_cubed, horizon),
+        "prediction horizon power",
+    )
+    horizon_fifth = _finite_nonzero_product(
+        (horizon_fourth, horizon),
+        "prediction horizon power",
+    )
+    return AxisAccelerationStateCovariance(
+        position_variance=_nonnegative_covariance_sum(
+            (
+                axis.position_variance,
+                _finite_nonzero_product(
+                    (
+                        2.0,
+                        horizon,
+                        axis.position_velocity_covariance,
+                    ),
+                    "predicted position variance term",
+                ),
+                _finite_nonzero_product(
+                    (horizon_squared, axis.velocity_variance),
+                    "predicted position variance term",
+                ),
+                _finite_nonzero_product(
+                    (
+                        horizon_squared,
+                        axis.position_acceleration_covariance,
+                    ),
+                    "predicted position variance term",
+                ),
+                _finite_nonzero_product(
+                    (
+                        horizon_cubed,
+                        axis.velocity_acceleration_covariance,
+                    ),
+                    "predicted position variance term",
+                ),
+                _finite_nonzero_product(
+                    (0.25, horizon_fourth, axis.acceleration_variance),
+                    "predicted position variance term",
+                ),
+                _finite_nonzero_product(
+                    (process_variance, horizon_fifth, 1.0 / 20.0),
+                    "predicted position variance term",
+                ),
+            ),
+            "predicted position variance",
+        ),
+        velocity_variance=_nonnegative_covariance_sum(
+            (
+                axis.velocity_variance,
+                _finite_nonzero_product(
+                    (
+                        2.0,
+                        horizon,
+                        axis.velocity_acceleration_covariance,
+                    ),
+                    "predicted velocity variance term",
+                ),
+                _finite_nonzero_product(
+                    (horizon_squared, axis.acceleration_variance),
+                    "predicted velocity variance term",
+                ),
+                _finite_nonzero_product(
+                    (process_variance, horizon_cubed, 1.0 / 3.0),
+                    "predicted velocity variance term",
+                ),
+            ),
+            "predicted velocity variance",
+        ),
+        position_velocity_covariance=_finite_sum(
+            (
+                axis.position_velocity_covariance,
+                _finite_nonzero_product(
+                    (
+                        horizon,
+                        axis.position_acceleration_covariance,
+                    ),
+                    "predicted position-velocity covariance term",
+                ),
+                _finite_nonzero_product(
+                    (horizon, axis.velocity_variance),
+                    "predicted position-velocity covariance term",
+                ),
+                _finite_nonzero_product(
+                    (
+                        1.5,
+                        horizon_squared,
+                        axis.velocity_acceleration_covariance,
+                    ),
+                    "predicted position-velocity covariance term",
+                ),
+                _finite_nonzero_product(
+                    (0.5, horizon_cubed, axis.acceleration_variance),
+                    "predicted position-velocity covariance term",
+                ),
+                _finite_nonzero_product(
+                    (process_variance, horizon_fourth, 1.0 / 8.0),
+                    "predicted position-velocity covariance term",
+                ),
+            ),
+            "predicted position-velocity covariance",
+        ),
+        acceleration_variance=_nonnegative_covariance_sum(
+            (
+                axis.acceleration_variance,
+                _finite_nonzero_product(
+                    (process_variance, horizon),
+                    "predicted acceleration variance term",
+                ),
+            ),
+            "predicted acceleration variance",
+        ),
+        position_acceleration_covariance=_finite_sum(
+            (
+                axis.position_acceleration_covariance,
+                _finite_nonzero_product(
+                    (
+                        horizon,
+                        axis.velocity_acceleration_covariance,
+                    ),
+                    "predicted position-acceleration covariance term",
+                ),
+                _finite_nonzero_product(
+                    (0.5, horizon_squared, axis.acceleration_variance),
+                    "predicted position-acceleration covariance term",
+                ),
+                _finite_nonzero_product(
+                    (process_variance, horizon_cubed, 1.0 / 6.0),
+                    "predicted position-acceleration covariance term",
+                ),
+            ),
+            "predicted position-acceleration covariance",
+        ),
+        velocity_acceleration_covariance=_finite_sum(
+            (
+                axis.velocity_acceleration_covariance,
+                _finite_nonzero_product(
+                    (horizon, axis.acceleration_variance),
+                    "predicted velocity-acceleration covariance term",
+                ),
+                _finite_nonzero_product(
+                    (process_variance, horizon_squared, 0.5),
+                    "predicted velocity-acceleration covariance term",
+                ),
+            ),
+            "predicted velocity-acceleration covariance",
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class ConstantAccelerationPredictor:
+    """Propagate acceleration with white-jerk density in mm^2/s^5."""
+
+    maximum_horizon_seconds: float
+    process_acceleration_variance_per_second: DiagonalCovariance3
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "maximum_horizon_seconds",
+            _prediction_number(
+                self.maximum_horizon_seconds,
+                "maximum_horizon_seconds",
+                positive=True,
+            ),
+        )
+        if not isinstance(
+            self.process_acceleration_variance_per_second,
+            DiagonalCovariance3,
+        ):
+            raise PredictionError(
+                "process noise must be DiagonalCovariance3"
+            )
+
+    def predict(self, estimate, target_timestamp_seconds):
+        if not isinstance(estimate, AcceleratedMotionEstimate):
+            raise PredictionError(
+                "estimate must be AcceleratedMotionEstimate"
+            )
+        target_timestamp, horizon = _validated_prediction_request(
+            estimate.timestamp_seconds,
+            target_timestamp_seconds,
+            self.maximum_horizon_seconds,
+        )
+        try:
+            horizon_squared = _finite_nonzero_product(
+                (horizon, horizon),
+                "prediction horizon power",
+            )
+            position = Vector3(*(
+                _finite_sum(
+                    (
+                        current,
+                        _finite_nonzero_product(
+                            (velocity, horizon),
+                            "predicted position term",
+                        ),
+                        _finite_nonzero_product(
+                            (0.5, acceleration, horizon_squared),
+                            "predicted position term",
+                        ),
+                    ),
+                    "predicted position",
+                )
+                for current, velocity, acceleration in zip(
+                    estimate.position.components(),
+                    estimate.velocity.components(),
+                    estimate.acceleration.components(),
+                )
+            ))
+            velocity = Vector3(*(
+                _finite_sum(
+                    (
+                        current,
+                        _finite_nonzero_product(
+                            (acceleration, horizon),
+                            "predicted velocity term",
+                        ),
+                    ),
+                    "predicted velocity",
+                )
+                for current, acceleration in zip(
+                    estimate.velocity.components(),
+                    estimate.acceleration.components(),
+                )
+            ))
+            covariance = AccelerationStateCovariance3(*(
+                _predicted_acceleration_covariance(
+                    axis,
+                    process_variance,
+                    horizon,
+                )
+                for axis, process_variance in zip(
+                    estimate.covariance.axes(),
+                    self.process_acceleration_variance_per_second.components(),
+                )
+            ))
+            return AcceleratedPredictedMotionState(
+                source_timestamp_seconds=estimate.timestamp_seconds,
+                timestamp_seconds=target_timestamp,
+                frame_id=estimate.frame_id,
+                position=position,
+                velocity=velocity,
+                covariance=covariance,
+                acceleration=estimate.acceleration,
             )
         except ObservationValidationError as exc:
             raise PredictionError(
@@ -884,6 +1716,15 @@ class ObservationReplay:
     def frame_id(self):
         return self.samples[0].observation.frame_id
 
+    def _run_estimator(self, estimator):
+        return tuple(
+            estimator.add_observation(
+                sample.observation,
+                sample.received_at_seconds,
+            )
+            for sample in self.samples
+        )
+
     def run(self, estimator_config):
         if not isinstance(
             estimator_config,
@@ -892,13 +1733,21 @@ class ObservationReplay:
             raise ObservationValidationError(
                 "replay config must be ConstantVelocityEstimatorConfig"
             )
-        estimator = ConstantVelocityEstimator(estimator_config)
-        return tuple(
-            estimator.add_observation(
-                sample.observation,
-                sample.received_at_seconds,
+        return self._run_estimator(
+            ConstantVelocityEstimator(estimator_config)
+        )
+
+    def run_constant_acceleration(self, estimator_config):
+        if not isinstance(
+            estimator_config,
+            ConstantVelocityEstimatorConfig,
+        ):
+            raise ObservationValidationError(
+                "replay config must be ConstantVelocityEstimatorConfig, "
+                "the shared observation-admission config"
             )
-            for sample in self.samples
+        return self._run_estimator(
+            ConstantAccelerationEstimator(estimator_config)
         )
 
 

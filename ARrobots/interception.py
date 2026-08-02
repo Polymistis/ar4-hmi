@@ -9,6 +9,8 @@ from numbers import Integral, Real
 from typing import Optional, Tuple
 
 from ARrobots.dynamic_motion import (
+    AcceleratedMotionEstimate,
+    AcceleratedPredictedMotionState,
     ConstantVelocityEstimatorConfig,
     DynamicMotionError,
     EstimatorUpdate,
@@ -143,6 +145,13 @@ def _candidate_lead_times(minimum_lead, maximum_lead, interval):
             "lead-time range exceeds the maximum candidate count"
         )
     return tuple(values)
+
+
+def _prediction_preserves_estimate_state(estimate, prediction):
+    return (
+        not isinstance(estimate, AcceleratedMotionEstimate)
+        or isinstance(prediction, AcceleratedPredictedMotionState)
+    )
 
 
 class InterceptFeasibilityStatus(Enum):
@@ -371,6 +380,14 @@ class InterceptSelection:
         previous_timestamp = None
         for candidate in candidates:
             prediction = candidate.prediction
+            if not _prediction_preserves_estimate_state(
+                self.estimate,
+                prediction,
+            ):
+                raise InterceptSelectionError(
+                    "candidate prediction does not preserve selection "
+                    "estimate state"
+                )
             if (
                 prediction.frame_id != self.estimate.frame_id
                 or prediction.source_timestamp_seconds
@@ -699,6 +716,11 @@ class InterceptSelector:
             raise InterceptSelectionError(
                 f"candidate {candidate_index} prediction output is invalid"
             )
+        if not _prediction_preserves_estimate_state(estimate, prediction):
+            raise InterceptSelectionError(
+                f"candidate {candidate_index} prediction output does not "
+                "preserve acceleration state"
+            )
         if prediction.source_timestamp_seconds != estimate.timestamp_seconds:
             raise InterceptSelectionError(
                 f"candidate {candidate_index} prediction source is invalid"
@@ -972,13 +994,11 @@ class ReplayInterceptStep:
             return
         if self.selection is not None:
             raise InterceptSelectionError(
-                "baseline replay step must not carry intercept selection"
+                "non-estimate replay step must not carry intercept selection"
             )
 
 
-def select_replay_intercepts(replay, estimator_config, selector):
-    """Re-estimate every replay observation and select after each estimate."""
-
+def _validate_replay_selection_inputs(replay, estimator_config, selector):
     if not isinstance(replay, ObservationReplay):
         raise InterceptSelectionError("replay must be ObservationReplay")
     if not isinstance(estimator_config, ConstantVelocityEstimatorConfig):
@@ -996,7 +1016,8 @@ def select_replay_intercepts(replay, estimator_config, selector):
             "replay and estimator frames must match"
         )
 
-    updates = replay.run(estimator_config)
+
+def _select_replay_updates(replay, updates, selector):
     estimated_update_count = sum(
         update.status is EstimatorUpdateStatus.ESTIMATE_UPDATED
         for update in updates
@@ -1026,3 +1047,29 @@ def select_replay_intercepts(replay, estimator_config, selector):
             selection=selection,
         ))
     return tuple(steps)
+
+
+def select_replay_intercepts(replay, estimator_config, selector):
+    """Re-estimate replay observations and select after velocity estimates."""
+
+    _validate_replay_selection_inputs(replay, estimator_config, selector)
+    return _select_replay_updates(
+        replay,
+        replay.run(estimator_config),
+        selector,
+    )
+
+
+def select_acceleration_replay_intercepts(
+    replay,
+    estimator_config,
+    selector,
+):
+    """Re-estimate replay observations and select after acceleration estimates."""
+
+    _validate_replay_selection_inputs(replay, estimator_config, selector)
+    return _select_replay_updates(
+        replay,
+        replay.run_constant_acceleration(estimator_config),
+        selector,
+    )

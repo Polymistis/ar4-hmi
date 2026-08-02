@@ -107,30 +107,42 @@ Repeat targets from consistent and reversed approach directions to expose hyster
 
 ## Implemented deterministic foundation
 
-`ARrobots.dynamic_motion` provides a hardware-free object-state estimator and
-replay boundary. The current model uses two ordered position observations to
-calculate constant velocity. Each observation carries an explicit
-coordinate-frame name, monotonic source timestamp, and diagonal position
-variance. Measurement errors are assumed independent across observations and
-coordinate axes; later camera calibration and estimator work must replace that
-assumption when correlated uncertainty becomes available.
+`ARrobots.dynamic_motion` provides hardware-free constant-velocity and
+constant-acceleration object-state estimators behind the same observation and
+replay boundary. Each observation carries an explicit coordinate-frame name,
+monotonic source timestamp, and diagonal position variance. Measurement errors
+are assumed independent across observations and coordinate axes; later camera
+calibration and filtered-estimator work must replace that assumption when
+correlated measurement uncertainty becomes available.
 
 Estimator configuration bounds observation age, future clock skew, minimum
 sample interval, and maximum sample interval. Rejected observations leave the
 active baseline and estimate unchanged. A gap beyond the configured maximum
 accepts the new observation only as a replacement baseline, making model reset
-visible to the caller. The predictor uses a bounded future timestamp, preserves
-constant velocity, propagates position/velocity covariance, and adds configured
-diagonal position-process variance per second. Intercept selection depends on
-the structural `MotionPredictor` contract rather than the constant-velocity
-class. The selector validates the advertised maximum horizon during
-construction and before every candidate prediction, so a mutable predictor
-cannot silently void the coverage check. Every result's type, source timestamp,
-coordinate frame, and requested timestamp within the shared composed-timestamp
-tolerance are also validated. Predictor and selector use that same band for
-numerically earlier requests and returned timestamps. Advertised horizon
-magnitude cannot widen the band, and a request outside the band fails instead
-of clamping to the source timestamp.
+visible to the caller. The two-observation estimator publishes constant
+velocity. The three-observation estimator reports an explicit warmup step after
+the second sample, then calculates acceleration and terminal velocity at the
+newest timestamp across equal or unequal sample intervals.
+
+The constant-velocity predictor uses a bounded future timestamp, preserves
+velocity, propagates position/velocity covariance, and adds configured diagonal
+position-process variance per second. The acceleration-aware estimate carries
+per-axis position, velocity, and acceleration variance plus all corresponding
+cross-covariances. Its predictor propagates that full state covariance and adds
+independent continuous white-jerk process noise supplied by the caller. The
+process-noise input is acceleration-variance growth in `mm^2/s^5`.
+Intercept selection depends on the structural `MotionPredictor` contract rather
+than either concrete predictor class. The selector validates the advertised
+maximum horizon during construction and before every candidate prediction, so
+a mutable predictor cannot silently void the coverage check. Every result's
+type, source timestamp, coordinate frame, and requested timestamp within the
+shared composed-timestamp tolerance are also validated. Predictor and selector
+use that same band for numerically earlier requests and returned timestamps.
+Advertised horizon magnitude cannot widen the band, and a request outside the
+band fails instead of clamping to the source timestamp.
+An accelerated estimate must produce an acceleration-aware predicted state;
+the selector rejects a velocity-only result before feasibility evaluation, and
+the constant-velocity predictor rejects an accelerated estimate directly.
 
 Recorded input uses canonical JSONL schema `ar4.observation-replay.v1`. The
 first record is the exact header:
@@ -153,9 +165,11 @@ accepts LF or CRLF, and canonical re-encoding normalizes either form to LF;
 byte-level hashes therefore identify encoded files rather than logical replay
 equivalence.
 
-Current object-model scope stops before acceleration estimation, transforms,
-innovation tests, impacts, production reachability, IK, collision checking,
-controller setpoint replacement, or grasp supervision. No live-arm result is
+Current object-model scope stops before calibrated transforms, innovation-based
+outlier filtering, impact models, jerk estimation, production reachability, IK,
+collision checking, controller setpoint replacement, or grasp supervision. The
+three-sample acceleration estimate is a deterministic finite-difference model,
+not a claim of camera or live-object tracking accuracy. No live-arm result is
 established by the deterministic module or associated tests.
 
 ## Implemented deterministic intercept selection
@@ -183,14 +197,16 @@ Stale and future estimates return explicit non-selected statuses without
 invoking the evaluator. Exceptions or malformed evaluator output fail the
 selection boundary.
 
-`select_replay_intercepts` validates the complete recorded estimator sequence
-and the bounded record-by-candidate workload before feasibility evaluation,
-then recomputes selection after every estimate update. That behavior exercises
-deterministic target reselection after new observations; no geometric path,
-controller setpoint, or grasp is generated. The injected evaluator provides
-simulation decisions only and does not establish physical reachability,
-collision clearance, singularity margin, joint-limit compliance, or arrival
-performance.
+`select_replay_intercepts` and `select_acceleration_replay_intercepts` validate
+the complete recorded estimator sequence and the bounded
+record-by-candidate workload before feasibility evaluation, then recompute
+selection after every applicable estimate update. Acceleration replay retains
+the initial baseline and warmup steps without invoking feasibility. That
+behavior exercises deterministic target reselection after new observations; no
+geometric path, controller setpoint, or grasp is generated. The injected
+evaluator provides simulation decisions only and does not establish physical
+reachability, collision clearance, singularity margin, joint-limit compliance,
+or arrival performance.
 
 ## Implemented rest-to-rest trajectory timing
 
