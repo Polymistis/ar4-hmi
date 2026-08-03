@@ -266,6 +266,50 @@ watchdog contract. No running firmware path accepts these segments or replaces
 a setpoint during motion. Deterministic construction and sampling establish a
 hardware-free replanning primitive only, not safe or achievable arm motion.
 
+## Implemented feedback-replanning coordinator
+
+`ARrobots.feedback_replanning` connects the constant-acceleration estimator,
+caller-supplied intercept selector, correlated joint-target resolution, and
+desired-trajectory
+replacement in a single-owner hardware-free coordinator. Baseline and warmup
+updates hold the current desired trajectory. A long-gap estimator reset has a
+distinct hold disposition. No-feasible, stale-estimate, and future-estimate
+selections produce distinct hold events without calling the joint-target
+resolver.
+
+A selected-only deep snapshot is passed to one synchronous injected resolver.
+Resolver output carries the estimate, evaluation, and intercept timestamps
+plus one to nine joint boundary states. All timestamps must match the selected
+candidate, and the axis count must match a validated snapshot of the active
+desired trajectory. The replacement duration comes from the selected intercept
+time.
+Completed active trajectories hold the terminal desired state before the next
+segment starts. A successful replacement advances a monotonic trajectory
+generation only after construction succeeds.
+
+Accepted events receive contiguous sequence numbers. Out-of-order observations
+are rejected by the owned estimator before target resolution. Reentrant
+processing, stale resolver output, invalid active state, callback failure, and
+infeasible trajectory construction cannot replace the last valid trajectory.
+Selection, target-resolution, and trajectory-construction faults are bounded,
+phase-tagged, and latched. Logical cancellation is also terminal. Neither a
+hold nor cancellation sends a controller command or claims physical motion has
+stopped.
+
+The replay adapter processes the versioned observation replay through the same
+coordinator and exposes every processed event. A terminal fault returns an
+explicit processed prefix. `processed_all_samples` reports record consumption;
+`complete` additionally requires no terminal fault. Neither property claims
+physical execution. Replay results require non-decreasing event timestamps,
+permit a fault only as the terminal event, and reject logical cancellation
+because the replay adapter has no cancellation input. Frame agreement and
+candidate-evaluation work are checked before coordinator construction;
+workload accounting uses the maximum estimate-bearing update count after the
+acceleration estimator's two-record warmup under the same cap as intercept
+replay. Target resolution remains synchronous, injected simulation logic. No
+production IK, collision engine, asynchronous result supersession, controller
+feedback adapter, setpoint transport, or real-time control loop is included.
+
 ## Product constraints requiring later decisions
 
 - Camera count, placement, frame rate, exposure, depth source, and calibration method.

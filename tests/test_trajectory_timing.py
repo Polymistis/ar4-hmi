@@ -1207,8 +1207,103 @@ class SynchronizedQuinticTrajectoryTests(unittest.TestCase):
             )
         self.assertEqual(
             str(raised.exception),
-            "active trajectory axes must be built-in joint trajectories",
+            "active trajectory axes must be built-in quintic trajectories",
         )
+
+        for tampered_axis_count in (
+            plan_synchronized_rest_to_rest_trajectory(
+                (0.0,),
+                (1.0,),
+                (joint_limits,),
+            ),
+            plan_synchronized_quintic_trajectory(
+                (boundary(0.0),),
+                (boundary(1.0),),
+                2.0,
+                (joint_limits,),
+            ),
+        ):
+            with self.subTest(
+                bounded_type=type(tampered_axis_count),
+            ):
+                object.__setattr__(
+                    tampered_axis_count,
+                    "axes",
+                    tampered_axis_count.axes * 10,
+                )
+                with self.assertRaisesRegex(
+                    TrajectoryTimingError,
+                    "exceeds the maximum axis count",
+                ):
+                    replan_synchronized_quintic_trajectory(
+                        tampered_axis_count,
+                        0.0,
+                        (boundary(1.0),),
+                        2.0,
+                    )
+
+        rest_duration_mismatch = plan_synchronized_rest_to_rest_trajectory(
+            (0.0,),
+            (1.0,),
+            (joint_limits,),
+        )
+        object.__setattr__(
+            rest_duration_mismatch,
+            "axes",
+            (
+                minimum_rest_to_rest_joint_trajectory(
+                    0.0,
+                    1.0,
+                    joint_limits,
+                ),
+                minimum_rest_to_rest_joint_trajectory(
+                    0.0,
+                    2.0,
+                    joint_limits,
+                ),
+            ),
+        )
+        quintic_duration_mismatch = plan_synchronized_quintic_trajectory(
+            (boundary(0.0),),
+            (boundary(1.0),),
+            2.0,
+            (joint_limits,),
+        )
+        object.__setattr__(
+            quintic_duration_mismatch,
+            "axes",
+            (
+                QuinticJointTrajectory(
+                    boundary(0.0),
+                    boundary(1.0),
+                    2.0,
+                    joint_limits,
+                ),
+                QuinticJointTrajectory(
+                    boundary(0.0),
+                    boundary(2.0),
+                    3.0,
+                    joint_limits,
+                ),
+            ),
+        )
+        for tampered_duration in (
+            rest_duration_mismatch,
+            quintic_duration_mismatch,
+        ):
+            with self.subTest(
+                duration_type=type(tampered_duration),
+            ):
+                with self.assertRaisesRegex(
+                    TrajectoryTimingError,
+                    "axis durations must match",
+                ):
+                    replan_synchronized_quintic_trajectory(
+                        tampered_duration,
+                        0.0,
+                        (boundary(1.0), boundary(2.0)),
+                        2.0,
+                    )
 
         tampered_limit_trajectories = (
             plan_synchronized_rest_to_rest_trajectory(

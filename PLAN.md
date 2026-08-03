@@ -38,7 +38,7 @@ Status terms and complete acceptance criteria are defined in the detailed-contra
 | M4A5 - Desired-versus-estimated-and-encoder joint display | `Tested` | Keep desired, active-target, estimate, and encoder channels distinct. |
 | M4A6 - Main-control workspace and named positions | `Tested` | Maintain tabbed controls and validated Start and Shutdown positions. |
 | M4A7 - Low-priority joint encoder telemetry | `Blocked` | Implementation remains in progress; powered acceptance prerequisites remain unmet. |
-| M4B - Repeatability and dynamic interception pass | `In progress` | Extend desired-state replacement toward feedback-driven local replanning. |
+| M4B - Repeatability and dynamic interception pass | `In progress` | Extend replay replanning toward impact filtering and asynchronous supersession. |
 | M5 - Controlled hardware validation | `Blocked` | Await the prerequisites defined by the controlled verification contract. |
 
 ## Verification records
@@ -1374,15 +1374,36 @@ Implemented foundation:
   boundary. Jerk continuity is not guaranteed. The helper consumes desired
   trajectory state rather than encoder feedback and does not transmit a
   controller setpoint.
+- `ARrobots.feedback_replanning` owns a constant-acceleration estimator and
+  uses a caller-supplied intercept selector around one validated desired
+  trajectory. Ordered observations produce distinct warmup, estimator-reset,
+  no-feasible, stale, future, replaced, cancelled, or phase-tagged fault
+  events. A synchronous injected resolver
+  must correlate estimate, evaluation, and intercept timestamps and return a
+  matching bounded joint target before transactional C2 replacement can
+  advance the trajectory generation. Invalid or stale resolver output,
+  reentrant processing, active-state corruption, callback failure, and
+  infeasible trajectory construction leave the last validated trajectory
+  unreplaced and latch the coordinator fault.
+- The feedback-replanning replay adapter exercises repeated desired-state
+  replacement through the versioned observation replay. A terminal fault
+  returns an explicit processed prefix. Replay results require non-decreasing
+  event timestamps, permit a fault only as the terminal event, and exclude
+  logical cancellation because the adapter has no cancellation input. The
+  adapter remains deterministic simulation logic and neither sends controller
+  commands nor claims physical hold or cancellation.
 - Hardware-free tests cover selection configuration and result invariants,
   per-candidate covariance and speed thresholds, deterministic ranking,
   explicit feasibility rejections, arrival timing, stale and future estimates,
   callback and predictor failures, numeric precision limits, replay-driven
   reselection, three-sample acceleration estimation, full covariance
   propagation, analytical trajectory regimes, synchronized time scaling,
-  arbitrary-state quintic derivative-root extrema, trajectory sampling, and C2
-  desired-state replacement. The injected feasibility boundary and trajectory
-  limits are simulation input, not evidence of physical reachability or timing.
+  arbitrary-state quintic derivative-root extrema, trajectory sampling, C2
+  desired-state replacement, repeated feedback-driven replacement, stale
+  target rejection, hold and cancellation dispositions, and latched fault
+  phases. The injected feasibility boundary, joint-target resolver, and
+  trajectory limits are simulation input, not evidence of physical
+  reachability or timing.
   No controller command, live motion, calibrated transform, production IK or
   collision engine, impact-aware state filtering, controller-online trajectory
   replacement, local collision-aware path replanning, or grasp behavior is

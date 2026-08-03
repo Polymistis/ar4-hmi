@@ -1497,22 +1497,36 @@ def replan_synchronized_quintic_trajectory(
     active_trajectory_type = type(active_trajectory)
     if active_trajectory_type is SynchronizedJointTrajectory:
         required_axis_type = JerkLimitedJointTrajectory
+        axis_label = "joint"
+        active_axes = _bounded_items(
+            active_trajectory.axes,
+            "active synchronized trajectory axes",
+        )
     elif active_trajectory_type is SynchronizedQuinticTrajectory:
         required_axis_type = QuinticJointTrajectory
+        axis_label = "quintic"
+        active_axes = _bounded_items(
+            active_trajectory.axes,
+            "active synchronized quintic trajectory axes",
+        )
     else:
         raise TrajectoryTimingError(
             "active trajectory must be a synchronized built-in trajectory"
         )
     if any(
         type(axis) is not required_axis_type
-        for axis in active_trajectory.axes
+        for axis in active_axes
     ):
         raise TrajectoryTimingError(
-            "active trajectory axes must be built-in joint trajectories"
+            f"active trajectory axes must be built-in {axis_label} trajectories"
         )
+    if active_trajectory_type is SynchronizedJointTrajectory:
+        validated_active = SynchronizedJointTrajectory(active_axes)
+    else:
+        validated_active = SynchronizedQuinticTrajectory(active_axes)
     if any(
         type(axis.limits) is not JointKinematicLimits
-        for axis in active_trajectory.axes
+        for axis in validated_active.axes
     ):
         raise TrajectoryTimingError(
             "active trajectory limits must be built-in joint limits"
@@ -1520,7 +1534,7 @@ def replan_synchronized_quintic_trajectory(
     if required_axis_type is QuinticJointTrajectory and any(
         type(axis.start_state) is not JointBoundaryState
         or type(axis.target_state) is not JointBoundaryState
-        for axis in active_trajectory.axes
+        for axis in validated_active.axes
     ):
         raise TrajectoryTimingError(
             "active trajectory boundaries must be built-in joint states"
@@ -1531,14 +1545,14 @@ def replan_synchronized_quintic_trajectory(
     )
     duration_tolerance = _comparison_tolerance(
         elapsed,
-        active_trajectory.duration_seconds,
+        validated_active.duration_seconds,
     )
-    if elapsed > active_trajectory.duration_seconds + duration_tolerance:
+    if elapsed > validated_active.duration_seconds + duration_tolerance:
         raise TrajectoryTimingError(
             "replan elapsed_seconds exceeds the active trajectory duration"
         )
-    elapsed = min(elapsed, active_trajectory.duration_seconds)
-    sampled_states = active_trajectory.states_at(elapsed)
+    elapsed = min(elapsed, validated_active.duration_seconds)
+    sampled_states = validated_active.states_at(elapsed)
     start_states = tuple(
         JointBoundaryState(
             state.position_degrees,
@@ -1547,7 +1561,7 @@ def replan_synchronized_quintic_trajectory(
         )
         for state in sampled_states
     )
-    joint_limits = tuple(axis.limits for axis in active_trajectory.axes)
+    joint_limits = tuple(axis.limits for axis in validated_active.axes)
     return plan_synchronized_quintic_trajectory(
         start_states,
         target_states,
