@@ -38,7 +38,7 @@ Status terms and complete acceptance criteria are defined in the detailed-contra
 | M4A5 - Desired-versus-estimated-and-encoder joint display | `Tested` | Keep desired, active-target, estimate, and encoder channels distinct. |
 | M4A6 - Main-control workspace and named positions | `Tested` | Maintain tabbed controls and validated Start and Shutdown positions. |
 | M4A7 - Low-priority joint encoder telemetry | `Blocked` | Implementation remains in progress; powered acceptance prerequisites remain unmet. |
-| M4B - Repeatability and dynamic interception pass | `In progress` | Wire bounded low-priority HMI trace capture to the controller-trace analyzer. |
+| M4B - Repeatability and dynamic interception pass | `In progress` | Define controlled repeatability trials and evaluate recorded traces without changing controller motion curves. |
 | M5 - Controlled hardware validation | `Blocked` | Await the prerequisites defined by the controlled verification contract. |
 
 ## Verification records
@@ -1356,9 +1356,26 @@ Implemented foundation:
   endpoint error. Missing initial or terminal coverage, cadence gaps, failed
   exchanges, insufficient samples, and stationary J1-J6 traces make the trace
   explicitly ineligible for profile analysis. Host receipt timestamps and
-  encoder quantization remain recorded limitations. No HMI capture adapter,
-  trace file, measured limit, automatic tuning decision, or physical result is
-  created by the hardware-free analyzer.
+  encoder quantization remain recorded limitations.
+- Telemetry-capable HMI `RJ` exchanges attempt trace capture at the exact
+  pre-write monotonic origin, every validated J1-J6 telemetry frame before UI
+  coalescing, and the classified terminal response. Dispatcher-owned immutable
+  snapshots bind each record to the confirmed command-start position, target,
+  and timing profile. Successful startup and acknowledged runtime `UP` writes
+  bind the trace to the exact canonical controller-configuration fingerprint.
+- `ARrobots.controller_trace_capture` transfers finalized captures through a
+  bounded non-blocking queue. A dedicated background worker validates finalized
+  records, encodes, analyzes, and atomically writes local
+  `controller-traces/trace-*.jsonl` records. Default retention is bounded by
+  `CONTROLLER_TRACE_CAPTURE_MAXIMUM_FILES` and
+  `CONTROLLER_TRACE_CAPTURE_MAXIMUM_TOTAL_BYTES`; the runtime directory remains
+  ignored by Git. Queue saturation, capture loss, persistence failure, and
+  analysis failure are surfaced through immutable events consumed on the Tk
+  polling thread without delaying or changing the controller exchange.
+- Automatic capture remains limited to serialized HMI joint-dispatcher motion;
+  raw program, G-code, offline, and non-telemetry exchanges create no trace.
+  No measured limit, automatic tuning decision, or physical result has been
+  established.
 - `ARrobots.interception` samples a configured bounded lead-time horizon and
   rejects candidates whose predicted covariance, terminal object speed, or
   arrival margin violates an explicit threshold. Construction and

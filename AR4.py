@@ -190,6 +190,16 @@ from ARrobots.calibration_schema import (
   normalize_vision_background_color,
   reconcile_auxiliary_output_assignments,
 )
+from ARrobots.controller_trace import (
+  ControllerMotionProfile,
+  ControllerTraceMetadata,
+)
+from ARrobots.controller_trace_capture import (
+  ControllerTraceCapture,
+  ControllerTracePersistenceEvent,
+  ControllerTraceStore,
+  controller_configuration_fingerprint,
+)
 from ARrobots.HMI.Calibration import apply_calibration
 from ARrobots.HMI.joint_motion import (
   AUXILIARY_BOARD_MEGA,
@@ -452,6 +462,7 @@ tab9 = ttk_bootstrap.Frame(nb)
 
 
 _joint_motion_shutdown_cleanup_diagnostics = set()
+JOINT_MOTION_TRACE_SHUTDOWN_WAIT_SECONDS = 1.0
 
 
 def _report_joint_motion_shutdown_cleanup_once(
@@ -562,6 +573,31 @@ def _close_joint_motion_dispatcher_for_shutdown():
       fault_detail,
     )
     return False
+  return False
+
+
+def _close_joint_motion_trace_store_for_shutdown():
+  store = globals().get('joint_motion_trace_store')
+  if store is None:
+    return True
+  try:
+    cleanup_complete = store.close(
+      JOINT_MOTION_TRACE_SHUTDOWN_WAIT_SECONDS
+    )
+  except Exception:
+    logger.exception("Controller trace store shutdown failed")
+    return False
+  _poll_joint_motion_trace_events()
+  if cleanup_complete is True:
+    return True
+  if cleanup_complete is not False:
+    logger.error(
+      "Controller trace store returned an invalid shutdown state"
+    )
+    return False
+  logger.error(
+    "Controller trace persistence remained active at process shutdown"
+  )
   return False
 
 
@@ -2191,6 +2227,7 @@ class MainControllerIdentityBinding:
   serial_port: object
   identity: ControllerIdentity
   home_reference: Optional[PrimaryHomeReference] = None
+  configuration_fingerprint: Optional[str] = None
 
   def __post_init__(self):
     if self.serial_port is None or not getattr(self.serial_port, "is_open", False):
@@ -2219,6 +2256,16 @@ class MainControllerIdentityBinding:
     validate_controller_hardware_id(
       self.identity.controller_hardware_id
     )
+    if (
+      self.configuration_fingerprint is not None
+      and re.fullmatch(
+        r"sha256:[0-9a-f]{64}",
+        self.configuration_fingerprint,
+      ) is None
+    ):
+      raise MotionInputError(
+        "main controller configuration fingerprint is invalid"
+      )
 
 
 class GCodeStorageStateLockError(RuntimeError):
@@ -4265,6 +4312,7 @@ def _bind_main_controller_identity(
   serial_port,
   identity,
   home_reference=None,
+  configuration_fingerprint=None,
 ):
   global main_controller_connection_epoch
   global main_controller_identity_binding
@@ -4275,6 +4323,7 @@ def _bind_main_controller_identity(
     serial_port,
     identity,
     home_reference,
+    configuration_fingerprint,
   )
   with controller_identity_state_lock:
     if RUN.get('ser') is not serial_port:
@@ -4328,6 +4377,7 @@ def _bind_main_controller_home_reference(serial_port, home_reference):
       serial_port,
       binding.identity,
       home_reference,
+      binding.configuration_fingerprint,
     )
     return main_controller_identity_binding
 
@@ -4383,6 +4433,37 @@ def _current_main_controller_identity(serial_port=None):
   return binding
 
 
+def _bind_main_controller_configuration(serial_port, command):
+  global main_controller_identity_binding
+
+  fingerprint = controller_configuration_fingerprint(
+    _validated_startup_command(command, "UP")
+  )
+  current_binding = _current_main_controller_identity(serial_port)
+  if current_binding is None:
+    raise ConnectionError(
+      "main controller changed before configuration binding"
+    )
+  with controller_identity_state_lock:
+    binding = main_controller_identity_binding
+    if (
+      binding is not current_binding
+      or binding.serial_port is not serial_port
+      or RUN.get('ser') is not serial_port
+      or not getattr(serial_port, "is_open", False)
+    ):
+      raise ConnectionError(
+        "main controller changed before configuration binding"
+      )
+    main_controller_identity_binding = MainControllerIdentityBinding(
+      serial_port,
+      binding.identity,
+      binding.home_reference,
+      fingerprint,
+    )
+  return fingerprint
+
+
 def _current_primary_home_reference(serial_port=None):
   binding = _current_main_controller_identity(serial_port)
   if binding is None:
@@ -4430,6 +4511,7 @@ def _invalidate_bound_primary_home_reference(serial_port):
           (False, False, False),
           (0.0, 0.0, 0.0),
         ),
+        binding.configuration_fingerprint,
       )
     except ConnectionError as exc:
       logger.warning(
@@ -5186,6 +5268,7 @@ def _poll_application_close():
     root.after(SERIAL_SHUTDOWN_RETRY_MS, _poll_application_close)
     return False
 
+  _close_joint_motion_trace_store_for_shutdown()
   cv2.destroyAllWindows()
   root.quit()
   root.destroy()
@@ -8362,6 +8445,9 @@ def _apply_controller_startup_result(
       startup_serial,
       result.controller_identity,
       result.home_reference,
+      controller_configuration_fingerprint(
+        startup_request.update_parameters_command
+      ),
     )
     _clear_controller_fault_latches_after_confirmed_startup(
       startup_serial,
@@ -20455,8 +20541,103 @@ def _current_joint_motion_profile():
   )
 
 
+joint_motion_trace_store = ControllerTraceStore()
+
+
+def _start_joint_motion_trace(command, binding):
+  try:
+    if not isinstance(binding, MainControllerIdentityBinding):
+      raise MotionInputError(
+        "controller trace requires a bound main-controller identity"
+      )
+    if binding.configuration_fingerprint is None:
+      raise MotionInputError(
+        "controller trace requires a bound configuration fingerprint"
+      )
+    snapshot = joint_motion_dispatcher.current_exchange_snapshot(command)
+    if snapshot is None:
+      raise MotionQueueFault(
+        "controller trace requires an active joint exchange snapshot"
+      )
+    profile = snapshot.profile
+    speed_mode = {
+      "Sp": "p",
+      "Ss": "s",
+    }.get(profile.speed_prefix)
+    if speed_mode is None:
+      raise MotionInputError(
+        "controller trace encountered an unsupported RJ speed mode"
+      )
+    metadata = ControllerTraceMetadata(
+      controller_hardware_id=(
+        binding.identity.controller_hardware_id
+      ),
+      firmware_version=binding.identity.firmware_version,
+      configuration_fingerprint=binding.configuration_fingerprint,
+      start_positions=snapshot.start_positions[:6],
+      target_positions=snapshot.target_positions[:6],
+      motion_profile=ControllerMotionProfile(
+        speed_mode=speed_mode,
+        speed_value=profile.speed,
+        acceleration_percent=profile.acceleration,
+        deceleration_percent=profile.deceleration,
+        ramp_percent=profile.ramp,
+      ),
+    )
+    return ControllerTraceCapture(metadata)
+  except Exception as exc:
+    joint_motion_trace_store.report_failure(
+      "Controller trace capture unavailable for the current joint exchange",
+      exc,
+    )
+    return None
+
+
+def _finish_joint_motion_trace(capture, response):
+  if capture is None:
+    return False
+  if not isinstance(response, ControllerLineExchangeResponse):
+    return capture.fail("controller line exchange returned an invalid result")
+  stopped_position = (
+    response.estop_position
+    if response.estop_position is not None
+    else response.admission_position
+  )
+  if stopped_position is not None:
+    return capture.stop(
+      stopped_position.joints,
+      f"physical E-stop response {stopped_position.flag}",
+    )
+  try:
+    position = parse_position_response(response.authoritative_response)
+  except Exception as exc:
+    return capture.fail(
+      f"controller terminal response was invalid: {exc}"
+    )
+  if position.flag:
+    return capture.fail(
+      f"controller reported motion fault: {position.flag}",
+      position.joints,
+    )
+  return capture.complete(position.joints)
+
+
+def _submit_joint_motion_trace(capture):
+  if capture is None:
+    return False
+  try:
+    return joint_motion_trace_store.submit(capture)
+  except Exception as exc:
+    joint_motion_trace_store.report_failure(
+      "Controller trace could not enter the background persistence queue",
+      exc,
+    )
+    return False
+
+
 def _exchange_joint_motion(command):
   serial_port = RUN.get('ser')
+  trace_capture = None
   try:
     binding = _current_main_controller_identity(serial_port)
     stop_context = _capture_main_controller_stop_context(serial_port)
@@ -20466,6 +20647,8 @@ def _exchange_joint_motion(command):
         in binding.identity.protocol_capabilities
     )
     response_timeout = _controller_response_timeout(command)
+    if telemetry_enabled:
+      trace_capture = _start_joint_motion_trace(command, binding)
 
     def publish_stop(position):
       return _publish_main_controller_stop(stop_context, position)
@@ -20474,6 +20657,8 @@ def _exchange_joint_motion(command):
       telemetry = parse_joint_motion_exchange_response(response)
       if telemetry is None:
         return False
+      if trace_capture is not None:
+        trace_capture.record_telemetry(telemetry.joints)
       joint_motion_dispatcher.publish_telemetry(telemetry)
       return True
 
@@ -20494,6 +20679,7 @@ def _exchange_joint_motion(command):
       outbound_command,
       write_lock=serial_write_lock,
       reset_input=False,
+      write_started_event=trace_capture,
     )
     response = read_controller_line_exchange_response(
       serial_port,
@@ -20513,6 +20699,7 @@ def _exchange_joint_motion(command):
       terminal_validator=validate_joint_terminal,
       context="joint-motion controller response",
     )
+    _finish_joint_motion_trace(trace_capture, response)
     if (
       response.estop_position is not None
       or response.admission_position is not None
@@ -20533,16 +20720,23 @@ def _exchange_joint_motion(command):
         ):
           RUN['ser'] = None
     return response.authoritative_response
+  except Exception as exc:
+    if trace_capture is not None:
+      trace_capture.fail(exc)
+    raise
   finally:
-    if (
-      RUN.get('ser') is serial_port
-      and not getattr(serial_port, "is_open", False)
-    ):
-      RUN['ser'] = None
-      _require_main_controller_identity_cleanup(
-        serial_port,
-        "joint-motion controller exchange cleanup",
-      )
+    try:
+      _submit_joint_motion_trace(trace_capture)
+    finally:
+      if (
+        RUN.get('ser') is serial_port
+        and not getattr(serial_port, "is_open", False)
+      ):
+        RUN['ser'] = None
+        _require_main_controller_identity_cleanup(
+          serial_port,
+          "joint-motion controller exchange cleanup",
+        )
 
 
 joint_motion_dispatcher = CoalescingJointDispatcher(
@@ -20873,6 +21067,28 @@ def _start_offline_joint_motion(command):
   return True
 
 
+def _poll_joint_motion_trace_events():
+  try:
+    events = joint_motion_trace_store.drain_events()
+  except Exception:
+    logger.exception("Unable to drain controller trace persistence events")
+    return False
+  for event in events:
+    if not isinstance(event, ControllerTracePersistenceEvent):
+      logger.error("Controller trace store returned an invalid event")
+      continue
+    if event.kind == "saved":
+      if event.analysis is None:
+        logger.warning("%s: %s", event.detail, event.path)
+      else:
+        logger.info("%s: %s", event.detail, event.path)
+    elif event.kind == "dropped":
+      logger.warning("%s", event.detail)
+    else:
+      logger.error("%s", event.detail)
+  return len(events)
+
+
 def _poll_joint_motion_events():
   try:
     for event in joint_motion_dispatcher.drain_events():
@@ -21025,7 +21241,10 @@ def _poll_joint_motion_events():
       _try_dispatch_deferred_joint_adjustments()
     _refresh_joint_motion_visualization()
   finally:
-    _reschedule_event_poll("joint-motion")
+    try:
+      _poll_joint_motion_trace_events()
+    finally:
+      _reschedule_event_poll("joint-motion")
 
 
 def _queue_joint_motion(axis, value, absolute):
@@ -27791,8 +28010,9 @@ def _exchange_controller_calibration_acknowledgement(
   if invalidates_home_reference and write_started_event is None:
     write_started_event = threading.Event()
   serial_port = RUN.get('ser')
+  acknowledged = False
   try:
-    return _exchange_legacy_main_command(
+    acknowledged = _exchange_legacy_main_command(
       command,
       read_line=False,
       expected_response=b"Done",
@@ -27816,6 +28036,9 @@ def _exchange_controller_calibration_acknowledgement(
           serial_port,
           "controller calibration exchange cleanup",
         )
+  if acknowledged and invalidates_home_reference:
+    _bind_main_controller_configuration(serial_port, command)
+  return acknowledged
 
 
 def _transmit_update_parameters(command, write_started_event=None):

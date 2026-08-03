@@ -140,12 +140,32 @@ command transmission or terminal response. A failed exchange, inadequate
 sample count, cadence or boundary gap, or stationary J1-J6 trace makes the
 record explicitly ineligible for profile analysis.
 
-The current schema and analyzer create no trace automatically, send no
-controller command, and establish no measured motion limit. The firmware emits
-best-effort telemetry at a nominal 10 Hz without controller timestamps. Host
-receipt jitter and millidegree encoder quantization therefore remain explicit
-measurement limitations, and any future tuning decision requires repeated
-recorded trials under an approved hardware procedure.
+Telemetry-capable HMI joint-dispatcher `RJ` exchanges now attempt automatic
+trace capture. Capture records the monotonic origin at the serial write boundary
+and every validated J1-J6 telemetry frame before UI event coalescing. The
+dispatcher supplies an immutable confirmed start, target, and timing-profile
+snapshot. Successful startup and acknowledged runtime `UP` writes bind the
+record to a SHA-256 fingerprint of the exact canonical controller-configuration
+command.
+
+`ARrobots.controller_trace_capture.ControllerTraceStore` hands finalized
+captures to a bounded `Queue.put_nowait` path. A dedicated daemon worker performs
+final-trace validation, encoding, analysis, atomic replacement, and retention
+away from the motion and Tk threads. Local records use
+`controller-traces/trace-*.jsonl`; Git ignores the runtime directory. Default
+retention uses `CONTROLLER_TRACE_CAPTURE_MAXIMUM_FILES` and
+`CONTROLLER_TRACE_CAPTURE_MAXIMUM_TOTAL_BYTES`. Queue saturation, capture loss,
+persistence failure, and analysis failure become immutable events consumed by
+the Tk poller. Trace failure never changes controller command or response
+handling.
+
+Automatic capture does not cover raw program, G-code, offline, non-telemetry,
+or non-joint exchanges. The firmware emits best-effort telemetry at a nominal
+10 Hz without controller timestamps. Host receipt jitter and millidegree
+encoder quantization therefore remain explicit measurement limitations. No
+measured motion limit, automatic tuning decision, or physical result has been
+established; tuning still requires repeated recorded trials under an approved
+hardware procedure.
 
 ## Implemented deterministic foundation
 

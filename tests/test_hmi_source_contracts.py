@@ -136,6 +136,16 @@ from ARrobots.HMI.joint_motion import (
     write_serial_control,
 )
 from ARrobots.HMI.joint_visualization import set_joint_slider_positions
+from ARrobots.controller_trace import (
+    ControllerMotionProfile,
+    ControllerTraceMetadata,
+    analyze_controller_trace,
+)
+from ARrobots.controller_trace_capture import (
+    ControllerTraceCapture,
+    ControllerTracePersistenceEvent,
+    controller_configuration_fingerprint,
+)
 from ARrobots.HMI.vision_io import (
     MAX_CAMERA_PREVIEW_EVENT_DETAIL,
     VISION_TEMPLATE_PREVIEW_SIZE,
@@ -494,6 +504,11 @@ class HmiSourceContractTests(unittest.TestCase):
                 "programStopStatusLatched": False,
             },
         )
+        if name == "_poll_joint_motion_events":
+            namespace.setdefault(
+                "_poll_joint_motion_trace_events",
+                lambda: 0,
+            )
 
         @contextmanager
         def vision_artifact_operation(context):
@@ -585,6 +600,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_poll_application_close": (
                 "_serial_shutdown_ready_for_close",
                 "_close_joint_motion_dispatcher_for_shutdown",
+                "_close_joint_motion_trace_store_for_shutdown",
             ),
             "_close_joint_motion_dispatcher_for_shutdown": (
                 "_report_joint_motion_shutdown_cleanup_once",
@@ -3593,6 +3609,7 @@ class HmiSourceContractTests(unittest.TestCase):
         for outcome in (True, RuntimeError("acknowledgement failed")):
             with self.subTest(outcome=outcome):
                 invalidations = []
+                configuration_bindings = []
 
                 def exchange_legacy(command, **options):
                     self.assertEqual(command, "UPA1\n")
@@ -3615,6 +3632,11 @@ class HmiSourceContractTests(unittest.TestCase):
                             or True
                         )
                     ),
+                    "_bind_main_controller_configuration": (
+                        lambda serial_port, command: configuration_bindings.append(
+                            (serial_port, command)
+                        )
+                    ),
                 }
                 exchange = self.compile_function(
                     "_exchange_controller_calibration_acknowledgement",
@@ -3630,6 +3652,10 @@ class HmiSourceContractTests(unittest.TestCase):
                 else:
                     self.assertTrue(exchange("UPA1\n"))
                 self.assertEqual(invalidations, [port])
+                self.assertEqual(
+                    configuration_bindings,
+                    [] if isinstance(outcome, Exception) else [(port, "UPA1\n")],
+                )
 
     def test_update_parameters_rejects_nonbinary_direction_flags(self):
         values = self._valid_update_parameter_values()
@@ -8358,6 +8384,7 @@ class HmiSourceContractTests(unittest.TestCase):
         port = SimpleNamespace(is_open=True)
         exchange_calls = []
         home_reference_invalidations = []
+        configuration_bindings = []
 
         def exchange_legacy(command, **options):
             exchange_calls.append((command, options))
@@ -8373,6 +8400,11 @@ class HmiSourceContractTests(unittest.TestCase):
                 lambda serial_port: (
                     home_reference_invalidations.append(serial_port)
                     or True
+                )
+            ),
+            "_bind_main_controller_configuration": (
+                lambda serial_port, command: configuration_bindings.append(
+                    (serial_port, command)
                 )
             ),
         }
@@ -8400,6 +8432,7 @@ class HmiSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(len(exchange_calls), 1)
         self.assertEqual(home_reference_invalidations, [port])
+        self.assertEqual(configuration_bindings, [(port, "UPA1\n")])
 
         calls = []
 
@@ -9191,9 +9224,18 @@ class HmiSourceContractTests(unittest.TestCase):
                 lambda reason: calls.append(("invalidate", reason))
             ),
             "_bind_main_controller_identity": (
-                lambda serial_port, identity, home_reference: calls.append(
-                    ("bind", serial_port, identity, home_reference)
+                lambda serial_port, identity, home_reference, fingerprint: calls.append(
+                    (
+                        "bind",
+                        serial_port,
+                        identity,
+                        home_reference,
+                        fingerprint,
+                    )
                 )
+            ),
+            "controller_configuration_fingerprint": (
+                lambda command: "sha256:" + "a" * 64
             ),
             "_clear_controller_fault_latches_after_confirmed_startup": (
                 lambda serial_port, position: calls.append(
@@ -9212,6 +9254,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 SimpleNamespace(
                     auxiliary_port="COM2",
                     auxiliary_board=AUXILIARY_BOARD_NANO,
+                    update_parameters_command="UPA1\n",
                 ),
                 SimpleNamespace(
                     position=position,
@@ -9236,7 +9279,13 @@ class HmiSourceContractTests(unittest.TestCase):
         self.assertIsNone(startup_serial.timeout)
         self.assertFalse(any(call[0] == "invalidate" for call in calls))
         self.assertIn(
-            ("bind", startup_serial, controller_identity, None),
+            (
+                "bind",
+                startup_serial,
+                controller_identity,
+                None,
+                "sha256:" + "a" * 64,
+            ),
             calls,
         )
         self.assertIn(
@@ -9875,6 +9924,51 @@ class HmiSourceContractTests(unittest.TestCase):
                 "cleanup-incomplete-ownership-release",
             },
         )
+
+    def test_shutdown_trace_store_uses_bounded_wait_and_reports_outcome(self):
+        class Store:
+            def __init__(self):
+                self.results = [True, False, None, RuntimeError("close failed")]
+                self.waits = []
+
+            def close(self, wait_seconds):
+                self.waits.append(wait_seconds)
+                result = self.results.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+        store = Store()
+        polls = []
+        logs = []
+        namespace = {
+            "joint_motion_trace_store": store,
+            "JOINT_MOTION_TRACE_SHUTDOWN_WAIT_SECONDS": 1.0,
+            "_poll_joint_motion_trace_events": lambda: polls.append(True),
+            "logger": SimpleNamespace(
+                error=lambda *args: logs.append(("error", args)),
+                exception=lambda *args: logs.append(("exception", args)),
+            ),
+        }
+        close_store = self.compile_function(
+            "_close_joint_motion_trace_store_for_shutdown",
+            namespace,
+        )
+
+        self.assertTrue(close_store())
+        self.assertFalse(close_store())
+        self.assertFalse(close_store())
+        self.assertFalse(close_store())
+
+        self.assertEqual(store.waits, [1.0, 1.0, 1.0, 1.0])
+        self.assertEqual(len(polls), 3)
+        self.assertEqual(
+            [level for level, _ in logs],
+            ["error", "error", "exception"],
+        )
+        self.assertIn("remained active", logs[0][1][0])
+        self.assertIn("invalid shutdown state", logs[1][1][0])
+        self.assertIn("shutdown failed", logs[2][1][0])
 
     def test_shutdown_requests_online_and_offline_stop_before_final_flush(self):
         class Flag:
@@ -12322,6 +12416,7 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace = {
             "dataclass": dataclass,
             "Optional": Optional,
+            "re": re,
             "threading": threading,
             "Empty": Empty,
             "Queue": Queue,
@@ -21205,6 +21300,7 @@ class HmiSourceContractTests(unittest.TestCase):
             "_auxiliary_stop_not_required": {"ser2"},
             # Controller identity helpers only bind or inspect the active handle;
             # callers retain transport ownership for any associated exchange.
+            "_bind_main_controller_configuration": {"ser"},
             "_bind_main_controller_identity": {"ser"},
             "_bind_gcode_storage_media": {"ser"},
             "_capture_main_controller_stop_context": {"ser"},
@@ -29058,6 +29154,7 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace = {
             "dataclass": dataclass,
             "Optional": Optional,
+            "re": re,
             "ControllerIdentity": ControllerIdentity,
             "PrimaryHomeReference": PrimaryHomeReference,
             "MotionInputError": MotionInputError,
@@ -30004,6 +30101,7 @@ class HmiSourceContractTests(unittest.TestCase):
         namespace = {
             "dataclass": dataclass,
             "Optional": Optional,
+            "re": re,
             "ControllerIdentity": ControllerIdentity,
             "MotionInputError": MotionInputError,
             "GCodeStorageMediaBinding": type(
@@ -30026,6 +30124,12 @@ class HmiSourceContractTests(unittest.TestCase):
             "MainControllerIdentityBinding",
             namespace,
         )
+        with self.assertRaisesRegex(MotionInputError, "fingerprint is invalid"):
+            namespace["MainControllerIdentityBinding"](
+                port,
+                identity,
+                configuration_fingerprint="sha256:invalid",
+            )
         bind_identity = self.compile_function(
             "_bind_main_controller_identity",
             namespace,
@@ -30035,20 +30139,60 @@ class HmiSourceContractTests(unittest.TestCase):
             namespace,
         )
 
-        bind_identity(port, identity)
+        initial_fingerprint = "sha256:" + "a" * 64
+        bind_identity(
+            port,
+            identity,
+            configuration_fingerprint=initial_fingerprint,
+        )
         first_source_snapshot = namespace[
             "joint_actual_position_source_snapshot"
         ]
         self.assertIs(first_source_snapshot[0], port)
         first_source_token = first_source_snapshot[1]
         self.assertIsNotNone(first_source_token)
+        self.assertEqual(
+            namespace["main_controller_identity_binding"].configuration_fingerprint,
+            initial_fingerprint,
+        )
+
+        namespace["_validated_startup_command"] = lambda command, prefix: command
+        namespace["controller_configuration_fingerprint"] = (
+            controller_configuration_fingerprint
+        )
+        namespace["_current_main_controller_identity"] = self.compile_function(
+            "_current_main_controller_identity",
+            namespace,
+        )
+        bind_configuration = self.compile_function(
+            "_bind_main_controller_configuration",
+            namespace,
+        )
+        expected_fingerprint = controller_configuration_fingerprint("UPA1\n")
+
+        self.assertEqual(
+            bind_configuration(port, "UPA1\n"),
+            expected_fingerprint,
+        )
+        self.assertEqual(
+            namespace["main_controller_identity_binding"].configuration_fingerprint,
+            expected_fingerprint,
+        )
+        self.assertEqual(
+            namespace["joint_actual_position_source_snapshot"],
+            first_source_snapshot,
+        )
 
         self.assertTrue(clear_identity(port))
         self.assertIsNone(
             namespace["joint_actual_position_source_snapshot"]
         )
 
-        bind_identity(port, identity)
+        bind_identity(
+            port,
+            identity,
+            configuration_fingerprint=initial_fingerprint,
+        )
         replacement_source_snapshot = namespace[
             "joint_actual_position_source_snapshot"
         ]
@@ -30060,6 +30204,7 @@ class HmiSourceContractTests(unittest.TestCase):
     def test_controller_identity_state_uses_dedicated_memory_lock(self):
         for function_name in (
             "_bind_main_controller_identity",
+            "_bind_main_controller_configuration",
             "_bind_main_controller_home_reference",
             "_clear_main_controller_identity",
             "_current_main_controller_identity",
@@ -38090,6 +38235,53 @@ class HmiSourceContractTests(unittest.TestCase):
         published = []
         published_stops = []
         identity_cleanups = []
+        trace_captures = []
+        trace_submissions = []
+        telemetry_timeline = []
+
+        class TraceCapture:
+            def __init__(self, candidate_command, candidate_binding):
+                self.command = candidate_command
+                self.binding = candidate_binding
+                self.write_started = False
+                self.telemetry = []
+                self.terminals = []
+                self.failures = []
+
+            def set(self):
+                self.write_started = True
+                return True
+
+            def record_telemetry(self, positions):
+                telemetry_timeline.append(("trace", positions))
+                self.telemetry.append(positions)
+                return True
+
+            def fail(self, error):
+                self.failures.append(error)
+                return True
+
+        def start_trace(candidate_command, candidate_binding):
+            capture = TraceCapture(candidate_command, candidate_binding)
+            trace_captures.append(capture)
+            return capture
+
+        def finish_trace(capture, response):
+            if capture is None:
+                return False
+            capture.terminals.append(response)
+            return True
+
+        def submit_trace(capture):
+            if capture is None:
+                return False
+            trace_submissions.append(capture)
+            return True
+
+        def publish_telemetry(telemetry):
+            telemetry_timeline.append(("dispatcher", telemetry.joints))
+            published.append(telemetry)
+            return True
 
         def write_control(
             candidate_port,
@@ -38097,6 +38289,7 @@ class HmiSourceContractTests(unittest.TestCase):
             *,
             write_lock,
             reset_input,
+            write_started_event,
         ):
             writes.append(
                 (
@@ -38106,6 +38299,8 @@ class HmiSourceContractTests(unittest.TestCase):
                     reset_input,
                 )
             )
+            if write_started_event is not None:
+                write_started_event.set()
             candidate_port.response.extend(wire_responses.pop(0))
             return True
 
@@ -38148,8 +38343,11 @@ class HmiSourceContractTests(unittest.TestCase):
             ),
             "_controller_response_timeout": lambda _command: 12.0,
             "joint_motion_dispatcher": SimpleNamespace(
-                publish_telemetry=published.append
+                publish_telemetry=publish_telemetry
             ),
+            "_start_joint_motion_trace": start_trace,
+            "_finish_joint_motion_trace": finish_trace,
+            "_submit_joint_motion_trace": submit_trace,
             "_require_main_controller_identity_cleanup": (
                 lambda candidate_port, context: identity_cleanups.append(
                     (candidate_port, context)
@@ -38219,6 +38417,18 @@ class HmiSourceContractTests(unittest.TestCase):
                 parse_joint_telemetry_response(telemetry)
             ],
         )
+        self.assertEqual(len(trace_captures), 1)
+        self.assertTrue(trace_captures[0].write_started)
+        self.assertEqual(
+            trace_captures[0].telemetry,
+            [parse_joint_telemetry_response(telemetry).joints],
+        )
+        self.assertEqual(
+            [source for source, _ in telemetry_timeline],
+            ["trace", "dispatcher"],
+        )
+        self.assertEqual(len(trace_captures[0].terminals), 1)
+        self.assertEqual(trace_submissions, [trace_captures[0]])
 
         estop = parse_position_response(
             VALID_CONTROLLER_POSITION.raw.replace(
@@ -38275,6 +38485,144 @@ class HmiSourceContractTests(unittest.TestCase):
                     "joint-motion controller exchange cleanup",
                 )
             ],
+        )
+
+    def test_joint_trace_capture_uses_bound_identity_and_dispatcher_snapshot(self):
+        profile = MotionProfile("Sp", 50, 10, 20, 25, "N", "000000")
+        snapshot = SimpleNamespace(
+            start_positions=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+            target_positions=(1, 2, 3, 4, 5, 6, 6, 7, 8),
+            profile=profile,
+        )
+        binding = SimpleNamespace(
+            identity=parse_controller_identity_response(
+                VALID_CONTROLLER_IDENTITY_RESPONSE
+            ),
+            configuration_fingerprint="sha256:" + "a" * 64,
+        )
+        diagnostics = []
+        namespace = {
+            "MainControllerIdentityBinding": SimpleNamespace,
+            "MotionInputError": MotionInputError,
+            "MotionQueueFault": MotionQueueFault,
+            "joint_motion_dispatcher": SimpleNamespace(
+                current_exchange_snapshot=lambda command: snapshot
+            ),
+            "ControllerTraceMetadata": ControllerTraceMetadata,
+            "ControllerMotionProfile": ControllerMotionProfile,
+            "ControllerTraceCapture": ControllerTraceCapture,
+            "joint_motion_trace_store": SimpleNamespace(
+                report_failure=lambda context, error: diagnostics.append(
+                    (context, str(error))
+                ) or True
+            ),
+        }
+        start_capture = self.compile_function(
+            "_start_joint_motion_trace",
+            namespace,
+        )
+
+        capture = start_capture("RJ-command\n", binding)
+
+        self.assertIsInstance(capture, ControllerTraceCapture)
+        self.assertEqual(capture.metadata.start_positions, (0, 1, 2, 3, 4, 5))
+        self.assertEqual(capture.metadata.target_positions, (1, 2, 3, 4, 5, 6))
+        self.assertEqual(capture.metadata.controller_hardware_id, "12ABEF")
+        self.assertEqual(
+            capture.metadata.firmware_version,
+            "6.7.1-ar4hmi.2",
+        )
+        self.assertEqual(capture.metadata.motion_profile.speed_mode, "p")
+        self.assertEqual(diagnostics, [])
+
+        missing_fingerprint = SimpleNamespace(
+            identity=binding.identity,
+            configuration_fingerprint=None,
+        )
+        self.assertIsNone(start_capture("RJ-command\n", missing_fingerprint))
+        self.assertEqual(
+            diagnostics,
+            [
+                (
+                    "Controller trace capture unavailable for the current joint exchange",
+                    "controller trace requires a bound configuration fingerprint",
+                )
+            ],
+        )
+
+    def test_joint_trace_terminal_classification_matches_dispatcher_result(self):
+        calls = []
+
+        class Capture:
+            def complete(self, positions):
+                calls.append(("completed", positions))
+                return True
+
+            def stop(self, positions, detail):
+                calls.append(("stopped", positions, detail))
+                return True
+
+            def fail(self, detail, positions=None):
+                calls.append(("failed", str(detail), positions))
+                return True
+
+        namespace = {
+            "ControllerLineExchangeResponse": ControllerLineExchangeResponse,
+            "parse_position_response": parse_position_response,
+        }
+        finish_capture = self.compile_function(
+            "_finish_joint_motion_trace",
+            namespace,
+        )
+        capture = Capture()
+
+        completed = ControllerLineExchangeResponse(
+            VALID_CONTROLLER_POSITION.raw,
+            None,
+            "terminal-only",
+        )
+        self.assertTrue(finish_capture(capture, completed))
+        self.assertEqual(calls.pop(), ("completed", VALID_CONTROLLER_POSITION.joints))
+
+        controller_fault = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace("NO", "NOEC000001", 1)
+        )
+        failed = ControllerLineExchangeResponse(
+            controller_fault.raw,
+            None,
+            "terminal-only",
+        )
+        self.assertTrue(finish_capture(capture, failed))
+        self.assertEqual(
+            calls.pop(),
+            ("failed", "controller reported motion fault: EC000001", controller_fault.joints),
+        )
+
+        stopped_position = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+                1,
+            )
+        )
+        stopped = ControllerLineExchangeResponse(
+            None,
+            stopped_position,
+            "estop-only",
+        )
+        self.assertTrue(finish_capture(capture, stopped))
+        self.assertEqual(
+            calls.pop(),
+            (
+                "stopped",
+                stopped_position.joints,
+                f"physical E-stop response {CONTROLLER_ESTOP_EVENT_FLAG}",
+            ),
+        )
+        self.assertTrue(finish_capture(capture, object()))
+        self.assertEqual(
+            calls.pop(),
+            ("failed", "controller line exchange returned an invalid result", None),
         )
 
     def test_tool_jog_directions_match_the_firmware_contract(self):
@@ -40639,6 +40987,84 @@ class HmiSourceContractTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(acknowledgement_calls), 1)
+
+    def test_joint_trace_events_are_reported_on_the_hmi_poll_thread(self):
+        saved_path = Path("controller-traces") / "trace-test.jsonl"
+        clock_values = iter((1.0, 1.1))
+        capture = ControllerTraceCapture(
+            ControllerTraceMetadata(
+                controller_hardware_id="12ABEF",
+                firmware_version="6.7.1-ar4hmi.2",
+                configuration_fingerprint="sha256:" + "a" * 64,
+                start_positions=(0.0,) * 6,
+                target_positions=(1.0,) * 6,
+                motion_profile=ControllerMotionProfile(
+                    speed_mode="p",
+                    speed_value=50.0,
+                    acceleration_percent=10.0,
+                    deceleration_percent=10.0,
+                    ramp_percent=20.0,
+                ),
+            ),
+            clock=lambda: next(clock_values),
+        )
+        self.assertTrue(capture.set())
+        self.assertTrue(capture.complete((1.0,) * 6))
+        analysis = analyze_controller_trace(capture.freeze())
+        events = [
+            ControllerTracePersistenceEvent(
+                "saved",
+                "controller trace saved; profile analysis ineligible",
+                path=saved_path,
+                analysis=analysis,
+            ),
+            ControllerTracePersistenceEvent(
+                "saved",
+                "controller trace saved; profile analysis failed",
+                path=saved_path,
+            ),
+            ControllerTracePersistenceEvent(
+                "dropped",
+                "controller trace persistence queue is full",
+            ),
+            ControllerTracePersistenceEvent(
+                "failed",
+                "controller trace persistence failed: disk unavailable",
+            ),
+            object(),
+        ]
+        logs = []
+        namespace = {
+            "joint_motion_trace_store": SimpleNamespace(
+                drain_events=lambda: list(events)
+            ),
+            "ControllerTracePersistenceEvent": ControllerTracePersistenceEvent,
+            "logger": SimpleNamespace(
+                info=lambda *values: logs.append(("info", values)),
+                warning=lambda *values: logs.append(("warning", values)),
+                error=lambda *values: logs.append(("error", values)),
+                exception=lambda *values: logs.append(("exception", values)),
+            ),
+        }
+        poll_trace_events = self.compile_function(
+            "_poll_joint_motion_trace_events",
+            namespace,
+        )
+
+        self.assertEqual(poll_trace_events(), 5)
+        self.assertEqual(
+            [level for level, _ in logs],
+            ["info", "warning", "warning", "error", "error"],
+        )
+        self.assertEqual(logs[0][1][-1], saved_path)
+
+        namespace["joint_motion_trace_store"] = SimpleNamespace(
+            drain_events=lambda: (_ for _ in ()).throw(
+                RuntimeError("event queue unavailable")
+            )
+        )
+        self.assertFalse(poll_trace_events())
+        self.assertEqual(logs[-1][0], "exception")
 
     def test_joint_physical_stop_result_uses_the_published_stop_event(self):
         estop = parse_position_response(

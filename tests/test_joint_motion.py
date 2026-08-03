@@ -44,6 +44,7 @@ from ARrobots.HMI.joint_motion import (
     MAX_RESPONSE_PAYLOAD_LENGTH,
     MAX_CONTROLLER_FILENAME_BYTES,
     DeferredJointAdjustments,
+    JointExchangeSnapshot,
     JointMove,
     JointTelemetry,
     MotionInputError,
@@ -6001,6 +6002,77 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         )
         self.assertEqual(events[1].telemetry, telemetry)
         self.assertIs(events[1].move, events[0].move)
+
+    def test_exchange_snapshot_tracks_confirmed_start_across_queued_moves(self):
+        dispatcher = None
+        first_started = threading.Event()
+        release_first = threading.Event()
+        commands = []
+        snapshots = []
+
+        def exchange(command):
+            commands.append(command)
+            snapshots.append(dispatcher.current_exchange_snapshot(command))
+            if len(commands) == 1:
+                first_started.set()
+                if not release_first.wait(2):
+                    raise TimeoutError("test did not release first exchange")
+                return position_response(
+                    (1, 2, 3, 4, 5, 6),
+                    external=(7, 8, 9),
+                )
+            return position_response(
+                (2, 3, 4, 5, 6, 7),
+                external=(7, 8, 9),
+            )
+
+        dispatcher = self.make_dispatcher(exchange)
+        actual = (0, 0, 0, 0, 0, 0, 7, 8, 9)
+        first_target = (1, 2, 3, 4, 5, 6, 7, 8, 9)
+        second_target = (2, 3, 4, 5, 6, 7, 7, 8, 9)
+        dispatcher.submit_positions(first_target, actual, self.profile)
+        self.assertTrue(first_started.wait(2))
+        active_snapshot = dispatcher.current_exchange_snapshot(commands[0])
+        self.assertIsInstance(active_snapshot, JointExchangeSnapshot)
+        with self.assertRaisesRegex(MotionQueueFault, "does not match"):
+            dispatcher.current_exchange_snapshot("RJ-invalid\n")
+        dispatcher.submit_positions(second_target, actual, self.profile)
+        release_first.set()
+        collect_events_until_idle(dispatcher)
+
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(snapshots[0].start_positions, actual)
+        self.assertEqual(snapshots[0].target_positions, first_target)
+        self.assertEqual(snapshots[1].start_positions, first_target)
+        self.assertEqual(snapshots[1].target_positions, second_target)
+        self.assertEqual(snapshots[0].profile, self.profile)
+        self.assertIsNone(dispatcher.current_exchange_snapshot(commands[-1]))
+        with self.assertRaisesRegex(MotionInputError, "must be text"):
+            dispatcher.current_exchange_snapshot(None)
+
+    def test_exchange_snapshot_prefers_synchronized_idle_position(self):
+        dispatcher = None
+        observed = []
+
+        def exchange(command):
+            observed.append(dispatcher.current_exchange_snapshot(command))
+            return position_response(
+                (2, 3, 4, 5, 6, 7),
+                external=(7, 8, 9),
+            )
+
+        dispatcher = self.make_dispatcher(exchange)
+        synchronized = (1, 2, 3, 4, 5, 6, 7, 8, 9)
+        stale_actual = (0, 0, 0, 0, 0, 0, 7, 8, 9)
+        target = (2, 3, 4, 5, 6, 7, 7, 8, 9)
+        self.assertTrue(dispatcher.synchronize(synchronized))
+
+        dispatcher.submit_positions(target, stale_actual, self.profile)
+        collect_events_until_idle(dispatcher)
+
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0].start_positions, synchronized)
+        self.assertEqual(observed[0].target_positions, target)
 
     def test_telemetry_events_coalesce_without_delaying_completion(self):
         dispatcher = None

@@ -3609,6 +3609,29 @@ class JointMove:
 
 
 @dataclass(frozen=True)
+class JointExchangeSnapshot:
+    """Confirmed start and immutable command inputs for one active RJ exchange."""
+
+    start_positions: Tuple[float, ...]
+    target_positions: Tuple[float, ...]
+    profile: MotionProfile
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "start_positions",
+            _finite_tuple(self.start_positions, JOINT_COUNT, "start_positions"),
+        )
+        object.__setattr__(
+            self,
+            "target_positions",
+            _finite_tuple(self.target_positions, JOINT_COUNT, "target_positions"),
+        )
+        if not isinstance(self.profile, MotionProfile):
+            raise MotionInputError("exchange profile must be a MotionProfile")
+
+
+@dataclass(frozen=True)
 class CommandedJointTrajectory:
     """Display-only RJ estimate for firmware that reports terminal position."""
 
@@ -6141,8 +6164,10 @@ class CoalescingJointDispatcher:
         self._next_event_sequence = 0
         self._worker = None
         self._inflight = None
+        self._inflight_start = None
         self._pending = None
         self._desired = None
+        self._confirmed = None
         self._fault_reason = None
         self._closed = False
         self._transport_reserved = False
@@ -6319,6 +6344,8 @@ class CoalescingJointDispatcher:
                 self._activity_lease = activity_lease
 
             self._desired = target
+            if starting_worker:
+                self._confirmed = base
             self._pending = move
             if starting_worker:
                 self._worker = worker_to_start
@@ -6329,6 +6356,7 @@ class CoalescingJointDispatcher:
                 except Exception as exc:
                     self._pending = None
                     self._desired = None
+                    self._confirmed = None
                     self._fault_reason = f"worker startup failed: {exc}"
                     release_error = self._finish_worker_locked()
                     if release_error is not None:
@@ -6378,6 +6406,7 @@ class CoalescingJointDispatcher:
         pending_discarded = self._pending is not None
         self._pending = None
         self._desired = None
+        self._confirmed = None
         self._latest_telemetry_event = None
         if self._fault_reason is None:
             self._fault_reason = release_reason
@@ -6411,6 +6440,7 @@ class CoalescingJointDispatcher:
             release_error = exc
             self._publish_transport_release_fault_locked(exc, move)
         self._worker = None
+        self._inflight_start = None
         return release_error
 
     def synchronize(self, positions):
@@ -6430,6 +6460,7 @@ class CoalescingJointDispatcher:
                     self._publish_transport_release_fault_locked(exc)
                     return False
             self._desired = normalized
+            self._confirmed = normalized
             self._fault_reason = None
             self._transport_release_event_reason = None
             return True
@@ -6456,6 +6487,7 @@ class CoalescingJointDispatcher:
             pending_discarded = self._pending is not None
             self._pending = None
             self._desired = normalized
+            self._confirmed = normalized
             return pending_discarded
 
     def invalidate(self, reason):
@@ -6467,6 +6499,7 @@ class CoalescingJointDispatcher:
             pending_discarded = self._pending is not None
             self._pending = None
             self._desired = None
+            self._confirmed = None
             self._fault_reason = reason.strip()
             return pending_discarded
 
@@ -6477,6 +6510,7 @@ class CoalescingJointDispatcher:
             self._closed = True
             self._pending = None
             self._desired = None
+            self._confirmed = None
             self._latest_telemetry_event = None
             acknowledgement = self._result_acknowledgement
             cleanup_complete = self._worker is None
@@ -6553,17 +6587,33 @@ class CoalescingJointDispatcher:
             )
         return True
 
+    def current_exchange_snapshot(self, command):
+        if not isinstance(command, str):
+            raise MotionInputError("exchange command must be text")
+        with self._lock:
+            move = self._inflight
+            start = self._inflight_start
+            if move is None or start is None:
+                return None
+            if command != move.command:
+                raise MotionQueueFault(
+                    "exchange command does not match the in-flight joint move"
+                )
+            return JointExchangeSnapshot(start, move.positions, move.profile)
+
     def _run(self):
         while True:
             move = None
             with self._lock:
                 if self._closed or self._pending is None:
                     self._inflight = None
+                    self._inflight_start = None
                     self._finish_worker_locked()
                 else:
                     move = self._pending
                     self._pending = None
                     self._inflight = move
+                    self._inflight_start = self._confirmed
                     self._latest_telemetry_event = None
             if move is None:
                 return
@@ -6599,7 +6649,9 @@ class CoalescingJointDispatcher:
                     pending_discarded = self._pending is not None
                     self._pending = None
                     self._desired = None
+                    self._confirmed = None
                     self._inflight = None
+                    self._inflight_start = None
                     if not self._closed:
                         self._fault_reason = str(exc)
                         self._result_acknowledgement = acknowledgement
@@ -6626,6 +6678,8 @@ class CoalescingJointDispatcher:
             acknowledgement = threading.Event()
             with self._lock:
                 self._inflight = None
+                self._inflight_start = None
+                self._confirmed = position.joints + position.external
                 if self._pending is None:
                     self._desired = position.joints + position.external
                 if not self._closed:
