@@ -27,6 +27,7 @@ dist/
 /gcode-storage-state.json
 /gcode-storage-state.json.lock
 /.gcode-storage-state-*.tmp
+/controller-traces/
 
 # Editor and operating-system state
 .idea/
