@@ -390,16 +390,28 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
     def test_issuance_feasibility_check_failure_latches_fault(self):
         replanner = asynchronous_replanner()
         request = feed_to_request(replanner)[-1].resolution_request
+        intercept_timestamp = (
+            request.selection.selected_candidate.prediction.timestamp_seconds
+        )
+        issuance_duration = math.fsum((
+            intercept_timestamp,
+            -request.issued_at_seconds,
+        ))
 
-        def replacement_failure(_active, _target, replacement_at):
-            if replacement_at == request.issued_at_seconds:
+        def trajectory_failure(
+            _active,
+            _elapsed,
+            _target_states,
+            duration_seconds,
+        ):
+            if duration_seconds == issuance_duration:
                 raise RuntimeError("issuance feasibility check failed")
             raise TrajectoryTimingError("late result is infeasible")
 
-        with patch.object(
-            replanner,
-            "_replacement",
-            side_effect=replacement_failure,
+        with patch(
+            "ARrobots.feedback_replanning."
+            "replan_synchronized_quintic_trajectory",
+            side_effect=trajectory_failure,
         ):
             faulted = replanner.complete_resolution(
                 request.request_sequence,
@@ -680,6 +692,17 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
             object(),
             deadline,
         )
+        window_replanner = asynchronous_replanner()
+        window_pending = feed_to_request(window_replanner)[-1]
+        window_deadline = (
+            window_pending.resolution_request.selection.selected_candidate
+            .prediction.timestamp_seconds
+        )
+        window_expired = window_replanner.complete_resolution(
+            window_pending.resolution_request.request_sequence,
+            target_for(window_pending.resolution_request.selection),
+            window_deadline - 0.001,
+        )
 
         delayed_selection = replace(
             completed.event.selection,
@@ -690,14 +713,16 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
             "selection follows resolution evaluation",
         ):
             replace(completed.event, selection=delayed_selection)
-        with self.assertRaisesRegex(
-            FeedbackReplanningError,
-            "discarded resolution event has inconsistent output",
-        ):
-            replace(
-                expired.event,
-                estimator_update=completed.event.estimator_update,
-            )
+        for discarded_event in (expired.event, window_expired.event):
+            with self.subTest(status=discarded_event.status):
+                with self.assertRaisesRegex(
+                    FeedbackReplanningError,
+                    "discarded resolution event has inconsistent output",
+                ):
+                    replace(
+                        discarded_event,
+                        estimator_update=completed.event.estimator_update,
+                    )
         with self.assertRaisesRegex(
             FeedbackReplanningError,
             "asynchronous replacement event has inconsistent output",

@@ -1410,7 +1410,7 @@ Implemented foundation:
   candidate. A newer accepted observation supersedes pending resolution work.
   Late superseded completions cannot inspect supplied target data, cannot
   mutate the trajectory, and preserve the current logical intercept-validity
-  state. A current completion at or within timestamp-comparison tolerance of
+  state. A current result at or within timestamp-comparison tolerance of
   the selected intercept deadline reports `EXPIRED_TARGET_RESOLUTION`. A
   pre-deadline completion reports `EXPIRED_TRAJECTORY_WINDOW` without fault
   when resolution latency consumed a motion window that was limit-compliant at

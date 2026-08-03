@@ -352,7 +352,7 @@ exception through the owning coordinator.
 Every accepted observation supersedes earlier pending resolution work. A late
 completion is reported as superseded before supplied target or error data is
 inspected; no trajectory state changes, and any current logical intercept
-validity is preserved. A current completion at or within the shared timestamp
+validity is preserved. A current result at or within the shared timestamp
 comparison tolerance of the selected intercept reports
 `EXPIRED_TARGET_RESOLUTION` and is discarded. A pre-deadline completion reports
 `EXPIRED_TRAJECTORY_WINDOW` without fault when the same target produced a
@@ -375,7 +375,7 @@ Estimator-processing, selection, target-resolution, and
 trajectory-construction faults are bounded, phase-tagged, and latched. Logical
 cancellation is also terminal. Neither a hold nor cancellation sends a
 controller command or claims physical motion has stopped. Any estimator hold,
-selection hold, pending resolution, either expiration disposition,
+selection hold, pending resolution, any expiration disposition,
 cancellation, or fault invalidates the logical active intercept. Superseded
 completion preserves the current validity state, and a successful replacement
 restores validity.
