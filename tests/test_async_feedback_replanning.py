@@ -393,6 +393,7 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
         intercept_timestamp = (
             request.selection.selected_candidate.prediction.timestamp_seconds
         )
+        completion_at = 1.25
         issuance_duration = math.fsum((
             intercept_timestamp,
             -request.issued_at_seconds,
@@ -404,7 +405,12 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
             _target_states,
             duration_seconds,
         ):
-            if duration_seconds == issuance_duration:
+            if math.isclose(
+                duration_seconds,
+                issuance_duration,
+                rel_tol=0.0,
+                abs_tol=math.ulp(issuance_duration),
+            ):
                 raise RuntimeError("issuance feasibility check failed")
             raise TrajectoryTimingError("late result is infeasible")
 
@@ -416,7 +422,7 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
             faulted = replanner.complete_resolution(
                 request.request_sequence,
                 target_for(request.selection),
-                1.25,
+                completion_at,
             )
 
         self.assertIs(faulted.event.status, FeedbackReplanStatus.FAULTED)
@@ -453,6 +459,16 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
         self.assertEqual(replanner.trajectory_generation, 0)
 
     def test_current_resolver_failure_latches_and_stale_failure_is_ignored(self):
+        class PoisonErrorData:
+            def __getattribute__(self, name):
+                raise AssertionError(f"unexpected error access: {name}")
+
+            def __str__(self):
+                raise AssertionError("unexpected error string conversion")
+
+            def __repr__(self):
+                raise AssertionError("unexpected error representation")
+
         replanner = asynchronous_replanner()
         first = feed_to_request(replanner)[-1].resolution_request
         second = replanner.process_observation(
@@ -460,7 +476,7 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
             1.31,
         ).resolution_request
 
-        stale = replanner.fail_resolution(0, object(), 1.32)
+        stale = replanner.fail_resolution(0, PoisonErrorData(), 1.32)
         failed = replanner.fail_resolution(
             second.request_sequence,
             RuntimeError("IK worker failed"),
@@ -702,6 +718,15 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
             window_pending.resolution_request.request_sequence,
             target_for(window_pending.resolution_request.selection),
             window_deadline - 0.001,
+        )
+
+        self.assertIs(
+            expired.event.status,
+            FeedbackReplanStatus.EXPIRED_TARGET_RESOLUTION,
+        )
+        self.assertIs(
+            window_expired.event.status,
+            FeedbackReplanStatus.EXPIRED_TRAJECTORY_WINDOW,
         )
 
         delayed_selection = replace(

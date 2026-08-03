@@ -1408,7 +1408,7 @@ Implemented foundation:
   emits an isolated request carrying a monotonic request sequence, the current
   trajectory generation, the required axis count, and only the selected
   candidate. A newer accepted observation supersedes pending resolution work.
-  Late superseded completions cannot inspect supplied target data, cannot
+  Late superseded results cannot inspect supplied target or error data, cannot
   mutate the trajectory, and preserve the current logical intercept-validity
   state. A current result at or within timestamp-comparison tolerance of
   the selected intercept deadline reports `EXPIRED_TARGET_RESOLUTION`. A

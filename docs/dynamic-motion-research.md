@@ -350,7 +350,7 @@ observation admission, then submit either a correlated joint target or an
 exception through the owning coordinator.
 
 Every accepted observation supersedes earlier pending resolution work. A late
-completion is reported as superseded before supplied target or error data is
+result is reported as superseded before supplied target or error data is
 inspected; no trajectory state changes, and any current logical intercept
 validity is preserved. A current result at or within the shared timestamp
 comparison tolerance of the selected intercept reports
@@ -374,11 +374,11 @@ infeasible trajectory construction cannot replace the last valid trajectory.
 Estimator-processing, selection, target-resolution, and
 trajectory-construction faults are bounded, phase-tagged, and latched. Logical
 cancellation is also terminal. Neither a hold nor cancellation sends a
-controller command or claims physical motion has stopped. Any estimator hold,
-selection hold, pending resolution, any expiration disposition,
-cancellation, or fault invalidates the logical active intercept. Superseded
-completion preserves the current validity state, and a successful replacement
-restores validity.
+controller command or claims physical motion has stopped. Estimator holds,
+selection holds, pending resolution, expiration dispositions, cancellation,
+and faults invalidate the logical active intercept. A superseded result
+preserves the current validity state, and a successful replacement restores
+validity.
 
 The replay adapter processes the versioned observation replay through the same
 coordinator and exposes every processed event. A terminal fault returns an
