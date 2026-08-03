@@ -1365,13 +1365,15 @@ Implemented foundation:
   bind the trace to the exact canonical controller-configuration fingerprint.
 - `ARrobots.controller_trace_capture` transfers finalized captures through a
   bounded non-blocking queue. A dedicated background worker validates finalized
-  records, encodes, analyzes, and atomically writes local
-  `controller-traces/trace-*.jsonl` records. Default retention is bounded by
+  records, encodes, atomically writes local `controller-traces/trace-*.jsonl`
+  records, applies retention, and then analyzes the in-memory trace. Default
+  retention is bounded by
   `CONTROLLER_TRACE_CAPTURE_MAXIMUM_FILES` and
   `CONTROLLER_TRACE_CAPTURE_MAXIMUM_TOTAL_BYTES`; the runtime directory remains
-  ignored by Git. Queue saturation, capture loss, persistence failure, and
-  analysis failure are surfaced through immutable events consumed on the Tk
-  polling thread without delaying or changing the controller exchange.
+  ignored by Git. Queue saturation, capture loss, persistence failure,
+  retention failure, and analysis failure are surfaced through immutable
+  events consumed on the Tk polling thread without delaying or changing the
+  controller exchange.
 - Automatic capture remains limited to serialized HMI joint-dispatcher motion;
   raw program, G-code, offline, and non-telemetry exchanges create no trace.
   No measured limit, automatic tuning decision, or physical result has been

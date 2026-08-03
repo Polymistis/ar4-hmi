@@ -38486,6 +38486,15 @@ class HmiSourceContractTests(unittest.TestCase):
                 )
             ],
         )
+        self.assertEqual(len(trace_captures), 3)
+        self.assertEqual(trace_submissions, trace_captures)
+        self.assertEqual(trace_captures[0].failures, [])
+        self.assertEqual(trace_captures[1].failures, [])
+        self.assertEqual(len(trace_captures[2].failures), 1)
+        self.assertIsInstance(
+            trace_captures[2].failures[0],
+            SerialTransportQuarantinedError,
+        )
 
     def test_joint_trace_capture_uses_bound_identity_and_dispatcher_snapshot(self):
         profile = MotionProfile("Sp", 50, 10, 20, 25, "N", "000000")
@@ -38550,6 +38559,40 @@ class HmiSourceContractTests(unittest.TestCase):
             ],
         )
 
+    def test_joint_trace_submission_reports_store_failure(self):
+        diagnostics = []
+
+        class Store:
+            def __init__(self):
+                self.failure = None
+
+            def submit(self, capture):
+                if self.failure is not None:
+                    raise self.failure
+                return capture == "capture"
+
+            def report_failure(self, context, error):
+                diagnostics.append((context, error))
+                return True
+
+        store = Store()
+        namespace = {"joint_motion_trace_store": store}
+        submit_capture = self.compile_function(
+            "_submit_joint_motion_trace",
+            namespace,
+        )
+
+        self.assertFalse(submit_capture(None))
+        self.assertTrue(submit_capture("capture"))
+        store.failure = RuntimeError("queue unavailable")
+        self.assertFalse(submit_capture("capture"))
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(
+            diagnostics[0][0],
+            "Controller trace could not enter the background persistence queue",
+        )
+        self.assertIs(diagnostics[0][1], store.failure)
+
     def test_joint_trace_terminal_classification_matches_dispatcher_result(self):
         calls = []
 
@@ -38567,6 +38610,7 @@ class HmiSourceContractTests(unittest.TestCase):
                 return True
 
         namespace = {
+            "CONTROLLER_ESTOP_ADMISSION_FLAG": CONTROLLER_ESTOP_ADMISSION_FLAG,
             "ControllerLineExchangeResponse": ControllerLineExchangeResponse,
             "parse_position_response": parse_position_response,
         }
@@ -38617,6 +38661,50 @@ class HmiSourceContractTests(unittest.TestCase):
                 "stopped",
                 stopped_position.joints,
                 f"physical E-stop response {CONTROLLER_ESTOP_EVENT_FLAG}",
+            ),
+        )
+
+        admission_position = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_ADMISSION_FLAG}",
+                1,
+            )
+        )
+        admission = ControllerLineExchangeResponse(
+            None,
+            admission_position,
+            "admission-estop",
+        )
+        self.assertTrue(finish_capture(capture, admission))
+        self.assertEqual(
+            calls.pop(),
+            (
+                "failed",
+                "joint motion rejected by physical E-stop admission",
+                admission_position.joints,
+            ),
+        )
+        event_position = parse_position_response(
+            VALID_CONTROLLER_POSITION.raw.replace(
+                "NO",
+                f"NO{CONTROLLER_ESTOP_EVENT_FLAG}",
+                1,
+            )
+        )
+        event_then_admission = ControllerLineExchangeResponse(
+            None,
+            event_position,
+            "estop-admission",
+            admission_position,
+        )
+        self.assertTrue(finish_capture(capture, event_then_admission))
+        self.assertEqual(
+            calls.pop(),
+            (
+                "failed",
+                "joint motion rejected by physical E-stop admission",
+                admission_position.joints,
             ),
         )
         self.assertTrue(finish_capture(capture, object()))

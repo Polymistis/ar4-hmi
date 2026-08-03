@@ -198,11 +198,6 @@ class ControllerTraceCapture:
         with self._lock:
             return len(self._samples)
 
-    @property
-    def write_started(self):
-        with self._lock:
-            return self._origin_seconds is not None
-
     def set(self):
         """Satisfy the serial write-marker contract without raising into motion."""
 
@@ -362,19 +357,6 @@ class ControllerTraceStore:
         self._stop = threading.Event()
         self._worker = None
         self._closed = False
-
-    @property
-    def directory(self):
-        return self._directory
-
-    @property
-    def pending_count(self):
-        return self._queue.qsize()
-
-    @property
-    def closed(self):
-        with self._lifecycle_lock:
-            return self._closed
 
     def submit(self, capture):
         if not isinstance(capture, ControllerTraceCapture):

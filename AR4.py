@@ -20598,15 +20598,22 @@ def _finish_joint_motion_trace(capture, response):
     return False
   if not isinstance(response, ControllerLineExchangeResponse):
     return capture.fail("controller line exchange returned an invalid result")
-  stopped_position = (
-    response.estop_position
-    if response.estop_position is not None
-    else response.admission_position
-  )
-  if stopped_position is not None:
+  admission_position = response.admission_position
+  if (
+    admission_position is None
+    and response.estop_position is not None
+    and response.estop_position.flag == CONTROLLER_ESTOP_ADMISSION_FLAG
+  ):
+    admission_position = response.estop_position
+  if admission_position is not None:
+    return capture.fail(
+      "joint motion rejected by physical E-stop admission",
+      admission_position.joints,
+    )
+  if response.estop_position is not None:
     return capture.stop(
-      stopped_position.joints,
-      f"physical E-stop response {stopped_position.flag}",
+      response.estop_position.joints,
+      f"physical E-stop response {response.estop_position.flag}",
     )
   try:
     position = parse_position_response(response.authoritative_response)

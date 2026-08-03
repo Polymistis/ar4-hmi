@@ -12,6 +12,7 @@ from ARrobots.controller_trace import (
     ControllerMotionProfile,
     ControllerTraceMetadata,
     decode_controller_trace,
+    encode_controller_trace,
 )
 from ARrobots.controller_trace_capture import (
     ControllerTraceCapture,
@@ -350,6 +351,26 @@ class ControllerTraceStoreTests(unittest.TestCase):
             self.assertEqual(
                 [event.kind for event in store.drain_events()],
                 ["saved", "saved", "saved"],
+            )
+
+    def test_store_retention_prunes_by_total_encoded_bytes(self):
+        with BoundedTemporaryDirectory(prefix="ar4-controller-trace-") as directory:
+            capture = completed_capture()
+            payload_size = len(encode_controller_trace(capture.freeze()))
+            store = ControllerTraceStore(
+                directory,
+                maximum_files=10,
+                maximum_total_bytes=(payload_size * 2) - 1,
+            )
+
+            self.assertTrue(store.submit(capture))
+            self.assertTrue(store.submit(completed_capture()))
+            self.assertTrue(store.close(5.0))
+
+            self.assertEqual(len(list(Path(directory).glob("trace-*.jsonl"))), 1)
+            self.assertEqual(
+                [event.kind for event in store.drain_events()],
+                ["saved", "saved"],
             )
 
     def test_store_reports_invalid_destination_and_capture_drop(self):

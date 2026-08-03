@@ -150,14 +150,14 @@ command.
 
 `ARrobots.controller_trace_capture.ControllerTraceStore` hands finalized
 captures to a bounded `Queue.put_nowait` path. A dedicated daemon worker performs
-final-trace validation, encoding, analysis, atomic replacement, and retention
-away from the motion and Tk threads. Local records use
+final-trace validation, encoding, atomic replacement, retention, and then
+in-memory analysis away from the motion and Tk threads. Local records use
 `controller-traces/trace-*.jsonl`; Git ignores the runtime directory. Default
 retention uses `CONTROLLER_TRACE_CAPTURE_MAXIMUM_FILES` and
 `CONTROLLER_TRACE_CAPTURE_MAXIMUM_TOTAL_BYTES`. Queue saturation, capture loss,
-persistence failure, and analysis failure become immutable events consumed by
-the Tk poller. Trace failure never changes controller command or response
-handling.
+persistence failure, retention failure, and analysis failure become immutable
+events consumed by the Tk poller. Trace failure never changes controller
+command or response handling.
 
 Automatic capture does not cover raw program, G-code, offline, non-telemetry,
 or non-joint exchanges. The firmware emits best-effort telemetry at a nominal
