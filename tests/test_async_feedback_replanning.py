@@ -362,7 +362,7 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
 
         self.assertIs(
             expired.event.status,
-            FeedbackReplanStatus.EXPIRED_TARGET_RESOLUTION,
+            FeedbackReplanStatus.EXPIRED_TRAJECTORY_WINDOW,
         )
         self.assertFalse(expired.active_intercept_valid)
         self.assertIsNone(replanner.fault)
@@ -391,13 +391,15 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
         replanner = asynchronous_replanner()
         request = feed_to_request(replanner)[-1].resolution_request
 
-        with patch(
-            "ARrobots.feedback_replanning."
-            "replan_synchronized_quintic_trajectory",
-            side_effect=(
-                TrajectoryTimingError("late result is infeasible"),
-                RuntimeError("issuance feasibility check failed"),
-            ),
+        def replacement_failure(_active, _target, replacement_at):
+            if replacement_at == request.issued_at_seconds:
+                raise RuntimeError("issuance feasibility check failed")
+            raise TrajectoryTimingError("late result is infeasible")
+
+        with patch.object(
+            replanner,
+            "_replacement",
+            side_effect=replacement_failure,
         ):
             faulted = replanner.complete_resolution(
                 request.request_sequence,
@@ -659,7 +661,7 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
                 0,
             )
 
-    def test_async_event_contract_rejects_every_inconsistent_variant(self):
+    def test_async_event_contract_rejects_additional_inconsistent_payloads(self):
         completed_replanner = asynchronous_replanner()
         completed_pending = feed_to_request(completed_replanner)[-1]
         completed = completed_replanner.complete_resolution(

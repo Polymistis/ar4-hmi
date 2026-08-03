@@ -353,15 +353,16 @@ Every accepted observation supersedes earlier pending resolution work. A late
 completion is reported as superseded before supplied target or error data is
 inspected; no trajectory state changes, and any current logical intercept
 validity is preserved. A current completion at or within the shared timestamp
-comparison tolerance of the selected intercept is reported as expired and
-discarded. A pre-deadline completion also expires without fault when the same
-target produced a limit-compliant trajectory at request issuance but no longer
-does so at result receipt; a target that was already infeasible at issuance
-remains a trajectory-construction fault. Only the current request can replace
-the desired trajectory, and the replacement begins from desired state sampled
-when the owning coordinator receives the result rather than at the older
-observation or worker-completion time. Result receipt timestamps must preserve
-coordinator event ordering.
+comparison tolerance of the selected intercept reports
+`EXPIRED_TARGET_RESOLUTION` and is discarded. A pre-deadline completion reports
+`EXPIRED_TRAJECTORY_WINDOW` without fault when the same target produced a
+limit-compliant trajectory at request issuance but no longer does so at result
+receipt; a target that was already infeasible at issuance remains a
+trajectory-construction fault. Only the current request can replace the desired
+trajectory, and the replacement begins from desired state sampled when the
+owning coordinator receives the result rather than at the older observation or
+worker-completion time. Result receipt timestamps must preserve coordinator
+event ordering.
 Invalid current output, active-state corruption, or a current resolver failure
 remains phase-tagged and latched. Public events and requests are isolated from
 the coordinator's internal pending snapshot.
@@ -374,9 +375,10 @@ Estimator-processing, selection, target-resolution, and
 trajectory-construction faults are bounded, phase-tagged, and latched. Logical
 cancellation is also terminal. Neither a hold nor cancellation sends a
 controller command or claims physical motion has stopped. Any estimator hold,
-selection hold, pending resolution, expired resolution, cancellation, or fault
-invalidates the logical active intercept. Superseded completion preserves the
-current validity state, and a successful replacement restores validity.
+selection hold, pending resolution, either expiration disposition,
+cancellation, or fault invalidates the logical active intercept. Superseded
+completion preserves the current validity state, and a successful replacement
+restores validity.
 
 The replay adapter processes the versioned observation replay through the same
 coordinator and exposes every processed event. A terminal fault returns an

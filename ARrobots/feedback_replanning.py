@@ -243,6 +243,7 @@ class FeedbackReplanStatus(Enum):
     AWAITING_TARGET_RESOLUTION = "awaiting-target-resolution"
     SUPERSEDED_TARGET_RESOLUTION = "superseded-target-resolution"
     EXPIRED_TARGET_RESOLUTION = "expired-target-resolution"
+    EXPIRED_TRAJECTORY_WINDOW = "expired-trajectory-window"
     REPLACED = "replaced"
     REPLACED_AFTER_TARGET_RESOLUTION = (
         "replaced-after-target-resolution"
@@ -676,6 +677,7 @@ class FeedbackReplanEvent:
         if self.status in (
             FeedbackReplanStatus.SUPERSEDED_TARGET_RESOLUTION,
             FeedbackReplanStatus.EXPIRED_TARGET_RESOLUTION,
+            FeedbackReplanStatus.EXPIRED_TRAJECTORY_WINDOW,
         ):
             if (
                 self.resolution_request_sequence is None
@@ -1365,7 +1367,7 @@ class _FeedbackReplannerCore:
                     self._active_trajectory = active_trajectory
                     return self._event(
                         replacement_at,
-                        FeedbackReplanStatus.EXPIRED_TARGET_RESOLUTION,
+                        FeedbackReplanStatus.EXPIRED_TRAJECTORY_WINDOW,
                         resolution_request_sequence=(
                             resolution_request_sequence
                         ),

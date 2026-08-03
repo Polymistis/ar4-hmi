@@ -1400,8 +1400,9 @@ Implemented foundation:
   return a matching bounded joint target before transactional C2 replacement
   can advance the trajectory generation. Estimator processing failure, invalid
   or stale resolver output, reentrant processing, active-state corruption,
-  callback failure, and infeasible trajectory construction leave the last
-  validated trajectory unreplaced and latch the coordinator fault.
+  and callback failure leave the last validated trajectory unreplaced and
+  latch the coordinator fault. In synchronous resolution, infeasible
+  trajectory construction has the same fault behavior.
 - `AsynchronousFeedbackReplanner` separates selected-intercept publication
   from externally scheduled joint-target resolution. Each selected update
   emits an isolated request carrying a monotonic request sequence, the current
@@ -1410,10 +1411,11 @@ Implemented foundation:
   Late superseded completions cannot inspect supplied target data, cannot
   mutate the trajectory, and preserve the current logical intercept-validity
   state. A current completion at or within timestamp-comparison tolerance of
-  the selected intercept deadline is discarded explicitly. A pre-deadline
-  completion also expires without fault when resolution latency consumed a
-  motion window that was limit-compliant at request issuance; a target that
-  was already infeasible at issuance remains a trajectory-construction fault.
+  the selected intercept deadline reports `EXPIRED_TARGET_RESOLUTION`. A
+  pre-deadline completion reports `EXPIRED_TRAJECTORY_WINDOW` without fault
+  when resolution latency consumed a motion window that was limit-compliant at
+  request issuance; a target that was already infeasible at issuance remains a
+  trajectory-construction fault.
   Only the current pre-deadline request can validate a correlated joint target
   and construct a C2 replacement from desired state at the coordinator receipt
   timestamp.
@@ -1437,9 +1439,10 @@ Implemented foundation:
   scaling,
   arbitrary-state quintic derivative-root extrema, trajectory sampling, C2
   desired-state replacement, repeated feedback-driven replacement, stale
-  target rejection, asynchronous request isolation, superseded and expired
-  resolution disposal, delayed desired-state replacement, hold and
-  cancellation dispositions, and latched fault phases. The injected
+  target rejection, asynchronous request isolation, superseded resolution
+  disposal, deadline expiration, trajectory-window expiration, delayed
+  desired-state replacement, hold and cancellation dispositions, and latched
+  fault phases. The injected
   feasibility boundary, joint-target resolver, and trajectory limits are
   simulation input, not evidence of physical reachability or timing.
   No controller command, live motion, calibrated transform, production IK or
