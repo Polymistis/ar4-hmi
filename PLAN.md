@@ -38,7 +38,7 @@ Status terms and complete acceptance criteria are defined in the detailed-contra
 | M4A5 - Desired-versus-estimated-and-encoder joint display | `Tested` | Keep desired, active-target, estimate, and encoder channels distinct. |
 | M4A6 - Main-control workspace and named positions | `Tested` | Maintain tabbed controls and validated Start and Shutdown positions. |
 | M4A7 - Low-priority joint encoder telemetry | `Blocked` | Implementation remains in progress; powered acceptance prerequisites remain unmet. |
-| M4B - Repeatability and dynamic interception pass | `In progress` | Add recorded controller-trace analysis for motion-profile tuning. |
+| M4B - Repeatability and dynamic interception pass | `In progress` | Wire bounded low-priority HMI trace capture to the controller-trace analyzer. |
 | M5 - Controlled hardware validation | `Blocked` | Await the prerequisites defined by the controlled verification contract. |
 
 ## Verification records
@@ -1341,6 +1341,22 @@ Implemented foundation:
 - Deterministic hardware-free tests cover validation, estimator reset and
   rejection behavior, covariance propagation, bounded prediction, canonical
   record round trips, and replay failures.
+- `ARrobots.controller_trace` defines the bounded versioned
+  `ar4.controller-trace.v1` JSONL contract for one complete J1-J6
+  `JOINT_TELEMETRY_V1` exchange. Metadata preserves controller and firmware
+  identity, a canonical controller-configuration fingerprint, the confirmed
+  command-start position, commanded target, RJ timing profile, and nominal
+  telemetry cadence. Samples use host-monotonic receipt offsets and remain
+  distinct from the terminal controller step-counter position.
+- Controller-trace analysis uses each observed non-uniform sample interval to
+  derive per-joint velocity, acceleration, and jerk finite differences plus
+  direction-aware acceleration, deceleration, reverse motion, overshoot, and
+  endpoint error. Missing initial or terminal coverage, cadence gaps, failed
+  exchanges, insufficient samples, and stationary J1-J6 traces make the trace
+  explicitly ineligible for profile analysis. Host receipt timestamps and
+  encoder quantization remain recorded limitations. No HMI capture adapter,
+  trace file, measured limit, automatic tuning decision, or physical result is
+  created by the hardware-free analyzer.
 - `ARrobots.interception` samples a configured bounded lead-time horizon and
   rejects candidates whose predicted covariance, terminal object speed, or
   arrival margin violates an explicit threshold. Construction and

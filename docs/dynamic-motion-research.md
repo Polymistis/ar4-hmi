@@ -105,6 +105,46 @@ Repeat targets from consistent and reversed approach directions to expose hyster
 7. Add local replanning, collision checking, and terminal visual servoing.
 8. Authorize conservative hardware validation only after stop, watchdog, limit, and fault behavior pass software and bench checks.
 
+## Implemented controller-trace analysis foundation
+
+`ARrobots.controller_trace` defines canonical JSONL schema
+`ar4.controller-trace.v1` for one complete J1-J6
+`JOINT_TELEMETRY_V1` exchange. The header preserves the controller hardware ID,
+firmware version, confirmed command-start position, commanded J1-J6 target, RJ
+speed and ramp inputs, the nominal telemetry period, and a `sha256:`
+configuration fingerprint. The fingerprint
+identifies the canonical ASCII `UP` controller-configuration command including
+the terminal LF; configuration contents remain outside the trace. The schema
+defines the trace time origin as the host monotonic timestamp captured
+immediately before the RJ write. Encoder-sample and terminal timestamps are
+offsets from that origin. Command direction is derived from the confirmed start
+and target positions rather than a potentially late first encoder sample.
+
+Encoder records contain host-receipt timestamps and J1-J6 positions in degrees.
+The terminal record separately identifies success, failure, or stop and stores
+controller-reported step-counter positions when available. Terminal positions
+are not reclassified as encoder measurements. The decoder bounds payload,
+record, and line size; requires strict UTF-8 and exact fields; rejects duplicate
+JSON keys and non-finite numbers; and requires strictly increasing sample
+timestamps followed by one terminal record.
+
+The hardware-free analyzer derives velocity, acceleration, and jerk through
+successive finite differences at the midpoint of each observed interval, so
+unequal host-receipt intervals are not treated as uniform samples. Per-joint
+results include endpoint error, terminal reported error, direction-aware peak
+speed, reverse speed, acceleration, deceleration, overshoot, and absolute jerk.
+Cadence statistics identify internal cadence gaps and missing coverage near
+command transmission or terminal response. A failed exchange, inadequate
+sample count, cadence or boundary gap, or stationary J1-J6 trace makes the
+record explicitly ineligible for profile analysis.
+
+The current schema and analyzer create no trace automatically, send no
+controller command, and establish no measured motion limit. The firmware emits
+best-effort telemetry at a nominal 10 Hz without controller timestamps. Host
+receipt jitter and millidegree encoder quantization therefore remain explicit
+measurement limitations, and any future tuning decision requires repeated
+recorded trials under an approved hardware procedure.
+
 ## Implemented deterministic foundation
 
 `ARrobots.dynamic_motion` provides hardware-free constant-velocity and
