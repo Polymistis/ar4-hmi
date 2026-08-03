@@ -402,6 +402,9 @@ class ControllerTraceCodecTests(unittest.TestCase):
         wrong_position_unit = [dict(record) for record in records]
         wrong_position_unit[0]["position_unit"] = "radian"
         mutations.append(wrong_position_unit)
+        wrong_axis_count = [dict(record) for record in records]
+        wrong_axis_count[0]["axis_count"] = 9
+        mutations.append(wrong_axis_count)
         float_axis_count = [dict(record) for record in records]
         float_axis_count[0]["axis_count"] = 6.0
         mutations.append(float_axis_count)
