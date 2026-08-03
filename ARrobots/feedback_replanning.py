@@ -37,6 +37,7 @@ from ARrobots.trajectory_timing import (
     SynchronizedJointTrajectory,
     SynchronizedQuinticTrajectory,
     TRAJECTORY_MAXIMUM_AXES,
+    TrajectoryTimingError,
     replan_synchronized_quintic_trajectory,
 )
 
@@ -1335,6 +1336,48 @@ class _FeedbackReplannerCore:
                 active_trajectory,
                 target,
                 replacement_at,
+            )
+        except TrajectoryTimingError as exc:
+            if resolution_request_sequence is not None:
+                try:
+                    self._replacement(
+                        active_trajectory,
+                        target,
+                        work.evaluated_at_seconds,
+                    )
+                except (FeedbackReplanningError, TrajectoryTimingError):
+                    feasible_at_issuance = False
+                except Exception as feasibility_exc:
+                    self._active_trajectory = active_trajectory
+                    return self._fault_event(
+                        FeedbackReplanFaultPhase.TRAJECTORY_CONSTRUCTION,
+                        feasibility_exc,
+                        replacement_at,
+                        work.estimator_update,
+                        work.selection,
+                        resolution_request_sequence,
+                    )
+                else:
+                    feasible_at_issuance = True
+                if feasible_at_issuance:
+                    # Resolution latency can consume a previously feasible
+                    # motion window before the intercept timestamp itself.
+                    self._active_trajectory = active_trajectory
+                    return self._event(
+                        replacement_at,
+                        FeedbackReplanStatus.EXPIRED_TARGET_RESOLUTION,
+                        resolution_request_sequence=(
+                            resolution_request_sequence
+                        ),
+                    )
+            self._active_trajectory = active_trajectory
+            return self._fault_event(
+                FeedbackReplanFaultPhase.TRAJECTORY_CONSTRUCTION,
+                exc,
+                replacement_at,
+                work.estimator_update,
+                work.selection,
+                resolution_request_sequence,
             )
         except Exception as exc:
             self._active_trajectory = active_trajectory

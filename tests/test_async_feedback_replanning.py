@@ -1,6 +1,7 @@
 import math
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 from ARrobots.dynamic_motion import OutOfOrderObservationError
 from ARrobots.feedback_replanning import (
@@ -18,17 +19,29 @@ from ARrobots.interception import (
     InterceptFeasibilityStatus,
 )
 from ARrobots.trajectory_timing import (
+    TrajectoryTimingError,
     plan_synchronized_rest_to_rest_trajectory,
 )
-from tests.test_feedback_replanning import (
-    estimator_config,
-    feasible,
-    joint_limits,
-    observation,
-    selector,
-    stationary_trajectory,
-    target_for,
-)
+if __package__:
+    from .test_feedback_replanning import (
+        estimator_config,
+        feasible,
+        joint_limits,
+        observation,
+        selector,
+        stationary_trajectory,
+        target_for,
+    )
+else:
+    from test_feedback_replanning import (
+        estimator_config,
+        feasible,
+        joint_limits,
+        observation,
+        selector,
+        stationary_trajectory,
+        target_for,
+    )
 
 
 def asynchronous_replanner(
@@ -334,6 +347,75 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
         self.assertIsNone(replanner.fault)
         self.assertIsNone(replanner.pending_resolution_request)
 
+    def test_latency_consumed_feasible_duration_expires_without_fault(self):
+        replanner = asynchronous_replanner()
+        request = feed_to_request(replanner)[-1].resolution_request
+        deadline = (
+            request.selection.selected_candidate.prediction.timestamp_seconds
+        )
+
+        expired = replanner.complete_resolution(
+            request.request_sequence,
+            target_for(request.selection),
+            deadline - 0.001,
+        )
+
+        self.assertIs(
+            expired.event.status,
+            FeedbackReplanStatus.EXPIRED_TARGET_RESOLUTION,
+        )
+        self.assertFalse(expired.active_intercept_valid)
+        self.assertIsNone(replanner.fault)
+        self.assertIsNone(replanner.pending_resolution_request)
+        self.assertEqual(replanner.trajectory_generation, 0)
+
+    def test_target_infeasible_at_request_issuance_still_faults(self):
+        replanner = asynchronous_replanner()
+        request = feed_to_request(replanner)[-1].resolution_request
+
+        faulted = replanner.complete_resolution(
+            request.request_sequence,
+            target_for(request.selection, (10000.0,)),
+            1.25,
+        )
+
+        self.assertIs(faulted.event.status, FeedbackReplanStatus.FAULTED)
+        self.assertIs(
+            faulted.event.fault.phase,
+            FeedbackReplanFaultPhase.TRAJECTORY_CONSTRUCTION,
+        )
+        self.assertIs(replanner.fault, faulted.event.fault)
+        self.assertEqual(replanner.trajectory_generation, 0)
+
+    def test_issuance_feasibility_check_failure_latches_fault(self):
+        replanner = asynchronous_replanner()
+        request = feed_to_request(replanner)[-1].resolution_request
+
+        with patch(
+            "ARrobots.feedback_replanning."
+            "replan_synchronized_quintic_trajectory",
+            side_effect=(
+                TrajectoryTimingError("late result is infeasible"),
+                RuntimeError("issuance feasibility check failed"),
+            ),
+        ):
+            faulted = replanner.complete_resolution(
+                request.request_sequence,
+                target_for(request.selection),
+                1.25,
+            )
+
+        self.assertIs(faulted.event.status, FeedbackReplanStatus.FAULTED)
+        self.assertIs(
+            faulted.event.fault.phase,
+            FeedbackReplanFaultPhase.TRAJECTORY_CONSTRUCTION,
+        )
+        self.assertIn(
+            "issuance feasibility check failed",
+            faulted.event.fault.detail,
+        )
+        self.assertIs(replanner.fault, faulted.event.fault)
+
     def test_invalid_current_target_latches_target_resolution_fault(self):
         replanner = asynchronous_replanner()
         request = feed_to_request(replanner)[-1].resolution_request
@@ -575,6 +657,86 @@ class AsynchronousFeedbackReplannerTests(unittest.TestCase):
                 1,
                 replanner.active_trajectory,
                 0,
+            )
+
+    def test_async_event_contract_rejects_every_inconsistent_variant(self):
+        completed_replanner = asynchronous_replanner()
+        completed_pending = feed_to_request(completed_replanner)[-1]
+        completed = completed_replanner.complete_resolution(
+            completed_pending.resolution_request.request_sequence,
+            target_for(completed_pending.resolution_request.selection),
+            1.25,
+        )
+        expired_replanner = asynchronous_replanner()
+        expired_pending = feed_to_request(expired_replanner)[-1]
+        deadline = (
+            expired_pending.resolution_request.selection.selected_candidate
+            .prediction.timestamp_seconds
+        )
+        expired = expired_replanner.complete_resolution(
+            expired_pending.resolution_request.request_sequence,
+            object(),
+            deadline,
+        )
+
+        delayed_selection = replace(
+            completed.event.selection,
+            evaluated_at_seconds=completed.event.evaluated_at_seconds + 0.1,
+        )
+        with self.assertRaisesRegex(
+            FeedbackReplanningError,
+            "selection follows resolution evaluation",
+        ):
+            replace(completed.event, selection=delayed_selection)
+        with self.assertRaisesRegex(
+            FeedbackReplanningError,
+            "discarded resolution event has inconsistent output",
+        ):
+            replace(
+                expired.event,
+                estimator_update=completed.event.estimator_update,
+            )
+        with self.assertRaisesRegex(
+            FeedbackReplanningError,
+            "asynchronous replacement event has inconsistent output",
+        ):
+            replace(completed.event, replacement_trajectory=None)
+        with self.assertRaisesRegex(
+            FeedbackReplanningError,
+            "synchronous event must not carry a resolution request",
+        ):
+            replace(
+                completed_pending.event,
+                status=FeedbackReplanStatus.REPLACED,
+            )
+
+    def test_async_result_contract_rejects_request_mismatches(self):
+        replanner = asynchronous_replanner()
+        pending = feed_to_request(replanner)[-1]
+        mismatched_request = replace(
+            pending.resolution_request,
+            trajectory_generation=1,
+        )
+
+        with self.assertRaisesRegex(
+            FeedbackReplanningError,
+            "request does not match the event",
+        ):
+            AsynchronousFeedbackReplanResult(
+                pending.event,
+                False,
+                mismatched_request,
+            )
+
+        cancelled = replanner.cancel(1.22)
+        with self.assertRaisesRegex(
+            FeedbackReplanningError,
+            "non-pending asynchronous result must not dispatch a request",
+        ):
+            AsynchronousFeedbackReplanResult(
+                cancelled.event,
+                False,
+                pending.resolution_request,
             )
 
     def test_request_contract_rejects_invalid_axis_and_timestamp(self):

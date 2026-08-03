@@ -1410,9 +1410,13 @@ Implemented foundation:
   Late superseded completions cannot inspect supplied target data, cannot
   mutate the trajectory, and preserve the current logical intercept-validity
   state. A current completion at or within timestamp-comparison tolerance of
-  the selected intercept deadline is discarded explicitly. Only the current
-  pre-deadline request can validate a correlated joint target and construct a
-  C2 replacement from desired state at the coordinator receipt timestamp.
+  the selected intercept deadline is discarded explicitly. A pre-deadline
+  completion also expires without fault when resolution latency consumed a
+  motion window that was limit-compliant at request issuance; a target that
+  was already infeasible at issuance remains a trajectory-construction fault.
+  Only the current pre-deadline request can validate a correlated joint target
+  and construct a C2 replacement from desired state at the coordinator receipt
+  timestamp.
   Current resolver failure or invalid active state remains phase-tagged and
   latched. No thread, worker pool, controller command, or physical cancellation
   is created by the split-phase coordinator.
