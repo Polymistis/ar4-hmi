@@ -38,7 +38,7 @@ Status terms and complete acceptance criteria are defined in the detailed-contra
 | M4A5 - Desired-versus-estimated-and-encoder joint display | `Tested` | Keep desired, active-target, estimate, and encoder channels distinct. |
 | M4A6 - Main-control workspace and named positions | `Tested` | Maintain tabbed controls and validated Start and Shutdown positions. |
 | M4A7 - Low-priority joint encoder telemetry | `Blocked` | Implementation remains in progress; powered acceptance prerequisites remain unmet. |
-| M4B - Repeatability and dynamic interception pass | `In progress` | Add asynchronous supersession after impact-filtered replay and replanning. |
+| M4B - Repeatability and dynamic interception pass | `In progress` | Add recorded controller-trace analysis for motion-profile tuning. |
 | M5 - Controlled hardware validation | `Blocked` | Await the prerequisites defined by the controlled verification contract. |
 
 ## Verification records
@@ -1402,6 +1402,20 @@ Implemented foundation:
   or stale resolver output, reentrant processing, active-state corruption,
   callback failure, and infeasible trajectory construction leave the last
   validated trajectory unreplaced and latch the coordinator fault.
+- `AsynchronousFeedbackReplanner` separates selected-intercept publication
+  from externally scheduled joint-target resolution. Each selected update
+  emits an isolated request carrying a monotonic request sequence, the current
+  trajectory generation, the required axis count, and only the selected
+  candidate. A newer accepted observation supersedes pending resolution work.
+  Late superseded completions cannot inspect supplied target data, cannot
+  mutate the trajectory, and preserve the current logical intercept-validity
+  state. A current completion at or within timestamp-comparison tolerance of
+  the selected intercept deadline is discarded explicitly. Only the current
+  pre-deadline request can validate a correlated joint target and construct a
+  C2 replacement from desired state at the coordinator receipt timestamp.
+  Current resolver failure or invalid active state remains phase-tagged and
+  latched. No thread, worker pool, controller command, or physical cancellation
+  is created by the split-phase coordinator.
 - The feedback-replanning replay adapter exercises repeated desired-state
   replacement through the versioned observation replay. A terminal fault
   returns an explicit processed prefix. Replay results require non-decreasing
@@ -1419,13 +1433,14 @@ Implemented foundation:
   scaling,
   arbitrary-state quintic derivative-root extrema, trajectory sampling, C2
   desired-state replacement, repeated feedback-driven replacement, stale
-  target rejection, hold and cancellation dispositions, and latched fault
-  phases. The injected feasibility boundary, joint-target resolver, and
-  trajectory limits are simulation input, not evidence of physical
-  reachability or timing.
+  target rejection, asynchronous request isolation, superseded and expired
+  resolution disposal, delayed desired-state replacement, hold and
+  cancellation dispositions, and latched fault phases. The injected
+  feasibility boundary, joint-target resolver, and trajectory limits are
+  simulation input, not evidence of physical reachability or timing.
   No controller command, live motion, calibrated transform, production IK or
   collision engine, physical impact classifier, controller-online trajectory
-  replacement, asynchronous resolver supersession, local collision-aware path
+  replacement, background resolver executor, local collision-aware path
   replanning, or grasp behavior is included.
 
 ### M5 - Controlled hardware validation

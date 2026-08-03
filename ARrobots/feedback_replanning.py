@@ -23,6 +23,7 @@ from ARrobots.dynamic_motion import (
 )
 from ARrobots.interception import (
     INTERCEPT_REPLAY_MAXIMUM_CANDIDATE_EVALUATIONS,
+    InterceptCandidateEvaluation,
     InterceptSelection,
     InterceptSelectionStatus,
     InterceptSelector,
@@ -238,7 +239,13 @@ class FeedbackReplanStatus(Enum):
     HOLDING_NO_FEASIBLE_CANDIDATE = "holding-no-feasible-candidate"
     HOLDING_STALE_ESTIMATE = "holding-stale-estimate"
     HOLDING_FUTURE_ESTIMATE = "holding-future-estimate"
+    AWAITING_TARGET_RESOLUTION = "awaiting-target-resolution"
+    SUPERSEDED_TARGET_RESOLUTION = "superseded-target-resolution"
+    EXPIRED_TARGET_RESOLUTION = "expired-target-resolution"
     REPLACED = "replaced"
+    REPLACED_AFTER_TARGET_RESOLUTION = (
+        "replaced-after-target-resolution"
+    )
     CANCELLED = "cancelled"
     FAULTED = "faulted"
 
@@ -356,7 +363,10 @@ def _estimator_hold_status(status):
 
 
 def _status_has_valid_intercept(status):
-    return status is FeedbackReplanStatus.REPLACED
+    return status in (
+        FeedbackReplanStatus.REPLACED,
+        FeedbackReplanStatus.REPLACED_AFTER_TARGET_RESOLUTION,
+    )
 
 
 def _validated_selection(selection, update, evaluated_at):
@@ -367,6 +377,13 @@ def _validated_selection(selection, update, evaluated_at):
     if type(selection.candidates) is not tuple:
         raise FeedbackReplanningError(
             "selector returned a non-built-in candidate sequence"
+        )
+    if any(
+        type(candidate) is not InterceptCandidateEvaluation
+        for candidate in selection.candidates
+    ):
+        raise FeedbackReplanningError(
+            "selector returned a non-built-in candidate"
         )
     selection = InterceptSelection(
         selection.status,
@@ -394,6 +411,10 @@ def _resolver_selection_snapshot(selection):
         raise FeedbackReplanningError(
             "target resolution requires a selected intercept"
         )
+    if type(selection.selected_candidate) is not InterceptCandidateEvaluation:
+        raise FeedbackReplanningError(
+            "target resolution requires a built-in selected candidate"
+        )
     try:
         estimate, selected_candidate = copy.deepcopy((
             selection.estimate,
@@ -414,6 +435,58 @@ def _resolver_selection_snapshot(selection):
 
 
 @dataclass(frozen=True)
+class FeedbackReplanResolutionRequest:
+    """Isolated selected intercept for one asynchronous target lookup."""
+
+    request_sequence: int
+    issued_at_seconds: float
+    trajectory_generation: int
+    axis_count: int
+    selection: InterceptSelection
+
+    def __post_init__(self):
+        request_sequence = _nonnegative_integer(
+            self.request_sequence,
+            "resolution request sequence",
+        )
+        issued_at = _nonnegative_number(
+            self.issued_at_seconds,
+            "resolution request issued_at_seconds",
+        )
+        trajectory_generation = _nonnegative_integer(
+            self.trajectory_generation,
+            "resolution request trajectory_generation",
+        )
+        axis_count = _nonnegative_integer(
+            self.axis_count,
+            "resolution request axis_count",
+        )
+        if axis_count == 0 or axis_count > TRAJECTORY_MAXIMUM_AXES:
+            raise FeedbackReplanningError(
+                "resolution request axis_count is outside the supported range"
+            )
+        if type(self.selection) is not InterceptSelection:
+            raise FeedbackReplanningError(
+                "resolution request selection must be a built-in "
+                "InterceptSelection"
+            )
+        selection = _resolver_selection_snapshot(self.selection)
+        if selection.evaluated_at_seconds != issued_at:
+            raise FeedbackReplanningError(
+                "resolution request timestamp does not match selection"
+            )
+        object.__setattr__(self, "request_sequence", request_sequence)
+        object.__setattr__(self, "issued_at_seconds", issued_at)
+        object.__setattr__(
+            self,
+            "trajectory_generation",
+            trajectory_generation,
+        )
+        object.__setattr__(self, "axis_count", axis_count)
+        object.__setattr__(self, "selection", selection)
+
+
+@dataclass(frozen=True)
 class FeedbackReplanEvent:
     sequence: int
     evaluated_at_seconds: float
@@ -423,6 +496,7 @@ class FeedbackReplanEvent:
     selection: Optional[InterceptSelection] = None
     replacement_trajectory: Optional[SynchronizedQuinticTrajectory] = None
     fault: Optional[FeedbackReplanFault] = None
+    resolution_request_sequence: Optional[int] = None
 
     def __post_init__(self):
         object.__setattr__(
@@ -474,9 +548,18 @@ class FeedbackReplanEvent:
             raise FeedbackReplanningError(
                 "event fault must be a built-in FeedbackReplanFault"
             )
+        if self.resolution_request_sequence is not None:
+            object.__setattr__(
+                self,
+                "resolution_request_sequence",
+                _nonnegative_integer(
+                    self.resolution_request_sequence,
+                    "event resolution_request_sequence",
+                ),
+            )
         self._validate_contract()
 
-    def _validate_selection_link(self):
+    def _validate_selection_link(self, allow_delayed_evaluation=False):
         if self.estimator_update is None or self.selection is None:
             raise FeedbackReplanningError(
                 "selection event requires an estimator update and selection"
@@ -489,7 +572,17 @@ class FeedbackReplanEvent:
             raise FeedbackReplanningError(
                 "event selection does not match the estimator update"
             )
-        if self.selection.evaluated_at_seconds != self.evaluated_at_seconds:
+        selection_time = self.selection.evaluated_at_seconds
+        if allow_delayed_evaluation:
+            tolerance = _comparison_tolerance(
+                selection_time,
+                self.evaluated_at_seconds,
+            )
+            if selection_time > self.evaluated_at_seconds + tolerance:
+                raise FeedbackReplanningError(
+                    "event selection follows resolution evaluation"
+                )
+        elif selection_time != self.evaluated_at_seconds:
             raise FeedbackReplanningError(
                 "event selection timestamp does not match evaluation"
             )
@@ -501,6 +594,7 @@ class FeedbackReplanEvent:
                 self.selection,
                 self.replacement_trajectory,
                 self.fault,
+                self.resolution_request_sequence,
             )):
                 raise FeedbackReplanningError(
                     "cancelled event must not carry processing output"
@@ -515,6 +609,7 @@ class FeedbackReplanEvent:
                 if (
                     self.estimator_update is not None
                     or self.selection is not None
+                    or self.resolution_request_sequence is not None
                 ):
                     raise FeedbackReplanningError(
                         "estimation fault must not carry processing output"
@@ -526,13 +621,16 @@ class FeedbackReplanEvent:
                     or self.estimator_update.status
                     is not EstimatorUpdateStatus.ESTIMATE_UPDATED
                     or self.selection is not None
+                    or self.resolution_request_sequence is not None
                 ):
                     raise FeedbackReplanningError(
                         "selection fault requires only an estimated update"
                     )
                 return
             if self.selection is not None:
-                self._validate_selection_link()
+                self._validate_selection_link(
+                    self.resolution_request_sequence is not None
+                )
                 if (
                     self.selection.status
                     is not InterceptSelectionStatus.SELECTED
@@ -561,6 +659,7 @@ class FeedbackReplanEvent:
                 is EstimatorUpdateStatus.ESTIMATE_UPDATED
                 or self.selection is not None
                 or self.replacement_trajectory is not None
+                or self.resolution_request_sequence is not None
             ):
                 raise FeedbackReplanningError(
                     "estimate hold event has inconsistent processing output"
@@ -573,6 +672,61 @@ class FeedbackReplanEvent:
                     "estimate hold event does not preserve estimator disposition"
                 )
             return
+        if self.status in (
+            FeedbackReplanStatus.SUPERSEDED_TARGET_RESOLUTION,
+            FeedbackReplanStatus.EXPIRED_TARGET_RESOLUTION,
+        ):
+            if (
+                self.resolution_request_sequence is None
+                or self.estimator_update is not None
+                or self.selection is not None
+                or self.replacement_trajectory is not None
+            ):
+                raise FeedbackReplanningError(
+                    "discarded resolution event has inconsistent output"
+                )
+            return
+        if self.status is FeedbackReplanStatus.AWAITING_TARGET_RESOLUTION:
+            if (
+                self.resolution_request_sequence is None
+                or self.replacement_trajectory is not None
+            ):
+                raise FeedbackReplanningError(
+                    "pending resolution event has inconsistent output"
+                )
+            self._validate_selection_link()
+            if (
+                self.selection.status
+                is not InterceptSelectionStatus.SELECTED
+            ):
+                raise FeedbackReplanningError(
+                    "pending resolution event requires a selected intercept"
+                )
+            return
+        if (
+            self.status
+            is FeedbackReplanStatus.REPLACED_AFTER_TARGET_RESOLUTION
+        ):
+            if (
+                self.resolution_request_sequence is None
+                or self.replacement_trajectory is None
+            ):
+                raise FeedbackReplanningError(
+                    "asynchronous replacement event has inconsistent output"
+                )
+            self._validate_selection_link(True)
+            if (
+                self.selection.status
+                is not InterceptSelectionStatus.SELECTED
+            ):
+                raise FeedbackReplanningError(
+                    "asynchronous replacement requires a selected intercept"
+                )
+            return
+        if self.resolution_request_sequence is not None:
+            raise FeedbackReplanningError(
+                "synchronous event must not carry a resolution request"
+            )
         self._validate_selection_link()
         if self.status is FeedbackReplanStatus.REPLACED:
             if (
@@ -590,6 +744,70 @@ class FeedbackReplanEvent:
         ):
             raise FeedbackReplanningError(
                 "selection hold event has inconsistent processing output"
+            )
+
+
+@dataclass(frozen=True)
+class AsynchronousFeedbackReplanResult:
+    """One coordinator event and any isolated resolver work to dispatch."""
+
+    event: FeedbackReplanEvent
+    active_intercept_valid: bool
+    resolution_request: Optional[FeedbackReplanResolutionRequest] = None
+
+    def __post_init__(self):
+        if type(self.event) is not FeedbackReplanEvent:
+            raise FeedbackReplanningError(
+                "asynchronous result event must be a built-in "
+                "FeedbackReplanEvent"
+            )
+        if type(self.active_intercept_valid) is not bool:
+            raise FeedbackReplanningError(
+                "asynchronous result active_intercept_valid must be boolean"
+            )
+        if (
+            self.event.status
+            is not FeedbackReplanStatus.SUPERSEDED_TARGET_RESOLUTION
+            and self.active_intercept_valid
+            is not _status_has_valid_intercept(self.event.status)
+        ):
+            raise FeedbackReplanningError(
+                "asynchronous result intercept validity is inconsistent"
+            )
+        if self.resolution_request is not None and (
+            type(self.resolution_request)
+            is not FeedbackReplanResolutionRequest
+        ):
+            raise FeedbackReplanningError(
+                "asynchronous result request must be a built-in "
+                "FeedbackReplanResolutionRequest"
+            )
+        if self.event.status is FeedbackReplanStatus.AWAITING_TARGET_RESOLUTION:
+            request = self.resolution_request
+            if request is None:
+                raise FeedbackReplanningError(
+                    "pending asynchronous result requires a resolution request"
+                )
+            if (
+                request.request_sequence
+                != self.event.resolution_request_sequence
+                or request.issued_at_seconds
+                != self.event.evaluated_at_seconds
+                or request.trajectory_generation
+                != self.event.trajectory_generation
+                or request.selection.evaluated_at_seconds
+                != self.event.selection.evaluated_at_seconds
+                or request.selection.estimate != self.event.selection.estimate
+                or request.selection.selected_candidate
+                != self.event.selection.selected_candidate
+            ):
+                raise FeedbackReplanningError(
+                    "asynchronous result request does not match the event"
+                )
+            return
+        if self.resolution_request is not None:
+            raise FeedbackReplanningError(
+                "non-pending asynchronous result must not dispatch a request"
             )
 
 
@@ -623,6 +841,13 @@ class FeedbackReplanReplayResult:
         if any(type(event) is not FeedbackReplanEvent for event in self.events):
             raise FeedbackReplanningError(
                 "replay result contains an invalid event"
+            )
+        if any(
+            event.resolution_request_sequence is not None
+            for event in self.events
+        ):
+            raise FeedbackReplanningError(
+                "feedback replay must not contain asynchronous events"
             )
         previous_evaluated_at = None
         for expected_sequence, event in enumerate(self.events):
@@ -708,8 +933,29 @@ class FeedbackReplanReplayResult:
         return _status_has_valid_intercept(self.events[-1].status)
 
 
-class FeedbackReplanner:
-    """Single-owner coordinator; no method transmits a controller command."""
+@dataclass(frozen=True)
+class _SelectedReplanWork:
+    evaluated_at_seconds: float
+    estimator_update: EstimatorUpdate
+    selection: InterceptSelection
+    active_trajectory: Union[
+        SynchronizedJointTrajectory,
+        SynchronizedQuinticTrajectory,
+    ]
+
+
+@dataclass(frozen=True)
+class _PendingFeedbackResolution:
+    request_sequence: int
+    issued_at_seconds: float
+    trajectory_generation: int
+    axis_count: int
+    estimator_update: EstimatorUpdate
+    selection: InterceptSelection
+
+
+class _FeedbackReplannerCore:
+    """Shared single-owner state without controller or worker side effects."""
 
     def __init__(
         self,
@@ -717,7 +963,6 @@ class FeedbackReplanner:
         selector,
         initial_trajectory,
         initial_trajectory_started_at_seconds,
-        target_resolver,
         impact_config=None,
     ):
         if type(estimator_config) is not ConstantVelocityEstimatorConfig:
@@ -777,8 +1022,6 @@ class FeedbackReplanner:
             raise FeedbackReplanningError(
                 "selector and estimator frames must match"
             )
-        if not callable(target_resolver):
-            raise FeedbackReplanningError("target_resolver must be callable")
         if (
             impact_config is not None
             and type(impact_config) is not ImpactAwareEstimatorConfig
@@ -806,7 +1049,6 @@ class FeedbackReplanner:
             initial_trajectory_started_at_seconds,
             "initial trajectory started_at_seconds",
         )
-        self._target_resolver = target_resolver
         self._trajectory_generation = 0
         self._active_intercept_valid = False
         self._next_event_sequence = 0
@@ -870,6 +1112,8 @@ class FeedbackReplanner:
         replacement=None,
         fault=None,
         generation=None,
+        resolution_request_sequence=None,
+        preserve_active_intercept=False,
     ):
         if generation is None:
             generation = self._trajectory_generation
@@ -882,15 +1126,25 @@ class FeedbackReplanner:
             selection=selection,
             replacement_trajectory=replacement,
             fault=fault,
+            resolution_request_sequence=resolution_request_sequence,
         )
-        self._active_intercept_valid = _status_has_valid_intercept(
-            event.status
-        )
+        if not preserve_active_intercept:
+            self._active_intercept_valid = _status_has_valid_intercept(
+                event.status
+            )
         self._next_event_sequence += 1
         self._last_event_at_seconds = evaluated_at
         return event
 
-    def _fault_event(self, phase, error, evaluated_at, update, selection=None):
+    def _fault_event(
+        self,
+        phase,
+        error,
+        evaluated_at,
+        update,
+        selection=None,
+        resolution_request_sequence=None,
+    ):
         fault = _fault_from_exception(phase, error)
         event = self._event(
             evaluated_at,
@@ -898,6 +1152,7 @@ class FeedbackReplanner:
             update=update,
             selection=selection,
             fault=fault,
+            resolution_request_sequence=resolution_request_sequence,
         )
         self._fault = fault
         return event
@@ -932,16 +1187,16 @@ class FeedbackReplanner:
             )
         return target
 
-    def _replacement(self, active_trajectory, selection, target):
+    def _replacement(self, active_trajectory, target, replacement_at):
         active_duration = active_trajectory.duration_seconds
         try:
             elapsed = math.fsum((
-                selection.evaluated_at_seconds,
+                replacement_at,
                 -self._active_started_at_seconds,
             ))
             duration = math.fsum((
                 target.intercept_timestamp_seconds,
-                -selection.evaluated_at_seconds,
+                -replacement_at,
             ))
         except (OverflowError, ValueError) as exc:
             raise FeedbackReplanningError(
@@ -956,143 +1211,154 @@ class FeedbackReplanner:
             duration,
         )
 
-    def process_observation(self, observation, received_at_seconds):
-        self._require_operational()
-        evaluated_at = self._validated_event_time(received_at_seconds)
-        self._processing = True
+    def _prepare_observation(self, observation, evaluated_at):
         try:
-            try:
-                update = self._estimator.add_observation(
-                    observation,
-                    evaluated_at,
-                )
-            except EstimatorProcessingError as exc:
-                return self._fault_event(
-                    FeedbackReplanFaultPhase.ESTIMATION,
-                    exc,
-                    evaluated_at,
-                    None,
-                )
-            except ObservationValidationError:
-                raise
-            except Exception as exc:
-                return self._fault_event(
-                    FeedbackReplanFaultPhase.ESTIMATION,
-                    exc,
-                    evaluated_at,
-                    None,
-                )
-            if update.status is not EstimatorUpdateStatus.ESTIMATE_UPDATED:
-                status = _estimator_hold_status(update.status)
-                if status is None:
-                    raise FeedbackReplanningError(
-                        "estimator returned an unsupported status"
-                    )
-                return self._event(
-                    evaluated_at,
-                    status,
-                    update=update,
-                )
-            try:
-                selection = self._selector.select(
-                    update.estimate,
-                    evaluated_at,
-                )
-            except Exception as exc:
-                return self._fault_event(
-                    FeedbackReplanFaultPhase.SELECTION,
-                    exc,
-                    evaluated_at,
-                    update,
-                )
-            try:
-                selection = _validated_selection(
-                    selection,
-                    update,
-                    evaluated_at,
-                )
-            except Exception as exc:
-                return self._fault_event(
-                    FeedbackReplanFaultPhase.SELECTION,
-                    exc,
-                    evaluated_at,
-                    update,
-                )
-            if selection.status is not InterceptSelectionStatus.SELECTED:
-                status = _selection_hold_status(selection.status)
-                if status is None:
-                    return self._fault_event(
-                        FeedbackReplanFaultPhase.SELECTION,
-                        FeedbackReplanningError(
-                            "selector returned an unsupported status"
-                        ),
-                        evaluated_at,
-                        update,
-                    )
-                return self._event(
-                    evaluated_at,
-                    status,
-                    update=update,
-                    selection=selection,
-                )
-            try:
-                active_trajectory = _validated_active_trajectory(
-                    self._active_trajectory
-                )
-            except Exception as exc:
-                return self._fault_event(
-                    FeedbackReplanFaultPhase.TRAJECTORY_CONSTRUCTION,
-                    exc,
-                    evaluated_at,
-                    update,
-                    selection,
-                )
-            try:
-                resolver_selection = _resolver_selection_snapshot(selection)
-                target = self._target_resolver(resolver_selection)
-                target = self._validate_target(
-                    target,
-                    selection,
-                    len(active_trajectory.axes),
-                )
-            except Exception as exc:
-                self._active_trajectory = active_trajectory
-                return self._fault_event(
-                    FeedbackReplanFaultPhase.TARGET_RESOLUTION,
-                    exc,
-                    evaluated_at,
-                    update,
-                    selection,
-                )
-            try:
-                replacement = self._replacement(
-                    active_trajectory,
-                    selection,
-                    target,
-                )
-            except Exception as exc:
-                self._active_trajectory = active_trajectory
-                return self._fault_event(
-                    FeedbackReplanFaultPhase.TRAJECTORY_CONSTRUCTION,
-                    exc,
-                    evaluated_at,
-                    update,
-                    selection,
-                )
-            event = self._event(
+            update = self._estimator.add_observation(
+                observation,
                 evaluated_at,
-                FeedbackReplanStatus.REPLACED,
+            )
+        except EstimatorProcessingError as exc:
+            return self._fault_event(
+                FeedbackReplanFaultPhase.ESTIMATION,
+                exc,
+                evaluated_at,
+                None,
+            )
+        except ObservationValidationError:
+            raise
+        except Exception as exc:
+            return self._fault_event(
+                FeedbackReplanFaultPhase.ESTIMATION,
+                exc,
+                evaluated_at,
+                None,
+            )
+        if update.status is not EstimatorUpdateStatus.ESTIMATE_UPDATED:
+            status = _estimator_hold_status(update.status)
+            if status is None:
+                raise FeedbackReplanningError(
+                    "estimator returned an unsupported status"
+                )
+            return self._event(
+                evaluated_at,
+                status,
+                update=update,
+            )
+        try:
+            selection = self._selector.select(
+                update.estimate,
+                evaluated_at,
+            )
+        except Exception as exc:
+            return self._fault_event(
+                FeedbackReplanFaultPhase.SELECTION,
+                exc,
+                evaluated_at,
+                update,
+            )
+        try:
+            selection = _validated_selection(
+                selection,
+                update,
+                evaluated_at,
+            )
+        except Exception as exc:
+            return self._fault_event(
+                FeedbackReplanFaultPhase.SELECTION,
+                exc,
+                evaluated_at,
+                update,
+            )
+        if selection.status is not InterceptSelectionStatus.SELECTED:
+            status = _selection_hold_status(selection.status)
+            if status is None:
+                return self._fault_event(
+                    FeedbackReplanFaultPhase.SELECTION,
+                    FeedbackReplanningError(
+                        "selector returned an unsupported status"
+                    ),
+                    evaluated_at,
+                    update,
+                )
+            return self._event(
+                evaluated_at,
+                status,
                 update=update,
                 selection=selection,
-                replacement=replacement,
-                generation=self._trajectory_generation + 1,
             )
-            self._active_trajectory = replacement
-            self._active_started_at_seconds = evaluated_at
-            self._trajectory_generation += 1
-            return event
-        finally:
-            self._processing = False
+        try:
+            active_trajectory = _validated_active_trajectory(
+                self._active_trajectory
+            )
+        except Exception as exc:
+            return self._fault_event(
+                FeedbackReplanFaultPhase.TRAJECTORY_CONSTRUCTION,
+                exc,
+                evaluated_at,
+                update,
+                selection,
+            )
+        return _SelectedReplanWork(
+            evaluated_at,
+            update,
+            selection,
+            active_trajectory,
+        )
+
+    def _apply_target(
+        self,
+        work,
+        target,
+        replacement_at,
+        status,
+        resolution_request_sequence=None,
+    ):
+        active_trajectory = work.active_trajectory
+        try:
+            target = self._validate_target(
+                target,
+                work.selection,
+                len(active_trajectory.axes),
+            )
+        except Exception as exc:
+            self._active_trajectory = active_trajectory
+            return self._fault_event(
+                FeedbackReplanFaultPhase.TARGET_RESOLUTION,
+                exc,
+                replacement_at,
+                work.estimator_update,
+                work.selection,
+                resolution_request_sequence,
+            )
+        try:
+            replacement = self._replacement(
+                active_trajectory,
+                target,
+                replacement_at,
+            )
+        except Exception as exc:
+            self._active_trajectory = active_trajectory
+            return self._fault_event(
+                FeedbackReplanFaultPhase.TRAJECTORY_CONSTRUCTION,
+                exc,
+                replacement_at,
+                work.estimator_update,
+                work.selection,
+                resolution_request_sequence,
+            )
+        event = self._event(
+            replacement_at,
+            status,
+            update=work.estimator_update,
+            selection=work.selection,
+            replacement=replacement,
+            generation=self._trajectory_generation + 1,
+            resolution_request_sequence=resolution_request_sequence,
+        )
+        self._active_trajectory = replacement
+        self._active_started_at_seconds = replacement_at
+        self._trajectory_generation += 1
+        return event
 
     def cancel(self, evaluated_at_seconds):
         self._require_operational()
@@ -1103,6 +1369,359 @@ class FeedbackReplanner:
         )
         self._cancelled = True
         return event
+
+
+class FeedbackReplanner(_FeedbackReplannerCore):
+    """Synchronous target-resolution coordinator."""
+
+    def __init__(
+        self,
+        estimator_config,
+        selector,
+        initial_trajectory,
+        initial_trajectory_started_at_seconds,
+        target_resolver,
+        impact_config=None,
+    ):
+        super().__init__(
+            estimator_config,
+            selector,
+            initial_trajectory,
+            initial_trajectory_started_at_seconds,
+            impact_config,
+        )
+        if not callable(target_resolver):
+            raise FeedbackReplanningError("target_resolver must be callable")
+        self._target_resolver = target_resolver
+
+    def process_observation(self, observation, received_at_seconds):
+        self._require_operational()
+        evaluated_at = self._validated_event_time(received_at_seconds)
+        self._processing = True
+        try:
+            work = self._prepare_observation(observation, evaluated_at)
+            if type(work) is FeedbackReplanEvent:
+                return work
+            try:
+                resolver_selection = _resolver_selection_snapshot(
+                    work.selection
+                )
+                target = self._target_resolver(resolver_selection)
+            except Exception as exc:
+                self._active_trajectory = work.active_trajectory
+                return self._fault_event(
+                    FeedbackReplanFaultPhase.TARGET_RESOLUTION,
+                    exc,
+                    evaluated_at,
+                    work.estimator_update,
+                    work.selection,
+                )
+            return self._apply_target(
+                work,
+                target,
+                evaluated_at,
+                FeedbackReplanStatus.REPLACED,
+            )
+        finally:
+            self._processing = False
+
+
+class AsynchronousFeedbackReplanner(_FeedbackReplannerCore):
+    """Split-phase coordinator for externally scheduled target resolution."""
+
+    def __init__(
+        self,
+        estimator_config,
+        selector,
+        initial_trajectory,
+        initial_trajectory_started_at_seconds,
+        impact_config=None,
+    ):
+        super().__init__(
+            estimator_config,
+            selector,
+            initial_trajectory,
+            initial_trajectory_started_at_seconds,
+            impact_config,
+        )
+        self._next_resolution_request_sequence = 0
+        self._pending_resolution = None
+
+    @property
+    def pending_resolution_request(self):
+        pending = self._pending_resolution
+        if pending is None:
+            return None
+        return self._request_for_pending(pending)
+
+    @staticmethod
+    def _request_for_pending(pending):
+        return FeedbackReplanResolutionRequest(
+            pending.request_sequence,
+            pending.issued_at_seconds,
+            pending.trajectory_generation,
+            pending.axis_count,
+            pending.selection,
+        )
+
+    @staticmethod
+    def _pending_for_work(work, request_sequence, trajectory_generation):
+        try:
+            update, selected_candidate = copy.deepcopy((
+                work.estimator_update,
+                work.selection.selected_candidate,
+            ))
+            if (
+                type(update) is not EstimatorUpdate
+                or update.status
+                is not EstimatorUpdateStatus.ESTIMATE_UPDATED
+                or update.estimate is None
+            ):
+                raise FeedbackReplanningError(
+                    "isolated estimator update has invalid state"
+                )
+            selection = InterceptSelection(
+                InterceptSelectionStatus.SELECTED,
+                work.evaluated_at_seconds,
+                update.estimate,
+                (selected_candidate,),
+                selected_candidate,
+            )
+        except Exception as exc:
+            raise FeedbackReplanningError(
+                "selected intercept could not be isolated for asynchronous "
+                "resolution"
+            ) from exc
+        return _PendingFeedbackResolution(
+            request_sequence,
+            work.evaluated_at_seconds,
+            trajectory_generation,
+            len(work.active_trajectory.axes),
+            update,
+            selection,
+        )
+
+    def process_observation(self, observation, received_at_seconds):
+        self._require_operational()
+        evaluated_at = self._validated_event_time(received_at_seconds)
+        self._processing = True
+        try:
+            work = self._prepare_observation(observation, evaluated_at)
+            if type(work) is FeedbackReplanEvent:
+                self._pending_resolution = None
+                return AsynchronousFeedbackReplanResult(
+                    work,
+                    self._active_intercept_valid,
+                )
+            request_sequence = self._next_resolution_request_sequence
+            try:
+                pending = self._pending_for_work(
+                    work,
+                    request_sequence,
+                    self._trajectory_generation,
+                )
+                request = self._request_for_pending(pending)
+            except Exception as exc:
+                self._pending_resolution = None
+                event = self._fault_event(
+                    FeedbackReplanFaultPhase.TARGET_RESOLUTION,
+                    exc,
+                    evaluated_at,
+                    work.estimator_update,
+                    work.selection,
+                )
+                return AsynchronousFeedbackReplanResult(
+                    event,
+                    self._active_intercept_valid,
+                )
+            event = self._event(
+                evaluated_at,
+                FeedbackReplanStatus.AWAITING_TARGET_RESOLUTION,
+                update=work.estimator_update,
+                selection=work.selection,
+                resolution_request_sequence=request_sequence,
+            )
+            result = AsynchronousFeedbackReplanResult(
+                event,
+                self._active_intercept_valid,
+                request,
+            )
+            self._pending_resolution = pending
+            self._next_resolution_request_sequence += 1
+            return result
+        finally:
+            self._processing = False
+
+    def _resolution_discard_result(self, request_sequence, evaluated_at):
+        if request_sequence >= self._next_resolution_request_sequence:
+            raise FeedbackReplanningError(
+                "resolution request sequence was not issued"
+            )
+        pending = self._pending_resolution
+        if pending is None or pending.request_sequence != request_sequence:
+            event = self._event(
+                evaluated_at,
+                FeedbackReplanStatus.SUPERSEDED_TARGET_RESOLUTION,
+                resolution_request_sequence=request_sequence,
+                preserve_active_intercept=True,
+            )
+            return AsynchronousFeedbackReplanResult(
+                event,
+                self._active_intercept_valid,
+            )
+        intercept_timestamp = (
+            pending.selection.selected_candidate.prediction.timestamp_seconds
+        )
+        deadline_tolerance = _comparison_tolerance(
+            evaluated_at,
+            intercept_timestamp,
+        )
+        if evaluated_at >= intercept_timestamp - deadline_tolerance:
+            event = self._event(
+                evaluated_at,
+                FeedbackReplanStatus.EXPIRED_TARGET_RESOLUTION,
+                resolution_request_sequence=request_sequence,
+            )
+            self._pending_resolution = None
+            return AsynchronousFeedbackReplanResult(
+                event,
+                self._active_intercept_valid,
+            )
+        return None
+
+    def complete_resolution(
+        self,
+        request_sequence,
+        target,
+        resolution_received_at_seconds,
+    ):
+        self._require_operational()
+        request_sequence = _nonnegative_integer(
+            request_sequence,
+            "resolution completion request_sequence",
+        )
+        evaluated_at = self._validated_event_time(
+            resolution_received_at_seconds
+        )
+        self._processing = True
+        try:
+            discarded = self._resolution_discard_result(
+                request_sequence,
+                evaluated_at,
+            )
+            if discarded is not None:
+                return discarded
+            pending = self._pending_resolution
+            if pending.trajectory_generation != self._trajectory_generation:
+                event = self._fault_event(
+                    FeedbackReplanFaultPhase.TRAJECTORY_CONSTRUCTION,
+                    FeedbackReplanningError(
+                        "trajectory generation changed while resolution was pending"
+                    ),
+                    evaluated_at,
+                    pending.estimator_update,
+                    pending.selection,
+                    request_sequence,
+                )
+                self._pending_resolution = None
+                return AsynchronousFeedbackReplanResult(
+                    event,
+                    self._active_intercept_valid,
+                )
+            try:
+                active_trajectory = _validated_active_trajectory(
+                    self._active_trajectory
+                )
+                if len(active_trajectory.axes) != pending.axis_count:
+                    raise FeedbackReplanningError(
+                        "active trajectory axis count changed while resolution "
+                        "was pending"
+                    )
+            except Exception as exc:
+                event = self._fault_event(
+                    FeedbackReplanFaultPhase.TRAJECTORY_CONSTRUCTION,
+                    exc,
+                    evaluated_at,
+                    pending.estimator_update,
+                    pending.selection,
+                    request_sequence,
+                )
+                self._pending_resolution = None
+                return AsynchronousFeedbackReplanResult(
+                    event,
+                    self._active_intercept_valid,
+                )
+            work = _SelectedReplanWork(
+                pending.issued_at_seconds,
+                pending.estimator_update,
+                pending.selection,
+                active_trajectory,
+            )
+            event = self._apply_target(
+                work,
+                target,
+                evaluated_at,
+                FeedbackReplanStatus.REPLACED_AFTER_TARGET_RESOLUTION,
+                request_sequence,
+            )
+            self._pending_resolution = None
+            return AsynchronousFeedbackReplanResult(
+                event,
+                self._active_intercept_valid,
+            )
+        finally:
+            self._processing = False
+
+    def fail_resolution(
+        self,
+        request_sequence,
+        error,
+        resolution_received_at_seconds,
+    ):
+        self._require_operational()
+        request_sequence = _nonnegative_integer(
+            request_sequence,
+            "resolution failure request_sequence",
+        )
+        evaluated_at = self._validated_event_time(
+            resolution_received_at_seconds
+        )
+        self._processing = True
+        try:
+            discarded = self._resolution_discard_result(
+                request_sequence,
+                evaluated_at,
+            )
+            if discarded is not None:
+                return discarded
+            if not isinstance(error, Exception):
+                raise FeedbackReplanningError(
+                    "resolution failure error must be an Exception"
+                )
+            pending = self._pending_resolution
+            event = self._fault_event(
+                FeedbackReplanFaultPhase.TARGET_RESOLUTION,
+                error,
+                evaluated_at,
+                pending.estimator_update,
+                pending.selection,
+                request_sequence,
+            )
+            self._pending_resolution = None
+            return AsynchronousFeedbackReplanResult(
+                event,
+                self._active_intercept_valid,
+            )
+        finally:
+            self._processing = False
+
+    def cancel(self, evaluated_at_seconds):
+        event = super().cancel(evaluated_at_seconds)
+        self._pending_resolution = None
+        return AsynchronousFeedbackReplanResult(
+            event,
+            self._active_intercept_valid,
+        )
 
 
 def run_feedback_replanning_replay(

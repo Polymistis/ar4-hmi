@@ -331,15 +331,36 @@ trajectory. A long-gap estimator reset has a distinct hold disposition.
 No-feasible, stale-estimate, and future-estimate selections produce distinct
 hold events without calling the joint-target resolver.
 
-A selected-only deep snapshot is passed to one synchronous injected resolver.
-Resolver output carries the estimate, evaluation, and intercept timestamps
-plus one to nine joint boundary states. All timestamps must match the selected
-candidate, and the axis count must match a validated snapshot of the active
-desired trajectory. The replacement duration comes from the selected intercept
-time.
+`FeedbackReplanner` passes a selected-only deep snapshot to one synchronous
+injected resolver. Resolver output carries the estimate, evaluation, and
+intercept timestamps plus one to nine joint boundary states. All timestamps
+must match the selected candidate, and the axis count must match a validated
+snapshot of the active desired trajectory. The replacement duration comes from
+the selected intercept time.
 Completed active trajectories hold the terminal desired state before the next
 segment starts. A successful replacement advances a monotonic trajectory
 generation only after construction succeeds.
+
+`AsynchronousFeedbackReplanner` exposes the same estimator, selector, and
+desired-trajectory boundary as a split-phase interface. A selected observation
+returns an isolated resolver request containing a monotonic request sequence,
+the active trajectory generation, the required axis count, and only the
+selected candidate. External code can schedule that request without blocking
+observation admission, then submit either a correlated joint target or an
+exception through the owning coordinator.
+
+Every accepted observation supersedes earlier pending resolution work. A late
+completion is reported as superseded before supplied target or error data is
+inspected; no trajectory state changes, and any current logical intercept
+validity is preserved. A current completion at or within the shared timestamp
+comparison tolerance of the selected intercept is reported as expired and
+discarded. Only the current request can replace the desired trajectory, and
+the replacement begins from desired state sampled when the owning coordinator
+receives the result rather than at the older observation or worker-completion
+time. Result receipt timestamps must preserve coordinator event ordering.
+Invalid current output, active-state corruption, or a current resolver failure
+remains phase-tagged and latched. Public events and requests are isolated from
+the coordinator's internal pending snapshot.
 
 Accepted events receive contiguous sequence numbers. Out-of-order observations
 are rejected by the owned estimator before target resolution. Reentrant
@@ -362,9 +383,10 @@ because the replay adapter has no cancellation input. Frame agreement and
 candidate-evaluation work are checked before coordinator construction;
 workload accounting uses the maximum estimate-bearing update count after the
 acceleration estimator's two-record warmup under the same cap as intercept
-replay. Target resolution remains synchronous, injected simulation logic. No
-production IK, collision engine, asynchronous result supersession, controller
-feedback adapter, setpoint transport, or real-time control loop is included.
+replay. Replay target resolution remains synchronous injected simulation
+logic. The asynchronous coordinator creates no thread, task, executor,
+production IK, collision engine, controller feedback adapter, setpoint
+transport, or real-time control loop.
 
 ## Product constraints requiring later decisions
 
