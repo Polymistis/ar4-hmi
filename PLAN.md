@@ -1345,8 +1345,9 @@ Implemented foundation:
   `ar4.controller-trace.v2` JSONL contract for one complete J1-J6
   `JOINT_TELEMETRY_V1` exchange. Metadata preserves controller and firmware
   identity, a canonical controller-configuration fingerprint, the confirmed
-  command-start position, commanded target, all RJ timing modes, and nominal
-  telemetry cadence. The header also fixes the offset origin immediately
+  command-start position, commanded target, RJ timing profile, and nominal
+  telemetry cadence. The schema accepts the complete `p`, `s`, and `m` RJ
+  timing-mode domain. The header also fixes the offset origin immediately
   before the RJ write. Samples use host-monotonic receipt offsets and remain
   distinct from the terminal controller step-counter position.
 - Controller-trace analysis uses each observed non-uniform sample interval to

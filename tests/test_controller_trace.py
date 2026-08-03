@@ -390,6 +390,18 @@ class ControllerTraceCodecTests(unittest.TestCase):
         wrong_schema = [dict(record) for record in records]
         wrong_schema[0]["schema"] = "ar4.controller-trace.v1"
         mutations.append(wrong_schema)
+        wrong_time_origin = [dict(record) for record in records]
+        wrong_time_origin[0]["time_origin"] = "after-first-encoder-sample"
+        mutations.append(wrong_time_origin)
+        wrong_timebase = [dict(record) for record in records]
+        wrong_timebase[0]["timebase"] = "controller-monotonic-seconds"
+        mutations.append(wrong_timebase)
+        wrong_source = [dict(record) for record in records]
+        wrong_source[0]["source"] = "JOINT_TELEMETRY_V2"
+        mutations.append(wrong_source)
+        wrong_position_unit = [dict(record) for record in records]
+        wrong_position_unit[0]["position_unit"] = "radian"
+        mutations.append(wrong_position_unit)
         float_axis_count = [dict(record) for record in records]
         float_axis_count[0]["axis_count"] = 6.0
         mutations.append(float_axis_count)
