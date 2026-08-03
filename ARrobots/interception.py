@@ -15,6 +15,7 @@ from ARrobots.dynamic_motion import (
     DynamicMotionError,
     EstimatorUpdate,
     EstimatorUpdateStatus,
+    ImpactAwareEstimatorConfig,
     MotionEstimate,
     MotionPredictor,
     ObservationReplay,
@@ -1071,5 +1072,33 @@ def select_acceleration_replay_intercepts(
     return _select_replay_updates(
         replay,
         replay.run_constant_acceleration(estimator_config),
+        selector,
+    )
+
+
+def select_impact_aware_acceleration_replay_intercepts(
+    replay,
+    estimator_config,
+    selector,
+    impact_config,
+):
+    """Select only after impact-filtered acceleration estimates."""
+
+    if type(estimator_config) is not ConstantVelocityEstimatorConfig:
+        raise InterceptSelectionError(
+            "estimator_config must be a built-in "
+            "ConstantVelocityEstimatorConfig"
+        )
+    _validate_replay_selection_inputs(replay, estimator_config, selector)
+    if type(impact_config) is not ImpactAwareEstimatorConfig:
+        raise InterceptSelectionError(
+            "impact_config must be a built-in ImpactAwareEstimatorConfig"
+        )
+    return _select_replay_updates(
+        replay,
+        replay.run_impact_aware_acceleration(
+            estimator_config,
+            impact_config,
+        ),
         selector,
     )

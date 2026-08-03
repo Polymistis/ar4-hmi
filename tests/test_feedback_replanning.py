@@ -7,7 +7,9 @@ from ARrobots.dynamic_motion import (
     ConstantAccelerationPredictor,
     ConstantVelocityEstimatorConfig,
     DiagonalCovariance3,
+    EstimatorProcessingError,
     EstimatorUpdateStatus,
+    ImpactAwareEstimatorConfig,
     OBSERVATION_REPLAY_MAXIMUM_RECORDS,
     ObservationReplay,
     OutOfOrderObservationError,
@@ -50,6 +52,20 @@ def estimator_config(**overrides):
     }
     values.update(overrides)
     return ConstantVelocityEstimatorConfig(**values)
+
+
+def impact_config(**overrides):
+    values = {
+        "maximum_axis_standardized_innovation": 4.0,
+        "impact_confirmation_observations": 2,
+        "process_acceleration_variance_per_second": DiagonalCovariance3(
+            0.0,
+            0.0,
+            0.0,
+        ),
+    }
+    values.update(overrides)
+    return ImpactAwareEstimatorConfig(**values)
 
 
 def selector_config(**overrides):
@@ -257,6 +273,7 @@ class FeedbackReplannerTests(unittest.TestCase):
         active_started_at=1.0,
         estimator=None,
         intercept_selector=None,
+        impact=None,
     ):
         return FeedbackReplanner(
             estimator_config() if estimator is None else estimator,
@@ -264,6 +281,7 @@ class FeedbackReplannerTests(unittest.TestCase):
             stationary_trajectory() if active is None else active,
             active_started_at,
             resolver,
+            impact,
         )
 
     def test_repeated_updates_replace_from_sampled_desired_state(self):
@@ -317,6 +335,118 @@ class FeedbackReplannerTests(unittest.TestCase):
         self.assertEqual(len(resolved_positions), 2)
         self.assertNotEqual(resolved_positions[0], resolved_positions[1])
 
+    def test_impact_filter_invalidates_intercept_until_reacquisition(self):
+        replanner = self.make_replanner(impact=impact_config())
+        initial_events = tuple(
+            replanner.process_observation(
+                observation(timestamp, position),
+                timestamp + 0.01,
+            )
+            for timestamp, position in (
+                (1.0, 0.0),
+                (1.1, 0.01),
+                (1.2, 0.04),
+            )
+        )
+        active_after_replacement = replanner.active_trajectory
+
+        rejected = replanner.process_observation(
+            observation(1.3, 5.0),
+            1.31,
+        )
+        valid_after_rejection = replanner.active_intercept_valid
+        reset = replanner.process_observation(
+            observation(1.4, 5.1),
+            1.41,
+        )
+        valid_after_reset = replanner.active_intercept_valid
+        warmup = replanner.process_observation(
+            observation(1.5, 5.2),
+            1.51,
+        )
+        valid_during_warmup = replanner.active_intercept_valid
+        reacquired = replanner.process_observation(
+            observation(1.6, 5.3),
+            1.61,
+        )
+
+        self.assertIs(
+            initial_events[-1].status,
+            FeedbackReplanStatus.REPLACED,
+        )
+        self.assertIs(
+            rejected.status,
+            FeedbackReplanStatus.HOLDING_INNOVATION_REJECTED,
+        )
+        self.assertIs(
+            reset.status,
+            FeedbackReplanStatus.HOLDING_AFTER_IMPACT,
+        )
+        self.assertIs(
+            warmup.status,
+            FeedbackReplanStatus.HOLDING_FOR_ESTIMATE,
+        )
+        self.assertIs(reacquired.status, FeedbackReplanStatus.REPLACED)
+        self.assertIs(
+            rejected.estimator_update.status,
+            EstimatorUpdateStatus.INNOVATION_REJECTED,
+        )
+        self.assertIs(
+            reset.estimator_update.status,
+            EstimatorUpdateStatus.IMPACT_RESET,
+        )
+        self.assertIs(
+            replanner.active_trajectory,
+            reacquired.replacement_trajectory,
+        )
+        self.assertIsNot(
+            replanner.active_trajectory,
+            active_after_replacement,
+        )
+        self.assertFalse(valid_after_rejection)
+        self.assertFalse(valid_after_reset)
+        self.assertFalse(valid_during_warmup)
+        self.assertTrue(replanner.active_intercept_valid)
+        self.assertEqual(replanner.trajectory_generation, 2)
+        with self.assertRaisesRegex(
+            FeedbackReplanningError,
+            "does not preserve estimator disposition",
+        ):
+            replace(
+                rejected,
+                status=FeedbackReplanStatus.HOLDING_AFTER_IMPACT,
+            )
+
+    def test_impact_filter_preserves_accumulated_model_gap_reset(self):
+        replanner = self.make_replanner(impact=impact_config())
+        self.assertIs(
+            feed_three(replanner)[-1].status,
+            FeedbackReplanStatus.REPLACED,
+        )
+        rejected = replanner.process_observation(
+            observation(1.3, 50.0),
+            1.31,
+        )
+
+        reset = replanner.process_observation(
+            observation(1.79, 50.1),
+            1.80,
+        )
+
+        self.assertIs(
+            rejected.status,
+            FeedbackReplanStatus.HOLDING_INNOVATION_REJECTED,
+        )
+        self.assertIs(
+            reset.status,
+            FeedbackReplanStatus.HOLDING_AFTER_ESTIMATOR_RESET,
+        )
+        self.assertIs(
+            reset.estimator_update.status,
+            EstimatorUpdateStatus.BASELINE_RESET,
+        )
+        self.assertFalse(replanner.active_intercept_valid)
+
     def test_completed_active_trajectory_holds_terminal_state_before_replace(self):
         active = plan_synchronized_rest_to_rest_trajectory(
             (0.0,),
@@ -362,6 +492,97 @@ class FeedbackReplannerTests(unittest.TestCase):
             1.31,
         )
         self.assertEqual(valid.sequence, 3)
+
+    def test_estimator_processing_failure_latches_exact_phase(self):
+        replanner = self.make_replanner()
+        self.assertIs(
+            feed_three(replanner)[-1].status,
+            FeedbackReplanStatus.REPLACED,
+        )
+        active = replanner.active_trajectory
+        generation = replanner.trajectory_generation
+
+        def failed_update(_observation, _received_at):
+            raise EstimatorProcessingError("estimator numeric failure")
+
+        replanner._estimator.add_observation = failed_update
+        event = replanner.process_observation(
+            observation(1.3, 3.0),
+            1.31,
+        )
+
+        self.assertIs(event.status, FeedbackReplanStatus.FAULTED)
+        self.assertIs(
+            event.fault.phase,
+            FeedbackReplanFaultPhase.ESTIMATION,
+        )
+        self.assertIsNone(event.estimator_update)
+        self.assertIsNone(event.selection)
+        self.assertIs(replanner.fault, event.fault)
+        self.assertIs(replanner.active_trajectory, active)
+        self.assertEqual(replanner.trajectory_generation, generation)
+        self.assertFalse(replanner.active_intercept_valid)
+        with self.assertRaisesRegex(
+            FeedbackReplanningError,
+            "replanner is faulted",
+        ):
+            replanner.process_observation(
+                observation(1.4, 4.0),
+                1.41,
+            )
+
+    def test_default_estimator_numeric_failure_latches(self):
+        replanner = self.make_replanner()
+        first = replanner.process_observation(
+            observation(1.0, -1e308),
+            1.01,
+        )
+        second = replanner.process_observation(
+            observation(1.1, 1e308),
+            1.11,
+        )
+
+        faulted = replanner.process_observation(
+            observation(1.2, -1e308),
+            1.21,
+        )
+
+        self.assertIs(
+            first.status,
+            FeedbackReplanStatus.HOLDING_FOR_ESTIMATE,
+        )
+        self.assertIs(
+            second.status,
+            FeedbackReplanStatus.HOLDING_FOR_ESTIMATE,
+        )
+        self.assertIs(faulted.status, FeedbackReplanStatus.FAULTED)
+        self.assertIs(
+            faulted.fault.phase,
+            FeedbackReplanFaultPhase.ESTIMATION,
+        )
+        self.assertIn("host numeric range", faulted.fault.detail)
+        self.assertIs(replanner.fault, faulted.fault)
+        self.assertFalse(replanner.active_intercept_valid)
+
+    def test_unexpected_estimator_failure_latches(self):
+        replanner = self.make_replanner()
+
+        def failed_update(_observation, _received_at):
+            raise RuntimeError("unexpected estimator failure")
+
+        replanner._estimator.add_observation = failed_update
+        event = replanner.process_observation(
+            observation(1.0, 0.0),
+            1.01,
+        )
+
+        self.assertIs(event.status, FeedbackReplanStatus.FAULTED)
+        self.assertIs(
+            event.fault.phase,
+            FeedbackReplanFaultPhase.ESTIMATION,
+        )
+        self.assertIn("unexpected estimator failure", event.fault.detail)
+        self.assertIs(replanner.fault, event.fault)
 
     def test_long_sample_gap_preserves_estimator_reset_disposition(self):
         resolver_calls = []
@@ -654,20 +875,128 @@ class FeedbackReplannerTests(unittest.TestCase):
                 self.assertEqual(resolver_calls, [])
                 self.assertEqual(replanner.trajectory_generation, 0)
                 self.assertIsNone(event.replacement_trajectory)
+                self.assertFalse(replanner.active_intercept_valid)
+
+    def test_selection_holds_invalidate_an_existing_intercept(self):
+        permit_candidate = True
+
+        def conditional_feasibility(_prediction, _evaluated_at):
+            if permit_candidate:
+                return feasible(_prediction, _evaluated_at)
+            return InterceptFeasibility(
+                InterceptFeasibilityStatus.UNREACHABLE
+            )
+
+        no_feasible = self.make_replanner(
+            intercept_selector=selector(conditional_feasibility),
+        )
+        self.assertIs(
+            feed_three(no_feasible)[-1].status,
+            FeedbackReplanStatus.REPLACED,
+        )
+        self.assertTrue(no_feasible.active_intercept_valid)
+        permit_candidate = False
+        no_feasible_event = no_feasible.process_observation(
+            observation(1.3, 3.0),
+            1.31,
+        )
+
+        stale = self.make_replanner(
+            estimator=estimator_config(
+                maximum_observation_age_seconds=0.5,
+            ),
+            intercept_selector=selector(
+                maximum_estimate_age_seconds=0.01,
+            ),
+        )
+        self.assertIs(
+            feed_three(stale)[-1].status,
+            FeedbackReplanStatus.REPLACED,
+        )
+        self.assertTrue(stale.active_intercept_valid)
+        stale_event = stale.process_observation(
+            observation(1.3, 3.0),
+            1.32,
+        )
+
+        future = self.make_replanner(
+            estimator=estimator_config(
+                maximum_future_skew_seconds=0.1,
+            ),
+            intercept_selector=selector(
+                maximum_future_skew_seconds=0.01,
+            ),
+        )
+        self.assertIs(
+            feed_three(future)[-1].status,
+            FeedbackReplanStatus.REPLACED,
+        )
+        self.assertTrue(future.active_intercept_valid)
+        future_event = future.process_observation(
+            observation(1.3, 3.0),
+            1.25,
+        )
+
+        self.assertIs(
+            no_feasible_event.status,
+            FeedbackReplanStatus.HOLDING_NO_FEASIBLE_CANDIDATE,
+        )
+        self.assertFalse(no_feasible.active_intercept_valid)
+        self.assertIs(
+            stale_event.status,
+            FeedbackReplanStatus.HOLDING_STALE_ESTIMATE,
+        )
+        self.assertFalse(stale.active_intercept_valid)
+        self.assertIs(
+            future_event.status,
+            FeedbackReplanStatus.HOLDING_FUTURE_ESTIMATE,
+        )
+        self.assertFalse(future.active_intercept_valid)
+
+    def test_fault_invalidates_an_existing_intercept(self):
+        resolver_calls = 0
+
+        def resolver(selection):
+            nonlocal resolver_calls
+            resolver_calls += 1
+            if resolver_calls > 1:
+                raise RuntimeError("IK unavailable")
+            return target_for(selection)
+
+        replanner = self.make_replanner(resolver=resolver)
+        self.assertIs(
+            feed_three(replanner)[-1].status,
+            FeedbackReplanStatus.REPLACED,
+        )
+        self.assertTrue(replanner.active_intercept_valid)
+
+        event = replanner.process_observation(
+            observation(1.3, 3.0),
+            1.31,
+        )
+
+        self.assertIs(event.status, FeedbackReplanStatus.FAULTED)
+        self.assertIs(
+            event.fault.phase,
+            FeedbackReplanFaultPhase.TARGET_RESOLUTION,
+        )
+        self.assertFalse(replanner.active_intercept_valid)
 
     def test_cancel_is_logical_terminal_event_without_trajectory_mutation(self):
         replanner = self.make_replanner()
-        first = replanner.process_observation(observation(1.0, 0.0), 1.01)
+        events = feed_three(replanner)
         active = replanner.active_trajectory
+        self.assertTrue(replanner.active_intercept_valid)
 
-        event = replanner.cancel(1.02)
+        event = replanner.cancel(1.22)
 
-        self.assertEqual(first.sequence, 0)
-        self.assertEqual(event.sequence, 1)
+        self.assertEqual(events[0].sequence, 0)
+        self.assertEqual(event.sequence, 3)
         self.assertEqual(event.status, FeedbackReplanStatus.CANCELLED)
         self.assertTrue(replanner.cancelled)
+        self.assertFalse(replanner.active_intercept_valid)
         self.assertIs(replanner.active_trajectory, active)
-        self.assertEqual(replanner.trajectory_generation, 0)
+        self.assertEqual(replanner.trajectory_generation, 1)
         with self.assertRaisesRegex(
             FeedbackReplanningError,
             "replanner is cancelled",
@@ -676,6 +1005,11 @@ class FeedbackReplannerTests(unittest.TestCase):
 
     def test_event_payload_contract_rejects_inconsistent_dispositions(self):
         replaced = feed_three(self.make_replanner())[-1]
+        estimation_fault = FeedbackReplanFault(
+            FeedbackReplanFaultPhase.ESTIMATION,
+            "ARrobots.dynamic_motion.EstimatorProcessingError",
+            "estimation failed",
+        )
         selection_fault = FeedbackReplanFault(
             FeedbackReplanFaultPhase.SELECTION,
             "builtins.RuntimeError",
@@ -698,6 +1032,25 @@ class FeedbackReplannerTests(unittest.TestCase):
                 status=FeedbackReplanStatus.FAULTED,
                 replacement_trajectory=None,
                 fault=selection_fault,
+            )
+        estimation_event = FeedbackReplanEvent(
+            sequence=0,
+            evaluated_at_seconds=1.0,
+            status=FeedbackReplanStatus.FAULTED,
+            trajectory_generation=0,
+            fault=estimation_fault,
+        )
+        self.assertIs(
+            estimation_event.fault.phase,
+            FeedbackReplanFaultPhase.ESTIMATION,
+        )
+        with self.assertRaisesRegex(
+            FeedbackReplanningError,
+            "estimation fault must not carry processing output",
+        ):
+            replace(
+                estimation_event,
+                estimator_update=replaced.estimator_update,
             )
 
         cancelled_replanner = self.make_replanner()
@@ -723,7 +1076,7 @@ class FeedbackReplannerTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             FeedbackReplanningError,
-            "does not preserve reset disposition",
+            "does not preserve estimator disposition",
         ):
             replace(
                 reset,
@@ -731,7 +1084,7 @@ class FeedbackReplannerTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(
             FeedbackReplanningError,
-            "does not preserve reset disposition",
+            "does not preserve estimator disposition",
         ):
             replace(
                 warmup,
@@ -777,6 +1130,17 @@ class FeedbackReplannerTests(unittest.TestCase):
                     target_for,
                 ),
                 "selector and estimator frames must match",
+            ),
+            (
+                (
+                    estimator_config(),
+                    selector(),
+                    active,
+                    1.0,
+                    target_for,
+                    object(),
+                ),
+                "impact_config must be built-in",
             ),
         )
         for values, expected_message in invalid:
@@ -831,6 +1195,18 @@ class FeedbackReplannerTests(unittest.TestCase):
         ):
             self.make_replanner(intercept_selector=tampered_selector)
 
+        tampered_impact = impact_config()
+        object.__setattr__(
+            tampered_impact,
+            "maximum_axis_standardized_innovation",
+            math.nan,
+        )
+        with self.assertRaisesRegex(
+            FeedbackReplanningError,
+            "impact estimator configuration failed validation",
+        ):
+            self.make_replanner(impact=tampered_impact)
+
         with self.assertRaisesRegex(
             FeedbackReplanningError,
             "positive candidate lead times",
@@ -884,6 +1260,54 @@ class FeedbackReplanningReplayTests(unittest.TestCase):
             result.events[-1].replacement_trajectory,
         )
 
+    def test_impact_replay_invalidates_and_reacquires_intercept(self):
+        samples = (
+            replay_sample(1.0, 0.0),
+            replay_sample(1.1, 0.01),
+            replay_sample(1.2, 0.04),
+            replay_sample(1.3, 5.0),
+            replay_sample(1.4, 5.1),
+            replay_sample(1.5, 5.2),
+            replay_sample(1.6, 5.3),
+        )
+        replay = ObservationReplay(samples)
+
+        result = run_feedback_replanning_replay(
+            replay,
+            estimator_config(),
+            selector(),
+            stationary_trajectory(),
+            1.0,
+            target_for,
+            impact_config(),
+        )
+        invalidated = run_feedback_replanning_replay(
+            ObservationReplay(samples[:5]),
+            estimator_config(),
+            selector(),
+            stationary_trajectory(),
+            1.0,
+            target_for,
+            impact_config(),
+        )
+
+        self.assertEqual(
+            tuple(event.status for event in result.events),
+            (
+                FeedbackReplanStatus.HOLDING_FOR_ESTIMATE,
+                FeedbackReplanStatus.HOLDING_FOR_ESTIMATE,
+                FeedbackReplanStatus.REPLACED,
+                FeedbackReplanStatus.HOLDING_INNOVATION_REJECTED,
+                FeedbackReplanStatus.HOLDING_AFTER_IMPACT,
+                FeedbackReplanStatus.HOLDING_FOR_ESTIMATE,
+                FeedbackReplanStatus.REPLACED,
+            ),
+        )
+        self.assertTrue(result.active_intercept_valid)
+        self.assertEqual(result.trajectory_generation, 2)
+        self.assertFalse(invalidated.active_intercept_valid)
+        self.assertEqual(invalidated.trajectory_generation, 1)
+
     def test_replay_exposes_terminal_fault_and_processed_prefix(self):
         replay = ObservationReplay((
             replay_sample(1.0, 0.0),
@@ -914,6 +1338,7 @@ class FeedbackReplanningReplayTests(unittest.TestCase):
         self.assertFalse(result.complete)
         self.assertFalse(result.processed_all_samples)
         self.assertTrue(result.faulted)
+        self.assertFalse(result.active_intercept_valid)
         self.assertEqual(len(result.events), 4)
         self.assertEqual(result.events[-1].status, FeedbackReplanStatus.FAULTED)
         self.assertEqual(result.trajectory_generation, 1)
@@ -940,7 +1365,44 @@ class FeedbackReplanningReplayTests(unittest.TestCase):
         self.assertTrue(result.processed_all_samples)
         self.assertTrue(result.faulted)
         self.assertFalse(result.complete)
+        self.assertFalse(result.active_intercept_valid)
         self.assertEqual(len(result.events), len(replay.samples))
+
+    def test_replay_returns_processed_prefix_for_estimation_fault(self):
+        replay = ObservationReplay((
+            replay_sample(1.0, 1e308),
+            replay_sample(1.1, 1e308),
+            replay_sample(1.2, 1e308),
+            replay_sample(1.3, -1e308),
+        ))
+
+        result = run_feedback_replanning_replay(
+            replay,
+            estimator_config(),
+            selector(),
+            stationary_trajectory(),
+            1.0,
+            lambda selection: target_for(selection, (0.0,)),
+            impact_config(),
+        )
+
+        self.assertTrue(result.processed_all_samples)
+        self.assertTrue(result.faulted)
+        self.assertFalse(result.complete)
+        self.assertFalse(result.active_intercept_valid)
+        self.assertIs(
+            result.events[-1].fault.phase,
+            FeedbackReplanFaultPhase.ESTIMATION,
+        )
+        self.assertEqual(
+            tuple(event.status for event in result.events),
+            (
+                FeedbackReplanStatus.HOLDING_FOR_ESTIMATE,
+                FeedbackReplanStatus.HOLDING_FOR_ESTIMATE,
+                FeedbackReplanStatus.REPLACED,
+                FeedbackReplanStatus.FAULTED,
+            ),
+        )
 
     def test_replay_validates_preconditions_and_candidate_workload(self):
         camera_replay = ObservationReplay((
@@ -1005,6 +1467,20 @@ class FeedbackReplanningReplayTests(unittest.TestCase):
                 stationary_trajectory(),
                 1.0,
                 resolver,
+            )
+
+        with self.assertRaisesRegex(
+            FeedbackReplanningError,
+            "replay impact_config must be built-in",
+        ):
+            run_feedback_replanning_replay(
+                table_replay,
+                estimator_config(),
+                selector(),
+                stationary_trajectory(),
+                1.0,
+                resolver,
+                object(),
             )
 
         unavailable_selector = selector()

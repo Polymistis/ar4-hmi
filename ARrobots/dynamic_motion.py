@@ -16,6 +16,7 @@ OBSERVATION_REPLAY_POSITION_UNIT = "millimeter"
 OBSERVATION_REPLAY_MAXIMUM_BYTES = 8 * 1024 * 1024
 OBSERVATION_REPLAY_MAXIMUM_RECORDS = 100_000
 OBSERVATION_REPLAY_MAXIMUM_LINE_BYTES = 4096
+IMPACT_CONFIRMATION_MAXIMUM_OBSERVATIONS = 32
 # Lead/skew admission can accumulate two four-ULP comparison bands. Reserving
 # two additional bands for timestamp composition and output validation keeps
 # producer and selector tolerances aligned without letting the advertised
@@ -30,6 +31,10 @@ class DynamicMotionError(ValueError):
 
 class ObservationValidationError(DynamicMotionError):
     """An observation or estimator setting violates the input contract."""
+
+
+class EstimatorProcessingError(ObservationValidationError):
+    """An admitted observation could not produce valid estimator state."""
 
 
 class StaleObservationError(ObservationValidationError):
@@ -657,11 +662,150 @@ class ConstantVelocityEstimatorConfig:
         )
 
 
+@dataclass(frozen=True)
+class ImpactAwareEstimatorConfig:
+    """Caller-supplied innovation gate without calibrated defaults."""
+
+    maximum_axis_standardized_innovation: float
+    impact_confirmation_observations: int
+    process_acceleration_variance_per_second: DiagonalCovariance3
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "maximum_axis_standardized_innovation",
+            _positive_number(
+                self.maximum_axis_standardized_innovation,
+                "maximum_axis_standardized_innovation",
+            ),
+        )
+        count = self.impact_confirmation_observations
+        if isinstance(count, bool) or not isinstance(count, Integral):
+            raise ObservationValidationError(
+                "impact_confirmation_observations must be an integer"
+            )
+        count = int(count)
+        if count < 2:
+            raise ObservationValidationError(
+                "impact confirmation requires at least two observations"
+            )
+        if count > IMPACT_CONFIRMATION_MAXIMUM_OBSERVATIONS:
+            raise ObservationValidationError(
+                "impact confirmation exceeds the observation limit"
+            )
+        if (
+            type(self.process_acceleration_variance_per_second)
+            is not DiagonalCovariance3
+        ):
+            raise ObservationValidationError(
+                "impact process noise must be built-in DiagonalCovariance3"
+            )
+        try:
+            process_noise = DiagonalCovariance3(
+                *self.process_acceleration_variance_per_second.components()
+            )
+        except Exception as exc:
+            raise ObservationValidationError(
+                "impact process noise failed validation"
+            ) from exc
+        object.__setattr__(
+            self,
+            "impact_confirmation_observations",
+            count,
+        )
+        object.__setattr__(
+            self,
+            "process_acceleration_variance_per_second",
+            process_noise,
+        )
+
+
+def _axis_innovation_exceeds(residual, variance, threshold):
+    if residual == 0:
+        return False
+    if variance == 0:
+        return True
+    standardized = abs(residual) / math.sqrt(variance)
+    if not math.isfinite(standardized):
+        return True
+    tolerance = _comparison_tolerance(standardized, threshold)
+    return standardized > threshold + tolerance
+
+
+@dataclass(frozen=True)
+class PositionInnovation:
+    """Position residual and diagonal uncertainty used by one gate decision."""
+
+    residual: Vector3
+    combined_position_variance: DiagonalCovariance3
+    maximum_axis_standardized_innovation: float
+    exceeded_axes: Tuple[bool, bool, bool]
+
+    def __post_init__(self):
+        if type(self.residual) is not Vector3:
+            raise ObservationValidationError(
+                "innovation residual must be built-in Vector3"
+            )
+        if type(self.combined_position_variance) is not DiagonalCovariance3:
+            raise ObservationValidationError(
+                "innovation variance must be built-in DiagonalCovariance3"
+            )
+        try:
+            residual = Vector3(*self.residual.components())
+            combined_variance = DiagonalCovariance3(
+                *self.combined_position_variance.components()
+            )
+        except Exception as exc:
+            raise ObservationValidationError(
+                "innovation inputs failed validation"
+            ) from exc
+        threshold = _positive_number(
+            self.maximum_axis_standardized_innovation,
+            "innovation maximum_axis_standardized_innovation",
+        )
+        if type(self.exceeded_axes) is not tuple or len(self.exceeded_axes) != 3:
+            raise ObservationValidationError(
+                "innovation exceeded_axes must be a three-item built-in tuple"
+            )
+        if any(type(value) is not bool for value in self.exceeded_axes):
+            raise ObservationValidationError(
+                "innovation exceeded_axes must contain boolean values"
+            )
+        expected_axes = tuple(
+            _axis_innovation_exceeds(axis_residual, variance, threshold)
+            for axis_residual, variance in zip(
+                residual.components(),
+                combined_variance.components(),
+            )
+        )
+        if self.exceeded_axes != expected_axes:
+            raise ObservationValidationError(
+                "innovation exceeded_axes do not match the gate inputs"
+            )
+        object.__setattr__(
+            self,
+            "maximum_axis_standardized_innovation",
+            threshold,
+        )
+        object.__setattr__(self, "residual", residual)
+        object.__setattr__(
+            self,
+            "combined_position_variance",
+            combined_variance,
+        )
+
+    @property
+    def exceeded(self):
+        return any(self.exceeded_axes)
+
+
 class EstimatorUpdateStatus(Enum):
     BASELINE_ACCEPTED = "baseline-accepted"
     WARMUP_ACCEPTED = "warmup-accepted"
     BASELINE_RESET = "baseline-reset"
     ESTIMATE_UPDATED = "estimate-updated"
+    INNOVATION_REJECTED = "innovation-rejected"
+    IMPACT_RESET = "impact-reset"
 
 
 @dataclass(frozen=True)
@@ -669,6 +813,8 @@ class EstimatorUpdate:
     status: EstimatorUpdateStatus
     observation: PositionObservation
     estimate: Optional[MotionEstimate] = None
+    innovation: Optional[PositionInnovation] = None
+    innovation_sequence_count: int = 0
 
     def __post_init__(self):
         if not isinstance(self.status, EstimatorUpdateStatus):
@@ -688,6 +834,82 @@ class EstimatorUpdate:
             raise ObservationValidationError(
                 "estimator update result does not match the update status"
             )
+        count = self.innovation_sequence_count
+        if isinstance(count, bool) or not isinstance(count, Integral):
+            raise ObservationValidationError(
+                "innovation_sequence_count must be an integer"
+            )
+        count = int(count)
+        if count < 0:
+            raise ObservationValidationError(
+                "innovation_sequence_count must be non-negative"
+            )
+        if count > IMPACT_CONFIRMATION_MAXIMUM_OBSERVATIONS:
+            raise ObservationValidationError(
+                "innovation_sequence_count exceeds the observation limit"
+            )
+        innovation = self.innovation
+        if innovation is not None:
+            if type(innovation) is not PositionInnovation:
+                raise ObservationValidationError(
+                    "estimator update innovation must be built-in "
+                    "PositionInnovation"
+                )
+            try:
+                innovation = PositionInnovation(
+                    innovation.residual,
+                    innovation.combined_position_variance,
+                    innovation.maximum_axis_standardized_innovation,
+                    innovation.exceeded_axes,
+                )
+            except Exception as exc:
+                raise ObservationValidationError(
+                    "estimator update innovation failed validation"
+                ) from exc
+        innovation_status = self.status in (
+            EstimatorUpdateStatus.INNOVATION_REJECTED,
+            EstimatorUpdateStatus.IMPACT_RESET,
+        )
+        if innovation_status:
+            if (
+                innovation is None
+                or not innovation.exceeded
+            ):
+                raise ObservationValidationError(
+                    "innovation disposition requires an exceeded innovation"
+                )
+            minimum_count = 1
+            if self.status is EstimatorUpdateStatus.IMPACT_RESET:
+                minimum_count = 2
+            if count < minimum_count:
+                raise ObservationValidationError(
+                    "innovation disposition has an invalid sequence count"
+                )
+            if (
+                self.status is EstimatorUpdateStatus.INNOVATION_REJECTED
+                and count == IMPACT_CONFIRMATION_MAXIMUM_OBSERVATIONS
+            ):
+                raise ObservationValidationError(
+                    "innovation rejection reached the confirmation limit"
+                )
+        elif self.status is EstimatorUpdateStatus.ESTIMATE_UPDATED:
+            if (
+                innovation is not None
+                and innovation.exceeded
+            ):
+                raise ObservationValidationError(
+                    "estimated update requires a non-exceeded innovation"
+                )
+            if count != 0:
+                raise ObservationValidationError(
+                    "estimated update cannot carry an innovation sequence"
+                )
+        elif innovation is not None or count != 0:
+            raise ObservationValidationError(
+                "non-innovation update cannot carry innovation state"
+            )
+        object.__setattr__(self, "innovation_sequence_count", count)
+        object.__setattr__(self, "innovation", innovation)
 
 
 def _axis_state_covariance(previous_variance, current_variance, interval):
@@ -1231,7 +1453,10 @@ class ConstantAccelerationEstimator:
                 observation,
             )
 
-        estimate = _accelerated_motion_estimate(*candidate_observations)
+        try:
+            estimate = _accelerated_motion_estimate(*candidate_observations)
+        except DynamicMotionError as exc:
+            raise EstimatorProcessingError(str(exc)) from exc
         self._observations = candidate_observations[-2:]
         self._last_received_at_seconds = received_at
         self._estimate = estimate
@@ -1656,6 +1881,262 @@ class ConstantAccelerationPredictor:
             ) from exc
 
 
+class ImpactAwareAccelerationEstimator:
+    """Reject innovations and reset after a confirmed model discontinuity."""
+
+    def __init__(self, estimator_config, impact_config):
+        if type(estimator_config) is not ConstantVelocityEstimatorConfig:
+            raise ObservationValidationError(
+                "impact estimator_config must be built-in "
+                "ConstantVelocityEstimatorConfig"
+            )
+        if type(impact_config) is not ImpactAwareEstimatorConfig:
+            raise ObservationValidationError(
+                "impact_config must be built-in ImpactAwareEstimatorConfig"
+            )
+        try:
+            estimator_config = ConstantVelocityEstimatorConfig(
+                estimator_config.frame_id,
+                estimator_config.maximum_observation_age_seconds,
+                estimator_config.minimum_sample_interval_seconds,
+                estimator_config.maximum_sample_interval_seconds,
+                estimator_config.maximum_future_skew_seconds,
+            )
+            process_noise = DiagonalCovariance3(
+                *impact_config.process_acceleration_variance_per_second.components()
+            )
+            impact_config = ImpactAwareEstimatorConfig(
+                impact_config.maximum_axis_standardized_innovation,
+                impact_config.impact_confirmation_observations,
+                process_noise,
+            )
+        except DynamicMotionError:
+            raise
+        except Exception as exc:
+            raise ObservationValidationError(
+                "impact estimator configuration is unavailable"
+            ) from exc
+        self._config = estimator_config
+        self._impact_config = impact_config
+        self._process_noise = DiagonalCovariance3(
+            *process_noise.components()
+        )
+        self._predictor = ConstantAccelerationPredictor(
+            estimator_config.maximum_sample_interval_seconds,
+            self._process_noise,
+        )
+        self._estimator = ConstantAccelerationEstimator(estimator_config)
+        self._last_observation = None
+        self._last_received_at_seconds = None
+        self._pending_innovation_count = 0
+        self._last_innovation = None
+        self._impact_generation = 0
+
+    @property
+    def config(self):
+        return self._config
+
+    @property
+    def impact_config(self):
+        return self._impact_config
+
+    @property
+    def last_observation(self):
+        return self._last_observation
+
+    @property
+    def model_last_observation(self):
+        return self._estimator.last_observation
+
+    @property
+    def last_received_at_seconds(self):
+        return self._last_received_at_seconds
+
+    @property
+    def estimate(self):
+        if self._pending_innovation_count:
+            return None
+        return self._estimator.estimate
+
+    @property
+    def pending_innovation_count(self):
+        return self._pending_innovation_count
+
+    @property
+    def last_innovation(self):
+        return self._last_innovation
+
+    @property
+    def impact_generation(self):
+        return self._impact_generation
+
+    def reset(self):
+        self._estimator = ConstantAccelerationEstimator(self._config)
+        self._last_observation = None
+        self._last_received_at_seconds = None
+        self._pending_innovation_count = 0
+        self._last_innovation = None
+        self._impact_generation = 0
+
+    def _replace_baseline(self, observation, received_at):
+        candidate = ConstantAccelerationEstimator(self._config)
+        candidate.add_observation(observation, received_at)
+        self._estimator = candidate
+
+    def _baseline_reset_update(self, observation, received_at):
+        self._replace_baseline(observation, received_at)
+        self._last_observation = observation
+        self._last_received_at_seconds = received_at
+        self._pending_innovation_count = 0
+        self._last_innovation = None
+        return EstimatorUpdate(
+            EstimatorUpdateStatus.BASELINE_RESET,
+            observation,
+        )
+
+    def _model_requires_baseline_reset(self, observation):
+        previous = self._estimator.last_observation
+        if previous is None:
+            raise EstimatorProcessingError(
+                "impact model baseline is unavailable"
+            )
+        interval = observation.timestamp_seconds - previous.timestamp_seconds
+        interval_tolerance = _comparison_tolerance(
+            observation.timestamp_seconds,
+            previous.timestamp_seconds,
+            self._config.minimum_sample_interval_seconds,
+            self._config.maximum_sample_interval_seconds,
+        )
+        return (
+            interval
+            > self._config.maximum_sample_interval_seconds
+            + interval_tolerance
+        )
+
+    def _innovation(self, observation):
+        try:
+            prediction = self._predictor.predict(
+                self._estimator.estimate,
+                observation.timestamp_seconds,
+            )
+            residual = Vector3(*(
+                _finite_sum(
+                    (observed, -predicted),
+                    "innovation residual",
+                )
+                for observed, predicted in zip(
+                    observation.position.components(),
+                    prediction.position.components(),
+                )
+            ))
+            combined_variance = DiagonalCovariance3(*(
+                _finite_sum(
+                    (predicted, measured),
+                    "innovation position variance",
+                )
+                for predicted, measured in zip(
+                    prediction.covariance.position_diagonal().components(),
+                    observation.position_variance.components(),
+                )
+            ))
+            threshold = (
+                self._impact_config.maximum_axis_standardized_innovation
+            )
+            exceeded_axes = tuple(
+                _axis_innovation_exceeds(axis_residual, variance, threshold)
+                for axis_residual, variance in zip(
+                    residual.components(),
+                    combined_variance.components(),
+                )
+            )
+            return PositionInnovation(
+                residual,
+                combined_variance,
+                threshold,
+                exceeded_axes,
+            )
+        except DynamicMotionError as exc:
+            raise EstimatorProcessingError(
+                "impact innovation update failed"
+            ) from exc
+
+    def add_observation(self, observation, received_at_seconds):
+        received_at, baseline_status = _validated_estimator_observation(
+            self._config,
+            self._last_observation,
+            self._last_received_at_seconds,
+            observation,
+            received_at_seconds,
+        )
+        if baseline_status is EstimatorUpdateStatus.BASELINE_RESET:
+            return self._baseline_reset_update(
+                observation,
+                received_at,
+            )
+
+        if self._estimator.estimate is None:
+            update = self._estimator.add_observation(
+                observation,
+                received_at,
+            )
+            self._last_observation = observation
+            self._last_received_at_seconds = received_at
+            self._pending_innovation_count = 0
+            self._last_innovation = None
+            return update
+
+        if (
+            self._pending_innovation_count
+            and self._model_requires_baseline_reset(observation)
+        ):
+            return self._baseline_reset_update(observation, received_at)
+
+        innovation = self._innovation(observation)
+        if innovation.exceeded:
+            sequence_count = self._pending_innovation_count + 1
+            if (
+                sequence_count
+                < self._impact_config.impact_confirmation_observations
+            ):
+                self._last_observation = observation
+                self._last_received_at_seconds = received_at
+                self._last_innovation = innovation
+                self._pending_innovation_count = sequence_count
+                return EstimatorUpdate(
+                    EstimatorUpdateStatus.INNOVATION_REJECTED,
+                    observation,
+                    innovation=innovation,
+                    innovation_sequence_count=sequence_count,
+                )
+            self._replace_baseline(observation, received_at)
+            self._last_observation = observation
+            self._last_received_at_seconds = received_at
+            self._last_innovation = innovation
+            self._pending_innovation_count = 0
+            self._impact_generation += 1
+            return EstimatorUpdate(
+                EstimatorUpdateStatus.IMPACT_RESET,
+                observation,
+                innovation=innovation,
+                innovation_sequence_count=sequence_count,
+            )
+
+        update = self._estimator.add_observation(
+            observation,
+            received_at,
+        )
+        self._last_observation = observation
+        self._last_received_at_seconds = received_at
+        self._pending_innovation_count = 0
+        self._last_innovation = innovation
+        return EstimatorUpdate(
+            EstimatorUpdateStatus.ESTIMATE_UPDATED,
+            update.observation,
+            update.estimate,
+            innovation=innovation,
+        )
+
+
 @dataclass(frozen=True)
 class ReplayObservation:
     observation: PositionObservation
@@ -1749,6 +2230,26 @@ class ObservationReplay:
         return self._run_estimator(
             ConstantAccelerationEstimator(estimator_config)
         )
+
+    def run_impact_aware_acceleration(
+        self,
+        estimator_config,
+        impact_config,
+    ):
+        if type(estimator_config) is not ConstantVelocityEstimatorConfig:
+            raise ObservationValidationError(
+                "impact replay estimator_config must be built-in "
+                "ConstantVelocityEstimatorConfig"
+            )
+        if type(impact_config) is not ImpactAwareEstimatorConfig:
+            raise ObservationValidationError(
+                "impact replay impact_config must be built-in "
+                "ImpactAwareEstimatorConfig"
+            )
+        return self._run_estimator(ImpactAwareAccelerationEstimator(
+            estimator_config,
+            impact_config,
+        ))
 
 
 def _fixed_items_bounded(values, maximum_count, field_name):

@@ -165,12 +165,51 @@ accepts LF or CRLF, and canonical re-encoding normalizes either form to LF;
 byte-level hashes therefore identify encoded files rather than logical replay
 equivalence.
 
-Current object-model scope stops before calibrated transforms, innovation-based
-outlier filtering, impact models, jerk estimation, production reachability, IK,
-collision checking, controller setpoint replacement, or grasp supervision. The
-three-sample acceleration estimate is a deterministic finite-difference model,
-not a claim of camera or live-object tracking accuracy. No live-arm result is
-established by the deterministic module or associated tests.
+Current object-model scope stops before calibrated transforms, a physical
+impact model, jerk estimation, production reachability, IK, collision checking,
+controller setpoint replacement, or grasp supervision. The three-sample
+acceleration estimate and innovation gate are deterministic models, not claims
+of camera or live-object tracking accuracy. No live-arm result is established
+by the deterministic module or associated tests.
+
+## Implemented impact-aware innovation filtering
+
+`ImpactAwareAccelerationEstimator` predicts the last accepted acceleration
+estimate to each new observation timestamp, combines predicted and measurement
+position variance per axis, and compares each residual with a caller-supplied
+maximum standardized innovation. The estimator's caller-supplied maximum sample
+interval bounds extrapolation from the accepted model while consecutive
+innovations are pending. A larger accumulated model gap produces an ordinary
+baseline reset before impact classification. No project default is embedded.
+Normalized innovation statistics depend on correctly tuned process and
+measurement noise; chi-square behavior alone does not establish correct tuning,
+as discussed in
+[Kalman Filter Auto-tuning through Enforcing Chi-Squared Normalized Error
+Distributions](https://arxiv.org/abs/2306.07225). Innovation-based protection
+also prevents a single outlier from directly corrupting the tracked state,
+consistent with the bounded-innovation motivation in
+[Robust Extended Kalman Filtering for Systems with Measurement
+Outliers](https://arxiv.org/abs/1904.00335).
+
+One exceeded observation reports `INNOVATION_REJECTED`, leaves the accepted
+finite-difference window unchanged, and makes the estimator's public estimate
+unavailable. At least two consecutive exceeded observations are required by
+configuration. Reaching that count reports `IMPACT_RESET` and transactionally
+replaces the model with the confirming observation as a new baseline. The
+label identifies a confirmed model discontinuity under the configured gate;
+no physical collision classification is claimed. A long model gap uses the
+existing baseline-reset disposition instead of claiming impact. A
+model-consistent observation after an isolated rejection resumes from the
+unchanged model.
+
+Impact-aware replay exposes every rejection, reset, warmup, and reacquisition.
+`select_impact_aware_acceleration_replay_intercepts` performs no intercept
+selection while an innovation sequence is pending or the estimator is warming
+after reset. The optional feedback-replanning integration emits distinct
+innovation and impact holds, keeps the last desired trajectory only as a
+fallback, and marks the active intercept invalid until a new replacement is
+constructed. Logical invalidation sends no controller command and does not
+claim physical hold, cancellation, or changed arm motion.
 
 ## Implemented deterministic intercept selection
 
@@ -197,14 +236,15 @@ Stale and future estimates return explicit non-selected statuses without
 invoking the evaluator. Exceptions or malformed evaluator output fail the
 selection boundary.
 
-`select_replay_intercepts` and `select_acceleration_replay_intercepts` validate
-the complete recorded estimator sequence and the bounded
-record-by-candidate workload before feasibility evaluation, then recompute
-selection after every applicable estimate update. Acceleration replay retains
-the initial baseline and warmup steps without invoking feasibility. That
-behavior exercises deterministic target reselection after new observations; no
-geometric path, controller setpoint, or grasp is generated. The injected
-evaluator provides simulation decisions only and does not establish physical
+`select_replay_intercepts`, `select_acceleration_replay_intercepts`, and
+`select_impact_aware_acceleration_replay_intercepts` validate the complete
+recorded estimator sequence and the bounded record-by-candidate workload before
+feasibility evaluation, then recompute selection after every applicable
+estimate update. Impact-aware acceleration replay retains baseline, warmup,
+innovation, and impact-reset steps without invoking feasibility. That behavior
+exercises deterministic target reselection after new observations; no geometric
+path, controller setpoint, or grasp is generated. The injected evaluator
+provides simulation decisions only and does not establish physical
 reachability, collision clearance, singularity margin, joint-limit compliance,
 or arrival performance.
 
@@ -268,14 +308,14 @@ hardware-free replanning primitive only, not safe or achievable arm motion.
 
 ## Implemented feedback-replanning coordinator
 
-`ARrobots.feedback_replanning` connects the constant-acceleration estimator,
+`ARrobots.feedback_replanning` connects a constant-acceleration estimator,
 caller-supplied intercept selector, correlated joint-target resolution, and
-desired-trajectory
-replacement in a single-owner hardware-free coordinator. Baseline and warmup
-updates hold the current desired trajectory. A long-gap estimator reset has a
-distinct hold disposition. No-feasible, stale-estimate, and future-estimate
-selections produce distinct hold events without calling the joint-target
-resolver.
+desired-trajectory replacement in a single-owner hardware-free coordinator.
+An optional impact-aware estimator configuration adds innovation-rejected and
+impact-reset holds. Baseline and warmup updates hold the current desired
+trajectory. A long-gap estimator reset has a distinct hold disposition.
+No-feasible, stale-estimate, and future-estimate selections produce distinct
+hold events without calling the joint-target resolver.
 
 A selected-only deep snapshot is passed to one synchronous injected resolver.
 Resolver output carries the estimate, evaluation, and intercept timestamps
@@ -291,10 +331,12 @@ Accepted events receive contiguous sequence numbers. Out-of-order observations
 are rejected by the owned estimator before target resolution. Reentrant
 processing, stale resolver output, invalid active state, callback failure, and
 infeasible trajectory construction cannot replace the last valid trajectory.
-Selection, target-resolution, and trajectory-construction faults are bounded,
-phase-tagged, and latched. Logical cancellation is also terminal. Neither a
-hold nor cancellation sends a controller command or claims physical motion has
-stopped.
+Estimator-processing, selection, target-resolution, and
+trajectory-construction faults are bounded, phase-tagged, and latched. Logical
+cancellation is also terminal. Neither a hold nor cancellation sends a
+controller command or claims physical motion has stopped. Any estimator hold,
+selection hold, cancellation, or fault invalidates the logical active
+intercept; a successful replacement restores validity.
 
 The replay adapter processes the versioned observation replay through the same
 coordinator and exposes every processed event. A terminal fault returns an

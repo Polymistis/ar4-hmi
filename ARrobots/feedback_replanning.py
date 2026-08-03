@@ -12,10 +12,14 @@ from ARrobots.dynamic_motion import (
     ConstantAccelerationEstimator,
     ConstantVelocityEstimatorConfig,
     DynamicMotionError,
+    EstimatorProcessingError,
     EstimatorUpdate,
     EstimatorUpdateStatus,
+    ImpactAwareAccelerationEstimator,
+    ImpactAwareEstimatorConfig,
     OBSERVATION_REPLAY_MAXIMUM_RECORDS,
     ObservationReplay,
+    ObservationValidationError,
 )
 from ARrobots.interception import (
     INTERCEPT_REPLAY_MAXIMUM_CANDIDATE_EVALUATIONS,
@@ -229,6 +233,8 @@ def _safe_fault_text(value, fallback):
 class FeedbackReplanStatus(Enum):
     HOLDING_FOR_ESTIMATE = "holding-for-estimate"
     HOLDING_AFTER_ESTIMATOR_RESET = "holding-after-estimator-reset"
+    HOLDING_INNOVATION_REJECTED = "holding-innovation-rejected"
+    HOLDING_AFTER_IMPACT = "holding-after-impact"
     HOLDING_NO_FEASIBLE_CANDIDATE = "holding-no-feasible-candidate"
     HOLDING_STALE_ESTIMATE = "holding-stale-estimate"
     HOLDING_FUTURE_ESTIMATE = "holding-future-estimate"
@@ -238,6 +244,7 @@ class FeedbackReplanStatus(Enum):
 
 
 class FeedbackReplanFaultPhase(Enum):
+    ESTIMATION = "estimation"
     SELECTION = "selection"
     TARGET_RESOLUTION = "target-resolution"
     TRAJECTORY_CONSTRUCTION = "trajectory-construction"
@@ -331,6 +338,25 @@ def _selection_hold_status(status):
     if status is InterceptSelectionStatus.FUTURE_ESTIMATE:
         return FeedbackReplanStatus.HOLDING_FUTURE_ESTIMATE
     return None
+
+
+def _estimator_hold_status(status):
+    if status in (
+        EstimatorUpdateStatus.BASELINE_ACCEPTED,
+        EstimatorUpdateStatus.WARMUP_ACCEPTED,
+    ):
+        return FeedbackReplanStatus.HOLDING_FOR_ESTIMATE
+    if status is EstimatorUpdateStatus.BASELINE_RESET:
+        return FeedbackReplanStatus.HOLDING_AFTER_ESTIMATOR_RESET
+    if status is EstimatorUpdateStatus.INNOVATION_REJECTED:
+        return FeedbackReplanStatus.HOLDING_INNOVATION_REJECTED
+    if status is EstimatorUpdateStatus.IMPACT_RESET:
+        return FeedbackReplanStatus.HOLDING_AFTER_IMPACT
+    return None
+
+
+def _status_has_valid_intercept(status):
+    return status is FeedbackReplanStatus.REPLACED
 
 
 def _validated_selection(selection, update, evaluated_at):
@@ -485,6 +511,15 @@ class FeedbackReplanEvent:
                 raise FeedbackReplanningError(
                     "faulted event requires only fault-safe trajectory output"
                 )
+            if self.fault.phase is FeedbackReplanFaultPhase.ESTIMATION:
+                if (
+                    self.estimator_update is not None
+                    or self.selection is not None
+                ):
+                    raise FeedbackReplanningError(
+                        "estimation fault must not carry processing output"
+                    )
+                return
             if self.fault.phase is FeedbackReplanFaultPhase.SELECTION:
                 if (
                     self.estimator_update is None
@@ -517,6 +552,8 @@ class FeedbackReplanEvent:
         if self.status in (
             FeedbackReplanStatus.HOLDING_FOR_ESTIMATE,
             FeedbackReplanStatus.HOLDING_AFTER_ESTIMATOR_RESET,
+            FeedbackReplanStatus.HOLDING_INNOVATION_REJECTED,
+            FeedbackReplanStatus.HOLDING_AFTER_IMPACT,
         ):
             if (
                 self.estimator_update is None
@@ -528,17 +565,12 @@ class FeedbackReplanEvent:
                 raise FeedbackReplanningError(
                     "estimate hold event has inconsistent processing output"
                 )
-            expected_status = FeedbackReplanStatus.HOLDING_FOR_ESTIMATE
-            if (
+            expected_status = _estimator_hold_status(
                 self.estimator_update.status
-                is EstimatorUpdateStatus.BASELINE_RESET
-            ):
-                expected_status = (
-                    FeedbackReplanStatus.HOLDING_AFTER_ESTIMATOR_RESET
-                )
+            )
             if self.status is not expected_status:
                 raise FeedbackReplanningError(
-                    "estimate hold event does not preserve reset disposition"
+                    "estimate hold event does not preserve estimator disposition"
                 )
             return
         self._validate_selection_link()
@@ -671,6 +703,10 @@ class FeedbackReplanReplayResult:
     def complete(self):
         return self.processed_all_samples and not self.faulted
 
+    @property
+    def active_intercept_valid(self):
+        return _status_has_valid_intercept(self.events[-1].status)
+
 
 class FeedbackReplanner:
     """Single-owner coordinator; no method transmits a controller command."""
@@ -682,6 +718,7 @@ class FeedbackReplanner:
         initial_trajectory,
         initial_trajectory_started_at_seconds,
         target_resolver,
+        impact_config=None,
     ):
         if type(estimator_config) is not ConstantVelocityEstimatorConfig:
             raise FeedbackReplanningError(
@@ -742,8 +779,27 @@ class FeedbackReplanner:
             )
         if not callable(target_resolver):
             raise FeedbackReplanningError("target_resolver must be callable")
+        if (
+            impact_config is not None
+            and type(impact_config) is not ImpactAwareEstimatorConfig
+        ):
+            raise FeedbackReplanningError(
+                "impact_config must be built-in ImpactAwareEstimatorConfig"
+            )
         active_trajectory = _validated_active_trajectory(initial_trajectory)
-        self._estimator = ConstantAccelerationEstimator(estimator_config)
+        if impact_config is None:
+            estimator = ConstantAccelerationEstimator(estimator_config)
+        else:
+            try:
+                estimator = ImpactAwareAccelerationEstimator(
+                    estimator_config,
+                    impact_config,
+                )
+            except Exception as exc:
+                raise FeedbackReplanningError(
+                    "impact estimator configuration failed validation"
+                ) from exc
+        self._estimator = estimator
         self._selector = selector
         self._active_trajectory = active_trajectory
         self._active_started_at_seconds = _nonnegative_number(
@@ -752,6 +808,7 @@ class FeedbackReplanner:
         )
         self._target_resolver = target_resolver
         self._trajectory_generation = 0
+        self._active_intercept_valid = False
         self._next_event_sequence = 0
         self._last_event_at_seconds = None
         self._fault = None
@@ -769,6 +826,10 @@ class FeedbackReplanner:
     @property
     def trajectory_generation(self):
         return self._trajectory_generation
+
+    @property
+    def active_intercept_valid(self):
+        return self._active_intercept_valid
 
     @property
     def fault(self):
@@ -821,6 +882,9 @@ class FeedbackReplanner:
             selection=selection,
             replacement_trajectory=replacement,
             fault=fault,
+        )
+        self._active_intercept_valid = _status_has_valid_intercept(
+            event.status
         )
         self._next_event_sequence += 1
         self._last_event_at_seconds = evaluated_at
@@ -897,15 +961,32 @@ class FeedbackReplanner:
         evaluated_at = self._validated_event_time(received_at_seconds)
         self._processing = True
         try:
-            update = self._estimator.add_observation(
-                observation,
-                evaluated_at,
-            )
+            try:
+                update = self._estimator.add_observation(
+                    observation,
+                    evaluated_at,
+                )
+            except EstimatorProcessingError as exc:
+                return self._fault_event(
+                    FeedbackReplanFaultPhase.ESTIMATION,
+                    exc,
+                    evaluated_at,
+                    None,
+                )
+            except ObservationValidationError:
+                raise
+            except Exception as exc:
+                return self._fault_event(
+                    FeedbackReplanFaultPhase.ESTIMATION,
+                    exc,
+                    evaluated_at,
+                    None,
+                )
             if update.status is not EstimatorUpdateStatus.ESTIMATE_UPDATED:
-                status = FeedbackReplanStatus.HOLDING_FOR_ESTIMATE
-                if update.status is EstimatorUpdateStatus.BASELINE_RESET:
-                    status = (
-                        FeedbackReplanStatus.HOLDING_AFTER_ESTIMATOR_RESET
+                status = _estimator_hold_status(update.status)
+                if status is None:
+                    raise FeedbackReplanningError(
+                        "estimator returned an unsupported status"
                     )
                 return self._event(
                     evaluated_at,
@@ -1031,6 +1112,7 @@ def run_feedback_replanning_replay(
     initial_trajectory,
     initial_trajectory_started_at_seconds,
     target_resolver,
+    impact_config=None,
 ):
     """Run one bounded replay without controller or GUI side effects."""
     if type(replay) is not ObservationReplay:
@@ -1056,6 +1138,14 @@ def run_feedback_replanning_replay(
         raise FeedbackReplanningError(
             "replay selector must be a built-in InterceptSelector"
         )
+    if (
+        impact_config is not None
+        and type(impact_config) is not ImpactAwareEstimatorConfig
+    ):
+        raise FeedbackReplanningError(
+            "replay impact_config must be built-in "
+            "ImpactAwareEstimatorConfig"
+        )
     try:
         selector_config = selector.config
         candidate_lead_times = selector_config.candidate_lead_times
@@ -1071,10 +1161,9 @@ def run_feedback_replanning_replay(
         raise FeedbackReplanningError(
             "replay selector candidate schedule is invalid"
         )
-    # The owned acceleration estimator cannot emit an estimate before one
-    # baseline and one warmup record. Resets only reduce this count. Deriving
-    # the bound from record count avoids an estimator pre-pass, so sample
-    # contents beyond a terminal coordinator fault remain uninspected.
+    # Estimator warmup and later holding dispositions only reduce this
+    # conservative record-derived bound. Avoiding an estimator pre-pass keeps
+    # samples beyond a terminal coordinator fault uninspected.
     estimate_update_count = max(0, len(replay.samples) - 2)
     candidate_evaluation_count = (
         estimate_update_count * len(candidate_lead_times)
@@ -1092,6 +1181,7 @@ def run_feedback_replanning_replay(
         initial_trajectory,
         initial_trajectory_started_at_seconds,
         target_resolver,
+        impact_config,
     )
     events = []
     for sample in replay.samples:

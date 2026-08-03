@@ -38,7 +38,7 @@ Status terms and complete acceptance criteria are defined in the detailed-contra
 | M4A5 - Desired-versus-estimated-and-encoder joint display | `Tested` | Keep desired, active-target, estimate, and encoder channels distinct. |
 | M4A6 - Main-control workspace and named positions | `Tested` | Maintain tabbed controls and validated Start and Shutdown positions. |
 | M4A7 - Low-priority joint encoder telemetry | `Blocked` | Implementation remains in progress; powered acceptance prerequisites remain unmet. |
-| M4B - Repeatability and dynamic interception pass | `In progress` | Extend replay replanning toward impact filtering and asynchronous supersession. |
+| M4B - Repeatability and dynamic interception pass | `In progress` | Add asynchronous supersession after impact-filtered replay and replanning. |
 | M5 - Controlled hardware validation | `Blocked` | Await the prerequisites defined by the controlled verification contract. |
 
 ## Verification records
@@ -1320,6 +1320,15 @@ Implemented foundation:
   feasibility evaluation, so a velocity-only predictor fails explicitly. The
   constant-velocity predictor also rejects accelerated estimates at its direct
   call boundary instead of discarding acceleration state.
+- `ImpactAwareAccelerationEstimator` applies a caller-supplied per-axis
+  standardized-innovation gate using predicted plus measurement position
+  variance. The estimator's caller-supplied maximum sample interval also bounds
+  extrapolation from the accepted model. One exceeded observation cannot mutate
+  the accepted model and makes the public estimate unavailable. A configurable
+  sequence of at least two exceeded observations confirms a model discontinuity,
+  transactionally replaces the baseline, and reports `IMPACT_RESET`; the
+  disposition does not claim a physical collision. Long model gaps remain
+  ordinary baseline resets.
 - The versioned `ar4.observation-replay.v1` JSONL codec enforces strict UTF-8,
   exact fields, duplicate-key rejection, finite numeric domains, payload and
   record bounds, one coordinate frame, and ordered observation and receipt
@@ -1348,9 +1357,10 @@ Implemented foundation:
   workload, then recomputes an intercept selection after every estimate update
   using the matching receipt timestamp.
 - Recorded observation replay can own either the constant-velocity estimator
-  or the constant-acceleration estimator. Acceleration replay exposes warmup
-  steps without selection and recomputes intercept candidates only after a
-  complete acceleration estimate becomes available.
+  or the constant-acceleration estimator, with optional impact-aware filtering.
+  Impact-aware acceleration replay exposes warmup, innovation-rejected, and
+  impact-reset steps without selection and recomputes intercept candidates only
+  after a complete acceleration estimate becomes available.
 - `ARrobots.trajectory_timing` generates deterministic symmetric seven-phase
   S-curves for rest-to-rest joint moves under caller-supplied positive velocity,
   acceleration, and jerk limits. The minimum single-axis profiles cover the
@@ -1374,17 +1384,20 @@ Implemented foundation:
   boundary. Jerk continuity is not guaranteed. The helper consumes desired
   trajectory state rather than encoder feedback and does not transmit a
   controller setpoint.
-- `ARrobots.feedback_replanning` owns a constant-acceleration estimator and
-  uses a caller-supplied intercept selector around one validated desired
-  trajectory. Ordered observations produce distinct warmup, estimator-reset,
+- `ARrobots.feedback_replanning` owns a constant-acceleration estimator, with
+  optional impact-aware filtering, and uses a caller-supplied intercept
+  selector around one validated desired trajectory. Ordered observations
+  produce distinct warmup, estimator-reset, innovation-rejected, impact-reset,
   no-feasible, stale, future, replaced, cancelled, or phase-tagged fault
-  events. A synchronous injected resolver
-  must correlate estimate, evaluation, and intercept timestamps and return a
-  matching bounded joint target before transactional C2 replacement can
-  advance the trajectory generation. Invalid or stale resolver output,
-  reentrant processing, active-state corruption, callback failure, and
-  infeasible trajectory construction leave the last validated trajectory
-  unreplaced and latch the coordinator fault.
+  events. Estimator and selection holds invalidate the logical active intercept
+  while retaining the last desired trajectory as a fallback. A successful
+  replacement restores logical intercept validity. A synchronous injected
+  resolver must correlate estimate, evaluation, and intercept timestamps and
+  return a matching bounded joint target before transactional C2 replacement
+  can advance the trajectory generation. Estimator processing failure, invalid
+  or stale resolver output, reentrant processing, active-state corruption,
+  callback failure, and infeasible trajectory construction leave the last
+  validated trajectory unreplaced and latch the coordinator fault.
 - The feedback-replanning replay adapter exercises repeated desired-state
   replacement through the versioned observation replay. A terminal fault
   returns an explicit processed prefix. Replay results require non-decreasing
@@ -1397,7 +1410,9 @@ Implemented foundation:
   explicit feasibility rejections, arrival timing, stale and future estimates,
   callback and predictor failures, numeric precision limits, replay-driven
   reselection, three-sample acceleration estimation, full covariance
-  propagation, analytical trajectory regimes, synchronized time scaling,
+  propagation, innovation rejection, impact reset and reacquisition,
+  estimation-fault replay, analytical trajectory regimes, synchronized time
+  scaling,
   arbitrary-state quintic derivative-root extrema, trajectory sampling, C2
   desired-state replacement, repeated feedback-driven replacement, stale
   target rejection, hold and cancellation dispositions, and latched fault
@@ -1405,9 +1420,9 @@ Implemented foundation:
   trajectory limits are simulation input, not evidence of physical
   reachability or timing.
   No controller command, live motion, calibrated transform, production IK or
-  collision engine, impact-aware state filtering, controller-online trajectory
-  replacement, local collision-aware path replanning, or grasp behavior is
-  included.
+  collision engine, physical impact classifier, controller-online trajectory
+  replacement, asynchronous resolver supersession, local collision-aware path
+  replanning, or grasp behavior is included.
 
 ### M5 - Controlled hardware validation
 
