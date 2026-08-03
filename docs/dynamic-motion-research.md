@@ -234,11 +234,37 @@ the rest-to-rest assumption.
 
 This duration excludes perception age, transport latency, controller response,
 IK, joint-position limits, singularity margin, collision clearance, path
-geometry, settling, and gripper timing. Nonzero initial or terminal velocity
-and acceleration, asymmetric directional limits, continuous setpoint
-replacement, and controller-specific curve tuning remain future work. The
-profiles therefore support deterministic simulation and feasibility plumbing;
-no physical timing or safe path is established.
+geometry, settling, and gripper timing. Asymmetric directional limits,
+continuous controller setpoint replacement, and controller-specific curve
+tuning remain future work. The profiles therefore support deterministic
+simulation and feasibility plumbing; no physical timing or safe path is
+established.
+
+## Implemented arbitrary-state replacement segments
+
+`ARrobots.trajectory_timing` also defines finite joint boundary states with
+position, velocity, and acceleration. A fixed-duration quintic segment matches
+those values at both endpoints, following the acceleration-continuous
+interpolation contract documented by the
+[ros2_control joint trajectory controller](https://control.ros.org/jazzy/doc/ros2_controllers/joint_trajectory_controller/doc/userdoc.html).
+Velocity, acceleration, and jerk limits are checked at endpoints and at
+interior critical points isolated from derivative-polynomial roots with bounded
+bisection. Validation does not depend on a sampling interval, and an infeasible
+requested duration is rejected instead of silently changed.
+
+Multi-axis construction uses one explicit duration for up to J1-J9. The local
+replacement helper samples an existing built-in desired trajectory at the
+replacement instant and uses the sampled position, velocity, and acceleration
+as the next segment's start state. Position, velocity, and acceleration are
+therefore continuous at that desired-state boundary; jerk may change
+discontinuously. Direct construction also accepts an independently measured
+start state, but no encoder-feedback adapter is implemented.
+
+The segment is not time-optimal and carries no collision, singularity,
+joint-position-limit, absolute timestamp, command-age, sequence, or controller
+watchdog contract. No running firmware path accepts these segments or replaces
+a setpoint during motion. Deterministic construction and sampling establish a
+hardware-free replanning primitive only, not safe or achievable arm motion.
 
 ## Product constraints requiring later decisions
 

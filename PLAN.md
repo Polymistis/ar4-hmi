@@ -38,7 +38,7 @@ Status terms and complete acceptance criteria are defined in the detailed-contra
 | M4A5 - Desired-versus-estimated-and-encoder joint display | `Tested` | Keep desired, active-target, estimate, and encoder channels distinct. |
 | M4A6 - Main-control workspace and named positions | `Tested` | Maintain tabbed controls and validated Start and Shutdown positions. |
 | M4A7 - Low-priority joint encoder telemetry | `Blocked` | Implementation remains in progress; powered acceptance prerequisites remain unmet. |
-| M4B - Repeatability and dynamic interception pass | `In progress` | Extend acceleration-aware replay toward local replanning. |
+| M4B - Repeatability and dynamic interception pass | `In progress` | Extend desired-state replacement toward feedback-driven local replanning. |
 | M5 - Controlled hardware validation | `Blocked` | Await the prerequisites defined by the controlled verification contract. |
 
 ## Verification records
@@ -1361,17 +1361,32 @@ Implemented foundation:
   duration. Profiles expose deterministic position, velocity, acceleration,
   and jerk samples plus the synchronized minimum arrival duration for an
   injected intercept-feasibility evaluator.
+- The same module defines finite arbitrary joint boundary states containing
+  position, velocity, and acceleration. Fixed-duration quintic segments
+  preserve those values at both endpoints and isolate the derivative-polynomial
+  roots for interior velocity, acceleration, and jerk extrema before accepting
+  the segment. A requested duration that violates any supplied joint limit
+  fails explicitly instead of being lengthened without caller knowledge.
+- Multi-axis quintic segments share one caller-selected duration across up to
+  J1-J9. A hardware-free replacement helper samples a currently active built-in
+  desired trajectory and constructs the next segment from the sampled position,
+  velocity, and acceleration, preserving C2 continuity at the replacement
+  boundary. Jerk continuity is not guaranteed. The helper consumes desired
+  trajectory state rather than encoder feedback and does not transmit a
+  controller setpoint.
 - Hardware-free tests cover selection configuration and result invariants,
   per-candidate covariance and speed thresholds, deterministic ranking,
   explicit feasibility rejections, arrival timing, stale and future estimates,
   callback and predictor failures, numeric precision limits, replay-driven
   reselection, three-sample acceleration estimation, full covariance
-  propagation, analytical trajectory regimes, synchronized time scaling, and
-  trajectory sampling. The injected feasibility boundary and trajectory limits
-  are simulation input, not evidence of physical reachability or timing. No
-  controller command, live motion, calibrated transform, production IK or
-  collision engine, impact-aware state filtering, arbitrary-state or online
-  trajectory replacement, local path replanning, or grasp behavior is included.
+  propagation, analytical trajectory regimes, synchronized time scaling,
+  arbitrary-state quintic derivative-root extrema, trajectory sampling, and C2
+  desired-state replacement. The injected feasibility boundary and trajectory
+  limits are simulation input, not evidence of physical reachability or timing.
+  No controller command, live motion, calibrated transform, production IK or
+  collision engine, impact-aware state filtering, controller-online trajectory
+  replacement, local collision-aware path replanning, or grasp behavior is
+  included.
 
 ### M5 - Controlled hardware validation
 
