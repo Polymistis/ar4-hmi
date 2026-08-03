@@ -108,17 +108,19 @@ Repeat targets from consistent and reversed approach directions to expose hyster
 ## Implemented controller-trace analysis foundation
 
 `ARrobots.controller_trace` defines canonical JSONL schema
-`ar4.controller-trace.v1` for one complete J1-J6
+`ar4.controller-trace.v2` for one complete J1-J6
 `JOINT_TELEMETRY_V1` exchange. The header preserves the controller hardware ID,
 firmware version, confirmed command-start position, commanded J1-J6 target, RJ
 speed and ramp inputs, the nominal telemetry period, and a `sha256:`
 configuration fingerprint. The fingerprint
 identifies the canonical ASCII `UP` controller-configuration command including
 the terminal LF; configuration contents remain outside the trace. The schema
-defines the trace time origin as the host monotonic timestamp captured
-immediately before the RJ write. Encoder-sample and terminal timestamps are
-offsets from that origin. Command direction is derived from the confirmed start
-and target positions rather than a potentially late first encoder sample.
+uses the complete existing `CommandTiming.mode` domain: `p`, `s`, and `m`.
+The trace header defines the time origin as the host monotonic timestamp
+captured immediately before the RJ write. Encoder-sample and terminal
+timestamps are host-receipt offsets from that origin. Command direction is
+derived from the confirmed start and target positions rather than a
+potentially late first encoder sample.
 
 Encoder records contain host-receipt timestamps and J1-J6 positions in degrees.
 The terminal record separately identifies success, failure, or stop and stores

@@ -10,8 +10,9 @@ import struct
 from typing import Optional, Tuple
 
 
-CONTROLLER_TRACE_SCHEMA = "ar4.controller-trace.v1"
+CONTROLLER_TRACE_SCHEMA = "ar4.controller-trace.v2"
 CONTROLLER_TRACE_TIMEBASE = "host-monotonic-offset-seconds"
+CONTROLLER_TRACE_TIME_ORIGIN = "immediately-before-rj-write"
 CONTROLLER_TRACE_POSITION_UNIT = "degree"
 CONTROLLER_TRACE_SOURCE = "JOINT_TELEMETRY_V1"
 CONTROLLER_TRACE_AXIS_COUNT = 6
@@ -216,10 +217,10 @@ class ControllerMotionProfile:
     def __post_init__(self):
         if (
             not isinstance(self.speed_mode, str)
-            or self.speed_mode not in ("percent", "seconds")
+            or self.speed_mode not in ("p", "s", "m")
         ):
             raise ControllerTraceValidationError(
-                "motion-profile speed_mode must be 'percent' or 'seconds'"
+                "motion-profile speed_mode must be 'p', 's', or 'm'"
             )
         speed = _controller_float(
             self.speed_value,
@@ -229,7 +230,7 @@ class ControllerMotionProfile:
             raise ControllerTraceValidationError(
                 "motion-profile speed_value must be positive"
             )
-        if self.speed_mode == "percent" and speed > 100:
+        if self.speed_mode == "p" and speed > 100:
             raise ControllerTraceValidationError(
                 "percent motion-profile speed_value must not exceed 100"
             )
@@ -353,7 +354,7 @@ class ControllerTraceMetadata:
 
 @dataclass(frozen=True)
 class ControllerTraceSample:
-    """J1-J6 encoder positions timestamped at host receipt."""
+    """J1-J6 host-received encoder positions offset from pre-RJ-write time."""
 
     elapsed_seconds: float
     encoder_positions: Tuple[float, ...]
@@ -601,6 +602,7 @@ def _decode_metadata(header):
         "start_positions",
         "target_positions",
         "timebase",
+        "time_origin",
     }
     if set(header) != expected_keys:
         raise ControllerTraceFormatError(
@@ -614,6 +616,7 @@ def _decode_metadata(header):
         or header["schema"] != CONTROLLER_TRACE_SCHEMA
         or header["source"] != CONTROLLER_TRACE_SOURCE
         or header["timebase"] != CONTROLLER_TRACE_TIMEBASE
+        or header["time_origin"] != CONTROLLER_TRACE_TIME_ORIGIN
     ):
         raise ControllerTraceFormatError(
             "line 1: unsupported controller-trace header"
@@ -762,6 +765,7 @@ def encode_controller_trace(trace):
         "start_positions": list(metadata.start_positions),
         "target_positions": list(metadata.target_positions),
         "timebase": CONTROLLER_TRACE_TIMEBASE,
+        "time_origin": CONTROLLER_TRACE_TIME_ORIGIN,
     }]
     records.extend({
         "elapsed_seconds": sample.elapsed_seconds,
@@ -930,27 +934,31 @@ def _joint_metrics(trace, axis):
     final = position_series[-1][1]
     peak_speed, peak_speed_time = _peak_absolute(velocities)
     peak_jerk, _ = _peak_absolute(jerks)
-    if direction:
+    if direction and velocities:
         peak_toward = max(
             (direction * value for _, value in velocities),
-            default=0.0,
         )
         peak_reverse = max(
             (-direction * value for _, value in velocities),
-            default=0.0,
         )
         peak_toward = max(0.0, peak_toward)
         peak_reverse = max(0.0, peak_reverse)
+    else:
+        peak_toward = None
+        peak_reverse = None
+    if direction and accelerations:
         peak_acceleration = max(
             (direction * value for _, value in accelerations),
-            default=0.0,
         )
         peak_deceleration = max(
             (-direction * value for _, value in accelerations),
-            default=0.0,
         )
         peak_acceleration = max(0.0, peak_acceleration)
         peak_deceleration = max(0.0, peak_deceleration)
+    else:
+        peak_acceleration = None
+        peak_deceleration = None
+    if direction:
         projected_target_errors = tuple(
             _finite_analysis_result(
                 direction * _analysis_difference(
@@ -967,10 +975,6 @@ def _joint_metrics(trace, axis):
             max(projected_target_errors),
         )
     else:
-        peak_toward = None
-        peak_reverse = None
-        peak_acceleration = None
-        peak_deceleration = None
         overshoot = None
 
     return JointTraceMetrics(

@@ -3,8 +3,11 @@ import unittest
 from unittest.mock import patch
 
 from ARrobots.controller_trace import (
+    CONTROLLER_TRACE_AXIS_COUNT,
     CONTROLLER_TRACE_EXPECTED_SAMPLE_PERIOD_SECONDS,
     CONTROLLER_TRACE_MAXIMUM_ENCODER_MILLIDEGREES,
+    CONTROLLER_TRACE_MINIMUM_ENCODER_MILLIDEGREES,
+    CONTROLLER_TRACE_SOURCE,
     CONTROLLER_TRACE_MAXIMUM_BYTES,
     CONTROLLER_TRACE_MAXIMUM_LINE_BYTES,
     CONTROLLER_TRACE_MAXIMUM_SAMPLES,
@@ -21,10 +24,13 @@ from ARrobots.controller_trace import (
     encode_controller_trace,
 )
 from ARrobots.HMI.joint_motion import (
+    CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
     CONTROLLER_HARDWARE_ID_LENGTH,
     CONTROLLER_MAXIMUM_RAMP_PERCENT,
     CONTROLLER_SIGNED_INT_MAX,
+    JOINT_TELEMETRY_AXIS_COUNT,
     JOINT_TELEMETRY_PERIOD_SECONDS,
+    parse_command_timing,
 )
 
 
@@ -33,7 +39,7 @@ FINGERPRINT = "sha256:" + "0" * 64
 
 def motion_profile(**overrides):
     values = {
-        "speed_mode": "percent",
+        "speed_mode": "p",
         "speed_value": 50,
         "acceleration_percent": 10,
         "deceleration_percent": 10,
@@ -97,6 +103,35 @@ class ControllerTraceValueTests(unittest.TestCase):
             CONTROLLER_SIGNED_INT_MAX,
         )
         self.assertEqual(
+            CONTROLLER_TRACE_MINIMUM_ENCODER_MILLIDEGREES,
+            -CONTROLLER_SIGNED_INT_MAX - 1,
+        )
+        self.assertEqual(
+            CONTROLLER_TRACE_AXIS_COUNT,
+            JOINT_TELEMETRY_AXIS_COUNT,
+        )
+        self.assertEqual(
+            CONTROLLER_TRACE_SOURCE,
+            CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
+        )
+        for speed_field, expected_mode in (
+            ("Sp50", "p"),
+            ("Ss2", "s"),
+            ("Sm25", "m"),
+        ):
+            with self.subTest(speed_field=speed_field):
+                timing = parse_command_timing(
+                    "RJA1B2C3D4E5F6J70J80J90"
+                    f"{speed_field}Ac10Dc20Rm25WNLm000000\n"
+                )
+                self.assertEqual(timing.mode, expected_mode)
+                self.assertEqual(
+                    motion_profile(
+                        speed_mode=timing.mode,
+                    ).speed_mode,
+                    expected_mode,
+                )
+        self.assertEqual(
             len(trace_metadata().controller_hardware_id),
             CONTROLLER_HARDWARE_ID_LENGTH,
         )
@@ -109,14 +144,18 @@ class ControllerTraceValueTests(unittest.TestCase):
 
     def test_profile_preserves_valid_controller_inputs(self):
         percent = motion_profile()
-        seconds = motion_profile(speed_mode="seconds", speed_value=120)
+        seconds = motion_profile(speed_mode="s", speed_value=120)
+        millimeters = motion_profile(speed_mode="m", speed_value=25)
 
         self.assertEqual(percent.speed_value, 50.0)
         self.assertEqual(seconds.speed_value, 120.0)
+        self.assertEqual(millimeters.speed_value, 25.0)
 
     def test_profile_rejects_invalid_controller_inputs(self):
         failures = (
             {"speed_mode": None},
+            {"speed_mode": "percent"},
+            {"speed_mode": "seconds"},
             {"speed_mode": "millimeters"},
             {"speed_value": 0},
             {"speed_value": 101},
@@ -128,7 +167,7 @@ class ControllerTraceValueTests(unittest.TestCase):
             {"ramp_percent": 101},
             {"speed_value": True},
             {"speed_value": float("inf")},
-            {"speed_mode": "seconds", "speed_value": 1e300},
+            {"speed_mode": "s", "speed_value": 1e300},
         )
         for overrides in failures:
             with self.subTest(overrides=overrides):
@@ -260,11 +299,15 @@ class ControllerTraceCodecTests(unittest.TestCase):
         self.assertEqual(decode_controller_trace(bytearray(payload)), self.trace)
         self.assertTrue(payload.endswith(b"\n"))
         header = json.loads(payload.splitlines()[0])
-        self.assertEqual(header["schema"], "ar4.controller-trace.v1")
+        self.assertEqual(header["schema"], "ar4.controller-trace.v2")
         self.assertEqual(header["source"], "JOINT_TELEMETRY_V1")
         self.assertEqual(
             header["timebase"],
             "host-monotonic-offset-seconds",
+        )
+        self.assertEqual(
+            header["time_origin"],
+            "immediately-before-rj-write",
         )
         self.assertEqual(header["position_unit"], "degree")
         self.assertEqual(
@@ -286,6 +329,17 @@ class ControllerTraceCodecTests(unittest.TestCase):
         for terminal in terminals:
             with self.subTest(outcome=terminal.outcome):
                 trace = ControllerTrace(metadata, (), terminal)
+                self.assertEqual(
+                    decode_controller_trace(encode_controller_trace(trace)),
+                    trace,
+                )
+
+    def test_all_rj_speed_modes_round_trip(self):
+        for speed_mode in ("p", "s", "m"):
+            with self.subTest(speed_mode=speed_mode):
+                trace = completed_trace(
+                    motion_profile=motion_profile(speed_mode=speed_mode),
+                )
                 self.assertEqual(
                     decode_controller_trace(encode_controller_trace(trace)),
                     trace,
@@ -334,7 +388,7 @@ class ControllerTraceCodecTests(unittest.TestCase):
         mutations = []
 
         wrong_schema = [dict(record) for record in records]
-        wrong_schema[0]["schema"] = "ar4.controller-trace.v2"
+        wrong_schema[0]["schema"] = "ar4.controller-trace.v1"
         mutations.append(wrong_schema)
         float_axis_count = [dict(record) for record in records]
         float_axis_count[0]["axis_count"] = 6.0
@@ -342,6 +396,9 @@ class ControllerTraceCodecTests(unittest.TestCase):
         missing_header = [dict(record) for record in records]
         del missing_header[0]["firmware_version"]
         mutations.append(missing_header)
+        missing_time_origin = [dict(record) for record in records]
+        del missing_time_origin[0]["time_origin"]
+        mutations.append(missing_time_origin)
         extra_sample = [dict(record) for record in records]
         extra_sample[1]["extra"] = True
         mutations.append(extra_sample)
@@ -364,8 +421,8 @@ class ControllerTraceCodecTests(unittest.TestCase):
         payload = encode_controller_trace(self.trace)
         header, *records = payload.splitlines()
         header = header.replace(
-            b'"speed_mode":"percent"',
-            b'"speed_mode":"percent","speed_mode":"seconds"',
+            b'"speed_mode":"p"',
+            b'"speed_mode":"p","speed_mode":"s"',
         )
         with self.assertRaisesRegex(ControllerTraceFormatError, "duplicated"):
             decode_controller_trace(
@@ -435,6 +492,39 @@ class ControllerTraceCodecTests(unittest.TestCase):
 
 
 class ControllerTraceAnalysisTests(unittest.TestCase):
+    def test_unavailable_derivative_metrics_remain_none(self):
+        one_sample = analyze_controller_trace(completed_trace((
+            sample(0.1, 0.1),
+        ))).joints[0]
+        self.assertIsNone(one_sample.peak_absolute_speed_degrees_per_second)
+        self.assertIsNone(
+            one_sample.peak_speed_toward_target_degrees_per_second
+        )
+        self.assertIsNone(one_sample.peak_reverse_speed_degrees_per_second)
+        self.assertIsNone(
+            one_sample.peak_acceleration_toward_target_degrees_per_second_squared
+        )
+        self.assertIsNone(
+            one_sample.peak_deceleration_degrees_per_second_squared
+        )
+
+        two_samples = analyze_controller_trace(completed_trace((
+            sample(0.1, 0.1),
+            sample(0.2, 0.2),
+        ))).joints[0]
+        self.assertIsNotNone(
+            two_samples.peak_speed_toward_target_degrees_per_second
+        )
+        self.assertIsNotNone(
+            two_samples.peak_reverse_speed_degrees_per_second
+        )
+        self.assertIsNone(
+            two_samples.peak_acceleration_toward_target_degrees_per_second_squared
+        )
+        self.assertIsNone(
+            two_samples.peak_deceleration_degrees_per_second_squared
+        )
+
     def test_uniform_quadratic_trace_reports_profile_derivatives(self):
         trace = completed_trace((
             sample(0.1, 0.01),

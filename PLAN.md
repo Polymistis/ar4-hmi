@@ -1342,11 +1342,12 @@ Implemented foundation:
   rejection behavior, covariance propagation, bounded prediction, canonical
   record round trips, and replay failures.
 - `ARrobots.controller_trace` defines the bounded versioned
-  `ar4.controller-trace.v1` JSONL contract for one complete J1-J6
+  `ar4.controller-trace.v2` JSONL contract for one complete J1-J6
   `JOINT_TELEMETRY_V1` exchange. Metadata preserves controller and firmware
   identity, a canonical controller-configuration fingerprint, the confirmed
-  command-start position, commanded target, RJ timing profile, and nominal
-  telemetry cadence. Samples use host-monotonic receipt offsets and remain
+  command-start position, commanded target, all RJ timing modes, and nominal
+  telemetry cadence. The header also fixes the offset origin immediately
+  before the RJ write. Samples use host-monotonic receipt offsets and remain
   distinct from the terminal controller step-counter position.
 - Controller-trace analysis uses each observed non-uniform sample interval to
   derive per-joint velocity, acceleration, and jerk finite differences plus
