@@ -355,7 +355,8 @@ class ImpactAwareAccelerationEstimatorTests(unittest.TestCase):
     def test_isolated_innovation_is_rejected_without_model_mutation(self):
         estimator, _updates = tracked_estimator()
         published = estimator.estimate
-        model_last = estimator.model_last_observation
+        model_last = estimator.last_observation
+        model_received_at = estimator.last_received_at_seconds
         outlier = observation(0.3, (5.0, 0.0, 0.0))
 
         rejected = estimator.add_observation(outlier, 0.3)
@@ -367,8 +368,10 @@ class ImpactAwareAccelerationEstimatorTests(unittest.TestCase):
         self.assertEqual(rejected.innovation_sequence_count, 1)
         self.assertTrue(rejected.innovation.exceeded_axes[0])
         self.assertIsNone(estimator.estimate)
-        self.assertIs(estimator.model_last_observation, model_last)
-        self.assertIs(estimator.last_observation, outlier)
+        self.assertIs(estimator.last_observation, model_last)
+        self.assertIs(estimator.last_admitted_observation, outlier)
+        self.assertEqual(estimator.last_received_at_seconds, model_received_at)
+        self.assertEqual(estimator.last_admitted_received_at_seconds, 0.3)
 
         recovery = estimator.add_observation(
             quadratic_observation(0.4),
@@ -408,7 +411,7 @@ class ImpactAwareAccelerationEstimatorTests(unittest.TestCase):
         self.assertEqual(estimator.pending_innovation_count, 0)
         self.assertEqual(estimator.impact_generation, 1)
         self.assertIsNone(estimator.estimate)
-        self.assertIs(estimator.model_last_observation, confirmed.observation)
+        self.assertIs(estimator.last_observation, confirmed.observation)
 
         warmup = estimator.add_observation(
             observation(0.5, (5.2, 0.0, 0.0)),
@@ -427,6 +430,8 @@ class ImpactAwareAccelerationEstimatorTests(unittest.TestCase):
             reacquired.status,
             EstimatorUpdateStatus.ESTIMATE_UPDATED,
         )
+        self.assertIsNone(warmup.innovation)
+        self.assertIsNone(reacquired.innovation)
         self.assertAlmostEqual(reacquired.estimate.velocity.x, 1.0)
         self.assertAlmostEqual(reacquired.estimate.acceleration.x, 0.0)
 
@@ -479,7 +484,7 @@ class ImpactAwareAccelerationEstimatorTests(unittest.TestCase):
         self.assertIs(update.status, EstimatorUpdateStatus.BASELINE_RESET)
         self.assertEqual(estimator.pending_innovation_count, 0)
         self.assertEqual(estimator.impact_generation, 0)
-        self.assertIs(estimator.model_last_observation, after_gap)
+        self.assertIs(estimator.last_observation, after_gap)
 
     def test_rejected_admission_and_numeric_failure_preserve_state(self):
         estimator, _updates = tracked_estimator()
@@ -493,7 +498,7 @@ class ImpactAwareAccelerationEstimatorTests(unittest.TestCase):
                 0.3,
             )
 
-        self.assertIs(estimator.last_observation, outlier)
+        self.assertIs(estimator.last_admitted_observation, outlier)
         self.assertIs(estimator.last_innovation, last_innovation)
         self.assertEqual(estimator.pending_innovation_count, 1)
 
@@ -515,7 +520,7 @@ class ImpactAwareAccelerationEstimatorTests(unittest.TestCase):
                 0.3,
             )
         self.assertEqual(
-            overflow_estimator.model_last_observation.timestamp_seconds,
+            overflow_estimator.last_observation.timestamp_seconds,
             0.2,
         )
         self.assertEqual(overflow_estimator.pending_innovation_count, 0)
@@ -538,7 +543,7 @@ class ImpactAwareAccelerationEstimatorTests(unittest.TestCase):
 
         self.assertIs(update.status, EstimatorUpdateStatus.BASELINE_RESET)
         self.assertIs(estimator.last_observation, after_gap)
-        self.assertIs(estimator.model_last_observation, after_gap)
+        self.assertIs(estimator.last_admitted_observation, after_gap)
         self.assertIsNone(estimator.last_innovation)
         self.assertEqual(estimator.pending_innovation_count, 0)
         self.assertEqual(estimator.impact_generation, 0)
@@ -562,7 +567,7 @@ class ImpactAwareAccelerationEstimatorTests(unittest.TestCase):
         estimator, _updates = tracked_estimator()
         first = observation(0.3, (5.0, 0.0, 0.0))
         estimator.add_observation(first, 0.3)
-        model_last = estimator.model_last_observation
+        model_last = estimator.last_observation
         last_innovation = estimator.last_innovation
 
         def failed_reset(_observation, _received_at):
@@ -578,8 +583,8 @@ class ImpactAwareAccelerationEstimatorTests(unittest.TestCase):
                 0.4,
             )
 
-        self.assertIs(estimator.last_observation, first)
-        self.assertIs(estimator.model_last_observation, model_last)
+        self.assertIs(estimator.last_admitted_observation, first)
+        self.assertIs(estimator.last_observation, model_last)
         self.assertIs(estimator.last_innovation, last_innovation)
         self.assertEqual(estimator.pending_innovation_count, 1)
         self.assertEqual(estimator.impact_generation, 0)
@@ -652,8 +657,9 @@ class ImpactAwareAccelerationEstimatorTests(unittest.TestCase):
         estimator.reset()
 
         self.assertIsNone(estimator.last_observation)
-        self.assertIsNone(estimator.model_last_observation)
+        self.assertIsNone(estimator.last_admitted_observation)
         self.assertIsNone(estimator.last_received_at_seconds)
+        self.assertIsNone(estimator.last_admitted_received_at_seconds)
         self.assertIsNone(estimator.estimate)
         self.assertIsNone(estimator.last_innovation)
         self.assertEqual(estimator.pending_innovation_count, 0)

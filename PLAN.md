@@ -1328,7 +1328,11 @@ Implemented foundation:
   sequence of at least two exceeded observations confirms a model discontinuity,
   transactionally replaces the baseline, and reports `IMPACT_RESET`; the
   disposition does not claim a physical collision. Long model gaps remain
-  ordinary baseline resets.
+  ordinary baseline resets. Any nonzero residual with zero combined variance
+  exceeds the gate because no finite standardized residual exists. After a
+  baseline replacement, reacquisition observations remain ungated until the
+  acceleration estimator can publish a complete model; intercept validity
+  remains false until selection and trajectory replacement succeed.
 - The versioned `ar4.observation-replay.v1` JSONL codec enforces strict UTF-8,
   exact fields, duplicate-key rejection, finite numeric domains, payload and
   record bounds, one coordinate frame, and ordered observation and receipt

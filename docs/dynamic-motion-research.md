@@ -191,6 +191,11 @@ consistent with the bounded-innovation motivation in
 [Robust Extended Kalman Filtering for Systems with Measurement
 Outliers](https://arxiv.org/abs/1904.00335).
 
+A nonzero residual with zero combined variance is treated as exceeded because
+no finite standardized residual exists. Zero measurement and process variance
+therefore require an exact model match; realistic covariance is required to
+avoid classifying floating-point-level model error as a discontinuity.
+
 One exceeded observation reports `INNOVATION_REJECTED`, leaves the accepted
 finite-difference window unchanged, and makes the estimator's public estimate
 unavailable. At least two consecutive exceeded observations are required by
@@ -201,6 +206,15 @@ no physical collision classification is claimed. A long model gap uses the
 existing baseline-reset disposition instead of claiming impact. A
 model-consistent observation after an isolated rejection resumes from the
 unchanged model.
+
+Baseline replacement removes the predictive model needed by the innovation
+gate. Reacquisition observations are admitted without an innovation comparison
+until the acceleration estimator can publish a complete model. Feedback
+replanning keeps the intercept invalid until selection and trajectory
+replacement succeed. The ungated observation that completes the model can
+therefore become part of the replacement model and immediately drive a valid
+intercept and replacement trajectory; callers must account for that limitation
+when configuring capture quality and covariance.
 
 Impact-aware replay exposes every rejection, reset, warmup, and reacquisition.
 `select_impact_aware_acceleration_replay_intercepts` performs no intercept

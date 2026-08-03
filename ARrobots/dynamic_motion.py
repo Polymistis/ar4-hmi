@@ -1926,8 +1926,8 @@ class ImpactAwareAccelerationEstimator:
             self._process_noise,
         )
         self._estimator = ConstantAccelerationEstimator(estimator_config)
-        self._last_observation = None
-        self._last_received_at_seconds = None
+        self._last_admitted_observation = None
+        self._last_admitted_received_at_seconds = None
         self._pending_innovation_count = 0
         self._last_innovation = None
         self._impact_generation = 0
@@ -1942,15 +1942,19 @@ class ImpactAwareAccelerationEstimator:
 
     @property
     def last_observation(self):
-        return self._last_observation
-
-    @property
-    def model_last_observation(self):
         return self._estimator.last_observation
 
     @property
+    def last_admitted_observation(self):
+        return self._last_admitted_observation
+
+    @property
     def last_received_at_seconds(self):
-        return self._last_received_at_seconds
+        return self._estimator.last_received_at_seconds
+
+    @property
+    def last_admitted_received_at_seconds(self):
+        return self._last_admitted_received_at_seconds
 
     @property
     def estimate(self):
@@ -1972,8 +1976,8 @@ class ImpactAwareAccelerationEstimator:
 
     def reset(self):
         self._estimator = ConstantAccelerationEstimator(self._config)
-        self._last_observation = None
-        self._last_received_at_seconds = None
+        self._last_admitted_observation = None
+        self._last_admitted_received_at_seconds = None
         self._pending_innovation_count = 0
         self._last_innovation = None
         self._impact_generation = 0
@@ -1985,8 +1989,8 @@ class ImpactAwareAccelerationEstimator:
 
     def _baseline_reset_update(self, observation, received_at):
         self._replace_baseline(observation, received_at)
-        self._last_observation = observation
-        self._last_received_at_seconds = received_at
+        self._last_admitted_observation = observation
+        self._last_admitted_received_at_seconds = received_at
         self._pending_innovation_count = 0
         self._last_innovation = None
         return EstimatorUpdate(
@@ -2057,14 +2061,14 @@ class ImpactAwareAccelerationEstimator:
             )
         except DynamicMotionError as exc:
             raise EstimatorProcessingError(
-                "impact innovation update failed"
+                f"impact innovation update failed: {exc}"
             ) from exc
 
     def add_observation(self, observation, received_at_seconds):
         received_at, baseline_status = _validated_estimator_observation(
             self._config,
-            self._last_observation,
-            self._last_received_at_seconds,
+            self._last_admitted_observation,
+            self._last_admitted_received_at_seconds,
             observation,
             received_at_seconds,
         )
@@ -2079,8 +2083,8 @@ class ImpactAwareAccelerationEstimator:
                 observation,
                 received_at,
             )
-            self._last_observation = observation
-            self._last_received_at_seconds = received_at
+            self._last_admitted_observation = observation
+            self._last_admitted_received_at_seconds = received_at
             self._pending_innovation_count = 0
             self._last_innovation = None
             return update
@@ -2098,8 +2102,8 @@ class ImpactAwareAccelerationEstimator:
                 sequence_count
                 < self._impact_config.impact_confirmation_observations
             ):
-                self._last_observation = observation
-                self._last_received_at_seconds = received_at
+                self._last_admitted_observation = observation
+                self._last_admitted_received_at_seconds = received_at
                 self._last_innovation = innovation
                 self._pending_innovation_count = sequence_count
                 return EstimatorUpdate(
@@ -2109,8 +2113,8 @@ class ImpactAwareAccelerationEstimator:
                     innovation_sequence_count=sequence_count,
                 )
             self._replace_baseline(observation, received_at)
-            self._last_observation = observation
-            self._last_received_at_seconds = received_at
+            self._last_admitted_observation = observation
+            self._last_admitted_received_at_seconds = received_at
             self._last_innovation = innovation
             self._pending_innovation_count = 0
             self._impact_generation += 1
@@ -2125,8 +2129,8 @@ class ImpactAwareAccelerationEstimator:
             observation,
             received_at,
         )
-        self._last_observation = observation
-        self._last_received_at_seconds = received_at
+        self._last_admitted_observation = observation
+        self._last_admitted_received_at_seconds = received_at
         self._pending_innovation_count = 0
         self._last_innovation = innovation
         return EstimatorUpdate(

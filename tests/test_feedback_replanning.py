@@ -395,6 +395,8 @@ class FeedbackReplannerTests(unittest.TestCase):
             reset.estimator_update.status,
             EstimatorUpdateStatus.IMPACT_RESET,
         )
+        self.assertIsNone(warmup.estimator_update.innovation)
+        self.assertIsNone(reacquired.estimator_update.innovation)
         self.assertIs(
             replanner.active_trajectory,
             reacquired.replacement_trajectory,
@@ -1393,6 +1395,10 @@ class FeedbackReplanningReplayTests(unittest.TestCase):
         self.assertIs(
             result.events[-1].fault.phase,
             FeedbackReplanFaultPhase.ESTIMATION,
+        )
+        self.assertIn(
+            "innovation residual is outside the host numeric range",
+            result.events[-1].fault.detail,
         )
         self.assertEqual(
             tuple(event.status for event in result.events),
