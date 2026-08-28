@@ -10,6 +10,7 @@
 namespace ar4_protocol {
 
 constexpr size_t kControllerAxisCount = 9;
+constexpr size_t kControllerPrimaryAxisCount = 6;
 constexpr size_t kControllerFilenameMaxLength = 255;
 constexpr size_t kControllerDirectoryPayloadMaxLength = 4096;
 constexpr size_t kControllerMediaIdByteLength = 16;
@@ -66,6 +67,82 @@ inline bool checked_double_to_int(double value, int &output) {
 
 inline bool checked_nonnegative_double_to_int(double value, int &output) {
   return value >= 0.0 && checked_double_to_int(value, output);
+}
+
+inline bool validate_encoder_calibration(
+  int step_limit,
+  float encoder_counts_per_step
+) {
+  if (
+    step_limit < 0
+    || !isfinite(encoder_counts_per_step)
+    || encoder_counts_per_step <= 0.0f
+  ) {
+    return false;
+  }
+  const double scale = static_cast<double>(encoder_counts_per_step);
+  const double maximum_written_count =
+    static_cast<double>(step_limit) * scale;
+  return (
+    isfinite(maximum_written_count)
+    && maximum_written_count >= 0.0
+    && maximum_written_count <= static_cast<double>(INT32_MAX)
+  );
+}
+
+inline bool configured_encoder_count_to_step(
+  int32_t encoder_count,
+  float encoder_counts_per_step,
+  int &output
+) {
+  if (
+    !isfinite(encoder_counts_per_step)
+    || encoder_counts_per_step <= 0.0f
+  ) {
+    return false;
+  }
+  return checked_double_to_int(
+    static_cast<double>(encoder_count)
+      / static_cast<double>(encoder_counts_per_step),
+    output
+  );
+}
+
+inline bool configured_step_to_encoder_count(
+  int step,
+  float encoder_counts_per_step,
+  int32_t &output
+) {
+  if (
+    !isfinite(encoder_counts_per_step)
+    || encoder_counts_per_step <= 0.0f
+  ) {
+    return false;
+  }
+  const double count =
+    static_cast<double>(step)
+      * static_cast<double>(encoder_counts_per_step);
+  if (
+    !isfinite(count)
+    || count < static_cast<double>(INT32_MIN)
+    || count > static_cast<double>(INT32_MAX)
+  ) {
+    return false;
+  }
+  output = static_cast<int32_t>(count);
+  return true;
+}
+
+inline bool encoder_step_difference_reaches_threshold(
+  int encoder_step,
+  int commanded_step,
+  int threshold
+) {
+  if (threshold < 0) return true;
+  int64_t difference = static_cast<int64_t>(encoder_step)
+    - static_cast<int64_t>(commanded_step);
+  if (difference < 0) difference = -difference;
+  return difference >= static_cast<int64_t>(threshold);
 }
 
 inline bool calibration_release_step_limit(
@@ -140,6 +217,66 @@ inline bool validate_axis_calibration(
 
   step_limit = staged_step_limit;
   zero_step = staged_zero_step;
+  return true;
+}
+
+inline bool validate_primary_axis_calibration(
+  float negative_limit,
+  float positive_limit,
+  float steps_per_unit,
+  int &step_limit,
+  int &zero_step
+) {
+  const float travel = negative_limit + positive_limit;
+  return isfinite(travel)
+    && travel > 0.0f
+    && validate_axis_calibration(
+      negative_limit,
+      positive_limit,
+      steps_per_unit,
+      step_limit,
+      zero_step
+    );
+}
+
+struct ControllerPositionRebase {
+  int step_monitors[kControllerAxisCount];
+  int32_t encoder_counts[kControllerPrimaryAxisCount];
+};
+
+inline bool build_controller_position_rebase(
+  const int (&step_monitors)[kControllerAxisCount],
+  const int (&step_limits)[kControllerAxisCount],
+  const float (&encoder_counts_per_step)[kControllerPrimaryAxisCount],
+  ControllerPositionRebase &output
+) {
+  ControllerPositionRebase staged = {};
+  for (size_t axis = 0; axis < kControllerAxisCount; ++axis) {
+    if (
+      step_limits[axis] < 0
+      || step_monitors[axis] < 0
+      || step_monitors[axis] > step_limits[axis]
+    ) {
+      return false;
+    }
+    staged.step_monitors[axis] = step_monitors[axis];
+  }
+  for (size_t axis = 0; axis < kControllerPrimaryAxisCount; ++axis) {
+    if (!validate_encoder_calibration(
+        step_limits[axis],
+        encoder_counts_per_step[axis]
+    )) {
+      return false;
+    }
+    if (!configured_step_to_encoder_count(
+        step_monitors[axis],
+        encoder_counts_per_step[axis],
+        staged.encoder_counts[axis]
+    )) {
+      return false;
+    }
+  }
+  output = staged;
   return true;
 }
 
@@ -406,11 +543,17 @@ inline bool validate_modbus_wait(
   int timeout_seconds,
   uint32_t &timeout_milliseconds
 ) {
-  return (
+  const bool operation_valid =
     operation == ModbusOperation::kReadCoil
       || operation == ModbusOperation::kReadDiscreteInput
-  )
-    && (expected_value == 0 || expected_value == 1)
+      || operation == ModbusOperation::kReadHoldingRegisters;
+  const bool expected_valid =
+    operation == ModbusOperation::kReadHoldingRegisters
+      ? expected_value >= 0
+        && expected_value <= kModbusMaximumRegisterValue
+      : (expected_value == 0 || expected_value == 1);
+  return operation_valid
+    && expected_valid
     && timeout_seconds > 0
     && validate_modbus_request(operation, slave_id, address, 1)
     && wait_seconds_to_milliseconds(timeout_seconds, timeout_milliseconds);
@@ -726,6 +869,15 @@ inline bool valid_delay_envelope(
     );
 }
 
+inline bool consume_motion_rounding_continuation(
+  bool continuation_enabled,
+  bool &continuation_pending
+) {
+  const bool selected = continuation_enabled && continuation_pending;
+  continuation_pending = false;
+  return selected;
+}
+
 inline bool pulse_delay_microseconds(
   double requested_delay,
   double distribution_delay,
@@ -809,23 +961,35 @@ inline bool supported_trajectory_rotation(float value) {
   return isfinite(value) && value == 0.0f;
 }
 
+inline bool valid_positive_spline_rounding(
+  float rounding,
+  float incoming_length,
+  float outgoing_length
+) {
+  return isfinite(rounding) && rounding > 0.0f
+    && isfinite(incoming_length) && incoming_length > 0.0f
+    && isfinite(outgoing_length) && outgoing_length > 0.0f
+    && rounding <= incoming_length * 0.45f
+    && rounding <= outgoing_length * 0.45f;
+}
+
 inline bool valid_circle_geometry(
   const float *center,
   const float *start,
-  const float *end,
+  const float *plane,
   float minimum_path_length
 ) {
   if (
     center == nullptr
     || start == nullptr
-    || end == nullptr
+    || plane == nullptr
     || !isfinite(minimum_path_length)
     || minimum_path_length <= 0.0f
   ) {
     return false;
   }
   for (size_t index = 0; index < 3; ++index) {
-    if (!isfinite(center[index]) || !isfinite(start[index]) || !isfinite(end[index])) {
+    if (!isfinite(center[index]) || !isfinite(start[index]) || !isfinite(plane[index])) {
       return false;
     }
   }
@@ -834,38 +998,39 @@ inline bool valid_circle_geometry(
     static_cast<double>(start[1]) - center[1],
     static_cast<double>(start[2]) - center[2],
   };
-  const double end_vector[3] = {
-    static_cast<double>(end[0]) - center[0],
-    static_cast<double>(end[1]) - center[1],
-    static_cast<double>(end[2]) - center[2],
+  const double plane_vector[3] = {
+    static_cast<double>(plane[0]) - center[0],
+    static_cast<double>(plane[1]) - center[1],
+    static_cast<double>(plane[2]) - center[2],
   };
   const double start_radius = sqrt(
     start_vector[0] * start_vector[0]
       + start_vector[1] * start_vector[1]
       + start_vector[2] * start_vector[2]
   );
-  const double end_radius = sqrt(
-    end_vector[0] * end_vector[0]
-      + end_vector[1] * end_vector[1]
-      + end_vector[2] * end_vector[2]
+  const double plane_radius = sqrt(
+    plane_vector[0] * plane_vector[0]
+      + plane_vector[1] * plane_vector[1]
+      + plane_vector[2] * plane_vector[2]
   );
   const double cross[3] = {
-    start_vector[1] * end_vector[2] - start_vector[2] * end_vector[1],
-    start_vector[2] * end_vector[0] - start_vector[0] * end_vector[2],
-    start_vector[0] * end_vector[1] - start_vector[1] * end_vector[0],
+    start_vector[1] * plane_vector[2] - start_vector[2] * plane_vector[1],
+    start_vector[2] * plane_vector[0] - start_vector[0] * plane_vector[2],
+    start_vector[0] * plane_vector[1] - start_vector[1] * plane_vector[0],
   };
   const double cross_magnitude = sqrt(
     cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]
   );
-  const double radius_tolerance = fmax(0.001, start_radius * 0.001);
+  const double circumference = 2.0 * 3.14159265358979323846 * start_radius;
   return isfinite(start_radius)
-    && isfinite(end_radius)
+    && isfinite(plane_radius)
     && isfinite(cross_magnitude)
+    && isfinite(circumference)
     && start_radius > 0.0
-    && fabs(start_radius - end_radius) <= radius_tolerance
-    && cross_magnitude > start_radius * end_radius * 0.000001
-    && 2.0 * 3.14159265358979323846 * start_radius
-      >= static_cast<double>(minimum_path_length);
+    && plane_radius > 0.0
+    && cross_magnitude > start_radius * plane_radius * 0.000001
+    && circumference <= static_cast<double>(FLT_MAX)
+    && circumference >= static_cast<double>(minimum_path_length);
 }
 
 struct OrderedArcGeometry {

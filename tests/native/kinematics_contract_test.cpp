@@ -13,7 +13,6 @@
 #include <vector>
 
 #include "../../ARrobots/src/kinematics.cpp"
-#include "../../ArduinoSketches/AR4_nano_sketch_v1.5/auxiliary_protocol_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/cartesian_pose_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/calibration_switch_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/command_queue_contract.h"
@@ -27,7 +26,6 @@
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/numeric_parse_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/persistence_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/serial_frame_contract.h"
-#include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/spline_response_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/tool_jog_contract.h"
 #include "../../ArduinoSketches/AR4_teensy41_sketch_v6.7.1/wrist_selection_contract.h"
 
@@ -37,427 +35,6 @@ constexpr float kDegreesPerRadian = 57.295779513082320876f;
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
-}
-
-bool parse_auxiliary_command(
-    const std::string& text,
-    ar4_auxiliary::BoardProfile board,
-    ar4_auxiliary::ParsedCommand& command
-) {
-    return ar4_auxiliary::parseCommand(
-        text.data(),
-        text.size(),
-        board,
-        &command
-    );
-}
-
-void test_auxiliary_protocol_contract() {
-    ar4_auxiliary::ParsedCommand command = {};
-    require(
-        parse_auxiliary_command(
-            "SV5P180",
-            ar4_auxiliary::kNanoBoard,
-            command
-        )
-            && command.kind == ar4_auxiliary::kServoCommand
-            && command.channel == 5
-            && command.position == 180,
-        "Nano servo boundary was rejected"
-    );
-    require(
-        !parse_auxiliary_command(
-            "SV6P90",
-            ar4_auxiliary::kNanoBoard,
-            command
-        )
-            && parse_auxiliary_command(
-                "SV6P90",
-                ar4_auxiliary::kMegaBoard,
-                command
-            ),
-        "board-specific servo boundary was not enforced"
-    );
-    require(
-        parse_auxiliary_command(
-            "ONX8",
-            ar4_auxiliary::kNanoBoard,
-            command
-        )
-            && command.kind == ar4_auxiliary::kOutputOnCommand
-            && parse_auxiliary_command(
-                "OFX13",
-                ar4_auxiliary::kNanoBoard,
-                command
-            )
-            && command.kind == ar4_auxiliary::kOutputOffCommand,
-        "auxiliary output opcode classification failed"
-    );
-    require(
-        !parse_auxiliary_command(
-            "ONX28",
-            ar4_auxiliary::kNanoBoard,
-            command
-        )
-            && !parse_auxiliary_command(
-                "OFX8",
-                ar4_auxiliary::kMegaBoard,
-                command
-            ),
-        "opposing board output range was accepted"
-    );
-    require(
-        parse_auxiliary_command(
-            "ONX28",
-            ar4_auxiliary::kMegaBoard,
-            command
-        )
-            && command.kind == ar4_auxiliary::kOutputOnCommand
-            && command.pin == 28
-            && parse_auxiliary_command(
-                "OFX53",
-                ar4_auxiliary::kMegaBoard,
-                command
-            )
-            && command.kind == ar4_auxiliary::kOutputOffCommand
-            && command.pin == 53,
-        "Mega output boundary was rejected"
-    );
-    require(
-        parse_auxiliary_command(
-            "JFX2",
-            ar4_auxiliary::kNanoBoard,
-            command
-        )
-            && command.kind == ar4_auxiliary::kInputReadCommand
-            && command.pin == 2
-            && parse_auxiliary_command(
-                "JFX7",
-                ar4_auxiliary::kNanoBoard,
-                command
-            )
-            && command.pin == 7
-            && !parse_auxiliary_command(
-                "JFX1",
-                ar4_auxiliary::kNanoBoard,
-                command
-            )
-            && !parse_auxiliary_command(
-                "JFX8",
-                ar4_auxiliary::kNanoBoard,
-                command
-            ),
-        "Nano input range was not enforced"
-    );
-    require(
-        parse_auxiliary_command(
-            "JFX2",
-            ar4_auxiliary::kMegaBoard,
-            command
-        )
-            && command.pin == 2
-            && parse_auxiliary_command(
-                "JFX27",
-                ar4_auxiliary::kMegaBoard,
-                command
-            )
-            && command.pin == 27
-            && !parse_auxiliary_command(
-                "JFX1",
-                ar4_auxiliary::kMegaBoard,
-                command
-            )
-            && !parse_auxiliary_command(
-                "JFX28",
-                ar4_auxiliary::kMegaBoard,
-                command
-            ),
-        "Mega input range was not enforced"
-    );
-    require(
-        parse_auxiliary_command(
-            "WIA7B1C32767",
-            ar4_auxiliary::kNanoBoard,
-            command
-        )
-            && command.kind == ar4_auxiliary::kWaitInputCommand
-            && command.pin == 7
-            && command.state == 1
-            && command.timeoutSeconds == 32767
-            && !parse_auxiliary_command(
-                "WIA1B1C1",
-                ar4_auxiliary::kNanoBoard,
-                command
-            )
-            && !parse_auxiliary_command(
-                "WIA8B1C1",
-                ar4_auxiliary::kNanoBoard,
-                command
-            )
-            && parse_auxiliary_command(
-                "WIA2B0C1",
-                ar4_auxiliary::kMegaBoard,
-                command
-            )
-            && parse_auxiliary_command(
-                "WIA27B1C32767",
-                ar4_auxiliary::kMegaBoard,
-                command
-            )
-            && !parse_auxiliary_command(
-                "WIA1B1C1",
-                ar4_auxiliary::kMegaBoard,
-                command
-            )
-            && !parse_auxiliary_command(
-                "WIA28B1C1",
-                ar4_auxiliary::kMegaBoard,
-                command
-            ),
-        "auxiliary wait boundary was rejected"
-    );
-    for (
-        const std::string malformed : {
-            "WIA7B2C1",
-            "WIA7B1C0",
-            "WIA7B1C32768",
-            "WIA7B1C999999999999",
-            "WIA7B1C1junk",
-            "SV0P181",
-            "SV0P1P2",
-            "JFX2T3",
-            " TG",
-            "TG ",
-            "STOPX",
-        }
-    ) {
-        require(
-            !parse_auxiliary_command(
-                malformed,
-                ar4_auxiliary::kNanoBoard,
-                command
-            ),
-            "malformed auxiliary command was accepted: " + malformed
-        );
-    }
-
-    require(
-        parse_auxiliary_command(
-            "TG",
-            ar4_auxiliary::kMegaBoard,
-            command
-        )
-            && command.kind == ar4_auxiliary::kGripperCurrentCommand
-            && parse_auxiliary_command(
-                "STOPWI",
-                ar4_auxiliary::kMegaBoard,
-                command
-            )
-            && command.kind == ar4_auxiliary::kStopCommand
-            && parse_auxiliary_command(
-                "STOP",
-                ar4_auxiliary::kMegaBoard,
-                command
-            )
-            && command.kind == ar4_auxiliary::kStopCommand
-            && parse_auxiliary_command(
-                "TMpayload",
-                ar4_auxiliary::kMegaBoard,
-                command
-            )
-            && command.kind == ar4_auxiliary::kEchoCommand
-            && std::string(command.payload, command.payloadLength) == "payload",
-        "auxiliary telemetry, stop, or echo classification failed"
-    );
-
-    ar4_auxiliary::ParsedCommand unchanged = {};
-    unchanged.kind = ar4_auxiliary::kEchoCommand;
-    unchanged.channel = 91;
-    unchanged.pin = 92;
-    unchanged.state = 93;
-    unchanged.position = 94;
-    unchanged.timeoutSeconds = 95;
-    unchanged.payload = "sentinel";
-    unchanged.payloadLength = 8;
-    require(
-        !parse_auxiliary_command(
-            "SV0P999",
-            ar4_auxiliary::kNanoBoard,
-            unchanged
-        )
-            && unchanged.kind == ar4_auxiliary::kEchoCommand
-            && unchanged.channel == 91
-            && unchanged.pin == 92
-            && unchanged.state == 93
-            && unchanged.position == 94
-            && unchanged.timeoutSeconds == 95
-            && std::string(
-                unchanged.payload,
-                unchanged.payloadLength
-            ) == "sentinel",
-        "rejected auxiliary parse mutated caller state"
-    );
-
-    ar4_auxiliary::FrameBuffer frames;
-    ar4_auxiliary::Frame frame = {};
-    require(
-        frames.push('T', &frame) == ar4_auxiliary::kFramePending
-            && frames.push('G', &frame) == ar4_auxiliary::kFramePending
-            && frames.push('\n', &frame) == ar4_auxiliary::kFrameReady
-            && std::string(frame.data, frame.length) == "TG",
-        "valid auxiliary frame was not emitted"
-    );
-    require(
-        frames.push('\n', &frame) == ar4_auxiliary::kFrameRejected,
-        "blank auxiliary frame was accepted"
-    );
-    require(
-        frames.push('T', &frame) == ar4_auxiliary::kFramePending
-            && frames.push('\r', &frame) == ar4_auxiliary::kFramePending
-            && frames.push('\n', &frame) == ar4_auxiliary::kFrameRejected,
-        "control byte did not reject the complete auxiliary frame"
-    );
-    for (
-        std::size_t index = 0;
-        index < ar4_auxiliary::kMaximumCommandLength;
-        ++index
-    ) {
-        require(
-            frames.push('A', &frame) == ar4_auxiliary::kFramePending,
-            "maximum auxiliary input responded before LF"
-        );
-    }
-    require(
-        frames.push('\n', &frame) == ar4_auxiliary::kFrameReady
-            && frame.length == ar4_auxiliary::kMaximumCommandLength,
-        "maximum-length auxiliary frame was rejected"
-    );
-    for (
-        std::size_t index = 0;
-        index <= ar4_auxiliary::kMaximumCommandLength;
-        ++index
-    ) {
-        require(
-            frames.push('A', &frame) == ar4_auxiliary::kFramePending,
-            "overlength auxiliary input responded before LF"
-        );
-    }
-    require(
-        frames.push('\n', &frame) == ar4_auxiliary::kFrameRejected
-            && frames.push('T', &frame) == ar4_auxiliary::kFramePending
-            && frames.push('G', &frame) == ar4_auxiliary::kFramePending
-            && frames.push('\n', &frame) == ar4_auxiliary::kFrameReady
-            && std::string(frame.data, frame.length) == "TG",
-        "auxiliary frame parser did not recover after overflow"
-    );
-
-    require(
-        !ar4_auxiliary::waitExpired(
-            UINT32_C(0xfffffff0),
-            UINT32_C(32),
-            UINT32_C(0x0000000f)
-        )
-            && ar4_auxiliary::waitExpired(
-                UINT32_C(0xfffffff0),
-                UINT32_C(32),
-                UINT32_C(0x00000010)
-            )
-            && ar4_auxiliary::waitExpired(10, 0, 10),
-        "auxiliary wait expiry is not rollover-safe"
-    );
-
-    ar4_auxiliary::WaitState wait = {
-        false,
-        91,
-        92,
-        UINT32_C(93),
-        UINT32_C(94),
-    };
-    require(
-        !ar4_auxiliary::startWait(NULL, 2, 1, 1, 0)
-            && !ar4_auxiliary::startWait(&wait, 2, 2, 1, 0)
-            && !ar4_auxiliary::startWait(&wait, 2, 1, 0, 0)
-            && !ar4_auxiliary::startWait(&wait, 2, 1, 32768, 0)
-            && !wait.active
-            && wait.pin == 91
-            && wait.expectedState == 92
-            && wait.startedAtMilliseconds == 93
-            && wait.timeoutMilliseconds == 94,
-        "rejected auxiliary wait start mutated caller state"
-    );
-    require(
-        ar4_auxiliary::startWait(
-            &wait,
-            7,
-            1,
-            1,
-            UINT32_C(0xfffffff0)
-        )
-            && wait.active
-            && wait.pin == 7
-            && wait.expectedState == 1
-            && wait.startedAtMilliseconds == UINT32_C(0xfffffff0)
-            && wait.timeoutMilliseconds == 1000,
-        "valid auxiliary wait start was rejected"
-    );
-    require(
-        !ar4_auxiliary::startWait(&wait, 2, 0, 2, 0)
-            && wait.active
-            && wait.pin == 7
-            && wait.expectedState == 1
-            && wait.startedAtMilliseconds == UINT32_C(0xfffffff0)
-            && wait.timeoutMilliseconds == 1000,
-        "active auxiliary wait was replaced"
-    );
-    require(
-        ar4_auxiliary::updateWait(
-            &wait,
-            0,
-            UINT32_C(0x000003d7)
-        ) == ar4_auxiliary::kWaitPending
-            && wait.active,
-        "auxiliary wait did not remain pending before rollover deadline"
-    );
-    require(
-        ar4_auxiliary::updateWait(
-            &wait,
-            1,
-            UINT32_C(0x000003d8)
-        ) == ar4_auxiliary::kWaitMatched
-            && !wait.active,
-        "matching input did not win at the auxiliary wait deadline"
-    );
-    require(
-        ar4_auxiliary::startWait(&wait, 7, 1, 1, 10)
-            && ar4_auxiliary::updateWait(&wait, 0, 1010)
-                == ar4_auxiliary::kWaitTimedOut
-            && !wait.active,
-        "auxiliary wait timeout did not settle the active state"
-    );
-    require(
-        ar4_auxiliary::updateWait(&wait, 1, 1011)
-                == ar4_auxiliary::kWaitInactive
-            && !ar4_auxiliary::cancelWait(&wait)
-            && ar4_auxiliary::startWait(&wait, 7, 0, 1, 20)
-            && ar4_auxiliary::cancelWait(&wait)
-            && !wait.active,
-        "auxiliary wait inactive or cancellation state was inconsistent"
-    );
-    require(
-        ar4_auxiliary::commandDisposition(
-            false,
-            ar4_auxiliary::kServoCommand
-        ) == ar4_auxiliary::kExecuteCommand
-            && ar4_auxiliary::commandDisposition(
-                true,
-                ar4_auxiliary::kStopCommand
-            ) == ar4_auxiliary::kStopActiveWait
-            && ar4_auxiliary::commandDisposition(
-                true,
-                ar4_auxiliary::kServoCommand
-            ) == ar4_auxiliary::kRejectDuringWait,
-        "auxiliary active-wait command admission was inconsistent"
-    );
 }
 
 template <typename Result>
@@ -612,10 +189,16 @@ void test_rejected_motion_mode_transaction_atomicity() {
 }
 
 void test_bounded_serial_frame_accumulator() {
-    using ar4_protocol::LiveControlFrameStatus;
-    using ar4_protocol::LiveTerminalResponseKind;
     using ar4_protocol::SerialFrameReadStatus;
     using ar4_protocol::StoredRowReadStatus;
+
+    require(
+        !ar4_protocol::retain_serial_frame_discarding(false, 0)
+            && ar4_protocol::retain_serial_frame_discarding(false, 1)
+            && ar4_protocol::retain_serial_frame_discarding(true, 0)
+            && ar4_protocol::retain_serial_frame_discarding(true, 1),
+        "serial frame discard retention lost or invented discard state"
+    );
 
     bool discarding = false;
     std::string frame(
@@ -697,48 +280,6 @@ void test_bounded_serial_frame_accumulator() {
             && ar4_protocol::finish_stored_row(std::string())
                 == StoredRowReadStatus::kRejected,
         "stored command row accepted invalid file input"
-    );
-
-    require(
-        ar4_protocol::classify_live_control_frame(
-            SerialFrameReadStatus::kComplete,
-            "S\n",
-            2
-        ) == LiveControlFrameStatus::kStop
-            && ar4_protocol::classify_live_control_frame(
-                SerialFrameReadStatus::kComplete,
-                "S\r\n",
-                3
-            ) == LiveControlFrameStatus::kStop
-            && ar4_protocol::classify_live_control_frame(
-                SerialFrameReadStatus::kComplete,
-                "RP\n",
-                3
-            ) == LiveControlFrameStatus::kRejected
-            && ar4_protocol::classify_live_control_frame(
-                SerialFrameReadStatus::kOverflow,
-                nullptr,
-                0
-            ) == LiveControlFrameStatus::kRejected,
-        "live control frame classification accepted a non-stop frame"
-    );
-    require(
-        ar4_protocol::select_live_terminal_response(
-            LiveControlFrameStatus::kStop,
-            0,
-            0
-        ) == LiveTerminalResponseKind::kPosition
-            && ar4_protocol::select_live_terminal_response(
-                LiveControlFrameStatus::kRejected,
-                0,
-                0
-            ) == LiveTerminalResponseKind::kError
-            && ar4_protocol::select_live_terminal_response(
-                LiveControlFrameStatus::kStop,
-                0,
-                1
-            ) == LiveTerminalResponseKind::kAxisLimit,
-        "live terminal response selection lost single-response ownership"
     );
 }
 
@@ -1808,71 +1349,43 @@ void test_controller_domain_contract() {
     );
 
     using ar4_protocol::ModbusOperation;
-    require(
-        ar4_protocol::validate_modbus_request(
-            ModbusOperation::kReadHoldingRegisters,
-            1,
-            0,
-            1
-        )
-            && ar4_protocol::validate_modbus_request(
-                ModbusOperation::kReadHoldingRegisters,
-                1,
-                ar4_protocol::kModbusMaximumAddress,
-                1
-            )
-            && ar4_protocol::validate_modbus_request(
-                ModbusOperation::kReadInputRegisters,
-                1,
-                ar4_protocol::kModbusMaximumAddress
-                    - ar4_protocol::kModbusMaximumRegisterReadQuantity + 1,
-                ar4_protocol::kModbusMaximumRegisterReadQuantity
-            )
-            && ar4_protocol::validate_modbus_request(
-                ModbusOperation::kWriteRegister,
-                247,
-                65535,
-                65535
-            )
-            && !ar4_protocol::validate_modbus_request(
-                ModbusOperation::kReadHoldingRegisters,
-                0,
-                0,
-                1
-            )
-            && !ar4_protocol::validate_modbus_request(
-                ModbusOperation::kReadHoldingRegisters,
-                1,
-                0,
-                2
-            )
-            && !ar4_protocol::validate_modbus_request(
-                ModbusOperation::kReadInputRegisters,
-                1,
-                0,
-                64
-            )
-            && !ar4_protocol::validate_modbus_request(
-                ModbusOperation::kReadHoldingRegisters,
-                1,
-                ar4_protocol::kModbusMaximumAddress,
-                2
-            )
-            && !ar4_protocol::validate_modbus_request(
-                ModbusOperation::kReadInputRegisters,
-                1,
-                ar4_protocol::kModbusMaximumAddress
-                    - ar4_protocol::kModbusMaximumRegisterReadQuantity + 2,
-                ar4_protocol::kModbusMaximumRegisterReadQuantity
-            )
-            && !ar4_protocol::validate_modbus_request(
-                ModbusOperation::kWriteCoil,
-                1,
-                0,
-                2
-            ),
-        "controller I/O domain accepted an unsafe value"
-    );
+    struct ModbusRequestCase {
+        ModbusOperation operation;
+        int slave_id;
+        int address;
+        int value;
+        bool accepted;
+    };
+    const int maximum_address = ar4_protocol::kModbusMaximumAddress;
+    const int register_quantity = ar4_protocol::kModbusMaximumRegisterReadQuantity;
+    const ModbusRequestCase modbus_request_cases[] = {
+        {ModbusOperation::kReadCoil, 1, 0, 1, true},
+        {ModbusOperation::kReadCoil, 1, 0, 2, false},
+        {ModbusOperation::kReadDiscreteInput, 1, 0, 1, true},
+        {ModbusOperation::kReadDiscreteInput, 1, 0, 2, false},
+        {ModbusOperation::kReadHoldingRegisters, 1, 0, 1, true},
+        {ModbusOperation::kReadHoldingRegisters, 1, maximum_address, 1, true},
+        {ModbusOperation::kReadInputRegisters, 1,
+         maximum_address - register_quantity + 1, register_quantity, true},
+        {ModbusOperation::kWriteRegister, 247, 65535, 65535, true},
+        {ModbusOperation::kReadHoldingRegisters, 0, 0, 1, false},
+        {ModbusOperation::kReadHoldingRegisters, 1, 0, 2, false},
+        {ModbusOperation::kReadInputRegisters, 1, 0, 64, false},
+        {ModbusOperation::kReadInputRegisters, 1,
+         maximum_address - register_quantity + 2, register_quantity, false},
+        {ModbusOperation::kWriteCoil, 1, 0, 2, false},
+    };
+    for (const auto &test_case : modbus_request_cases) {
+        require(
+            ar4_protocol::validate_modbus_request(
+                test_case.operation,
+                test_case.slave_id,
+                test_case.address,
+                test_case.value
+            ) == test_case.accepted,
+            "Modbus request domain changed"
+        );
+    }
     milliseconds = 17;
     require(
         ar4_protocol::validate_modbus_wait(
@@ -2190,6 +1703,31 @@ void test_controller_domain_contract() {
             ),
         "controller delay envelope changed"
     );
+    bool rounding_continuation_pending = true;
+    require(
+        !ar4_protocol::consume_motion_rounding_continuation(
+            false,
+            rounding_continuation_pending
+        )
+            && !rounding_continuation_pending,
+        "disabled rounding continuation retained stale motion state"
+    );
+    rounding_continuation_pending = true;
+    require(
+        ar4_protocol::consume_motion_rounding_continuation(
+            true,
+            rounding_continuation_pending
+        )
+            && !rounding_continuation_pending,
+        "enabled rounding continuation was not consumed"
+    );
+    require(
+        !ar4_protocol::consume_motion_rounding_continuation(
+            true,
+            rounding_continuation_pending
+        ),
+        "cleared rounding continuation was reused"
+    );
     std::uint32_t pulse_delay = 17;
     require(
         ar4_protocol::pulse_delay_microseconds(
@@ -2279,8 +1817,8 @@ void test_controller_domain_contract() {
 
     const float circle_center[3] = {0.0f, 0.0f, 0.0f};
     const float circle_start[3] = {1.0f, 0.0f, 0.0f};
-    const float circle_end[3] = {0.0f, 1.0f, 0.0f};
-    const float circle_degenerate[3] = {-1.0f, 0.0f, 0.0f};
+    const float circle_plane[3] = {0.0f, 2.0f, 0.0f};
+    const float circle_degenerate[3] = {-2.0f, 0.0f, 0.0f};
     require(
         ar4_protocol::supported_trajectory_rotation(0.0f)
             && ar4_protocol::supported_trajectory_rotation(-0.0f)
@@ -2294,7 +1832,7 @@ void test_controller_domain_contract() {
         ar4_protocol::valid_circle_geometry(
             circle_center,
             circle_start,
-            circle_end,
+            circle_plane,
             0.1f
         )
             && !ar4_protocol::valid_circle_geometry(
@@ -2304,6 +1842,11 @@ void test_controller_domain_contract() {
                 0.1f
             ),
         "circle geometry domain changed"
+    );
+    require(
+        ar4_protocol::valid_positive_spline_rounding(0.45f, 1.0f, 2.0f)
+            && !ar4_protocol::valid_positive_spline_rounding(0.46f, 1.0f, 2.0f),
+        "positive spline rounding exceeded an adjacent translation leg"
     );
     const float arc_start[3] = {1.0f, 0.0f, 0.0f};
     const float arc_middle[3] = {0.0f, 1.0f, 0.0f};
@@ -2731,6 +2274,48 @@ void test_calibration_switch_contract() {
             && !ar4_protocol::calibration_switch_is_released(2, 1),
         "calibration-switch active-state classification is invalid"
     );
+
+    uint64_t maximum_iterations = 17;
+    require(
+        ar4_protocol::calibration_stage_maximum_iterations(
+            200000,
+            ar4_protocol::kCalibrationLimitSearchLoopDelayMicroseconds,
+            maximum_iterations
+        )
+            && maximum_iterations == 6200032ULL,
+        "limit-search bounce budget is invalid"
+    );
+    require(
+        ar4_protocol::calibration_stage_maximum_iterations(
+            100000,
+            4000U,
+            maximum_iterations
+        )
+            && maximum_iterations == 200003ULL,
+        "switch-release bounce budget is invalid"
+    );
+    maximum_iterations = 17;
+    require(
+        !ar4_protocol::calibration_stage_maximum_iterations(
+            -1,
+            100U,
+            maximum_iterations
+        )
+            && maximum_iterations == 17
+            && !ar4_protocol::calibration_stage_maximum_iterations(
+                1,
+                0U,
+                maximum_iterations
+            )
+            && maximum_iterations == 17
+            && !ar4_protocol::calibration_stage_maximum_iterations(
+                INT64_MAX,
+                1U,
+                maximum_iterations
+            )
+            && maximum_iterations == 17,
+        "invalid calibration bounce budget mutated output"
+    );
 }
 
 void test_primary_home_reference_contract() {
@@ -2763,6 +2348,11 @@ void test_primary_home_reference_contract() {
     int32_t first = 0;
     int32_t second = 0;
     int32_t third = 0;
+    int32_t first_parking = 0;
+    int32_t second_parking = 0;
+    int32_t third_parking = 0;
+    int32_t negative_parking = 0;
+    int32_t fractional_parking = 0;
     require(
         ar4_protocol::primary_home_reference_millidegrees(
             163.8004f,
@@ -2780,6 +2370,34 @@ void test_primary_home_reference_contract() {
             )
             && third == 72500,
         "primary home-reference conversion changed millidegree rounding"
+    );
+    require(
+        ar4_protocol::primary_parking_reference_from_steps(
+            0, 200, 100, 10.0f, 20.0f, 20.0f,
+            first_parking
+        )
+            && first_parking == 10000
+            && ar4_protocol::primary_parking_reference_from_steps(
+                1, 250, 100, 10.0f, 20.0f, 20.0f,
+                second_parking
+            )
+            && second_parking == 15000
+            && ar4_protocol::primary_parking_reference_from_steps(
+                2, 15822, 9888, 111.111f, 89.0f, 52.0f,
+                third_parking
+            )
+            && third_parking == 52000
+            && ar4_protocol::primary_parking_reference_from_steps(
+                1, -150, 100, 10.0f, 20.0f, 20.0f,
+                negative_parking
+            )
+            && negative_parking == -20000
+            && ar4_protocol::primary_parking_reference_from_steps(
+                2, 534, 0, 10.0f, 89.0f, 52.3456f,
+                fractional_parking
+            )
+            && fractional_parking == 52345,
+        "primary home-reference bounded parking conversion changed"
     );
     require(
         ar4_protocol::set_primary_home_reference(state, 0, first)
@@ -3559,11 +3177,18 @@ void test_firmware_identity_contract() {
         const char*,
         ar4_protocol::kProtocolCapabilityMaximumCount
     > maximum_capabilities;
+    constexpr char capability_suffixes[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+    static_assert(
+        ar4_protocol::kProtocolCapabilityMaximumCount
+            < sizeof(capability_suffixes),
+        "maximum capability fixture requires unique valid suffixes"
+    );
     for (size_t index = 0; index < maximum_capability_values.size(); ++index) {
         maximum_capability_values[index] = std::string(
             ar4_protocol::kProtocolCapabilityMaximumLength - 1,
             'A'
-        ) + static_cast<char>('A' + index);
+        ) + capability_suffixes[index];
         maximum_capabilities[index] =
             maximum_capability_values[index].c_str();
     }
@@ -3746,24 +3371,6 @@ void test_firmware_command_queue_consumption() {
             "invalid SD row boundary was accepted"
         );
     }
-}
-
-void test_firmware_spline_response_contract() {
-    require(
-        ar4_protocol::should_emit_spline_preface(true, "MS"),
-        "active spline motion lost the position preface"
-    );
-    for (const char* opcode : {"HO", "RP", "DB", "JT", "SS", ""}) {
-        require(
-            !ar4_protocol::should_emit_spline_preface(true, opcode),
-            "non-spline command gained a speculative response frame"
-        );
-    }
-    require(
-        !ar4_protocol::should_emit_spline_preface(false, "MS")
-        && !ar4_protocol::should_emit_spline_preface(true, nullptr),
-        "inactive or invalid spline state emitted a response frame"
-    );
 }
 
 void test_firmware_debug_command_transaction() {
@@ -4863,7 +4470,6 @@ int main(int argc, char** argv) {
         return run_protocol_contract_probe(argv[2], argv[3]);
     }
     try {
-        test_auxiliary_protocol_contract();
         test_rejected_motion_mode_transaction_atomicity();
         test_bounded_serial_frame_accumulator();
         test_directory_entry_name_contract();
@@ -4879,7 +4485,6 @@ int main(int argc, char** argv) {
         test_joint_telemetry_contract();
         test_firmware_identity_contract();
         test_firmware_command_queue_consumption();
-        test_firmware_spline_response_contract();
         test_firmware_debug_command_transaction();
         test_firmware_eeprom_persistence_contract();
         test_wrist_branch_selection();

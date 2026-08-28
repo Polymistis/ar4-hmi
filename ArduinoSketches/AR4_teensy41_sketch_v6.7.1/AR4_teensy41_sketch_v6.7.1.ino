@@ -66,17 +66,9 @@
 // 6.6 - 2/22/26 - update kinematic solver to reduce J4/6 wrap | reimplement wrist N/F config
 // 6.7 - 3/11/26 MB holding reg bug fix
 // 6.7.1 - 3/11/26 bug fix calibration debounce
-const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.10";
-const char *JT_WRIST_CONFIG_CAPABILITY = "JT_WRIST_CONFIG_V1";
-const char *GCODE_DIRECTORY_CAPABILITY = "GCODE_DIRECTORY_FRAMING_V1";
-const char *GCODE_DELETE_IDENTITY_CAPABILITY = "GCODE_DELETE_IDENTITY_V1";
-const char *GCODE_WRITE_IDENTITY_CAPABILITY = "GCODE_WRITE_IDENTITY_V1";
-const char *HOME_REFERENCE_V1_CAPABILITY = "HOME_REFERENCE_V1";
-const char *HOME_REFERENCE_V2_CAPABILITY = "HOME_REFERENCE_V2";
-const char *JOINT_TELEMETRY_CAPABILITY = "JOINT_TELEMETRY_V1";
-const char *ESTOP_ADMISSION_CAPABILITY = "ESTOP_ADMISSION_V1";
-const char *CALIBRATION_SWITCH_POLARITY_CAPABILITY =
-  "CALIBRATION_SWITCH_POLARITY_V1";
+const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.38";
+const char *JSON_FIRMWARE_NAME = "AR4 Teensy";
+const char *JSON_FIRMWARE_BUILD = "tracked";
 
 //////////////////////////////////////////////////////////////////////////////
 //DEBUGGING
@@ -101,28 +93,40 @@ const char *CALIBRATION_SWITCH_POLARITY_CAPABILITY =
 #include "debug_contract.h"
 #include "home_reference_contract.h"
 #include "identity_contract.h"
+#include "json_event_contract.h"
+#include "json_main_controller_dispatch_contract.h"
+#include "json_runtime_contract.h"
+#include "json_session_identity_contract.h"
 #include "joint_telemetry_contract.h"
+#include "joint_speed_target_contract.h"
 #include "motion_command_parse_contract.h"
 #include "motion_mode_transaction.h"
 #include "numeric_parse_contract.h"
 #include "persistence_contract.h"
 #include "serial_frame_contract.h"
-#include "spline_response_contract.h"
 #include "tool_jog_contract.h"
 #include "wrist_selection_contract.h"
 const char *const PROTOCOL_CAPABILITIES[] = {
-  JT_WRIST_CONFIG_CAPABILITY,
-  GCODE_DIRECTORY_CAPABILITY,
-  GCODE_DELETE_IDENTITY_CAPABILITY,
-  GCODE_WRITE_IDENTITY_CAPABILITY,
-  HOME_REFERENCE_V1_CAPABILITY,
-  HOME_REFERENCE_V2_CAPABILITY,
-  JOINT_TELEMETRY_CAPABILITY,
-  ESTOP_ADMISSION_CAPABILITY,
-  CALIBRATION_SWITCH_POLARITY_CAPABILITY,
+  ar4_protocol::kJsonProtocolCapability,
+  ar4_protocol::kJsonRequestCorrelationCapability,
+  ar4_protocol::kJsonEventStreamCapability,
 };
 constexpr size_t PROTOCOL_CAPABILITY_COUNT =
   sizeof(PROTOCOL_CAPABILITIES) / sizeof(PROTOCOL_CAPABILITIES[0]);
+const char *const JSON_COMMANDS[] = {
+  "hello", "get_home_reference", "get_position_disposition",
+  "correct_position", "set_position", "test_limit_switches", "set_encoders",
+  "read_encoders", "update_params", "config_ext_axis", "zero_j7", "zero_j8",
+  "zero_j9", "controller_wait", "calibrate", "move_joints", "move_cartesian",
+  "move_linear", "move_vision", "jog_tool", "live_joint_jog", "live_cart_jog",
+  "live_tool_jog", "stop", "renew_live_motion", "modbus_read_holding_register",
+  "modbus_read_coil", "modbus_read_discrete_input", "modbus_read_input_register",
+  "modbus_write_coil", "modbus_write_register", "wait_modbus_coil",
+  "wait_modbus_discrete_input", "delete_sd_program", "list_sd_programs",
+  "write_gcode_move", "play_gcode_file", "wait_modbus_holding_register",
+  "move_arc", "move_circle", "move_spline",
+};
+constexpr size_t JSON_COMMAND_COUNT = sizeof(JSON_COMMANDS) / sizeof(JSON_COMMANDS[0]);
 static_assert(
   PROTOCOL_CAPABILITY_COUNT
     <= ar4_protocol::kProtocolCapabilityMaximumCount,
@@ -138,30 +142,48 @@ static_assert(
 #pragma GCC diagnostic ignored "-Waddress"
 #pragma GCC diagnostic ignored "-Wall"
 
-bool DEBUG = false;
-// These Debug printers do nothing unless DEBUG = true
-#define DEBUG_PRINT(x) \
-  do { \
-    if (DEBUG) Serial.print(x); \
-  } while (0)
-#define DEBUG_PRINTLN(x) \
-  do { \
-    if (DEBUG) Serial.println(x); \
-  } while (0)
-
 #define Table_Size 6
 typedef float Matrix4x4[16];
 typedef float tRobot[66];
 
-String cmdBuffer1;
-String cmdBuffer2;
-String cmdBuffer3;
-String inData;
 String recData;
-String checkData;
-String function;
 bool serialFrameDiscarding = false;
-volatile byte state = LOW;
+ar4_protocol::SerialFrameReceiveDeadline serialFrameReceiveDeadline = {};
+bool jsonRuntimeFault = false;
+bool jsonResponseWritePrepared = false;
+size_t jsonResponseWriteOffset = 0;
+bool jsonEventWritePrepared = false;
+size_t jsonEventWriteOffset = 0;
+bool jsonEstopAdmissionResponsePending = false;
+bool jsonEstopAdmissionTelemetryBlocked = false;
+ar4_protocol::EstopAdmissionDecision jsonEstopAdmissionDecision = {
+  false,
+  0,
+};
+ar4_protocol::JsonMainControllerFrameView jsonResponseWriteView = {};
+ar4_protocol::JsonEventFrameView jsonEventWriteView = {};
+ar4_protocol::JsonMainControllerRequestOwner jsonMainControllerOwner;
+ar4_protocol::JsonControllerEventOutputOwner jsonControllerEventOwner;
+uint32_t jsonJointTelemetrySequence = 0;
+using ar4_protocol::JsonLiveMotionRuntimeState;
+struct JsonLiveMotionRuntime {
+  ar4_protocol::JsonLiveMotionRuntimeOwner owner;
+  ar4_protocol::JsonMainLiveJogParameters parameters;
+  ar4_protocol::JsonMainLiveJogExecutionResult terminal;
+  bool speed_limited;
+};
+JsonLiveMotionRuntime jsonLiveMotion = {};
+
+void processSerial();
+bool service_json_output();
+uint32_t json_live_motion_microseconds(void *context);
+void json_live_motion_delay_microseconds(
+  uint32_t durationMicroseconds,
+  void *context
+);
+bool json_joint_telemetry_output_available(
+  const ar4_protocol::JsonLiveMotionContinuationSource *continuationSource
+);
 
 const int J1stepPin = 0;
 const int J1dirPin = 1;
@@ -363,9 +385,6 @@ unsigned long J4DebounceTime = 0;
 unsigned long J5DebounceTime = 0;
 unsigned long J6DebounceTime = 0;
 unsigned long debounceDelay = 50;
-constexpr float CALIBRATION_RELEASE_MAXIMUM_TRAVEL_UNITS = 10.0f;
-constexpr unsigned long CALIBRATION_RELEASE_STABLE_MICROSECONDS = 3000UL;
-
 String Alarm = "0";
 String speedViolation = "0";
 float minSpeedDelay = 200;
@@ -390,6 +409,18 @@ typedef ar4_protocol::MotionModeTransaction<
   ROBOT_nDOFs
 > FirmwareMotionModeTransaction;
 const int numJoints = 9;
+static_assert(
+  numJoints == ROBOT_nDOFs + 3,
+  "JSON set-position mapping requires three external axes"
+);
+static_assert(
+  ROBOT_nDOFs == ar4_protocol::kJsonPrimaryJointCount,
+  "JSON configuration mapping requires six primary joints"
+);
+static_assert(
+  numJoints == ar4_protocol::kJsonControllerAxisCount,
+  "JSON configuration mapping requires nine controller axes"
+);
 uint8_t calibrationLimitSensor[numJoints] = {
   HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH,
 };
@@ -399,7 +430,6 @@ typedef float tRobotPose[ROBOT_nDOFs];
 //declare in out vars
 float xyzuvw_Out[ROBOT_nDOFs];
 float xyzuvw_In[ROBOT_nDOFs];
-float xyzuvw_Temp[ROBOT_nDOFs];
 
 float JangleOut[ROBOT_nDOFs];
 float JangleIn[ROBOT_nDOFs];
@@ -417,24 +447,11 @@ float J7_pos;
 float J8_pos;
 float J9_pos;
 
-float J7_In;
-float J8_In;
-float J9_In;
-
 float pose[16];
 
-String moveSequence;
-
 //define rounding vars
-float rndArcStart[6];
-float rndArcMid[6];
-float rndArcEnd[6];
-float rndCalcCen[6];
-String rndData;
 bool rndTrue;
 float rndSpeed;
-bool splineTrue;
-bool splineEndReceived;
 volatile bool estopActive;
 volatile ar4_protocol::JointTelemetryResponseOwnership
   telemetryResponseOwnership = { false, false, false };
@@ -466,35 +483,6 @@ using ar4_protocol::parse_float_span;
 using ar4_protocol::parse_float_spans;
 using ar4_protocol::parse_int_marker_fields;
 using ar4_protocol::parse_int_span;
-using ar4_protocol::parse_int_spans;
-
-bool parse_loop_mode_span(
-  const String &command,
-  int begin,
-  int end,
-  int (&outputs)[ROBOT_nDOFs]
-) {
-  return ar4_protocol::parse_binary_digit_span(
-    command,
-    begin,
-    end,
-    outputs
-  );
-}
-
-bool parse_loop_modes(
-  const String &command,
-  int marker,
-  int (&outputs)[ROBOT_nDOFs]
-) {
-  if (marker < 0) return false;
-  return parse_loop_mode_span(
-    command,
-    marker + 2,
-    static_cast<int>(command.length()),
-    outputs
-  );
-}
 
 void load_axis_calibration(
   float (&negative_limits)[numJoints],
@@ -552,6 +540,52 @@ bool joint_positions_to_future_steps(
     step_limits,
     future_steps
   );
+}
+
+bool build_configured_position_rebase(
+  const int (&step_monitors)[numJoints],
+  ar4_protocol::ControllerPositionRebase &output
+) {
+  float negative_limits[numJoints];
+  float positive_limits[numJoints];
+  float steps_per_unit[numJoints];
+  int step_limits[numJoints];
+  load_axis_calibration(
+    negative_limits,
+    positive_limits,
+    steps_per_unit,
+    step_limits
+  );
+  const float encoder_counts_per_step[ROBOT_nDOFs] = {
+    J1encMult, J2encMult, J3encMult,
+    J4encMult, J5encMult, J6encMult,
+  };
+  return ar4_protocol::build_controller_position_rebase(
+    step_monitors,
+    step_limits,
+    encoder_counts_per_step,
+    output
+  );
+}
+
+void commit_configured_position_rebase(
+  const ar4_protocol::ControllerPositionRebase &state
+) {
+  J1StepM = state.step_monitors[0];
+  J2StepM = state.step_monitors[1];
+  J3StepM = state.step_monitors[2];
+  J4StepM = state.step_monitors[3];
+  J5StepM = state.step_monitors[4];
+  J6StepM = state.step_monitors[5];
+  J7StepM = state.step_monitors[6];
+  J8StepM = state.step_monitors[7];
+  J9StepM = state.step_monitors[8];
+  J1encPos.write(state.encoder_counts[0]);
+  J2encPos.write(state.encoder_counts[1]);
+  J3encPos.write(state.encoder_counts[2]);
+  J4encPos.write(state.encoder_counts[3]);
+  J5encPos.write(state.encoder_counts[4]);
+  J6encPos.write(state.encoder_counts[5]);
 }
 
 bool inverse_solution_to_future_steps(
@@ -620,39 +654,6 @@ bool primary_inverse_solution_to_future_steps(
   for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
     if (!ar4_protocol::calibrated_position_to_step(
         JangleOut[axis],
-        negative_limits[axis],
-        positive_limits[axis],
-        steps_per_unit[axis],
-        step_limits[axis],
-        staged[axis]
-    )) {
-      return false;
-    }
-  }
-  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
-    future_steps[axis] = staged[axis];
-  }
-  return true;
-}
-
-bool primary_positions_to_future_steps(
-  const float (&positions)[ROBOT_nDOFs],
-  int (&future_steps)[ROBOT_nDOFs]
-) {
-  float negative_limits[numJoints];
-  float positive_limits[numJoints];
-  float steps_per_unit[numJoints];
-  int step_limits[numJoints];
-  load_axis_calibration(
-    negative_limits,
-    positive_limits,
-    steps_per_unit,
-    step_limits
-  );
-  int staged[ROBOT_nDOFs];
-  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
-    if (!ar4_protocol::calibrated_position_to_step(
-        positions[axis],
         negative_limits[axis],
         positive_limits[axis],
         steps_per_unit[axis],
@@ -848,24 +849,10 @@ bool isValidResult(float value) {
   return !std::isnan(value) && !std::isinf(value);
 }
 
-bool robot_set_AR() {
-  float nativeTheta[ROBOT_nDOFs] = {};
-  float nativeAlpha[ROBOT_nDOFs] = {};
-  for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
-    if (
-      !ar4_protocol::degrees_to_radians(
-        DHparams[joint][0],
-        nativeTheta[joint]
-      )
-      || !ar4_protocol::degrees_to_radians(
-        DHparams[joint][1],
-        nativeAlpha[joint]
-      )
-    ) {
-      return false;
-    }
-  }
-
+void apply_robot_native_configuration(
+  const float (&nativeTheta)[ROBOT_nDOFs],
+  const float (&nativeAlpha)[ROBOT_nDOFs]
+) {
   robot_data_reset();
   const float lowerLimits[ROBOT_nDOFs] = {
     J1axisLimNeg,
@@ -892,6 +879,27 @@ bool robot_set_AR() {
     Robot_JointLimits_Lower[joint] = lowerLimits[joint];
     Robot_JointLimits_Upper[joint] = upperLimits[joint];
   }
+}
+
+bool robot_set_AR() {
+  float nativeTheta[ROBOT_nDOFs] = {};
+  float nativeAlpha[ROBOT_nDOFs] = {};
+  for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
+    if (
+      !ar4_protocol::degrees_to_radians(
+        DHparams[joint][0],
+        nativeTheta[joint]
+      )
+      || !ar4_protocol::degrees_to_radians(
+        DHparams[joint][1],
+        nativeAlpha[joint]
+      )
+    ) {
+      return false;
+    }
+  }
+
+  apply_robot_native_configuration(nativeTheta, nativeAlpha);
   return true;
 }
 
@@ -912,20 +920,12 @@ void robot_data_reset() {
 // EEPROM Configuration
 // ============================================================================
 
-// EEPROM Memory Map
-constexpr int EEPROM_ROBOT_MODEL_ADDR = ar4_protocol::kRobotModelAddress;
-constexpr int EEPROM_ROBOT_VERSION_ADDR = ar4_protocol::kRobotVersionAddress;
-constexpr int EEPROM_DRIVER_BOARD_ADDR = ar4_protocol::kDriverBoardAddress;
-constexpr int EEPROM_SERIAL_NUMBER_ADDR = ar4_protocol::kSerialNumberAddress;
-constexpr int EEPROM_ASSET_TAG_ADDR = ar4_protocol::kAssetTagAddress;
-
 // Defaults represent an identity record whose commit marker is absent.
 const char *DEFAULT_ROBOT_MODEL = "Unset";
 const char *DEFAULT_ROBOT_VERSION = "Unset";
 const char *DEFAULT_DRIVER_BOARD = "Unset";
 const char *DEFAULT_SERIAL_NUMBER = "Unset";
 const char *DEFAULT_ASSET_TAG = "Unset";
-const bool DEFAULT_DEBUG = DEBUG;
 
 String robot_model = DEFAULT_ROBOT_MODEL;
 String robot_version = DEFAULT_ROBOT_VERSION;
@@ -934,12 +934,15 @@ String serial_number = DEFAULT_SERIAL_NUMBER;
 String asset_tag = DEFAULT_ASSET_TAG;
 ar4_protocol::IdentityRecordStatus identity_record_status =
   ar4_protocol::IdentityRecordStatus::kUninitialized;
+ar4_protocol::JsonSessionIdentityStatus json_session_identity_status =
+  ar4_protocol::JsonSessionIdentityStatus::kPersistenceUnavailable;
+char controller_hardware_id[
+  ar4_protocol::kControllerHardwareIdCapacity
+] = { 0 };
+char json_session_id[
+  ar4_protocol::kJsonSessionIdentifierLength + 1
+] = { 0 };
 
-
-String validated_identity_field(String value) {
-  if (!ar4_protocol::identity_field_valid(value.c_str())) return "";
-  return value;
-}
 
 void use_default_robot_identity() {
   robot_model = DEFAULT_ROBOT_MODEL;
@@ -957,37 +960,9 @@ void clear_robot_identity() {
   asset_tag = "";
 }
 
-bool write_identity_field_to_eeprom(int address, const String& value) {
-  return ar4_protocol::write_identity_field(
-    EEPROM,
-    address,
-    value.c_str()
-  );
-}
-
 // ============================================================================
 // EEPROM Functions
 // ============================================================================
-
-void load_debug_from_eeprom() {
-  bool debugBuf = false;
-  if (!ar4_protocol::load_debug_record(EEPROM, debugBuf)) {
-    Serial.println("Debug persistence not initialized or invalid in load_debug");
-    return;
-  }
-  DEBUG = debugBuf;
-  if (DEBUG) {
-    DEBUG_PRINTLN("Loaded DEBUG=True from EEPROM - Setting DEBUG to True");
-  }
-}
-
-bool save_debug_to_eeprom(bool value) {
-  if (!ar4_protocol::save_debug_record(EEPROM, value)) {
-    Serial.println("Error saving Debug Persistence - Transaction failed");
-    return false;
-  }
-  return true;
-}
 
 void load_robot_id_from_eeprom() {
   char stored_robot_model[ar4_protocol::kIdentityFieldStorageSize] = { 0 };
@@ -1008,7 +983,6 @@ void load_robot_id_from_eeprom() {
     identity_record_status
     == ar4_protocol::IdentityRecordStatus::kUninitialized
   ) {
-    Serial.println("EEPROM not initialized in load_robot_id");
     use_default_robot_identity();
     return;
   }
@@ -1016,7 +990,6 @@ void load_robot_id_from_eeprom() {
     identity_record_status
     != ar4_protocol::IdentityRecordStatus::kValid
   ) {
-    Serial.println("EEPROM identity record corrupt in load_robot_id");
     identity_record_status = ar4_protocol::IdentityRecordStatus::kCorrupt;
     clear_robot_identity();
     return;
@@ -1027,162 +1000,6 @@ void load_robot_id_from_eeprom() {
   driver_board = stored_driver_board;
   serial_number = stored_serial_number;
   asset_tag = stored_asset_tag;
-  DEBUG_PRINT("Debug - Loaded Robot Model from EEPROM: ");
-  DEBUG_PRINTLN(robot_model);
-  DEBUG_PRINT("Debug - Loaded Robot Version from EEPROM: ");
-  DEBUG_PRINTLN(robot_version);
-  DEBUG_PRINT("Debug - Loaded Driver Board from EEPROM: ");
-  DEBUG_PRINTLN(driver_board);
-  DEBUG_PRINT("Debug - Loaded Serial Number from EEPROM: ");
-  DEBUG_PRINTLN(serial_number);
-  DEBUG_PRINT("Debug - Loaded Asset Tag from EEPROM: ");
-  DEBUG_PRINTLN(asset_tag);
-}
-
-bool save_robot_id_to_eeprom(const String robot_model, const String robot_version, const String driver_board, const String serial_number, const String asset_tag) {
-  /*
-     * Save robot model and version to EEPROM.
-     * 
-     * Args:
-     *   robot_model: Robot model string (max 31 chars)
-     *   robot_version: Robot version string (max 31 chars)
-     *   driver_board: Driver board string (max 31 chars)
-     *   serial_number: Serial number string (max 31 chars)
-     *   asset_tag: Asset Tag string (max 31 chars)
-     */
-  if (
-    !ar4_protocol::identity_field_valid(robot_model.c_str())
-    || !ar4_protocol::identity_field_valid(robot_version.c_str())
-    || !ar4_protocol::identity_field_valid(driver_board.c_str())
-    || !ar4_protocol::identity_field_valid(serial_number.c_str())
-    || !ar4_protocol::identity_field_valid(asset_tag.c_str())
-  ) {
-    return false;
-  }
-  return ar4_protocol::save_identity_record(EEPROM, [&]() {
-    return write_identity_field_to_eeprom(EEPROM_ROBOT_MODEL_ADDR, robot_model)
-      && write_identity_field_to_eeprom(EEPROM_ROBOT_VERSION_ADDR, robot_version)
-      && write_identity_field_to_eeprom(EEPROM_DRIVER_BOARD_ADDR, driver_board)
-      && write_identity_field_to_eeprom(EEPROM_SERIAL_NUMBER_ADDR, serial_number)
-      && write_identity_field_to_eeprom(EEPROM_ASSET_TAG_ADDR, asset_tag);
-  });
-}
-
-void reboot() {
-  SCB_AIRCR = 0x05FA0004;
-  while (true)
-    ;
-}
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////
-// Persistent Hardware / Query Functions
-/////////////////////////////////////////////////////////////////////////////////////////////////////
-
-void handle_hello_command() {
-  if (
-    identity_record_status
-    == ar4_protocol::IdentityRecordStatus::kCorrupt
-  ) {
-    Serial.println("ER");
-    return;
-  }
-  char response[ar4_protocol::kIdentityJsonCapacity] = { 0 };
-  char controller_hardware_id[
-    ar4_protocol::kControllerHardwareIdCapacity
-  ] = { 0 };
-  if (!ar4_protocol::format_controller_hardware_id(
-      HW_OCOTP_MAC0 & 0xFFFFFFu,
-      controller_hardware_id,
-      sizeof(controller_hardware_id)
-  )) {
-    Serial.println("ER");
-    return;
-  }
-  if (!ar4_protocol::build_identity_json(
-      controller_hardware_id,
-      driver_board.c_str(),
-      FIRMWARE_VERSION,
-      robot_model.c_str(),
-      robot_version.c_str(),
-      serial_number.c_str(),
-      asset_tag.c_str(),
-      PROTOCOL_CAPABILITIES,
-      PROTOCOL_CAPABILITY_COUNT,
-      response,
-      sizeof(response)
-  )) {
-    Serial.println("ER");
-    return;
-  }
-  Serial.println(response);
-}
-
-void handle_home_reference_v1_command() {
-  char response[
-    ar4_protocol::kPrimaryHomeReferenceV1ResponseCapacity
-  ] = { 0 };
-  if (!ar4_protocol::build_primary_home_reference_v1_response(
-      primaryHomeReference,
-      response,
-      sizeof(response)
-  )) {
-    Serial.println("ER");
-    return;
-  }
-  Serial.println(response);
-}
-
-void handle_home_reference_v2_command() {
-  char response[
-    ar4_protocol::kPrimaryHomeReferenceV2ResponseCapacity
-  ] = { 0 };
-  if (!ar4_protocol::build_primary_home_reference_v2_response(
-      primaryHomeReference,
-      response,
-      sizeof(response)
-  )) {
-    Serial.println("ER");
-    return;
-  }
-  Serial.println(response);
-}
-
-
-void handle_set_robot_id_command(String new_robot_model, String new_robot_version, String new_driver_board, String new_serial_number, String new_asset_tag) {
-  new_robot_model = validated_identity_field(new_robot_model);
-  new_robot_version = validated_identity_field(new_robot_version);
-  new_driver_board = validated_identity_field(new_driver_board);
-  new_serial_number = validated_identity_field(new_serial_number);
-  new_asset_tag = validated_identity_field(new_asset_tag);
-  if (
-    new_robot_model.length() == 0
-    || new_robot_version.length() == 0
-    || new_driver_board.length() == 0
-    || new_serial_number.length() == 0
-    || new_asset_tag.length() == 0
-  ) {
-    Serial.println("Error: Invalid robot identity field");
-    return;
-  }
-  if (!save_robot_id_to_eeprom(
-      new_robot_model,
-      new_robot_version,
-      new_driver_board,
-      new_serial_number,
-      new_asset_tag
-  )) {
-    identity_record_status = ar4_protocol::IdentityRecordStatus::kCorrupt;
-    clear_robot_identity();
-    Serial.println("Error: Robot identity persistence failed");
-    return;
-  }
-  robot_model = new_robot_model;
-  robot_version = new_robot_version;
-  driver_board = new_driver_board;
-  serial_number = new_serial_number;
-  asset_tag = new_asset_tag;
-  identity_record_status = ar4_protocol::IdentityRecordStatus::kValid;
-  Serial.println("Done");
 }
 
 
@@ -1552,7 +1369,6 @@ void SolveInverseKinematics(char wrist_config) {
     KinematicError = 1;
     return;
   }
-  // Serial.println("Sol : " + String(solVal) + " Nb sol : " + String(NumberOfSol));
 
   for (int i = 0; i < ROBOT_nDOFs; i++) {
     JangleOut[i] = SolutionMatrix[i][solVal];
@@ -1835,27 +1651,6 @@ void inverse_kinematics_raw(const T pose[16], const tRobot DK, const T joints_ap
 //CALCULATE POSITIONS
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void sendRobotPos() {
-
-  updatePos();
-
-  String sendPos = "A" + String(JangleIn[0], 3) + "B" + String(JangleIn[1], 3) + "C" + String(JangleIn[2], 3) + "D" + String(JangleIn[3], 3) + "E" + String(JangleIn[4], 3) + "F" + String(JangleIn[5], 3) + "G" + String(xyzuvw_Out[0], 3) + "H" + String(xyzuvw_Out[1], 3) + "I" + String(xyzuvw_Out[2], 3) + "J" + String(xyzuvw_Out[3], 3) + "K" + String(xyzuvw_Out[4], 3) + "L" + String(xyzuvw_Out[5], 3) + "M" + speedViolation + "N" + debug + "O" + flag + "P" + J7_pos + "Q" + J8_pos + "R" + J9_pos;
-  delay(5);
-  Serial.println(sendPos);
-  speedViolation = "0";
-  flag = "";
-}
-
-void sendRobotPosSpline() {
-
-  updatePos();
-
-  String sendPos = "A" + String(JangleIn[0], 3) + "B" + String(JangleIn[1], 3) + "C" + String(JangleIn[2], 3) + "D" + String(JangleIn[3], 3) + "E" + String(JangleIn[4], 3) + "F" + String(JangleIn[5], 3) + "G" + String(xyzuvw_Out[0], 3) + "H" + String(xyzuvw_Out[1], 3) + "I" + String(xyzuvw_Out[2], 3) + "J" + String(xyzuvw_Out[3], 3) + "K" + String(xyzuvw_Out[4], 3) + "L" + String(xyzuvw_Out[5], 3) + "M" + speedViolation + "N" + debug + "O" + flag + "P" + J7_pos + "Q" + J8_pos + "R" + J9_pos;
-  delay(5);
-  Serial.println(sendPos);
-  speedViolation = "0";
-}
-
 void updatePos() {
 
   JangleIn[0] = (J1StepM - J1zeroStep) / J1StepDeg;
@@ -1873,32 +1668,11 @@ void updatePos() {
 }
 
 
-
-void correctRobotPos() {
-
-  J1StepM = J1encPos.read() / J1encMult;
-  J2StepM = J2encPos.read() / J2encMult;
-  J3StepM = J3encPos.read() / J3encMult;
-  J4StepM = J4encPos.read() / J4encMult;
-  J5StepM = J5encPos.read() / J5encMult;
-  J6StepM = J6encPos.read() / J6encMult;
-
-  JangleIn[0] = (J1StepM - J1zeroStep) / J1StepDeg;
-  JangleIn[1] = (J2StepM - J2zeroStep) / J2StepDeg;
-  JangleIn[2] = (J3StepM - J3zeroStep) / J3StepDeg;
-  JangleIn[3] = (J4StepM - J4zeroStep) / J4StepDeg;
-  JangleIn[4] = (J5StepM - J5zeroStep) / J5StepDeg;
-  JangleIn[5] = (J6StepM - J6zeroStep) / J6StepDeg;
-
-
-  SolveFowardKinematics();
-
-  String sendPos = "A" + String(JangleIn[0], 3) + "B" + String(JangleIn[1], 3) + "C" + String(JangleIn[2], 3) + "D" + String(JangleIn[3], 3) + "E" + String(JangleIn[4], 3) + "F" + String(JangleIn[5], 3) + "G" + String(xyzuvw_Out[0], 3) + "H" + String(xyzuvw_Out[1], 3) + "I" + String(xyzuvw_Out[2], 3) + "J" + String(xyzuvw_Out[3], 3) + "K" + String(xyzuvw_Out[4], 3) + "L" + String(xyzuvw_Out[5], 3) + "M" + speedViolation + "N" + debug + "O" + flag + "P" + J7_pos + "Q" + J8_pos + "R" + J9_pos;
-  delay(5);
-  Serial.println(sendPos);
-  speedViolation = "0";
-  flag = "";
-}
+bool read_configured_encoder_steps(
+  int (&output)[ROBOT_nDOFs],
+  uint8_t &failureMask
+);
+void latch_encoder_conversion_fault(uint8_t failureMask);
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //SD CARD
@@ -1910,38 +1684,12 @@ static char mounted_sd_media_id[
   ar4_protocol::kControllerMediaIdCapacity
 ] = { 0 };
 
-const char *sdCodeMeaning(uint8_t code) {
-  switch (code) {
-    case 0x04: return "CMD17 read block failed (card error response)";
-    case 0x0A: return "ACMD41 init timeout";
-    case 0x02: return "CMD8 not accepted (not SD/unsupported)";
-    default: return "see code/data";
-  }
-}
-
-String egSD(const char *stage) {
-  uint8_t code = SD.sdfs.sdErrorCode();
-  uint8_t data = SD.sdfs.sdErrorData();
-
-  String s = "EG: ";
-  s += stage;
-  s += " | code=0x";
-  s += String(code, HEX);
-  s += " data=0x";
-  s += String(data, HEX);
-  s += " | ";
-  s += sdCodeMeaning(code);
-  return s;
-}
-
 bool readSDMediaId(
-  char (&output)[ar4_protocol::kControllerMediaIdCapacity],
-  bool report_error
+  char (&output)[ar4_protocol::kControllerMediaIdCapacity]
 ) {
   cid_t cid = {};
   if (SD.sdfs.card() == nullptr || !SD.sdfs.card()->readCID(&cid)) {
     sd_ok = false;
-    if (report_error) Serial.println(egSD("read CID fail"));
     return false;
   }
   if (!ar4_protocol::format_controller_media_id(
@@ -1951,18 +1699,9 @@ bool readSDMediaId(
       sizeof(output)
   )) {
     sd_ok = false;
-    if (report_error) {
-      Serial.println("EG: G-code media identity encoding failed");
-    }
     return false;
   }
   return true;
-}
-
-bool readSDMediaId(
-  char (&output)[ar4_protocol::kControllerMediaIdCapacity]
-) {
-  return readSDMediaId(output, true);
 }
 
 bool sameSDMediaId(
@@ -1999,7 +1738,7 @@ bool initSD() {
   ] = { 0 };
   if (
     sd_ok
-    && readSDMediaId(current_media_id, false)
+    && readSDMediaId(current_media_id)
     && sameSDMediaId(current_media_id, mounted_sd_media_id)
   ) {
     return true;
@@ -2007,7 +1746,6 @@ bool initSD() {
 
   sd_ok = false;
   if (!SD.begin(BUILTIN_SDCARD)) {
-    Serial.println(egSD("begin fail"));
     return false;
   }
 
@@ -2034,7 +1772,6 @@ bool verifyExpectedSDMediaId(const String &expected_media_id) {
       static_cast<int>(expected_media_id.length())
     )
   ) {
-    Serial.println("EG: G-code storage media identity is invalid");
     return false;
   }
   char current_media_id[
@@ -2047,12 +1784,10 @@ bool verifyExpectedSDMediaId(const String &expected_media_id) {
     !copyMountedSDMediaId(mounted_media_id)
     || expected_media_id != mounted_media_id
   ) {
-    Serial.println("EG: G-code storage media changed");
     return false;
   }
   if (!readSDMediaId(current_media_id)) return false;
   if (expected_media_id != current_media_id) {
-    Serial.println("EG: G-code storage media changed");
     return false;
   }
   return true;
@@ -2069,7 +1804,6 @@ bool writeSD(
   File f = SD.open(filename.c_str(), FILE_WRITE);
   if (!f) {
     sd_ok = false;
-    Serial.println(egSD("open fail"));
     return false;
   }
   const size_t written = f.println(info);
@@ -2079,7 +1813,6 @@ bool writeSD(
   f.close();
   if (!succeeded) {
     sd_ok = false;
-    Serial.println(egSD("write fail"));
     return false;
   }
   return verifyExpectedSDMediaId(expected_media_id);
@@ -2093,7 +1826,6 @@ bool deleteSD(
   if (!verifyExpectedSDMediaId(expected_media_id)) return false;
   if (!SD.remove(filename.c_str())) {
     sd_ok = false;
-    Serial.println(egSD("remove fail"));
     return false;
   }
   return verifyExpectedSDMediaId(expected_media_id);
@@ -2103,7 +1835,6 @@ ar4_protocol::SDFileLookupStatus findSDFile(const String &filename) {
   FsFile root = SD.sdfs.open("/");
   if (!root) {
     sd_ok = false;
-    Serial.println(egSD("open root fail"));
     return ar4_protocol::SDFileLookupStatus::kError;
   }
 
@@ -2114,7 +1845,6 @@ ar4_protocol::SDFileLookupStatus findSDFile(const String &filename) {
       root.close();
       if (read_failed) {
         sd_ok = false;
-        Serial.println(egSD("directory lookup fail"));
         return ar4_protocol::SDFileLookupStatus::kError;
       }
       return ar4_protocol::SDFileLookupStatus::kAbsent;
@@ -2140,7 +1870,6 @@ ar4_protocol::SDFileLookupStatus findSDFile(const String &filename) {
     ) {
       root.close();
       sd_ok = false;
-      Serial.println("EG: G-code directory filename read failed");
       return ar4_protocol::SDFileLookupStatus::kError;
     }
     if (
@@ -2171,103 +1900,6 @@ ar4_protocol::StoredRowReadStatus read_stored_command_row(
   return ar4_protocol::finish_stored_row(row);
 }
 
-bool printDirectory(FsFile &dir, const char *media_id) {
-  String filesSD;
-  if (
-    !filesSD.reserve(
-      ar4_protocol::kControllerDirectoryPayloadMaxLength
-    )
-  ) {
-    Serial.println("EG: G-code directory buffer unavailable");
-    return false;
-  }
-  filesSD += ar4_protocol::kControllerDirectoryIdentityPrefix;
-  filesSD += media_id;
-  filesSD += ar4_protocol::kControllerDirectoryIdentitySeparator;
-  if (
-    filesSD.length()
-    != ar4_protocol::kControllerDirectoryIdentityPrefixLength
-  ) {
-    Serial.println("EG: G-code directory identity framing failed");
-    return false;
-  }
-  while (true) {
-
-    FsFile entry = dir.openNextFile();
-    if (!entry) {
-      if (dir.getError() != 0) {
-        sd_ok = false;
-        Serial.println(egSD("directory read fail"));
-        return false;
-      }
-      if (!verifyExpectedSDMediaId(String(media_id))) return false;
-      Serial.println(filesSD);
-      return true;
-    }
-    char entry_name[
-      ar4_protocol::kControllerFilenameMaxLength + 1
-    ] = { 0 };
-    size_t entry_name_length = 0;
-    const bool entry_name_read =
-      ar4_protocol::read_controller_directory_entry_name(
-        entry,
-        entry_name,
-        sizeof(entry_name),
-        entry_name_length
-      );
-    if (
-      !entry_name_read
-      || entry_name_length
-        > ar4_protocol::kControllerFilenameMaxLength
-    ) {
-      entry.close();
-      sd_ok = false;
-      Serial.println("EG: G-code directory filename read failed");
-      return false;
-    }
-    String entryName(entry_name);
-    if (entryName.length() != entry_name_length) {
-      entry.close();
-      Serial.println("EG: G-code directory buffer unavailable");
-      return false;
-    }
-    if (
-      !entry.isDirectory()
-      && entryName != "System Volume Information"
-    ) {
-      if (
-        !ar4_protocol::valid_controller_directory_entry_filename(
-          entryName,
-          0,
-          static_cast<int>(entryName.length())
-        )
-      ) {
-        entry.close();
-        Serial.println("EG: rename incompatible filename on SD card");
-        return false;
-      }
-      if (
-        !ar4_protocol::controller_directory_entry_fits_payload(
-          filesSD.length(),
-          entryName.length()
-        )
-      ) {
-        entry.close();
-        Serial.println(
-          "EG: G-code directory listing exceeds protocol payload limit"
-        );
-        return false;
-      }
-      filesSD += entryName;
-      filesSD += ar4_protocol::kControllerDirectorySeparator;
-    }
-    entry.close();
-  }
-}
-
-
-
-
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //DRIVE LIMIT
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2286,7 +1918,6 @@ bool driveLimit(
   ) {
     return false;
   }
-  const unsigned long DEBOUNCE_US = 3000;  // 3 ms
   unsigned long firstActiveUs[numJoints] = { 0 };
 
   int calcStepGap = minSpeedDelay / (SpeedVal / 100);
@@ -2301,6 +1932,10 @@ bool driveLimit(
   int curState[numJoints] = { 0 };
   int calPins[numJoints] = { J1calPin, J2calPin, J3calPin, J4calPin, J5calPin, J6calPin, J7calPin, J8calPin, J9calPin };
   int stepPins[numJoints] = { J1stepPin, J2stepPin, J3stepPin, J4stepPin, J5stepPin, J6stepPin, J7stepPin, J8stepPin, J9stepPin };
+  int *stepMonitors[numJoints] = {
+    &J1StepM, &J2StepM, &J3StepM, &J4StepM, &J5StepM,
+    &J6StepM, &J7StepM, &J8StepM, &J9StepM,
+  };
 
   int stepsDone[numJoints] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
   int complete[numJoints] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -2321,18 +1956,34 @@ bool driveLimit(
     digitalWrite(stepPins[i], LOW);
   }
 
+  int64_t progressStepBudget = 0;
   for (int i = 0; i < numJoints; i++) {
     if (requested[i] != 0 && requested[i] != 1) return false;
     // Unrequested joints must not participate in completion or switch checks.
     if (requested[i] == 0) {
       complete[i] = 1;
+    } else {
+      if (steps[i] < 0) return false;
+      progressStepBudget += steps[i];
     }
   }
+
+  uint64_t maximumIterations = 0;
+  if (!ar4_protocol::calibration_stage_maximum_iterations(
+      progressStepBudget,
+      ar4_protocol::kCalibrationLimitSearchLoopDelayMicroseconds,
+      maximumIterations
+  )) {
+    return false;
+  }
+  uint64_t iterations = 0;
 
   // DRIVE MOTORS FOR CALIBRATION
   int DriveLimInProc = 1;
 
   while (DriveLimInProc == 1 && estopActive == false) {
+    if (iterations >= maximumIterations) return false;
+    ++iterations;
 
     for (int i = 0; i < numJoints; i++) {
 
@@ -2348,12 +1999,15 @@ bool driveLimit(
           calibrationLimitSensor[i]
       )) {
 
-        if (firstActiveUs[i] == 0) {
+        if (limitSeen[i] == 0) {
           firstActiveUs[i] = micros();
           limitSeen[i] = 1;  // stop stepping this axis immediately
         }
 
-        if ((micros() - firstActiveUs[i]) >= DEBOUNCE_US) {
+        if (
+          (micros() - firstActiveUs[i])
+            >= ar4_protocol::kCalibrationSwitchStableMicroseconds
+        ) {
           complete[i] = 1;
           limitConfirmed[i] = 1;
         }
@@ -2365,10 +2019,20 @@ bool driveLimit(
 
       // Step the motor only if the limit has not been seen yet
       if (stepsDone[i] < steps[i] && complete[i] == 0 && limitSeen[i] == 0) {
+        const int logicalIncrement = calDir[i] == 1 ? 1 : -1;
+        if (
+          (logicalIncrement > 0
+            && *stepMonitors[i] == std::numeric_limits<int>::max())
+          || (logicalIncrement < 0
+            && *stepMonitors[i] == std::numeric_limits<int>::min())
+        ) {
+          return false;
+        }
         digitalWrite(stepPins[i], HIGH);
-        delayMicroseconds(5);
+        delayMicroseconds(ar4_protocol::kCalibrationStepPulseMicroseconds);
         digitalWrite(stepPins[i], LOW);
 
+        *stepMonitors[i] += logicalIncrement;
         stepsDone[i]++;
 
         delayMicroseconds(calcStepGap);
@@ -2397,7 +2061,9 @@ bool driveLimit(
       DriveLimInProc = 0;
     }
 
-    delayMicroseconds(100);
+    delayMicroseconds(
+      ar4_protocol::kCalibrationLimitSearchLoopDelayMicroseconds
+    );
   }
 
   if (estopActive) return false;
@@ -2458,6 +2124,14 @@ bool backOff(uint8_t J1req, uint8_t J2req, uint8_t J3req, uint8_t J4req, uint8_t
     J1stepPin, J2stepPin, J3stepPin, J4stepPin, J5stepPin,
     J6stepPin, J7stepPin, J8stepPin, J9stepPin,
   };
+  const int calibrationDirections[numJoints] = {
+    J1CalDir, J2CalDir, J3CalDir, J4CalDir, J5CalDir,
+    J6CalDir, J7CalDir, J8CalDir, J9CalDir,
+  };
+  int *stepMonitors[numJoints] = {
+    &J1StepM, &J2StepM, &J3StepM, &J4StepM, &J5StepM,
+    &J6StepM, &J7StepM, &J8StepM, &J9StepM,
+  };
   const float stepsPerUnit[numJoints] = {
     J1StepDeg, J2StepDeg, J3StepDeg, J4StepDeg, J5StepDeg,
     J6StepDeg, J7StepDeg, J8StepDeg, J9StepDeg,
@@ -2472,6 +2146,7 @@ bool backOff(uint8_t J1req, uint8_t J2req, uint8_t J3req, uint8_t J4req, uint8_t
   bool releaseConfirmed[numJoints] = { false };
   unsigned long releaseStarted[numJoints] = { 0 };
 
+  int64_t progressStepBudget = 0;
   for (int axis = 0; axis < numJoints; ++axis) {
     if (requested[axis] == 0) {
       releaseConfirmed[axis] = true;
@@ -2485,16 +2160,29 @@ bool backOff(uint8_t J1req, uint8_t J2req, uint8_t J3req, uint8_t J4req, uint8_t
     )) {
       return false;
     }
+    progressStepBudget += maximumSteps[axis];
   }
+
+  uint64_t maximumIterations = 0;
+  if (!ar4_protocol::calibration_stage_maximum_iterations(
+      progressStepBudget,
+      static_cast<uint32_t>(calcStepGap),
+      maximumIterations
+  )) {
+    return false;
+  }
+  uint64_t iterations = 0;
 
   auto pulseStep = [](int pin) {
     digitalWrite(pin, HIGH);
-    delayMicroseconds(5);
+    delayMicroseconds(ar4_protocol::kCalibrationStepPulseMicroseconds);
     digitalWrite(pin, LOW);
   };
 
   while (true) {
     if (estopActive) return false;
+    if (iterations >= maximumIterations) return false;
+    ++iterations;
     bool allReleased = true;
     const unsigned long now = micros();
     for (int axis = 0; axis < numJoints; ++axis) {
@@ -2509,7 +2197,7 @@ bool backOff(uint8_t J1req, uint8_t J2req, uint8_t J3req, uint8_t J4req, uint8_t
           releaseStarted[axis] = now;
         } else if (
           (now - releaseStarted[axis])
-          >= CALIBRATION_RELEASE_STABLE_MICROSECONDS
+          >= ar4_protocol::kCalibrationSwitchStableMicroseconds
         ) {
           releaseConfirmed[axis] = true;
         }
@@ -2517,7 +2205,17 @@ bool backOff(uint8_t J1req, uint8_t J2req, uint8_t J3req, uint8_t J4req, uint8_t
       }
       releaseCandidate[axis] = false;
       if (completedSteps[axis] >= maximumSteps[axis]) return false;
+      const int logicalIncrement = calibrationDirections[axis] == 1 ? -1 : 1;
+      if (
+        (logicalIncrement > 0
+          && *stepMonitors[axis] == std::numeric_limits<int>::max())
+        || (logicalIncrement < 0
+          && *stepMonitors[axis] == std::numeric_limits<int>::min())
+      ) {
+        return false;
+      }
       pulseStep(stepPins[axis]);
+      *stepMonitors[axis] += logicalIncrement;
       ++completedSteps[axis];
     }
     if (allReleased) return true;
@@ -2533,7 +2231,96 @@ bool backOff(uint8_t J1req, uint8_t J2req, uint8_t J3req, uint8_t J4req, uint8_t
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
-void resetEncoders() {
+bool read_configured_encoder_steps(
+  int (&output)[ROBOT_nDOFs],
+  uint8_t &failureMask
+) {
+  const int32_t encoderCounts[ROBOT_nDOFs] = {
+    J1encPos.read(), J2encPos.read(), J3encPos.read(),
+    J4encPos.read(), J5encPos.read(), J6encPos.read(),
+  };
+  const float encoderScales[ROBOT_nDOFs] = {
+    J1encMult, J2encMult, J3encMult,
+    J4encMult, J5encMult, J6encMult,
+  };
+  int staged[ROBOT_nDOFs] = {};
+  failureMask = 0;
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    if (!ar4_protocol::configured_encoder_count_to_step(
+        encoderCounts[axis],
+        encoderScales[axis],
+        staged[axis]
+    )) {
+      failureMask |= static_cast<uint8_t>(1u << axis);
+    }
+  }
+  if (failureMask != 0) return false;
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    output[axis] = staged[axis];
+  }
+  return true;
+}
+
+
+bool build_configured_encoder_counts(
+  int32_t (&output)[ROBOT_nDOFs],
+  uint8_t &failureMask
+) {
+  const int stepMonitors[ROBOT_nDOFs] = {
+    J1StepM, J2StepM, J3StepM, J4StepM, J5StepM, J6StepM,
+  };
+  const float encoderScales[ROBOT_nDOFs] = {
+    J1encMult, J2encMult, J3encMult,
+    J4encMult, J5encMult, J6encMult,
+  };
+  int32_t staged[ROBOT_nDOFs] = {};
+  failureMask = 0;
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    if (!ar4_protocol::configured_step_to_encoder_count(
+        stepMonitors[axis],
+        encoderScales[axis],
+        staged[axis]
+    )) {
+      failureMask |= static_cast<uint8_t>(1u << axis);
+    }
+  }
+  if (failureMask != 0) return false;
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    output[axis] = staged[axis];
+  }
+  return true;
+}
+
+
+void latch_encoder_conversion_fault(uint8_t failureMask) {
+  int *collisionFlags[ROBOT_nDOFs] = {
+    &J1collisionTrue, &J2collisionTrue, &J3collisionTrue,
+    &J4collisionTrue, &J5collisionTrue, &J6collisionTrue,
+  };
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    if ((failureMask & static_cast<uint8_t>(1u << axis)) != 0) {
+      *collisionFlags[axis] = 1;
+    }
+  }
+  TotalCollision = J1collisionTrue + J2collisionTrue + J3collisionTrue
+    + J4collisionTrue + J5collisionTrue + J6collisionTrue;
+  flag = "EC" + String(J1collisionTrue) + String(J2collisionTrue)
+    + String(J3collisionTrue) + String(J4collisionTrue)
+    + String(J5collisionTrue) + String(J6collisionTrue);
+}
+
+
+bool resetEncoders() {
+
+  int32_t encoderCounts[ROBOT_nDOFs] = {};
+  uint8_t conversionFailureMask = 0;
+  if (!build_configured_encoder_counts(
+      encoderCounts,
+      conversionFailureMask
+  )) {
+    latch_encoder_conversion_fault(conversionFailureMask);
+    return false;
+  }
 
   J1collisionTrue = 0;
   J2collisionTrue = 0;
@@ -2541,60 +2328,71 @@ void resetEncoders() {
   J4collisionTrue = 0;
   J5collisionTrue = 0;
   J6collisionTrue = 0;
+  TotalCollision = 0;
 
   //set encoders to current position
-  J1encPos.write(J1StepM * J1encMult);
-  J2encPos.write(J2StepM * J2encMult);
-  J3encPos.write(J3StepM * J3encMult);
-  J4encPos.write(J4StepM * J4encMult);
-  J5encPos.write(J5StepM * J5encMult);
-  J6encPos.write(J6StepM * J6encMult);
+  J1encPos.write(encoderCounts[0]);
+  J2encPos.write(encoderCounts[1]);
+  J3encPos.write(encoderCounts[2]);
+  J4encPos.write(encoderCounts[3]);
+  J5encPos.write(encoderCounts[4]);
+  J6encPos.write(encoderCounts[5]);
   //delayMicroseconds(5);
+  return true;
 }
 
-void checkEncoders() {
+bool checkEncoders() {
   //read encoders
-  J1EncSteps = J1encPos.read() / J1encMult;
-  J2EncSteps = J2encPos.read() / J2encMult;
-  J3EncSteps = J3encPos.read() / J3encMult;
-  J4EncSteps = J4encPos.read() / J4encMult;
-  J5EncSteps = J5encPos.read() / J5encMult;
-  J6EncSteps = J6encPos.read() / J6encMult;
+  int encoderSteps[ROBOT_nDOFs] = {};
+  uint8_t conversionFailureMask = 0;
+  if (!read_configured_encoder_steps(
+      encoderSteps,
+      conversionFailureMask
+  )) {
+    latch_encoder_conversion_fault(conversionFailureMask);
+    return false;
+  }
+  J1EncSteps = encoderSteps[0];
+  J2EncSteps = encoderSteps[1];
+  J3EncSteps = encoderSteps[2];
+  J4EncSteps = encoderSteps[3];
+  J5EncSteps = encoderSteps[4];
+  J6EncSteps = encoderSteps[5];
 
-  if (abs((J1EncSteps - J1StepM)) >= encOffset) {
+  if (ar4_protocol::encoder_step_difference_reaches_threshold(J1EncSteps, J1StepM, encOffset)) {
     if (JointLoopModes[0] == 0) {
       J1collisionTrue = 1;
-      J1StepM = J1encPos.read() / J1encMult;
+      J1StepM = J1EncSteps;
     }
   }
-  if (abs((J2EncSteps - J2StepM)) >= encOffset) {
+  if (ar4_protocol::encoder_step_difference_reaches_threshold(J2EncSteps, J2StepM, encOffset)) {
     if (JointLoopModes[1] == 0) {
       J2collisionTrue = 1;
-      J2StepM = J2encPos.read() / J2encMult;
+      J2StepM = J2EncSteps;
     }
   }
-  if (abs((J3EncSteps - J3StepM)) >= encOffset) {
+  if (ar4_protocol::encoder_step_difference_reaches_threshold(J3EncSteps, J3StepM, encOffset)) {
     if (JointLoopModes[2] == 0) {
       J3collisionTrue = 1;
-      J3StepM = J3encPos.read() / J3encMult;
+      J3StepM = J3EncSteps;
     }
   }
-  if (abs((J4EncSteps - J4StepM)) >= encOffset) {
+  if (ar4_protocol::encoder_step_difference_reaches_threshold(J4EncSteps, J4StepM, encOffset)) {
     if (JointLoopModes[3] == 0) {
       J4collisionTrue = 1;
-      J4StepM = J4encPos.read() / J4encMult;
+      J4StepM = J4EncSteps;
     }
   }
-  if (abs((J5EncSteps - J5StepM)) >= encOffset) {
+  if (ar4_protocol::encoder_step_difference_reaches_threshold(J5EncSteps, J5StepM, encOffset)) {
     if (JointLoopModes[4] == 0) {
       J5collisionTrue = 1;
-      J5StepM = J5encPos.read() / J5encMult;
+      J5StepM = J5EncSteps;
     }
   }
-  if (abs((J6EncSteps - J6StepM)) >= encOffset) {
+  if (ar4_protocol::encoder_step_difference_reaches_threshold(J6EncSteps, J6StepM, encOffset)) {
     if (JointLoopModes[5] == 0) {
       J6collisionTrue = 1;
-      J6StepM = J6encPos.read() / J6encMult;
+      J6StepM = J6EncSteps;
     }
   }
 
@@ -2602,6 +2400,7 @@ void checkEncoders() {
   if (TotalCollision > 0) {
     flag = "EC" + String(J1collisionTrue) + String(J2collisionTrue) + String(J3collisionTrue) + String(J4collisionTrue) + String(J5collisionTrue) + String(J6collisionTrue);
   }
+  return true;
 }
 
 
@@ -2673,27 +2472,37 @@ bool emit_joint_telemetry() {
     return false;
   }
 
-  char frame[ar4_protocol::kJointTelemetryFrameCapacity] = {};
+  char frame[ar4_protocol::kJsonJointPositionTelemetryFrameCapacity] = {};
   size_t frameLength = 0;
-  if (
-    !ar4_protocol::build_joint_telemetry_frame(
+  const bool frameBuilt =
+    ar4_protocol::build_json_joint_position_telemetry_frame(
+      jsonJointTelemetrySequence,
       millidegrees,
       frame,
       sizeof(frame),
       frameLength
-    )
+    );
+  const size_t terminalReserve =
+    ar4_protocol::kJsonJointMotionTerminalPayloadReservationBytes;
+  if (
+    !frameBuilt
     || estopActive
     || Serial.availableForWrite()
-      < static_cast<int>(
-        frameLength + ar4_protocol::kJointTelemetryTerminalReserveBytes
-      )
+      < static_cast<int>(frameLength + terminalReserve)
   ) {
     return false;
   }
-  return Serial.write(
+  const bool written = Serial.write(
     reinterpret_cast<const uint8_t *>(frame),
     frameLength
   ) == frameLength;
+  if (written) {
+    jsonJointTelemetrySequence =
+      jsonJointTelemetrySequence == UINT32_MAX
+        ? 0
+        : jsonJointTelemetrySequence + 1;
+  }
+  return written;
 }
 
 void begin_telemetry_response_ownership(bool telemetryRequested) {
@@ -2705,66 +2514,20 @@ void begin_telemetry_response_ownership(bool telemetryRequested) {
   interrupts();
 }
 
-bool complete_telemetry_joint_response(
-    bool telemetryRequested,
-    bool driveSucceeded
-) {
-  if (!telemetryRequested) return false;
-
-  checkEncoders();
-  noInterrupts();
-  const ar4_protocol::JointTelemetryTerminalDecision decision =
-    ar4_protocol::decide_joint_telemetry_terminal(
-      telemetryRequested,
-      driveSucceeded,
-      estopActive,
-      telemetryResponseOwnership
-    );
-  interrupts();
-
-  switch (decision.kind) {
-    case ar4_protocol::JointTelemetryTerminalKind::kNotOwned:
-      return false;
-    case ar4_protocol::JointTelemetryTerminalKind::kAlreadySent:
-      break;
-    case ar4_protocol::JointTelemetryTerminalKind::kPosition:
-      if (decision.emergency_stop) flag = "EB";
-      sendRobotPos();
-      if (decision.emergency_stop) {
-        ar4_protocol::acknowledge_controller_estop_response(
-          controllerResponseOwnership
-        );
-      }
-      break;
-    case ar4_protocol::JointTelemetryTerminalKind::kError:
-      Serial.println("ER");
-      break;
-  }
-
-  // Preserve admission blocking and publish a late stop after terminal framing
-  // so an idle host can consume the asynchronous event without another command.
-  noInterrupts();
-  const bool publishLateEstop =
-    ar4_protocol::commit_joint_telemetry_terminal(
-      decision,
-      telemetryResponseOwnership
-    );
-  interrupts();
-  if (publishLateEstop) {
-    ar4_protocol::acknowledge_controller_estop_response(
-      controllerResponseOwnership
-    );
-    flag = "EB";
-    sendRobotPos();
-  }
-  return true;
-}
-
 bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, int J6step, int J7step, int J8step, int J9step,
                   int J1dir, int J2dir, int J3dir, int J4dir, int J5dir, int J6dir, int J7dir, int J8dir, int J9dir,
                   String SpeedType, float SpeedVal, float ACCspd, float DCCspd, float ACCramp,
                   FirmwareMotionModeTransaction *motionModes,
-                  bool telemetryRequested) {
+                  bool telemetryRequested,
+                  const ar4_protocol::JsonLiveMotionContinuationSource *
+                    continuationSource = nullptr,
+                  bool roundingContinuationEnabled = true) {
+  if (!roundingContinuationEnabled) {
+    ar4_protocol::consume_motion_rounding_continuation(false, rndTrue);
+  }
+  if (!ar4_protocol::json_live_motion_continuation_source_valid(
+      continuationSource
+  )) return false;
   // Array of steps and directions
   int steps[9] = { J1step, J2step, J3step, J4step, J5step, J6step, J7step, J8step, J9step };
   int dirs[9] = { J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir };
@@ -2829,6 +2592,7 @@ bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
     const double y = static_cast<double>(xyzuvw_In[1]) - xyzuvw_Out[1];
     const double z = static_cast<double>(xyzuvw_In[2]) - xyzuvw_Out[2];
     const double lineDist = sqrt(x * x + y * y + z * z);
+    if (!isfinite(lineDist) || lineDist <= 0.0) return false;
     speedSP = lineDist / static_cast<double>(SpeedVal) * 1000000.0;
   }
 
@@ -2871,16 +2635,27 @@ bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
   // With cruise known, define start/end delays and per-step increments
   float startDelay = calcStepGap * k_acc;  // slower than cruise
   float endDelay = calcStepGap * k_dec;    // slower than cruise
+  const bool roundingContinuationSelected =
+    roundingContinuationEnabled && rndTrue;
   if (!ar4_protocol::valid_delay_envelope(
       calcStepGap,
       startDelay,
       endDelay,
-      rndTrue,
+      roundingContinuationSelected,
       rndSpeed
   )) {
+    if (!roundingContinuationEnabled) rndTrue = false;
     return false;
   }
+  const bool useRoundingContinuation =
+    ar4_protocol::consume_motion_rounding_continuation(
+      roundingContinuationEnabled,
+      rndTrue
+    );
   if (estopActive) return false;
+  if (!ar4_protocol::service_json_live_motion_continuation(
+      continuationSource
+  )) return false;
   if (motionModes != nullptr) motionModes->commit();
 
   // Timing rejection must precede every output-pin mutation.
@@ -2895,8 +2670,7 @@ bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
 
   // Start at the slow end of accel (or keep rounding behavior)
   float calcACCstartDel = startDelay;
-  float curDelay = (rndTrue == true) ? rndSpeed : calcACCstartDel;
-  rndTrue = false;
+  float curDelay = useRoundingContinuation ? rndSpeed : calcACCstartDel;
 
   ///// DRIVE MOTORS /////
   unsigned long moveStart = micros();
@@ -2904,6 +2678,13 @@ bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
   int highStepCur = 0;
 
   while ((cur[0] < steps[0] || cur[1] < steps[1] || cur[2] < steps[2] || cur[3] < steps[3] || cur[4] < steps[4] || cur[5] < steps[5] || cur[6] < steps[6] || cur[7] < steps[7] || cur[8] < steps[8]) && estopActive == false) {
+
+    if (!ar4_protocol::service_json_live_motion_continuation(
+        continuationSource
+    )) {
+      store_step_monitors(stepMonitors);
+      return false;
+    }
 
     ////DELAY CALC/////
     if (highStepCur < ACCStep) {
@@ -2987,7 +2768,17 @@ bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
     }
     const uint32_t pulseWaitStarted = micros();
     if (
+      continuationSource != nullptr
+      && !ar4_protocol::service_json_live_motion_continuation(
+        continuationSource
+      )
+    ) {
+      store_step_monitors(stepMonitors);
+      return false;
+    }
+    if (
       telemetryRequested
+      && json_joint_telemetry_output_available(continuationSource)
       && ar4_protocol::joint_telemetry_due(
         pulseWaitStarted,
         lastTelemetryAttempt
@@ -2998,8 +2789,25 @@ bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
     }
     const uint32_t telemetryWorkMicroseconds =
       static_cast<uint32_t>(micros() - pulseWaitStarted);
-    if (telemetryWorkMicroseconds < pulseDelay) {
-      delayMicroseconds(pulseDelay - telemetryWorkMicroseconds);
+    if (continuationSource == nullptr) {
+      if (telemetryWorkMicroseconds < pulseDelay) {
+        delayMicroseconds(pulseDelay - telemetryWorkMicroseconds);
+      }
+    } else {
+      const ar4_protocol::JsonLiveMotionPulseClockSource pulseClock = {
+        json_live_motion_microseconds,
+        json_live_motion_delay_microseconds,
+        nullptr,
+      };
+      if (!ar4_protocol::wait_json_live_motion_pulse(
+          pulseWaitStarted,
+          pulseDelay,
+          *continuationSource,
+          pulseClock
+      )) {
+        store_step_monitors(stepMonitors);
+        return false;
+      }
     }
   }
   unsigned long moveEnd = micros();
@@ -3012,6 +2820,31 @@ bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
   // Update the original step monitor variables
   store_step_monitors(stepMonitors);
   return true;
+}
+
+uint32_t json_live_motion_microseconds(void *context) {
+  (void)context;
+  return static_cast<uint32_t>(micros());
+}
+
+void json_live_motion_delay_microseconds(
+  uint32_t durationMicroseconds,
+  void *context
+) {
+  (void)context;
+  delayMicroseconds(durationMicroseconds);
+}
+
+bool json_joint_telemetry_output_available(
+  const ar4_protocol::JsonLiveMotionContinuationSource *continuationSource
+) {
+  if (continuationSource == nullptr) return true;
+  return jsonMainControllerOwner.state()
+      == ar4_protocol::JsonMainControllerOwnerState::kIdle
+    && !jsonResponseWritePrepared
+    && Serial.available() == 0
+    && recData.length() == 0
+    && !serialFrameDiscarding;
 }
 
 
@@ -3036,7 +2869,7 @@ bool driveMotorsG(int J1step, int J2step, int J3step, int J4step, int J5step, in
       HighStep = steps[i];
     }
   }
-  if (HighStep == 0) return true;
+  if (HighStep == 0) return !estopActive;
 
   // FIND ACTIVE JOINTS
   int Jactive = 0;
@@ -3175,6 +3008,7 @@ bool driveMotorsG(int J1step, int J2step, int J3step, int J4step, int J5step, in
 
   // assign the updated values back to the original step monitors
   store_step_monitors(stepMonitors);
+  if (estopActive) return false;
   return true;
 }
 
@@ -3207,7 +3041,7 @@ bool driveMotorsL(int J1step, int J2step, int J3step, int J4step, int J5step, in
       HighStep = steps[i];
     }
   }
-  if (HighStep == 0) return true;
+  if (HighStep == 0) return !estopActive;
   if (!ar4_protocol::valid_delay_envelope(
       curDelay,
       curDelay,
@@ -3225,10 +3059,6 @@ bool driveMotorsL(int J1step, int J2step, int J3step, int J4step, int J5step, in
     }
   }
 
-  // Process lookahead
-  if (splineTrue) {
-    processSerial();
-  }
   if (estopActive) return false;
   if (motionModes != nullptr) motionModes->commit();
 
@@ -3249,11 +3079,6 @@ bool driveMotorsL(int J1step, int J2step, int J3step, int J4step, int J5step, in
   while ((cur[0] < steps[0] || cur[1] < steps[1] || cur[2] < steps[2] || cur[3] < steps[3] || cur[4] < steps[4] || cur[5] < steps[5] || cur[6] < steps[6] || cur[7] < steps[7] || cur[8] < steps[8]) && !estopActive) {
     float distDelay = 30;
     float disDelayCur = 0;
-
-    // Process lookahead
-    if (splineTrue) {
-      processSerial();
-    }
 
     // Iterate through each joint
     for (int i = 0; i < 9; i++) {
@@ -3312,6 +3137,7 @@ bool driveMotorsL(int J1step, int J2step, int J3step, int J4step, int J5step, in
 
   // Assign the updated values back to the original step monitors
   store_step_monitors(stepMonitors);
+  if (estopActive) return false;
   return true;
 }
 
@@ -3320,194 +3146,6 @@ bool driveMotorsL(int J1step, int J2step, int J3step, int J4step, int J5step, in
 //MOVE J
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-ar4_protocol::MotionCommandStatus moveJ(
-  String inData,
-  bool response,
-  bool precalc,
-  bool simspeed
-) {
-
-  int J1dir;
-  int J2dir;
-  int J3dir;
-  int J4dir;
-  int J5dir;
-  int J6dir;
-  int J7dir;
-  int J8dir;
-  int J9dir;
-
-  int J1axisFault = 0;
-  int J2axisFault = 0;
-  int J3axisFault = 0;
-  int J4axisFault = 0;
-  int J5axisFault = 0;
-  int J6axisFault = 0;
-  int J7axisFault = 0;
-  int J8axisFault = 0;
-  int J9axisFault = 0;
-  int TotalAxisFault = 0;
-
-  ar4_protocol::CartesianMoveCommandFields commandFields = {};
-  if (!ar4_protocol::parse_cartesian_move_command(inData, commandFields)) {
-    return ar4_protocol::MotionCommandStatus::kRejected;
-  }
-  int staged_external_steps[3];
-  if (!external_positions_to_future_steps(
-      commandFields.auxiliary[0],
-      commandFields.auxiliary[1],
-      commandFields.auxiliary[2],
-      staged_external_steps
-  )) {
-    return ar4_protocol::MotionCommandStatus::kRejected;
-  }
-
-  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
-    xyzuvw_In[axis] = commandFields.pose[axis];
-  }
-  J7_In = commandFields.auxiliary[0];
-  J8_In = commandFields.auxiliary[1];
-  J9_In = commandFields.auxiliary[2];
-  String SpeedType(commandFields.speed_mode);
-  float SpeedVal = commandFields.speed;
-  float ACCspd = commandFields.acceleration;
-  float DCCspd = commandFields.deceleration;
-  float ACCramp = commandFields.ramp;
-  ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
-    WristCon,
-    JointLoopModes,
-    String(commandFields.wrist_config),
-    commandFields.loop_modes
-  );
-
-
-  SolveInverseKinematics(commandFields.wrist_config);
-
-  //calc destination motor steps
-  int future_steps[numJoints] = {};
-  int primary_future_steps[ROBOT_nDOFs] = {};
-  if (
-    KinematicError != 0
-    || !primary_inverse_solution_to_future_steps(primary_future_steps)
-  ) {
-    return ar4_protocol::MotionCommandStatus::kRejected;
-  }
-  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
-    future_steps[axis] = primary_future_steps[axis];
-  }
-  for (int axis = 0; axis < 3; ++axis) {
-    future_steps[axis + ROBOT_nDOFs] = staged_external_steps[axis];
-  }
-  int J1futStepM = future_steps[0];
-  int J2futStepM = future_steps[1];
-  int J3futStepM = future_steps[2];
-  int J4futStepM = future_steps[3];
-  int J5futStepM = future_steps[4];
-  int J6futStepM = future_steps[5];
-  int J7futStepM = future_steps[6];
-  int J8futStepM = future_steps[7];
-  int J9futStepM = future_steps[8];
-
-  if (precalc) {
-    J1StepM = J1futStepM;
-    J2StepM = J2futStepM;
-    J3StepM = J3futStepM;
-    J4StepM = J4futStepM;
-    J5StepM = J5futStepM;
-    J6StepM = J6futStepM;
-    J7StepM = J7futStepM;
-    J8StepM = J8futStepM;
-    J9StepM = J9futStepM;
-  }
-
-  else {
-    //calc delta from current to destination
-    int J1stepDif = J1StepM - J1futStepM;
-    int J2stepDif = J2StepM - J2futStepM;
-    int J3stepDif = J3StepM - J3futStepM;
-    int J4stepDif = J4StepM - J4futStepM;
-    int J5stepDif = J5StepM - J5futStepM;
-    int J6stepDif = J6StepM - J6futStepM;
-    int J7stepDif = J7StepM - J7futStepM;
-    int J8stepDif = J8StepM - J8futStepM;
-    int J9stepDif = J9StepM - J9futStepM;
-
-    //determine motor directions
-    J1dir = (J1stepDif <= 0) ? 1 : 0;
-    J2dir = (J2stepDif <= 0) ? 1 : 0;
-    J3dir = (J3stepDif <= 0) ? 1 : 0;
-    J4dir = (J4stepDif <= 0) ? 1 : 0;
-    J5dir = (J5stepDif <= 0) ? 1 : 0;
-    J6dir = (J6stepDif <= 0) ? 1 : 0;
-    J7dir = (J7stepDif <= 0) ? 1 : 0;
-    J8dir = (J8stepDif <= 0) ? 1 : 0;
-    J9dir = (J9stepDif <= 0) ? 1 : 0;
-
-    int StepLim[numJoints] = { J1StepLim, J2StepLim, J3StepLim, J4StepLim, J5StepLim, J6StepLim, J7StepLim, J8StepLim, J9StepLim };
-    int axisFault[numJoints] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-
-    // Future counters are the safety boundary; signed deltas are not positions.
-    for (int i = 0; i < numJoints; ++i) {
-      if (future_step_is_outside_limit(future_steps[i], StepLim[i])) {
-        axisFault[i] = 1;
-      }
-    }
-
-    // Assign fault values back to individual variables
-    J1axisFault = axisFault[0];
-    J2axisFault = axisFault[1];
-    J3axisFault = axisFault[2];
-    J4axisFault = axisFault[3];
-    J5axisFault = axisFault[4];
-    J6axisFault = axisFault[5];
-    J7axisFault = axisFault[6];
-    J8axisFault = axisFault[7];
-    J9axisFault = axisFault[8];
-
-    // Calculate total axis fault
-    TotalAxisFault = 0;
-    for (int i = 0; i < numJoints; ++i) {
-      TotalAxisFault += axisFault[i];
-    }
-
-    if (TotalAxisFault == 0 && KinematicError == 0) {
-      resetEncoders();
-      bool drive_succeeded = false;
-      if (simspeed) {
-        drive_succeeded = driveMotorsG(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes);
-      } else {
-        drive_succeeded = driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes, false);
-      }
-      if (!drive_succeeded) {
-        return ar4_protocol::MotionCommandStatus::kRejected;
-      }
-      checkEncoders();
-      if (TotalCollision > 0) {
-        sendRobotPos();
-        return ar4_protocol::MotionCommandStatus::kTerminalFaultReported;
-      }
-      if (response == true) {
-        sendRobotPos();
-      }
-    } else if (KinematicError == 1) {
-      Alarm = "ER";
-      delay(5);
-      Serial.println(Alarm);
-      Alarm = "0";
-      return ar4_protocol::MotionCommandStatus::kTerminalFaultReported;
-    } else {
-      Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault) + String(J7axisFault) + String(J8axisFault) + String(J9axisFault);
-      delay(5);
-      Serial.println(Alarm);
-      Alarm = "0";
-      return ar4_protocol::MotionCommandStatus::kTerminalFaultReported;
-    }
-
-    inData = "";  // Clear recieved buffer
-                  ////////MOVE COMPLETE///////////
-  }
-  return ar4_protocol::MotionCommandStatus::kCompleted;
-}
 
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -3518,124 +3156,46 @@ ar4_protocol::MotionCommandStatus moveJ(
 
 const int32_t MODBUS_PARSE_ERROR = -2;
 
-int32_t modbusQuerry(String inData, int function) {
-  int32_t result;
-  int32_t response;
-  int32_t response2;
-  int slaveIdIndex = inData.indexOf('A');
-  int MBaddressIndex = inData.indexOf('B');
-  int MBvalIndex = inData.indexOf('C');
-  const int markers[] = { slaveIdIndex, MBaddressIndex, MBvalIndex };
-  const int begins[] = {
-    slaveIdIndex + 1,
-    MBaddressIndex + 1,
-    MBvalIndex + 1,
-  };
-  const int ends[] = {
-    MBaddressIndex,
-    MBvalIndex,
-    static_cast<int>(inData.length()),
-  };
-  int parsed[3];
-  if (
-    !ar4_protocol::marker_positions_are_ordered_from(
-      inData.length(),
-      markers,
-      0
-    )
-    || !parse_int_spans(inData, begins, ends, parsed)
-  ) {
-    return MODBUS_PARSE_ERROR;
-  }
-  int SlaveID = parsed[0];
-  int MBaddress = parsed[1];
-  int MBval = parsed[2];
-  ar4_protocol::ModbusOperation operation;
-  if (function == 1) {
-    operation = ar4_protocol::ModbusOperation::kReadCoil;
-  } else if (function == 2) {
-    operation = ar4_protocol::ModbusOperation::kReadDiscreteInput;
-  } else if (function == 3) {
-    operation = ar4_protocol::ModbusOperation::kReadHoldingRegisters;
-  } else if (function == 4) {
-    operation = ar4_protocol::ModbusOperation::kReadInputRegisters;
-  } else if (function == 15) {
-    operation = ar4_protocol::ModbusOperation::kWriteCoil;
-  } else if (function == 6) {
-    operation = ar4_protocol::ModbusOperation::kWriteRegister;
-  } else {
-    return MODBUS_PARSE_ERROR;
-  }
+int32_t execute_modbus_operation(
+  ar4_protocol::ModbusOperation operation,
+  int slave_id,
+  int address,
+  int value
+) {
   if (!ar4_protocol::validate_modbus_request(
-      operation,
-      SlaveID,
-      MBaddress,
-      MBval
-  )) {
-    return MODBUS_PARSE_ERROR;
-  }
+      operation, slave_id, address, value
+  )) return MODBUS_PARSE_ERROR;
   node = ModbusMaster();
-  node.begin(SlaveID, Serial8);
-
-  if (function == 1) {
-    result = node.readCoils(MBaddress, 1);
-    if (result == node.ku8MBSuccess) {
-      response = node.getResponseBuffer(0);
-      return response;
-    } else {
-      response = -1;
-      return response;
-    }
-  } else if (function == 2) {
-    result = node.readDiscreteInputs(MBaddress, 1);
-    if (result == node.ku8MBSuccess) {
-      response = node.getResponseBuffer(0);
-      return response;
-    } else {
-      response = -1;
-      return response;
-    }
-  } else if (function == 3) {
-    result = node.readHoldingRegisters(MBaddress, MBval);
-    if (result == node.ku8MBSuccess) {
-      response = node.getResponseBuffer(0);
-      return response;
-    } else {
-      response = -1;
-      return response;
-    }
-  } else if (function == 4) {
-    result = node.readInputRegisters(MBaddress, MBval);
-    if (result == node.ku8MBSuccess) {
-      response = node.getResponseBuffer(0);
-      return response;
-    } else {
-      response = -1;
-      return response;
-    }
-  } else if (function == 15) {
-    result = node.writeSingleCoil(MBaddress, MBval);
-    if (result == node.ku8MBSuccess) {
-      response = 1;
-      return response;
-    } else {
-      response = -1;
-      return response;
-    }
-  } else if (function == 6) {
-    result = node.writeSingleRegister(MBaddress, MBval);
-    if (result == node.ku8MBSuccess) {
-      response = 1;
-      return response;
-    } else {
-      response = -1;
-      return response;
-    }
-  } else {
-    response = -1;
-    return response;
+  node.begin(slave_id, Serial8);
+  uint8_t result = node.ku8MBInvalidFunction;
+  switch (operation) {
+    case ar4_protocol::ModbusOperation::kReadCoil:
+      result = node.readCoils(address, value);
+      break;
+    case ar4_protocol::ModbusOperation::kReadDiscreteInput:
+      result = node.readDiscreteInputs(address, value);
+      break;
+    case ar4_protocol::ModbusOperation::kReadHoldingRegisters:
+      result = node.readHoldingRegisters(address, value);
+      break;
+    case ar4_protocol::ModbusOperation::kReadInputRegisters:
+      result = node.readInputRegisters(address, value);
+      break;
+    case ar4_protocol::ModbusOperation::kWriteCoil:
+      result = node.writeSingleCoil(address, value);
+      break;
+    case ar4_protocol::ModbusOperation::kWriteRegister:
+      result = node.writeSingleRegister(address, value);
+      break;
   }
+  if (result != node.ku8MBSuccess) return -1;
+  if (
+    operation == ar4_protocol::ModbusOperation::kWriteCoil
+    || operation == ar4_protocol::ModbusOperation::kWriteRegister
+  ) return 1;
+  return node.getResponseBuffer(0);
 }
+
 
 
 
@@ -3644,180 +3204,3065 @@ int32_t modbusQuerry(String inData, int function) {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
-ar4_protocol::SerialFrameReadStatus read_serial_frame_byte(String &frame) {
-  if (Serial.available() <= 0) {
-    return ar4_protocol::SerialFrameReadStatus::kPending;
+void abandon_json_estop_admission_response() {
+  if (!jsonEstopAdmissionResponsePending) return;
+  noInterrupts();
+  // A failed JSON admission response has not reported the stop. Release only
+  // admission gates; the stop latch and controller response owner must survive
+  // while the JSON runtime remains fail-closed.
+  if (jsonEstopAdmissionTelemetryBlocked) {
+    ar4_protocol::clear_joint_telemetry_estop_admission_block(
+      telemetryResponseOwnership
+    );
   }
-  return ar4_protocol::append_serial_frame_byte(
-    frame,
-    serialFrameDiscarding,
-    Serial.read()
+  ar4_protocol::abandon_estop_admission_response(
+    estopAdmissionOwnership
+  );
+  jsonEstopAdmissionDecision = {false, 0};
+  jsonEstopAdmissionTelemetryBlocked = false;
+  jsonEstopAdmissionResponsePending = false;
+  interrupts();
+}
+
+
+void clear_json_live_motion_runtime() {
+  jsonLiveMotion = {};
+}
+
+
+void latch_json_runtime_fault() {
+  clear_json_live_motion_runtime();
+  abandon_json_estop_admission_response();
+  jsonRuntimeFault = true;
+}
+
+
+void apply_json_process_status(
+  ar4_protocol::JsonMainControllerProcessStatus status
+) {
+  switch (status) {
+    case ar4_protocol::JsonMainControllerProcessStatus::kResponseReady:
+      return;
+    case ar4_protocol::JsonMainControllerProcessStatus::kBusy:
+    case ar4_protocol::JsonMainControllerProcessStatus::kControllerFault:
+    case ar4_protocol::JsonMainControllerProcessStatus::kSessionFaulted:
+      latch_json_runtime_fault();
+      return;
+  }
+  latch_json_runtime_fault();
+}
+
+
+void stage_json_estop_admission_response() {
+  noInterrupts();
+  if (jsonEstopAdmissionResponsePending) {
+    interrupts();
+    latch_json_runtime_fault();
+    return;
+  }
+  const bool telemetry_blocked =
+    ar4_protocol::joint_telemetry_estop_admission_blocked(
+      telemetryResponseOwnership
+    );
+  const ar4_protocol::EstopAdmissionDecision decision =
+    ar4_protocol::begin_estop_admission(
+      telemetry_blocked,
+      estopActive,
+      digitalRead(EstopPin) == LOW,
+      estopAdmissionOwnership
+    );
+  if (decision.blocked) {
+    jsonEstopAdmissionDecision = decision;
+    jsonEstopAdmissionTelemetryBlocked = telemetry_blocked;
+    jsonEstopAdmissionResponsePending = true;
+  }
+  interrupts();
+}
+
+
+void complete_json_estop_admission_response() {
+  if (!jsonEstopAdmissionResponsePending) return;
+  noInterrupts();
+  if (jsonEstopAdmissionTelemetryBlocked) {
+    ar4_protocol::clear_joint_telemetry_estop_admission_block(
+      telemetryResponseOwnership
+    );
+  }
+  const bool clear_estop_latch =
+    ar4_protocol::complete_estop_admission_response(
+      jsonEstopAdmissionDecision,
+      digitalRead(EstopPin) == LOW,
+      estopAdmissionOwnership,
+      controllerResponseOwnership
+    );
+  jsonEstopAdmissionDecision = {false, 0};
+  jsonEstopAdmissionTelemetryBlocked = false;
+  jsonEstopAdmissionResponsePending = false;
+  if (clear_estop_latch) estopActive = false;
+  interrupts();
+}
+
+
+bool controller_mutation_estop_blocked() {
+  noInterrupts();
+  const bool blocked =
+    estopActive
+    || digitalRead(EstopPin) == LOW
+    || ar4_protocol::joint_telemetry_estop_admission_blocked(
+      telemetryResponseOwnership
+    );
+  interrupts();
+  return blocked;
+}
+
+
+bool wait_for_controller_duration(
+  uint32_t duration_ms,
+  bool include_admission_blocks
+);
+
+
+bool prepare_json_position_snapshot(
+  ar4_protocol::JsonMainPositionSnapshot &snapshot
+) {
+  KinematicError = 0;
+  updatePos();
+  if (KinematicError != 0) return false;
+  const float external_axes[3] = {J7_pos, J8_pos, J9_pos};
+  const float cartesian[3] = {
+    xyzuvw_Out[0],
+    xyzuvw_Out[1],
+    xyzuvw_Out[2],
+  };
+  const float orientation[3] = {
+    xyzuvw_Out[3],
+    xyzuvw_Out[4],
+    xyzuvw_Out[5],
+  };
+  return ar4_protocol::build_json_main_position_snapshot(
+    JangleIn,
+    external_axes,
+    cartesian,
+    orientation,
+    snapshot
   );
 }
+
+
+bool prepare_json_position_disposition_fields(
+  ar4_protocol::JsonMainPositionResponseSource &source
+) {
+  source.status = ar4_protocol::JsonMainPositionSourceStatus::kAvailable;
+  source.speed_limited = speedViolation == "1";
+  if (
+    (speedViolation != "0" && speedViolation != "1")
+    || debug.length()
+      > ar4_protocol::kJsonPositionControllerDebugMaximumLength
+    || flag.length() > ar4_protocol::kJsonPositionMotionFaultMaximumLength
+  ) {
+    source.status =
+      ar4_protocol::JsonMainPositionSourceStatus::kDispositionUnavailable;
+    return false;
+  }
+  debug.toCharArray(source.controller_debug, sizeof(source.controller_debug));
+  flag.toCharArray(source.motion_fault, sizeof(source.motion_fault));
+  if (
+    !ar4_protocol::json_position_controller_debug_valid(
+      source.controller_debug
+    )
+    || !ar4_protocol::json_position_motion_fault_valid(source.motion_fault)
+  ) {
+    source.status =
+      ar4_protocol::JsonMainPositionSourceStatus::kDispositionUnavailable;
+    return false;
+  }
+  return true;
+}
+
+
+bool prepare_json_position_source(
+  ar4_protocol::JsonMainPositionResponseSource &source
+) {
+  source = {};
+  if (!prepare_json_position_snapshot(source.snapshot)) {
+    source.status =
+      ar4_protocol::JsonMainPositionSourceStatus::kPositionUnavailable;
+    return false;
+  }
+  if (Alarm != "0") {
+    if (
+      Alarm.length()
+        > ar4_protocol::kJsonPositionControllerAlarmMaximumLength
+    ) {
+      source.status =
+        ar4_protocol::JsonMainPositionSourceStatus::kDispositionUnavailable;
+      return true;
+    }
+    Alarm.toCharArray(
+      source.controller_alarm,
+      sizeof(source.controller_alarm)
+    );
+    if (!ar4_protocol::json_position_controller_alarm_valid(
+        source.controller_alarm
+    )) {
+      source.status =
+        ar4_protocol::JsonMainPositionSourceStatus::kDispositionUnavailable;
+      return true;
+    }
+    source.status =
+      ar4_protocol::JsonMainPositionSourceStatus::kControllerAlarm;
+    return true;
+  }
+  prepare_json_position_disposition_fields(source);
+  return true;
+}
+
+
+bool stage_json_external_axis_zero_post_zero_position(
+  uint8_t axis,
+  ar4_protocol::JsonMainPositionResponseSource &postZeroPosition,
+  void *context
+) {
+  const ar4_protocol::JsonMainPositionResponseSource *const currentPosition =
+    static_cast<const ar4_protocol::JsonMainPositionResponseSource *>(context);
+  if (
+    currentPosition == nullptr
+    || currentPosition->status
+      != ar4_protocol::JsonMainPositionSourceStatus::kAvailable
+    || axis < 7
+    || axis > 9
+  ) {
+    return false;
+  }
+  const int zeroSteps[3] = {J7zeroStep, J8zeroStep, J9zeroStep};
+  const float stepsPerUnit[3] = {J7StepDeg, J8StepDeg, J9StepDeg};
+  const size_t index = static_cast<size_t>(axis - 7);
+  ar4_protocol::JsonMainPositionResponseSource staged = *currentPosition;
+  const float zeroPosition =
+    -static_cast<float>(zeroSteps[index]) / stepsPerUnit[index];
+  if (!ar4_protocol::scale_json_position_value(
+      zeroPosition,
+      1000.0,
+      staged.snapshot.external_axes_milliunits[index]
+  )) {
+    return false;
+  }
+  postZeroPosition = staged;
+  return true;
+}
+
+
+ar4_protocol::JsonMainExternalAxisZeroApplyStatus
+apply_json_external_axis_zero(uint8_t axis, void *context) {
+  (void)context;
+  if (axis < 7 || axis > 9) {
+    return ar4_protocol::JsonMainExternalAxisZeroApplyStatus::kInvalid;
+  }
+  int *stepMonitors[3] = {&J7StepM, &J8StepM, &J9StepM};
+  noInterrupts();
+  const bool estopBlocked =
+    estopActive
+    || digitalRead(EstopPin) == LOW
+    || ar4_protocol::joint_telemetry_estop_admission_blocked(
+      telemetryResponseOwnership
+    );
+  if (!estopBlocked) *stepMonitors[axis - 7] = 0;
+  interrupts();
+  return estopBlocked
+    ? ar4_protocol::JsonMainExternalAxisZeroApplyStatus::kEmergencyStopActive
+    : ar4_protocol::JsonMainExternalAxisZeroApplyStatus::kApplied;
+}
+
+
+struct PreparedJsonPositionCorrection {
+  bool ready;
+  int primarySteps[ROBOT_nDOFs];
+  float joints[ROBOT_nDOFs];
+  float cartesian[3];
+  float orientation[3];
+};
+
+PreparedJsonPositionCorrection preparedJsonPositionCorrection = {};
+
+
+bool prepare_json_corrected_position_snapshot(
+  const int (&primarySteps)[ROBOT_nDOFs],
+  PreparedJsonPositionCorrection &prepared,
+  ar4_protocol::JsonMainPositionSnapshot &snapshot
+) {
+  prepared = {};
+  const int zeroSteps[ROBOT_nDOFs] = {
+    J1zeroStep, J2zeroStep, J3zeroStep,
+    J4zeroStep, J5zeroStep, J6zeroStep,
+  };
+  const float stepsPerDegree[ROBOT_nDOFs] = {
+    J1StepDeg, J2StepDeg, J3StepDeg,
+    J4StepDeg, J5StepDeg, J6StepDeg,
+  };
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    const double scale = static_cast<double>(stepsPerDegree[axis]);
+    if (!isfinite(scale) || scale == 0.0) return false;
+    const double position = (
+      static_cast<double>(primarySteps[axis])
+      - static_cast<double>(zeroSteps[axis])
+    ) / scale;
+    if (
+      !isfinite(position)
+      || fabs(position) > std::numeric_limits<float>::max()
+    ) return false;
+    prepared.primarySteps[axis] = primarySteps[axis];
+    prepared.joints[axis] = static_cast<float>(position);
+  }
+
+  if (!robot_set_AR()) return false;
+  float nativePose[6] = {};
+  float externalPose[ar4_protocol::kCartesianPoseSize] = {};
+  forward_kinematics_robot_xyzuvw(prepared.joints, nativePose);
+  if (!ar4_protocol::native_cartesian_pose_to_external(
+      nativePose,
+      externalPose
+  )) return false;
+  for (int axis = 0; axis < 3; ++axis) {
+    prepared.cartesian[axis] = externalPose[axis];
+    prepared.orientation[axis] = externalPose[axis + 3] / M_PI * 180.0f;
+  }
+  const float externalAxes[3] = {J7_pos, J8_pos, J9_pos};
+  if (!ar4_protocol::build_json_main_position_snapshot(
+      prepared.joints,
+      externalAxes,
+      prepared.cartesian,
+      prepared.orientation,
+      snapshot
+  )) return false;
+  prepared.ready = true;
+  return true;
+}
+
+
+bool prepare_json_position_correction(
+  ar4_protocol::JsonMainCorrectPositionResult &result,
+  void *context
+) {
+  PreparedJsonPositionCorrection *prepared =
+    static_cast<PreparedJsonPositionCorrection *>(context);
+  if (prepared == nullptr) return false;
+  *prepared = {};
+  result = {};
+
+  int encoderSteps[ROBOT_nDOFs] = {};
+  uint8_t failureMask = 0;
+  if (!read_configured_encoder_steps(encoderSteps, failureMask)) {
+    latch_encoder_conversion_fault(failureMask);
+    if (!prepare_json_position_snapshot(result.position.snapshot)) {
+      result.outcome =
+        ar4_protocol::JsonMainCorrectPositionOutcome::kPositionUnavailable;
+      result.position.status =
+        ar4_protocol::JsonMainPositionSourceStatus::kPositionUnavailable;
+      return true;
+    }
+    const int encoderFaults[ROBOT_nDOFs] = {
+      J1collisionTrue, J2collisionTrue, J3collisionTrue,
+      J4collisionTrue, J5collisionTrue, J6collisionTrue,
+    };
+    result.outcome = ar4_protocol::JsonMainCorrectPositionOutcome::
+      kEncoderStateUnavailable;
+    result.position.status =
+      ar4_protocol::JsonMainPositionSourceStatus::kAvailable;
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      result.axes[axis] = encoderFaults[axis] != 0;
+    }
+    return true;
+  }
+
+  if (!prepare_json_corrected_position_snapshot(
+      encoderSteps,
+      *prepared,
+      result.position.snapshot
+  )) {
+    result.outcome =
+      ar4_protocol::JsonMainCorrectPositionOutcome::kPositionUnavailable;
+    result.position.status =
+      ar4_protocol::JsonMainPositionSourceStatus::kPositionUnavailable;
+    return true;
+  }
+  if (!prepare_json_position_disposition_fields(result.position)) {
+    *prepared = {};
+    result.outcome =
+      ar4_protocol::JsonMainCorrectPositionOutcome::kPositionUnavailable;
+    result.position.status =
+      ar4_protocol::JsonMainPositionSourceStatus::kPositionUnavailable;
+    return true;
+  }
+  result.outcome =
+    ar4_protocol::JsonMainCorrectPositionOutcome::kCompleted;
+  return true;
+}
+
+
+ar4_protocol::JsonMainCorrectPositionApplyStatus
+apply_json_position_correction(void *context) {
+  PreparedJsonPositionCorrection *prepared =
+    static_cast<PreparedJsonPositionCorrection *>(context);
+  if (prepared == nullptr || !prepared->ready) {
+    return ar4_protocol::JsonMainCorrectPositionApplyStatus::kInvalid;
+  }
+  int *stepMonitors[ROBOT_nDOFs] = {
+    &J1StepM, &J2StepM, &J3StepM, &J4StepM, &J5StepM, &J6StepM,
+  };
+  noInterrupts();
+  const bool estopBlocked =
+    estopActive
+    || digitalRead(EstopPin) == LOW
+    || ar4_protocol::joint_telemetry_estop_admission_blocked(
+      telemetryResponseOwnership
+    );
+  if (!estopBlocked) {
+    // The correction changes no output pins. Keeping the late-stop admission
+    // and state replacement in the same short critical section prevents a
+    // stop ISR from landing between the safety decision and the logical pose
+    // commit.
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      *stepMonitors[axis] = prepared->primarySteps[axis];
+      JangleIn[axis] = prepared->joints[axis];
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+      xyzuvw_Out[axis] = prepared->cartesian[axis];
+      xyzuvw_Out[axis + 3] = prepared->orientation[axis];
+    }
+    KinematicError = 0;
+  }
+  interrupts();
+  *prepared = {};
+  if (estopBlocked) {
+    return ar4_protocol::JsonMainCorrectPositionApplyStatus::
+      kEmergencyStopActive;
+  }
+  return ar4_protocol::JsonMainCorrectPositionApplyStatus::kApplied;
+}
+
+
+template <typename JsonMotionResult>
+bool capture_json_motion_position(JsonMotionResult &result) {
+  return prepare_json_position_snapshot(result.position);
+}
+
+
+struct PreparedCalibrationOperation {
+  int requested[numJoints];
+  int searchSteps[numJoints];
+  int masterSteps[numJoints];
+  int centerSteps[numJoints];
+  int centerDirections[numJoints];
+  int32_t primaryHomeReference[
+    ar4_protocol::kPrimaryHomeReferenceAxisCount
+  ];
+};
+
+
+bool prepare_calibration_operation(
+  const ar4_protocol::JsonMainCalibrationParameters &params,
+  PreparedCalibrationOperation &prepared,
+  bool (&invalidAxes)[numJoints]
+) {
+  prepared = {};
+  for (int axis = 0; axis < numJoints; ++axis) invalidAxes[axis] = false;
+
+  const int stepLimits[numJoints] = {
+    J1StepLim, J2StepLim, J3StepLim, J4StepLim, J5StepLim,
+    J6StepLim, J7StepLim, J8StepLim, J9StepLim,
+  };
+  const int calibrationDirections[numJoints] = {
+    J1CalDir, J2CalDir, J3CalDir, J4CalDir, J5CalDir,
+    J6CalDir, J7CalDir, J8CalDir, J9CalDir,
+  };
+  const float positiveLimits[numJoints] = {
+    J1axisLimPos, J2axisLimPos, J3axisLimPos,
+    J4axisLimPos, J5axisLimPos, J6axisLimPos,
+    J7axisLimPos, J8axisLimPos, J9axisLimPos,
+  };
+  const float negativeLimits[numJoints] = {
+    J1axisLimNeg, J2axisLimNeg, J3axisLimNeg,
+    J4axisLimNeg, J5axisLimNeg, J6axisLimNeg,
+    J7axisLimNeg, J8axisLimNeg, J9axisLimNeg,
+  };
+  const float stepsPerUnit[numJoints] = {
+    J1StepDeg, J2StepDeg, J3StepDeg,
+    J4StepDeg, J5StepDeg, J6StepDeg,
+    J7StepDeg, J8StepDeg, J9StepDeg,
+  };
+  const float baseOffsets[numJoints] = {
+    J1calBaseOff, J2calBaseOff, J3calBaseOff,
+    J4calBaseOff, J5calBaseOff, J6calBaseOff,
+    J7calBaseOff, J8calBaseOff, J9calBaseOff,
+  };
+  const int zeroSteps[numJoints] = {
+    J1zeroStep, J2zeroStep, J3zeroStep,
+    J4zeroStep, J5zeroStep, J6zeroStep,
+    J7zeroStep, J8zeroStep, J9zeroStep,
+  };
+  bool valid = true;
+  for (int axis = 0; axis < numJoints; ++axis) {
+    prepared.requested[axis] = params.axes[axis] ? 1 : 0;
+    int stagedCenterSteps = 0;
+    int stagedJointFiveSteps = 0;
+    if (!ar4_protocol::calibration_reference_steps(
+        prepared.requested[axis],
+        calibrationDirections[axis],
+        positiveLimits[axis],
+        negativeLimits[axis],
+        stepsPerUnit[axis],
+        stepLimits[axis],
+        baseOffsets[axis],
+        params.offsets[axis],
+        axis == 4,
+        prepared.masterSteps[axis],
+        stagedCenterSteps,
+        stagedJointFiveSteps
+    )) {
+      invalidAxes[axis] = true;
+      valid = false;
+      continue;
+    }
+    prepared.searchSteps[axis] = prepared.requested[axis] == 1
+      ? stepLimits[axis]
+      : 0;
+    prepared.centerSteps[axis] = axis == 4
+      ? stagedJointFiveSteps
+      : stagedCenterSteps;
+    prepared.centerDirections[axis] = calibrationDirections[axis] == 1
+      ? 0
+      : 1;
+    if (
+      static_cast<size_t>(axis)
+        < ar4_protocol::kPrimaryHomeReferenceAxisCount
+      && prepared.requested[axis] == 1
+      && !ar4_protocol::primary_parking_reference_from_steps(
+        static_cast<size_t>(axis),
+        prepared.masterSteps[axis],
+        zeroSteps[axis],
+        stepsPerUnit[axis],
+        negativeLimits[axis],
+        positiveLimits[axis],
+        prepared.primaryHomeReference[axis]
+      )
+    ) {
+      invalidAxes[axis] = true;
+      valid = false;
+    }
+  }
+  return valid;
+}
+
+
+void finish_calibration_execution_failure(
+  ar4_protocol::JsonMainCalibrationStage stage,
+  ar4_protocol::JsonMainCalibrationExecutionResult &result
+) {
+  const bool estopBlocked = controller_mutation_estop_blocked();
+  result.outcome = estopBlocked
+    ? ar4_protocol::JsonMainCalibrationOutcome::kEmergencyStop
+    : ar4_protocol::JsonMainCalibrationOutcome::kCalibrationFailed;
+  result.stage = estopBlocked
+    ? ar4_protocol::JsonMainCalibrationStage::kNone
+    : stage;
+  if (!capture_json_motion_position(result)) {
+    result = {};
+    result.outcome =
+      ar4_protocol::JsonMainCalibrationOutcome::kPositionUnavailable;
+  }
+}
+
+
+bool execute_calibration_operation(
+  const ar4_protocol::JsonMainCalibrationParameters &params,
+  ar4_protocol::JsonMainCalibrationExecutionResult &result
+) {
+  result = {};
+  ar4_protocol::consume_motion_rounding_continuation(false, rndTrue);
+  PreparedCalibrationOperation prepared = {};
+  bool invalidAxes[numJoints] = {};
+  if (!prepare_calibration_operation(params, prepared, invalidAxes)) {
+    result.outcome =
+      ar4_protocol::JsonMainCalibrationOutcome::kNotRepresentable;
+    for (int axis = 0; axis < numJoints; ++axis) {
+      result.axes[axis] = invalidAxes[axis];
+    }
+    return true;
+  }
+  if (controller_mutation_estop_blocked()) {
+    finish_calibration_execution_failure(
+      ar4_protocol::JsonMainCalibrationStage::kFastLimitSearch,
+      result
+    );
+    return true;
+  }
+
+  ar4_protocol::PrimaryHomeReferenceState invalidatedHomeReference =
+    primaryHomeReference;
+  for (
+    size_t axis = 0;
+    axis < ar4_protocol::kPrimaryHomeReferenceAxisCount;
+    ++axis
+  ) {
+    if (prepared.requested[axis] == 1) {
+      ar4_protocol::invalidate_primary_home_reference_axis(
+        invalidatedHomeReference,
+        axis
+      );
+    }
+  }
+  primaryHomeReference = invalidatedHomeReference;
+  speedViolation = "0";
+  flag = "";
+
+  if (!driveLimit(
+      prepared.searchSteps,
+      prepared.requested,
+      ar4_protocol::kCalibrationFastSearchSpeedPercent
+  )) {
+    finish_calibration_execution_failure(
+      ar4_protocol::JsonMainCalibrationStage::kFastLimitSearch,
+      result
+    );
+    return true;
+  }
+  if (!backOff(
+      prepared.requested[0],
+      prepared.requested[1],
+      prepared.requested[2],
+      prepared.requested[3],
+      prepared.requested[4],
+      prepared.requested[5],
+      prepared.requested[6],
+      prepared.requested[7],
+      prepared.requested[8],
+      ar4_protocol::kCalibrationReleaseSpeedPercent,
+      ar4_protocol::kCalibrationReleaseMaximumTravelUnits
+  )) {
+    finish_calibration_execution_failure(
+      ar4_protocol::JsonMainCalibrationStage::kSwitchRelease,
+      result
+    );
+    return true;
+  }
+  if (!driveLimit(
+      prepared.searchSteps,
+      prepared.requested,
+      ar4_protocol::kCalibrationSlowSearchSpeedPercent
+  )) {
+    finish_calibration_execution_failure(
+      ar4_protocol::JsonMainCalibrationStage::kSlowLimitSearch,
+      result
+    );
+    return true;
+  }
+
+  int *stepMonitors[numJoints] = {
+    &J1StepM, &J2StepM, &J3StepM, &J4StepM, &J5StepM,
+    &J6StepM, &J7StepM, &J8StepM, &J9StepM,
+  };
+  for (int axis = 0; axis < numJoints; ++axis) {
+    if (prepared.requested[axis] == 1) {
+      *stepMonitors[axis] = prepared.masterSteps[axis];
+    }
+  }
+  if (!driveMotorsJ(
+      prepared.centerSteps[0],
+      prepared.centerSteps[1],
+      prepared.centerSteps[2],
+      prepared.centerSteps[3],
+      prepared.centerSteps[4],
+      prepared.centerSteps[5],
+      prepared.centerSteps[6],
+      prepared.centerSteps[7],
+      prepared.centerSteps[8],
+      prepared.centerDirections[0],
+      prepared.centerDirections[1],
+      prepared.centerDirections[2],
+      prepared.centerDirections[3],
+      prepared.centerDirections[4],
+      prepared.centerDirections[5],
+      prepared.centerDirections[6],
+      prepared.centerDirections[7],
+      prepared.centerDirections[8],
+      "p",
+      ar4_protocol::kCalibrationCenterSpeedPercent,
+      ar4_protocol::kCalibrationCenterAccelerationPercent,
+      ar4_protocol::kCalibrationCenterDecelerationPercent,
+      ar4_protocol::kCalibrationCenterRampPercent,
+      nullptr,
+      false,
+      nullptr,
+      false
+  ) || controller_mutation_estop_blocked()) {
+    finish_calibration_execution_failure(
+      ar4_protocol::JsonMainCalibrationStage::kCenterMove,
+      result
+    );
+    return true;
+  }
+
+  ar4_protocol::PrimaryHomeReferenceState committedHomeReference =
+    primaryHomeReference;
+  for (
+    size_t axis = 0;
+    axis < ar4_protocol::kPrimaryHomeReferenceAxisCount;
+    ++axis
+  ) {
+    if (prepared.requested[axis] == 1) {
+      ar4_protocol::set_primary_home_reference(
+        committedHomeReference,
+        axis,
+        prepared.primaryHomeReference[axis]
+      );
+    }
+  }
+  primaryHomeReference = committedHomeReference;
+  result.outcome = ar4_protocol::JsonMainCalibrationOutcome::kCompleted;
+  result.speed_limited = speedViolation == "1";
+  if (!capture_json_motion_position(result)) {
+    result = {};
+    result.outcome =
+      ar4_protocol::JsonMainCalibrationOutcome::kPositionUnavailable;
+  }
+  return true;
+}
+
+
+bool execute_json_calibration(
+  const ar4_protocol::JsonMainCalibrationParameters &params,
+  ar4_protocol::JsonMainCalibrationExecutionResult &result,
+  void *context
+) {
+  if (context != nullptr) return false;
+  const bool executed = execute_calibration_operation(params, result);
+  speedViolation = "0";
+  flag = "";
+  return executed;
+}
+
+
+bool complete_json_telemetry_ownership(
+  bool telemetryRequested,
+  bool driveSucceeded
+) {
+  if (!telemetryRequested) return true;
+  noInterrupts();
+  const ar4_protocol::JointTelemetryTerminalDecision decision =
+    ar4_protocol::decide_joint_telemetry_terminal(
+      telemetryRequested,
+      driveSucceeded,
+      estopActive,
+      telemetryResponseOwnership
+    );
+  const bool owned =
+    decision.kind != ar4_protocol::JointTelemetryTerminalKind::kNotOwned;
+  if (owned) {
+    ar4_protocol::commit_joint_telemetry_terminal(
+      decision,
+      telemetryResponseOwnership
+    );
+  }
+  interrupts();
+  return owned;
+}
+
+
+enum class PreparedJsonMotionOutcome : uint8_t {
+  kCompleted,
+  kEmergencyStop,
+  kPositionUnavailable,
+  kMotionExecutionFailed,
+  kEncoderCollision,
+  kEncoderStateUnavailable,
+};
+
+
+struct PreparedJsonMotionResult {
+  PreparedJsonMotionOutcome outcome;
+  bool encoder_axes[ROBOT_nDOFs];
+  bool speed_limited;
+};
+
+
+bool execute_prepared_json_motion(
+  const int (&futureSteps)[numJoints],
+  const String &speedMode,
+  float speedValue,
+  float accelerationPercent,
+  float decelerationPercent,
+  float rampPercent,
+  const String &wristConfiguration,
+  const int (&loopModes)[ROBOT_nDOFs],
+  bool telemetryRequested,
+  PreparedJsonMotionResult &result,
+  const ar4_protocol::JsonLiveMotionContinuationSource *
+    continuationSource,
+  bool gcodeTiming = false
+) {
+  result = {};
+  if (!ar4_protocol::json_live_motion_continuation_source_valid(
+      continuationSource
+  )) return false;
+  const int currentSteps[numJoints] = {
+    J1StepM,
+    J2StepM,
+    J3StepM,
+    J4StepM,
+    J5StepM,
+    J6StepM,
+    J7StepM,
+    J8StepM,
+    J9StepM,
+  };
+  const int stepLimits[numJoints] = {
+    J1StepLim,
+    J2StepLim,
+    J3StepLim,
+    J4StepLim,
+    J5StepLim,
+    J6StepLim,
+    J7StepLim,
+    J8StepLim,
+    J9StepLim,
+  };
+  int moveSteps[numJoints] = {};
+  int directions[numJoints] = {};
+  for (int axis = 0; axis < numJoints; ++axis) {
+    if (
+      future_step_is_outside_limit(futureSteps[axis], stepLimits[axis])
+      || future_step_is_outside_limit(currentSteps[axis], stepLimits[axis])
+    ) {
+      result.outcome = PreparedJsonMotionOutcome::kPositionUnavailable;
+      return true;
+    }
+    const int64_t difference =
+      static_cast<int64_t>(currentSteps[axis]) - futureSteps[axis];
+    const int64_t magnitude = difference < 0 ? -difference : difference;
+    if (magnitude > std::numeric_limits<int>::max()) {
+      result.outcome = PreparedJsonMotionOutcome::kPositionUnavailable;
+      return true;
+    }
+    moveSteps[axis] = static_cast<int>(magnitude);
+    directions[axis] = difference <= 0 ? 1 : 0;
+  }
+
+  if (controller_mutation_estop_blocked()) {
+    result.outcome = PreparedJsonMotionOutcome::kEmergencyStop;
+    return true;
+  }
+
+  int32_t encoderCounts[ROBOT_nDOFs] = {};
+  uint8_t encoderFailureMask = 0;
+  if (!build_configured_encoder_counts(
+      encoderCounts,
+      encoderFailureMask
+  )) {
+    latch_encoder_conversion_fault(encoderFailureMask);
+    result.outcome = PreparedJsonMotionOutcome::kEncoderStateUnavailable;
+    const int encoderFaults[ROBOT_nDOFs] = {
+      J1collisionTrue,
+      J2collisionTrue,
+      J3collisionTrue,
+      J4collisionTrue,
+      J5collisionTrue,
+      J6collisionTrue,
+    };
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      result.encoder_axes[axis] = encoderFaults[axis] != 0;
+    }
+    return true;
+  }
+
+  FirmwareMotionModeTransaction motionModes(
+    WristCon,
+    JointLoopModes,
+    wristConfiguration,
+    loopModes
+  );
+  speedViolation = "0";
+  flag = "";
+  if (!resetEncoders()) {
+    result.outcome = PreparedJsonMotionOutcome::kEncoderStateUnavailable;
+    const int encoderFaults[ROBOT_nDOFs] = {
+      J1collisionTrue,
+      J2collisionTrue,
+      J3collisionTrue,
+      J4collisionTrue,
+      J5collisionTrue,
+      J6collisionTrue,
+    };
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      result.encoder_axes[axis] = encoderFaults[axis] != 0;
+    }
+    flag = "";
+    return true;
+  }
+
+  begin_telemetry_response_ownership(telemetryRequested);
+  const bool driveSucceeded = gcodeTiming ? driveMotorsG(
+    moveSteps[0], moveSteps[1], moveSteps[2], moveSteps[3], moveSteps[4],
+    moveSteps[5], moveSteps[6], moveSteps[7], moveSteps[8],
+    directions[0], directions[1], directions[2], directions[3],
+    directions[4], directions[5], directions[6], directions[7],
+    directions[8], speedMode, speedValue, accelerationPercent,
+    decelerationPercent, rampPercent, &motionModes
+  ) : driveMotorsJ(
+    moveSteps[0],
+    moveSteps[1],
+    moveSteps[2],
+    moveSteps[3],
+    moveSteps[4],
+    moveSteps[5],
+    moveSteps[6],
+    moveSteps[7],
+    moveSteps[8],
+    directions[0],
+    directions[1],
+    directions[2],
+    directions[3],
+    directions[4],
+    directions[5],
+    directions[6],
+    directions[7],
+    directions[8],
+    speedMode,
+    speedValue,
+    accelerationPercent,
+    decelerationPercent,
+    rampPercent,
+    &motionModes,
+    telemetryRequested,
+    continuationSource
+  );
+  const bool telemetryOwnershipCompleted =
+    complete_json_telemetry_ownership(
+      telemetryRequested,
+      driveSucceeded
+    );
+  const bool encoderStateAvailable = checkEncoders();
+  const bool estopBlocked = controller_mutation_estop_blocked();
+
+  if (estopBlocked) {
+    result.outcome = PreparedJsonMotionOutcome::kEmergencyStop;
+  } else if (!telemetryOwnershipCompleted || !driveSucceeded) {
+    result.outcome = PreparedJsonMotionOutcome::kMotionExecutionFailed;
+  } else if (!encoderStateAvailable) {
+    result.outcome = PreparedJsonMotionOutcome::kEncoderStateUnavailable;
+  } else if (TotalCollision > 0) {
+    result.outcome = PreparedJsonMotionOutcome::kEncoderCollision;
+  } else {
+    result.outcome = PreparedJsonMotionOutcome::kCompleted;
+    result.speed_limited = speedViolation == "1";
+  }
+  if (
+    result.outcome == PreparedJsonMotionOutcome::kEncoderCollision
+    || result.outcome
+      == PreparedJsonMotionOutcome::kEncoderStateUnavailable
+  ) {
+    const int encoderFaults[ROBOT_nDOFs] = {
+      J1collisionTrue,
+      J2collisionTrue,
+      J3collisionTrue,
+      J4collisionTrue,
+      J5collisionTrue,
+      J6collisionTrue,
+    };
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      result.encoder_axes[axis] = encoderFaults[axis] != 0;
+    }
+  }
+  speedViolation = "0";
+  flag = "";
+  return true;
+}
+
+
+class MotionKinematicsTransaction {
+ public:
+  MotionKinematicsTransaction()
+    : savedKinematicError_(KinematicError) {
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      savedCartesianInput_[axis] = xyzuvw_In[axis];
+      savedJointOutput_[axis] = JangleOut[axis];
+      savedJointEstimate_[axis] = joints_estimate[axis];
+      for (
+        int solution = 0;
+        solution < ar4_protocol::kMaximumWristSolutions;
+        ++solution
+      ) {
+        savedSolutionMatrix_[axis][solution] =
+          SolutionMatrix[axis][solution];
+      }
+    }
+  }
+
+  ~MotionKinematicsTransaction() {
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      xyzuvw_In[axis] = savedCartesianInput_[axis];
+      JangleOut[axis] = savedJointOutput_[axis];
+      joints_estimate[axis] = savedJointEstimate_[axis];
+      for (
+        int solution = 0;
+        solution < ar4_protocol::kMaximumWristSolutions;
+        ++solution
+      ) {
+        SolutionMatrix[axis][solution] =
+          savedSolutionMatrix_[axis][solution];
+      }
+    }
+    KinematicError = savedKinematicError_;
+  }
+
+  MotionKinematicsTransaction(
+    const MotionKinematicsTransaction &
+  ) = delete;
+  MotionKinematicsTransaction &operator=(
+    const MotionKinematicsTransaction &
+  ) = delete;
+
+ private:
+  int savedKinematicError_;
+  float savedCartesianInput_[ROBOT_nDOFs];
+  float savedJointOutput_[ROBOT_nDOFs];
+  float savedJointEstimate_[ROBOT_nDOFs];
+  float savedSolutionMatrix_[
+    ar4_protocol::kWristJointCount
+  ][ar4_protocol::kMaximumWristSolutions];
+};
+
+
+class MotionToolFrameTransaction {
+ public:
+  MotionToolFrameTransaction() {
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      savedToolFrame_[axis] = Robot_Kin_Tool[axis];
+    }
+  }
+
+  ~MotionToolFrameTransaction() {
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      Robot_Kin_Tool[axis] = savedToolFrame_[axis];
+    }
+  }
+
+  MotionToolFrameTransaction(
+    const MotionToolFrameTransaction &
+  ) = delete;
+  MotionToolFrameTransaction &operator=(
+    const MotionToolFrameTransaction &
+  ) = delete;
+
+  bool apply_offset(int frame_index, float frame_offset) {
+    if (frame_index < 0 || frame_index >= ROBOT_nDOFs) return false;
+    float staged = 0.0f;
+    if (!ar4_protocol::stage_json_tool_frame_offset(
+        Robot_Kin_Tool[frame_index],
+        frame_offset,
+        staged
+    )) {
+      return false;
+    }
+    Robot_Kin_Tool[frame_index] = staged;
+    return true;
+  }
+
+ private:
+  float savedToolFrame_[ROBOT_nDOFs];
+};
+
+
+bool refresh_motion_source_position() {
+  KinematicError = 0;
+  updatePos();
+  return KinematicError == 0;
+}
+
+
+bool prepare_joint_speed_target(
+  const float *robotJointsDegrees,
+  bool millimetersPerSecond
+) {
+  if (!millimetersPerSecond) return true;
+  if (robotJointsDegrees == nullptr) return false;
+  if (!refresh_motion_source_position()) return false;
+
+  float externalTarget[ar4_protocol::kCartesianPoseSize] = {};
+  if (!ar4_protocol::joint_speed_target_from_joints(
+    robotJointsDegrees,
+    &forward_kinematics_robot_xyzuvw<float>,
+    externalTarget
+  )) {
+    return false;
+  }
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    xyzuvw_In[axis] = externalTarget[axis];
+  }
+  return true;
+}
+
+
+bool execute_json_move_cartesian_with_timing(
+  const ar4_protocol::JsonMainMoveCartesianParameters &params,
+  ar4_protocol::JsonMainMoveCartesianExecutionResult &result,
+  void *context,
+  bool gcodeTiming,
+  bool capturePosition
+) {
+  const ar4_protocol::JsonLiveMotionContinuationSource *
+    continuationSource = static_cast<
+      const ar4_protocol::JsonLiveMotionContinuationSource *
+    >(context);
+  if (!ar4_protocol::json_live_motion_continuation_source_valid(
+      continuationSource
+  )) return false;
+  result = {};
+
+  // Millimeters-per-second scheduling reads xyzuvw_In during driveMotorsJ;
+  // restoration therefore occurs only after every motion exit path settles.
+  MotionKinematicsTransaction kinematicsTransaction;
+  xyzuvw_In[0] = params.translation_millimeters[0];
+  xyzuvw_In[1] = params.translation_millimeters[1];
+  xyzuvw_In[2] = params.translation_millimeters[2];
+  // Firmware kinematics use Rz, Ry, Rx; JSON uses Rx, Ry, Rz.
+  xyzuvw_In[3] = params.orientation_degrees[2];
+  xyzuvw_In[4] = params.orientation_degrees[1];
+  xyzuvw_In[5] = params.orientation_degrees[0];
+
+  char wristConfiguration = 'A';
+  switch (params.wrist_configuration) {
+    case ar4_protocol::JsonCartesianMotionWristConfiguration::kAutomatic:
+      wristConfiguration = 'A';
+      break;
+    case ar4_protocol::JsonCartesianMotionWristConfiguration::kNear:
+      wristConfiguration = 'N';
+      break;
+    case ar4_protocol::JsonCartesianMotionWristConfiguration::kFar:
+      wristConfiguration = 'F';
+      break;
+  }
+  SolveInverseKinematics(wristConfiguration);
+  const bool kinematicsSolved = KinematicError == 0;
+  float primaryTargets[ROBOT_nDOFs] = {};
+  if (kinematicsSolved) {
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      primaryTargets[axis] = JangleOut[axis];
+    }
+  }
+  if (!kinematicsSolved) {
+    result.outcome =
+      ar4_protocol::JsonMainMoveCartesianOutcome::kKinematicsUnreachable;
+    return true;
+  }
+
+  const float targets[numJoints] = {
+    primaryTargets[0],
+    primaryTargets[1],
+    primaryTargets[2],
+    primaryTargets[3],
+    primaryTargets[4],
+    primaryTargets[5],
+    params.external_axes_units[0],
+    params.external_axes_units[1],
+    params.external_axes_units[2],
+  };
+  float negativeLimits[numJoints] = {};
+  float positiveLimits[numJoints] = {};
+  float stepsPerUnit[numJoints] = {};
+  int stepLimits[numJoints] = {};
+  load_axis_calibration(
+    negativeLimits,
+    positiveLimits,
+    stepsPerUnit,
+    stepLimits
+  );
+  int futureSteps[numJoints] = {};
+  bool representationAxes[numJoints] = {};
+  bool limitAxes[numJoints] = {};
+  bool representationFailure = false;
+  bool limitFailure = false;
+  for (int axis = 0; axis < numJoints; ++axis) {
+    int derivedStepLimit = 0;
+    int zeroStep = 0;
+    if (
+      !ar4_protocol::validate_axis_calibration(
+        negativeLimits[axis],
+        positiveLimits[axis],
+        stepsPerUnit[axis],
+        derivedStepLimit,
+        zeroStep
+      )
+      || stepLimits[axis] < 0
+      || stepLimits[axis] != derivedStepLimit
+    ) {
+      representationAxes[axis] = true;
+      representationFailure = true;
+      continue;
+    }
+    if (
+      targets[axis] < -negativeLimits[axis]
+      || targets[axis] > positiveLimits[axis]
+    ) {
+      limitAxes[axis] = true;
+      limitFailure = true;
+      continue;
+    }
+    if (!ar4_protocol::calibrated_position_to_step(
+        targets[axis],
+        negativeLimits[axis],
+        positiveLimits[axis],
+        stepsPerUnit[axis],
+        stepLimits[axis],
+        futureSteps[axis]
+    )) {
+      representationAxes[axis] = true;
+      representationFailure = true;
+    }
+  }
+  if (representationFailure) {
+    result.outcome =
+      ar4_protocol::JsonMainMoveCartesianOutcome::kPositionNotRepresentable;
+    for (int axis = 0; axis < numJoints; ++axis) {
+      result.axes[axis] = representationAxes[axis];
+    }
+    return true;
+  }
+  if (limitFailure) {
+    result.outcome =
+      ar4_protocol::JsonMainMoveCartesianOutcome::kJointLimitViolation;
+    for (int axis = 0; axis < numJoints; ++axis) {
+      result.axes[axis] = limitAxes[axis];
+    }
+    return true;
+  }
+  if (
+    params.speed_mode
+      == ar4_protocol::JsonCartesianMotionSpeedMode::
+        kMillimetersPerSecond
+    && !refresh_motion_source_position()
+  ) {
+    result.outcome =
+      ar4_protocol::JsonMainMoveCartesianOutcome::kPositionUnavailable;
+    return true;
+  }
+
+  int loopModes[ROBOT_nDOFs] = {};
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    loopModes[axis] = params.loop_modes[axis] ? 1 : 0;
+  }
+  String speedMode = "p";
+  switch (params.speed_mode) {
+    case ar4_protocol::JsonCartesianMotionSpeedMode::kPercent:
+      speedMode = "p";
+      break;
+    case ar4_protocol::JsonCartesianMotionSpeedMode::kSeconds:
+      speedMode = "s";
+      break;
+    case ar4_protocol::JsonCartesianMotionSpeedMode::kMillimetersPerSecond:
+      speedMode = "m";
+      break;
+  }
+  PreparedJsonMotionResult prepared = {};
+  if (!execute_prepared_json_motion(
+      futureSteps,
+      speedMode,
+      params.speed_value,
+      params.acceleration_percent,
+      params.deceleration_percent,
+      params.ramp_percent,
+      String(wristConfiguration),
+      loopModes,
+      params.telemetry_enabled,
+      prepared,
+      continuationSource,
+      gcodeTiming
+  )) {
+    return false;
+  }
+
+  switch (prepared.outcome) {
+    case PreparedJsonMotionOutcome::kCompleted:
+      result.outcome =
+        ar4_protocol::JsonMainMoveCartesianOutcome::kCompleted;
+      result.speed_limited = prepared.speed_limited;
+      break;
+    case PreparedJsonMotionOutcome::kEmergencyStop:
+      result.outcome =
+        ar4_protocol::JsonMainMoveCartesianOutcome::kEmergencyStop;
+      break;
+    case PreparedJsonMotionOutcome::kPositionUnavailable:
+      result.outcome =
+        ar4_protocol::JsonMainMoveCartesianOutcome::kPositionUnavailable;
+      return true;
+    case PreparedJsonMotionOutcome::kMotionExecutionFailed:
+      result.outcome =
+        ar4_protocol::JsonMainMoveCartesianOutcome::kMotionExecutionFailed;
+      break;
+    case PreparedJsonMotionOutcome::kEncoderCollision:
+      result.outcome =
+        ar4_protocol::JsonMainMoveCartesianOutcome::kEncoderCollision;
+      break;
+    case PreparedJsonMotionOutcome::kEncoderStateUnavailable:
+      result.outcome = ar4_protocol::JsonMainMoveCartesianOutcome::
+        kEncoderStateUnavailable;
+      break;
+  }
+  if (
+    prepared.outcome == PreparedJsonMotionOutcome::kEncoderCollision
+    || prepared.outcome
+      == PreparedJsonMotionOutcome::kEncoderStateUnavailable
+  ) {
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      result.axes[axis] = prepared.encoder_axes[axis];
+    }
+  }
+  if (capturePosition && !capture_json_motion_position(result)) {
+    result = {};
+    result.outcome =
+      ar4_protocol::JsonMainMoveCartesianOutcome::kPositionUnavailable;
+  }
+  return true;
+}
+
+bool execute_json_move_cartesian(
+  const ar4_protocol::JsonMainMoveCartesianParameters &params,
+  ar4_protocol::JsonMainMoveCartesianExecutionResult &result,
+  void *context
+) {
+  return execute_json_move_cartesian_with_timing(
+    params, result, context, false, true
+  );
+}
+
+
+bool execute_json_move_joints(
+  const ar4_protocol::JsonMainMoveJointsParameters &params,
+  ar4_protocol::JsonMainMoveJointsExecutionResult &result,
+  void *context
+) {
+  const ar4_protocol::JsonLiveMotionContinuationSource *
+    continuationSource = static_cast<
+      const ar4_protocol::JsonLiveMotionContinuationSource *
+    >(context);
+  if (!ar4_protocol::json_live_motion_continuation_source_valid(
+      continuationSource
+  )) return false;
+  result = {};
+
+  float positions[numJoints] = {};
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    positions[axis] = params.robot_joints_degrees[axis];
+  }
+  for (int axis = 0; axis < 3; ++axis) {
+    positions[axis + ROBOT_nDOFs] = params.external_axes_units[axis];
+  }
+
+  float negativeLimits[numJoints] = {};
+  float positiveLimits[numJoints] = {};
+  float stepsPerUnit[numJoints] = {};
+  int stepLimits[numJoints] = {};
+  load_axis_calibration(
+    negativeLimits,
+    positiveLimits,
+    stepsPerUnit,
+    stepLimits
+  );
+  int futureSteps[numJoints] = {};
+  bool representationFailure = false;
+  bool limitFailure = false;
+  bool representationAxes[numJoints] = {};
+  bool limitAxes[numJoints] = {};
+  for (int axis = 0; axis < numJoints; ++axis) {
+    int derivedStepLimit = 0;
+    int zeroStep = 0;
+    if (
+      !ar4_protocol::validate_axis_calibration(
+        negativeLimits[axis],
+        positiveLimits[axis],
+        stepsPerUnit[axis],
+        derivedStepLimit,
+        zeroStep
+      )
+      || stepLimits[axis] < 0
+      || stepLimits[axis] != derivedStepLimit
+    ) {
+      representationAxes[axis] = true;
+      representationFailure = true;
+      continue;
+    }
+    if (
+      positions[axis] < -negativeLimits[axis]
+      || positions[axis] > positiveLimits[axis]
+    ) {
+      limitAxes[axis] = true;
+      limitFailure = true;
+      continue;
+    }
+    if (!ar4_protocol::calibrated_position_to_step(
+        positions[axis],
+        negativeLimits[axis],
+        positiveLimits[axis],
+        stepsPerUnit[axis],
+        stepLimits[axis],
+        futureSteps[axis]
+    )) {
+      representationAxes[axis] = true;
+      representationFailure = true;
+    }
+  }
+  if (representationFailure) {
+    result.outcome =
+      ar4_protocol::JsonMainMoveJointsOutcome::kPositionNotRepresentable;
+    for (int axis = 0; axis < numJoints; ++axis) {
+      result.axes[axis] = representationAxes[axis];
+    }
+    return true;
+  }
+  if (limitFailure) {
+    result.outcome =
+      ar4_protocol::JsonMainMoveJointsOutcome::kJointLimitViolation;
+    for (int axis = 0; axis < numJoints; ++axis) {
+      result.axes[axis] = limitAxes[axis];
+    }
+    return true;
+  }
+
+  MotionKinematicsTransaction kinematicsTransaction;
+  if (!prepare_joint_speed_target(
+      params.robot_joints_degrees,
+      params.speed_mode
+        == ar4_protocol::JsonJointMotionSpeedMode::kMillimetersPerSecond
+  )) {
+    result.outcome =
+      ar4_protocol::JsonMainMoveJointsOutcome::kPositionUnavailable;
+    return true;
+  }
+
+  int loopModes[ROBOT_nDOFs] = {};
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    loopModes[axis] = params.loop_modes[axis] ? 1 : 0;
+  }
+  String wristConfiguration = "A";
+  switch (params.wrist_configuration) {
+    case ar4_protocol::JsonJointMotionWristConfiguration::kNear:
+      wristConfiguration = "N";
+      break;
+    case ar4_protocol::JsonJointMotionWristConfiguration::kFar:
+      wristConfiguration = "F";
+      break;
+    case ar4_protocol::JsonJointMotionWristConfiguration::kAutomatic:
+      wristConfiguration = "A";
+      break;
+  }
+  String speedMode = "p";
+  switch (params.speed_mode) {
+    case ar4_protocol::JsonJointMotionSpeedMode::kPercent:
+      speedMode = "p";
+      break;
+    case ar4_protocol::JsonJointMotionSpeedMode::kSeconds:
+      speedMode = "s";
+      break;
+    case ar4_protocol::JsonJointMotionSpeedMode::kMillimetersPerSecond:
+      speedMode = "m";
+      break;
+  }
+  PreparedJsonMotionResult prepared = {};
+  if (!execute_prepared_json_motion(
+    futureSteps,
+    speedMode,
+    params.speed_value,
+    params.acceleration_percent,
+    params.deceleration_percent,
+    params.ramp_percent,
+    wristConfiguration,
+    loopModes,
+    params.telemetry_enabled,
+    prepared,
+    continuationSource
+  )) {
+    return false;
+  }
+  switch (prepared.outcome) {
+    case PreparedJsonMotionOutcome::kCompleted:
+      result.outcome = ar4_protocol::JsonMainMoveJointsOutcome::kCompleted;
+      result.speed_limited = prepared.speed_limited;
+      break;
+    case PreparedJsonMotionOutcome::kEmergencyStop:
+      result.outcome =
+        ar4_protocol::JsonMainMoveJointsOutcome::kEmergencyStop;
+      break;
+    case PreparedJsonMotionOutcome::kPositionUnavailable:
+      result.outcome =
+        ar4_protocol::JsonMainMoveJointsOutcome::kPositionUnavailable;
+      return true;
+    case PreparedJsonMotionOutcome::kMotionExecutionFailed:
+      result.outcome =
+        ar4_protocol::JsonMainMoveJointsOutcome::kMotionExecutionFailed;
+      break;
+    case PreparedJsonMotionOutcome::kEncoderCollision:
+      result.outcome =
+        ar4_protocol::JsonMainMoveJointsOutcome::kEncoderCollision;
+      break;
+    case PreparedJsonMotionOutcome::kEncoderStateUnavailable:
+      result.outcome =
+        ar4_protocol::JsonMainMoveJointsOutcome::kEncoderStateUnavailable;
+      break;
+  }
+  if (
+    prepared.outcome == PreparedJsonMotionOutcome::kEncoderCollision
+    || prepared.outcome
+      == PreparedJsonMotionOutcome::kEncoderStateUnavailable
+  ) {
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      result.axes[axis] = prepared.encoder_axes[axis];
+    }
+  }
+  if (!capture_json_motion_position(result)) {
+    result = {};
+    result.outcome =
+      ar4_protocol::JsonMainMoveJointsOutcome::kPositionUnavailable;
+  }
+  return true;
+}
+
+
+bool execute_json_jog_tool_with_telemetry(
+  const ar4_protocol::JsonMainToolJogParameters &params,
+  ar4_protocol::JsonMainToolJogExecutionResult &result,
+  bool telemetryRequested,
+  ar4_protocol::JsonLiveMotionContinuationSource *
+    continuationSource
+) {
+  if (!ar4_protocol::json_live_motion_continuation_source_valid(
+      continuationSource
+  )) return false;
+  result = {};
+
+  int toolFrameIndex = -1;
+  float toolFrameOffset = 0.0f;
+  if (!ar4_protocol::decode_json_tool_jog_offset(
+      params,
+      toolFrameIndex,
+      toolFrameOffset
+  )) {
+    return false;
+  }
+
+  float primaryTargets[ROBOT_nDOFs] = {};
+  {
+    MotionKinematicsTransaction kinematicsTransaction;
+    if (!refresh_motion_source_position()) {
+      result.outcome =
+        ar4_protocol::JsonMainToolJogOutcome::kPositionUnavailable;
+      return true;
+    }
+    MotionToolFrameTransaction toolFrameTransaction;
+    if (!toolFrameTransaction.apply_offset(
+        toolFrameIndex,
+        toolFrameOffset
+    )) {
+      result.outcome =
+        ar4_protocol::JsonMainToolJogOutcome::kPositionNotRepresentable;
+      return true;
+    }
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      xyzuvw_In[axis] = xyzuvw_Out[axis];
+    }
+
+    char wristConfiguration = 'A';
+    switch (params.wrist_configuration) {
+      case ar4_protocol::JsonCartesianMotionWristConfiguration::kAutomatic:
+        wristConfiguration = 'A';
+        break;
+      case ar4_protocol::JsonCartesianMotionWristConfiguration::kNear:
+        wristConfiguration = 'N';
+        break;
+      case ar4_protocol::JsonCartesianMotionWristConfiguration::kFar:
+        wristConfiguration = 'F';
+        break;
+    }
+    SolveInverseKinematics(wristConfiguration);
+    if (KinematicError != 0) {
+      result.outcome =
+        ar4_protocol::JsonMainToolJogOutcome::kKinematicsUnreachable;
+      return true;
+    }
+    for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      primaryTargets[axis] = JangleOut[axis];
+    }
+  }
+
+  ar4_protocol::JsonMainMoveJointsParameters jointParams = {};
+  for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    jointParams.robot_joints_degrees[axis] = primaryTargets[axis];
+    jointParams.loop_modes[axis] = params.loop_modes[axis];
+  }
+  jointParams.external_axes_units[0] = J7_pos;
+  jointParams.external_axes_units[1] = J8_pos;
+  jointParams.external_axes_units[2] = J9_pos;
+  switch (params.speed_mode) {
+    case ar4_protocol::JsonCartesianMotionSpeedMode::kPercent:
+      jointParams.speed_mode =
+        ar4_protocol::JsonJointMotionSpeedMode::kPercent;
+      break;
+    case ar4_protocol::JsonCartesianMotionSpeedMode::kSeconds:
+      jointParams.speed_mode =
+        ar4_protocol::JsonJointMotionSpeedMode::kSeconds;
+      break;
+    case ar4_protocol::JsonCartesianMotionSpeedMode::
+        kMillimetersPerSecond:
+      return false;
+  }
+  jointParams.speed_value = params.speed_value;
+  jointParams.acceleration_percent = params.acceleration_percent;
+  jointParams.deceleration_percent = params.deceleration_percent;
+  jointParams.ramp_percent = params.ramp_percent;
+  switch (params.wrist_configuration) {
+    case ar4_protocol::JsonCartesianMotionWristConfiguration::kAutomatic:
+      jointParams.wrist_configuration =
+        ar4_protocol::JsonJointMotionWristConfiguration::kAutomatic;
+      break;
+    case ar4_protocol::JsonCartesianMotionWristConfiguration::kNear:
+      jointParams.wrist_configuration =
+        ar4_protocol::JsonJointMotionWristConfiguration::kNear;
+      break;
+    case ar4_protocol::JsonCartesianMotionWristConfiguration::kFar:
+      jointParams.wrist_configuration =
+        ar4_protocol::JsonJointMotionWristConfiguration::kFar;
+      break;
+  }
+  jointParams.telemetry_enabled = telemetryRequested;
+
+  ar4_protocol::JsonMainMoveJointsExecutionResult jointResult = {};
+  if (!execute_json_move_joints(
+      jointParams,
+      jointResult,
+      continuationSource
+  )) {
+    return false;
+  }
+  switch (jointResult.outcome) {
+    case ar4_protocol::JsonMainMoveJointsOutcome::kCompleted:
+      result.outcome = ar4_protocol::JsonMainToolJogOutcome::kCompleted;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kJointLimitViolation:
+      result.outcome =
+        ar4_protocol::JsonMainToolJogOutcome::kJointLimitViolation;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kPositionNotRepresentable:
+      result.outcome =
+        ar4_protocol::JsonMainToolJogOutcome::kPositionNotRepresentable;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kEmergencyStop:
+      result.outcome = ar4_protocol::JsonMainToolJogOutcome::kEmergencyStop;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kPositionUnavailable:
+      result.outcome =
+        ar4_protocol::JsonMainToolJogOutcome::kPositionUnavailable;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kMotionExecutionFailed:
+      result.outcome =
+        ar4_protocol::JsonMainToolJogOutcome::kMotionExecutionFailed;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kEncoderCollision:
+      result.outcome =
+        ar4_protocol::JsonMainToolJogOutcome::kEncoderCollision;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kEncoderStateUnavailable:
+      result.outcome =
+        ar4_protocol::JsonMainToolJogOutcome::kEncoderStateUnavailable;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kInvalid:
+      return false;
+  }
+  result.position = jointResult.position;
+  for (size_t axis = 0; axis < ar4_protocol::kJsonCartesianMotionAxisCount;
+       ++axis) {
+    result.axes[axis] = jointResult.axes[axis];
+  }
+  result.speed_limited = jointResult.speed_limited;
+  for (size_t index = 0; index < sizeof(result.controller_debug); ++index) {
+    result.controller_debug[index] = jointResult.controller_debug[index];
+  }
+  return true;
+}
+
+
+bool execute_json_jog_tool(
+  const ar4_protocol::JsonMainToolJogParameters &params,
+  ar4_protocol::JsonMainToolJogExecutionResult &result,
+  void *context
+) {
+  (void)context;
+  return execute_json_jog_tool_with_telemetry(
+    params,
+    result,
+    false,
+    nullptr
+  );
+}
+
+
+bool begin_json_live_jog(
+  uint32_t motionId,
+  const ar4_protocol::JsonMainLiveJogParameters &params,
+  void *context
+) {
+  (void)context;
+  if (
+    motionId == 0
+    || !ar4_protocol::json_live_motion_owner_empty(jsonLiveMotion.owner)
+    || !ar4_protocol::json_live_jog_detail::parameters_valid(params)
+  ) return false;
+  JsonLiveMotionRuntime pending = {};
+  if (!ar4_protocol::begin_json_live_motion(
+      motionId,
+      params.lease_milliseconds,
+      pending.owner
+  )) return false;
+  pending.parameters = params;
+  jsonLiveMotion = pending;
+  return true;
+}
+
+
+bool request_json_live_stop(uint32_t motionId, void *context) {
+  (void)context;
+  if (
+    jsonLiveMotion.owner.motion_id == motionId
+    && jsonLiveMotion.owner.state
+      == JsonLiveMotionRuntimeState::kTerminalReady
+  ) {
+    return true;
+  }
+  return ar4_protocol::request_json_live_motion_stop(
+    motionId,
+    jsonLiveMotion.owner
+  );
+}
+
+
+ar4_protocol::JsonMainLiveJogRenewStatus renew_json_live_motion_callback(
+  uint32_t motionId,
+  void *context
+) {
+  (void)context;
+  if (ar4_protocol::renew_json_live_motion(
+      motionId,
+      static_cast<uint32_t>(millis()),
+      jsonLiveMotion.owner
+  )) {
+    return ar4_protocol::JsonMainLiveJogRenewStatus::kRenewed;
+  }
+  if (
+    jsonLiveMotion.owner.motion_id == motionId
+    && (
+      jsonLiveMotion.owner.state
+        == JsonLiveMotionRuntimeState::kLeaseExpired
+      || (
+        jsonLiveMotion.owner.state
+          == JsonLiveMotionRuntimeState::kTerminalReady
+        && jsonLiveMotion.terminal.outcome
+          == ar4_protocol::JsonMainLiveJogOutcome::kControlLeaseExpired
+      )
+    )
+  ) {
+    return ar4_protocol::JsonMainLiveJogRenewStatus::kLeaseExpired;
+  }
+  if (
+    jsonLiveMotion.owner.motion_id == motionId
+    && (
+      jsonLiveMotion.owner.state
+        == JsonLiveMotionRuntimeState::kStopRequested
+      || jsonLiveMotion.owner.state
+        == JsonLiveMotionRuntimeState::kTerminalReady
+    )
+  ) {
+    return ar4_protocol::JsonMainLiveJogRenewStatus::kMotionSettled;
+  }
+  return ar4_protocol::JsonMainLiveJogRenewStatus::kFault;
+}
+
+
+bool json_live_motion_continuation(void *context) {
+  (void)context;
+  return ar4_protocol::json_live_motion_may_continue(
+    jsonLiveMotion.owner.motion_id,
+    static_cast<uint32_t>(millis()),
+    jsonLiveMotion.owner
+  );
+}
+
+
+bool json_live_motion_control_input_pending(void *context) {
+  (void)context;
+  return !jsonRuntimeFault
+    && jsonMainControllerOwner.state()
+      == ar4_protocol::JsonMainControllerOwnerState::kIdle
+    && Serial.available() > 0;
+}
+
+
+bool service_one_json_live_motion_control_byte(void *context) {
+  (void)context;
+  processSerial();
+  return !jsonRuntimeFault;
+}
+
+
+bool service_json_live_motion_control(void *context) {
+  (void)context;
+  const ar4_protocol::JsonLiveMotionControlInputSource controlInput = {
+    json_live_motion_control_input_pending,
+    service_one_json_live_motion_control_byte,
+    nullptr,
+  };
+  if (!ar4_protocol::service_bounded_json_live_motion_control_input(
+      controlInput
+  )) return false;
+  service_json_output();
+  return !jsonRuntimeFault;
+}
+
+
+template <typename SourceResult>
+void copy_json_live_result_fields(
+  const SourceResult &source,
+  ar4_protocol::JsonMainLiveJogExecutionResult &target
+) {
+  target.position = source.position;
+  for (
+    size_t axis = 0;
+    axis < ar4_protocol::kJsonLiveJogControllerAxisCount;
+    ++axis
+  ) {
+    target.axes[axis] = source.axes[axis];
+  }
+  target.speed_limited = source.speed_limited;
+  for (size_t index = 0; index < sizeof(target.controller_debug); ++index) {
+    target.controller_debug[index] = source.controller_debug[index];
+  }
+}
+
+
+ar4_protocol::JsonMainLiveJogExecutionResult convert_json_live_result(
+  const ar4_protocol::JsonMainMoveJointsExecutionResult &source
+) {
+  ar4_protocol::JsonMainLiveJogExecutionResult target = {};
+  copy_json_live_result_fields(source, target);
+  switch (source.outcome) {
+    case ar4_protocol::JsonMainMoveJointsOutcome::kCompleted:
+      target.outcome = ar4_protocol::JsonMainLiveJogOutcome::kCompleted;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kJointLimitViolation:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kJointLimitReached;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kPositionNotRepresentable:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kPositionNotRepresentable;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kEmergencyStop:
+      target.outcome = ar4_protocol::JsonMainLiveJogOutcome::kEmergencyStop;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kPositionUnavailable:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kPositionUnavailable;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kMotionExecutionFailed:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kMotionExecutionFailed;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kEncoderCollision:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kEncoderCollision;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kEncoderStateUnavailable:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kEncoderStateUnavailable;
+      break;
+    case ar4_protocol::JsonMainMoveJointsOutcome::kInvalid:
+      target.outcome = ar4_protocol::JsonMainLiveJogOutcome::kInvalid;
+      break;
+  }
+  return target;
+}
+
+
+ar4_protocol::JsonMainLiveJogExecutionResult convert_json_live_result(
+  const ar4_protocol::JsonMainMoveCartesianExecutionResult &source
+) {
+  ar4_protocol::JsonMainLiveJogExecutionResult target = {};
+  copy_json_live_result_fields(source, target);
+  switch (source.outcome) {
+    case ar4_protocol::JsonMainMoveCartesianOutcome::kCompleted:
+      target.outcome = ar4_protocol::JsonMainLiveJogOutcome::kCompleted;
+      break;
+    case ar4_protocol::JsonMainMoveCartesianOutcome::kKinematicsUnreachable:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kKinematicsUnreachable;
+      break;
+    case ar4_protocol::JsonMainMoveCartesianOutcome::kJointLimitViolation:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kJointLimitReached;
+      break;
+    case ar4_protocol::JsonMainMoveCartesianOutcome::
+        kPositionNotRepresentable:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kPositionNotRepresentable;
+      break;
+    case ar4_protocol::JsonMainMoveCartesianOutcome::kEmergencyStop:
+      target.outcome = ar4_protocol::JsonMainLiveJogOutcome::kEmergencyStop;
+      break;
+    case ar4_protocol::JsonMainMoveCartesianOutcome::kPositionUnavailable:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kPositionUnavailable;
+      break;
+    case ar4_protocol::JsonMainMoveCartesianOutcome::kMotionExecutionFailed:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kMotionExecutionFailed;
+      break;
+    case ar4_protocol::JsonMainMoveCartesianOutcome::kEncoderCollision:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kEncoderCollision;
+      break;
+    case ar4_protocol::JsonMainMoveCartesianOutcome::
+        kEncoderStateUnavailable:
+      target.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kEncoderStateUnavailable;
+      break;
+    case ar4_protocol::JsonMainMoveCartesianOutcome::kInvalid:
+      target.outcome = ar4_protocol::JsonMainLiveJogOutcome::kInvalid;
+      break;
+  }
+  return target;
+}
+
+
+void settle_json_live_terminal(
+  ar4_protocol::JsonMainLiveJogExecutionResult terminal
+) {
+  if (
+    terminal.outcome
+      != ar4_protocol::JsonMainLiveJogOutcome::kPositionUnavailable
+    && !capture_json_motion_position(terminal)
+  ) {
+    terminal = {};
+    terminal.outcome =
+      ar4_protocol::JsonMainLiveJogOutcome::kPositionUnavailable;
+  }
+  jsonLiveMotion.terminal = terminal;
+  if (!ar4_protocol::mark_json_live_motion_terminal_ready(
+      jsonLiveMotion.owner
+  )) {
+    latch_json_runtime_fault();
+  }
+}
+
+
+void record_json_live_segment_result(
+  ar4_protocol::JsonMainLiveJogExecutionResult result
+) {
+  if (
+    jsonLiveMotion.owner.state
+      == JsonLiveMotionRuntimeState::kLeaseExpired
+    && result.outcome
+      == ar4_protocol::JsonMainLiveJogOutcome::kMotionExecutionFailed
+  ) {
+    result = {};
+    result.outcome =
+      ar4_protocol::JsonMainLiveJogOutcome::kControlLeaseExpired;
+  }
+  if (result.outcome == ar4_protocol::JsonMainLiveJogOutcome::kCompleted) {
+    jsonLiveMotion.speed_limited =
+      jsonLiveMotion.speed_limited || result.speed_limited;
+    jsonLiveMotion.terminal = result;
+    jsonLiveMotion.terminal.speed_limited = jsonLiveMotion.speed_limited;
+    return;
+  }
+  settle_json_live_terminal(result);
+}
+
+
+bool execute_json_live_joint_segment() {
+  ar4_protocol::JsonMainPositionSnapshot position = {};
+  if (!prepare_json_position_snapshot(position)) {
+    ar4_protocol::JsonMainLiveJogExecutionResult terminal = {};
+    terminal.outcome =
+      ar4_protocol::JsonMainLiveJogOutcome::kPositionUnavailable;
+    settle_json_live_terminal(terminal);
+    return true;
+  }
+  ar4_protocol::JsonMainMoveJointsParameters params = {};
+  for (size_t axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    params.robot_joints_degrees[axis] =
+      static_cast<float>(position.robot_joints_millidegrees[axis])
+        / 1000.0f;
+    params.loop_modes[axis] = jsonLiveMotion.parameters.loop_modes[axis];
+  }
+  for (size_t axis = 0; axis < 3; ++axis) {
+    params.external_axes_units[axis] =
+      static_cast<float>(position.external_axes_milliunits[axis])
+        / 1000.0f;
+  }
+  const float direction =
+    jsonLiveMotion.parameters.direction
+        == ar4_protocol::JsonToolJogDirection::kPositive
+      ? 1.0f
+      : -1.0f;
+  const size_t axis = jsonLiveMotion.parameters.axis_index;
+  if (axis < ROBOT_nDOFs) {
+    params.robot_joints_degrees[axis] += direction * 0.25f;
+  } else if (axis < numJoints) {
+    params.external_axes_units[axis - ROBOT_nDOFs] += direction * 0.25f;
+  } else {
+    return false;
+  }
+  params.speed_mode = jsonLiveMotion.parameters.speed_mode;
+  params.speed_value = jsonLiveMotion.parameters.speed_value;
+  params.acceleration_percent =
+    jsonLiveMotion.parameters.acceleration_percent;
+  params.deceleration_percent =
+    jsonLiveMotion.parameters.deceleration_percent;
+  params.ramp_percent = jsonLiveMotion.parameters.ramp_percent;
+  params.wrist_configuration =
+    jsonLiveMotion.parameters.wrist_configuration;
+  params.telemetry_enabled = jsonLiveMotion.parameters.telemetry_enabled;
+  ar4_protocol::JsonMainMoveJointsExecutionResult result = {};
+  ar4_protocol::JsonLiveMotionContinuationSource continuation = {
+    json_live_motion_continuation,
+    service_json_live_motion_control,
+    nullptr,
+  };
+  const bool executed = execute_json_move_joints(
+    params,
+    result,
+    &continuation
+  );
+  if (ar4_protocol::json_live_motion_interrupted_by_control(
+      jsonLiveMotion.owner.state
+  )) return true;
+  if (!executed) return false;
+  record_json_live_segment_result(convert_json_live_result(result));
+  return true;
+}
+
+
+bool execute_json_live_cartesian_segment() {
+  if (!refresh_motion_source_position()) {
+    ar4_protocol::JsonMainLiveJogExecutionResult terminal = {};
+    terminal.outcome =
+      ar4_protocol::JsonMainLiveJogOutcome::kPositionUnavailable;
+    settle_json_live_terminal(terminal);
+    return true;
+  }
+  ar4_protocol::JsonMainMoveCartesianParameters params = {};
+  params.translation_millimeters[0] = xyzuvw_Out[0];
+  params.translation_millimeters[1] = xyzuvw_Out[1];
+  params.translation_millimeters[2] = xyzuvw_Out[2];
+  params.orientation_degrees[0] = xyzuvw_Out[5];
+  params.orientation_degrees[1] = xyzuvw_Out[4];
+  params.orientation_degrees[2] = xyzuvw_Out[3];
+  params.external_axes_units[0] = J7_pos;
+  params.external_axes_units[1] = J8_pos;
+  params.external_axes_units[2] = J9_pos;
+  const float direction =
+    jsonLiveMotion.parameters.direction
+        == ar4_protocol::JsonToolJogDirection::kPositive
+      ? 1.0f
+      : -1.0f;
+  const size_t axis = jsonLiveMotion.parameters.axis_index;
+  if (axis < 3) {
+    params.translation_millimeters[axis] += direction * 0.25f;
+  } else if (axis < ROBOT_nDOFs) {
+    params.orientation_degrees[axis - 3] += direction * 0.25f;
+  } else {
+    return false;
+  }
+  params.speed_mode =
+    ar4_protocol::JsonCartesianMotionSpeedMode::kPercent;
+  params.speed_value = jsonLiveMotion.parameters.speed_value;
+  params.acceleration_percent =
+    jsonLiveMotion.parameters.acceleration_percent;
+  params.deceleration_percent =
+    jsonLiveMotion.parameters.deceleration_percent;
+  params.ramp_percent = jsonLiveMotion.parameters.ramp_percent;
+  switch (jsonLiveMotion.parameters.wrist_configuration) {
+    case ar4_protocol::JsonJointMotionWristConfiguration::kNear:
+      params.wrist_configuration =
+        ar4_protocol::JsonCartesianMotionWristConfiguration::kNear;
+      break;
+    case ar4_protocol::JsonJointMotionWristConfiguration::kFar:
+      params.wrist_configuration =
+        ar4_protocol::JsonCartesianMotionWristConfiguration::kFar;
+      break;
+    case ar4_protocol::JsonJointMotionWristConfiguration::kAutomatic:
+      params.wrist_configuration =
+        ar4_protocol::JsonCartesianMotionWristConfiguration::kAutomatic;
+      break;
+  }
+  for (size_t joint = 0; joint < ROBOT_nDOFs; ++joint) {
+    params.loop_modes[joint] = jsonLiveMotion.parameters.loop_modes[joint];
+  }
+  params.telemetry_enabled = jsonLiveMotion.parameters.telemetry_enabled;
+  ar4_protocol::JsonMainMoveCartesianExecutionResult result = {};
+  ar4_protocol::JsonLiveMotionContinuationSource continuation = {
+    json_live_motion_continuation,
+    service_json_live_motion_control,
+    nullptr,
+  };
+  const bool executed = execute_json_move_cartesian(
+    params,
+    result,
+    &continuation
+  );
+  if (ar4_protocol::json_live_motion_interrupted_by_control(
+      jsonLiveMotion.owner.state
+  )) return true;
+  if (!executed) return false;
+  record_json_live_segment_result(convert_json_live_result(result));
+  return true;
+}
+
+
+bool execute_json_live_tool_segment() {
+  ar4_protocol::JsonMainToolJogParameters params = {};
+  params.axis = static_cast<ar4_protocol::JsonToolJogAxis>(
+    jsonLiveMotion.parameters.axis_index
+  );
+  params.direction = jsonLiveMotion.parameters.direction;
+  params.distance = 0.25f;
+  params.speed_mode = ar4_protocol::JsonCartesianMotionSpeedMode::kPercent;
+  params.speed_value = jsonLiveMotion.parameters.speed_value;
+  params.acceleration_percent =
+    jsonLiveMotion.parameters.acceleration_percent;
+  params.deceleration_percent =
+    jsonLiveMotion.parameters.deceleration_percent;
+  params.ramp_percent = jsonLiveMotion.parameters.ramp_percent;
+  switch (jsonLiveMotion.parameters.wrist_configuration) {
+    case ar4_protocol::JsonJointMotionWristConfiguration::kNear:
+      params.wrist_configuration =
+        ar4_protocol::JsonCartesianMotionWristConfiguration::kNear;
+      break;
+    case ar4_protocol::JsonJointMotionWristConfiguration::kFar:
+      params.wrist_configuration =
+        ar4_protocol::JsonCartesianMotionWristConfiguration::kFar;
+      break;
+    case ar4_protocol::JsonJointMotionWristConfiguration::kAutomatic:
+      params.wrist_configuration =
+        ar4_protocol::JsonCartesianMotionWristConfiguration::kAutomatic;
+      break;
+  }
+  for (size_t joint = 0; joint < ROBOT_nDOFs; ++joint) {
+    params.loop_modes[joint] = jsonLiveMotion.parameters.loop_modes[joint];
+  }
+  ar4_protocol::JsonMainToolJogExecutionResult result = {};
+  ar4_protocol::JsonLiveMotionContinuationSource continuation = {
+    json_live_motion_continuation,
+    service_json_live_motion_control,
+    nullptr,
+  };
+  const bool executed = execute_json_jog_tool_with_telemetry(
+      params,
+      result,
+      jsonLiveMotion.parameters.telemetry_enabled,
+      &continuation
+  );
+  if (ar4_protocol::json_live_motion_interrupted_by_control(
+      jsonLiveMotion.owner.state
+  )) return true;
+  if (!executed) return false;
+  record_json_live_segment_result(convert_json_live_result(result));
+  return true;
+}
+
+
+bool stage_json_live_terminal() {
+  jsonLiveMotion.terminal.speed_limited = jsonLiveMotion.speed_limited
+    || jsonLiveMotion.terminal.speed_limited;
+  const ar4_protocol::JsonMainControllerProcessStatus status =
+    jsonMainControllerOwner.stage_live_terminal(
+      jsonLiveMotion.owner.motion_id,
+      jsonLiveMotion.parameters.kind,
+      jsonLiveMotion.terminal,
+      ar4_protocol::kJsonProtocolMaximumPayloadBytes
+    );
+  if (
+    status
+      != ar4_protocol::JsonMainControllerProcessStatus::kResponseReady
+  ) {
+    apply_json_process_status(status);
+    return false;
+  }
+  if (!ar4_protocol::mark_json_live_motion_terminal_staged(
+      jsonLiveMotion.owner
+  )) {
+    latch_json_runtime_fault();
+    return false;
+  }
+  return true;
+}
+
+
+bool service_json_live_motion(bool advanceSegment) {
+  const uint32_t ownerMotionId =
+    jsonMainControllerOwner.active_live_motion_id();
+  const bool ownerIdle = jsonMainControllerOwner.state()
+    == ar4_protocol::JsonMainControllerOwnerState::kIdle;
+  const bool activeKindMatches = ownerMotionId != 0
+    && jsonMainControllerOwner.active_live_kind()
+      == jsonLiveMotion.parameters.kind;
+  const ar4_protocol::JsonLiveMotionServiceAction action =
+    ar4_protocol::plan_json_live_motion_service(
+      static_cast<uint32_t>(millis()),
+      ownerMotionId,
+      activeKindMatches,
+      ownerIdle,
+      jsonRuntimeFault,
+      controller_mutation_estop_blocked(),
+      Serial.available() > 0
+        || recData.length() != 0
+        || serialFrameDiscarding,
+      advanceSegment,
+      jsonLiveMotion.owner
+    );
+  switch (action) {
+    case ar4_protocol::JsonLiveMotionServiceAction::kIdle:
+      return false;
+    case ar4_protocol::JsonLiveMotionServiceAction::kClear:
+      clear_json_live_motion_runtime();
+      return false;
+    case ar4_protocol::JsonLiveMotionServiceAction::kFault:
+      latch_json_runtime_fault();
+      return false;
+    case ar4_protocol::JsonLiveMotionServiceAction::kWait:
+      return true;
+    case ar4_protocol::JsonLiveMotionServiceAction::kStageTerminal:
+      stage_json_live_terminal();
+      return true;
+    case ar4_protocol::JsonLiveMotionServiceAction::kSettleStop: {
+      ar4_protocol::JsonMainLiveJogExecutionResult terminal = {};
+      terminal.outcome = ar4_protocol::JsonMainLiveJogOutcome::kCompleted;
+      terminal.speed_limited = jsonLiveMotion.speed_limited;
+      settle_json_live_terminal(terminal);
+      return true;
+    }
+    case ar4_protocol::JsonLiveMotionServiceAction::kSettleLeaseExpiry: {
+      ar4_protocol::JsonMainLiveJogExecutionResult terminal = {};
+      terminal.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kControlLeaseExpired;
+      settle_json_live_terminal(terminal);
+      return true;
+    }
+    case ar4_protocol::JsonLiveMotionServiceAction::kSettleEmergencyStop: {
+      ar4_protocol::JsonMainLiveJogExecutionResult terminal = {};
+      terminal.outcome =
+        ar4_protocol::JsonMainLiveJogOutcome::kEmergencyStop;
+      settle_json_live_terminal(terminal);
+      return true;
+    }
+    case ar4_protocol::JsonLiveMotionServiceAction::kAdvanceSegment:
+      break;
+  }
+  bool executed = false;
+  switch (jsonLiveMotion.parameters.kind) {
+    case ar4_protocol::JsonLiveJogKind::kJoint:
+      executed = execute_json_live_joint_segment();
+      break;
+    case ar4_protocol::JsonLiveJogKind::kCartesian:
+      executed = execute_json_live_cartesian_segment();
+      break;
+    case ar4_protocol::JsonLiveJogKind::kTool:
+      executed = execute_json_live_tool_segment();
+      break;
+    case ar4_protocol::JsonLiveJogKind::kInvalid:
+      executed = false;
+      break;
+  }
+  if (!executed) {
+    latch_json_runtime_fault();
+    return false;
+  }
+  return true;
+}
+
+
+ar4_protocol::JsonMainSetPositionApplyStatus apply_json_set_position(
+  const ar4_protocol::JsonMainSetPositionParameters &params,
+  void *context
+) {
+  (void)context;
+  float positions[numJoints] = {};
+  for (size_t axis = 0; axis < ROBOT_nDOFs; ++axis) {
+    positions[axis] =
+      static_cast<float>(params.robot_joints_millidegrees[axis]) / 1000.0f;
+  }
+  for (size_t axis = 0; axis < 3; ++axis) {
+    positions[axis + ROBOT_nDOFs] =
+      static_cast<float>(params.external_axes_milliunits[axis]) / 1000.0f;
+  }
+  int stagedStepMonitors[numJoints] = {};
+  ar4_protocol::ControllerPositionRebase stagedRebase = {};
+  if (
+    !joint_positions_to_future_steps(positions, stagedStepMonitors)
+    || !build_configured_position_rebase(
+      stagedStepMonitors,
+      stagedRebase
+    )
+  ) {
+    return ar4_protocol::JsonMainSetPositionApplyStatus::
+      kPositionNotRepresentable;
+  }
+  ar4_protocol::PrimaryHomeReferenceState invalidatedHomeReference =
+    primaryHomeReference;
+  ar4_protocol::invalidate_primary_home_reference(
+    invalidatedHomeReference
+  );
+  if (controller_mutation_estop_blocked()) {
+    return ar4_protocol::JsonMainSetPositionApplyStatus::
+      kEmergencyStopActive;
+  }
+  commit_configured_position_rebase(stagedRebase);
+  primaryHomeReference = invalidatedHomeReference;
+  return ar4_protocol::JsonMainSetPositionApplyStatus::kApplied;
+}
+
+
+ar4_protocol::JsonMainConfigurationApplyStatus apply_json_update_params(
+  const ar4_protocol::JsonMainUpdateParameters &params,
+  void *context
+) {
+  (void)context;
+  ar4_protocol::JsonMainUpdateConfiguration staged = {};
+  if (!ar4_protocol::build_json_main_update_configuration(params, staged)) {
+    return ar4_protocol::JsonMainConfigurationApplyStatus::
+      kConfigurationNotRepresentable;
+  }
+  ar4_protocol::PrimaryHomeReferenceState invalidatedHomeReference =
+    primaryHomeReference;
+  ar4_protocol::invalidate_primary_home_reference(
+    invalidatedHomeReference
+  );
+  if (controller_mutation_estop_blocked()) {
+    return ar4_protocol::JsonMainConfigurationApplyStatus::
+      kEmergencyStopActive;
+  }
+
+  for (int field = 0; field < ROBOT_nDOFs; ++field) {
+    Robot_Kin_Tool[field] = staged.tool[field];
+  }
+
+  int *motorDirections[numJoints] = {
+    &J1MotDir, &J2MotDir, &J3MotDir, &J4MotDir, &J5MotDir,
+    &J6MotDir, &J7MotDir, &J8MotDir, &J9MotDir,
+  };
+  int *calibrationDirections[numJoints] = {
+    &J1CalDir, &J2CalDir, &J3CalDir, &J4CalDir, &J5CalDir,
+    &J6CalDir, &J7CalDir, &J8CalDir, &J9CalDir,
+  };
+  for (int axis = 0; axis < numJoints; ++axis) {
+    *motorDirections[axis] = staged.motor_directions[axis];
+    *calibrationDirections[axis] = staged.calibration_directions[axis];
+  }
+
+  J1axisLimPos = staged.positive_joint_limits_degrees[0];
+  J2axisLimPos = staged.positive_joint_limits_degrees[1];
+  J3axisLimPos = staged.positive_joint_limits_degrees[2];
+  J4axisLimPos = staged.positive_joint_limits_degrees[3];
+  J5axisLimPos = staged.positive_joint_limits_degrees[4];
+  J6axisLimPos = staged.positive_joint_limits_degrees[5];
+  J1axisLimNeg = staged.negative_joint_limits_degrees[0];
+  J2axisLimNeg = staged.negative_joint_limits_degrees[1];
+  J3axisLimNeg = staged.negative_joint_limits_degrees[2];
+  J4axisLimNeg = staged.negative_joint_limits_degrees[3];
+  J5axisLimNeg = staged.negative_joint_limits_degrees[4];
+  J6axisLimNeg = staged.negative_joint_limits_degrees[5];
+
+  J1StepDeg = staged.steps_per_degree[0];
+  J2StepDeg = staged.steps_per_degree[1];
+  J3StepDeg = staged.steps_per_degree[2];
+  J4StepDeg = staged.steps_per_degree[3];
+  J5StepDeg = staged.steps_per_degree[4];
+  J6StepDeg = staged.steps_per_degree[5];
+  J1encMult = staged.encoder_counts_per_step[0];
+  J2encMult = staged.encoder_counts_per_step[1];
+  J3encMult = staged.encoder_counts_per_step[2];
+  J4encMult = staged.encoder_counts_per_step[3];
+  J5encMult = staged.encoder_counts_per_step[4];
+  J6encMult = staged.encoder_counts_per_step[5];
+
+  for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
+    for (int field = 0; field < 4; ++field) {
+      DHparams[joint][field] = staged.dh_degrees[joint][field];
+    }
+  }
+
+  J1axisLim = staged.joint_travel_degrees[0];
+  J2axisLim = staged.joint_travel_degrees[1];
+  J3axisLim = staged.joint_travel_degrees[2];
+  J4axisLim = staged.joint_travel_degrees[3];
+  J5axisLim = staged.joint_travel_degrees[4];
+  J6axisLim = staged.joint_travel_degrees[5];
+  J1StepLim = staged.step_limits[0];
+  J2StepLim = staged.step_limits[1];
+  J3StepLim = staged.step_limits[2];
+  J4StepLim = staged.step_limits[3];
+  J5StepLim = staged.step_limits[4];
+  J6StepLim = staged.step_limits[5];
+  J1zeroStep = staged.zero_steps[0];
+  J2zeroStep = staged.zero_steps[1];
+  J3zeroStep = staged.zero_steps[2];
+  J4zeroStep = staged.zero_steps[3];
+  J5zeroStep = staged.zero_steps[4];
+  J6zeroStep = staged.zero_steps[5];
+  for (int axis = 0; axis < numJoints; ++axis) {
+    calibrationLimitSensor[axis] =
+      staged.calibration_switch_active_high[axis] ? HIGH : LOW;
+  }
+
+  primaryHomeReference = invalidatedHomeReference;
+  apply_robot_native_configuration(
+    staged.dh_theta_radians,
+    staged.dh_alpha_radians
+  );
+  return ar4_protocol::JsonMainConfigurationApplyStatus::kApplied;
+}
+
+
+ar4_protocol::JsonMainConfigurationApplyStatus apply_json_config_ext_axis(
+  const ar4_protocol::JsonMainExternalAxisParameters &params,
+  void *context
+) {
+  (void)context;
+  ar4_protocol::JsonMainExternalAxisConfiguration staged = {};
+  if (!ar4_protocol::build_json_main_external_axis_configuration(
+      params,
+      staged
+  )) {
+    return ar4_protocol::JsonMainConfigurationApplyStatus::
+      kConfigurationNotRepresentable;
+  }
+  if (controller_mutation_estop_blocked()) {
+    return ar4_protocol::JsonMainConfigurationApplyStatus::
+      kEmergencyStopActive;
+  }
+
+  J7length = staged.travel_units[0];
+  J7rot = staged.drive_rotations[0];
+  J7steps = staged.motor_steps[0];
+  J8length = staged.travel_units[1];
+  J8rot = staged.drive_rotations[1];
+  J8steps = staged.motor_steps[1];
+  J9length = staged.travel_units[2];
+  J9rot = staged.drive_rotations[2];
+  J9steps = staged.motor_steps[2];
+
+  J7axisLimNeg = 0.0f;
+  J7axisLimPos = staged.axes[0].positive_limit;
+  J7axisLim = J7axisLimPos;
+  J7StepDeg = staged.axes[0].steps_per_unit;
+  J7StepLim = staged.axes[0].step_limit;
+  J7zeroStep = staged.axes[0].zero_step;
+  J8axisLimNeg = 0.0f;
+  J8axisLimPos = staged.axes[1].positive_limit;
+  J8axisLim = J8axisLimPos;
+  J8StepDeg = staged.axes[1].steps_per_unit;
+  J8StepLim = staged.axes[1].step_limit;
+  J8zeroStep = staged.axes[1].zero_step;
+  J9axisLimNeg = 0.0f;
+  J9axisLimPos = staged.axes[2].positive_limit;
+  J9axisLim = J9axisLimPos;
+  J9StepDeg = staged.axes[2].steps_per_unit;
+  J9StepLim = staged.axes[2].step_limit;
+  J9zeroStep = staged.axes[2].zero_step;
+  return ar4_protocol::JsonMainConfigurationApplyStatus::kApplied;
+}
+
+
+ar4_protocol::JsonMainDiagnosticOutcome execute_json_diagnostic(
+  ar4_protocol::JsonMainRequestCommand command,
+  bool *active,
+  int32_t *counts,
+  void *context
+) {
+  (void)context;
+  if (active == nullptr || counts == nullptr) {
+    return ar4_protocol::JsonMainDiagnosticOutcome::kUnavailable;
+  }
+  if (command == ar4_protocol::JsonMainRequestCommand::kTestLimitSwitches) {
+    const int calibrationPins[ROBOT_nDOFs] = {
+      J1calPin, J2calPin, J3calPin, J4calPin, J5calPin, J6calPin,
+    };
+    for (size_t axis = 0; axis < ROBOT_nDOFs; ++axis) {
+      active[axis] = ar4_protocol::calibration_switch_is_active(
+        digitalRead(calibrationPins[axis]),
+        calibrationLimitSensor[axis]
+      );
+    }
+    return ar4_protocol::JsonMainDiagnosticOutcome::kCompleted;
+  }
+  if (command == ar4_protocol::JsonMainRequestCommand::kReadEncoders) {
+    counts[0] = static_cast<int32_t>(J1encPos.read());
+    counts[1] = static_cast<int32_t>(J2encPos.read());
+    counts[2] = static_cast<int32_t>(J3encPos.read());
+    counts[3] = static_cast<int32_t>(J4encPos.read());
+    counts[4] = static_cast<int32_t>(J5encPos.read());
+    counts[5] = static_cast<int32_t>(J6encPos.read());
+    return ar4_protocol::JsonMainDiagnosticOutcome::kCompleted;
+  }
+  if (command == ar4_protocol::JsonMainRequestCommand::kSetEncoders) {
+    if (controller_mutation_estop_blocked()) {
+      return ar4_protocol::JsonMainDiagnosticOutcome::kEmergencyStopActive;
+    }
+    J1encPos.write(1000);
+    J2encPos.write(1000);
+    J3encPos.write(1000);
+    J4encPos.write(1000);
+    J5encPos.write(1000);
+    J6encPos.write(1000);
+    return ar4_protocol::JsonMainDiagnosticOutcome::kCompleted;
+  }
+  return ar4_protocol::JsonMainDiagnosticOutcome::kUnavailable;
+}
+
+
+ar4_protocol::JsonMainControllerWaitOutcome execute_json_controller_wait(
+  uint32_t duration_milliseconds,
+  void *context
+) {
+  (void)context;
+  return wait_for_controller_duration(duration_milliseconds, true)
+    ? ar4_protocol::JsonMainControllerWaitOutcome::kCompleted
+    : ar4_protocol::JsonMainControllerWaitOutcome::kEmergencyStop;
+}
+
+
+ar4_protocol::JsonMainModbusReadOutcome execute_json_modbus_read(
+  ar4_protocol::ModbusOperation operation,
+  const ar4_protocol::JsonMainModbusReadParameters &parameters,
+  int32_t &value,
+  void *context
+) {
+  (void)context;
+  const bool read_operation =
+    operation == ar4_protocol::ModbusOperation::kReadCoil
+    || operation == ar4_protocol::ModbusOperation::kReadDiscreteInput
+    || operation == ar4_protocol::ModbusOperation::kReadHoldingRegisters
+    || operation == ar4_protocol::ModbusOperation::kReadInputRegisters;
+  // Keep the active JSON source read-only even if dispatcher mapping drifts.
+  if (!read_operation) return ar4_protocol::JsonMainModbusReadOutcome::kInvalid;
+  if (controller_mutation_estop_blocked()) {
+    return ar4_protocol::JsonMainModbusReadOutcome::kEmergencyStop;
+  }
+  const int32_t result = execute_modbus_operation(
+    operation, parameters.slave_id, parameters.address, parameters.count
+  );
+  if (controller_mutation_estop_blocked()) {
+    return ar4_protocol::JsonMainModbusReadOutcome::kEmergencyStop;
+  }
+  if (result < 0) {
+    return ar4_protocol::JsonMainModbusReadOutcome::kModbusError;
+  }
+  if (
+    result > 1
+    && (
+      operation == ar4_protocol::ModbusOperation::kReadCoil
+      || operation == ar4_protocol::ModbusOperation::kReadDiscreteInput
+    )
+  ) return ar4_protocol::JsonMainModbusReadOutcome::kModbusError;
+  value = result;
+  return ar4_protocol::JsonMainModbusReadOutcome::kCompleted;
+}
+
+
+ar4_protocol::JsonMainModbusWriteOutcome execute_json_modbus_write(
+  ar4_protocol::ModbusOperation operation,
+  const ar4_protocol::JsonMainModbusWriteParameters &parameters,
+  void *context
+) {
+  (void)context;
+  const bool write_operation =
+    operation == ar4_protocol::ModbusOperation::kWriteCoil
+    || operation == ar4_protocol::ModbusOperation::kWriteRegister;
+  // Keep the active JSON source write-only even if dispatcher mapping drifts.
+  if (!write_operation) {
+    return ar4_protocol::JsonMainModbusWriteOutcome::kInvalid;
+  }
+  if (controller_mutation_estop_blocked()) {
+    return ar4_protocol::JsonMainModbusWriteOutcome::kEmergencyStop;
+  }
+  const int32_t result = execute_modbus_operation(
+    operation, parameters.slave_id, parameters.address, parameters.value
+  );
+  // Once bus access begins, the response owner emits any concurrent stop
+  // after the shared-executor outcome instead of replacing that result.
+  if (result != 1) {
+    return ar4_protocol::JsonMainModbusWriteOutcome::kModbusError;
+  }
+  return ar4_protocol::JsonMainModbusWriteOutcome::kCompleted;
+}
+
+#include "json_direct_command_runtime.h"
+
+ar4_protocol::JsonMainHelloResponseSource prepare_json_hello_source() {
+  ar4_protocol::JsonMainHelloSourceStatus status =
+    ar4_protocol::JsonMainHelloSourceStatus::kAvailable;
+  if (
+    identity_record_status
+      == ar4_protocol::IdentityRecordStatus::kCorrupt
+    || !ar4_protocol::controller_hardware_id_valid(controller_hardware_id)
+  ) {
+    status = ar4_protocol::JsonMainHelloSourceStatus::kIdentityUnavailable;
+  } else if (
+    json_session_identity_status
+      != ar4_protocol::JsonSessionIdentityStatus::kAvailable
+  ) {
+    status = ar4_protocol::JsonMainHelloSourceStatus::kSessionUnavailable;
+  }
+  return {
+    status,
+    json_session_id,
+    JSON_FIRMWARE_NAME,
+    FIRMWARE_VERSION,
+    JSON_FIRMWARE_BUILD,
+    controller_hardware_id,
+    driver_board.c_str(),
+    robot_model.c_str(),
+    robot_version.c_str(),
+    serial_number.c_str(),
+    asset_tag.c_str(),
+    PROTOCOL_CAPABILITIES,
+    PROTOCOL_CAPABILITY_COUNT,
+    JSON_COMMANDS,
+    JSON_COMMAND_COUNT,
+  };
+}
+
+
+void queue_json_transport_error(
+  const char *error_code,
+  const char *message
+) {
+  const ar4_protocol::JsonMainControllerProcessStatus status =
+    jsonMainControllerOwner.process_protocol_error(
+      error_code,
+      message,
+      ar4_protocol::kJsonProtocolMaximumPayloadBytes
+    );
+  apply_json_process_status(status);
+}
+
+
+void process_json_serial_frame(const String &frame) {
+  if (jsonRuntimeFault) return;
+
+  ar4_protocol::JsonSerialFrameView frame_view = {};
+  const ar4_protocol::JsonSerialFrameStatus frame_status =
+    ar4_protocol::validate_json_serial_frame(
+      frame.c_str(),
+      frame.length(),
+      frame_view
+    );
+  if (frame_status != ar4_protocol::JsonSerialFrameStatus::kComplete) {
+    queue_json_transport_error(
+      "malformed_frame",
+      "request payload is invalid"
+    );
+    return;
+  }
+
+  ar4_protocol::JsonMainHelloResponseSource hello =
+    prepare_json_hello_source();
+  const ar4_protocol::JsonMainHomeReferenceResponseSource homeReference = {
+    ar4_protocol::JsonMainHomeReferenceSourceStatus::kAvailable,
+    primaryHomeReference,
+  };
+  ar4_protocol::JsonMainPositionResponseSource position = {};
+  if (jsonMainControllerOwner.configuration_sync_required()) {
+    position.status =
+      ar4_protocol::JsonMainPositionSourceStatus::kPositionUnavailable;
+  } else {
+    prepare_json_position_source(position);
+  }
+  const ar4_protocol::JsonMainSetPositionCommandSource setPosition = {
+    apply_json_set_position,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainUpdateParametersCommandSource updateParams = {
+    apply_json_update_params,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainExternalAxisCommandSource configExtAxis = {
+    apply_json_config_ext_axis,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainMoveJointsCommandSource moveJoints = {
+    execute_json_move_joints,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainMoveCartesianCommandSource moveCartesian = {
+    execute_json_move_cartesian,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainToolJogCommandSource jogTool = {
+    execute_json_jog_tool,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainLiveJogCommandSource liveJog = {
+    jsonLiveMotion.owner.state == JsonLiveMotionRuntimeState::kIdle
+      ? 0
+      : jsonLiveMotion.owner.motion_id,
+    begin_json_live_jog,
+    request_json_live_stop,
+    renew_json_live_motion_callback,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainDiagnosticCommandSource diagnostics = {
+    execute_json_diagnostic,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainCalibrationCommandSource calibration = {
+    execute_json_calibration,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainCorrectPositionCommandSource correctPosition = {
+    prepare_json_position_correction,
+    apply_json_position_correction,
+    &preparedJsonPositionCorrection,
+  };
+  const ar4_protocol::JsonMainExternalAxisZeroCommandSource zeroExternalAxis = {
+    stage_json_external_axis_zero_post_zero_position,
+    apply_json_external_axis_zero,
+    &position,
+  };
+  const ar4_protocol::JsonMainControllerWaitCommandSource controllerWait = {
+    execute_json_controller_wait,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainModbusReadCommandSource modbusRead = {
+    execute_json_modbus_read,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainModbusWriteCommandSource modbusWrite = {
+    execute_json_modbus_write,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainDirectCommandSource direct = {
+    ar4_json_direct_runtime::execute,
+    nullptr,
+  };
+  const bool estop_blocked = controller_mutation_estop_blocked();
+  const ar4_protocol::JsonMainControllerDispatchSources sources = {
+    &hello,
+    &homeReference,
+    &position,
+    estop_blocked
+      ? ar4_protocol::JsonMainControllerAdmissionStatus::
+        kEmergencyStopActive
+      : ar4_protocol::JsonMainControllerAdmissionStatus::kAvailable,
+    &setPosition,
+    &updateParams,
+    &configExtAxis,
+    &moveJoints,
+    &moveCartesian,
+    &jogTool,
+    &liveJog,
+    &diagnostics,
+    &calibration,
+    &correctPosition,
+    &zeroExternalAxis,
+    &controllerWait,
+    &modbusRead,
+    &modbusWrite,
+    &direct,
+  };
+  const ar4_protocol::JsonMainControllerProcessStatus status =
+    jsonMainControllerOwner.process_payload(
+      frame_view.payload,
+      frame_view.payload_length,
+      sources,
+      ar4_protocol::kJsonProtocolMaximumPayloadBytes
+    );
+  apply_json_process_status(status);
+  if (
+    status == ar4_protocol::JsonMainControllerProcessStatus::kResponseReady
+    && jsonMainControllerOwner.response_kind()
+      == ar4_protocol::JsonMainControllerResponseKind::kAdmissionRejected
+  ) {
+    stage_json_estop_admission_response();
+  }
+}
+
+
+bool service_json_response_output() {
+  const ar4_protocol::JsonMainControllerOwnerState state =
+    jsonMainControllerOwner.state();
+  if (state == ar4_protocol::JsonMainControllerOwnerState::kFaulted) {
+    latch_json_runtime_fault();
+    return true;
+  }
+  if (
+    state == ar4_protocol::JsonMainControllerOwnerState::kIdle
+    && !jsonResponseWritePrepared
+  ) {
+    return false;
+  }
+  if (!jsonResponseWritePrepared) {
+    const ar4_protocol::JsonMainControllerOutputBeginStatus begin_status =
+      jsonMainControllerOwner.begin_response_write(jsonResponseWriteView);
+    if (
+      begin_status
+        != ar4_protocol::JsonMainControllerOutputBeginStatus::kReady
+    ) {
+      latch_json_runtime_fault();
+      return true;
+    }
+    jsonResponseWritePrepared = true;
+    jsonResponseWriteOffset = 0;
+  }
+  size_t admitted = 0;
+  const ar4_protocol::JsonOutputProgressStatus plan_status =
+    ar4_protocol::plan_json_output_chunk(
+      jsonResponseWriteView.length,
+      jsonResponseWriteOffset,
+      Serial.availableForWrite(),
+      admitted
+    );
+  if (plan_status == ar4_protocol::JsonOutputProgressStatus::kBlocked) {
+    return true;
+  }
+  if (plan_status != ar4_protocol::JsonOutputProgressStatus::kProgress) {
+    latch_json_runtime_fault();
+    return true;
+  }
+  const size_t written = Serial.write(
+    reinterpret_cast<const uint8_t *>(jsonResponseWriteView.data)
+      + jsonResponseWriteOffset,
+    admitted
+  );
+  const ar4_protocol::JsonOutputProgressStatus write_status =
+    ar4_protocol::record_json_output_chunk(
+      jsonResponseWriteView.length,
+      admitted,
+      written,
+      jsonResponseWriteOffset
+    );
+  if (
+    write_status == ar4_protocol::JsonOutputProgressStatus::kBlocked
+    || write_status == ar4_protocol::JsonOutputProgressStatus::kProgress
+  ) {
+    return true;
+  }
+  if (write_status != ar4_protocol::JsonOutputProgressStatus::kCompleted) {
+    latch_json_runtime_fault();
+    return true;
+  }
+  const ar4_protocol::JsonMainControllerResponseKind completed_response_kind =
+    jsonResponseWriteView.kind;
+  const ar4_protocol::JsonMainControllerOutputCompletionStatus
+    completion_status = jsonMainControllerOwner.complete_response_write(
+      jsonResponseWriteOffset
+    );
+  jsonResponseWritePrepared = false;
+  jsonResponseWriteOffset = 0;
+  jsonResponseWriteView = {};
+  if (
+    completion_status
+      != ar4_protocol::JsonMainControllerOutputCompletionStatus::kCompleted
+  ) {
+    latch_json_runtime_fault();
+  } else {
+    if (
+      completed_response_kind
+        == ar4_protocol::JsonMainControllerResponseKind::
+          kPositionDispositionCompleted
+      || completed_response_kind
+        == ar4_protocol::JsonMainControllerResponseKind::
+          kCorrectPositionCompleted
+      || completed_response_kind
+        == ar4_protocol::JsonMainControllerResponseKind::
+          kExternalAxisZeroCompleted
+    ) {
+      speedViolation = "0";
+      flag = "";
+    } else if (
+      completed_response_kind
+        == ar4_protocol::JsonMainControllerResponseKind::
+          kCorrectPositionEncoderFailed
+    ) {
+      flag = "";
+    } else if (
+      completed_response_kind
+        == ar4_protocol::JsonMainControllerResponseKind::kPositionAlarmFailed
+      && Alarm != "0"
+    ) {
+      Alarm = "0";
+    }
+    complete_json_estop_admission_response();
+  }
+  return true;
+}
+
+
+bool service_json_event_output() {
+  const ar4_protocol::JsonEventOutputState state =
+    jsonControllerEventOwner.state();
+  if (state == ar4_protocol::JsonEventOutputState::kFaulted) {
+    latch_json_runtime_fault();
+    return true;
+  }
+  if (state == ar4_protocol::JsonEventOutputState::kIdle) return false;
+  if (!jsonEventWritePrepared) {
+    const ar4_protocol::JsonEventOutputBeginStatus begin_status =
+      jsonControllerEventOwner.begin_write(jsonEventWriteView);
+    if (begin_status != ar4_protocol::JsonEventOutputBeginStatus::kReady) {
+      latch_json_runtime_fault();
+      return true;
+    }
+    jsonEventWritePrepared = true;
+    jsonEventWriteOffset = 0;
+  }
+  size_t admitted = 0;
+  const ar4_protocol::JsonOutputProgressStatus plan_status =
+    ar4_protocol::plan_json_output_chunk(
+      jsonEventWriteView.length,
+      jsonEventWriteOffset,
+      Serial.availableForWrite(),
+      admitted
+    );
+  if (plan_status == ar4_protocol::JsonOutputProgressStatus::kBlocked) {
+    return true;
+  }
+  if (plan_status != ar4_protocol::JsonOutputProgressStatus::kProgress) {
+    latch_json_runtime_fault();
+    return true;
+  }
+  const size_t written = Serial.write(
+    reinterpret_cast<const uint8_t *>(jsonEventWriteView.data)
+      + jsonEventWriteOffset,
+    admitted
+  );
+  const ar4_protocol::JsonOutputProgressStatus write_status =
+    ar4_protocol::record_json_output_chunk(
+      jsonEventWriteView.length,
+      admitted,
+      written,
+      jsonEventWriteOffset
+    );
+  if (
+    write_status == ar4_protocol::JsonOutputProgressStatus::kBlocked
+    || write_status == ar4_protocol::JsonOutputProgressStatus::kProgress
+  ) {
+    return true;
+  }
+  if (write_status != ar4_protocol::JsonOutputProgressStatus::kCompleted) {
+    latch_json_runtime_fault();
+    return true;
+  }
+  const ar4_protocol::JsonEventOutputCompletionStatus completion_status =
+    jsonControllerEventOwner.complete_write(jsonEventWriteOffset);
+  jsonEventWritePrepared = false;
+  jsonEventWriteOffset = 0;
+  jsonEventWriteView = {};
+  if (
+    completion_status
+      != ar4_protocol::JsonEventOutputCompletionStatus::kCompleted
+  ) {
+    latch_json_runtime_fault();
+    return true;
+  }
+  noInterrupts();
+  ar4_protocol::acknowledge_controller_estop_response(
+    controllerResponseOwnership
+  );
+  interrupts();
+  return true;
+}
+
+
+
+
+bool service_json_output() {
+  const bool response_owned = jsonResponseWritePrepared
+    || jsonMainControllerOwner.state()
+      != ar4_protocol::JsonMainControllerOwnerState::kIdle;
+  const bool event_owned = jsonEventWritePrepared
+    || jsonControllerEventOwner.state()
+      != ar4_protocol::JsonEventOutputState::kIdle;
+  switch (ar4_protocol::select_json_output_route(
+      false,
+      jsonRuntimeFault,
+      jsonResponseWritePrepared,
+      jsonEventWritePrepared,
+      response_owned,
+      event_owned
+  )) {
+    case ar4_protocol::JsonOutputRoute::kFaultSignal:
+    case ar4_protocol::JsonOutputRoute::kFaulted:
+    case ar4_protocol::JsonOutputRoute::kIdle:
+      return false;
+    case ar4_protocol::JsonOutputRoute::kResponse:
+      return service_json_response_output();
+    case ar4_protocol::JsonOutputRoute::kEvent:
+      return service_json_event_output();
+    case ar4_protocol::JsonOutputRoute::kInvalid:
+      latch_json_runtime_fault();
+      return true;
+  }
+  latch_json_runtime_fault();
+  return true;
+}
+
 
 
 void processSerial() {
-  if (Serial.available() > 0 and cmdBuffer3 == "") {
-    const ar4_protocol::SerialFrameReadStatus frameStatus =
-      read_serial_frame_byte(recData);
-    if (frameStatus == ar4_protocol::SerialFrameReadStatus::kOverflow) {
-      Serial.println("ER");
-      return;
-    }
-    // Process message when new line character is recieved
-    if (frameStatus == ar4_protocol::SerialFrameReadStatus::kComplete) {
-      //place data in last position
-      cmdBuffer3 = recData;
-      //determine if move command
-      String commandPayload;
-      String procCMDtype = "";
-      if (ar4_protocol::extract_serial_command_payload(
-          recData,
-          commandPayload
-      )) {
-        procCMDtype = commandPayload.substring(0, 2);
-      }
-      if (procCMDtype == "SS") {
-        splineTrue = false;
-        splineEndReceived = true;
-      }
-      if (ar4_protocol::should_emit_spline_preface(
-          splineTrue,
-          procCMDtype.c_str()
-      )) {
-        if (moveSequence == "") {
-          moveSequence = "firsMoveActive";
-        }
-        //close serial so next command can be read in
-        if (Alarm == "0") {
-          sendRobotPosSpline();
-        } else {
-          Serial.println(Alarm);
-          Alarm = "0";
-        }
-      }
-
-      recData = "";  // Clear recieved buffer
-
-      shiftCMDarray();
-
-
-      //if second position is empty and first move command read in process second move ahead of time
-      if (procCMDtype == "MS" and moveSequence == "firsMoveActive" and cmdBuffer2 == "" and cmdBuffer1 != "" and splineTrue == true) {
-        moveSequence = "secondMoveProcessed";
-        while (cmdBuffer2 == "") {
-          if (Serial.available() > 0) {
-            const ar4_protocol::SerialFrameReadStatus lookaheadStatus =
-              read_serial_frame_byte(recData);
-            if (
-              lookaheadStatus
-              == ar4_protocol::SerialFrameReadStatus::kOverflow
-            ) {
-              Serial.println("ER");
-              return;
-            }
-            if (
-              lookaheadStatus
-              == ar4_protocol::SerialFrameReadStatus::kComplete
-            ) {
-              cmdBuffer2 = recData;
-              commandPayload = "";
-              procCMDtype = "";
-              if (ar4_protocol::extract_serial_command_payload(
-                  recData,
-                  commandPayload
-              )) {
-                procCMDtype = commandPayload.substring(0, 2);
-              }
-              if (procCMDtype == "MS") {
-                //close serial so next command can be read in
-                delay(5);
-                if (Alarm == "0") {
-                  sendRobotPosSpline();
-                } else {
-                  Serial.println(Alarm);
-                  Alarm = "0";
-                }
-              }
-              recData = "";  // Clear recieved buffer
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-
-void shiftCMDarray() {
-  if (cmdBuffer1 == "") {
-    //shift 2 to 1
-    cmdBuffer1 = cmdBuffer2;
-    cmdBuffer2 = "";
-  }
-  if (cmdBuffer2 == "") {
-    //shift 3 to 2
-    cmdBuffer2 = cmdBuffer3;
-    cmdBuffer3 = "";
-  }
-  if (cmdBuffer1 == "") {
-    //shift 2 to 1
-    cmdBuffer1 = cmdBuffer2;
-    cmdBuffer2 = "";
-  }
-}
-
-
-void consume_current_command() {
-  ar4_protocol::consume_command_queue(
-    inData,
-    cmdBuffer1,
-    cmdBuffer2,
-    cmdBuffer3
-  );
-}
-
-void finish_calibration_failure_response() {
-  Serial.println("ER");
-  consume_current_command();
-}
-
-
-ar4_protocol::LiveControlFrameStatus read_live_control_frame() {
+  if (jsonMainControllerOwner.playback_execution_active()) return;
+  if (Serial.available() <= 0) return;
   const ar4_protocol::SerialFrameReadStatus status =
-    read_serial_frame_byte(inData);
-  return ar4_protocol::classify_live_control_frame(
-    status,
-    inData.c_str(),
-    inData.length()
-  );
-}
-
-
-void send_live_terminal_response(
-  ar4_protocol::LiveControlFrameStatus control_status,
-  int kinematic_error,
-  int axis_fault,
-  const String &axis_limit_response
-) {
-  switch (ar4_protocol::select_live_terminal_response(
-      control_status,
-      kinematic_error,
-      axis_fault
-  )) {
-    case ar4_protocol::LiveTerminalResponseKind::kPosition:
-      sendRobotPos();
-      return;
-    case ar4_protocol::LiveTerminalResponseKind::kError:
-      delay(5);
-      Serial.println("ER");
-      return;
-    case ar4_protocol::LiveTerminalResponseKind::kAxisLimit:
-      delay(5);
-      Serial.println(axis_limit_response);
-      return;
+    ar4_protocol::append_serial_frame_byte(
+      recData, serialFrameDiscarding, Serial.read());
+  ar4_protocol::update_serial_frame_receive_deadline(
+    static_cast<uint32_t>(millis()), status, recData.length(),
+    serialFrameDiscarding, serialFrameReceiveDeadline);
+  if (status == ar4_protocol::SerialFrameReadStatus::kOverflow) {
+    queue_json_transport_error(
+      "frame_too_large", "request frame exceeds protocol limit");
+  } else if (status == ar4_protocol::SerialFrameReadStatus::kComplete) {
+    process_json_serial_frame(recData);
+    recData = "";
   }
 }
+
+
+bool service_json_gcode_playback() {
+  if (jsonMainControllerOwner.active_playback_request_id() == 0) {
+    return false;
+  }
+  if (
+    jsonMainControllerOwner.state()
+      != ar4_protocol::JsonMainControllerOwnerState::kIdle
+  ) {
+    return true;
+  }
+  const ar4_protocol::JsonMainDirectCommandSource direct = {
+    ar4_json_direct_runtime::execute,
+    nullptr,
+  };
+  const ar4_protocol::JsonMainControllerProcessStatus status =
+    jsonMainControllerOwner.stage_playback_terminal(
+      &direct,
+      ar4_protocol::kJsonProtocolMaximumPayloadBytes
+    );
+  apply_json_process_status(status);
+  return true;
+}
+
+
+
+
+
+
+
 
 
 void EstopProg() {
@@ -3830,70 +6275,29 @@ void EstopProg() {
 }
 
 
-bool interruptible_command_delay(
+
+
+bool wait_for_controller_duration(
   uint32_t duration_ms,
-  bool terminal_response_sent,
-  bool external_write_started = false
+  bool include_admission_blocks
 ) {
   const unsigned long started_at = millis();
   while (millis() - started_at < duration_ms) {
     if (estopActive) break;
+    if (
+      include_admission_blocks
+      && controller_mutation_estop_blocked()
+    ) return false;
     delay(1);
   }
-  if (!estopActive) return true;
-
-  // End the active response scope so EB can follow either the existing
-  // terminal or an ER terminal without leaving the command queued.
-  if (!terminal_response_sent) {
-    Serial.println(external_write_started ? "Modbus Error" : "ER");
-  }
-  consume_current_command();
-  return false;
+  return !estopActive
+    && (
+      !include_admission_blocks
+      || !controller_mutation_estop_blocked()
+    );
 }
 
 
-bool reject_current_command_for_estop() {
-  noInterrupts();
-  const bool deferredTelemetryEstop =
-    ar4_protocol::joint_telemetry_estop_admission_blocked(
-      telemetryResponseOwnership
-    );
-  const bool estopInputAsserted = digitalRead(EstopPin) == LOW;
-  const ar4_protocol::EstopAdmissionDecision decision =
-    ar4_protocol::begin_estop_admission(
-      deferredTelemetryEstop,
-      estopActive,
-      estopInputAsserted,
-      estopAdmissionOwnership
-    );
-  interrupts();
-  if (!decision.blocked) return false;
-
-  // Admission retires pending generic output after the correlated EA frame.
-  flag = "EA";
-  sendRobotPos();
-  flag = "";
-
-  // Admission and loop-response ownership must retire atomically. Otherwise
-  // a reassertion can publish EB after the correlated EA response.
-  noInterrupts();
-  if (deferredTelemetryEstop) {
-    ar4_protocol::clear_joint_telemetry_estop_admission_block(
-      telemetryResponseOwnership
-    );
-  }
-  const bool clearEstopLatch =
-    ar4_protocol::complete_estop_admission_response(
-      decision,
-      digitalRead(EstopPin) == LOW,
-      estopAdmissionOwnership,
-      controllerResponseOwnership
-    );
-  if (clearEstopLatch) estopActive = false;
-  interrupts();
-  consume_current_command();
-  return true;
-}
 
 void complete_controller_response_scope() {
   noInterrupts();
@@ -3901,15 +6305,31 @@ void complete_controller_response_scope() {
     ar4_protocol::complete_controller_response_ownership(
       controllerResponseOwnership
     );
-  const bool publishEstop =
-    completed
-    && ar4_protocol::acknowledge_controller_estop_response(
-      controllerResponseOwnership
-    );
+  const bool publishEstop = completed
+    && controllerResponseOwnership.estop_response_pending;
   interrupts();
   if (!publishEstop) return;
-  flag = "EB";
-  sendRobotPos();
+  if (jsonRuntimeFault) return;
+  if (
+    jsonMainControllerOwner.state()
+      != ar4_protocol::JsonMainControllerOwnerState::kIdle
+    || jsonResponseWritePrepared
+    || jsonControllerEventOwner.state()
+      != ar4_protocol::JsonEventOutputState::kIdle
+    || jsonEventWritePrepared
+  ) {
+    return;
+  }
+  const ar4_protocol::JsonEventQueueStatus queue_status =
+    jsonControllerEventOwner.queue_emergency_stop(
+      true,
+      ar4_protocol::kJsonProtocolMaximumPayloadBytes
+    );
+  if (queue_status != ar4_protocol::JsonEventQueueStatus::kResponseReady) {
+    latch_json_runtime_fault();
+    return;
+  }
+  service_json_event_output();
 }
 
 
@@ -3948,12 +6368,28 @@ void setup() {
     migration_status
     == ar4_protocol::PersistenceMigrationStatus::kFailed
   ) {
-    Serial.println("EEPROM legacy persistence migration failed");
     identity_record_status = ar4_protocol::IdentityRecordStatus::kCorrupt;
     clear_robot_identity();
   } else {
-    load_debug_from_eeprom();
     load_robot_id_from_eeprom();
+  }
+  const bool hardware_id_available =
+    ar4_protocol::format_controller_hardware_id(
+      HW_OCOTP_MAC0 & 0xFFFFFFu,
+      controller_hardware_id,
+      sizeof(controller_hardware_id)
+    );
+  if (!hardware_id_available) {
+    json_session_identity_status =
+      ar4_protocol::JsonSessionIdentityStatus::kInvalidHardwareIdentity;
+  } else {
+    json_session_identity_status =
+      ar4_protocol::advance_json_session_identity(
+        EEPROM,
+        controller_hardware_id,
+        json_session_id,
+        sizeof(json_session_id)
+      );
   }
 
 
@@ -4002,5056 +6438,46 @@ void setup() {
   digitalWrite(J8stepPin, HIGH);
   digitalWrite(J9stepPin, HIGH);
 
-  //clear command buffer array
-  cmdBuffer1 = "";
-  cmdBuffer2 = "";
-  cmdBuffer3 = "";
-  //reset move command flag
-  moveSequence = "";
   flag = "";
   rndTrue = false;
-  splineTrue = false;
-  splineEndReceived = false;
 }
 
 void loop() {
   ControllerResponseScope responseScope;
-
-  ////////////////////////////////////
-  ///////////start loop///////////////
-
-  if (splineEndReceived == false) {
-    processSerial();
+  if (ar4_protocol::serial_frame_receive_timed_out(
+      static_cast<uint32_t>(millis()), serialFrameReceiveDeadline
+  )) {
+    const bool liveMotionActive =
+      jsonLiveMotion.owner.state != JsonLiveMotionRuntimeState::kIdle;
+    ar4_protocol::expire_serial_frame_receive(
+      recData, serialFrameDiscarding, serialFrameReceiveDeadline
+    );
+    if (liveMotionActive) latch_json_runtime_fault();
+    else queue_json_transport_error(
+      "frame_timeout", "request frame receive deadline expired"
+    );
   }
-  //dont start unless at least one command has been read in
-  if (cmdBuffer1 != "") {
-    if (reject_current_command_for_estop()) return;
-    if (!ar4_protocol::extract_serial_command_payload(cmdBuffer1, inData)) {
-      Serial.println("ER");
-      consume_current_command();
-      return;
-    }
-    String function = inData.substring(0, 2);
-    inData = inData.substring(2);
-    // Parsing is side-effect free; the post-parse atomic gate catches an interrupt
-    // arriving after the queue-boundary admission check.
-    if (reject_current_command_for_estop()) return;
-    KinematicError = 0;
-    debug = "";
-
-    if (function == "HO") {
-      handle_hello_command();
-    }
-
-    if (function == "HR") {
-      handle_home_reference_v1_command();
-    }
-
-    if (function == "H2") {
-      handle_home_reference_v2_command();
-    }
-
-    if (function == "RB") {
-      reboot();
-    }
-
-    if (function == "DB") {
-      String help = "Command DB - Set Debug Parameters\n";
-      help += "required [D] - Debug State 0/1 (off/on) Enables / Disabled Serial Debug Mode\n";
-      help += "optional [P] - Persistence 0/1 Disable / Enable debug mode persist accross reboots\n\n";
-      help += "Example: DB[D]1[P]1 - Enabled Debug mode with persist\n";
-      help += "Example: DB[D]0 - Disable debug mode, don't change current persisted value\n\n";
-
-      ar4_protocol::DebugCommand debugCommand = {false, false, false};
-      const ar4_protocol::DebugCommandStatus debugStatus =
-        ar4_protocol::parse_debug_command(inData.c_str(), debugCommand);
-      if (
-        debugStatus == ar4_protocol::DebugCommandStatus::kMissingDebugField
-        || debugStatus == ar4_protocol::DebugCommandStatus::kInvalidFormat
-      ) {
-        if (debugStatus == ar4_protocol::DebugCommandStatus::kInvalidFormat) {
-          Serial.println("Invalid DB command format");
-        }
-        Serial.println(help);
-        consume_current_command();
-        return;
-      }
-      if (debugStatus == ar4_protocol::DebugCommandStatus::kInvalidDebugValue) {
-        Serial.println("Valid values for debug are 0 and 1\n");
-        Serial.println(help);
-        consume_current_command();
-        return;
-      }
-      if (
-        debugStatus
-        == ar4_protocol::DebugCommandStatus::kInvalidPersistenceValue
-      ) {
-        Serial.println("Valid values for persist are 0 and 1\n");
-        Serial.println(help);
-        consume_current_command();
-        return;
-      }
-      if (!ar4_protocol::apply_debug_command(
-        debugCommand,
-        DEBUG,
-        save_debug_to_eeprom
-      )) {
-        consume_current_command();
-        return;
-      }
-
-      Serial.println("Done");
-      consume_current_command();
-      return;
-    }
-
-    if (function == "SR") {
-      ar4_protocol::IdentitySetCommandFields commandFields = {};
-      if (!ar4_protocol::parse_identity_set_command(
-          inData.c_str(),
-          commandFields
-      )) {
-        Serial.println("Error: Invalid format (SR)");
-        consume_current_command();
-        return;
-      }
-
-      handle_set_robot_id_command(
-        String(commandFields.robot_model),
-        String(commandFields.robot_version),
-        String(commandFields.driver_board),
-        String(commandFields.serial_number),
-        String(commandFields.asset_tag)
-      );
-    }
-
-    //-----MODBUS READ HOLDING REGISTER - FUNCTION 03--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BA") {
-      int32_t result = modbusQuerry(inData, 3);
-      if (!interruptible_command_delay(0, false)) return;
-      if (result == MODBUS_PARSE_ERROR) {
-        Serial.println("ER");
-      } else if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println(result);
-      }
-    }
-
-    //-----MODBUS READ COIL - FUNCTION 01--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BB") {
-      int32_t result = modbusQuerry(inData, 1);
-      if (!interruptible_command_delay(0, false)) return;
-      if (result == MODBUS_PARSE_ERROR) {
-        Serial.println("ER");
-      } else if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println(result);
-      }
-    }
-
-    //-----MODBUS READ INPUT - FUNCTION 02--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BC") {
-      int32_t result = modbusQuerry(inData, 2);
-      if (!interruptible_command_delay(0, false)) return;
-      if (result == MODBUS_PARSE_ERROR) {
-        Serial.println("ER");
-      } else if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println(result);
-      }
-    }
-
-    //-----MODBUS READ HOLDING REGISTER - FUNCTION 03--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BH") {
-      int32_t result = modbusQuerry(inData, 3);
-      if (!interruptible_command_delay(0, false)) return;
-      if (result == MODBUS_PARSE_ERROR) {
-        Serial.println("ER");
-      } else if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println(result);
-      }
-    }
-
-    //-----MODBUS READ INPUT REGISTER - FUNCTION 04--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BD") {
-      int32_t result = modbusQuerry(inData, 4);
-      if (!interruptible_command_delay(0, false)) return;
-      if (result == MODBUS_PARSE_ERROR) {
-        Serial.println("ER");
-      } else if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println(result);
-      }
-    }
-
-    //-----MODBUS WRITE COIL - FUNCTION 15--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BE") {
-      int32_t result = modbusQuerry(inData, 15);
-      if (result == MODBUS_PARSE_ERROR) {
-        Serial.println("ER");
-      } else if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println("Write Success");
-      }
-      if (!interruptible_command_delay(0, true)) return;
-    }
-
-    //-----MODBUS WRITE REGISTER - FUNCTION 6--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "BF") {
-      int32_t result = modbusQuerry(inData, 6);
-      if (result == MODBUS_PARSE_ERROR) {
-        Serial.println("ER");
-      } else if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println("Write Success");
-      }
-      if (!interruptible_command_delay(0, true)) return;
-    }
-
-    //-----QUERRY DRIVE MODBUS--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "MQ") {
-      uint8_t result;
-      int16_t highRegister;
-
-      // Modbus read
-      result = node.readHoldingRegisters(0x1207, 2);
-      if (!interruptible_command_delay(0, false)) return;
-
-      if (result == node.ku8MBSuccess) {
-
-        highRegister = node.getResponseBuffer(0);
-        Serial.println(highRegister);
-
-      } else {
-        Serial.println("Modbus error: ");
-        //Serial.println(result, HEX);
-      }
-
-      if (!interruptible_command_delay(1000, true)) return;
-    }
-
-    //-----HOME MOTOR DRIVE MODBUS--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "HD") {
-      uint8_t result;
-      bool writeFailed = false;
-
-      // Address and value to write
-      uint16_t registerAddress1 = 0x020D;  // P0213 - DI3
-      uint16_t registerAddress2 = 0x020C;  // P0212 - DI2
-      //uint16_t registerAddress = 0x1207;  // P1807 - absolute position counter
-      uint16_t valueOn = 1;   // Value to write to the register
-      uint16_t valueOff = 0;  // Value to write to the register
-
-      // Write the value to the register
-      result = node.writeSingleRegister(registerAddress1, valueOn);
-      writeFailed = writeFailed || result != node.ku8MBSuccess;
-      if (!interruptible_command_delay(50, false, true)) return;
-      result = node.writeSingleRegister(registerAddress2, valueOn);
-      writeFailed = writeFailed || result != node.ku8MBSuccess;
-      if (!interruptible_command_delay(50, false, true)) return;
-      result = node.writeSingleRegister(registerAddress1, valueOff);
-      writeFailed = writeFailed || result != node.ku8MBSuccess;
-      if (!interruptible_command_delay(50, false, true)) return;
-      result = node.writeSingleRegister(registerAddress2, valueOff);
-      writeFailed = writeFailed || result != node.ku8MBSuccess;
-      if (!interruptible_command_delay(0, false, true)) return;
-
-      if (!writeFailed) {
-        Serial.println("Write successful");
-      } else {
-        Serial.println("Modbus Error");
-      }
-
-      if (!interruptible_command_delay(50, true)) return;
-    }
-
-    //-----RESET DRIVE MODBUS--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "RR") {
-      uint8_t result;
-      bool writeFailed = false;
-
-      // Address and value to write
-      uint16_t registerAddress1 = 0x020D;  // P0213 - DI3 INPUT
-      uint16_t registerAddress2 = 0x0203;  // P0203 - DI3 FUNCTION SELECTION
-
-      uint16_t valueOn = 1;
-      uint16_t valueOff = 0;
-      uint16_t homingMode = 33;
-      uint16_t resetMode = 2;
-
-
-      result = node.writeSingleRegister(registerAddress2, resetMode);
-      writeFailed = writeFailed || result != node.ku8MBSuccess;
-      if (!interruptible_command_delay(50, false, true)) return;
-      result = node.writeSingleRegister(registerAddress1, valueOn);
-      writeFailed = writeFailed || result != node.ku8MBSuccess;
-      if (!interruptible_command_delay(50, false, true)) return;
-      result = node.writeSingleRegister(registerAddress2, homingMode);
-      writeFailed = writeFailed || result != node.ku8MBSuccess;
-      if (!interruptible_command_delay(50, false, true)) return;
-
-
-      if (!writeFailed) {
-        Serial.println("Write successful");
-      } else {
-        Serial.println("Modbus Error");
-      }
-
-      if (!interruptible_command_delay(50, true)) return;
-    }
-
-    //-----RESET DRIVE MODBUS--------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "FR") {
-      uint8_t result;
-      bool writeFailed = false;
-
-      // Address and value to write
-      uint16_t registerAddress1 = 0x0B01;  // P1101 - fault reset
-
-      uint16_t valueOn = 1;
-      uint16_t valueOff = 0;
-
-      result = node.writeSingleRegister(registerAddress1, valueOn);
-      writeFailed = writeFailed || result != node.ku8MBSuccess;
-      if (!interruptible_command_delay(50, false, true)) return;
-      result = node.writeSingleRegister(registerAddress1, valueOff);
-      writeFailed = writeFailed || result != node.ku8MBSuccess;
-      if (!interruptible_command_delay(50, false, true)) return;
-
-
-      if (!writeFailed) {
-        Serial.println("Write successful");
-      } else {
-        Serial.println("Modbus Error");
-      }
-
-      if (!interruptible_command_delay(50, true)) return;
-    }
-
-    //-----SPLINE START------------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "SL") {
-      splineTrue = true;
-      delay(5);
-      Serial.print("SL");
-      moveSequence = "";
-      flag = "";
-      rndTrue = false;
-      splineEndReceived = false;
-    }
-
-    //----- SPLINE STOP  ----------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "SS") {
-      delay(5);
-      sendRobotPos();
-      splineTrue = false;
-      splineEndReceived = false;
-    }
-
-    //-----COMMAND TO CLOSE---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "CL") {
-      delay(5);
-      Serial.end();
-    }
-
-    //-----COMMAND TEST LIMIT SWITCHES---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "TL") {
-
-      String J1calTest = "0";
-      String J2calTest = "0";
-      String J3calTest = "0";
-      String J4calTest = "0";
-      String J5calTest = "0";
-      String J6calTest = "0";
-
-      if (ar4_protocol::calibration_switch_is_active(
-          digitalRead(J1calPin),
-          calibrationLimitSensor[0]
-      )) {
-        J1calTest = "1";
-      }
-      if (ar4_protocol::calibration_switch_is_active(
-          digitalRead(J2calPin),
-          calibrationLimitSensor[1]
-      )) {
-        J2calTest = "1";
-      }
-      if (ar4_protocol::calibration_switch_is_active(
-          digitalRead(J3calPin),
-          calibrationLimitSensor[2]
-      )) {
-        J3calTest = "1";
-      }
-      if (ar4_protocol::calibration_switch_is_active(
-          digitalRead(J4calPin),
-          calibrationLimitSensor[3]
-      )) {
-        J4calTest = "1";
-      }
-      if (ar4_protocol::calibration_switch_is_active(
-          digitalRead(J5calPin),
-          calibrationLimitSensor[4]
-      )) {
-        J5calTest = "1";
-      }
-      if (ar4_protocol::calibration_switch_is_active(
-          digitalRead(J6calPin),
-          calibrationLimitSensor[5]
-      )) {
-        J6calTest = "1";
-      }
-      String TestLim = " J1 = " + J1calTest + "   J2 = " + J2calTest + "   J3 = " + J3calTest + "   J4 = " + J4calTest + "   J5 = " + J5calTest + "   J6 = " + J6calTest;
-      delay(5);
-      Serial.println(TestLim);
-    }
-
-
-    //-----COMMAND SET ENCODERS TO 1000---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "SE") {
-      J1encPos.write(1000);
-      J2encPos.write(1000);
-      J3encPos.write(1000);
-      J4encPos.write(1000);
-      J5encPos.write(1000);
-      J6encPos.write(1000);
-      delay(5);
-      Serial.print("Done");
-    }
-
-    //-----COMMAND READ ENCODERS---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "RE") {
-      J1EncSteps = J1encPos.read();
-      J2EncSteps = J2encPos.read();
-      J3EncSteps = J3encPos.read();
-      J4EncSteps = J4encPos.read();
-      J5EncSteps = J5encPos.read();
-      J6EncSteps = J6encPos.read();
-      String Read = " J1 = " + String(J1EncSteps) + "   J2 = " + String(J2EncSteps) + "   J3 = " + String(J3EncSteps) + "   J4 = " + String(J4EncSteps) + "   J5 = " + String(J5EncSteps) + "   J6 = " + String(J6EncSteps);
-      delay(5);
-      Serial.println(Read);
-    }
-
-    //-----COMMAND REQUEST POSITION---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "RP") {
-      //close serial so next command can be read in
-      delay(5);
-      if (Alarm == "0") {
-        sendRobotPos();
-      } else {
-        Serial.println(Alarm);
-        Alarm = "0";
-      }
-    }
-
-
-
-    //-----COMMAND HOME POSITION---------------------------------------------------
-    //-----------------------------------------------------------------------
-
-    //For debugging
-    if (function == "HM") {
-
-      int J1dir;
-      int J2dir;
-      int J3dir;
-      int J4dir;
-      int J5dir;
-      int J6dir;
-      int J7dir;
-      int J8dir;
-      int J9dir;
-
-
-      String SpeedType = "p";
-      float SpeedVal = 25.0;
-      float ACCspd = 10.0;
-      float DCCspd = 10.0;
-      float ACCramp = 20.0;
-
-      const float home_positions[ROBOT_nDOFs] = {
-        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-      };
-      int home_steps[ROBOT_nDOFs] = {};
-      if (!primary_positions_to_future_steps(home_positions, home_steps)) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
-        JangleIn[axis] = home_positions[axis];
-      }
-
-
-      //calc destination motor steps
-      int J1futStepM = home_steps[0];
-      int J2futStepM = home_steps[1];
-      int J3futStepM = home_steps[2];
-      int J4futStepM = home_steps[3];
-      int J5futStepM = home_steps[4];
-      int J6futStepM = home_steps[5];
-
-      //calc delta from current to destination
-      int J1stepDif = J1StepM - J1futStepM;
-      int J2stepDif = J2StepM - J2futStepM;
-      int J3stepDif = J3StepM - J3futStepM;
-      int J4stepDif = J4StepM - J4futStepM;
-      int J5stepDif = J5StepM - J5futStepM;
-      int J6stepDif = J6StepM - J6futStepM;
-      int J7stepDif = 0;
-      int J8stepDif = 0;
-      int J9stepDif = 0;
-
-      //determine motor directions
-      J1dir = (J1stepDif <= 0) ? 1 : 0;
-      J2dir = (J2stepDif <= 0) ? 1 : 0;
-      J3dir = (J3stepDif <= 0) ? 1 : 0;
-      J4dir = (J4stepDif <= 0) ? 1 : 0;
-      J5dir = (J5stepDif <= 0) ? 1 : 0;
-      J6dir = (J6stepDif <= 0) ? 1 : 0;
-      J7dir = 0;
-      J8dir = 0;
-      J9dir = 0;
-
-
-
-      resetEncoders();
-      if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, nullptr, false)) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      checkEncoders();
-      sendRobotPos();
-      delay(5);
-      Serial.println("Done");
-    }
-
-
-    //-----COMMAND CORRECT POSITION---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "CP") {
-      correctRobotPos();
-    }
-
-    //-----COMMAND UPDATE PARAMS---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "UP") {
-      int TFxStart = inData.indexOf('A');
-      int TFyStart = inData.indexOf('B');
-      int TFzStart = inData.indexOf('C');
-      int TFrzStart = inData.indexOf('D');
-      int TFryStart = inData.indexOf('E');
-      int TFrxStart = inData.indexOf('F');
-
-      int J1motDirStart = inData.indexOf('G');
-      int J2motDirStart = inData.indexOf('H');
-      int J3motDirStart = inData.indexOf('I');
-      int J4motDirStart = inData.indexOf('J');
-      int J5motDirStart = inData.indexOf('K');
-      int J6motDirStart = inData.indexOf('L');
-      int J7motDirStart = inData.indexOf('M');
-      int J8motDirStart = inData.indexOf('N');
-      int J9motDirStart = inData.indexOf('O');
-
-      int J1calDirStart = inData.indexOf('P');
-      int J2calDirStart = inData.indexOf('Q');
-      int J3calDirStart = inData.indexOf('R');
-      int J4calDirStart = inData.indexOf('S');
-      int J5calDirStart = inData.indexOf('T');
-      int J6calDirStart = inData.indexOf('U');
-      int J7calDirStart = inData.indexOf('V');
-      int J8calDirStart = inData.indexOf('W');
-      int J9calDirStart = inData.indexOf('X');
-
-      int J1PosLimStart = inData.indexOf('Y');
-      int J1NegLimStart = inData.indexOf('Z');
-      int J2PosLimStart = inData.indexOf('a');
-      int J2NegLimStart = inData.indexOf('b');
-      int J3PosLimStart = inData.indexOf('c');
-      int J3NegLimStart = inData.indexOf('d');
-      int J4PosLimStart = inData.indexOf('e');
-      int J4NegLimStart = inData.indexOf('f');
-      int J5PosLimStart = inData.indexOf('g');
-      int J5NegLimStart = inData.indexOf('h');
-      int J6PosLimStart = inData.indexOf('i');
-      int J6NegLimStart = inData.indexOf('j');
-
-      int J1StepDegStart = inData.indexOf('k');
-      int J2StepDegStart = inData.indexOf('l');
-      int J3StepDegStart = inData.indexOf('m');
-      int J4StepDegStart = inData.indexOf('n');
-      int J5StepDegStart = inData.indexOf('o');
-      int J6StepDegStart = inData.indexOf('p');
-
-      int J1EncMultStart = inData.indexOf('q');
-      int J2EncMultStart = inData.indexOf('r');
-      int J3EncMultStart = inData.indexOf('s');
-      int J4EncMultStart = inData.indexOf('t');
-      int J5EncMultStart = inData.indexOf('u');
-      int J6EncMultStart = inData.indexOf('v');
-
-      int J1tDHparStart = inData.indexOf('w');
-      int J2tDHparStart = inData.indexOf('x');
-      int J3tDHparStart = inData.indexOf('y');
-      int J4tDHparStart = inData.indexOf('z');
-      int J5tDHparStart = inData.indexOf('!');
-      int J6tDHparStart = inData.indexOf('@');
-
-      int J1uDHparStart = inData.indexOf('#');
-      int J2uDHparStart = inData.indexOf('$');
-      int J3uDHparStart = inData.indexOf('%');
-      int J4uDHparStart = inData.indexOf('^');
-      int J5uDHparStart = inData.indexOf('&');
-      int J6uDHparStart = inData.indexOf('*');
-
-      int J1dDHparStart = inData.indexOf('(');
-      int J2dDHparStart = inData.indexOf(')');
-      int J3dDHparStart = inData.indexOf('+');
-      int J4dDHparStart = inData.indexOf('=');
-      int J5dDHparStart = inData.indexOf(',');
-      int J6dDHparStart = inData.indexOf('_');
-
-      int J1aDHparStart = inData.indexOf('<');
-      int J2aDHparStart = inData.indexOf('>');
-      int J3aDHparStart = inData.indexOf('?');
-      int J4aDHparStart = inData.indexOf('{');
-      int J5aDHparStart = inData.indexOf('}');
-      int J6aDHparStart = inData.indexOf('~');
-      int calibrationSwitchMaskStart = inData.indexOf('|');
-
-      const int positions[] = {
-        TFxStart,
-        TFyStart,
-        TFzStart,
-        TFrzStart,
-        TFryStart,
-        TFrxStart,
-        J1motDirStart,
-        J2motDirStart,
-        J3motDirStart,
-        J4motDirStart,
-        J5motDirStart,
-        J6motDirStart,
-        J7motDirStart,
-        J8motDirStart,
-        J9motDirStart,
-        J1calDirStart,
-        J2calDirStart,
-        J3calDirStart,
-        J4calDirStart,
-        J5calDirStart,
-        J6calDirStart,
-        J7calDirStart,
-        J8calDirStart,
-        J9calDirStart,
-        J1PosLimStart,
-        J1NegLimStart,
-        J2PosLimStart,
-        J2NegLimStart,
-        J3PosLimStart,
-        J3NegLimStart,
-        J4PosLimStart,
-        J4NegLimStart,
-        J5PosLimStart,
-        J5NegLimStart,
-        J6PosLimStart,
-        J6NegLimStart,
-        J1StepDegStart,
-        J2StepDegStart,
-        J3StepDegStart,
-        J4StepDegStart,
-        J5StepDegStart,
-        J6StepDegStart,
-        J1EncMultStart,
-        J2EncMultStart,
-        J3EncMultStart,
-        J4EncMultStart,
-        J5EncMultStart,
-        J6EncMultStart,
-        J1tDHparStart,
-        J2tDHparStart,
-        J3tDHparStart,
-        J4tDHparStart,
-        J5tDHparStart,
-        J6tDHparStart,
-        J1uDHparStart,
-        J2uDHparStart,
-        J3uDHparStart,
-        J4uDHparStart,
-        J5uDHparStart,
-        J6uDHparStart,
-        J1dDHparStart,
-        J2dDHparStart,
-        J3dDHparStart,
-        J4dDHparStart,
-        J5dDHparStart,
-        J6dDHparStart,
-        J1aDHparStart,
-        J2aDHparStart,
-        J3aDHparStart,
-        J4aDHparStart,
-        J5aDHparStart,
-        J6aDHparStart,
-        calibrationSwitchMaskStart,
-        static_cast<int>(inData.length()),
-      };
-      float stagedTool[ROBOT_nDOFs];
-      int stagedDirections[18];
-      float stagedLimits[12];
-      float stagedStepDegrees[ROBOT_nDOFs];
-      float stagedEncoderMultipliers[ROBOT_nDOFs];
-      float stagedDHTheta[ROBOT_nDOFs];
-      float stagedDHAlpha[ROBOT_nDOFs];
-      float stagedDHD[ROBOT_nDOFs];
-      float stagedDHA[ROBOT_nDOFs];
-      int stagedCalibrationSwitchMask = 0;
-      uint8_t stagedCalibrationSwitches[numJoints] = {};
-      if (
-        !ar4_protocol::field_boundaries_cover_command(
-          inData.length(),
-          positions
-        )
-        || !parse_float_marker_fields(inData, positions, stagedTool)
-        || !parse_int_marker_fields(inData, positions + 6, stagedDirections)
-        || !ar4_protocol::values_are_binary(stagedDirections)
-        || !parse_float_marker_fields(inData, positions + 24, stagedLimits)
-        || !parse_float_marker_fields(inData, positions + 36, stagedStepDegrees)
-        || !parse_float_marker_fields(
-          inData,
-          positions + 42,
-          stagedEncoderMultipliers
-        )
-        || !parse_float_marker_fields(inData, positions + 48, stagedDHTheta)
-        || !parse_float_marker_fields(inData, positions + 54, stagedDHAlpha)
-        || !parse_float_marker_fields(inData, positions + 60, stagedDHD)
-        || !parse_float_marker_fields(inData, positions + 66, stagedDHA)
-        || !parse_int_span(
-          inData,
-          calibrationSwitchMaskStart + 1,
-          static_cast<int>(inData.length()),
-          stagedCalibrationSwitchMask
-        )
-        || !ar4_protocol::decode_calibration_switch_mask(
-          stagedCalibrationSwitchMask,
-          stagedCalibrationSwitches
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      int stagedStepLimits[ROBOT_nDOFs];
-      int stagedZeroSteps[ROBOT_nDOFs];
-      for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
-        if (
-          stagedEncoderMultipliers[joint] <= 0.0f
-          || !ar4_protocol::validate_axis_calibration(
-            stagedLimits[joint * 2 + 1],
-            stagedLimits[joint * 2],
-            stagedStepDegrees[joint],
-            stagedStepLimits[joint],
-            stagedZeroSteps[joint]
-          )
-        ) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-      }
-
-      float nativeToolRz = 0.0f;
-      float nativeToolRy = 0.0f;
-      float nativeToolRx = 0.0f;
-      if (
-        !ar4_protocol::degrees_to_radians(
-          stagedTool[3],
-          nativeToolRz
-        )
-        || !ar4_protocol::degrees_to_radians(
-          stagedTool[4],
-          nativeToolRy
-        )
-        || !ar4_protocol::degrees_to_radians(
-          stagedTool[5],
-          nativeToolRx
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
-        float nativeTheta = 0.0f;
-        float nativeAlpha = 0.0f;
-        if (
-          !ar4_protocol::degrees_to_radians(
-            stagedDHTheta[joint],
-            nativeTheta
-          )
-          || !ar4_protocol::degrees_to_radians(
-            stagedDHAlpha[joint],
-            nativeAlpha
-          )
-        ) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-      }
-      ar4_protocol::PrimaryHomeReferenceState invalidatedHomeReference =
-        primaryHomeReference;
-      ar4_protocol::invalidate_primary_home_reference(
-        invalidatedHomeReference
-      );
-      Robot_Kin_Tool[0] = stagedTool[0];
-      Robot_Kin_Tool[1] = stagedTool[1];
-      Robot_Kin_Tool[2] = stagedTool[2];
-      Robot_Kin_Tool[5] = nativeToolRz;
-      Robot_Kin_Tool[4] = nativeToolRy;
-      Robot_Kin_Tool[3] = nativeToolRx;
-      J1MotDir = stagedDirections[0];
-      J2MotDir = stagedDirections[1];
-      J3MotDir = stagedDirections[2];
-      J4MotDir = stagedDirections[3];
-      J5MotDir = stagedDirections[4];
-      J6MotDir = stagedDirections[5];
-      J7MotDir = stagedDirections[6];
-      J8MotDir = stagedDirections[7];
-      J9MotDir = stagedDirections[8];
-      J1CalDir = stagedDirections[9];
-      J2CalDir = stagedDirections[10];
-      J3CalDir = stagedDirections[11];
-      J4CalDir = stagedDirections[12];
-      J5CalDir = stagedDirections[13];
-      J6CalDir = stagedDirections[14];
-      J7CalDir = stagedDirections[15];
-      J8CalDir = stagedDirections[16];
-      J9CalDir = stagedDirections[17];
-      J1axisLimPos = stagedLimits[0];
-      J1axisLimNeg = stagedLimits[1];
-      J2axisLimPos = stagedLimits[2];
-      J2axisLimNeg = stagedLimits[3];
-      J3axisLimPos = stagedLimits[4];
-      J3axisLimNeg = stagedLimits[5];
-      J4axisLimPos = stagedLimits[6];
-      J4axisLimNeg = stagedLimits[7];
-      J5axisLimPos = stagedLimits[8];
-      J5axisLimNeg = stagedLimits[9];
-      J6axisLimPos = stagedLimits[10];
-      J6axisLimNeg = stagedLimits[11];
-
-      J1StepDeg = stagedStepDegrees[0];
-      J2StepDeg = stagedStepDegrees[1];
-      J3StepDeg = stagedStepDegrees[2];
-      J4StepDeg = stagedStepDegrees[3];
-      J5StepDeg = stagedStepDegrees[4];
-      J6StepDeg = stagedStepDegrees[5];
-
-      J1encMult = stagedEncoderMultipliers[0];
-      J2encMult = stagedEncoderMultipliers[1];
-      J3encMult = stagedEncoderMultipliers[2];
-      J4encMult = stagedEncoderMultipliers[3];
-      J5encMult = stagedEncoderMultipliers[4];
-      J6encMult = stagedEncoderMultipliers[5];
-
-      for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
-        DHparams[joint][0] = stagedDHTheta[joint];
-        DHparams[joint][1] = stagedDHAlpha[joint];
-        DHparams[joint][2] = stagedDHD[joint];
-        DHparams[joint][3] = stagedDHA[joint];
-      }
-
-
-      //define total axis travel
-      J1axisLim = J1axisLimPos + J1axisLimNeg;
-      J2axisLim = J2axisLimPos + J2axisLimNeg;
-      J3axisLim = J3axisLimPos + J3axisLimNeg;
-      J4axisLim = J4axisLimPos + J4axisLimNeg;
-      J5axisLim = J5axisLimPos + J5axisLimNeg;
-      J6axisLim = J6axisLimPos + J6axisLimNeg;
-
-      //steps full movement of each axis
-      J1StepLim = stagedStepLimits[0];
-      J2StepLim = stagedStepLimits[1];
-      J3StepLim = stagedStepLimits[2];
-      J4StepLim = stagedStepLimits[3];
-      J5StepLim = stagedStepLimits[4];
-      J6StepLim = stagedStepLimits[5];
-
-      //step and axis zero
-      J1zeroStep = stagedZeroSteps[0];
-      J2zeroStep = stagedZeroSteps[1];
-      J3zeroStep = stagedZeroSteps[2];
-      J4zeroStep = stagedZeroSteps[3];
-      J5zeroStep = stagedZeroSteps[4];
-      J6zeroStep = stagedZeroSteps[5];
-
-      for (int axis = 0; axis < numJoints; ++axis) {
-        calibrationLimitSensor[axis] = stagedCalibrationSwitches[axis];
-      }
-      primaryHomeReference = invalidatedHomeReference;
-      if (!robot_set_AR()) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      Serial.print("Done");
-    }
-
-    //-----COMMAND CALIBRATE EXTERNAL AXIS---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "CE") {
-      int J7lengthStart = inData.indexOf('A');
-      int J7rotStart = inData.indexOf('B');
-      int J7stepsStart = inData.indexOf('C');
-      int J8lengthStart = inData.indexOf('D');
-      int J8rotStart = inData.indexOf('E');
-      int J8stepsStart = inData.indexOf('F');
-      int J9lengthStart = inData.indexOf('G');
-      int J9rotStart = inData.indexOf('H');
-      int J9stepsStart = inData.indexOf('I');
-
-      const int positions[] = {
-        J7lengthStart,
-        J7rotStart,
-        J7stepsStart,
-        J8lengthStart,
-        J8rotStart,
-        J8stepsStart,
-        J9lengthStart,
-        J9rotStart,
-        J9stepsStart,
-        static_cast<int>(inData.length()),
-      };
-      float parsed[9];
-      if (
-        !ar4_protocol::field_boundaries_cover_command(
-          inData.length(),
-          positions
-        )
-        || !parse_float_marker_fields(inData, positions, parsed)
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      ar4_protocol::ExternalAxisCalibration stagedCalibration[3];
-      for (int axis = 0; axis < 3; ++axis) {
-        if (!ar4_protocol::validate_external_axis_calibration(
-            parsed[axis * 3],
-            parsed[axis * 3 + 1],
-            parsed[axis * 3 + 2],
-            stagedCalibration[axis]
-        )) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-      }
-
-      J7length = parsed[0];
-      J7rot = parsed[1];
-      J7steps = parsed[2];
-      J8length = parsed[3];
-      J8rot = parsed[4];
-      J8steps = parsed[5];
-      J9length = parsed[6];
-      J9rot = parsed[7];
-      J9steps = parsed[8];
-
-      J7axisLimNeg = 0;
-      J7axisLimPos = stagedCalibration[0].positive_limit;
-      J7axisLim = J7axisLimPos + J7axisLimNeg;
-      J7StepDeg = stagedCalibration[0].steps_per_unit;
-      J7StepLim = stagedCalibration[0].step_limit;
-      J7zeroStep = stagedCalibration[0].zero_step;
-
-      J8axisLimNeg = 0;
-      J8axisLimPos = stagedCalibration[1].positive_limit;
-      J8axisLim = J8axisLimPos + J8axisLimNeg;
-      J8StepDeg = stagedCalibration[1].steps_per_unit;
-      J8StepLim = stagedCalibration[1].step_limit;
-      J8zeroStep = stagedCalibration[1].zero_step;
-
-      J9axisLimNeg = 0;
-      J9axisLimPos = stagedCalibration[2].positive_limit;
-      J9axisLim = J9axisLimPos + J9axisLimNeg;
-      J9StepDeg = stagedCalibration[2].steps_per_unit;
-      J9StepLim = stagedCalibration[2].step_limit;
-      J9zeroStep = stagedCalibration[2].zero_step;
-
-      delay(5);
-      Serial.print("Done");
-    }
-
-    //-----COMMAND ZERO J7---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "Z7") {
-      J7StepM = 0;
-      sendRobotPos();
-    }
-
-    //-----COMMAND ZERO J8---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "Z8") {
-      J8StepM = 0;
-      sendRobotPos();
-    }
-
-    //-----COMMAND ZERO J9---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "Z9") {
-      J9StepM = 0;
-      sendRobotPos();
-    }
-
-
-    //-----COMMAND TO WAIT TIME---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "WT") {
-      int WTstart = inData.indexOf('S');
-      float WaitTime = 0.0f;
-      uint32_t WaitTimeMS = 0;
-      if (
-        WTstart != 0
-        || !parse_float_span(
-          inData,
-          WTstart + 1,
-          static_cast<int>(inData.length()),
-          WaitTime
-        )
-        || !ar4_protocol::wait_seconds_to_milliseconds(
-          WaitTime,
-          WaitTimeMS
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      if (!interruptible_command_delay(WaitTimeMS, false)) return;
-      Serial.println("WTdone");
-    }
-
-
-    // The Teensy GPIO map has no general-purpose output profile. ON/OF remain
-    // auxiliary-controller commands until a board-specific map is defined.
-    if (function == "ON" || function == "OF") {
-      Serial.println("ER");
-      consume_current_command();
-      return;
-    }
-
-    //-----COMMAND TO WAIT MODBUS COIL---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "WJ") {
-      int32_t result = -2;
-      String MBquery = "";
-      int slaveIndex = inData.indexOf('A');
-      int inputIndex = inData.indexOf('B');
-      int valueIndex = inData.indexOf('C');
-      int timoutIndex = inData.indexOf('D');
-      const int positions[] = {
-        slaveIndex,
-        inputIndex,
-        valueIndex,
-        timoutIndex,
-        static_cast<int>(inData.length()),
-      };
-      int parsed[4];
-      uint32_t timeoutMillis = 0;
-      if (
-        !ar4_protocol::field_boundaries_cover_command(
-          inData.length(),
-          positions
-        )
-        || !parse_int_marker_fields(inData, positions, parsed)
-        || !ar4_protocol::validate_modbus_wait(
-          ar4_protocol::ModbusOperation::kReadCoil,
-          parsed[0],
-          parsed[1],
-          parsed[2],
-          parsed[3],
-          timeoutMillis
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      int slaveID = parsed[0];
-      int input = parsed[1];
-      int value = parsed[2];
-      unsigned long startTime = millis();
-      MBquery = "A" + String(slaveID) + "B" + String(input) + "C1";
-      while (
-        (millis() - startTime < timeoutMillis)
-        && (result != value)
-        && !estopActive
-      ) {
-        result = modbusQuerry(MBquery, 1);
-        if (!interruptible_command_delay(100, false)) return;
-      }
-      if (!interruptible_command_delay(5, false)) return;
-      if (result == value) {
-        Serial.println("Done");
-      } else if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println("ER");
-      }
-    }
-
-    //-----COMMAND TO WAIT MODBUS INPUT---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "WK") {
-      int32_t result = -2;
-      String MBquery = "";
-      int slaveIndex = inData.indexOf('A');
-      int inputIndex = inData.indexOf('B');
-      int valueIndex = inData.indexOf('C');
-      int timoutIndex = inData.indexOf('D');
-      const int positions[] = {
-        slaveIndex,
-        inputIndex,
-        valueIndex,
-        timoutIndex,
-        static_cast<int>(inData.length()),
-      };
-      int parsed[4];
-      uint32_t timeoutMillis = 0;
-      if (
-        !ar4_protocol::field_boundaries_cover_command(
-          inData.length(),
-          positions
-        )
-        || !parse_int_marker_fields(inData, positions, parsed)
-        || !ar4_protocol::validate_modbus_wait(
-          ar4_protocol::ModbusOperation::kReadDiscreteInput,
-          parsed[0],
-          parsed[1],
-          parsed[2],
-          parsed[3],
-          timeoutMillis
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      int slaveID = parsed[0];
-      int input = parsed[1];
-      int value = parsed[2];
-      unsigned long startTime = millis();
-      MBquery = "A" + String(slaveID) + "B" + String(input) + "C1";
-      while (
-        (millis() - startTime < timeoutMillis)
-        && (result != value)
-        && !estopActive
-      ) {
-        result = modbusQuerry(MBquery, 2);
-        if (!interruptible_command_delay(100, false)) return;
-      }
-      if (!interruptible_command_delay(5, false)) return;
-      if (result == value) {
-        Serial.println("Done");
-      } else if (result == -1) {
-        Serial.println("Modbus Error");
-      } else {
-        Serial.println("ER");
-      }
-    }
-
-    //-----COMMAND TO SET MODBUS COIL---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "SC") {
-      int32_t result = -2;
-      String MBquery = "";
-      int slaveIndex = inData.indexOf('A');
-      int inputIndex = inData.indexOf('B');
-      int valueIndex = inData.indexOf('C');
-      const int positions[] = {
-        slaveIndex,
-        inputIndex,
-        valueIndex,
-        static_cast<int>(inData.length()),
-      };
-      int parsed[3];
-      if (
-        !ar4_protocol::field_boundaries_cover_command(
-          inData.length(),
-          positions
-        )
-        || !parse_int_marker_fields(inData, positions, parsed)
-        || !ar4_protocol::validate_modbus_request(
-          ar4_protocol::ModbusOperation::kWriteCoil,
-          parsed[0],
-          parsed[1],
-          parsed[2]
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      int slaveID = parsed[0];
-      int input = parsed[1];
-      int value = parsed[2];
-      MBquery = "A" + String(slaveID) + "B" + String(input) + "C" + String(value);
-      result = modbusQuerry(MBquery, 15);
-      Serial.println(result);
-      if (!interruptible_command_delay(5, true)) return;
-    }
-
-    //-----COMMAND TO SET MODBUS OUTPUT REGISTER---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "SO") {
-      int32_t result = -2;
-      String MBquery = "";
-      int slaveIndex = inData.indexOf('A');
-      int inputIndex = inData.indexOf('B');
-      int valueIndex = inData.indexOf('C');
-      const int positions[] = {
-        slaveIndex,
-        inputIndex,
-        valueIndex,
-        static_cast<int>(inData.length()),
-      };
-      int parsed[3];
-      if (
-        !ar4_protocol::field_boundaries_cover_command(
-          inData.length(),
-          positions
-        )
-        || !parse_int_marker_fields(inData, positions, parsed)
-        || !ar4_protocol::validate_modbus_request(
-          ar4_protocol::ModbusOperation::kWriteRegister,
-          parsed[0],
-          parsed[1],
-          parsed[2]
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      int slaveID = parsed[0];
-      int input = parsed[1];
-      int value = parsed[2];
-      MBquery = "A" + String(slaveID) + "B" + String(input) + "C" + String(value);
-      result = modbusQuerry(MBquery, 6);
-      Serial.println(result);
-      if (!interruptible_command_delay(5, true)) return;
-    }
-
-
-    //-----COMMAND SEND POSITION---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "SP") {
-      int J1angStart = inData.indexOf('A');
-      int J2angStart = inData.indexOf('B');
-      int J3angStart = inData.indexOf('C');
-      int J4angStart = inData.indexOf('D');
-      int J5angStart = inData.indexOf('E');
-      int J6angStart = inData.indexOf('F');
-      int J7angStart = inData.indexOf('G');
-      int J8angStart = inData.indexOf('H');
-      int J9angStart = inData.indexOf('I');
-      const int positions[] = {
-        J1angStart,
-        J2angStart,
-        J3angStart,
-        J4angStart,
-        J5angStart,
-        J6angStart,
-        J7angStart,
-        J8angStart,
-        J9angStart,
-        static_cast<int>(inData.length()),
-      };
-      float parsed[9];
-      int stagedStepMonitors[numJoints];
-      if (
-        !ar4_protocol::field_boundaries_cover_command(
-          inData.length(),
-          positions
-        )
-        || !parse_float_marker_fields(inData, positions, parsed)
-        || !joint_positions_to_future_steps(parsed, stagedStepMonitors)
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      ar4_protocol::PrimaryHomeReferenceState invalidatedHomeReference =
-        primaryHomeReference;
-      ar4_protocol::invalidate_primary_home_reference(
-        invalidatedHomeReference
-      );
-      J1StepM = stagedStepMonitors[0];
-      J2StepM = stagedStepMonitors[1];
-      J3StepM = stagedStepMonitors[2];
-      J4StepM = stagedStepMonitors[3];
-      J5StepM = stagedStepMonitors[4];
-      J6StepM = stagedStepMonitors[5];
-      J7StepM = stagedStepMonitors[6];
-      J8StepM = stagedStepMonitors[7];
-      J9StepM = stagedStepMonitors[8];
-      primaryHomeReference = invalidatedHomeReference;
-      delay(5);
-      Serial.println("Done");
-    }
-
-
-    //-----COMMAND ECHO TEST MESSAGE---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "TM") {
-      int J1start = inData.indexOf('A');
-      int J2start = inData.indexOf('B');
-      int J3start = inData.indexOf('C');
-      int J4start = inData.indexOf('D');
-      int J5start = inData.indexOf('E');
-      int J6start = inData.indexOf('F');
-      int WristConStart = inData.indexOf('W');
-      const int positions[] = {
-        J1start,
-        J2start,
-        J3start,
-        J4start,
-        J5start,
-        J6start,
-        WristConStart,
-      };
-      float parsed[ROBOT_nDOFs];
-      if (
-        !ar4_protocol::marker_positions_are_ordered_from(
-          inData.length(),
-          positions,
-          0
-        )
-        || WristConStart + 2 != static_cast<int>(inData.length())
-        || !ar4_protocol::valid_wrist_config(inData.charAt(WristConStart + 1))
-        || !parse_float_marker_fields(inData, positions, parsed)
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      for (int joint = 0; joint < ROBOT_nDOFs; ++joint) {
-        JangleIn[joint] = parsed[joint];
-      }
-      WristCon = inData.substring(WristConStart + 1);
-
-      SolveInverseKinematics(inData.charAt(WristConStart + 1));
-
-      String echo = "";
-      delay(5);
-      Serial.println(inData);
-    }
-
-
-    //-----COMMAND TO CALIBRATE---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "LL") {
-      int J1start = inData.indexOf('A');
-      int J2start = inData.indexOf('B');
-      int J3start = inData.indexOf('C');
-      int J4start = inData.indexOf('D');
-      int J5start = inData.indexOf('E');
-      int J6start = inData.indexOf('F');
-      int J7start = inData.indexOf('G');
-      int J8start = inData.indexOf('H');
-      int J9start = inData.indexOf('I');
-
-      int J1calstart = inData.indexOf('J');
-      int J2calstart = inData.indexOf('K');
-      int J3calstart = inData.indexOf('L');
-      int J4calstart = inData.indexOf('M');
-      int J5calstart = inData.indexOf('N');
-      int J6calstart = inData.indexOf('O');
-      int J7calstart = inData.indexOf('P');
-      int J8calstart = inData.indexOf('Q');
-      int J9calstart = inData.indexOf('R');
-
-      const int positions[] = {
-        J1start,
-        J2start,
-        J3start,
-        J4start,
-        J5start,
-        J6start,
-        J7start,
-        J8start,
-        J9start,
-        J1calstart,
-        J2calstart,
-        J3calstart,
-        J4calstart,
-        J5calstart,
-        J6calstart,
-        J7calstart,
-        J8calstart,
-        J9calstart,
-        static_cast<int>(inData.length()),
-      };
-      int requested[9];
-      float calibrationOffsets[9];
-      if (
-        !ar4_protocol::field_boundaries_cover_command(
-          inData.length(),
-          positions
-        )
-        || !parse_int_marker_fields(inData, positions, requested)
-        || !ar4_protocol::values_are_binary(requested)
-        || !parse_float_marker_fields(
-          inData,
-          positions + 9,
-          calibrationOffsets
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      bool hasRequestedAxis = false;
-      for (int axis = 0; axis < 9; ++axis) {
-        if (requested[axis] == 1) {
-          hasRequestedAxis = true;
-          break;
-        }
-      }
-      if (!hasRequestedAxis) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      int J1req = requested[0];
-      int J2req = requested[1];
-      int J3req = requested[2];
-      int J4req = requested[3];
-      int J5req = requested[4];
-      int J6req = requested[5];
-      int J7req = requested[6];
-      int J8req = requested[7];
-      int J9req = requested[8];
-
-      ///
-      float SpeedIn;
-      ///
-      int J1stepCen = 0;
-      int J2stepCen = 0;
-      int J3stepCen = 0;
-      int J4stepCen = 0;
-      int J5step45 = 0;
-      int J6stepCen = 0;
-      int J7stepCen = 0;
-      int J8stepCen = 0;
-      int J9stepCen = 0;
-      ///
-      int J1dir;
-      int J2dir;
-      int J3dir;
-      int J4dir;
-      int J5dir;
-      int J6dir;
-      int J7dir;
-      int J8dir;
-      int J9dir;
-
-      int Jreq[9] = { J1req, J2req, J3req, J4req, J5req, J6req, J7req, J8req, J9req };
-      int JStepLim[9] = { J1StepLim, J2StepLim, J3StepLim, J4StepLim, J5StepLim, J6StepLim, J7StepLim, J8StepLim, J9StepLim };
-      int JStep[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-
-      const int calibrationDirections[9] = {
-        J1CalDir, J2CalDir, J3CalDir, J4CalDir, J5CalDir,
-        J6CalDir, J7CalDir, J8CalDir, J9CalDir,
-      };
-      const float positiveLimits[9] = {
-        J1axisLimPos, J2axisLimPos, J3axisLimPos,
-        J4axisLimPos, J5axisLimPos, J6axisLimPos,
-        J7axisLimPos, J8axisLimPos, J9axisLimPos,
-      };
-      const float negativeLimits[9] = {
-        J1axisLimNeg, J2axisLimNeg, J3axisLimNeg,
-        J4axisLimNeg, J5axisLimNeg, J6axisLimNeg,
-        J7axisLimNeg, J8axisLimNeg, J9axisLimNeg,
-      };
-      const float stepsPerUnit[9] = {
-        J1StepDeg, J2StepDeg, J3StepDeg,
-        J4StepDeg, J5StepDeg, J6StepDeg,
-        J7StepDeg, J8StepDeg, J9StepDeg,
-      };
-      const float baseOffsets[9] = {
-        J1calBaseOff, J2calBaseOff, J3calBaseOff,
-        J4calBaseOff, J5calBaseOff, J6calBaseOff,
-        J7calBaseOff, J8calBaseOff, J9calBaseOff,
-      };
-      const int zeroSteps[9] = {
-        J1zeroStep, J2zeroStep, J3zeroStep,
-        J4zeroStep, J5zeroStep, J6zeroStep,
-        J7zeroStep, J8zeroStep, J9zeroStep,
-      };
-      int stagedMasterSteps[9] = {};
-      int stagedCenterSteps[9] = {};
-      int stagedJointFiveSteps[9] = {};
-      int32_t stagedPrimaryHomeReference[
-        ar4_protocol::kPrimaryHomeReferenceAxisCount
-      ] = {};
-      for (int axis = 0; axis < 9; ++axis) {
-        if (!ar4_protocol::calibration_reference_steps(
-            Jreq[axis],
-            calibrationDirections[axis],
-            positiveLimits[axis],
-            negativeLimits[axis],
-            stepsPerUnit[axis],
-            JStepLim[axis],
-            baseOffsets[axis],
-            calibrationOffsets[axis],
-            axis == 4,
-            stagedMasterSteps[axis],
-            stagedCenterSteps[axis],
-            stagedJointFiveSteps[axis]
-        )) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-        if (
-          static_cast<size_t>(axis)
-            < ar4_protocol::kPrimaryHomeReferenceAxisCount
-          && Jreq[axis] == 1
-          && !ar4_protocol::primary_home_reference_millidegrees(
-            (
-              static_cast<float>(stagedMasterSteps[axis])
-              - static_cast<float>(zeroSteps[axis])
-            ) / stepsPerUnit[axis],
-            stagedPrimaryHomeReference[axis]
-          )
-        ) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-      }
-
-      for (int i = 0; i < 9; i++) {
-        if (Jreq[i] == 1) {
-          JStep[i] = JStepLim[i];
-        }
-      }
-      ar4_protocol::PrimaryHomeReferenceState invalidatedHomeReference =
-        primaryHomeReference;
-      for (
-        size_t axis = 0;
-        axis < ar4_protocol::kPrimaryHomeReferenceAxisCount;
-        ++axis
-      ) {
-        if (Jreq[axis] == 1) {
-          ar4_protocol::invalidate_primary_home_reference_axis(
-            invalidatedHomeReference,
-            axis
-          );
-        }
-      }
-      primaryHomeReference = invalidatedHomeReference;
-
-      //DRIVE TO LIMITS FAST
-      SpeedIn = 25;
-      if (!driveLimit(JStep, Jreq, SpeedIn)) {
-        finish_calibration_failure_response();
-        return;
-      }
-
-      //Backoff 
-      if (!backOff(
-          J1req, J2req, J3req, J4req, J5req,
-          J6req, J7req, J8req, J9req,
-          5,
-          CALIBRATION_RELEASE_MAXIMUM_TRAVEL_UNITS
-      )) {
-        finish_calibration_failure_response();
-        return;
-      }
-
-      //DRIVE TO LIMITS MED
-      SpeedIn = 2;
-      if (!driveLimit(JStep, Jreq, SpeedIn)) {
-        finish_calibration_failure_response();
-        return;
-      }
-
-
-
-
-
-
-      int *stepMonitors[9] = {
-        &J1StepM, &J2StepM, &J3StepM, &J4StepM, &J5StepM,
-        &J6StepM, &J7StepM, &J8StepM, &J9StepM,
-      };
-      for (int axis = 0; axis < 9; ++axis) {
-        if (Jreq[axis] == 1) *stepMonitors[axis] = stagedMasterSteps[axis];
-      }
-      J1stepCen = stagedCenterSteps[0];
-      J2stepCen = stagedCenterSteps[1];
-      J3stepCen = stagedCenterSteps[2];
-      J4stepCen = stagedCenterSteps[3];
-      J5step45 = stagedJointFiveSteps[4];
-      J6stepCen = stagedCenterSteps[5];
-      J7stepCen = stagedCenterSteps[6];
-      J8stepCen = stagedCenterSteps[7];
-      J9stepCen = stagedCenterSteps[8];
-
-
-      //move to center
-      /// J1 ///
-      if (J1CalDir) {
-        J1dir = 0;
-      } else {
-        J1dir = 1;
-      }
-      /// J2 ///
-      if (J2CalDir) {
-        J2dir = 0;
-      } else {
-        J2dir = 1;
-      }
-      /// J3 ///
-      if (J3CalDir) {
-        J3dir = 0;
-      } else {
-        J3dir = 1;
-      }
-      /// J4 ///
-      if (J4CalDir) {
-        J4dir = 0;
-      } else {
-        J4dir = 1;
-      }
-      /// J5 ///
-      if (J5CalDir) {
-        J5dir = 0;
-      } else {
-        J5dir = 1;
-      }
-      /// J6 ///
-      if (J6CalDir) {
-        J6dir = 0;
-      } else {
-        J6dir = 1;
-      }
-      /// J7 ///
-      if (J7CalDir) {
-        J7dir = 0;
-      } else {
-        J7dir = 1;
-      }
-      /// J8 ///
-      if (J8CalDir) {
-        J8dir = 0;
-      } else {
-        J8dir = 1;
-      }
-      /// J9 ///
-      if (J9CalDir) {
-        J9dir = 0;
-      } else {
-        J9dir = 1;
-      }
-
-      float ACCspd = 10;
-      float DCCspd = 10;
-      String SpeedType = "p";
-      //float SpeedVal = 50;
-      float SpeedVal = 100;
-      float ACCramp = 50;
-
-      if (!driveMotorsJ(J1stepCen, J2stepCen, J3stepCen, J4stepCen, J5step45, J6stepCen, J7stepCen, J8stepCen, J9stepCen, J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, nullptr, false)) {
-        finish_calibration_failure_response();
-        return;
-      }
-      if (estopActive) {
-        finish_calibration_failure_response();
-        return;
-      }
-      ar4_protocol::PrimaryHomeReferenceState committedHomeReference =
-        primaryHomeReference;
-      for (
-        size_t axis = 0;
-        axis < ar4_protocol::kPrimaryHomeReferenceAxisCount;
-        ++axis
-      ) {
-        if (Jreq[axis] == 1) {
-          ar4_protocol::set_primary_home_reference(
-            committedHomeReference,
-            axis,
-            stagedPrimaryHomeReference[axis]
-          );
-        }
-      }
-      primaryHomeReference = committedHomeReference;
-      sendRobotPos();
-      inData = "";  // Clear recieved buffer
-    }
-
-
-    //----- LIVE CARTESIAN JOG  ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "LC") {
-      int J1dir;
-      int J2dir;
-      int J3dir;
-      int J4dir;
-      int J5dir;
-      int J6dir;
-      int J7dir;
-      int J8dir;
-      int J9dir;
-
-      int J1axisFault = 0;
-      int J2axisFault = 0;
-      int J3axisFault = 0;
-      int J4axisFault = 0;
-      int J5axisFault = 0;
-      int J6axisFault = 0;
-      int TotalAxisFault = 0;
-      ar4_protocol::LiveControlFrameStatus liveControlStatus =
-        ar4_protocol::LiveControlFrameStatus::kPending;
-
-      bool JogInPoc = true;
-      Alarm = "0";
-
-
-      ar4_protocol::LiveJogCommandFields commandFields = {};
-      if (!ar4_protocol::parse_live_jog_command(
-          inData,
-          ar4_protocol::LiveJogCommandKind::kCartesian,
-          commandFields
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      int Vector = commandFields.vector;
-      String SpeedType(commandFields.speed_mode);
-      float SpeedVal = commandFields.speed;
-      float ACCspd = commandFields.acceleration;
-      float DCCspd = commandFields.deceleration;
-      float ACCramp = commandFields.ramp;
-      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
-        WristCon,
-        JointLoopModes,
-        String(commandFields.wrist_config),
-        commandFields.loop_modes
-      );
-
-      inData = "";  // Clear recieved buffer
-
-      delay(5);
-      Serial.println();
-      updatePos();
-
-      xyzuvw_In[0] = xyzuvw_Out[0];
-      xyzuvw_In[1] = xyzuvw_Out[1];
-      xyzuvw_In[2] = xyzuvw_Out[2];
-      xyzuvw_In[3] = xyzuvw_Out[3];
-      xyzuvw_In[4] = xyzuvw_Out[4];
-      xyzuvw_In[5] = xyzuvw_Out[5];
-
-
-      while (JogInPoc == true) {
-
-        if (Vector == 10) {
-          xyzuvw_In[0] = xyzuvw_Out[0] - JogStepInc;
-        }
-        if (Vector == 11) {
-          xyzuvw_In[0] = xyzuvw_Out[0] + JogStepInc;
-        }
-
-        if (Vector == 20) {
-          xyzuvw_In[1] = xyzuvw_Out[1] - JogStepInc;
-        }
-        if (Vector == 21) {
-          xyzuvw_In[1] = xyzuvw_Out[1] + JogStepInc;
-        }
-
-        if (Vector == 30) {
-          xyzuvw_In[2] = xyzuvw_Out[2] - JogStepInc;
-        }
-        if (Vector == 31) {
-          xyzuvw_In[2] = xyzuvw_Out[2] + JogStepInc;
-        }
-
-        if (Vector == 40) {
-          xyzuvw_In[3] = xyzuvw_Out[3] - JogStepInc;
-        }
-        if (Vector == 41) {
-          xyzuvw_In[3] = xyzuvw_Out[3] + JogStepInc;
-        }
-
-        if (Vector == 50) {
-          xyzuvw_In[4] = xyzuvw_Out[4] - JogStepInc;
-        }
-        if (Vector == 51) {
-          xyzuvw_In[4] = xyzuvw_Out[4] + JogStepInc;
-        }
-
-        if (Vector == 60) {
-          xyzuvw_In[5] = xyzuvw_Out[5] - JogStepInc;
-        }
-        if (Vector == 61) {
-          xyzuvw_In[5] = xyzuvw_Out[5] + JogStepInc;
-        }
-
-        SolveInverseKinematics(commandFields.wrist_config);
-
-        //calc destination motor steps
-        int future_steps[ROBOT_nDOFs] = {};
-        if (
-          KinematicError != 0
-          || !primary_inverse_solution_to_future_steps(future_steps)
-        ) {
-          KinematicError = 1;
-          break;
-        }
-        int J1futStepM = future_steps[0];
-        int J2futStepM = future_steps[1];
-        int J3futStepM = future_steps[2];
-        int J4futStepM = future_steps[3];
-        int J5futStepM = future_steps[4];
-        int J6futStepM = future_steps[5];
-
-        //calc delta from current to destination
-        int J1stepDif = J1StepM - J1futStepM;
-        int J2stepDif = J2StepM - J2futStepM;
-        int J3stepDif = J3StepM - J3futStepM;
-        int J4stepDif = J4StepM - J4futStepM;
-        int J5stepDif = J5StepM - J5futStepM;
-        int J6stepDif = J6StepM - J6futStepM;
-        int J7stepDif = 0;
-        int J8stepDif = 0;
-        int J9stepDif = 0;
-
-        //determine motor directions
-        J1dir = (J1stepDif <= 0) ? 1 : 0;
-        J2dir = (J2stepDif <= 0) ? 1 : 0;
-        J3dir = (J3stepDif <= 0) ? 1 : 0;
-        J4dir = (J4stepDif <= 0) ? 1 : 0;
-        J5dir = (J5stepDif <= 0) ? 1 : 0;
-        J6dir = (J6stepDif <= 0) ? 1 : 0;
-        J7dir = 0;
-        J8dir = 0;
-        J9dir = 0;
-
-
-        //determine if requested position is within axis limits
-        if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
-          J1axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
-          J2axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
-          J3axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
-          J4axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
-          J5axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
-          J6axisFault = 1;
-        }
-        TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
-
-
-        if (TotalAxisFault == 0 && KinematicError == 0) {
-          if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes, false)) {
-            KinematicError = 1;
-            break;
-          }
-          updatePos();
-        }
-
-        //stop loop if any serial command is recieved - but the expected command is "S" to stop the loop.
-
-        liveControlStatus = read_live_control_frame();
-        if (
-          liveControlStatus
-          != ar4_protocol::LiveControlFrameStatus::kPending
-        ) {
-          break;
-        }
-
-        //end loop
-      }
-
-      TotalCollision = J1collisionTrue + J2collisionTrue + J3collisionTrue + J4collisionTrue + J5collisionTrue + J6collisionTrue;
-      if (TotalCollision > 0) {
-        flag = "EC" + String(J1collisionTrue) + String(J2collisionTrue) + String(J3collisionTrue) + String(J4collisionTrue) + String(J5collisionTrue) + String(J6collisionTrue);
-      }
-
-      send_live_terminal_response(
-        liveControlStatus,
-        KinematicError,
-        TotalAxisFault,
-        "EL" + String(J1axisFault) + String(J2axisFault)
-          + String(J3axisFault) + String(J4axisFault)
-          + String(J5axisFault) + String(J6axisFault)
-      );
-
-      inData = "";  // Clear recieved buffer
-      ////////MOVE COMPLETE///////////
-    }
-
-
-
-    //----- LIVE JOINT JOG  ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "LJ") {
-
-      int J1dir;
-      int J2dir;
-      int J3dir;
-      int J4dir;
-      int J5dir;
-      int J6dir;
-      int J7dir;
-      int J8dir;
-      int J9dir;
-
-      int J1axisFault = 0;
-      int J2axisFault = 0;
-      int J3axisFault = 0;
-      int J4axisFault = 0;
-      int J5axisFault = 0;
-      int J6axisFault = 0;
-      int J7axisFault = 0;
-      int J8axisFault = 0;
-      int J9axisFault = 0;
-      int TotalAxisFault = 0;
-      ar4_protocol::LiveControlFrameStatus liveControlStatus =
-        ar4_protocol::LiveControlFrameStatus::kPending;
-
-      bool JogInPoc = true;
-      Alarm = "0";
-
-
-      ar4_protocol::LiveJogCommandFields commandFields = {};
-      if (!ar4_protocol::parse_live_jog_command(
-          inData,
-          ar4_protocol::LiveJogCommandKind::kJoint,
-          commandFields
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      int Vector = commandFields.vector;
-      String SpeedType(commandFields.speed_mode);
-      float SpeedVal = commandFields.speed;
-      float ACCspd = commandFields.acceleration;
-      float DCCspd = commandFields.deceleration;
-      float ACCramp = commandFields.ramp;
-      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
-        WristCon,
-        JointLoopModes,
-        String(commandFields.wrist_config),
-        commandFields.loop_modes
-      );
-
-      inData = "";  // Clear recieved buffer
-
-      //clear serial
-      delay(5);
-      Serial.println();
-      updatePos();
-
-      float J1Angle = JangleIn[0];
-      float J2Angle = JangleIn[1];
-      float J3Angle = JangleIn[2];
-      float J4Angle = JangleIn[3];
-      float J5Angle = JangleIn[4];
-      float J6Angle = JangleIn[5];
-      float J7Angle = J7_pos;
-      float J8Angle = J8_pos;
-      float J9Angle = J9_pos;
-      float xyzuvw_In[6];
-
-      while (JogInPoc == true) {
-
-        if (Vector == 10) {
-          J1Angle = JangleIn[0] - .25;
-        }
-        if (Vector == 11) {
-          J1Angle = JangleIn[0] + .25;
-        }
-
-        if (Vector == 20) {
-          J2Angle = JangleIn[1] - .25;
-        }
-        if (Vector == 21) {
-          J2Angle = JangleIn[1] + .25;
-        }
-
-        if (Vector == 30) {
-          J3Angle = JangleIn[2] - .25;
-        }
-        if (Vector == 31) {
-          J3Angle = JangleIn[2] + .25;
-        }
-
-        if (Vector == 40) {
-          J4Angle = JangleIn[3] - .25;
-        }
-        if (Vector == 41) {
-          J4Angle = JangleIn[3] + .25;
-        }
-
-        if (Vector == 50) {
-          J5Angle = JangleIn[4] - .25;
-        }
-        if (Vector == 51) {
-          J5Angle = JangleIn[4] + .25;
-        }
-
-        if (Vector == 60) {
-          J6Angle = JangleIn[5] - .25;
-        }
-        if (Vector == 61) {
-          J6Angle = JangleIn[5] + .25;
-        }
-        if (Vector == 70) {
-          J7Angle = J7_pos - .25;
-        }
-        if (Vector == 71) {
-          J7Angle = J7_pos + .25;
-        }
-        if (Vector == 80) {
-          J8Angle = J8_pos - .25;
-        }
-        if (Vector == 81) {
-          J8Angle = J8_pos + .25;
-        }
-        if (Vector == 90) {
-          J9Angle = J9_pos - .25;
-        }
-        if (Vector == 91) {
-          J9Angle = J9_pos + .25;
-        }
-
-        //calc destination motor steps
-        const float positions[numJoints] = {
-          J1Angle, J2Angle, J3Angle, J4Angle, J5Angle, J6Angle,
-          J7Angle, J8Angle, J9Angle,
-        };
-        int future_steps[numJoints] = {};
-        if (!joint_positions_to_future_steps(positions, future_steps)) {
-          KinematicError = 1;
-          break;
-        }
-        int J1futStepM = future_steps[0];
-        int J2futStepM = future_steps[1];
-        int J3futStepM = future_steps[2];
-        int J4futStepM = future_steps[3];
-        int J5futStepM = future_steps[4];
-        int J6futStepM = future_steps[5];
-        int J7futStepM = future_steps[6];
-        int J8futStepM = future_steps[7];
-        int J9futStepM = future_steps[8];
-
-        //calc delta from current to destination
-        int J1stepDif = J1StepM - J1futStepM;
-        int J2stepDif = J2StepM - J2futStepM;
-        int J3stepDif = J3StepM - J3futStepM;
-        int J4stepDif = J4StepM - J4futStepM;
-        int J5stepDif = J5StepM - J5futStepM;
-        int J6stepDif = J6StepM - J6futStepM;
-        int J7stepDif = J7StepM - J7futStepM;
-        int J8stepDif = J8StepM - J8futStepM;
-        int J9stepDif = J9StepM - J9futStepM;
-
-        //determine motor directions
-        J1dir = (J1stepDif <= 0) ? 1 : 0;
-        J2dir = (J2stepDif <= 0) ? 1 : 0;
-        J3dir = (J3stepDif <= 0) ? 1 : 0;
-        J4dir = (J4stepDif <= 0) ? 1 : 0;
-        J5dir = (J5stepDif <= 0) ? 1 : 0;
-        J6dir = (J6stepDif <= 0) ? 1 : 0;
-        J7dir = (J7stepDif <= 0) ? 1 : 0;
-        J8dir = (J8stepDif <= 0) ? 1 : 0;
-        J9dir = (J9stepDif <= 0) ? 1 : 0;
-
-        //determine if requested position is within axis limits
-        if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
-          J1axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
-          J2axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
-          J3axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
-          J4axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
-          J5axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
-          J6axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J7futStepM, J7StepLim)) {
-          J7axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J8futStepM, J8StepLim)) {
-          J8axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J9futStepM, J9StepLim)) {
-          J9axisFault = 1;
-        }
-        TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
-
-        if (TotalAxisFault == 0 && KinematicError == 0) {
-          if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes, false)) {
-            KinematicError = 1;
-            break;
-          }
-          updatePos();
-        }
-
-        //stop loop if any serial command is recieved - but the expected command is "S" to stop the loop.
-
-        liveControlStatus = read_live_control_frame();
-        if (
-          liveControlStatus
-          != ar4_protocol::LiveControlFrameStatus::kPending
-        ) {
-          break;
-        }
-
-        //end loop
-      }
-
-      TotalCollision = J1collisionTrue + J2collisionTrue + J3collisionTrue + J4collisionTrue + J5collisionTrue + J6collisionTrue;
-      if (TotalCollision > 0) {
-        flag = "EC" + String(J1collisionTrue) + String(J2collisionTrue) + String(J3collisionTrue) + String(J4collisionTrue) + String(J5collisionTrue) + String(J6collisionTrue);
-      }
-
-      send_live_terminal_response(
-        liveControlStatus,
-        KinematicError,
-        TotalAxisFault,
-        "EL" + String(J1axisFault) + String(J2axisFault)
-          + String(J3axisFault) + String(J4axisFault)
-          + String(J5axisFault) + String(J6axisFault)
-          + String(J7axisFault) + String(J8axisFault)
-          + String(J9axisFault)
-      );
-
-      inData = "";  // Clear recieved buffer
-      ////////MOVE COMPLETE///////////
-    }
-
-
-
-    //----- LIVE TOOL JOG  ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "LT") {
-      int J1dir;
-      int J2dir;
-      int J3dir;
-      int J4dir;
-      int J5dir;
-      int J6dir;
-      int J7dir;
-      int J8dir;
-      int J9dir;
-
-      int J1axisFault = 0;
-      int J2axisFault = 0;
-      int J3axisFault = 0;
-      int J4axisFault = 0;
-      int J5axisFault = 0;
-      int J6axisFault = 0;
-      int TRaxisFault = 0;
-      int TotalAxisFault = 0;
-      ar4_protocol::LiveControlFrameStatus liveControlStatus =
-        ar4_protocol::LiveControlFrameStatus::kPending;
-
-      float Xtool = Robot_Kin_Tool[0];
-      float Ytool = Robot_Kin_Tool[1];
-      float Ztool = Robot_Kin_Tool[2];
-      float RZtool = Robot_Kin_Tool[5];
-      float RYtool = Robot_Kin_Tool[4];
-      float RXtool = Robot_Kin_Tool[3];
-
-      bool JogInPoc = true;
-      Alarm = "0";
-
-      ar4_protocol::LiveJogCommandFields commandFields = {};
-      if (!ar4_protocol::parse_live_jog_command(
-          inData,
-          ar4_protocol::LiveJogCommandKind::kTool,
-          commandFields
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      int Vector = commandFields.vector;
-      String SpeedType(commandFields.speed_mode);
-      float SpeedVal = commandFields.speed;
-      float ACCspd = commandFields.acceleration;
-      float DCCspd = commandFields.deceleration;
-      float ACCramp = commandFields.ramp;
-      int toolFrameIndex = -1;
-      float toolFrameOffset = 0.0f;
-      if (
-        !ar4_protocol::decode_live_tool_offset(
-          Vector,
-          ar4_protocol::kLiveToolJogIncrement,
-          toolFrameIndex,
-          toolFrameOffset
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
-        WristCon,
-        JointLoopModes,
-        String(commandFields.wrist_config),
-        commandFields.loop_modes
-      );
-
-      inData = "";  // Clear recieved buffer
-
-      delay(5);
-      Serial.println();
-      updatePos();
-
-      Xtool = Robot_Kin_Tool[0];
-      Ytool = Robot_Kin_Tool[1];
-      Ztool = Robot_Kin_Tool[2];
-      RXtool = Robot_Kin_Tool[3];
-      RYtool = Robot_Kin_Tool[4];
-      RZtool = Robot_Kin_Tool[5];
-
-      JangleIn[0] = (J1StepM - J1zeroStep) / J1StepDeg;
-      JangleIn[1] = (J2StepM - J2zeroStep) / J2StepDeg;
-      JangleIn[2] = (J3StepM - J3zeroStep) / J3StepDeg;
-      JangleIn[3] = (J4StepM - J4zeroStep) / J4StepDeg;
-      JangleIn[4] = (J5StepM - J5zeroStep) / J5StepDeg;
-      JangleIn[5] = (J6StepM - J6zeroStep) / J6StepDeg;
-
-      while (JogInPoc == true && KinematicError == 0) {
-
-        Xtool = Robot_Kin_Tool[0];
-        Ytool = Robot_Kin_Tool[1];
-        Ztool = Robot_Kin_Tool[2];
-        RXtool = Robot_Kin_Tool[3];
-        RYtool = Robot_Kin_Tool[4];
-        RZtool = Robot_Kin_Tool[5];
-
-        Robot_Kin_Tool[toolFrameIndex] += toolFrameOffset;
-
-
-
-        xyzuvw_In[0] = xyzuvw_Out[0];
-        xyzuvw_In[1] = xyzuvw_Out[1];
-        xyzuvw_In[2] = xyzuvw_Out[2];
-        xyzuvw_In[3] = xyzuvw_Out[3];
-        xyzuvw_In[4] = xyzuvw_Out[4];
-        xyzuvw_In[5] = xyzuvw_Out[5];
-
-        SolveInverseKinematics(commandFields.wrist_config);
-
-        Robot_Kin_Tool[0] = Xtool;
-        Robot_Kin_Tool[1] = Ytool;
-        Robot_Kin_Tool[2] = Ztool;
-        Robot_Kin_Tool[3] = RXtool;
-        Robot_Kin_Tool[4] = RYtool;
-        Robot_Kin_Tool[5] = RZtool;
-
-        //calc destination motor steps
-        int future_steps[ROBOT_nDOFs] = {};
-        if (
-          KinematicError != 0
-          || !primary_inverse_solution_to_future_steps(future_steps)
-        ) {
-          KinematicError = 1;
-          break;
-        }
-        int J1futStepM = future_steps[0];
-        int J2futStepM = future_steps[1];
-        int J3futStepM = future_steps[2];
-        int J4futStepM = future_steps[3];
-        int J5futStepM = future_steps[4];
-        int J6futStepM = future_steps[5];
-
-        //calc delta from current to destination
-        int J1stepDif = J1StepM - J1futStepM;
-        int J2stepDif = J2StepM - J2futStepM;
-        int J3stepDif = J3StepM - J3futStepM;
-        int J4stepDif = J4StepM - J4futStepM;
-        int J5stepDif = J5StepM - J5futStepM;
-        int J6stepDif = J6StepM - J6futStepM;
-        int J7stepDif = 0;
-        int J8stepDif = 0;
-        int J9stepDif = 0;
-
-        //determine motor directions
-        J1dir = (J1stepDif <= 0) ? 1 : 0;
-        J2dir = (J2stepDif <= 0) ? 1 : 0;
-        J3dir = (J3stepDif <= 0) ? 1 : 0;
-        J4dir = (J4stepDif <= 0) ? 1 : 0;
-        J5dir = (J5stepDif <= 0) ? 1 : 0;
-        J6dir = (J6stepDif <= 0) ? 1 : 0;
-        J7dir = 0;
-        J8dir = 0;
-        J9dir = 0;
-
-
-        //determine if requested position is within axis limits
-        if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
-          J1axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
-          J2axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
-          J3axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
-          J4axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
-          J5axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
-          J6axisFault = 1;
-        }
-        TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
-
-
-        if (TotalAxisFault == 0 && KinematicError == 0) {
-          if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes, false)) {
-            KinematicError = 1;
-            break;
-          }
-          updatePos();
-        }
-
-        //stop loop if any serial command is recieved - but the expected command is "S" to stop the loop.
-
-        liveControlStatus = read_live_control_frame();
-        if (
-          liveControlStatus
-          != ar4_protocol::LiveControlFrameStatus::kPending
-        ) {
-          break;
-        }
-
-        //end loop
-      }
-
-      TotalCollision = J1collisionTrue + J2collisionTrue + J3collisionTrue + J4collisionTrue + J5collisionTrue + J6collisionTrue;
-      if (TotalCollision > 0) {
-        flag = "EC" + String(J1collisionTrue) + String(J2collisionTrue) + String(J3collisionTrue) + String(J4collisionTrue) + String(J5collisionTrue) + String(J6collisionTrue);
-      }
-
-      send_live_terminal_response(
-        liveControlStatus,
-        KinematicError,
-        TotalAxisFault,
-        "EL" + String(J1axisFault) + String(J2axisFault)
-          + String(J3axisFault) + String(J4axisFault)
-          + String(J5axisFault) + String(J6axisFault)
-      );
-
-      inData = "";  // Clear recieved buffer
-      ////////MOVE COMPLETE///////////
-    }
-
-
-
-    //----- Jog T ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "JT") {
-      int J1dir;
-      int J2dir;
-      int J3dir;
-      int J4dir;
-      int J5dir;
-      int J6dir;
-      int J7dir;
-      int J8dir;
-      int J9dir;
-
-      float Xtool = Robot_Kin_Tool[0];
-      float Ytool = Robot_Kin_Tool[1];
-      float Ztool = Robot_Kin_Tool[2];
-      float RZtool = Robot_Kin_Tool[5];
-      float RYtool = Robot_Kin_Tool[4];
-      float RXtool = Robot_Kin_Tool[3];
-
-      int J1axisFault = 0;
-      int J2axisFault = 0;
-      int J3axisFault = 0;
-      int J4axisFault = 0;
-      int J5axisFault = 0;
-      int J6axisFault = 0;
-      int TotalAxisFault = 0;
-
-      String Alarm = "0";
-
-      ar4_protocol::ToolJogCommandFields commandFields = {};
-      if (!ar4_protocol::parse_tool_jog_command(inData, commandFields)) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      float Dist = commandFields.distance;
-      String SpeedType(commandFields.speed_mode);
-      float SpeedVal = commandFields.speed;
-      float ACCspd = commandFields.acceleration;
-      float DCCspd = commandFields.deceleration;
-      float ACCramp = commandFields.ramp;
-
-      int toolFrameIndex = -1;
-      float toolFrameOffset = 0.0f;
-      if (
-        !ar4_protocol::decode_discrete_tool_offset(
-          commandFields.axis,
-          static_cast<char>('0' + commandFields.direction),
-          Dist,
-          toolFrameIndex,
-          toolFrameOffset
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
-        WristCon,
-        JointLoopModes,
-        String(commandFields.wrist_config),
-        commandFields.loop_modes
-      );
-      Robot_Kin_Tool[toolFrameIndex] += toolFrameOffset;
-
-
-      JangleIn[0] = (J1StepM - J1zeroStep) / J1StepDeg;
-      JangleIn[1] = (J2StepM - J2zeroStep) / J2StepDeg;
-      JangleIn[2] = (J3StepM - J3zeroStep) / J3StepDeg;
-      JangleIn[3] = (J4StepM - J4zeroStep) / J4StepDeg;
-      JangleIn[4] = (J5StepM - J5zeroStep) / J5StepDeg;
-      JangleIn[5] = (J6StepM - J6zeroStep) / J6StepDeg;
-
-
-      xyzuvw_In[0] = xyzuvw_Out[0];
-      xyzuvw_In[1] = xyzuvw_Out[1];
-      xyzuvw_In[2] = xyzuvw_Out[2];
-      xyzuvw_In[3] = xyzuvw_Out[3];
-      xyzuvw_In[4] = xyzuvw_Out[4];
-      xyzuvw_In[5] = xyzuvw_Out[5];
-
-      SolveInverseKinematics(commandFields.wrist_config);
-
-      Robot_Kin_Tool[0] = Xtool;
-      Robot_Kin_Tool[1] = Ytool;
-      Robot_Kin_Tool[2] = Ztool;
-      Robot_Kin_Tool[3] = RXtool;
-      Robot_Kin_Tool[4] = RYtool;
-      Robot_Kin_Tool[5] = RZtool;
-
-
-      //calc destination motor steps
-      int future_steps[ROBOT_nDOFs] = {};
-      if (
-        KinematicError == 0
-        && !primary_inverse_solution_to_future_steps(future_steps)
-      ) {
-        KinematicError = 1;
-      }
-      int J1futStepM = future_steps[0];
-      int J2futStepM = future_steps[1];
-      int J3futStepM = future_steps[2];
-      int J4futStepM = future_steps[3];
-      int J5futStepM = future_steps[4];
-      int J6futStepM = future_steps[5];
-
-      //calc delta from current to destination
-      int J1stepDif = J1StepM - J1futStepM;
-      int J2stepDif = J2StepM - J2futStepM;
-      int J3stepDif = J3StepM - J3futStepM;
-      int J4stepDif = J4StepM - J4futStepM;
-      int J5stepDif = J5StepM - J5futStepM;
-      int J6stepDif = J6StepM - J6futStepM;
-      int J7stepDif = 0;
-      int J8stepDif = 0;
-      int J9stepDif = 0;
-
-      //determine motor directions
-      J1dir = (J1stepDif <= 0) ? 1 : 0;
-      J2dir = (J2stepDif <= 0) ? 1 : 0;
-      J3dir = (J3stepDif <= 0) ? 1 : 0;
-      J4dir = (J4stepDif <= 0) ? 1 : 0;
-      J5dir = (J5stepDif <= 0) ? 1 : 0;
-      J6dir = (J6stepDif <= 0) ? 1 : 0;
-      J7dir = 0;
-      J8dir = 0;
-      J9dir = 0;
-
-      //determine if requested position is within axis limits
-      if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
-        J1axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
-        J2axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
-        J3axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
-        J4axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
-        J5axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
-        J6axisFault = 1;
-      }
-      TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
-
-      debug = String(SpeedVal);
-      if (TotalAxisFault == 0 && KinematicError == 0) {
-        resetEncoders();
-        if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes, false)) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-        checkEncoders();
-        sendRobotPos();
-      } else if (KinematicError == 1) {
-        Alarm = "ER";
-        delay(5);
-        Serial.println(Alarm);
-        Alarm = "0";
-      } else {
-        Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault);
-        delay(5);
-        Serial.println(Alarm);
-        Alarm = "0";
-      }
-
-      inData = "";  // Clear recieved buffer
-      ////////MOVE COMPLETE///////////
-    }
-
-
-
-
-
-    //----- MOVE V ------ VISION OFFSET ----------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "MV") {
-      int J1dir;
-      int J2dir;
-      int J3dir;
-      int J4dir;
-      int J5dir;
-      int J6dir;
-      int J7dir;
-      int J8dir;
-      int J9dir;
-
-      int J1axisFault = 0;
-      int J2axisFault = 0;
-      int J3axisFault = 0;
-      int J4axisFault = 0;
-      int J5axisFault = 0;
-      int J6axisFault = 0;
-      int J7axisFault = 0;
-      int J8axisFault = 0;
-      int J9axisFault = 0;
-      int TotalAxisFault = 0;
-
-      ar4_protocol::CartesianMoveCommandFields commandFields = {};
-      if (!ar4_protocol::parse_vision_move_command(inData, commandFields)) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      float vision_rotation_radians = 0.0f;
-      if (!ar4_protocol::degrees_to_radians(
-          commandFields.vision_rotation_degrees,
-          vision_rotation_radians
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
-        xyzuvw_In[axis] = commandFields.pose[axis];
-      }
-      J7_In = commandFields.auxiliary[0];
-      J8_In = commandFields.auxiliary[1];
-      J9_In = commandFields.auxiliary[2];
-      String SpeedType(commandFields.speed_mode);
-      float SpeedVal = commandFields.speed;
-      float ACCspd = commandFields.acceleration;
-      float DCCspd = commandFields.deceleration;
-      float ACCramp = commandFields.ramp;
-      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
-        WristCon,
-        JointLoopModes,
-        String(commandFields.wrist_config),
-        commandFields.loop_modes
-      );
-
-      //get current tool rotation
-      float RXtool = Robot_Kin_Tool[3];
-
-
-      // offset tool rotation by the found vision angle
-      Robot_Kin_Tool[3] = Robot_Kin_Tool[3] - vision_rotation_radians;
-
-      //solve kinematics
-      SolveInverseKinematics(commandFields.wrist_config);
-
-      //calc destination motor steps
-      int future_steps[numJoints] = {};
-      if (
-        KinematicError == 0
-        && !inverse_solution_to_future_steps(J7_In, J8_In, J9_In, future_steps)
-      ) {
-        KinematicError = 1;
-      }
-      int J1futStepM = future_steps[0];
-      int J2futStepM = future_steps[1];
-      int J3futStepM = future_steps[2];
-      int J4futStepM = future_steps[3];
-      int J5futStepM = future_steps[4];
-      int J6futStepM = future_steps[5];
-      int J7futStepM = future_steps[6];
-      int J8futStepM = future_steps[7];
-      int J9futStepM = future_steps[8];
-
-
-      //calc delta from current to destination
-      int J1stepDif = J1StepM - J1futStepM;
-      int J2stepDif = J2StepM - J2futStepM;
-      int J3stepDif = J3StepM - J3futStepM;
-      int J4stepDif = J4StepM - J4futStepM;
-      int J5stepDif = J5StepM - J5futStepM;
-      int J6stepDif = J6StepM - J6futStepM;
-      int J7stepDif = J7StepM - J7futStepM;
-      int J8stepDif = J8StepM - J8futStepM;
-      int J9stepDif = J9StepM - J9futStepM;
-
-      // put tool roation back where it was
-      Robot_Kin_Tool[3] = RXtool;
-
-      //determine motor directions
-      J1dir = (J1stepDif <= 0) ? 1 : 0;
-      J2dir = (J2stepDif <= 0) ? 1 : 0;
-      J3dir = (J3stepDif <= 0) ? 1 : 0;
-      J4dir = (J4stepDif <= 0) ? 1 : 0;
-      J5dir = (J5stepDif <= 0) ? 1 : 0;
-      J6dir = (J6stepDif <= 0) ? 1 : 0;
-      J7dir = (J7stepDif <= 0) ? 1 : 0;
-      J8dir = (J8stepDif <= 0) ? 1 : 0;
-      J9dir = (J9stepDif <= 0) ? 1 : 0;
-
-
-
-      //determine if requested position is within axis limits
-      if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
-        J1axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
-        J2axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
-        J3axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
-        J4axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
-        J5axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
-        J6axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J7futStepM, J7StepLim)) {
-        J7axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J8futStepM, J8StepLim)) {
-        J8axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J9futStepM, J9StepLim)) {
-        J9axisFault = 1;
-      }
-      TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
-
-
-      if (TotalAxisFault == 0 && KinematicError == 0) {
-        resetEncoders();
-        if (!driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes, false)) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-        checkEncoders();
-        sendRobotPos();
-      } else if (KinematicError == 1) {
-        Alarm = "ER";
-        delay(5);
-        Serial.println(Alarm);
-        Alarm = "0";
-      } else {
-        Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault) + String(J7axisFault) + String(J8axisFault) + String(J9axisFault);
-        delay(5);
-        Serial.println(Alarm);
-        Alarm = "0";
-      }
-
-
-
-      inData = "";  // Clear recieved buffer
-      ////////MOVE COMPLETE///////////
-    }
-
-
-
-
-    //----- MOVE IN JOINTS ROTATION  ---------------------------------------------------
-    //-----------------------------------------------------------------------
-
-    if (function == "RJ") {
-      int J1dir;
-      int J2dir;
-      int J3dir;
-      int J4dir;
-      int J5dir;
-      int J6dir;
-      int J7dir;
-      int J8dir;
-      int J9dir;
-
-      int J1axisFault = 0;
-      int J2axisFault = 0;
-      int J3axisFault = 0;
-      int J4axisFault = 0;
-      int J5axisFault = 0;
-      int J6axisFault = 0;
-      int J7axisFault = 0;
-      int J8axisFault = 0;
-      int J9axisFault = 0;
-      int TotalAxisFault = 0;
-
-      ar4_protocol::JointMoveCommandFields commandFields = {};
-      if (!ar4_protocol::parse_joint_move_command(inData, commandFields)) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      int future_steps[numJoints] = {};
-      if (!joint_positions_to_future_steps(
-          commandFields.positions,
-          future_steps
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      J7_In = commandFields.positions[6];
-      J8_In = commandFields.positions[7];
-      J9_In = commandFields.positions[8];
-      String SpeedType(commandFields.speed_mode);
-      float SpeedVal = commandFields.speed;
-      float ACCspd = commandFields.acceleration;
-      float DCCspd = commandFields.deceleration;
-      float ACCramp = commandFields.ramp;
-      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
-        WristCon,
-        JointLoopModes,
-        String(commandFields.wrist_config),
-        commandFields.loop_modes
-      );
-
-      int J1futStepM = future_steps[0];
-      int J2futStepM = future_steps[1];
-      int J3futStepM = future_steps[2];
-      int J4futStepM = future_steps[3];
-      int J5futStepM = future_steps[4];
-      int J6futStepM = future_steps[5];
-      int J7futStepM = future_steps[6];
-      int J8futStepM = future_steps[7];
-      int J9futStepM = future_steps[8];
-
-      //calc delta from current to destination
-      int J1stepDif = J1StepM - J1futStepM;
-      int J2stepDif = J2StepM - J2futStepM;
-      int J3stepDif = J3StepM - J3futStepM;
-      int J4stepDif = J4StepM - J4futStepM;
-      int J5stepDif = J5StepM - J5futStepM;
-      int J6stepDif = J6StepM - J6futStepM;
-      int J7stepDif = J7StepM - J7futStepM;
-      int J8stepDif = J8StepM - J8futStepM;
-      int J9stepDif = J9StepM - J9futStepM;
-
-
-      //determine motor directions
-      J1dir = (J1stepDif <= 0) ? 1 : 0;
-      J2dir = (J2stepDif <= 0) ? 1 : 0;
-      J3dir = (J3stepDif <= 0) ? 1 : 0;
-      J4dir = (J4stepDif <= 0) ? 1 : 0;
-      J5dir = (J5stepDif <= 0) ? 1 : 0;
-      J6dir = (J6stepDif <= 0) ? 1 : 0;
-      J7dir = (J7stepDif <= 0) ? 1 : 0;
-      J8dir = (J8stepDif <= 0) ? 1 : 0;
-      J9dir = (J9stepDif <= 0) ? 1 : 0;
-
-
-      //determine if requested position is within axis limits
-      if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
-        J1axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
-        J2axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
-        J3axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
-        J4axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
-        J5axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
-        J6axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J7futStepM, J7StepLim)) {
-        J7axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J8futStepM, J8StepLim)) {
-        J8axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J9futStepM, J9StepLim)) {
-        J9axisFault = 1;
-      }
-      TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
-
-
-      if (TotalAxisFault == 0 && KinematicError == 0) {
-        begin_telemetry_response_ownership(
-          commandFields.telemetry_requested
-        );
-        resetEncoders();
-        const bool driveSucceeded = driveMotorsJ(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, &motionModes, commandFields.telemetry_requested);
-        if (!driveSucceeded) {
-          if (!complete_telemetry_joint_response(
-              commandFields.telemetry_requested,
-              false
-          )) {
-            Serial.println("ER");
-          }
-          consume_current_command();
-          return;
-        }
-        if (!complete_telemetry_joint_response(
-            commandFields.telemetry_requested,
-            true
-        )) {
-          checkEncoders();
-          sendRobotPos();
-        }
-      } else if (KinematicError == 1) {
-        Alarm = "ER";
-        delay(5);
-        Serial.println(Alarm);
-      } else {
-        Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault) + String(J7axisFault) + String(J8axisFault) + String(J9axisFault);
-        delay(5);
-        Serial.println(Alarm);
-      }
-
-
-      inData = "";  // Clear recieved buffer
-      ////////MOVE COMPLETE///////////
-    }
-
-
-
-    //----- MOVE L ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "ML" and flag == "") {
-      int J1dir;
-      int J2dir;
-      int J3dir;
-      int J4dir;
-      int J5dir;
-      int J6dir;
-      int J7dir;
-      int J8dir;
-      int J9dir;
-
-      float curDelay;
-
-      String nextCMDtype;
-      String test;
-
-      int J1axisFault = 0;
-      int J2axisFault = 0;
-      int J3axisFault = 0;
-      int J4axisFault = 0;
-      int J5axisFault = 0;
-      int J6axisFault = 0;
-      int J7axisFault = 0;
-      int J8axisFault = 0;
-      int J9axisFault = 0;
-      int TotalAxisFault = 0;
-
-      //String Alarm = "0";
-
-      float curWayDis;
-      float speedSP;
-
-      float Xvect;
-      float Yvect;
-      float Zvect;
-      float RZvect;
-      float RYvect;
-      float RXvect;
-
-      ar4_protocol::CartesianMoveCommandFields commandFields = {};
-      if (!ar4_protocol::parse_linear_move_command(
-          inData,
-          commandFields
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      int external_target_steps[3] = {};
-      if (!external_positions_to_future_steps(
-          commandFields.auxiliary[0],
-          commandFields.auxiliary[1],
-          commandFields.auxiliary[2],
-          external_target_steps
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
-        xyzuvw_Temp[axis] = commandFields.pose[axis];
-      }
-      J7_In = commandFields.auxiliary[0];
-      J8_In = commandFields.auxiliary[1];
-      J9_In = commandFields.auxiliary[2];
-      String SpeedType(commandFields.speed_mode);
-      float SpeedVal = commandFields.speed;
-      float ACCspd = commandFields.acceleration;
-      float DCCspd = commandFields.deceleration;
-      float ACCramp = commandFields.ramp;
-      float Rounding = commandFields.rounding;
-      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
-        WristCon,
-        JointLoopModes,
-        String(commandFields.wrist_config),
-        commandFields.loop_modes
-      );
-
-
-      ///// rounding logic /////
-      if (cmdBuffer2 != "") {
-        if (ar4_protocol::extract_serial_command_payload(
-            cmdBuffer2,
-            checkData
-        )) {
-          nextCMDtype = checkData.substring(0, 1);
-          checkData = checkData.substring(2);
-        } else {
-          nextCMDtype = "";
-          checkData = "";
-        }
-      }
-      if (splineTrue == true and Rounding > 0 and nextCMDtype == "M") {
-        //calculate new end point before rounding arc
-        updatePos();
-        //vector
-        float Xvect = xyzuvw_Temp[0] - xyzuvw_Out[0];
-        float Yvect = xyzuvw_Temp[1] - xyzuvw_Out[1];
-        float Zvect = xyzuvw_Temp[2] - xyzuvw_Out[2];
-        float RZvect = xyzuvw_Temp[3] - xyzuvw_Out[3];
-        float RYvect = xyzuvw_Temp[4] - xyzuvw_Out[4];
-        float RXvect = xyzuvw_Temp[5] - xyzuvw_Out[5];
-        //start pos
-        float Xstart = xyzuvw_Out[0];
-        float Ystart = xyzuvw_Out[1];
-        float Zstart = xyzuvw_Out[2];
-        float RZstart = xyzuvw_Out[3];
-        float RYstart = xyzuvw_Out[4];
-        float RXstart = xyzuvw_Out[5];
-        //line dist
-        float lineDist = pow((pow((Xvect), 2) + pow((Yvect), 2) + pow((Zvect), 2) + pow((RZvect), 2) + pow((RYvect), 2) + pow((RXvect), 2)), .5);
-        if (!isfinite(lineDist) || lineDist <= 0.0f) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-        if (Rounding > (lineDist * .45)) {
-          Rounding = lineDist * .45;
-        }
-        float newDistPerc = 1 - (Rounding / lineDist);
-        //cropped destination (new end point before rounding arc)
-        xyzuvw_In[0] = Xstart + (Xvect * newDistPerc);
-        xyzuvw_In[1] = Ystart + (Yvect * newDistPerc);
-        xyzuvw_In[2] = Zstart + (Zvect * newDistPerc);
-        xyzuvw_In[3] = RZstart + (RZvect * newDistPerc);
-        xyzuvw_In[4] = RYstart + (RYvect * newDistPerc);
-        xyzuvw_In[5] = RXstart + (RXvect * newDistPerc);
-        ar4_protocol::CartesianMoveCommandFields nextCommandFields = {};
-        if (!ar4_protocol::parse_linear_move_command(
-            checkData,
-            nextCommandFields
-        )) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-        for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
-          rndArcEnd[axis] = nextCommandFields.pose[axis];
-        }
-        //arc vector
-        Xvect = rndArcEnd[0] - xyzuvw_Temp[0];
-        Yvect = rndArcEnd[1] - xyzuvw_Temp[1];
-        Zvect = rndArcEnd[2] - xyzuvw_Temp[2];
-        RZvect = rndArcEnd[3] - xyzuvw_Temp[3];
-        RYvect = rndArcEnd[4] - xyzuvw_Temp[4];
-        RXvect = rndArcEnd[5] - xyzuvw_Temp[5];
-        //end arc start pos
-        Xstart = xyzuvw_Temp[0];
-        Ystart = xyzuvw_Temp[1];
-        Zstart = xyzuvw_Temp[2];
-        RZstart = xyzuvw_Temp[3];
-        RYstart = xyzuvw_Temp[4];
-        RXstart = xyzuvw_Temp[5];
-        //line dist
-        lineDist = pow((pow((Xvect), 2) + pow((Yvect), 2) + pow((Zvect), 2) + pow((RZvect), 2) + pow((RYvect), 2) + pow((RXvect), 2)), .5);
-        if (!isfinite(lineDist) || lineDist <= 0.0f) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-        if (Rounding > (lineDist * .45)) {
-          Rounding = lineDist * .45;
-        }
-        newDistPerc = (Rounding / lineDist);
-        //calculated arc end postion
-        rndArcEnd[0] = Xstart + (Xvect * newDistPerc);
-        rndArcEnd[1] = Ystart + (Yvect * newDistPerc);
-        rndArcEnd[2] = Zstart + (Zvect * newDistPerc);
-        rndArcEnd[3] = RZstart + (RZvect * newDistPerc);
-        rndArcEnd[4] = RYstart + (RYvect * newDistPerc);
-        rndArcEnd[5] = RXstart + (RXvect * newDistPerc);
-        //calculate arc center point
-        rndCalcCen[0] = (xyzuvw_In[0] + rndArcEnd[0]) / 2;
-        rndCalcCen[1] = (xyzuvw_In[1] + rndArcEnd[1]) / 2;
-        rndCalcCen[2] = (xyzuvw_In[2] + rndArcEnd[2]) / 2;
-        rndCalcCen[3] = (xyzuvw_In[3] + rndArcEnd[3]) / 2;
-        rndCalcCen[4] = (xyzuvw_In[4] + rndArcEnd[4]) / 2;
-        rndCalcCen[5] = (xyzuvw_In[5] + rndArcEnd[5]) / 2;
-        rndArcMid[0] = (xyzuvw_Temp[0] + rndCalcCen[0]) / 2;
-        rndArcMid[1] = (xyzuvw_Temp[1] + rndCalcCen[1]) / 2;
-        rndArcMid[2] = (xyzuvw_Temp[2] + rndCalcCen[2]) / 2;
-        rndArcMid[3] = (xyzuvw_Temp[3] + rndCalcCen[3]) / 2;
-        rndArcMid[4] = (xyzuvw_Temp[4] + rndCalcCen[4]) / 2;
-        rndArcMid[5] = (xyzuvw_Temp[5] + rndCalcCen[5]) / 2;
-        //set arc move to be executed
-        rndData = "X" + String(rndArcMid[0]) + "Y" + String(rndArcMid[1]) + "Z" + String(rndArcMid[2]) + "Rz" + String(rndArcMid[3]) + "Ry" + String(rndArcMid[4]) + "Rx" + String(rndArcMid[5]) + "Ex" + String(rndArcEnd[0]) + "Ey" + String(rndArcEnd[1]) + "Ez" + String(rndArcEnd[2]) + "Tr0S" + SpeedType + String(SpeedVal) + "Ac" + String(ACCspd) + "Dc" + String(DCCspd) + "Rm" + String(ACCramp) + "W" + String(commandFields.wrist_config) + "Lm" + String(commandFields.loop_modes[0]) + String(commandFields.loop_modes[1]) + String(commandFields.loop_modes[2]) + String(commandFields.loop_modes[3]) + String(commandFields.loop_modes[4]) + String(commandFields.loop_modes[5]);
-        function = "MA";
-        rndTrue = true;
-      } else {
-        updatePos();
-        xyzuvw_In[0] = xyzuvw_Temp[0];
-        xyzuvw_In[1] = xyzuvw_Temp[1];
-        xyzuvw_In[2] = xyzuvw_Temp[2];
-        xyzuvw_In[3] = xyzuvw_Temp[3];
-        xyzuvw_In[4] = xyzuvw_Temp[4];
-        xyzuvw_In[5] = xyzuvw_Temp[5];
-      }
-
-
-
-      //xyz vector
-      Xvect = xyzuvw_In[0] - xyzuvw_Out[0];
-      Yvect = xyzuvw_In[1] - xyzuvw_Out[1];
-      Zvect = xyzuvw_In[2] - xyzuvw_Out[2];
-      RZvect = xyzuvw_In[3] - xyzuvw_Out[3];
-      RYvect = xyzuvw_In[4] - xyzuvw_Out[4];
-      RXvect = xyzuvw_In[5] - xyzuvw_Out[5];
-
-
-      //start pos
-      float Xstart = xyzuvw_Out[0];
-      float Ystart = xyzuvw_Out[1];
-      float Zstart = xyzuvw_Out[2];
-      float RZstart = xyzuvw_Out[3];
-      float RYstart = xyzuvw_Out[4];
-      float RXstart = xyzuvw_Out[5];
-
-
-      //line dist and determine way point gap
-      float lineDist = pow((pow((Xvect), 2) + pow((Yvect), 2) + pow((Zvect), 2) + pow((RZvect), 2) + pow((RYvect), 2) + pow((RXvect), 2)), .5);
-      int waypoint_count = 0;
-      if (!ar4_protocol::waypoint_count_for_path(
-          lineDist,
-          linWayDistSP,
-          waypoint_count
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      if (lineDist > 0) {
-
-        float wayPts = static_cast<float>(waypoint_count);
-        float wayPerc = 1.0f / wayPts;
-
-        //pre calculate entire move and speeds
-
-        SolveInverseKinematics(commandFields.wrist_config);
-        //calc destination motor steps for precalc
-        int destination_steps[ROBOT_nDOFs] = {};
-        if (
-          KinematicError != 0
-          || !primary_inverse_solution_to_future_steps(destination_steps)
-        ) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-        int J1futStepM = destination_steps[0];
-        int J2futStepM = destination_steps[1];
-        int J3futStepM = destination_steps[2];
-        int J4futStepM = destination_steps[3];
-        int J5futStepM = destination_steps[4];
-        int J6futStepM = destination_steps[5];
-
-        //calc delta from current to destination fpr precalc
-        int J1stepDif = J1StepM - J1futStepM;
-        int J2stepDif = J2StepM - J2futStepM;
-        int J3stepDif = J3StepM - J3futStepM;
-        int J4stepDif = J4StepM - J4futStepM;
-        int J5stepDif = J5StepM - J5futStepM;
-        int J6stepDif = J6StepM - J6futStepM;
-
-        //FIND HIGHEST STEP FOR PRECALC
-        int HighStep = abs(J1stepDif);
-        if (abs(J2stepDif) > HighStep) {
-          HighStep = abs(J2stepDif);
-        }
-        if (abs(J3stepDif) > HighStep) {
-          HighStep = abs(J3stepDif);
-        }
-        if (abs(J4stepDif) > HighStep) {
-          HighStep = abs(J4stepDif);
-        }
-        if (abs(J5stepDif) > HighStep) {
-          HighStep = abs(J5stepDif);
-        }
-        if (abs(J6stepDif) > HighStep) {
-          HighStep = abs(J6stepDif);
-        }
-        const int external_start_steps[3] = { J7StepM, J8StepM, J9StepM };
-        for (int axis = 0; axis < 3; ++axis) {
-          const int external_difference = abs(
-            external_start_steps[axis] - external_target_steps[axis]
-          );
-          if (external_difference > HighStep) HighStep = external_difference;
-        }
-        if (HighStep < 1) HighStep = 1;
-
-
-        /////PRE CALC SPEEDS//////
-        float calcStepGap;
-
-        //determine steps
-        float ACCStep = HighStep * (ACCspd / 100);
-        float NORStep = HighStep * ((100 - ACCspd - DCCspd) / 100);
-        float DCCStep = HighStep * (DCCspd / 100);
-
-        //set speed for seconds or mm per sec
-        if (SpeedType == "s") {
-          speedSP = (SpeedVal * 1000000) * 1.2;
-        } else if ((SpeedType == "m")) {
-          speedSP = ((lineDist / SpeedVal) * 1000000) * 1.2;
-        }
-        if (
-          (SpeedType == "s" || SpeedType == "m")
-          && (!isfinite(speedSP) || speedSP <= 0.0f)
-        ) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-
-        //calc step gap for seconds or mm per sec
-        if (SpeedType == "s" or SpeedType == "m") {
-          float zeroStepGap = speedSP / HighStep;
-          float zeroACCstepInc = (zeroStepGap * (100 / ACCramp)) / ACCStep;
-          float zeroACCtime = ((ACCStep)*zeroStepGap) + ((ACCStep - 9) * (((ACCStep) * (zeroACCstepInc / 2))));
-          float zeroNORtime = NORStep * zeroStepGap;
-          float zeroDCCstepInc = (zeroStepGap * (100 / ACCramp)) / DCCStep;
-          float zeroDCCtime = ((DCCStep)*zeroStepGap) + ((DCCStep - 9) * (((DCCStep) * (zeroDCCstepInc / 2))));
-          float zeroTOTtime = zeroACCtime + zeroNORtime + zeroDCCtime;
-          if (!isfinite(zeroTOTtime) || zeroTOTtime <= 0.0f) {
-            calcStepGap = minSpeedDelay;
-            speedViolation = "1";
-          } else {
-            float overclockPerc = speedSP / zeroTOTtime;
-            calcStepGap = zeroStepGap * overclockPerc;
-          }
-          if (calcStepGap <= minSpeedDelay) {
-            calcStepGap = minSpeedDelay;
-            speedViolation = "1";
-          }
-        }
-
-        //calc step gap for percentage
-        else if (SpeedType == "p") {
-          calcStepGap = minSpeedDelay / (SpeedVal / 100);
-        }
-        if (!isfinite(calcStepGap) || calcStepGap <= 0.0f) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-
-        //calculate final step increments
-        float calcACCstepInc = (calcStepGap * (100 / ACCramp)) / ACCStep;
-        float calcDCCstepInc = (calcStepGap * (100 / ACCramp)) / DCCStep;
-        float calcACCstartDel = (calcACCstepInc * ACCStep) * 2;
-        float calcDCCendDel = (calcDCCstepInc * DCCStep) * 2;
-
-
-        //calc way pt speeds
-        float ACCwayPts = wayPts * (ACCspd / 100);
-        float NORwayPts = wayPts * ((100 - ACCspd - DCCspd) / 100);
-        float DCCwayPts = wayPts * (DCCspd / 100);
-
-        //calc way inc for lin way steps
-        float ACCwayInc = (calcACCstartDel - calcStepGap) / ACCwayPts;
-        float DCCwayInc = (calcDCCendDel - calcStepGap) / DCCwayPts;
-        if (
-          !isfinite(ACCwayInc)
-          || !isfinite(DCCwayInc)
-          || !ar4_protocol::valid_delay_envelope(
-            calcStepGap,
-            calcACCstartDel,
-            calcDCCendDel,
-            rndTrue,
-            rndSpeed
-          )
-        ) {
-          Serial.println("ER");
-          consume_current_command();
-          return;
-        }
-
-        //set starting delsy
-        if (rndTrue == true) {
-          curDelay = rndSpeed;
-        } else {
-          curDelay = calcACCstartDel;
-        }
-
-
-        resetEncoders();
-        /////////////////////////////////////////////////
-        //loop through waypoints
-        for (int i = 1; i <= waypoint_count; i++) {
-
-          ////DELAY CALC/////
-          if (i <= ACCwayPts) {
-            curDelay = fmax(calcStepGap, curDelay - ACCwayInc);
-          } else if (i >= (wayPts - DCCwayPts)) {
-            curDelay = fmin(calcDCCendDel, curDelay + DCCwayInc);
-          } else {
-            curDelay = calcStepGap;
-          }
-
-          float curWayPerc = wayPerc * i;
-          xyzuvw_In[0] = Xstart + (Xvect * curWayPerc);
-          xyzuvw_In[1] = Ystart + (Yvect * curWayPerc);
-          xyzuvw_In[2] = Zstart + (Zvect * curWayPerc);
-          xyzuvw_In[3] = RZstart + (RZvect * curWayPerc);
-          xyzuvw_In[4] = RYstart + (RYvect * curWayPerc);
-          xyzuvw_In[5] = RXstart + (RXvect * curWayPerc);
-
-          SolveInverseKinematics(commandFields.wrist_config);
-
-          //calc destination motor steps
-          int future_steps[ROBOT_nDOFs] = {};
-          if (
-            KinematicError != 0
-            || !primary_inverse_solution_to_future_steps(future_steps)
-          ) {
-            KinematicError = 1;
-            break;
-          }
-          int J1futStepM = future_steps[0];
-          int J2futStepM = future_steps[1];
-          int J3futStepM = future_steps[2];
-          int J4futStepM = future_steps[3];
-          int J5futStepM = future_steps[4];
-          int J6futStepM = future_steps[5];
-          int J7futStepM = 0;
-          int J8futStepM = 0;
-          int J9futStepM = 0;
-          if (
-            !ar4_protocol::interpolated_step_target(
-              external_start_steps[0], external_target_steps[0],
-              i, waypoint_count, J7StepLim, J7futStepM
-            )
-            || !ar4_protocol::interpolated_step_target(
-              external_start_steps[1], external_target_steps[1],
-              i, waypoint_count, J8StepLim, J8futStepM
-            )
-            || !ar4_protocol::interpolated_step_target(
-              external_start_steps[2], external_target_steps[2],
-              i, waypoint_count, J9StepLim, J9futStepM
-            )
-          ) {
-            KinematicError = 1;
-            break;
-          }
-
-          //calc delta from current to destination
-          int J1stepDif = J1StepM - J1futStepM;
-          int J2stepDif = J2StepM - J2futStepM;
-          int J3stepDif = J3StepM - J3futStepM;
-          int J4stepDif = J4StepM - J4futStepM;
-          int J5stepDif = J5StepM - J5futStepM;
-          int J6stepDif = J6StepM - J6futStepM;
-          int J7stepDif = J7StepM - J7futStepM;
-          int J8stepDif = J8StepM - J8futStepM;
-          int J9stepDif = J9StepM - J9futStepM;
-
-          //determine motor directions
-          J1dir = (J1stepDif <= 0) ? 1 : 0;
-          J2dir = (J2stepDif <= 0) ? 1 : 0;
-          J3dir = (J3stepDif <= 0) ? 1 : 0;
-          J4dir = (J4stepDif <= 0) ? 1 : 0;
-          J5dir = (J5stepDif <= 0) ? 1 : 0;
-          J6dir = (J6stepDif <= 0) ? 1 : 0;
-          J7dir = (J7stepDif <= 0) ? 1 : 0;
-          J8dir = (J8stepDif <= 0) ? 1 : 0;
-          J9dir = (J9stepDif <= 0) ? 1 : 0;
-
-          //determine if requested position is within axis limits
-          if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
-            J1axisFault = 1;
-          }
-          if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
-            J2axisFault = 1;
-          }
-          if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
-            J3axisFault = 1;
-          }
-          if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
-            J4axisFault = 1;
-          }
-          if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
-            J5axisFault = 1;
-          }
-          if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
-            J6axisFault = 1;
-          }
-          if (future_step_is_outside_limit(J7futStepM, J7StepLim)) {
-            J7axisFault = 1;
-          }
-          if (future_step_is_outside_limit(J8futStepM, J8StepLim)) {
-            J8axisFault = 1;
-          }
-          if (future_step_is_outside_limit(J9futStepM, J9StepLim)) {
-            J9axisFault = 1;
-          }
-          TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
-
-          if (TotalAxisFault != 0) {
-            Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault) + String(J7axisFault) + String(J8axisFault) + String(J9axisFault);
-            break;
-          }
-
-          if (!driveMotorsL(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, curDelay, &motionModes)) {
-            KinematicError = 1;
-            break;
-          }
-          updatePos();
-          rndSpeed = curDelay;
-        }
-      }
-
-      if (KinematicError == 1) {
-        Alarm = "ER";
-        if (splineTrue == false) {
-          delay(5);
-          Serial.println(Alarm);
-        }
-      } else if (TotalAxisFault != 0) {
-        if (splineTrue == false) {
-          delay(5);
-          Serial.println(Alarm);
-        }
-      } else {
-        checkEncoders();
-      }
-      if (
-        splineTrue == false
-        && KinematicError == 0
-        && TotalAxisFault == 0
-      ) {
-        sendRobotPos();
-      }
-      inData = "";  // Clear recieved buffer
-      ////////MOVE COMPLETE///////////
-    }
-
-
-
-
-    //----- MOVE J ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "MJ") {
-      const ar4_protocol::MotionCommandStatus status =
-        moveJ(inData, true, false, false);
-      if (ar4_protocol::should_emit_generic_motion_error(status)) {
-        Serial.println("ER");
-      }
-    }
-
-    //----- MOVE G ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "MG") {
-      const ar4_protocol::MotionCommandStatus status =
-        moveJ(inData, true, false, true);
-      if (ar4_protocol::should_emit_generic_motion_error(status)) {
-        Serial.println("ER");
-      }
-    }
-
-
-    //----- DELETE PROG FROM SD CARD ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "DG") {
-      int filenameStart = -1;
-      if (!ar4_protocol::parse_gcode_media_filename_suffix(
-          inData,
-          filenameStart
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      if (!initSD()) {
-        consume_current_command();
-        return;
-      }
-      const String expected_media_id = inData.substring(
-        2,
-        2 + ar4_protocol::kControllerMediaIdLength
-      );
-      if (!verifyExpectedSDMediaId(expected_media_id)) {
-        consume_current_command();
-        return;
-      }
-      String filename = inData.substring(filenameStart);
-      const ar4_protocol::SDFileLookupStatus file_status =
-        findSDFile(filename);
-      if (
-        file_status != ar4_protocol::SDFileLookupStatus::kError
-        && !verifyExpectedSDMediaId(expected_media_id)
-      ) {
-        consume_current_command();
-        return;
-      }
-      if (file_status == ar4_protocol::SDFileLookupStatus::kPresent) {
-        if (deleteSD(filename, expected_media_id)) Serial.println("P");
-      } else if (
-        file_status == ar4_protocol::SDFileLookupStatus::kAbsent
-      ) {
-        Serial.println("F");
-      }
-    }
-
-    //----- READ FILES FROM SD CARD ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "RG") {
-      if (!initSD()) {
-        consume_current_command();
-        return;
-      }
-      char media_id[ar4_protocol::kControllerMediaIdCapacity] = { 0 };
-      if (!copyMountedSDMediaId(media_id)) {
-        sd_ok = false;
-        Serial.println("EG: G-code storage mount identity is unavailable");
-        consume_current_command();
-        return;
-      }
-      FsFile root = SD.sdfs.open("/");
-      if (!root) {
-        sd_ok = false;
-        Serial.println(egSD("open root fail"));
-        consume_current_command();
-        return;
-      }
-      printDirectory(root, media_id);
-      root.close();
-    }
-
-
-    //----- WRITE COMMAND TO SD CARD ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "WC") {
-      const int mediaStart = inData.indexOf("Mi");
-      int targetFilenameStart = -1;
-      const String storageTarget = mediaStart > 0
-        ? inData.substring(mediaStart)
-        : String();
-      if (
-        mediaStart <= 0
-        || !ar4_protocol::parse_gcode_media_filename_suffix(
-          storageTarget,
-          targetFilenameStart
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      const String expected_media_id = storageTarget.substring(
-        2,
-        2 + ar4_protocol::kControllerMediaIdLength
-      );
-      String filename = storageTarget.substring(targetFilenameStart);
-      String info = inData.substring(0, mediaStart);
-      ar4_protocol::CartesianMoveCommandFields stored_fields = {};
-      int stored_external_steps[3] = {};
-      if (
-        !ar4_protocol::parse_cartesian_move_command(info, stored_fields)
-        || !external_positions_to_future_steps(
-          stored_fields.auxiliary[0],
-          stored_fields.auxiliary[1],
-          stored_fields.auxiliary[2],
-          stored_external_steps
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      if (writeSD(filename, info, expected_media_id)) sendRobotPos();
-    }
-
-    //----- PLAY FILE ON SD CARD ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "PG") {
-      File gcFile;
-      String Cmd;
-      String storedRow;
-      int fileStart = inData.indexOf("Fn");
-      if (
-        fileStart != 0
-        || !ar4_protocol::valid_controller_filename(
-          inData,
-          fileStart + 2,
-          static_cast<int>(inData.length())
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      if (!initSD()) {
-        consume_current_command();
-        return;
-      }
-      String filename = inData.substring(fileStart + 2);
-      const char *fn = filename.c_str();
-      gcFile = SD.open(fn);
-      if (!gcFile) {
-        Serial.println("EG");
-        consume_current_command();
-        return;
-      }
-      while (gcFile.available() && estopActive == false) {
-        if (
-          read_stored_command_row(gcFile, storedRow)
-              != ar4_protocol::StoredRowReadStatus::kComplete
-          || !ar4_protocol::extract_stored_command_payload(storedRow, Cmd)
-        ) {
-          Serial.println("ER");
-          gcFile.close();
-          consume_current_command();
-          return;
-        }
-        //CARTESIAN CMD
-        if (Cmd.substring(0, 1) == "X") {
-          updatePos();
-          const ar4_protocol::MotionCommandStatus status =
-            moveJ(Cmd, false, false, true);
-          if (!ar4_protocol::should_continue_stored_playback(status)) {
-            if (ar4_protocol::should_emit_generic_motion_error(status)) {
-              Serial.println("ER");
-            }
-            gcFile.close();
-            consume_current_command();
-            return;
-          }
-        }
-        //PRECALC'D CMD - not currently used, needs position handling
-        else {
-          int i1 = Cmd.indexOf(',');
-          int i2 = Cmd.indexOf(',', i1 + 1);
-          int i3 = Cmd.indexOf(',', i2 + 1);
-          int i4 = Cmd.indexOf(',', i3 + 1);
-          int i5 = Cmd.indexOf(',', i4 + 1);
-          int i6 = Cmd.indexOf(',', i5 + 1);
-          int i7 = Cmd.indexOf(',', i6 + 1);
-          int i8 = Cmd.indexOf(',', i7 + 1);
-          int i9 = Cmd.indexOf(',', i8 + 1);
-          int i10 = Cmd.indexOf(',', i9 + 1);
-          int i11 = Cmd.indexOf(',', i10 + 1);
-          int i12 = Cmd.indexOf(',', i11 + 1);
-          int i13 = Cmd.indexOf(',', i12 + 1);
-          int i14 = Cmd.indexOf(',', i13 + 1);
-          int i15 = Cmd.indexOf(',', i14 + 1);
-          int i16 = Cmd.indexOf(',', i15 + 1);
-          int i17 = Cmd.indexOf(',', i16 + 1);
-          int i18 = Cmd.indexOf(',', i17 + 1);
-          int i19 = Cmd.indexOf(',', i18 + 1);
-          int i20 = Cmd.indexOf(',', i19 + 1);
-          int i21 = Cmd.indexOf(',', i20 + 1);
-          int i22 = Cmd.indexOf(',', i21 + 1);
-          const int markers[] = {
-            i1,
-            i2,
-            i3,
-            i4,
-            i5,
-            i6,
-            i7,
-            i8,
-            i9,
-            i10,
-            i11,
-            i12,
-            i13,
-            i14,
-            i15,
-            i16,
-            i17,
-            i18,
-            i19,
-            i20,
-            i21,
-            i22,
-          };
-          const int intBegins[] = {
-            0,
-            i1 + 1,
-            i2 + 1,
-            i3 + 1,
-            i4 + 1,
-            i5 + 1,
-            i6 + 1,
-            i7 + 1,
-            i8 + 1,
-            i9 + 1,
-            i10 + 1,
-            i11 + 1,
-            i12 + 1,
-            i13 + 1,
-            i14 + 1,
-            i15 + 1,
-            i16 + 1,
-            i17 + 1,
-          };
-          const int intEnds[] = {
-            i1,
-            i2,
-            i3,
-            i4,
-            i5,
-            i6,
-            i7,
-            i8,
-            i9,
-            i10,
-            i11,
-            i12,
-            i13,
-            i14,
-            i15,
-            i16,
-            i17,
-            i18,
-          };
-          const int floatBegins[] = {
-            i19 + 1,
-            i20 + 1,
-            i21 + 1,
-            i22 + 1,
-          };
-          const int floatEnds[] = {
-            i20,
-            i21,
-            i22,
-            static_cast<int>(Cmd.length()),
-          };
-          int intFields[18];
-          float floatFields[4];
-          if (
-            !ar4_protocol::marker_positions_are_ordered(Cmd.length(), markers)
-            || Cmd.indexOf(',', i22 + 1) != -1
-            || i19 - i18 != 2
-            || !parse_int_spans(Cmd, intBegins, intEnds, intFields)
-            || !ar4_protocol::values_are_binary(intFields + 9, 9)
-            || !parse_float_spans(Cmd, floatBegins, floatEnds, floatFields)
-          ) {
-            Serial.println("ER");
-            gcFile.close();
-            consume_current_command();
-            return;
-          }
-          int J1step = intFields[0];
-          int J2step = intFields[1];
-          int J3step = intFields[2];
-          int J4step = intFields[3];
-          int J5step = intFields[4];
-          int J6step = intFields[5];
-          int J7step = intFields[6];
-          int J8step = intFields[7];
-          int J9step = intFields[8];
-          int J1dir = intFields[9];
-          int J2dir = intFields[10];
-          int J3dir = intFields[11];
-          int J4dir = intFields[12];
-          int J5dir = intFields[13];
-          int J6dir = intFields[14];
-          int J7dir = intFields[15];
-          int J8dir = intFields[16];
-          int J9dir = intFields[17];
-          String SpeedType = Cmd.substring(i18 + 1, i19);
-          float SpeedVal = floatFields[0];
-          float ACCspd = floatFields[1];
-          float DCCspd = floatFields[2];
-          float ACCramp = floatFields[3];
-          const char speed_mode = SpeedType.charAt(0);
-          const int step_counts[numJoints] = {
-            J1step, J2step, J3step, J4step, J5step,
-            J6step, J7step, J8step, J9step,
-          };
-          const int directions[numJoints] = {
-            J1dir, J2dir, J3dir, J4dir, J5dir,
-            J6dir, J7dir, J8dir, J9dir,
-          };
-          const int current_steps[numJoints] = {
-            J1StepM, J2StepM, J3StepM, J4StepM, J5StepM,
-            J6StepM, J7StepM, J8StepM, J9StepM,
-          };
-          const int step_limits[numJoints] = {
-            J1StepLim, J2StepLim, J3StepLim, J4StepLim, J5StepLim,
-            J6StepLim, J7StepLim, J8StepLim, J9StepLim,
-          };
-          int future_steps[numJoints] = {};
-          bool stored_move_is_valid = ar4_protocol::valid_motion_profile(
-            speed_mode,
-            SpeedVal,
-            ACCspd,
-            DCCspd,
-            ACCramp
-          );
-          for (int axis = 0; axis < numJoints && stored_move_is_valid; ++axis) {
-            stored_move_is_valid = ar4_protocol::stored_step_target(
-              current_steps[axis],
-              step_counts[axis],
-              directions[axis],
-              step_limits[axis],
-              future_steps[axis]
-            );
-          }
-          if (!stored_move_is_valid) {
-            Serial.println("ER");
-            gcFile.close();
-            consume_current_command();
-            return;
-          }
-          if (!driveMotorsG(J1step, J2step, J3step, J4step, J5step, J6step, J7step, J8step, J9step, J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, SpeedType, SpeedVal, ACCspd, DCCspd, ACCramp, nullptr)) {
-            Serial.println("ER");
-            gcFile.close();
-            consume_current_command();
-            return;
-          }
-        }
-      }
-      gcFile.close();
-      sendRobotPos();
-    }
-
-
-
-    //----- WRITE PRE-CALC'D MOVE TO SD CARD ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "WG") {
-      int J1dir;
-      int J2dir;
-      int J3dir;
-      int J4dir;
-      int J5dir;
-      int J6dir;
-      int J7dir;
-      int J8dir;
-      int J9dir;
-
-      int J1axisFault = 0;
-      int J2axisFault = 0;
-      int J3axisFault = 0;
-      int J4axisFault = 0;
-      int J5axisFault = 0;
-      int J6axisFault = 0;
-      int J7axisFault = 0;
-      int J8axisFault = 0;
-      int J9axisFault = 0;
-      int TotalAxisFault = 0;
-
-      String info;
-
-      const int mediaStart = inData.indexOf("Mi");
-      int targetFilenameStart = -1;
-      const String storageTarget = mediaStart > 0
-        ? inData.substring(mediaStart)
-        : String();
-      if (
-        mediaStart <= 0
-        || !ar4_protocol::parse_gcode_media_filename_suffix(
-          storageTarget,
-          targetFilenameStart
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      const String expected_media_id = storageTarget.substring(
-        2,
-        2 + ar4_protocol::kControllerMediaIdLength
-      );
-      String motionInfo = inData.substring(0, mediaStart);
-      ar4_protocol::CartesianMoveCommandFields commandFields = {};
-      if (!ar4_protocol::parse_cartesian_move_command(
-          motionInfo,
-          commandFields
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      String filename = storageTarget.substring(targetFilenameStart);
-      for (int axis = 0; axis < ROBOT_nDOFs; ++axis) {
-        xyzuvw_In[axis] = commandFields.pose[axis];
-      }
-      J7_In = commandFields.auxiliary[0];
-      J8_In = commandFields.auxiliary[1];
-      J9_In = commandFields.auxiliary[2];
-      String SpeedType(commandFields.speed_mode);
-      float SpeedVal = commandFields.speed;
-      float ACCspd = commandFields.acceleration;
-      float DCCspd = commandFields.deceleration;
-      float ACCramp = commandFields.ramp;
-      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
-        WristCon,
-        JointLoopModes,
-        String(commandFields.wrist_config),
-        commandFields.loop_modes
-      );
-
-      SolveInverseKinematics(commandFields.wrist_config);
-
-      //calc destination motor steps
-      int future_steps[numJoints] = {};
-      if (
-        KinematicError != 0
-        || !inverse_solution_to_future_steps(
-          J7_In,
-          J8_In,
-          J9_In,
-          future_steps
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      int J1futStepM = future_steps[0];
-      int J2futStepM = future_steps[1];
-      int J3futStepM = future_steps[2];
-      int J4futStepM = future_steps[3];
-      int J5futStepM = future_steps[4];
-      int J6futStepM = future_steps[5];
-      int J7futStepM = future_steps[6];
-      int J8futStepM = future_steps[7];
-      int J9futStepM = future_steps[8];
-
-
-      //calc delta from current to destination
-      int J1stepDif = J1StepM - J1futStepM;
-      int J2stepDif = J2StepM - J2futStepM;
-      int J3stepDif = J3StepM - J3futStepM;
-      int J4stepDif = J4StepM - J4futStepM;
-      int J5stepDif = J5StepM - J5futStepM;
-      int J6stepDif = J6StepM - J6futStepM;
-      int J7stepDif = J7StepM - J7futStepM;
-      int J8stepDif = J8StepM - J8futStepM;
-      int J9stepDif = J9StepM - J9futStepM;
-
-      //determine motor directions
-      J1dir = (J1stepDif <= 0) ? 1 : 0;
-      J2dir = (J2stepDif <= 0) ? 1 : 0;
-      J3dir = (J3stepDif <= 0) ? 1 : 0;
-      J4dir = (J4stepDif <= 0) ? 1 : 0;
-      J5dir = (J5stepDif <= 0) ? 1 : 0;
-      J6dir = (J6stepDif <= 0) ? 1 : 0;
-      J7dir = (J7stepDif <= 0) ? 1 : 0;
-      J8dir = (J8stepDif <= 0) ? 1 : 0;
-      J9dir = (J9stepDif <= 0) ? 1 : 0;
-
-
-      //determine if requested position is within axis limits
-      if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
-        J1axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
-        J2axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
-        J3axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
-        J4axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
-        J5axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
-        J6axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J7futStepM, J7StepLim)) {
-        J7axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J8futStepM, J8StepLim)) {
-        J8axisFault = 1;
-      }
-      if (future_step_is_outside_limit(J9futStepM, J9StepLim)) {
-        J9axisFault = 1;
-      }
-      TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault + J7axisFault + J8axisFault + J9axisFault;
-
-
-      if (TotalAxisFault == 0 && KinematicError == 0) {
-        info = String(abs(J1stepDif)) + "," + String(abs(J2stepDif)) + "," + String(abs(J3stepDif)) + "," + String(abs(J4stepDif)) + "," + String(abs(J5stepDif)) + "," + String(abs(J6stepDif)) + "," + String(abs(J7stepDif)) + "," + String(abs(J8stepDif)) + "," + String(abs(J9stepDif)) + "," + String(J1dir) + "," + String(J2dir) + "," + String(J3dir) + "," + String(J4dir) + "," + String(J5dir) + "," + String(J6dir) + "," + String(J7dir) + "," + String(J8dir) + "," + String(J9dir) + "," + String(SpeedType) + "," + String(SpeedVal) + "," + String(ACCspd) + "," + String(DCCspd) + "," + String(ACCramp);
-        if (writeSD(filename, info, expected_media_id)) {
-          J1StepM = J1futStepM;
-          J2StepM = J2futStepM;
-          J3StepM = J3futStepM;
-          J4StepM = J4futStepM;
-          J5StepM = J5futStepM;
-          J6StepM = J6futStepM;
-          J7StepM = J7futStepM;
-          J8StepM = J8futStepM;
-          J9StepM = J9futStepM;
-          sendRobotPos();
-        }
-      } else if (KinematicError == 1) {
-        Alarm = "ER";
-        delay(5);
-        Serial.println(Alarm);
-        Alarm = "0";
-      } else {
-        Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault) + String(J7axisFault) + String(J8axisFault) + String(J9axisFault);
-        delay(5);
-        Serial.println(Alarm);
-        Alarm = "0";
-      }
-
-      inData = "";  // Clear recieved buffer
-      ////////MOVE COMPLETE///////////
-    }
-
-
-
-    //----- MOVE C (Cirlce) ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "MC") {
-
-      int J1dir;
-      int J2dir;
-      int J3dir;
-      int J4dir;
-      int J5dir;
-      int J6dir;
-      int J7dir;
-      int J8dir;
-      int J9dir;
-
-      int J1axisFault = 0;
-      int J2axisFault = 0;
-      int J3axisFault = 0;
-      int J4axisFault = 0;
-      int J5axisFault = 0;
-      int J6axisFault = 0;
-      int TotalAxisFault = 0;
-
-      String Alarm = "0";
-      float curWayDis;
-      float speedSP;
-      float Xvect;
-      float Yvect;
-      float Zvect;
-      float calcStepGap;
-      float theta;
-      int Cdir;
-      float axis[3];
-      float axisTemp[3];
-      float startVect[3];
-      float Rotation[3][3];
-      float DestPt[3];
-      float a;
-      float b;
-      float c;
-      float d;
-      float aa;
-      float bb;
-      float cc;
-      float dd;
-      float bc;
-      float ad;
-      float ac;
-      float ab;
-      float bd;
-      float cd;
-
-      int xStart = inData.indexOf("Cx");
-      int yStart = inData.indexOf("Cy");
-      int zStart = inData.indexOf("Cz");
-      int rzStart = inData.indexOf("Rz");
-      int ryStart = inData.indexOf("Ry");
-      int rxStart = inData.indexOf("Rx");
-      int xMidIndex = inData.indexOf("Bx");
-      int yMidIndex = inData.indexOf("By");
-      int zMidIndex = inData.indexOf("Bz");
-      int xEndIndex = inData.indexOf("Px");
-      int yEndIndex = inData.indexOf("Py");
-      int zEndIndex = inData.indexOf("Pz");
-      int tStart = inData.indexOf("Tr");
-      int SPstart = inData.indexOf("S");
-      int AcStart = inData.indexOf("Ac");
-      int DcStart = inData.indexOf("Dc");
-      int RmStart = inData.indexOf("Rm");
-      int WristConStart = inData.indexOf("W");
-      int LoopModeStart = inData.indexOf("Lm");
-
-      const int markers[] = {
-        xStart,
-        yStart,
-        zStart,
-        rzStart,
-        ryStart,
-        rxStart,
-        xMidIndex,
-        yMidIndex,
-        zMidIndex,
-        xEndIndex,
-        yEndIndex,
-        zEndIndex,
-        tStart,
-        SPstart,
-        AcStart,
-        DcStart,
-        RmStart,
-        WristConStart,
-        LoopModeStart,
-      };
-      const int begins[] = {
-        xStart + 2,
-        yStart + 2,
-        zStart + 2,
-        rzStart + 2,
-        ryStart + 2,
-        rxStart + 2,
-        xMidIndex + 2,
-        yMidIndex + 2,
-        zMidIndex + 2,
-        xEndIndex + 2,
-        yEndIndex + 2,
-        zEndIndex + 2,
-        tStart + 2,
-        SPstart + 2,
-        AcStart + 2,
-        DcStart + 2,
-        RmStart + 2,
-      };
-      const int ends[] = {
-        yStart,
-        zStart,
-        rzStart,
-        ryStart,
-        rxStart,
-        xMidIndex,
-        yMidIndex,
-        zMidIndex,
-        xEndIndex,
-        yEndIndex,
-        zEndIndex,
-        tStart,
-        SPstart,
-        AcStart,
-        DcStart,
-        RmStart,
-        WristConStart,
-      };
-      float parsed[17];
-      int loopModes[ROBOT_nDOFs];
-      const char speed_mode = inData.charAt(SPstart + 1);
-      const char wrist_config = inData.charAt(WristConStart + 1);
-      if (
-        !ar4_protocol::marker_positions_are_ordered_from(
-          inData.length(),
-          markers,
-          0
-        )
-        || WristConStart + 2 != LoopModeStart
-        || LoopModeStart + 2 + ROBOT_nDOFs
-          != static_cast<int>(inData.length())
-        || !parse_float_spans(inData, begins, ends, parsed)
-        || !ar4_protocol::supported_trajectory_rotation(parsed[12])
-        || !parse_loop_modes(inData, LoopModeStart, loopModes)
-        || !ar4_protocol::valid_motion_profile(
-          speed_mode,
-          parsed[13],
-          parsed[14],
-          parsed[15],
-          parsed[16]
-        )
-        || !ar4_protocol::valid_wrist_config(wrist_config)
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      float xBeg = parsed[0];
-      float yBeg = parsed[1];
-      float zBeg = parsed[2];
-      float rzBeg = parsed[3];
-      float ryBeg = parsed[4];
-      float rxBeg = parsed[5];
-      float xMid = parsed[6];
-      float yMid = parsed[7];
-      float zMid = parsed[8];
-      float xEnd = parsed[9];
-      float yEnd = parsed[10];
-      float zEnd = parsed[11];
-      String SpeedType(speed_mode);
-      float SpeedVal = parsed[13];
-      float ACCspd = parsed[14];
-      float DCCspd = parsed[15];
-      float ACCramp = parsed[16];
-      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
-        WristCon,
-        JointLoopModes,
-        String(wrist_config),
-        loopModes
-      );
-
-      const float circle_center[3] = { xBeg, yBeg, zBeg };
-      const float circle_start[3] = { xMid, yMid, zMid };
-      const float circle_end[3] = { xEnd, yEnd, zEnd };
-      if (!ar4_protocol::valid_circle_geometry(
-          circle_center,
-          circle_start,
-          circle_end,
-          linWayDistSP
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      //calc vector from start point of circle (mid) to center of circle (beg)
-      Xvect = xMid - xBeg;
-      Yvect = yMid - yBeg;
-      Zvect = zMid - zBeg;
-      //get radius - distance from first point (center of circle) to second point (start point of circle)
-      float Radius = pow((pow((Xvect), 2) + pow((Yvect), 2) + pow((Zvect), 2)), .5);
-
-      //set center coordinates of circle to first point (beg) as this is the center of our circle
-      float Px = xBeg;
-      float Py = yBeg;
-      float Pz = zBeg;
-
-      //define start vetor (mid) point is start of circle
-      startVect[0] = (xMid - Px);
-      startVect[1] = (yMid - Py);
-      startVect[2] = (zMid - Pz);
-      //get vectors from center of circle to  mid target (start) and end target then normalize
-      float vect_Bmag = pow((pow((xMid - Px), 2) + pow((yMid - Py), 2) + pow((zMid - Pz), 2)), .5);
-      float vect_Bx = (xMid - Px) / vect_Bmag;
-      float vect_By = (yMid - Py) / vect_Bmag;
-      float vect_Bz = (zMid - Pz) / vect_Bmag;
-      float vect_Cmag = pow((pow((xEnd - Px), 2) + pow((yEnd - Py), 2) + pow((zEnd - Pz), 2)), .5);
-      float vect_Cx = (xEnd - Px) / vect_Cmag;
-      float vect_Cy = (yEnd - Py) / vect_Cmag;
-      float vect_Cz = (zEnd - Pz) / vect_Cmag;
-      //get cross product of vectors b & c than apply to axis matrix
-      float CrossX = (vect_By * vect_Cz) - (vect_Bz * vect_Cy);
-      float CrossY = (vect_Bz * vect_Cx) - (vect_Bx * vect_Cz);
-      float CrossZ = (vect_Bx * vect_Cy) - (vect_By * vect_Cx);
-      axis[0] = CrossX / sqrt((CrossX * CrossX) + (CrossY * CrossY) + (CrossZ * CrossZ));
-      axis[1] = CrossY / sqrt((CrossX * CrossX) + (CrossY * CrossY) + (CrossZ * CrossZ));
-      axis[2] = CrossZ / sqrt((CrossX * CrossX) + (CrossY * CrossY) + (CrossZ * CrossZ));
-      //get radian angle between vectors using acos of dot product
-      float circle_dot = (
-        vect_Bx * vect_Cx + vect_By * vect_Cy + vect_Bz * vect_Cz
-      ) / (
-        sqrt(pow(vect_Bx, 2) + pow(vect_By, 2) + pow(vect_Bz, 2))
-        * sqrt(pow(vect_Cx, 2) + pow(vect_Cy, 2) + pow(vect_Cz, 2))
-      );
-      circle_dot = fmax(-1.0f, fmin(1.0f, circle_dot));
-      float BCradians = acos(circle_dot);
-      //get arc degree
-      float ABdegrees = degrees(BCradians);
-      //get direction from angle
-      if (ABdegrees > 0) {
-        Cdir = 1;
-      } else {
-        Cdir = -1;
-      }
-
-      //get circumference and calc way pt gap
-      float lineDist = 2 * 3.14159265359 * Radius;
-      int waypoint_count = 0;
-      int HighStep = 0;
-      if (
-        !ar4_protocol::waypoint_count_for_path(
-          lineDist,
-          linWayDistSP,
-          waypoint_count
-        )
-        || !ar4_protocol::waypoint_count_for_path(
-          lineDist,
-          0.05f,
-          HighStep
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      float wayPts = static_cast<float>(waypoint_count);
-
-      float wayPerc = 1.0f / wayPts;
-      //cacl way pt angle
-      float theta_Deg = ((360 * Cdir) / (wayPts));
-
-      //determine steps
-      float ACCStep = HighStep * (ACCspd / 100);
-      float NORStep = HighStep * ((100 - ACCspd - DCCspd) / 100);
-      float DCCStep = HighStep * (DCCspd / 100);
-
-      //set speed for seconds or mm per sec
-      if (SpeedType == "s") {
-        speedSP = (SpeedVal * 1000000) * 1.75;
-      } else if (SpeedType == "m") {
-        speedSP = ((lineDist / SpeedVal) * 1000000) * 1.75;
-      }
-      if (
-        (SpeedType == "s" || SpeedType == "m")
-        && (!isfinite(speedSP) || speedSP <= 0.0f)
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      //calc step gap for seconds or mm per sec
-      if (SpeedType == "s" or SpeedType == "m") {
-        float zeroStepGap = speedSP / HighStep;
-        float zeroACCstepInc = (zeroStepGap * (100 / ACCramp)) / ACCStep;
-        float zeroACCtime = ((ACCStep)*zeroStepGap) + ((ACCStep - 9) * (((ACCStep) * (zeroACCstepInc / 2))));
-        float zeroNORtime = NORStep * zeroStepGap;
-        float zeroDCCstepInc = (zeroStepGap * (100 / ACCramp)) / DCCStep;
-        float zeroDCCtime = ((DCCStep)*zeroStepGap) + ((DCCStep - 9) * (((DCCStep) * (zeroDCCstepInc / 2))));
-        float zeroTOTtime = zeroACCtime + zeroNORtime + zeroDCCtime;
-        if (!isfinite(zeroTOTtime) || zeroTOTtime <= 0.0f) {
-          calcStepGap = minSpeedDelay;
-          speedViolation = "1";
-        } else {
-          float overclockPerc = speedSP / zeroTOTtime;
-          calcStepGap = zeroStepGap * overclockPerc;
-        }
-        if (calcStepGap <= minSpeedDelay) {
-          calcStepGap = minSpeedDelay;
-          speedViolation = "1";
-        }
-      }
-
-      //calc step gap for percentage
-      else if (SpeedType == "p") {
-        calcStepGap = minSpeedDelay / (SpeedVal / 100);
-      }
-      if (!isfinite(calcStepGap) || calcStepGap <= 0.0f) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      //calculate final step increments
-      float calcACCstepInc = (calcStepGap * (100 / ACCramp)) / ACCStep;
-      float calcDCCstepInc = (calcStepGap * (100 / ACCramp)) / DCCStep;
-      float calcACCstartDel = (calcACCstepInc * ACCStep) * 2;
-      float calcDCCendDel = (calcDCCstepInc * DCCStep) * 2;
-
-
-      //calc way pt speeds
-      float ACCwayPts = wayPts * (ACCspd / 100);
-      float NORwayPts = wayPts * ((100 - ACCspd - DCCspd) / 100);
-      float DCCwayPts = wayPts * (DCCspd / 100);
-
-      //calc way inc for lin way steps
-      float ACCwayInc = (calcACCstartDel - calcStepGap) / ACCwayPts;
-      float DCCwayInc = (calcDCCendDel - calcStepGap) / DCCwayPts;
-      if (
-        !isfinite(ACCwayInc)
-        || !isfinite(DCCwayInc)
-        || !ar4_protocol::valid_delay_envelope(
-          calcStepGap,
-          calcACCstartDel,
-          calcDCCendDel,
-          false,
-          rndSpeed
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      //set starting delsy
-      float curDelay = calcACCstartDel;
-
-      //set starting angle first way pt
-      float cur_deg = theta_Deg;
-
-      /////////////////////////////////////
-      //loop through waypoints
-      ////////////////////////////////////
-
-      resetEncoders();
-
-      for (int i = 1; i <= waypoint_count; i++) {
-
-        theta = radians(cur_deg);
-        //use euler rodrigues formula to find rotation vector
-        a = cos(theta / 2.0);
-        b = -axis[0] * sin(theta / 2.0);
-        c = -axis[1] * sin(theta / 2.0);
-        d = -axis[2] * sin(theta / 2.0);
-        aa = a * a;
-        bb = b * b;
-        cc = c * c;
-        dd = d * d;
-        bc = b * c;
-        ad = a * d;
-        ac = a * c;
-        ab = a * b;
-        bd = b * d;
-        cd = c * d;
-        Rotation[0][0] = aa + bb - cc - dd;
-        Rotation[0][1] = 2 * (bc + ad);
-        Rotation[0][2] = 2 * (bd - ac);
-        Rotation[1][0] = 2 * (bc - ad);
-        Rotation[1][1] = aa + cc - bb - dd;
-        Rotation[1][2] = 2 * (cd + ab);
-        Rotation[2][0] = 2 * (bd + ac);
-        Rotation[2][1] = 2 * (cd - ab);
-        Rotation[2][2] = aa + dd - bb - cc;
-
-        //get product of current rotation and start vector
-        DestPt[0] = (Rotation[0][0] * startVect[0]) + (Rotation[0][1] * startVect[1]) + (Rotation[0][2] * startVect[2]);
-        DestPt[1] = (Rotation[1][0] * startVect[0]) + (Rotation[1][1] * startVect[1]) + (Rotation[1][2] * startVect[2]);
-        DestPt[2] = (Rotation[2][0] * startVect[0]) + (Rotation[2][1] * startVect[1]) + (Rotation[2][2] * startVect[2]);
-
-        ////DELAY CALC/////
-        if (i <= ACCwayPts) {
-          curDelay = fmax(calcStepGap, curDelay - ACCwayInc);
-        } else if (i >= (wayPts - DCCwayPts)) {
-          curDelay = fmin(calcDCCendDel, curDelay + DCCwayInc);
-        } else {
-          curDelay = calcStepGap;
-        }
-
-        //shift way pts back to orignal origin and calc kinematics for way pt movement
-        xyzuvw_In[0] = (DestPt[0]) + Px;
-        xyzuvw_In[1] = (DestPt[1]) + Py;
-        xyzuvw_In[2] = (DestPt[2]) + Pz;
-        xyzuvw_In[3] = rzBeg;
-        xyzuvw_In[4] = ryBeg;
-        xyzuvw_In[5] = rxBeg;
-
-        SolveInverseKinematics(wrist_config);
-
-        //calc destination motor steps
-        int future_steps[ROBOT_nDOFs] = {};
-        if (
-          KinematicError != 0
-          || !primary_inverse_solution_to_future_steps(future_steps)
-        ) {
-          KinematicError = 1;
-          break;
-        }
-        int J1futStepM = future_steps[0];
-        int J2futStepM = future_steps[1];
-        int J3futStepM = future_steps[2];
-        int J4futStepM = future_steps[3];
-        int J5futStepM = future_steps[4];
-        int J6futStepM = future_steps[5];
-
-        //calc delta from current to destination
-        int J1stepDif = J1StepM - J1futStepM;
-        int J2stepDif = J2StepM - J2futStepM;
-        int J3stepDif = J3StepM - J3futStepM;
-        int J4stepDif = J4StepM - J4futStepM;
-        int J5stepDif = J5StepM - J5futStepM;
-        int J6stepDif = J6StepM - J6futStepM;
-        int J7stepDif = 0;
-        int J8stepDif = 0;
-        int J9stepDif = 0;
-
-        //determine motor directions
-        J1dir = (J1stepDif <= 0) ? 1 : 0;
-        J2dir = (J2stepDif <= 0) ? 1 : 0;
-        J3dir = (J3stepDif <= 0) ? 1 : 0;
-        J4dir = (J4stepDif <= 0) ? 1 : 0;
-        J5dir = (J5stepDif <= 0) ? 1 : 0;
-        J6dir = (J6stepDif <= 0) ? 1 : 0;
-        J7dir = 0;
-        J8dir = 0;
-        J9dir = 0;
-
-        //determine if requested position is within axis limits
-        if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
-          J1axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
-          J2axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
-          J3axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
-          J4axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
-          J5axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
-          J6axisFault = 1;
-        }
-        TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
-
-        if (TotalAxisFault != 0) {
-          Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault);
-          break;
-        }
-
-        if (!driveMotorsL(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, curDelay, &motionModes)) {
-          KinematicError = 1;
-          break;
-        }
-        updatePos();
-
-        //increment angle
-        cur_deg += theta_Deg;
-      }
-
-      if (KinematicError == 1) {
-        Alarm = "ER";
-        delay(5);
-        Serial.println(Alarm);
-      } else if (TotalAxisFault != 0) {
-        delay(5);
-        Serial.println(Alarm);
-      } else {
-        checkEncoders();
-        sendRobotPos();
-      }
-
-
-      inData = "";  // Clear recieved buffer
-      ////////MOVE COMPLETE///////////
-    }
-
-
-
-
-    //----- MOVE A (Arc) ---------------------------------------------------
-    //-----------------------------------------------------------------------
-    if (function == "MA" and flag == "") {
-
-      if (rndTrue == true) {
-        inData = rndData;
-      }
-
-      float curDelay;
-
-      int J1dir;
-      int J2dir;
-      int J3dir;
-      int J4dir;
-      int J5dir;
-      int J6dir;
-      int J7dir;
-      int J8dir;
-      int J9dir;
-
-      int J1axisFault = 0;
-      int J2axisFault = 0;
-      int J3axisFault = 0;
-      int J4axisFault = 0;
-      int J5axisFault = 0;
-      int J6axisFault = 0;
-      int TotalAxisFault = 0;
-
-      //String Alarm = "0";
-      float curWayDis;
-      float speedSP;
-      float Xvect;
-      float Yvect;
-      float Zvect;
-      float calcStepGap;
-      float theta;
-      float axis[3];
-      float axisTemp[3];
-      float startVect[3];
-      float Rotation[3][3];
-      float DestPt[3];
-      float a;
-      float b;
-      float c;
-      float d;
-      float aa;
-      float bb;
-      float cc;
-      float dd;
-      float bc;
-      float ad;
-      float ac;
-      float ab;
-      float bd;
-      float cd;
-
-      int xMidIndex = inData.indexOf("X");
-      int yMidIndex = inData.indexOf("Y");
-      int zMidIndex = inData.indexOf("Z");
-      int rzIndex = inData.indexOf("Rz");
-      int ryIndex = inData.indexOf("Ry");
-      int rxIndex = inData.indexOf("Rx");
-
-      int xEndIndex = inData.indexOf("Ex");
-      int yEndIndex = inData.indexOf("Ey");
-      int zEndIndex = inData.indexOf("Ez");
-      int tStart = inData.indexOf("Tr");
-      int SPstart = inData.indexOf("S");
-      int AcStart = inData.indexOf("Ac");
-      int DcStart = inData.indexOf("Dc");
-      int RmStart = inData.indexOf("Rm");
-      int WristConStart = inData.indexOf("W");
-      int LoopModeStart = inData.indexOf("Lm");
-
-      const int markers[] = {
-        xMidIndex,
-        yMidIndex,
-        zMidIndex,
-        rzIndex,
-        ryIndex,
-        rxIndex,
-        xEndIndex,
-        yEndIndex,
-        zEndIndex,
-        tStart,
-        SPstart,
-        AcStart,
-        DcStart,
-        RmStart,
-        WristConStart,
-        LoopModeStart,
-      };
-      const int begins[] = {
-        xMidIndex + 1,
-        yMidIndex + 1,
-        zMidIndex + 1,
-        rzIndex + 2,
-        ryIndex + 2,
-        rxIndex + 2,
-        xEndIndex + 2,
-        yEndIndex + 2,
-        zEndIndex + 2,
-        tStart + 2,
-        SPstart + 2,
-        AcStart + 2,
-        DcStart + 2,
-        RmStart + 2,
-      };
-      const int ends[] = {
-        yMidIndex,
-        zMidIndex,
-        rzIndex,
-        ryIndex,
-        rxIndex,
-        xEndIndex,
-        yEndIndex,
-        zEndIndex,
-        tStart,
-        SPstart,
-        AcStart,
-        DcStart,
-        RmStart,
-        WristConStart,
-      };
-      float parsed[14];
-      int loopModes[ROBOT_nDOFs];
-      const char speed_mode = inData.charAt(SPstart + 1);
-      const char wrist_config = inData.charAt(WristConStart + 1);
-      if (
-        !ar4_protocol::marker_positions_are_ordered_from(
-          inData.length(),
-          markers,
-          0
-        )
-        || WristConStart + 2 != LoopModeStart
-        || LoopModeStart + 2 + ROBOT_nDOFs
-          != static_cast<int>(inData.length())
-        || !parse_float_spans(inData, begins, ends, parsed)
-        || !ar4_protocol::supported_trajectory_rotation(parsed[9])
-        || !parse_loop_modes(inData, LoopModeStart, loopModes)
-        || !ar4_protocol::valid_motion_profile(
-          speed_mode,
-          parsed[10],
-          parsed[11],
-          parsed[12],
-          parsed[13]
-        )
-        || !ar4_protocol::valid_wrist_config(wrist_config)
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      updatePos();
-
-      float xBeg = xyzuvw_Out[0];
-      float yBeg = xyzuvw_Out[1];
-      float zBeg = xyzuvw_Out[2];
-      float rzBeg = xyzuvw_Out[3];
-      float ryBeg = xyzuvw_Out[4];
-      float rxBeg = xyzuvw_Out[5];
-
-      float xMid = parsed[0];
-      float yMid = parsed[1];
-      float zMid = parsed[2];
-      float rz = parsed[3];
-      float ry = parsed[4];
-      float rx = parsed[5];
-
-
-      float RZvect = rzBeg - rz;
-      float RYvect = ryBeg - ry;
-      float RXvect = rxBeg - rx;
-
-      float xEnd = parsed[6];
-      float yEnd = parsed[7];
-      float zEnd = parsed[8];
-      String SpeedType(speed_mode);
-      float SpeedVal = parsed[10];
-      float ACCspd = parsed[11];
-      float DCCspd = parsed[12];
-      float ACCramp = parsed[13];
-      ar4_protocol::MotionModeTransaction<String, ROBOT_nDOFs> motionModes(
-        WristCon,
-        JointLoopModes,
-        String(wrist_config),
-        loopModes
-      );
-
-      const float arc_start[3] = { xBeg, yBeg, zBeg };
-      const float arc_middle[3] = { xMid, yMid, zMid };
-      const float arc_end[3] = { xEnd, yEnd, zEnd };
-      ar4_protocol::OrderedArcGeometry arc_geometry = {};
-      if (!ar4_protocol::valid_arc_geometry(
-          arc_start,
-          arc_middle,
-          arc_end,
-          linWayDistSP,
-          &arc_geometry
-      )) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      const float Px = static_cast<float>(arc_geometry.center[0]);
-      const float Py = static_cast<float>(arc_geometry.center[1]);
-      const float Pz = static_cast<float>(arc_geometry.center[2]);
-      startVect[0] = xBeg - Px;
-      startVect[1] = yBeg - Py;
-      startVect[2] = zBeg - Pz;
-      axis[0] = static_cast<float>(arc_geometry.axis[0]);
-      axis[1] = static_cast<float>(arc_geometry.axis[1]);
-      axis[2] = static_cast<float>(arc_geometry.axis[2]);
-      const float ABdegrees = degrees(
-        static_cast<float>(arc_geometry.radians)
-      );
-      const float lineDist = static_cast<float>(
-        arc_geometry.radius * arc_geometry.radians
-      );
-      int waypoint_count = 0;
-      int HighStep = 0;
-      if (
-        !ar4_protocol::waypoint_count_for_path(
-          lineDist,
-          linWayDistSP,
-          waypoint_count
-        )
-        || !ar4_protocol::waypoint_count_for_path(
-          lineDist,
-          0.05f,
-          HighStep
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-      float wayPts = static_cast<float>(waypoint_count);
-
-      float wayPerc = 1.0f / wayPts;
-      //cacl way pt angle
-      float theta_Deg = (ABdegrees / wayPts);
-
-      //determine steps
-      float ACCStep = HighStep * (ACCspd / 100);
-      float NORStep = HighStep * ((100 - ACCspd - DCCspd) / 100);
-      float DCCStep = HighStep * (DCCspd / 100);
-
-      //set speed for seconds or mm per sec
-      if (SpeedType == "s") {
-        speedSP = (SpeedVal * 1000000) * 1.2;
-      } else if (SpeedType == "m") {
-        speedSP = ((lineDist / SpeedVal) * 1000000) * 1.2;
-      }
-      if (
-        (SpeedType == "s" || SpeedType == "m")
-        && (!isfinite(speedSP) || speedSP <= 0.0f)
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      //calc step gap for seconds or mm per sec
-      if (SpeedType == "s" or SpeedType == "m") {
-        float zeroStepGap = speedSP / HighStep;
-        float zeroACCstepInc = (zeroStepGap * (100 / ACCramp)) / ACCStep;
-        float zeroACCtime = ((ACCStep)*zeroStepGap) + ((ACCStep - 9) * (((ACCStep) * (zeroACCstepInc / 2))));
-        float zeroNORtime = NORStep * zeroStepGap;
-        float zeroDCCstepInc = (zeroStepGap * (100 / ACCramp)) / DCCStep;
-        float zeroDCCtime = ((DCCStep)*zeroStepGap) + ((DCCStep - 9) * (((DCCStep) * (zeroDCCstepInc / 2))));
-        float zeroTOTtime = zeroACCtime + zeroNORtime + zeroDCCtime;
-        if (!isfinite(zeroTOTtime) || zeroTOTtime <= 0.0f) {
-          calcStepGap = minSpeedDelay;
-          speedViolation = "1";
-        } else {
-          float overclockPerc = speedSP / zeroTOTtime;
-          calcStepGap = zeroStepGap * overclockPerc;
-        }
-        if (calcStepGap <= minSpeedDelay) {
-          calcStepGap = minSpeedDelay;
-          speedViolation = "1";
-        }
-      }
-
-      //calc step gap for percentage
-      else if (SpeedType == "p") {
-        calcStepGap = minSpeedDelay / (SpeedVal / 100);
-      }
-      if (!isfinite(calcStepGap) || calcStepGap <= 0.0f) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      //calculate final step increments
-      float calcACCstepInc = (calcStepGap * (100 / ACCramp)) / ACCStep;
-      float calcDCCstepInc = (calcStepGap * (100 / ACCramp)) / DCCStep;
-      float calcACCstartDel = (calcACCstepInc * ACCStep) * 2;
-      float calcDCCendDel = (calcDCCstepInc * DCCStep) * 2;
-
-
-      //calc way pt speeds
-      float ACCwayPts = wayPts * (ACCspd / 100);
-      float NORwayPts = wayPts * ((100 - ACCspd - DCCspd) / 100);
-      float DCCwayPts = wayPts * (DCCspd / 100);
-
-      //calc way inc for lin way steps
-      float ACCwayInc = (calcACCstartDel - calcStepGap) / ACCwayPts;
-      float DCCwayInc = (calcDCCendDel - calcStepGap) / DCCwayPts;
-      if (
-        !isfinite(ACCwayInc)
-        || !isfinite(DCCwayInc)
-        || !ar4_protocol::valid_delay_envelope(
-          calcStepGap,
-          calcACCstartDel,
-          calcDCCendDel,
-          rndTrue,
-          rndSpeed
-        )
-      ) {
-        Serial.println("ER");
-        consume_current_command();
-        return;
-      }
-
-      //set starting delsy
-      if (rndTrue == true) {
-        curDelay = rndSpeed;
-      } else {
-        curDelay = calcACCstartDel;
-      }
-
-
-      //set starting angle first way pt
-      float cur_deg = theta_Deg;
-
-      /////////////////////////////////////
-      //loop through waypoints
-      ////////////////////////////////////
-
-      resetEncoders();
-
-      for (int i = 1; i <= waypoint_count; i++) {
-
-        theta = radians(cur_deg);
-        //use euler rodrigues formula to find rotation vector
-        a = cos(theta / 2.0);
-        b = -axis[0] * sin(theta / 2.0);
-        c = -axis[1] * sin(theta / 2.0);
-        d = -axis[2] * sin(theta / 2.0);
-        aa = a * a;
-        bb = b * b;
-        cc = c * c;
-        dd = d * d;
-        bc = b * c;
-        ad = a * d;
-        ac = a * c;
-        ab = a * b;
-        bd = b * d;
-        cd = c * d;
-        Rotation[0][0] = aa + bb - cc - dd;
-        Rotation[0][1] = 2 * (bc + ad);
-        Rotation[0][2] = 2 * (bd - ac);
-        Rotation[1][0] = 2 * (bc - ad);
-        Rotation[1][1] = aa + cc - bb - dd;
-        Rotation[1][2] = 2 * (cd + ab);
-        Rotation[2][0] = 2 * (bd + ac);
-        Rotation[2][1] = 2 * (cd - ab);
-        Rotation[2][2] = aa + dd - bb - cc;
-
-        //get product of current rotation and start vector
-        DestPt[0] = (Rotation[0][0] * startVect[0]) + (Rotation[0][1] * startVect[1]) + (Rotation[0][2] * startVect[2]);
-        DestPt[1] = (Rotation[1][0] * startVect[0]) + (Rotation[1][1] * startVect[1]) + (Rotation[1][2] * startVect[2]);
-        DestPt[2] = (Rotation[2][0] * startVect[0]) + (Rotation[2][1] * startVect[1]) + (Rotation[2][2] * startVect[2]);
-
-        ////DELAY CALC/////
-        if (rndTrue == true) {
-          curDelay = rndSpeed;
-        } else if (i <= ACCwayPts) {
-          curDelay = fmax(calcStepGap, curDelay - ACCwayInc);
-        } else if (i >= (wayPts - DCCwayPts)) {
-          curDelay = fmin(calcDCCendDel, curDelay + DCCwayInc);
-        } else {
-          curDelay = calcStepGap;
-        }
-
-        //shift way pts back to orignal origin and calc kinematics for way pt movement
-        float curWayPerc = wayPerc * i;
-        xyzuvw_In[0] = (DestPt[0]) + Px;
-        xyzuvw_In[1] = (DestPt[1]) + Py;
-        xyzuvw_In[2] = (DestPt[2]) + Pz;
-        xyzuvw_In[3] = rzBeg - (RZvect * curWayPerc);
-        xyzuvw_In[4] = ryBeg - (RYvect * curWayPerc);
-        xyzuvw_In[5] = rxBeg - (RXvect * curWayPerc);
-
-
-        SolveInverseKinematics(wrist_config);
-
-        //calc destination motor steps
-        int future_steps[ROBOT_nDOFs] = {};
-        if (
-          KinematicError != 0
-          || !primary_inverse_solution_to_future_steps(future_steps)
-        ) {
-          KinematicError = 1;
-          break;
-        }
-        int J1futStepM = future_steps[0];
-        int J2futStepM = future_steps[1];
-        int J3futStepM = future_steps[2];
-        int J4futStepM = future_steps[3];
-        int J5futStepM = future_steps[4];
-        int J6futStepM = future_steps[5];
-
-        //calc delta from current to destination
-        int J1stepDif = J1StepM - J1futStepM;
-        int J2stepDif = J2StepM - J2futStepM;
-        int J3stepDif = J3StepM - J3futStepM;
-        int J4stepDif = J4StepM - J4futStepM;
-        int J5stepDif = J5StepM - J5futStepM;
-        int J6stepDif = J6StepM - J6futStepM;
-        int J7stepDif = 0;
-        int J8stepDif = 0;
-        int J9stepDif = 0;
-
-
-        //determine motor directions
-        J1dir = (J1stepDif <= 0) ? 1 : 0;
-        J2dir = (J2stepDif <= 0) ? 1 : 0;
-        J3dir = (J3stepDif <= 0) ? 1 : 0;
-        J4dir = (J4stepDif <= 0) ? 1 : 0;
-        J5dir = (J5stepDif <= 0) ? 1 : 0;
-        J6dir = (J6stepDif <= 0) ? 1 : 0;
-        J7dir = 0;
-        J8dir = 0;
-        J9dir = 0;
-
-        //determine if requested position is within axis limits
-        if (future_step_is_outside_limit(J1futStepM, J1StepLim)) {
-          J1axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J2futStepM, J2StepLim)) {
-          J2axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J3futStepM, J3StepLim)) {
-          J3axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J4futStepM, J4StepLim)) {
-          J4axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J5futStepM, J5StepLim)) {
-          J5axisFault = 1;
-        }
-        if (future_step_is_outside_limit(J6futStepM, J6StepLim)) {
-          J6axisFault = 1;
-        }
-        TotalAxisFault = J1axisFault + J2axisFault + J3axisFault + J4axisFault + J5axisFault + J6axisFault;
-
-        if (TotalAxisFault != 0) {
-          Alarm = "EL" + String(J1axisFault) + String(J2axisFault) + String(J3axisFault) + String(J4axisFault) + String(J5axisFault) + String(J6axisFault);
-          break;
-        }
-
-        if (!driveMotorsL(abs(J1stepDif), abs(J2stepDif), abs(J3stepDif), abs(J4stepDif), abs(J5stepDif), abs(J6stepDif), abs(J7stepDif), abs(J8stepDif), abs(J9stepDif), J1dir, J2dir, J3dir, J4dir, J5dir, J6dir, J7dir, J8dir, J9dir, curDelay, &motionModes)) {
-          KinematicError = 1;
-          break;
-        }
-        updatePos();
-
-        //increment angle
-        cur_deg += theta_Deg;
-      }
-      if (KinematicError == 1) {
-        Alarm = "ER";
-        if (splineTrue == false) {
-          delay(5);
-          Serial.println(Alarm);
-        }
-      } else if (TotalAxisFault != 0) {
-        if (splineTrue == false) {
-          delay(5);
-          Serial.println(Alarm);
-        }
-      } else {
-        checkEncoders();
-      }
-      rndTrue = false;
-      inData = "";  // Clear recieved buffer
-      if (
-        splineTrue == false
-        && KinematicError == 0
-        && TotalAxisFault == 0
-      ) {
-        sendRobotPos();
-      }
-      ////////MOVE COMPLETE///////////
-    }
-
-
-    consume_current_command();
+  bool outputOwned = service_json_output();
+  if (jsonRuntimeFault) return;
+  bool playbackOwned = false;
+  if (!outputOwned) {
+    playbackOwned = service_json_gcode_playback();
+    outputOwned = service_json_output();
   }
+  bool liveOwned = false;
+  if (!outputOwned && !playbackOwned) {
+    liveOwned = service_json_live_motion(false);
+    outputOwned = service_json_output();
+  }
+  const bool controlPending = Serial.available() > 0
+    || recData.length() != 0 || serialFrameDiscarding;
+  if (
+    !outputOwned
+    && !playbackOwned
+    && (!liveOwned || controlPending)
+  ) processSerial();
+  if (!outputOwned && !playbackOwned && liveOwned) {
+    service_json_live_motion(!controlPending);
+  }
+  service_json_output();
 }

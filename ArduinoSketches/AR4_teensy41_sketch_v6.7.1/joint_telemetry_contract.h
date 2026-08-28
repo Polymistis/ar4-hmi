@@ -122,6 +122,12 @@ inline bool complete_estop_admission_response(
     return !newer_assertion && !estop_input_asserted;
 }
 
+inline void abandon_estop_admission_response(
+    volatile EstopAdmissionOwnership& admission_ownership
+) {
+    admission_ownership.response_active = false;
+}
+
 inline void begin_joint_telemetry_response_ownership(
     bool telemetry_requested,
     volatile JointTelemetryResponseOwnership& ownership

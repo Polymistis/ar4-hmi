@@ -1611,6 +1611,9 @@ class VisionIoTests(unittest.TestCase):
             def acquire(self, *args, **kwargs):
                 return self._lock.acquire(*args, **kwargs)
 
+            def locked(self):
+                return self._lock.locked()
+
             def release(self):
                 current = threading.current_thread()
                 exit_candidate = (

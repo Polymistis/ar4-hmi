@@ -215,6 +215,18 @@ class ControllerTraceCapture:
             self._origin_seconds = timestamp
         return True
 
+    def __call__(self):
+        """Admit the controller write even when diagnostic capture is lost."""
+
+        try:
+            self.set()
+        except Exception as exc:
+            try:
+                self._discard(_bounded_detail(exc))
+            except Exception:
+                pass
+        return True
+
     def record_telemetry(self, encoder_positions):
         try:
             timestamp = _capture_clock(self._clock)

@@ -11,7 +11,6 @@ from collections import deque
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-import json
 import math
 from numbers import Integral, Real
 import re
@@ -25,7 +24,6 @@ JOINT_COUNT = 9
 PRIMARY_START_POSITION = (0.0, 0.0, 0.0, 0.0, 45.0, 0.0)
 MAX_COMMAND_LENGTH = 4096
 MAX_RESPONSE_PAYLOAD_LENGTH = 4096
-MAX_RESPONSE_FRAME_LENGTH = MAX_RESPONSE_PAYLOAD_LENGTH + 2
 AUXILIARY_BOARD_NONE = "None"
 AUXILIARY_BOARD_NANO = "Nano"
 AUXILIARY_BOARD_MEGA = "Mega"
@@ -50,8 +48,6 @@ AUXILIARY_SERVO_MINIMUM_POSITION = 0
 AUXILIARY_SERVO_MAXIMUM_POSITION = 180
 AUXILIARY_WAIT_MAXIMUM_SECONDS = 32767
 AUXILIARY_CURRENT_MAXIMUM_AMPS = 28.0
-CONTROL_POLL_INTERVAL_SECONDS = 0.05
-PENDING_CONTROL_FRAME_TIMEOUT_SECONDS = 1.0
 RESPONSE_TIMEOUT_SAFETY_SCALE = 1.25
 FIRMWARE_MINIMUM_RAMP_PERCENT = 10.0
 FIRMWARE_LEGACY_RAMP_NUMERATOR = 200.0
@@ -71,8 +67,6 @@ CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1 = (
     "GCODE_WRITE_IDENTITY_V1"
 )
 CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1 = "JT_WRIST_CONFIG_V1"
-CONTROLLER_CAPABILITY_HOME_REFERENCE_V1 = "HOME_REFERENCE_V1"
-CONTROLLER_CAPABILITY_HOME_REFERENCE_V2 = "HOME_REFERENCE_V2"
 CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1 = "JOINT_TELEMETRY_V1"
 CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1 = "ESTOP_ADMISSION_V1"
 CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1 = (
@@ -84,29 +78,13 @@ CONTROLLER_PHYSICAL_ESTOP_FLAGS = frozenset(
     (CONTROLLER_ESTOP_ADMISSION_FLAG, CONTROLLER_ESTOP_EVENT_FLAG)
 )
 JOINT_TELEMETRY_AXIS_COUNT = 6
-JOINT_TELEMETRY_PREFIX = "TMA"
-JOINT_TELEMETRY_FAMILY_PREFIX = JOINT_TELEMETRY_PREFIX[:2]
 JOINT_TELEMETRY_PERIOD_SECONDS = 0.1
-JOINT_TELEMETRY_RESPONSE_BUDGET_MARGIN = 2
 CONTROLLER_DIRECTORY_SEPARATOR = ","
 MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES = MAX_RESPONSE_PAYLOAD_LENGTH
-MAX_CONTROLLER_IDENTITY_FIELD_LENGTH = 31
-MAX_CONTROLLER_CAPABILITY_COUNT = 32
 MAX_CONTROLLER_FILENAME_BYTES = 255
 CONTROLLER_HARDWARE_ID_LENGTH = 6
 CONTROLLER_MEDIA_ID_LENGTH = 32
 _FAT_RESERVED_FILENAME_CHARACTERS = frozenset('"*/:<>?\\|')
-_CONTROLLER_IDENTITY_FIELD_NAMES = (
-    ("DriverModel", "driver_model"),
-    ("FirmwareVersion", "firmware_version"),
-    ("RobotModel", "robot_model"),
-    ("RobotVersion", "robot_version"),
-    ("SerialNumber", "serial_number"),
-    ("AssetTag", "asset_tag"),
-)
-_CONTROLLER_IDENTITY_WIRE_FIELDS = frozenset(
-    wire_name for wire_name, _ in _CONTROLLER_IDENTITY_FIELD_NAMES
-) | {"ControllerHardwareId", "ProtocolCapabilities"}
 _SERIAL_QUARANTINE_ATTRIBUTE = "_ar4_transport_quarantine_reason"
 _SERIAL_QUARANTINE_LOCK = threading.Lock()
 _SERIAL_QUARANTINED_PORTS = {}
@@ -344,7 +322,7 @@ class LiveMotionScheduleResult(Enum):
 
 
 class SerialActivityRejected(RuntimeError):
-    """A legacy serial operation cannot start during shutdown or control injection."""
+    """A controller serial operation cannot start during shutdown or control injection."""
 
 
 class _SerialActivityLease:
@@ -370,7 +348,7 @@ class _SerialActivityLease:
 
 
 class SerialActivityRegistry:
-    """Track legacy serial ownership for shutdown and injected control writes."""
+    """Track controller serial ownership for shutdown and injected control writes."""
 
     CONTROL_INJECT = "inject"
     CONTROL_EXCLUSIVE = "exclusive"
@@ -650,7 +628,7 @@ def build_controller_modbus_command(opcode, slave_id, address, value):
     return f"{opcode}A{slave_id}B{address}C{value}\n"
 
 
-def validate_controller_modbus_command(command):
+def parse_controller_modbus_command(command):
     if not isinstance(command, str):
         raise MotionInputError("controller Modbus command must be text")
     match = _CONTROLLER_MODBUS_COMMAND_PATTERN.fullmatch(command)
@@ -664,6 +642,16 @@ def validate_controller_modbus_command(command):
     )
     if command != canonical:
         raise MotionInputError("controller Modbus command is not canonical")
+    return (
+        match.group("opcode"),
+        int(match.group("slave")),
+        int(match.group("address")),
+        int(match.group("value")),
+    )
+
+
+def validate_controller_modbus_command(command):
+    parse_controller_modbus_command(command)
     return command
 
 
@@ -748,7 +736,7 @@ class ControllerIdentity:
 
 @dataclass(frozen=True)
 class PrimaryHomeReference:
-    """Controller-reported J1-J3 parking-switch coordinates in degrees."""
+    """Controller-reported J1-J3 parking references in degrees."""
 
     valid: Tuple[bool, bool, bool]
     positions: Tuple[float, float, float]
@@ -812,92 +800,6 @@ def validate_controller_media_id(value):
             "controller media ID must be fixed-width uppercase hexadecimal"
         )
     return value
-
-
-def _unique_json_object(pairs):
-    result = {}
-    for name, value in pairs:
-        if not isinstance(name, str) or name in result:
-            raise ProtocolResponseError(
-                "controller identity response contains a duplicated or invalid field"
-            )
-        result[name] = value
-    return result
-
-
-def parse_controller_identity_response(response):
-    if (
-        not isinstance(response, str)
-        or not response
-        or len(response) > MAX_RESPONSE_PAYLOAD_LENGTH
-        or "\n" in response
-        or "\r" in response
-    ):
-        raise ProtocolResponseError("controller identity response is invalid")
-    try:
-        payload = json.loads(response, object_pairs_hook=_unique_json_object)
-    except ProtocolResponseError:
-        raise
-    except (TypeError, ValueError) as exc:
-        raise ProtocolResponseError(
-            "controller identity response is not valid JSON"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise ProtocolResponseError("controller identity response must be an object")
-    if frozenset(payload) != _CONTROLLER_IDENTITY_WIRE_FIELDS:
-        raise ProtocolResponseError(
-            "controller identity response fields do not match the protocol schema"
-        )
-
-    fields = {}
-    for wire_name, field_name in _CONTROLLER_IDENTITY_FIELD_NAMES:
-        value = payload.get(wire_name)
-        if (
-            not isinstance(value, str)
-            or not value
-            or len(value) > MAX_CONTROLLER_IDENTITY_FIELD_LENGTH
-            or not value.isascii()
-            or any(ord(character) < 32 or ord(character) == 127 for character in value)
-        ):
-            raise ProtocolResponseError(
-                f"controller identity field {wire_name} is invalid"
-            )
-        fields[field_name] = value
-
-    try:
-        controller_hardware_id = validate_controller_hardware_id(
-            payload.get("ControllerHardwareId")
-        )
-    except MotionInputError as exc:
-        raise ProtocolResponseError(
-            "controller hardware identity is invalid"
-        ) from exc
-
-    capabilities = payload.get("ProtocolCapabilities")
-    if (
-        not isinstance(capabilities, list)
-        or len(capabilities) > MAX_CONTROLLER_CAPABILITY_COUNT
-    ):
-        raise ProtocolResponseError(
-            "controller protocol capabilities must be a bounded list"
-        )
-    normalized_capabilities = []
-    for capability in capabilities:
-        if (
-            not isinstance(capability, str)
-            or re.fullmatch(r"[A-Z][A-Z0-9_]{0,30}", capability) is None
-            or capability in normalized_capabilities
-        ):
-            raise ProtocolResponseError(
-                "controller protocol capability is invalid or duplicated"
-            )
-        normalized_capabilities.append(capability)
-
-    return ControllerIdentity(
-        controller_hardware_id=controller_hardware_id,
-        **fields,
-        protocol_capabilities=tuple(normalized_capabilities),
-    )
 
 
 class SerialTransportQuarantinedError(ConnectionError):
@@ -1283,30 +1185,6 @@ class DeferredLiveMotionArbiter:
         return admitted and not stale_success
 
 
-def _serial_command_bytes(command):
-    if not isinstance(command, str) or not command.endswith("\n"):
-        raise MotionInputError("serial command must be newline-terminated text")
-    if not command[:-1] or "\n" in command[:-1] or "\r" in command:
-        raise MotionInputError("serial command must contain exactly one trailing line delimiter")
-    if len(command) > MAX_COMMAND_LENGTH:
-        raise MotionInputError("serial command exceeds the size limit")
-    try:
-        return command.encode("ascii")
-    except UnicodeEncodeError as exc:
-        raise MotionInputError("serial command must contain ASCII characters only") from exc
-
-
-def _require_open_serial_port(serial_port):
-    quarantine_reason = _serial_quarantine_reason(serial_port)
-    if quarantine_reason is not None:
-        raise SerialTransportQuarantinedError(
-            "serial connection is quarantined "
-            f"({quarantine_reason}); reconnect required"
-        )
-    if serial_port is None or not getattr(serial_port, "is_open", False):
-        raise ConnectionError("controller serial connection is not open")
-
-
 def _record_serial_quarantine(serial_port, reason):
     if serial_port is None:
         return
@@ -1406,1731 +1284,6 @@ def _raise_quarantined_transport(
     if error_cause is not None:
         raise error from error_cause
     raise error
-
-
-def _validate_write_lock(write_lock, parameter_name="write_lock"):
-    if not isinstance(parameter_name, str) or not parameter_name:
-        raise TypeError("write-lock parameter name must be non-empty text")
-    if write_lock is None:
-        return
-    if not callable(getattr(write_lock, "acquire", None)) or not callable(
-        getattr(write_lock, "release", None)
-    ):
-        raise MotionInputError(
-            f"{parameter_name} must satisfy the lock contract"
-        )
-
-
-def _write_serial_bytes(
-    serial_port,
-    command_bytes,
-    write_lock,
-    reset_input=None,
-    write_admission_check=None,
-    write_started_event=None,
-    write_boundary_lock=None,
-):
-    write = getattr(serial_port, "write", None)
-    flush = getattr(serial_port, "flush", None)
-    if not all(callable(method) for method in (write, flush)):
-        raise TypeError("serial connection does not satisfy the line-write contract")
-    if write_admission_check is not None and not callable(write_admission_check):
-        raise TypeError("serial write admission check must be callable")
-    if write_started_event is not None and not callable(
-        getattr(write_started_event, "set", None)
-    ):
-        raise TypeError("serial write-start event must satisfy the event contract")
-    _validate_write_lock(write_boundary_lock, "write_boundary_lock")
-    if write_boundary_lock is not None and write_boundary_lock is write_lock:
-        raise MotionInputError(
-            "serial write and write-boundary locks must be distinct"
-        )
-
-    acquired = False
-    if write_lock is not None:
-        acquired = write_lock.acquire()
-        if acquired is False:
-            raise RuntimeError("serial write lock acquisition failed")
-    try:
-        if write_admission_check is not None:
-            write_admission_check()
-        if reset_input is not None:
-            reset_input()
-        boundary_acquired = False
-        if write_boundary_lock is not None:
-            boundary_acquired = write_boundary_lock.acquire()
-            if boundary_acquired is False:
-                raise RuntimeError("serial write-boundary lock acquisition failed")
-        try:
-            if write_admission_check is not None:
-                write_admission_check()
-            if write_started_event is not None:
-                write_started_event.set()
-        finally:
-            if write_boundary_lock is not None and boundary_acquired is not False:
-                write_boundary_lock.release()
-        written = write(command_bytes)
-        if written != len(command_bytes):
-            raise OSError(
-                "serial write was incomplete: "
-                f"expected {len(command_bytes)} bytes, wrote {written!r}"
-            )
-        flush()
-    finally:
-        if write_lock is not None and acquired is not False:
-            write_lock.release()
-
-
-def _set_serial_timeout(serial_port, timeout):
-    try:
-        serial_port.timeout = timeout
-    except Exception as exc:
-        raise TypeError("serial connection does not support timeout updates") from exc
-
-
-def _raise_quarantined_timeout(serial_port, timeout, stop_error=None):
-    details = [f"no controller response within {timeout:g} seconds"]
-    if stop_error is not None:
-        details.append(f"fail-safe stop write failed: {stop_error}")
-    _raise_quarantined_transport(
-        serial_port,
-        "; ".join(details),
-        cause=stop_error,
-        error_type=SerialTransportTimeout,
-    )
-
-
-def write_serial_control(
-    serial_port,
-    command,
-    write_lock=None,
-    reset_input=False,
-    write_started_event=None,
-    cancellation_event=None,
-    write_boundary_lock=None,
-):
-    """Write a serialized command without consuming the pending response.
-
-    The optional cancellation lock orders the final admission check against
-    write commitment. Cancellation after commitment remains the caller's
-    response-ownership responsibility.
-    """
-    command_bytes = _serial_command_bytes(command)
-    _require_open_serial_port(serial_port)
-    _validate_write_lock(write_lock)
-    if not isinstance(reset_input, bool):
-        raise MotionInputError("reset_input must be boolean")
-    reset = None
-    if reset_input:
-        reset = getattr(serial_port, "reset_input_buffer", None)
-        if not callable(reset):
-            reset = getattr(serial_port, "flushInput", None)
-        if not callable(reset):
-            raise TypeError("serial connection does not support input-buffer reset")
-    if cancellation_event is None:
-        if write_boundary_lock is not None:
-            raise MotionInputError(
-                "write_boundary_lock requires a cancellation_event"
-            )
-        write_admission_check = None
-    else:
-        if not callable(getattr(cancellation_event, "is_set", None)):
-            raise MotionInputError(
-                "cancellation_event must satisfy the event contract"
-            )
-        if write_started_event is None or write_boundary_lock is None:
-            raise MotionInputError(
-                "cancellation_event requires write_started_event and "
-                "write_boundary_lock"
-            )
-
-        def write_admission_check():
-            try:
-                cancelled = cancellation_event.is_set()
-            except Exception as exc:
-                raise MotionInputError(
-                    "cancellation_event could not be read before transmission"
-                ) from exc
-            if not isinstance(cancelled, bool):
-                raise MotionInputError(
-                    "cancellation_event.is_set() must return a boolean"
-                )
-            if cancelled:
-                raise SerialActivityRejected(
-                    "serial control write cancelled before transmission"
-                )
-
-    try:
-        _write_serial_bytes(
-            serial_port,
-            command_bytes,
-            write_lock,
-            reset_input=reset,
-            write_admission_check=write_admission_check,
-            write_started_event=write_started_event,
-            write_boundary_lock=write_boundary_lock,
-        )
-    except SerialActivityRejected:
-        raise
-    except Exception as exc:
-        _raise_quarantined_transport(
-            serial_port,
-            f"serial control write ended without trusted framing: {exc}",
-            cause=exc,
-        )
-    return True
-
-
-def _validated_response_set(accepted_responses):
-    if accepted_responses is None:
-        return None
-    if isinstance(accepted_responses, (str, bytes)):
-        raise MotionInputError("accepted_responses must be a sequence of text")
-    try:
-        responses = tuple(accepted_responses)
-    except TypeError as exc:
-        raise MotionInputError(
-            "accepted_responses must be a sequence of text"
-        ) from exc
-    if not responses:
-        raise MotionInputError("accepted_responses must not be empty")
-    if any(
-        not isinstance(response, str)
-        or not response
-        or response != response.strip()
-        or "\r" in response
-        or "\n" in response
-        or not response.isascii()
-        or len(response) > MAX_RESPONSE_PAYLOAD_LENGTH
-        for response in responses
-    ):
-        raise MotionInputError(
-            "accepted_responses must contain normalized non-empty ASCII text"
-        )
-    if len(set(responses)) != len(responses):
-        raise MotionInputError("accepted_responses must not contain duplicates")
-    return frozenset(responses)
-
-
-def decode_serial_response_line(response_bytes, allow_empty=False):
-    """Decode exactly one ASCII line without normalizing payload bytes."""
-    if not isinstance(allow_empty, bool):
-        raise MotionInputError("allow_empty must be boolean")
-    if not isinstance(response_bytes, (bytes, bytearray)):
-        raise ProtocolResponseError("serial line reader returned a non-bytes response")
-    framed = bytes(response_bytes)
-    if not framed.endswith(b"\n"):
-        raise ProtocolResponseError("controller response is missing the line delimiter")
-    if len(framed) > MAX_RESPONSE_FRAME_LENGTH:
-        raise ProtocolResponseError("controller response exceeds the size limit")
-    payload = framed[:-1]
-    if payload.endswith(b"\r"):
-        payload = payload[:-1]
-    if len(payload) > MAX_RESPONSE_PAYLOAD_LENGTH:
-        raise ProtocolResponseError("controller response payload exceeds the size limit")
-    if b"\r" in payload or b"\n" in payload:
-        raise ProtocolResponseError("controller response contains extra line delimiters")
-    try:
-        response = payload.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise ProtocolResponseError(
-            "controller response is not valid ASCII"
-        ) from exc
-    if response != response.strip():
-        raise ProtocolResponseError(
-            "controller response contains leading or trailing payload whitespace"
-        )
-    if not response and not allow_empty:
-        raise ProtocolResponseError("controller returned a blank response line")
-    return response
-
-
-def _read_serial_quiet_boundary(serial_port, read, timeout, context):
-    quiet_timeout = finite_number(timeout, "serial quiet-boundary timeout")
-    if quiet_timeout < CONTROL_POLL_INTERVAL_SECONDS:
-        _raise_quarantined_transport(
-            serial_port,
-            f"{context} quiet-boundary deadline expired",
-            error_type=SerialTransportTimeout,
-        )
-    _set_serial_timeout(serial_port, CONTROL_POLL_INTERVAL_SECONDS)
-    trailing = read(1)
-    if not isinstance(trailing, (bytes, bytearray)):
-        raise ProtocolResponseError(
-            f"{context} quiet-boundary reader returned a non-bytes response"
-        )
-    if trailing:
-        raise ProtocolResponseError(f"{context} returned queued trailing data")
-    if not getattr(serial_port, "is_open", False):
-        raise ConnectionError(f"{context} connection closed during the quiet boundary")
-
-
-def _read_serial_framed_line(
-    serial_port,
-    readline,
-    read_until,
-    deadline,
-    timeout,
-    initial_bytes=b"",
-    allow_empty_terminal_response=False,
-):
-    response_buffer = bytearray(initial_bytes)
-    while True:
-        if len(response_buffer) > MAX_RESPONSE_FRAME_LENGTH:
-            raise ProtocolResponseError("controller response exceeds the size limit")
-        newline_index = response_buffer.find(b"\n")
-        if newline_index >= 0:
-            if newline_index != len(response_buffer) - 1:
-                raise ProtocolResponseError(
-                    "controller returned trailing framed data"
-                )
-            return decode_serial_response_line(
-                response_buffer,
-                allow_empty=allow_empty_terminal_response,
-            )
-
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _raise_quarantined_timeout(serial_port, timeout)
-        _set_serial_timeout(serial_port, remaining)
-        remaining_size = MAX_RESPONSE_FRAME_LENGTH + 1 - len(response_buffer)
-        if callable(read_until):
-            response_bytes = read_until(b"\n", remaining_size)
-        else:
-            response_bytes = readline()
-        if not isinstance(response_bytes, (bytes, bytearray)):
-            raise ProtocolResponseError(
-                "serial line reader returned a non-bytes response"
-            )
-        if not response_bytes:
-            _raise_quarantined_timeout(serial_port, timeout)
-        response_buffer.extend(response_bytes)
-
-
-def read_serial_line_response(
-    serial_port,
-    timeout,
-    accepted_responses=None,
-    response_deadline=None,
-    allow_empty_terminal_response=False,
-):
-    """Read one bounded response line without taking command-write ownership.
-
-    An absolute monotonic deadline can shorten but cannot extend the timeout.
-    An explicitly admitted blank payload must be the command's terminal
-    response before the required quiet boundary; non-terminal acknowledgements
-    require a continuing response owner. Dynamic terminal responses must be
-    validated by the caller before higher-level transport ownership is released.
-    Empty terminal admission cannot be combined with accepted_responses.
-    """
-    if not isinstance(allow_empty_terminal_response, bool):
-        raise MotionInputError(
-            "allow_empty_terminal_response must be boolean"
-        )
-    if allow_empty_terminal_response and accepted_responses is not None:
-        raise MotionInputError(
-            "allow_empty_terminal_response cannot be combined with "
-            "accepted_responses"
-        )
-    timeout = finite_number(timeout, "serial response timeout")
-    if timeout <= 0:
-        raise MotionInputError("serial response timeout must be positive")
-    now = time.monotonic()
-    if response_deadline is None:
-        deadline = now + timeout
-    else:
-        deadline = finite_number(response_deadline, "serial response deadline")
-        if deadline > now + timeout:
-            raise MotionInputError(
-                "serial response deadline exceeds its timeout window"
-            )
-    accepted = _validated_response_set(accepted_responses)
-    _require_open_serial_port(serial_port)
-
-    readline = getattr(serial_port, "readline", None)
-    read_until = getattr(serial_port, "read_until", None)
-    read = getattr(serial_port, "read", None)
-    if not (callable(read_until) or callable(readline)) or not callable(read):
-        raise TypeError("serial connection does not satisfy the line-read contract")
-    try:
-        original_timeout = serial_port.timeout
-    except Exception as exc:
-        raise TypeError("serial connection does not expose a read timeout") from exc
-
-    operation_error = None
-    try:
-        response = _read_serial_framed_line(
-            serial_port,
-            readline,
-            read_until,
-            deadline,
-            timeout,
-            allow_empty_terminal_response=allow_empty_terminal_response,
-        )
-        if accepted is not None and response not in accepted:
-            raise ProtocolResponseError(
-                f"controller returned an unexpected response: {response!r}"
-            )
-        _read_serial_quiet_boundary(
-            serial_port,
-            read,
-            deadline - time.monotonic(),
-            "controller response",
-        )
-        return response
-    except (SerialTransportQuarantinedError, SerialTransportTimeout) as exc:
-        operation_error = exc
-        raise
-    except Exception as exc:
-        operation_error = exc
-        _raise_quarantined_transport(
-            serial_port,
-            f"serial response read ended without trusted framing: {exc}",
-            cause=exc,
-        )
-    finally:
-        try:
-            _set_serial_timeout(serial_port, original_timeout)
-        except Exception as exc:
-            reason = "unable to restore the serial read timeout"
-            if operation_error is not None:
-                reason = f"{operation_error}; {reason}"
-            _raise_quarantined_transport(
-                serial_port,
-                reason,
-                cause=exc,
-            )
-
-
-def read_serial_line_response_with_optional_followup(
-    serial_port,
-    timeout,
-    accepted_responses,
-    followup_after_responses,
-    accepted_followup_responses,
-    control_event=None,
-    control_response_timeout_seconds=None,
-    control_response_deadline_provider=None,
-):
-    """Read a primary line and an authorized follow-up under one owner.
-
-    A control deadline provider supplies an existing absolute monotonic deadline.
-    The supplied deadline can shorten but cannot extend the configured window.
-    """
-    timeout = finite_number(timeout, "serial response timeout")
-    if timeout <= 0:
-        raise MotionInputError("serial response timeout must be positive")
-    accepted = _validated_response_set(accepted_responses)
-    followup_after = _validated_response_set(followup_after_responses)
-    accepted_followups = _validated_response_set(accepted_followup_responses)
-    if accepted is None or followup_after is None or accepted_followups is None:
-        raise MotionInputError(
-            "optional follow-up response contracts must contain response sets"
-        )
-    if not followup_after.issubset(accepted):
-        raise MotionInputError(
-            "followup_after_responses must be a subset of accepted_responses"
-        )
-    if control_event is None:
-        if control_response_timeout_seconds is not None:
-            raise MotionInputError(
-                "control response timeout requires a control_event"
-            )
-        if control_response_deadline_provider is not None:
-            raise MotionInputError(
-                "control response deadline provider requires a control_event"
-            )
-        control_response_timeout = None
-    else:
-        if not callable(getattr(control_event, "is_set", None)):
-            raise MotionInputError("control_event must satisfy the event contract")
-        if control_response_timeout_seconds is None:
-            raise MotionInputError(
-                "control_event requires a control_response_timeout_seconds"
-            )
-        control_response_timeout = finite_number(
-            control_response_timeout_seconds,
-            "control_response_timeout_seconds",
-        )
-        if control_response_timeout <= 0:
-            raise MotionInputError(
-                "control_response_timeout_seconds must be positive"
-            )
-        if control_response_deadline_provider is not None and not callable(
-            control_response_deadline_provider
-        ):
-            raise MotionInputError(
-                "control_response_deadline_provider must be callable"
-            )
-    _require_open_serial_port(serial_port)
-
-    readline = getattr(serial_port, "readline", None)
-    read_until = getattr(serial_port, "read_until", None)
-    read = getattr(serial_port, "read", None)
-    if not (callable(read_until) or callable(readline)) or not callable(read):
-        raise TypeError("serial connection does not satisfy the line-read contract")
-    try:
-        original_timeout = serial_port.timeout
-    except Exception as exc:
-        raise TypeError("serial connection does not expose a read timeout") from exc
-
-    operation_error = None
-    try:
-        deadline = time.monotonic() + timeout
-        control_deadline = None
-
-        def active_deadline():
-            nonlocal control_deadline
-            if control_event is not None:
-                try:
-                    control_requested = control_event.is_set()
-                except Exception as exc:
-                    raise ProtocolResponseError(
-                        f"control_event could not be read: {exc}"
-                    ) from exc
-                if not isinstance(control_requested, bool):
-                    raise ProtocolResponseError(
-                        "control_event.is_set() must return a boolean"
-                    )
-                if control_requested and control_deadline is None:
-                    now = time.monotonic()
-                    if control_response_deadline_provider is None:
-                        control_deadline = now + control_response_timeout
-                    else:
-                        control_deadline = finite_number(
-                            control_response_deadline_provider(),
-                            "control response deadline",
-                        )
-                        if control_deadline > now + control_response_timeout:
-                            raise ProtocolResponseError(
-                                "control response deadline exceeds its timeout window"
-                            )
-            if control_deadline is not None:
-                if control_response_deadline_provider is not None:
-                    return control_deadline, control_response_timeout
-                if control_deadline < deadline:
-                    return control_deadline, control_response_timeout
-            return deadline, timeout
-
-        def read_controlled_line(initial_bytes=b""):
-            response_buffer = bytearray(initial_bytes)
-            while True:
-                if len(response_buffer) > MAX_RESPONSE_FRAME_LENGTH:
-                    raise ProtocolResponseError(
-                        "controller response exceeds the size limit"
-                    )
-                newline_index = response_buffer.find(b"\n")
-                if newline_index >= 0:
-                    if newline_index != len(response_buffer) - 1:
-                        raise ProtocolResponseError(
-                            "controller returned trailing framed data"
-                        )
-                    return decode_serial_response_line(response_buffer)
-
-                current_deadline, current_timeout = active_deadline()
-                remaining = current_deadline - time.monotonic()
-                if remaining <= 0:
-                    _raise_quarantined_timeout(serial_port, current_timeout)
-                _set_serial_timeout(
-                    serial_port,
-                    min(CONTROL_POLL_INTERVAL_SECONDS, remaining),
-                )
-                remaining_size = MAX_RESPONSE_FRAME_LENGTH + 1 - len(response_buffer)
-                if callable(read_until):
-                    response_bytes = read_until(b"\n", remaining_size)
-                else:
-                    response_bytes = readline()
-                if not isinstance(response_bytes, (bytes, bytearray)):
-                    raise ProtocolResponseError(
-                        "serial line reader returned a non-bytes response"
-                    )
-                if not response_bytes:
-                    if not getattr(serial_port, "is_open", False):
-                        raise ConnectionError(
-                            "serial connection closed before a terminal response"
-                        )
-                    continue
-                response_buffer.extend(response_bytes)
-
-        if control_event is None:
-            response = _read_serial_framed_line(
-                serial_port,
-                readline,
-                read_until,
-                deadline,
-                timeout,
-            )
-        else:
-            response = read_controlled_line()
-        if response not in accepted:
-            raise ProtocolResponseError(
-                f"controller returned an unexpected response: {response!r}"
-            )
-
-        current_deadline, current_timeout = active_deadline()
-        remaining = current_deadline - time.monotonic()
-        if remaining < CONTROL_POLL_INTERVAL_SECONDS:
-            _raise_quarantined_transport(
-                serial_port,
-                "controller response follow-up probe deadline expired",
-                error_type=SerialTransportTimeout,
-            )
-        _set_serial_timeout(
-            serial_port,
-            CONTROL_POLL_INTERVAL_SECONDS,
-        )
-        leading = read(1)
-        if not isinstance(leading, (bytes, bytearray)):
-            raise ProtocolResponseError(
-                "controller follow-up probe returned a non-bytes response"
-            )
-        if not leading:
-            if not getattr(serial_port, "is_open", False):
-                raise ConnectionError(
-                    "controller response connection closed during the quiet boundary"
-                )
-            return response, None
-        if response not in followup_after:
-            raise ProtocolResponseError(
-                "controller returned a follow-up after an ineligible response"
-            )
-
-        if control_event is None:
-            followup = _read_serial_framed_line(
-                serial_port,
-                readline,
-                read_until,
-                deadline,
-                timeout,
-                initial_bytes=leading,
-            )
-        else:
-            followup = read_controlled_line(initial_bytes=leading)
-        if followup not in accepted_followups:
-            raise ProtocolResponseError(
-                f"controller returned an unexpected follow-up response: {followup!r}"
-            )
-        current_deadline, _ = active_deadline()
-        _read_serial_quiet_boundary(
-            serial_port,
-            read,
-            current_deadline - time.monotonic(),
-            "controller follow-up response",
-        )
-        return response, followup
-    except (SerialTransportQuarantinedError, SerialTransportTimeout) as exc:
-        operation_error = exc
-        raise
-    except Exception as exc:
-        operation_error = exc
-        _raise_quarantined_transport(
-            serial_port,
-            f"serial response read ended without trusted framing: {exc}",
-            cause=exc,
-        )
-    finally:
-        try:
-            _set_serial_timeout(serial_port, original_timeout)
-        except Exception as exc:
-            reason = "unable to restore the serial read timeout"
-            if operation_error is not None:
-                reason = f"{operation_error}; {reason}"
-            _raise_quarantined_transport(
-                serial_port,
-                reason,
-                cause=exc,
-            )
-
-
-def read_serial_exact_response(serial_port, expected_response, timeout):
-    """Read exact unframed bytes followed by a bounded quiet boundary."""
-    if (
-        not isinstance(expected_response, bytes)
-        or not expected_response
-        or len(expected_response) > MAX_RESPONSE_PAYLOAD_LENGTH
-        or expected_response != expected_response.strip()
-        or b"\r" in expected_response
-        or b"\n" in expected_response
-    ):
-        raise MotionInputError(
-            "expected_response must contain normalized, non-empty unframed bytes"
-        )
-    try:
-        expected_response.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise MotionInputError(
-            "expected_response must contain ASCII bytes only"
-        ) from exc
-    timeout = finite_number(timeout, "serial response timeout")
-    if timeout <= 0:
-        raise MotionInputError("serial response timeout must be positive")
-    _require_open_serial_port(serial_port)
-    read = getattr(serial_port, "read", None)
-    if not callable(read):
-        raise TypeError("serial connection does not satisfy the exact-read contract")
-    try:
-        original_timeout = serial_port.timeout
-    except Exception as exc:
-        raise TypeError("serial connection does not expose a read timeout") from exc
-
-    response = bytearray()
-    operation_error = None
-    try:
-        deadline = time.monotonic() + timeout
-        while len(response) < len(expected_response):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _raise_quarantined_timeout(serial_port, timeout)
-            _set_serial_timeout(serial_port, remaining)
-            response_bytes = read(len(expected_response) - len(response))
-            if not isinstance(response_bytes, (bytes, bytearray)):
-                raise ProtocolResponseError(
-                    "serial exact reader returned a non-bytes response"
-                )
-            if not response_bytes:
-                _raise_quarantined_timeout(serial_port, timeout)
-            response.extend(response_bytes)
-        if bytes(response) != expected_response:
-            raise ProtocolResponseError(
-                "controller returned an unexpected unframed response"
-            )
-        remaining = deadline - time.monotonic()
-        if remaining < CONTROL_POLL_INTERVAL_SECONDS:
-            _raise_quarantined_transport(
-                serial_port,
-                "serial exact response quiet-boundary deadline expired",
-                error_type=SerialTransportTimeout,
-            )
-        _set_serial_timeout(serial_port, CONTROL_POLL_INTERVAL_SECONDS)
-        trailing = read(1)
-        if not isinstance(trailing, (bytes, bytearray)):
-            raise ProtocolResponseError(
-                "serial exact reader returned a non-bytes quiet-boundary response"
-            )
-        if trailing:
-            raise ProtocolResponseError(
-                "controller returned trailing unframed response data"
-            )
-        if not getattr(serial_port, "is_open", False):
-            raise ConnectionError(
-                "serial connection closed before the quiet boundary completed"
-            )
-        return expected_response.decode("ascii")
-    except (SerialTransportQuarantinedError, SerialTransportTimeout) as exc:
-        operation_error = exc
-        raise
-    except Exception as exc:
-        operation_error = exc
-        _raise_quarantined_transport(
-            serial_port,
-            f"serial exact read ended without trusted framing: {exc}",
-            cause=exc,
-        )
-    finally:
-        try:
-            _set_serial_timeout(serial_port, original_timeout)
-        except Exception as exc:
-            reason = "unable to restore the serial read timeout"
-            if operation_error is not None:
-                reason = f"{operation_error}; {reason}"
-            _raise_quarantined_transport(
-                serial_port,
-                reason,
-                cause=exc,
-            )
-
-
-def exchange_serial_line_until_cancelled(
-    serial_port,
-    command,
-    cancellation_event,
-    write_lock=None,
-    poll_interval_seconds=CONTROL_POLL_INTERVAL_SECONDS,
-    write_started_event=None,
-    write_boundary_lock=None,
-    write_cancellation_event=None,
-    reset_input=True,
-    estop_callback=None,
-):
-    """Own a framed exchange until terminal data or explicit cancellation.
-
-    A write-commitment event is set after admission and reset checks while the
-    optional boundary lock remains held. Callers requiring latched post-commit
-    ownership must provide cancellation semantics that observe that event.
-    """
-    if not callable(getattr(cancellation_event, "is_set", None)):
-        raise MotionInputError("cancellation_event must satisfy the event contract")
-    try:
-        cancelled = cancellation_event.is_set()
-    except Exception as exc:
-        raise MotionInputError("cancellation_event could not be read") from exc
-    if not isinstance(cancelled, bool):
-        raise MotionInputError("cancellation_event.is_set() must return a boolean")
-    if cancelled:
-        raise SerialActivityRejected("serial exchange cancelled before transmission")
-    if write_cancellation_event is not None:
-        if not callable(getattr(write_cancellation_event, "is_set", None)):
-            raise MotionInputError(
-                "write_cancellation_event must satisfy the event contract"
-            )
-        try:
-            write_cancelled = write_cancellation_event.is_set()
-        except Exception as exc:
-            raise MotionInputError(
-                "write_cancellation_event could not be read"
-            ) from exc
-        if not isinstance(write_cancelled, bool):
-            raise MotionInputError(
-                "write_cancellation_event.is_set() must return a boolean"
-            )
-        if write_cancelled:
-            raise SerialActivityRejected(
-                "serial exchange cancelled before transmission"
-            )
-        if write_started_event is None or write_boundary_lock is None:
-            raise MotionInputError(
-                "write_cancellation_event requires write_started_event and "
-                "write_boundary_lock"
-            )
-    poll_interval = finite_number(
-        poll_interval_seconds,
-        "poll_interval_seconds",
-    )
-    if poll_interval <= 0:
-        raise MotionInputError("poll_interval_seconds must be positive")
-    if not isinstance(reset_input, bool):
-        raise MotionInputError("reset_input must be boolean")
-    if estop_callback is not None and not callable(estop_callback):
-        raise MotionInputError(
-            "serial exchange E-stop callback must be callable or None"
-        )
-    command_bytes = _serial_command_bytes(command)
-    _require_open_serial_port(serial_port)
-    _validate_write_lock(write_lock)
-    _validate_write_lock(write_boundary_lock, "write_boundary_lock")
-    try:
-        original_timeout = serial_port.timeout
-    except Exception as exc:
-        raise TypeError("serial connection does not expose a read timeout") from exc
-
-    reset_input_method = None
-    if reset_input:
-        reset_input_method = getattr(
-            serial_port,
-            "reset_input_buffer",
-            None,
-        )
-        if not callable(reset_input_method):
-            reset_input_method = getattr(serial_port, "flushInput", None)
-        if not callable(reset_input_method):
-            raise TypeError(
-                "serial connection does not support input-buffer reset"
-            )
-    readline = getattr(serial_port, "readline", None)
-    read_until = getattr(serial_port, "read_until", None)
-    read = getattr(serial_port, "read", None)
-    if not (callable(read_until) or callable(readline)) or not callable(read):
-        raise TypeError("serial connection does not satisfy the line-exchange contract")
-
-    response = bytearray()
-    operation_error = None
-    transmitted = False
-
-    def require_write_admission():
-        try:
-            write_cancelled = cancellation_event.is_set()
-        except Exception as exc:
-            raise MotionInputError(
-                "cancellation_event could not be read before transmission"
-            ) from exc
-        if not isinstance(write_cancelled, bool):
-            raise MotionInputError(
-                "cancellation_event.is_set() must return a boolean"
-            )
-        if write_cancelled:
-            raise SerialActivityRejected(
-                "serial exchange cancelled before transmission"
-            )
-        if write_cancellation_event is not None:
-            try:
-                write_cancelled = write_cancellation_event.is_set()
-            except Exception as exc:
-                raise MotionInputError(
-                    "write_cancellation_event could not be read before "
-                    "transmission"
-                ) from exc
-            if not isinstance(write_cancelled, bool):
-                raise MotionInputError(
-                    "write_cancellation_event.is_set() must return a boolean"
-                )
-            if write_cancelled:
-                raise SerialActivityRejected(
-                    "serial exchange cancelled before transmission"
-                )
-
-    def read_followup_frame(initial_bytes=b""):
-        frame = bytearray(initial_bytes)
-        while True:
-            try:
-                cancelled = cancellation_event.is_set()
-            except Exception as exc:
-                raise ProtocolResponseError(
-                    f"cancellation_event could not be read: {exc}"
-                ) from exc
-            if not isinstance(cancelled, bool):
-                raise ProtocolResponseError(
-                    "cancellation_event.is_set() must return a boolean"
-                )
-            if cancelled:
-                _raise_quarantined_transport(
-                    serial_port,
-                    "serial exchange cancelled before a terminal response",
-                )
-            if len(frame) > MAX_RESPONSE_FRAME_LENGTH:
-                raise ProtocolResponseError(
-                    "controller response exceeds the size limit"
-                )
-            newline_index = frame.find(b"\n")
-            if newline_index >= 0:
-                if newline_index != len(frame) - 1:
-                    raise ProtocolResponseError(
-                        "controller returned trailing framed data"
-                    )
-                return decode_serial_response_line(frame)
-
-            _set_serial_timeout(serial_port, poll_interval)
-            remaining_size = MAX_RESPONSE_FRAME_LENGTH + 1 - len(frame)
-            if callable(read_until):
-                response_bytes = read_until(b"\n", remaining_size)
-            else:
-                response_bytes = readline()
-            if not isinstance(response_bytes, (bytes, bytearray)):
-                raise ProtocolResponseError(
-                    "serial line reader returned a non-bytes response"
-                )
-            if not response_bytes:
-                if not getattr(serial_port, "is_open", False):
-                    raise ConnectionError(
-                        "serial connection closed before a terminal response"
-                    )
-                continue
-            frame.extend(response_bytes)
-
-    try:
-        _write_serial_bytes(
-            serial_port,
-            command_bytes,
-            write_lock,
-            reset_input=reset_input_method,
-            write_admission_check=require_write_admission,
-            write_started_event=write_started_event,
-            write_boundary_lock=write_boundary_lock,
-        )
-        transmitted = True
-        while True:
-            try:
-                cancelled = cancellation_event.is_set()
-            except Exception as exc:
-                raise ProtocolResponseError(
-                    f"cancellation_event could not be read: {exc}"
-                ) from exc
-            if not isinstance(cancelled, bool):
-                raise ProtocolResponseError(
-                    "cancellation_event.is_set() must return a boolean"
-                )
-            if cancelled:
-                _raise_quarantined_transport(
-                    serial_port,
-                    "serial exchange cancelled before a terminal response",
-                )
-
-            _set_serial_timeout(serial_port, poll_interval)
-            remaining_size = MAX_RESPONSE_FRAME_LENGTH + 1 - len(response)
-            if callable(read_until):
-                response_bytes = read_until(b"\n", remaining_size)
-            else:
-                response_bytes = readline()
-            if not isinstance(response_bytes, (bytes, bytearray)):
-                raise ProtocolResponseError(
-                    "serial line reader returned a non-bytes response"
-                )
-            if not response_bytes:
-                if not getattr(serial_port, "is_open", False):
-                    raise ConnectionError(
-                        "serial connection closed before a terminal response"
-                    )
-                continue
-            response.extend(response_bytes)
-            if len(response) > MAX_RESPONSE_FRAME_LENGTH:
-                raise ProtocolResponseError("controller response exceeds the size limit")
-            newline_index = response.find(b"\n")
-            if newline_index < 0:
-                continue
-            if newline_index != len(response) - 1:
-                raise ProtocolResponseError(
-                    "controller returned trailing framed data"
-                )
-            decoded = decode_serial_response_line(response)
-            if estop_callback is not None:
-                response_kind, response_position = (
-                    _parse_controller_line_exchange_frame(decoded)
-                )
-                if response_kind != "terminal":
-                    try:
-                        published = estop_callback(response_position)
-                    except Exception as exc:
-                        raise ProtocolResponseError(
-                            "serial exchange E-stop publication failed: "
-                            f"{exc}"
-                        ) from exc
-                    if published is not True:
-                        raise ProtocolResponseError(
-                            "serial exchange E-stop callback did not confirm "
-                            "publication"
-                        )
-                    if response_kind == "estop-admission":
-                        _read_serial_quiet_boundary(
-                            serial_port,
-                            read,
-                            max(
-                                poll_interval,
-                                CONTROL_POLL_INTERVAL_SECONDS,
-                            ),
-                            "controller response",
-                        )
-                        return decoded
-                    second = read_followup_frame()
-                    second_kind, _ = (
-                        _parse_controller_line_exchange_frame(second)
-                    )
-                    if second_kind == "estop-event":
-                        raise ProtocolResponseError(
-                            "controller returned duplicate physical-stop events"
-                        )
-                    exchange_response = (
-                        parse_controller_line_exchange_frames(
-                            (decoded, second)
-                        )
-                    )
-                    _read_serial_quiet_boundary(
-                        serial_port,
-                        read,
-                        max(
-                            poll_interval,
-                            CONTROL_POLL_INTERVAL_SECONDS,
-                        ),
-                        "controller response",
-                    )
-                    return exchange_response.authoritative_response
-
-                _set_serial_timeout(
-                    serial_port,
-                    max(
-                        poll_interval,
-                        CONTROL_POLL_INTERVAL_SECONDS,
-                    ),
-                )
-                leading = read(1)
-                if not isinstance(leading, (bytes, bytearray)):
-                    raise ProtocolResponseError(
-                        "controller response follow-up probe returned "
-                        "non-bytes data"
-                    )
-                if not leading:
-                    if not getattr(serial_port, "is_open", False):
-                        raise ConnectionError(
-                            "serial connection closed during the controller "
-                            "response quiet boundary"
-                        )
-                    return decoded
-                second = read_followup_frame(initial_bytes=leading)
-                second_kind, second_position = (
-                    _parse_controller_line_exchange_frame(second)
-                )
-                if second_kind != "estop-event":
-                    raise ProtocolResponseError(
-                        "controller returned an invalid post-terminal frame"
-                    )
-                try:
-                    published = estop_callback(second_position)
-                except Exception as exc:
-                    raise ProtocolResponseError(
-                        "serial exchange E-stop publication failed: "
-                        f"{exc}"
-                    ) from exc
-                if published is not True:
-                    raise ProtocolResponseError(
-                        "serial exchange E-stop callback did not confirm "
-                        "publication"
-                    )
-                exchange_response = parse_controller_line_exchange_frames(
-                    (decoded, second)
-                )
-                _read_serial_quiet_boundary(
-                    serial_port,
-                    read,
-                    max(
-                        poll_interval,
-                        CONTROL_POLL_INTERVAL_SECONDS,
-                    ),
-                    "controller response",
-                )
-                return exchange_response.authoritative_response
-            _read_serial_quiet_boundary(
-                serial_port,
-                read,
-                max(poll_interval, CONTROL_POLL_INTERVAL_SECONDS),
-                "controller response",
-            )
-            return decoded
-    except (SerialTransportQuarantinedError, SerialTransportTimeout) as exc:
-        operation_error = exc
-        raise
-    except (MotionInputError, SerialActivityRejected) as exc:
-        operation_error = exc
-        if not transmitted:
-            raise
-        _raise_quarantined_transport(
-            serial_port,
-            f"serial exchange ended without a trusted response: {exc}",
-            cause=exc,
-        )
-    except Exception as exc:
-        operation_error = exc
-        _raise_quarantined_transport(
-            serial_port,
-            f"serial exchange ended without a trusted response: {exc}",
-            cause=exc,
-        )
-    finally:
-        try:
-            _set_serial_timeout(serial_port, original_timeout)
-        except Exception as exc:
-            reason = "unable to restore the serial read timeout"
-            if operation_error is not None:
-                reason = f"{operation_error}; {reason}"
-            _raise_quarantined_transport(
-                serial_port,
-                reason,
-                cause=exc,
-            )
-
-
-def exchange_serial_line(
-    serial_port,
-    command,
-    response_timeout_seconds,
-    write_lock=None,
-    control_event=None,
-    control_command=None,
-    control_ack_timeout_seconds=None,
-    control_response_timeout_seconds=None,
-    write_started_event=None,
-    cancellation_event=None,
-    write_boundary_lock=None,
-    reset_input=True,
-    interim_response_handler=None,
-    interim_response_limit=None,
-    estop_callback=None,
-):
-    """Perform a validated newline-delimited exchange on a serial-like object.
-
-    A write-start event is set after admission and any requested input reset,
-    immediately before the initial serial write call.
-    """
-    timeout = finite_number(response_timeout_seconds, "response_timeout_seconds")
-    if timeout <= 0:
-        raise MotionInputError("response_timeout_seconds must be positive")
-    if not isinstance(reset_input, bool):
-        raise MotionInputError("reset_input must be boolean")
-    if estop_callback is not None and not callable(estop_callback):
-        raise MotionInputError(
-            "serial exchange E-stop callback must be callable or None"
-        )
-    if interim_response_handler is not None and not callable(
-        interim_response_handler
-    ):
-        raise MotionInputError(
-            "interim_response_handler must be callable or None"
-        )
-    if interim_response_handler is None:
-        if interim_response_limit is not None:
-            raise MotionInputError(
-                "interim_response_limit requires an interim_response_handler"
-            )
-    elif (
-        isinstance(interim_response_limit, bool)
-        or not isinstance(interim_response_limit, int)
-        or interim_response_limit <= 0
-    ):
-        raise MotionInputError(
-            "interim_response_limit must be a positive integer"
-        )
-    command_bytes = _serial_command_bytes(command)
-    _require_open_serial_port(serial_port)
-    _validate_write_lock(write_lock)
-    _validate_write_lock(write_boundary_lock, "write_boundary_lock")
-    if cancellation_event is None:
-        if write_boundary_lock is not None:
-            raise MotionInputError(
-                "write_boundary_lock requires a cancellation_event"
-            )
-    else:
-        if not callable(getattr(cancellation_event, "is_set", None)):
-            raise MotionInputError(
-                "cancellation_event must satisfy the event contract"
-            )
-        if write_started_event is None or write_boundary_lock is None:
-            raise MotionInputError(
-                "cancellation_event requires write_started_event and "
-                "write_boundary_lock"
-            )
-
-    if control_event is None:
-        if (
-            control_command is not None
-            or control_ack_timeout_seconds is not None
-            or control_response_timeout_seconds is not None
-        ):
-            raise MotionInputError(
-                "control command and timeouts require a control_event"
-            )
-        control_bytes = None
-        control_ack_timeout = None
-        control_response_timeout = None
-    else:
-        if interim_response_handler is not None:
-            raise MotionInputError(
-                "interim responses are unsupported during live control"
-            )
-        if not callable(getattr(control_event, "is_set", None)):
-            raise MotionInputError("control_event must satisfy the event contract")
-        if control_command is None:
-            raise MotionInputError("control_event requires a control_command")
-        if control_ack_timeout_seconds is None:
-            raise MotionInputError(
-                "control_event requires a control_ack_timeout_seconds"
-            )
-        if control_response_timeout_seconds is None:
-            raise MotionInputError(
-                "control_event requires a control_response_timeout_seconds"
-            )
-        control_bytes = _serial_command_bytes(control_command)
-        control_ack_timeout = finite_number(
-            control_ack_timeout_seconds,
-            "control_ack_timeout_seconds",
-        )
-        if control_ack_timeout <= 0:
-            raise MotionInputError(
-                "control_ack_timeout_seconds must be positive"
-            )
-        control_response_timeout = finite_number(
-            control_response_timeout_seconds,
-            "control_response_timeout_seconds",
-        )
-        if control_response_timeout <= 0:
-            raise MotionInputError(
-                "control_response_timeout_seconds must be positive"
-            )
-
-    try:
-        original_timeout = serial_port.timeout
-    except Exception as exc:
-        raise TypeError("serial connection does not expose a read timeout") from exc
-
-    operation_error = None
-    try:
-        return _exchange_serial_line_with_timeout(
-            serial_port,
-            command_bytes,
-            timeout,
-            write_lock,
-            control_event,
-            control_bytes,
-            control_ack_timeout,
-            control_response_timeout,
-            write_started_event,
-            cancellation_event,
-            write_boundary_lock,
-            reset_input,
-            interim_response_handler,
-            interim_response_limit,
-            estop_callback,
-        )
-    except (SerialTransportQuarantinedError, SerialTransportTimeout) as exc:
-        operation_error = exc
-        raise
-    except (MotionInputError, SerialActivityRejected) as exc:
-        operation_error = exc
-        raise
-    except Exception as exc:
-        operation_error = exc
-        _raise_quarantined_transport(
-            serial_port,
-            f"serial exchange ended without a trusted response: {exc}",
-            cause=exc,
-        )
-    finally:
-        try:
-            _set_serial_timeout(serial_port, original_timeout)
-        except Exception as exc:
-            reason = "unable to restore the serial read timeout"
-            if operation_error is not None:
-                reason = f"{operation_error}; {reason}"
-            _raise_quarantined_transport(
-                serial_port,
-                reason,
-                cause=exc,
-            )
-
-
-def _exchange_serial_line_with_timeout(
-    serial_port,
-    command_bytes,
-    timeout,
-    write_lock,
-    control_event,
-    control_bytes,
-    control_ack_timeout,
-    control_response_timeout,
-    write_started_event,
-    cancellation_event,
-    write_boundary_lock,
-    reset_input,
-    interim_response_handler,
-    interim_response_limit,
-    estop_callback,
-):
-    _set_serial_timeout(serial_port, timeout)
-
-    reset_input_method = None
-    if reset_input:
-        reset_input_method = getattr(
-            serial_port,
-            "reset_input_buffer",
-            None,
-        )
-        if not callable(reset_input_method):
-            reset_input_method = getattr(serial_port, "flushInput", None)
-        if not callable(reset_input_method):
-            raise TypeError(
-                "serial connection does not support input-buffer reset"
-            )
-
-    readline = getattr(serial_port, "readline", None)
-    read_until = getattr(serial_port, "read_until", None)
-    read = getattr(serial_port, "read", None)
-    if not (callable(read_until) or callable(readline)) or not callable(read):
-        raise TypeError("serial connection does not satisfy the line-exchange contract")
-
-    response_buffer = bytearray()
-    interim_response_count = 0
-    control_sent = False
-    control_attempted = False
-    live_acknowledged = False
-    initial_write_started = (
-        write_started_event
-        if write_started_event is not None
-        else threading.Event()
-    )
-    if control_bytes is not None and not callable(
-        getattr(initial_write_started, "is_set", None)
-    ):
-        raise MotionInputError(
-            "live serial write-start event must satisfy the event contract"
-        )
-
-    def send_control_once():
-        nonlocal control_attempted, control_sent
-        if control_attempted:
-            return
-        control_attempted = True
-        _write_serial_bytes(serial_port, control_bytes, write_lock)
-        control_sent = True
-
-    def control_is_requested():
-        try:
-            requested = control_event.is_set()
-            if not isinstance(requested, bool):
-                raise ProtocolResponseError(
-                    "control_event.is_set() must return a boolean"
-                )
-            return requested
-        except Exception as exc:
-            if not control_attempted:
-                try:
-                    send_control_once()
-                except Exception as stop_exc:
-                    raise ProtocolResponseError(
-                        f"{exc}; fail-safe stop write failed: {stop_exc}"
-                    ) from exc
-            raise ProtocolResponseError(
-                f"control_event could not be read after live transmission: {exc}"
-            ) from exc
-
-    def probe_post_terminal_estop(
-        terminal_response,
-        followup_deadline,
-        followup_timeout,
-    ):
-        remaining = followup_deadline - time.monotonic()
-        if remaining < CONTROL_POLL_INTERVAL_SECONDS:
-            _raise_quarantined_transport(
-                serial_port,
-                "controller response follow-up probe deadline expired",
-                error_type=SerialTransportTimeout,
-            )
-        _set_serial_timeout(
-            serial_port,
-            CONTROL_POLL_INTERVAL_SECONDS,
-        )
-        leading = read(1)
-        if not isinstance(leading, (bytes, bytearray)):
-            raise ProtocolResponseError(
-                "controller response follow-up probe returned non-bytes data"
-            )
-        if not leading:
-            if not getattr(serial_port, "is_open", False):
-                raise ConnectionError(
-                    "serial connection closed during the controller "
-                    "response quiet boundary"
-                )
-            return None
-        second = _read_serial_framed_line(
-            serial_port,
-            readline,
-            read_until,
-            followup_deadline,
-            followup_timeout,
-            initial_bytes=leading,
-        )
-        second_kind, second_position = (
-            _parse_controller_line_exchange_frame(second)
-        )
-        if second_kind != "estop-event":
-            raise ProtocolResponseError(
-                "controller returned an invalid post-terminal frame"
-            )
-        try:
-            published = estop_callback(second_position)
-        except Exception as exc:
-            raise ProtocolResponseError(
-                "serial exchange E-stop publication failed: "
-                f"{exc}"
-            ) from exc
-        if published is not True:
-            raise ProtocolResponseError(
-                "serial exchange E-stop callback did not confirm publication"
-            )
-        exchange_response = parse_controller_line_exchange_frames(
-            (terminal_response, second)
-        )
-        _read_serial_quiet_boundary(
-            serial_port,
-            read,
-            followup_deadline - time.monotonic(),
-            "controller response",
-        )
-        return exchange_response.authoritative_response
-
-    def require_initial_write_admission():
-        if cancellation_event is not None:
-            try:
-                cancelled = cancellation_event.is_set()
-            except Exception as exc:
-                raise MotionInputError(
-                    "cancellation_event could not be read before transmission"
-                ) from exc
-            if not isinstance(cancelled, bool):
-                raise MotionInputError(
-                    "cancellation_event.is_set() must return a boolean"
-                )
-            if cancelled:
-                raise SerialActivityRejected(
-                    "serial exchange cancelled before transmission"
-                )
-        if control_bytes is not None:
-            try:
-                requested = control_event.is_set()
-            except Exception as exc:
-                raise MotionInputError(
-                    "control_event could not be read before live transmission"
-                ) from exc
-            if not isinstance(requested, bool):
-                raise MotionInputError(
-                    "control_event.is_set() must return a boolean"
-                )
-            if requested:
-                raise SerialActivityRejected(
-                    "live serial exchange stopped before transmission"
-                )
-
-    try:
-        _write_serial_bytes(
-            serial_port,
-            command_bytes,
-            write_lock,
-            reset_input=reset_input_method,
-            write_admission_check=require_initial_write_admission,
-            write_started_event=(
-                initial_write_started
-                if control_bytes is not None or write_started_event is not None
-                else None
-            ),
-            write_boundary_lock=write_boundary_lock,
-        )
-    except Exception as exc:
-        if control_bytes is not None and initial_write_started.is_set():
-            try:
-                send_control_once()
-            except Exception as stop_exc:
-                raise ProtocolResponseError(
-                    f"{exc}; fail-safe stop write failed: {stop_exc}"
-                ) from exc
-            raise ProtocolResponseError(
-                f"live command write failed after transmission started: {exc}"
-            ) from exc
-        raise
-
-    active_timeout = control_ack_timeout if control_bytes is not None else timeout
-    deadline = time.monotonic() + active_timeout
-
-    while True:
-        if (
-            control_bytes is not None
-            and not control_sent
-            and control_is_requested()
-        ):
-            send_control_once()
-            if live_acknowledged:
-                active_timeout = control_response_timeout
-                deadline = time.monotonic() + control_response_timeout
-
-        if deadline is None:
-            read_timeout = CONTROL_POLL_INTERVAL_SECONDS
-        else:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                if control_bytes is not None and not control_sent:
-                    try:
-                        send_control_once()
-                    except Exception as exc:
-                        _raise_quarantined_timeout(serial_port, active_timeout, exc)
-                    _raise_quarantined_timeout(serial_port, active_timeout)
-                _raise_quarantined_timeout(serial_port, active_timeout)
-            read_timeout = remaining
-            if control_bytes is not None and not control_sent:
-                read_timeout = min(read_timeout, CONTROL_POLL_INTERVAL_SECONDS)
-        try:
-            _set_serial_timeout(serial_port, read_timeout)
-
-            if callable(read_until):
-                response_bytes = read_until(
-                    b"\n",
-                    MAX_RESPONSE_FRAME_LENGTH + 1 - len(response_buffer),
-                )
-            else:
-                response_bytes = readline()
-            if not isinstance(response_bytes, (bytes, bytearray)):
-                raise ProtocolResponseError(
-                    "serial line reader returned a non-bytes response"
-                )
-            if not response_bytes:
-                if not getattr(serial_port, "is_open", False):
-                    raise ConnectionError(
-                        "serial connection closed during live response ownership"
-                    )
-                if control_bytes is None:
-                    _raise_quarantined_timeout(serial_port, timeout)
-                continue
-
-            response_buffer.extend(response_bytes)
-            if len(response_buffer) > MAX_RESPONSE_FRAME_LENGTH:
-                raise ProtocolResponseError("controller response exceeds the size limit")
-            if not response_buffer.endswith(b"\n"):
-                continue
-            response = decode_serial_response_line(
-                response_buffer,
-                allow_empty=control_bytes is not None,
-            )
-            response_buffer.clear()
-            if response:
-                response_kind = "terminal"
-                response_position = None
-                if estop_callback is not None:
-                    response_kind, response_position = (
-                        _parse_controller_line_exchange_frame(response)
-                    )
-                if response_kind != "terminal":
-                    try:
-                        published = estop_callback(response_position)
-                    except Exception as exc:
-                        raise ProtocolResponseError(
-                            "serial exchange E-stop publication failed: "
-                            f"{exc}"
-                        ) from exc
-                    if published is not True:
-                        raise ProtocolResponseError(
-                            "serial exchange E-stop callback did not confirm "
-                            "publication"
-                        )
-                    if response_kind == "estop-admission":
-                        quiet_timeout = CONTROL_POLL_INTERVAL_SECONDS
-                        if deadline is not None:
-                            quiet_timeout = deadline - time.monotonic()
-                        _read_serial_quiet_boundary(
-                            serial_port,
-                            read,
-                            quiet_timeout,
-                            "controller response",
-                        )
-                        return response
-
-                    if deadline is None:
-                        followup_timeout = control_response_timeout
-                        followup_deadline = (
-                            time.monotonic() + control_response_timeout
-                        )
-                    else:
-                        followup_timeout = active_timeout
-                        followup_deadline = deadline
-                    second = _read_serial_framed_line(
-                        serial_port,
-                        readline,
-                        read_until,
-                        followup_deadline,
-                        followup_timeout,
-                    )
-                    second_kind, _ = (
-                        _parse_controller_line_exchange_frame(second)
-                    )
-                    if second_kind == "estop-event":
-                        raise ProtocolResponseError(
-                            "controller returned duplicate physical-stop events"
-                        )
-                    exchange_response = (
-                        parse_controller_line_exchange_frames(
-                            (response, second)
-                        )
-                    )
-                    _read_serial_quiet_boundary(
-                        serial_port,
-                        read,
-                        followup_deadline - time.monotonic(),
-                        "controller response",
-                    )
-                    return exchange_response.authoritative_response
-
-                if interim_response_handler is not None:
-                    try:
-                        consumed = interim_response_handler(response)
-                    except Exception as exc:
-                        raise ProtocolResponseError(
-                            "interim response handler failed after "
-                            f"transmission: {exc}"
-                        ) from exc
-                    if not isinstance(consumed, bool):
-                        raise ProtocolResponseError(
-                            "interim response handler must return a boolean"
-                        )
-                    if consumed:
-                        interim_response_count += 1
-                        if interim_response_count > interim_response_limit:
-                            raise ProtocolResponseError(
-                                "controller exceeded the interim response limit"
-                            )
-                        continue
-                controller_estop = _is_physical_estop_position_response(response)
-                if (
-                    control_bytes is not None
-                    and live_acknowledged
-                    and not control_sent
-                    and not controller_estop
-                    and estop_callback is not None
-                ):
-                    followup_timeout = control_response_timeout
-                    followup_deadline = (
-                        time.monotonic() + followup_timeout
-                    )
-                    paired_estop = probe_post_terminal_estop(
-                        response,
-                        followup_deadline,
-                        followup_timeout,
-                    )
-                    if paired_estop is not None:
-                        return paired_estop
-                if control_bytes is not None and not controller_estop:
-                    if not live_acknowledged:
-                        if not control_sent:
-                            try:
-                                send_control_once()
-                            except Exception as exc:
-                                raise ProtocolResponseError(
-                                    "controller returned terminal data before live "
-                                    "acknowledgement and the fail-safe stop write "
-                                    f"failed: {exc}"
-                                ) from exc
-                        raise ProtocolResponseError(
-                            "controller returned terminal data before live "
-                            "acknowledgement"
-                        )
-                    if not control_sent:
-                        try:
-                            send_control_once()
-                        except Exception as exc:
-                            raise ProtocolResponseError(
-                                "controller returned terminal data before live stop "
-                                f"and the fail-safe stop write failed: {exc}"
-                            ) from exc
-                        raise ProtocolResponseError(
-                            "controller returned terminal data before live stop"
-                        )
-                if estop_callback is not None:
-                    if deadline is None:
-                        raise ProtocolResponseError(
-                            "controller returned terminal data without a "
-                            "bounded response deadline"
-                        )
-                    paired_estop = probe_post_terminal_estop(
-                        response,
-                        deadline,
-                        active_timeout,
-                    )
-                    if paired_estop is not None:
-                        return paired_estop
-                quiet_timeout = CONTROL_POLL_INTERVAL_SECONDS
-                if deadline is not None:
-                    quiet_timeout = deadline - time.monotonic()
-                _read_serial_quiet_boundary(
-                    serial_port,
-                    read,
-                    quiet_timeout,
-                    "controller response",
-                )
-                return response
-            if control_bytes is None:
-                raise ProtocolResponseError("controller returned a blank response line")
-            if live_acknowledged:
-                raise ProtocolResponseError(
-                    "controller returned a duplicate live acknowledgement"
-                )
-            live_acknowledged = True
-            if control_sent:
-                active_timeout = control_response_timeout
-                deadline = time.monotonic() + control_response_timeout
-            else:
-                deadline = None
-        except (SerialTransportQuarantinedError, SerialTransportTimeout):
-            raise
-        except Exception as exc:
-            if control_bytes is not None and not control_attempted:
-                try:
-                    send_control_once()
-                except Exception as stop_exc:
-                    raise ProtocolResponseError(
-                        f"{exc}; fail-safe stop write failed: {stop_exc}"
-                    ) from exc
-            raise
 
 
 def _finite_number_state(value, field_name):
@@ -3548,6 +1701,63 @@ class ControllerJointCalibration:
             for axis, position in enumerate(normalized, start=1)
         })
         return normalized
+
+
+def validate_controller_encoder_scale(
+    calibration,
+    axis,
+    encoder_counts_per_step,
+    field_name,
+):
+    if not isinstance(calibration, ControllerJointCalibration):
+        raise MotionInputError(
+            "encoder scale calibration must be a ControllerJointCalibration"
+        )
+    if (
+        isinstance(axis, bool)
+        or not isinstance(axis, int)
+        or not 1 <= axis <= 6
+    ):
+        raise MotionInputError("encoder scale axis must be in [1, 6]")
+    scale = _controller_float(encoder_counts_per_step, field_name)
+    if scale <= 0.0:
+        raise MotionInputError(f"{field_name} must be positive")
+
+    negative = _controller_float(
+        calibration.negative_limits[axis - 1],
+        f"J{axis} negative limit",
+    )
+    positive = _controller_float(
+        calibration.positive_limits[axis - 1],
+        f"J{axis} positive limit",
+    )
+    steps_per_unit = _controller_float(
+        calibration.steps_per_unit[axis - 1],
+        f"J{axis} steps per unit",
+    )
+    travel = _controller_float(
+        negative + positive,
+        f"J{axis} calibrated travel",
+    )
+    if travel <= 0.0:
+        raise MotionInputError(
+            f"J{axis} configured travel must be positive"
+        )
+    step_limit = int(_controller_float_product(
+        travel,
+        steps_per_unit,
+        f"J{axis} calibrated step limit",
+    ))
+    maximum_written_count = step_limit * scale
+    if (
+        not math.isfinite(maximum_written_count)
+        or maximum_written_count < 0.0
+        or maximum_written_count > CONTROLLER_SIGNED_INT_MAX
+    ):
+        raise MotionInputError(
+            f"{field_name} exceeds the signed encoder counter range"
+        )
+    return scale
 
 
 def build_robot_joint_command(positions, profile, calibration):
@@ -4189,33 +2399,6 @@ _VIRTUAL_CARTESIAN_FIELDS = _numeric_fields(
     ("Ry", "ry"),
     ("Rx", "rx"),
 )
-_ARC_FIELDS = _numeric_fields(
-    ("X", "x"),
-    ("Y", "y"),
-    ("Z", "z"),
-    ("Rz", "rz"),
-    ("Ry", "ry"),
-    ("Rx", "rx"),
-    ("Ex", "ex"),
-    ("Ey", "ey"),
-    ("Ez", "ez"),
-    ("Tr", "tr"),
-)
-_CIRCLE_FIELDS = _numeric_fields(
-    ("Cx", "cx"),
-    ("Cy", "cy"),
-    ("Cz", "cz"),
-    ("Rz", "rz"),
-    ("Ry", "ry"),
-    ("Rx", "rx"),
-    ("Bx", "bx"),
-    ("By", "by"),
-    ("Bz", "bz"),
-    ("Px", "px"),
-    ("Py", "py"),
-    ("Pz", "pz"),
-    ("Tr", "tr"),
-)
 _VALUE_FIELD = _numeric_fields(("V", "value"))
 _DISTANCE_FIELD = rf"(?P<distance>{_NONNEGATIVE_NUMBER})"
 _ROUNDING_FIELD = _numeric_fields(("", "rounding"))
@@ -4241,10 +2424,8 @@ _STANDARD_TIMING_ENVELOPES = {
     "RJ": re.compile(rf"^RJ{_ROBOT_JOINT_FIELDS}(?=S)"),
     **{
         opcode: re.compile(rf"^{opcode}{_CARTESIAN_FIELDS}(?=S)")
-        for opcode in ("MG", "MJ", "ML", "MV", "WC", "WG")
+        for opcode in ("MJ", "ML", "MV", "WC")
     },
-    "MA": re.compile(rf"^MA{_ARC_FIELDS}(?=S)"),
-    "MC": re.compile(rf"^MC{_CIRCLE_FIELDS}(?=S)"),
     **{
         opcode: re.compile(rf"^{opcode}{_VALUE_FIELD}(?=S)")
         for opcode in ("LC", "LJ", "LT")
@@ -4261,7 +2442,7 @@ _LEGACY_TIMING_ENVELOPES = {
 _STANDARD_TIMING_SUFFIXES = {
     **{
         opcode: re.compile(r"W[NFA]Lm[01]{6}\n\Z")
-        for opcode in ("MA", "MC", "MG", "MJ", "RJ")
+        for opcode in ("MJ", "RJ")
     },
     "ML": re.compile(
         rf"Rnd{_ROUNDING_FIELD}W[NFA]Lm[01]{{6}}Q0\n\Z"
@@ -4274,14 +2455,11 @@ _STANDARD_TIMING_SUFFIXES = {
         opcode: re.compile(r"W[NFA]Lm[01]{6}\n\Z")
         for opcode in ("LC", "LT")
     },
-    **{
-        opcode: re.compile(
-            rf"W[NFA]Lm[01]{{6}}"
-            rf"Mi[0-9A-F]{{{CONTROLLER_MEDIA_ID_LENGTH}}}"
-            rf"Fn[ -~]+\n\Z"
-        )
-        for opcode in ("WC", "WG")
-    },
+    "WC": re.compile(
+        rf"W[NFA]Lm[01]{{6}}"
+        rf"Mi[0-9A-F]{{{CONTROLLER_MEDIA_ID_LENGTH}}}"
+        rf"Fn[ -~]+\n\Z"
+    ),
 }
 _SERIAL_TIMING_SUFFIXES = {
     **_STANDARD_TIMING_SUFFIXES,
@@ -4304,32 +2482,6 @@ _POSITION_RESPONSE = re.compile(
     rf"O(?P<flag>(?:EA|EB|EC[01]{{6}})?)"
     rf"P(?P<j7>{_NUMBER})Q(?P<j8>{_NUMBER})R(?P<j9>{_NUMBER})$"
 )
-_PRIMARY_HOME_REFERENCE_V1_RESPONSE = re.compile(
-    r"^A(?P<j1_valid>[01])"
-    r"B(?P<j1_millidegrees>(?:0|-?[1-9][0-9]*))"
-    r"C(?P<j2_valid>[01])"
-    r"D(?P<j2_millidegrees>(?:0|-?[1-9][0-9]*))$"
-)
-_PRIMARY_HOME_REFERENCE_V2_RESPONSE = re.compile(
-    r"^A(?P<j1_valid>[01])"
-    r"B(?P<j1_millidegrees>(?:0|-?[1-9][0-9]*))"
-    r"C(?P<j2_valid>[01])"
-    r"D(?P<j2_millidegrees>(?:0|-?[1-9][0-9]*))"
-    r"E(?P<j3_valid>[01])"
-    r"F(?P<j3_millidegrees>(?:0|-?[1-9][0-9]*))$"
-)
-_JOINT_TELEMETRY_RESPONSE = re.compile(
-    rf"^{re.escape(JOINT_TELEMETRY_PREFIX)}"
-    r"(?P<j1_millidegrees>(?:0|-?[1-9][0-9]*))"
-    r"B(?P<j2_millidegrees>(?:0|-?[1-9][0-9]*))"
-    r"C(?P<j3_millidegrees>(?:0|-?[1-9][0-9]*))"
-    r"D(?P<j4_millidegrees>(?:0|-?[1-9][0-9]*))"
-    r"E(?P<j5_millidegrees>(?:0|-?[1-9][0-9]*))"
-    r"F(?P<j6_millidegrees>(?:0|-?[1-9][0-9]*))$"
-)
-_JOINT_MOTION_ERROR_RESPONSE = re.compile(r"^(?:ER|EL[01]{9})$")
-
-
 @dataclass(frozen=True)
 class CommandTiming:
     mode: str
@@ -4337,6 +2489,35 @@ class CommandTiming:
     acceleration: float
     deceleration: float
     ramp: float
+
+
+@dataclass(frozen=True)
+class JointMotionCommand:
+    robot_joints_degrees: Tuple[float, float, float, float, float, float]
+    external_axes_units: Tuple[float, float, float]
+    timing: CommandTiming
+    wrist_configuration: str
+    loop_modes: Tuple[bool, bool, bool, bool, bool, bool]
+
+
+@dataclass(frozen=True)
+class CartesianMotionCommand:
+    translation_millimeters: Tuple[float, float, float]
+    orientation_degrees: Tuple[float, float, float]
+    external_axes_units: Tuple[float, float, float]
+    timing: CommandTiming
+    wrist_configuration: str
+    loop_modes: Tuple[bool, bool, bool, bool, bool, bool]
+
+
+@dataclass(frozen=True)
+class ToolJogCommand:
+    axis: str
+    direction: str
+    distance: float
+    timing: CommandTiming
+    wrist_configuration: str
+    loop_modes: Tuple[bool, bool, bool, bool, bool, bool]
 
 
 def _canonicalize_protocol_numbers(command, *matches):
@@ -4356,13 +2537,14 @@ def _canonicalize_protocol_numbers(command, *matches):
     normalized = command
     for start, end, canonical in sorted(replacements, reverse=True):
         normalized = normalized[:start] + canonical + normalized[end:]
-    _serial_command_bytes(normalized)
+    if len(normalized) > MAX_COMMAND_LENGTH:
+        raise MotionInputError("controller command exceeds the size limit")
     return normalized, encoded_values
 
 
 def _validate_motion_angle_fields(command, opcode, encoded_values):
     field_names = []
-    if opcode in ("MA", "MC", "MG", "MJ", "ML", "MV", "WC", "WG"):
+    if opcode in ("MJ", "ML", "MV", "WC"):
         field_names.extend(("rz", "ry", "rx"))
     if opcode == "MV":
         field_names.append("vision_rotation")
@@ -4435,10 +2617,6 @@ def _parse_timed_command(
         suffix_match,
     )
     _validate_motion_angle_fields(command, opcode, encoded_values)
-    if opcode in ("MA", "MC") and encoded_values.get("tr") != 0.0:
-        raise MotionInputError(
-            f"{opcode} trajectory rotation is unsupported and must be 0"
-        )
     mode = match.group("mode")
     _validate_command_specific_motion_fields(opcode, mode, encoded_values)
     speed = encoded_values["speed"]
@@ -4466,7 +2644,20 @@ def _parse_timed_command(
 
 
 def _parse_command_contract(command, virtual):
-    _serial_command_bytes(command)
+    if not isinstance(command, str) or not command.endswith("\n"):
+        raise MotionInputError(
+            "controller command must be newline-terminated text"
+        )
+    if not command[:-1] or "\n" in command[:-1] or "\r" in command:
+        raise MotionInputError(
+            "controller command must contain exactly one trailing line delimiter"
+        )
+    if len(command) > MAX_COMMAND_LENGTH:
+        raise MotionInputError("controller command exceeds the size limit")
+    if not command.isascii():
+        raise MotionInputError(
+            "controller command must contain ASCII characters only"
+        )
     opcode = command[:2]
     if not virtual:
         fieldless = _FIELDLESS_COMMANDS.get(opcode)
@@ -4507,7 +2698,7 @@ def _parse_command_contract(command, virtual):
         suffix_pattern,
         contract_name,
     )
-    if not virtual and opcode in ("WC", "WG"):
+    if not virtual and opcode == "WC":
         filename_index = normalized.find("Fn")
         if filename_index < 0:
             raise MotionInputError(f"serial {opcode} filename marker is missing")
@@ -4571,7 +2762,7 @@ def _serial_axis_targets(command):
             axis: match.group(name)
             for axis, name in enumerate(names, start=1)
         }
-    if opcode in ("MG", "MJ", "ML", "MV", "WC", "WG"):
+    if opcode in ("MJ", "ML", "MV", "WC"):
         return {
             axis: match.group(f"j{axis}")
             for axis in range(7, JOINT_COUNT + 1)
@@ -4592,29 +2783,6 @@ def canonicalize_serial_command(command, calibration=None):
     return normalized
 
 
-def request_joint_telemetry(command):
-    normalized = _parse_command_contract(command, virtual=False)[1]
-    if normalized[:2] != "RJ":
-        raise MotionInputError("joint telemetry is available only for RJ commands")
-    if normalized.endswith("T1\n"):
-        return normalized
-    requested = normalized[:-1] + "T1\n"
-    return _parse_command_contract(requested, virtual=False)[1]
-
-
-def joint_telemetry_response_budget(response_timeout_seconds):
-    timeout = finite_number(
-        response_timeout_seconds,
-        "response_timeout_seconds",
-    )
-    if timeout <= 0:
-        raise MotionInputError("response_timeout_seconds must be positive")
-    return (
-        math.ceil(timeout / JOINT_TELEMETRY_PERIOD_SECONDS)
-        + JOINT_TELEMETRY_RESPONSE_BUDGET_MARGIN
-    )
-
-
 def canonicalize_virtual_command(command):
     """Validate and encode every numeric field for simulator parsing."""
     return _parse_command_contract(command, virtual=True)[1]
@@ -4623,6 +2791,121 @@ def canonicalize_virtual_command(command):
 def parse_command_timing(command):
     """Return a validated controller timing profile, when present."""
     return _parse_command_contract(command, virtual=False)[0]
+
+
+def parse_joint_motion_command(command, virtual=False):
+    if not isinstance(virtual, bool):
+        raise TypeError("virtual joint-command flag must be boolean")
+    timing, normalized = _parse_command_contract(command, virtual=virtual)
+    if timing is None or normalized[:2] != "RJ":
+        raise MotionInputError("joint motion requires an RJ command")
+    envelope = (
+        _VIRTUAL_TIMING_ENVELOPES["RJ"]
+        if virtual
+        else _STANDARD_TIMING_ENVELOPES["RJ"]
+    ).match(normalized)
+    if envelope is None:
+        raise MotionInputError("joint RJ command is missing target fields")
+    loop_match = re.search(r"Lm(?P<loops>[01]{6})(?:T1)?\n\Z", normalized)
+    if loop_match is None:
+        raise MotionInputError("joint RJ loop modes are invalid")
+    return JointMotionCommand(
+        robot_joints_degrees=tuple(
+            float(envelope.group(f"j{axis}")) for axis in range(1, 7)
+        ),
+        external_axes_units=(0.0, 0.0, 0.0) if virtual else tuple(
+            float(envelope.group(f"j{axis}"))
+            for axis in range(7, JOINT_COUNT + 1)
+        ),
+        timing=timing,
+        wrist_configuration=parse_motion_wrist_config(
+            normalized,
+            virtual=virtual,
+        ),
+        loop_modes=tuple(
+            value == "1" for value in loop_match.group("loops")
+        ),
+    )
+
+
+def parse_cartesian_motion_command(command, virtual=False):
+    if not isinstance(virtual, bool):
+        raise TypeError("virtual Cartesian command flag must be boolean")
+    timing, normalized = _parse_command_contract(command, virtual=virtual)
+    opcode = normalized[:2]
+    allowed_opcodes = ("MJ", "MV") if virtual else ("MJ", "ML", "MV", "WC")
+    if timing is None or opcode not in allowed_opcodes:
+        raise MotionInputError("Cartesian motion command is unsupported")
+    envelope = (
+        _VIRTUAL_TIMING_ENVELOPES[opcode]
+        if virtual
+        else _STANDARD_TIMING_ENVELOPES[opcode]
+    ).match(normalized)
+    if envelope is None:
+        raise MotionInputError(f"Cartesian {opcode} command is missing target fields")
+    loop_match = re.search(r"Lm(?P<loops>[01]{6})", normalized)
+    if loop_match is None:
+        raise MotionInputError(f"Cartesian {opcode} command is missing loop modes")
+    loop_text = loop_match.group("loops")
+    return CartesianMotionCommand(
+        translation_millimeters=tuple(
+            float(envelope.group(name)) for name in ("x", "y", "z")
+        ),
+        orientation_degrees=tuple(
+            float(envelope.group(name)) for name in ("rx", "ry", "rz")
+        ),
+        external_axes_units=(0.0, 0.0, 0.0) if virtual else tuple(
+            float(envelope.group(name)) for name in ("j7", "j8", "j9")
+        ),
+        timing=timing,
+        wrist_configuration=parse_motion_wrist_config(
+            normalized,
+            virtual=virtual,
+        ),
+        loop_modes=tuple(value == "1" for value in loop_text),
+    )
+
+
+def parse_tool_jog_command(command, virtual=False):
+    if not isinstance(virtual, bool):
+        raise TypeError("virtual tool-jog command flag must be boolean")
+    timing, normalized = _parse_command_contract(command, virtual=virtual)
+    if timing is None or normalized[:2] != "JT":
+        raise MotionInputError("tool-frame jog requires a JT command")
+    envelope = _LEGACY_TIMING_ENVELOPES["JT"].match(normalized)
+    if envelope is None:
+        raise MotionInputError("tool-frame JT command is missing target fields")
+    loop_match = re.search(r"Lm(?P<loops>[01]{6})\n\Z", normalized)
+    if loop_match is None:
+        raise MotionInputError("tool-frame JT loop modes are invalid")
+    axis = {
+        "X": "x",
+        "Y": "y",
+        "Z": "z",
+        "W": "rx",
+        "P": "ry",
+        "R": "rz",
+    }.get(normalized[2:3])
+    direction = (
+        {"1": "positive", "0": "negative"}
+        if virtual
+        else {"1": "negative", "0": "positive"}
+    ).get(normalized[3:4])
+    if axis is None or direction is None:
+        raise MotionInputError("tool-frame JT direction is invalid")
+    return ToolJogCommand(
+        axis=axis,
+        direction=direction,
+        distance=float(envelope.group("distance")),
+        timing=timing,
+        wrist_configuration=parse_motion_wrist_config(
+            normalized,
+            virtual=virtual,
+        ),
+        loop_modes=tuple(
+            value == "1" for value in loop_match.group("loops")
+        ),
+    )
 
 
 def parse_virtual_command_timing(command):
@@ -4776,110 +3059,60 @@ class PositionResponse:
 
 
 @dataclass(frozen=True)
-class ControllerLineExchangeResponse:
-    """Terminal/E-stop frame ownership metadata for a bounded exchange."""
-
-    terminal_response: Optional[str]
-    estop_position: Optional[PositionResponse]
-    frame_order: str
-    admission_position: Optional[PositionResponse] = None
+class JointMotionExchangeResult:
+    response: str
+    position: Optional[PositionResponse]
+    error: Optional[str] = None
+    confirmed_position_unchanged: bool = False
 
     def __post_init__(self):
-        if self.terminal_response is not None:
-            if (
-                not isinstance(self.terminal_response, str)
-                or not self.terminal_response
-                or self.terminal_response
-                != self.terminal_response.strip()
-                or "\r" in self.terminal_response
-                or "\n" in self.terminal_response
-                or len(self.terminal_response)
-                > MAX_RESPONSE_PAYLOAD_LENGTH
-            ):
-                raise MotionInputError(
-                    "controller terminal response is invalid"
-                )
-            try:
-                self.terminal_response.encode("ascii")
-            except UnicodeEncodeError as exc:
-                raise MotionInputError(
-                    "controller terminal response must contain ASCII only"
-                ) from exc
-        if self.frame_order == "estop-only":
-            if (
-                self.terminal_response is not None
-                or not isinstance(self.estop_position, PositionResponse)
-                or self.estop_position.flag != CONTROLLER_ESTOP_EVENT_FLAG
-                or self.admission_position is not None
-            ):
-                raise MotionInputError(
-                    "standalone controller E-stop response is invalid"
-                )
-        elif self.frame_order == "admission-estop":
-            if (
-                self.terminal_response is not None
-                or not isinstance(self.estop_position, PositionResponse)
-                or self.estop_position.flag
-                != CONTROLLER_ESTOP_ADMISSION_FLAG
-                or self.admission_position is not None
-            ):
-                raise MotionInputError(
-                    "controller admission E-stop response is invalid"
-                )
-        elif self.frame_order == "terminal-only":
-            if (
-                self.estop_position is not None
-                or self.admission_position is not None
-            ):
-                raise MotionInputError(
-                    "terminal-only controller response contains an E-stop"
-                )
-            if self.terminal_response is None:
-                raise MotionInputError(
-                    "terminal-only controller response lacks a terminal"
-                )
-        elif self.frame_order in ("estop-terminal", "terminal-estop"):
-            if (
-                self.terminal_response is None
-                or not isinstance(self.estop_position, PositionResponse)
-                or self.estop_position.flag != CONTROLLER_ESTOP_EVENT_FLAG
-                or self.admission_position is not None
-            ):
-                raise MotionInputError(
-                    "controller E-stop response is invalid"
-                )
-        elif self.frame_order == "estop-admission":
-            if (
-                self.terminal_response is not None
-                or not isinstance(self.estop_position, PositionResponse)
-                or self.estop_position.flag != CONTROLLER_ESTOP_EVENT_FLAG
-                or not isinstance(
-                    self.admission_position,
-                    PositionResponse,
-                )
-                or self.admission_position.flag
-                != CONTROLLER_ESTOP_ADMISSION_FLAG
-            ):
-                raise MotionInputError(
-                    "controller E-stop admission pair is invalid"
-                )
-        else:
+        if (
+            not isinstance(self.response, str)
+            or not self.response
+            or self.response != self.response.strip()
+            or "\r" in self.response
+            or "\n" in self.response
+            or len(self.response) > MAX_RESPONSE_PAYLOAD_LENGTH
+        ):
             raise MotionInputError(
-                "controller response frame order is invalid"
+                "joint-motion exchange response is invalid"
             )
-
-    @property
-    def authoritative_response(self):
-        if self.admission_position is not None:
-            return self.admission_position.raw
-        if self.estop_position is not None:
-            return self.estop_position.raw
-        return self.terminal_response
-
-
-@dataclass(frozen=True)
-class ControllerModbusExchangeResponse(ControllerLineExchangeResponse):
-    pass
+        try:
+            self.response.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise MotionInputError(
+                "joint-motion exchange response must contain ASCII only"
+            ) from exc
+        if type(self.confirmed_position_unchanged) is not bool:
+            raise MotionInputError(
+                "joint-motion confirmed-position state is invalid"
+            )
+        if self.position is not None and (
+            not isinstance(self.position, PositionResponse)
+            or self.position.raw != self.response
+        ):
+            raise MotionInputError(
+                "joint-motion exchange position does not match the response"
+            )
+        if self.error is not None and (
+            not isinstance(self.error, str)
+            or not self.error
+            or self.error != self.error.strip()
+            or "\r" in self.error
+            or "\n" in self.error
+        ):
+            raise MotionInputError(
+                "joint-motion exchange error is invalid"
+            )
+        if self.confirmed_position_unchanged:
+            if self.position is not None or self.error is None:
+                raise MotionInputError(
+                    "unchanged joint-motion position requires a positionless failure"
+                )
+        elif self.position is None:
+            raise MotionInputError(
+                "joint-motion exchange requires a validated position"
+            )
 
 
 @dataclass(frozen=True)
@@ -4888,199 +3121,6 @@ class JointTelemetry:
 
     raw: str
     joints: Tuple[float, ...]
-
-
-def parse_joint_telemetry_response(response):
-    if (
-        not isinstance(response, str)
-        or not response
-        or response != response.strip()
-        or len(response) > MAX_RESPONSE_PAYLOAD_LENGTH
-    ):
-        raise ProtocolResponseError(
-            "controller joint telemetry response is invalid"
-        )
-    try:
-        response.encode("ascii")
-    except UnicodeEncodeError as exc:
-        raise ProtocolResponseError(
-            "controller joint telemetry response must contain ASCII only"
-        ) from exc
-    match = _JOINT_TELEMETRY_RESPONSE.fullmatch(response)
-    if match is None:
-        raise ProtocolResponseError(
-            "controller joint telemetry response has invalid markers or values"
-        )
-    millidegrees = tuple(
-        int(match.group(f"j{axis}_millidegrees"))
-        for axis in range(1, JOINT_TELEMETRY_AXIS_COUNT + 1)
-    )
-    if any(
-        value < -CONTROLLER_SIGNED_INT_MAX - 1
-        or value > CONTROLLER_SIGNED_INT_MAX
-        for value in millidegrees
-    ):
-        raise ProtocolResponseError(
-            "controller joint telemetry response exceeds the signed range"
-        )
-    return JointTelemetry(
-        raw=response,
-        joints=tuple(value / 1000.0 for value in millidegrees),
-    )
-
-
-def parse_joint_motion_exchange_response(response):
-    if (
-        isinstance(response, str)
-        and response.startswith(JOINT_TELEMETRY_FAMILY_PREFIX)
-    ):
-        return parse_joint_telemetry_response(response)
-    try:
-        parse_position_response(response)
-    except ProtocolResponseError as exc:
-        if (
-            not isinstance(response, str)
-            or _JOINT_MOTION_ERROR_RESPONSE.fullmatch(response) is None
-        ):
-            raise ProtocolResponseError(
-                "controller joint-motion exchange returned an invalid frame"
-            ) from exc
-    return None
-
-
-def _parse_primary_home_reference_response(
-    response,
-    response_pattern,
-    axis_groups,
-):
-    if (
-        not isinstance(response, str)
-        or not response
-        or response != response.strip()
-        or len(response) > MAX_RESPONSE_PAYLOAD_LENGTH
-    ):
-        raise ProtocolResponseError(
-            "controller home-reference response is invalid"
-        )
-    try:
-        response.encode("ascii")
-    except UnicodeEncodeError as exc:
-        raise ProtocolResponseError(
-            "controller home-reference response must contain ASCII only"
-        ) from exc
-    match = response_pattern.fullmatch(response)
-    if match is None:
-        raise ProtocolResponseError(
-            "controller home-reference response has invalid markers or values"
-        )
-    millidegrees = tuple(
-        int(match.group(position_group))
-        for _, position_group in axis_groups
-    )
-    if any(
-        value < -CONTROLLER_SIGNED_INT_MAX - 1
-        or value > CONTROLLER_SIGNED_INT_MAX
-        for value in millidegrees
-    ):
-        raise ProtocolResponseError(
-            "controller home-reference response exceeds the signed range"
-        )
-    try:
-        missing_axis_count = 3 - len(axis_groups)
-        return PrimaryHomeReference(
-            valid=(
-                tuple(
-                    match.group(valid_group) == "1"
-                    for valid_group, _ in axis_groups
-                )
-                + (False,) * missing_axis_count
-            ),
-            positions=(
-                tuple(value / 1000.0 for value in millidegrees)
-                + (0.0,) * missing_axis_count
-            ),
-        )
-    except MotionInputError as exc:
-        raise ProtocolResponseError(
-            f"controller home-reference response is inconsistent: {exc}"
-        ) from exc
-
-
-def parse_primary_home_reference_response(response):
-    return _parse_primary_home_reference_response(
-        response,
-        _PRIMARY_HOME_REFERENCE_V1_RESPONSE,
-        (
-            ("j1_valid", "j1_millidegrees"),
-            ("j2_valid", "j2_millidegrees"),
-        ),
-    )
-
-
-def parse_primary_home_reference_v2_response(response):
-    return _parse_primary_home_reference_response(
-        response,
-        _PRIMARY_HOME_REFERENCE_V2_RESPONSE,
-        (
-            ("j1_valid", "j1_millidegrees"),
-            ("j2_valid", "j2_millidegrees"),
-            ("j3_valid", "j3_millidegrees"),
-        ),
-    )
-
-
-def select_primary_home_reference_capability(protocol_capabilities):
-    if isinstance(protocol_capabilities, (str, bytes)):
-        raise MotionInputError(
-            "controller protocol capabilities must be a sequence"
-        )
-    try:
-        capabilities = tuple(protocol_capabilities)
-    except TypeError as exc:
-        raise MotionInputError(
-            "controller protocol capabilities must be a sequence"
-        ) from exc
-    if any(
-        not isinstance(capability, str) or not capability
-        for capability in capabilities
-    ):
-        raise MotionInputError(
-            "controller protocol capabilities contain an invalid value"
-        )
-    for capability in (
-        CONTROLLER_CAPABILITY_HOME_REFERENCE_V2,
-        CONTROLLER_CAPABILITY_HOME_REFERENCE_V1,
-    ):
-        if capability in capabilities:
-            return capability
-    return None
-
-
-def primary_home_reference_command(protocol_capabilities):
-    capability = select_primary_home_reference_capability(
-        protocol_capabilities
-    )
-    if capability == CONTROLLER_CAPABILITY_HOME_REFERENCE_V2:
-        return "H2\n"
-    if capability == CONTROLLER_CAPABILITY_HOME_REFERENCE_V1:
-        return "HR\n"
-    return None
-
-
-def parse_primary_home_reference_capability_response(
-    response,
-    protocol_capabilities,
-):
-    capability = select_primary_home_reference_capability(
-        protocol_capabilities
-    )
-    if capability == CONTROLLER_CAPABILITY_HOME_REFERENCE_V2:
-        return parse_primary_home_reference_v2_response(response)
-    if capability == CONTROLLER_CAPABILITY_HOME_REFERENCE_V1:
-        return parse_primary_home_reference_response(response)
-    raise ProtocolResponseError(
-        "controller does not advertise a home-reference protocol"
-    )
 
 
 def parse_position_response(response):
@@ -5143,808 +3183,6 @@ def position_response_is_physical_estop(position):
     )
 
 
-def _parse_controller_line_exchange_frame(frame):
-    if (
-        not isinstance(frame, str)
-        or not frame
-        or frame != frame.strip()
-        or "\r" in frame
-        or "\n" in frame
-        or len(frame) > MAX_RESPONSE_PAYLOAD_LENGTH
-    ):
-        raise ProtocolResponseError(
-            "controller line exchange frame is invalid"
-        )
-    try:
-        frame.encode("ascii")
-    except UnicodeEncodeError as exc:
-        raise ProtocolResponseError(
-            "controller line exchange frame must contain ASCII only"
-        ) from exc
-
-    try:
-        position = parse_position_response(frame)
-    except ProtocolResponseError:
-        position = None
-    if position is not None:
-        if position_response_is_physical_estop(position):
-            if position.flag == CONTROLLER_ESTOP_ADMISSION_FLAG:
-                return "estop-admission", position
-            return "estop-event", position
-        return "terminal", None
-    return "terminal", None
-
-
-def _parse_controller_modbus_exchange_frame(command, frame):
-    kind, position = _parse_controller_line_exchange_frame(frame)
-    if kind != "terminal":
-        return kind, position
-
-    try:
-        classify_controller_modbus_terminal_response(command, frame)
-    except ProtocolResponseError as exc:
-        raise ProtocolResponseError(
-            "controller Modbus exchange terminal frame is invalid"
-        ) from exc
-    return "terminal", None
-
-
-def parse_controller_line_exchange_frames(frames):
-    """Validate one terminal and the supported physical-stop frame orders."""
-    if not isinstance(frames, (tuple, list)):
-        raise ProtocolResponseError(
-            "controller line exchange frames must be a sequence"
-        )
-    frame_sequence = tuple(frames)
-    if len(frame_sequence) not in (1, 2):
-        raise ProtocolResponseError(
-            "controller line exchange must contain one or two frames"
-        )
-
-    parsed = tuple(
-        _parse_controller_line_exchange_frame(frame)
-        for frame in frame_sequence
-    )
-    kinds = tuple(kind for kind, _ in parsed)
-    if len(frame_sequence) == 1:
-        if kinds[0] == "estop-event":
-            return ControllerLineExchangeResponse(
-                None,
-                parsed[0][1],
-                "estop-only",
-            )
-        if kinds[0] == "estop-admission":
-            return ControllerLineExchangeResponse(
-                None,
-                parsed[0][1],
-                "admission-estop",
-            )
-        return ControllerLineExchangeResponse(
-            frame_sequence[0],
-            None,
-            "terminal-only",
-        )
-
-    if kinds == ("estop-event", "estop-admission"):
-        return ControllerLineExchangeResponse(
-            None,
-            parsed[0][1],
-            "estop-admission",
-            parsed[1][1],
-        )
-    if kinds == ("estop-event", "terminal"):
-        frame_order = "estop-terminal"
-        estop_position = parsed[0][1]
-        terminal_response = frame_sequence[1]
-    elif kinds == ("terminal", "estop-event"):
-        frame_order = "terminal-estop"
-        estop_position = parsed[1][1]
-        terminal_response = frame_sequence[0]
-    else:
-        raise ProtocolResponseError(
-            "controller line exchange contains duplicate frame roles"
-        )
-    return ControllerLineExchangeResponse(
-        terminal_response,
-        estop_position,
-        frame_order,
-    )
-
-
-def parse_controller_modbus_exchange_frames(command, frames):
-    """Validate a bounded terminal/E-stop frame set under one response owner."""
-    validate_controller_modbus_command(command)
-    response = parse_controller_line_exchange_frames(frames)
-    if response.terminal_response is not None:
-        _parse_controller_modbus_exchange_frame(
-            command,
-            response.terminal_response,
-        )
-    return ControllerModbusExchangeResponse(
-        response.terminal_response,
-        response.estop_position,
-        response.frame_order,
-        response.admission_position,
-    )
-
-
-def read_pending_controller_estop_response(
-    serial_port,
-    estop_callback,
-    timeout=PENDING_CONTROL_FRAME_TIMEOUT_SECONDS,
-):
-    """Publish and consume a queued E-stop before another controller write."""
-    timeout = finite_number(timeout, "pending controller E-stop timeout")
-    if timeout < CONTROL_POLL_INTERVAL_SECONDS * 2:
-        raise MotionInputError(
-            "pending controller E-stop timeout is too short"
-        )
-    if not callable(estop_callback):
-        raise MotionInputError(
-            "pending controller E-stop callback must be callable"
-        )
-    _require_open_serial_port(serial_port)
-
-    readline = getattr(serial_port, "readline", None)
-    read_until = getattr(serial_port, "read_until", None)
-    read = getattr(serial_port, "read", None)
-    if not (callable(read_until) or callable(readline)) or not callable(read):
-        raise TypeError(
-            "serial connection does not satisfy the pending E-stop "
-            "read contract"
-        )
-    try:
-        original_timeout = serial_port.timeout
-    except Exception as exc:
-        raise TypeError(
-            "serial connection does not expose a read timeout"
-        ) from exc
-
-    operation_error = None
-    try:
-        deadline = time.monotonic() + timeout
-        _set_serial_timeout(
-            serial_port,
-            CONTROL_POLL_INTERVAL_SECONDS,
-        )
-        leading = read(1)
-        if not isinstance(leading, (bytes, bytearray)):
-            raise ProtocolResponseError(
-                "pending controller E-stop probe returned non-bytes data"
-            )
-        if not leading:
-            if not getattr(serial_port, "is_open", False):
-                raise ConnectionError(
-                    "controller connection closed during the pending "
-                    "E-stop probe"
-                )
-            return None
-
-        response = _read_serial_framed_line(
-            serial_port,
-            readline,
-            read_until,
-            deadline,
-            timeout,
-            initial_bytes=leading,
-        )
-        position = parse_position_response(response)
-        if not position_response_is_physical_estop(position):
-            raise ProtocolResponseError(
-                "queued controller frame is not a physical E-stop"
-            )
-        try:
-            published = estop_callback(position)
-        except Exception as exc:
-            raise ProtocolResponseError(
-                f"pending controller E-stop publication failed: {exc}"
-            ) from exc
-        if published is not True:
-            raise ProtocolResponseError(
-                "pending controller E-stop callback did not confirm "
-                "publication"
-            )
-        _read_serial_quiet_boundary(
-            serial_port,
-            read,
-            deadline - time.monotonic(),
-            "pending controller E-stop response",
-        )
-        return position
-    except (SerialTransportQuarantinedError, SerialTransportTimeout) as exc:
-        operation_error = exc
-        raise
-    except Exception as exc:
-        operation_error = exc
-        _raise_quarantined_transport(
-            serial_port,
-            "pending controller E-stop read ended without trusted framing: "
-            f"{exc}",
-            cause=exc,
-        )
-    finally:
-        try:
-            _set_serial_timeout(serial_port, original_timeout)
-        except Exception as exc:
-            reason = "unable to restore the serial read timeout"
-            if operation_error is not None:
-                reason = f"{operation_error}; {reason}"
-            _raise_quarantined_transport(
-                serial_port,
-                reason,
-                cause=exc,
-            )
-
-
-def read_controller_line_exchange_response(
-    serial_port,
-    timeout,
-    *,
-    estop_callback,
-    allow_standalone_estop_event=False,
-    interim_response_handler=None,
-    interim_response_limit=None,
-    accepted_responses=None,
-    terminal_validator=None,
-    context="controller line response",
-):
-    """Own one bounded terminal and physical-stop frame exchange."""
-    timeout = finite_number(timeout, "controller line response timeout")
-    if timeout <= 0:
-        raise MotionInputError(
-            "controller line response timeout must be positive"
-        )
-    if not callable(estop_callback):
-        raise MotionInputError(
-            "controller line E-stop callback must be callable"
-        )
-    if not isinstance(allow_standalone_estop_event, bool):
-        raise MotionInputError(
-            "standalone controller E-stop policy must be boolean"
-        )
-    if interim_response_handler is not None and not callable(
-        interim_response_handler
-    ):
-        raise MotionInputError(
-            "controller line interim handler must be callable or None"
-        )
-    if interim_response_handler is None:
-        if interim_response_limit is not None:
-            raise MotionInputError(
-                "controller line interim limit requires a handler"
-            )
-    elif (
-        isinstance(interim_response_limit, bool)
-        or not isinstance(interim_response_limit, int)
-        or interim_response_limit <= 0
-    ):
-        raise MotionInputError(
-            "controller line interim limit must be a positive integer"
-        )
-    if terminal_validator is not None and not callable(terminal_validator):
-        raise MotionInputError(
-            "controller line terminal validator must be callable or None"
-        )
-    accepted = _validated_response_set(accepted_responses)
-    if (
-        not isinstance(context, str)
-        or not context
-        or context != context.strip()
-        or "\r" in context
-        or "\n" in context
-    ):
-        raise MotionInputError(
-            "controller line response context must be normalized text"
-        )
-    _require_open_serial_port(serial_port)
-
-    readline = getattr(serial_port, "readline", None)
-    read_until = getattr(serial_port, "read_until", None)
-    read = getattr(serial_port, "read", None)
-    if not (callable(read_until) or callable(readline)) or not callable(read):
-        raise TypeError(
-            "serial connection does not satisfy the stop-aware line contract"
-        )
-    try:
-        original_timeout = serial_port.timeout
-    except Exception as exc:
-        raise TypeError(
-            "serial connection does not expose a read timeout"
-        ) from exc
-
-    operation_error = None
-    try:
-        deadline = time.monotonic() + timeout
-        interim_count = 0
-
-        def publish_estop(position):
-            try:
-                published = estop_callback(position)
-            except Exception as exc:
-                raise ProtocolResponseError(
-                    f"{context} E-stop publication failed: {exc}"
-                ) from exc
-            if published is not True:
-                raise ProtocolResponseError(
-                    f"{context} E-stop callback did not confirm publication"
-                )
-
-        def read_frame(initial_bytes=b""):
-            return _read_serial_framed_line(
-                serial_port,
-                readline,
-                read_until,
-                deadline,
-                timeout,
-                initial_bytes=initial_bytes,
-            )
-
-        def read_initial_frame():
-            nonlocal interim_count
-            while True:
-                frame = read_frame()
-                frame_kind, _ = _parse_controller_line_exchange_frame(frame)
-                if frame_kind != "terminal":
-                    return frame
-                if interim_response_handler is None:
-                    return frame
-                try:
-                    consumed = interim_response_handler(frame)
-                except Exception as exc:
-                    raise ProtocolResponseError(
-                        f"{context} interim handler failed: {exc}"
-                    ) from exc
-                if not isinstance(consumed, bool):
-                    raise ProtocolResponseError(
-                        f"{context} interim handler must return a boolean"
-                    )
-                if not consumed:
-                    return frame
-                interim_count += 1
-                if interim_count > interim_response_limit:
-                    raise ProtocolResponseError(
-                        f"{context} exceeded the interim response limit"
-                    )
-
-        first = read_initial_frame()
-        first_kind, first_position = _parse_controller_line_exchange_frame(
-            first
-        )
-        frames = [first]
-
-        if first_kind == "estop-admission":
-            publish_estop(first_position)
-            response = parse_controller_line_exchange_frames(frames)
-            _read_serial_quiet_boundary(
-                serial_port,
-                read,
-                deadline - time.monotonic(),
-                context,
-            )
-        elif first_kind == "estop-event":
-            publish_estop(first_position)
-            if allow_standalone_estop_event:
-                remaining = deadline - time.monotonic()
-                if remaining < CONTROL_POLL_INTERVAL_SECONDS:
-                    _raise_quarantined_transport(
-                        serial_port,
-                        f"{context} E-stop follow-up probe deadline expired",
-                        error_type=SerialTransportTimeout,
-                    )
-                _set_serial_timeout(
-                    serial_port,
-                    CONTROL_POLL_INTERVAL_SECONDS,
-                )
-                leading = read(1)
-                if not isinstance(leading, (bytes, bytearray)):
-                    raise ProtocolResponseError(
-                        f"{context} E-stop follow-up probe returned "
-                        "non-bytes data"
-                    )
-                if not leading:
-                    if not getattr(serial_port, "is_open", False):
-                        raise ConnectionError(
-                            f"{context} connection closed during the "
-                            "E-stop quiet boundary"
-                        )
-                    quarantine_serial_transport(
-                        serial_port,
-                        f"{context} standalone E-stop event has ambiguous "
-                        "command-admission framing",
-                    )
-                    response = parse_controller_line_exchange_frames(frames)
-                else:
-                    second = read_frame(initial_bytes=leading)
-                    second_kind, _ = (
-                        _parse_controller_line_exchange_frame(second)
-                    )
-                    if second_kind == "estop-event":
-                        raise ProtocolResponseError(
-                            f"{context} returned duplicate physical-stop events"
-                        )
-                    frames.append(second)
-                    response = parse_controller_line_exchange_frames(frames)
-                    _read_serial_quiet_boundary(
-                        serial_port,
-                        read,
-                        deadline - time.monotonic(),
-                        context,
-                    )
-            else:
-                second = read_frame()
-                second_kind, _ = _parse_controller_line_exchange_frame(second)
-                if second_kind == "estop-event":
-                    raise ProtocolResponseError(
-                        f"{context} returned duplicate physical-stop events"
-                    )
-                frames.append(second)
-                response = parse_controller_line_exchange_frames(frames)
-                _read_serial_quiet_boundary(
-                    serial_port,
-                    read,
-                    deadline - time.monotonic(),
-                    context,
-                )
-        else:
-            remaining = deadline - time.monotonic()
-            if remaining < CONTROL_POLL_INTERVAL_SECONDS:
-                _raise_quarantined_transport(
-                    serial_port,
-                    f"{context} follow-up probe deadline expired",
-                    error_type=SerialTransportTimeout,
-                )
-            _set_serial_timeout(
-                serial_port,
-                CONTROL_POLL_INTERVAL_SECONDS,
-            )
-            leading = read(1)
-            if not isinstance(leading, (bytes, bytearray)):
-                raise ProtocolResponseError(
-                    f"{context} follow-up probe returned non-bytes data"
-                )
-            if not leading:
-                if not getattr(serial_port, "is_open", False):
-                    raise ConnectionError(
-                        f"{context} connection closed during the quiet boundary"
-                    )
-                response = parse_controller_line_exchange_frames(frames)
-            else:
-                second = read_frame(initial_bytes=leading)
-                second_kind, second_position = (
-                    _parse_controller_line_exchange_frame(second)
-                )
-                if second_kind != "estop-event":
-                    raise ProtocolResponseError(
-                        f"{context} returned an invalid post-terminal frame"
-                    )
-                publish_estop(second_position)
-                frames.append(second)
-                response = parse_controller_line_exchange_frames(frames)
-                _read_serial_quiet_boundary(
-                    serial_port,
-                    read,
-                    deadline - time.monotonic(),
-                    context,
-                )
-
-        if (
-            response.terminal_response is not None
-        ):
-            if (
-                accepted is not None
-                and response.terminal_response not in accepted
-            ):
-                raise ProtocolResponseError(
-                    f"{context} returned an unexpected terminal response"
-                )
-            if terminal_validator is not None:
-                try:
-                    terminal_validator(response.terminal_response)
-                except Exception as exc:
-                    raise ProtocolResponseError(
-                        f"{context} terminal validation failed: {exc}"
-                    ) from exc
-        return response
-    except (SerialTransportQuarantinedError, SerialTransportTimeout) as exc:
-        operation_error = exc
-        raise
-    except Exception as exc:
-        operation_error = exc
-        _raise_quarantined_transport(
-            serial_port,
-            f"{context} ended without trusted framing: {exc}",
-            cause=exc,
-        )
-    finally:
-        try:
-            _set_serial_timeout(serial_port, original_timeout)
-        except Exception as exc:
-            reason = "unable to restore the serial read timeout"
-            if operation_error is not None:
-                reason = f"{operation_error}; {reason}"
-            _raise_quarantined_transport(
-                serial_port,
-                reason,
-                cause=exc,
-            )
-
-
-def read_controller_exact_exchange_response(
-    serial_port,
-    expected_response,
-    timeout,
-    *,
-    estop_callback,
-    context="controller exact response",
-):
-    """Own an unframed terminal or a physical-stop framed response."""
-    if (
-        not isinstance(expected_response, bytes)
-        or not expected_response
-        or len(expected_response) > MAX_RESPONSE_PAYLOAD_LENGTH
-        or expected_response != expected_response.strip()
-        or b"\r" in expected_response
-        or b"\n" in expected_response
-    ):
-        raise MotionInputError(
-            "expected_response must contain normalized, non-empty "
-            "unframed bytes"
-        )
-    try:
-        expected_text = expected_response.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise MotionInputError(
-            "expected_response must contain ASCII bytes only"
-        ) from exc
-    if expected_response.startswith(b"A"):
-        raise MotionInputError(
-            "expected_response conflicts with physical-stop framing"
-        )
-    timeout = finite_number(timeout, "controller exact response timeout")
-    if timeout <= 0:
-        raise MotionInputError(
-            "controller exact response timeout must be positive"
-        )
-    if not callable(estop_callback):
-        raise MotionInputError(
-            "controller exact E-stop callback must be callable"
-        )
-    if (
-        not isinstance(context, str)
-        or not context
-        or context != context.strip()
-        or "\r" in context
-        or "\n" in context
-    ):
-        raise MotionInputError(
-            "controller exact response context must be normalized text"
-        )
-    _require_open_serial_port(serial_port)
-
-    readline = getattr(serial_port, "readline", None)
-    read_until = getattr(serial_port, "read_until", None)
-    read = getattr(serial_port, "read", None)
-    if not (callable(read_until) or callable(readline)) or not callable(read):
-        raise TypeError(
-            "serial connection does not satisfy the stop-aware exact contract"
-        )
-    try:
-        original_timeout = serial_port.timeout
-    except Exception as exc:
-        raise TypeError(
-            "serial connection does not expose a read timeout"
-        ) from exc
-
-    operation_error = None
-    try:
-        deadline = time.monotonic() + timeout
-
-        def publish_estop(position):
-            try:
-                published = estop_callback(position)
-            except Exception as exc:
-                raise ProtocolResponseError(
-                    f"{context} E-stop publication failed: {exc}"
-                ) from exc
-            if published is not True:
-                raise ProtocolResponseError(
-                    f"{context} E-stop callback did not confirm publication"
-                )
-
-        def read_item():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _raise_quarantined_timeout(serial_port, timeout)
-            _set_serial_timeout(serial_port, remaining)
-            leading = read(1)
-            if not isinstance(leading, (bytes, bytearray)):
-                raise ProtocolResponseError(
-                    f"{context} reader returned non-bytes data"
-                )
-            if not leading:
-                _raise_quarantined_timeout(serial_port, timeout)
-            if bytes(leading) == b"A":
-                frame = _read_serial_framed_line(
-                    serial_port,
-                    readline,
-                    read_until,
-                    deadline,
-                    timeout,
-                    initial_bytes=leading,
-                )
-                kind, position = _parse_controller_line_exchange_frame(
-                    frame
-                )
-                if kind == "terminal":
-                    raise ProtocolResponseError(
-                        f"{context} returned an unexpected framed terminal"
-                    )
-                return "framed", frame, kind, position
-
-            response = bytearray(leading)
-            while len(response) < len(expected_response):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    _raise_quarantined_timeout(serial_port, timeout)
-                _set_serial_timeout(serial_port, remaining)
-                chunk = read(len(expected_response) - len(response))
-                if not isinstance(chunk, (bytes, bytearray)):
-                    raise ProtocolResponseError(
-                        f"{context} reader returned non-bytes data"
-                    )
-                if not chunk:
-                    _raise_quarantined_timeout(serial_port, timeout)
-                response.extend(chunk)
-            if bytes(response) != expected_response:
-                raise ProtocolResponseError(
-                    f"{context} returned an unexpected unframed terminal"
-                )
-            return "terminal", expected_text, "terminal", None
-
-        first_type, first, first_kind, first_position = read_item()
-        if first_type == "terminal":
-            remaining = deadline - time.monotonic()
-            if remaining < CONTROL_POLL_INTERVAL_SECONDS:
-                _raise_quarantined_transport(
-                    serial_port,
-                    f"{context} follow-up probe deadline expired",
-                    error_type=SerialTransportTimeout,
-                )
-            _set_serial_timeout(
-                serial_port,
-                CONTROL_POLL_INTERVAL_SECONDS,
-            )
-            leading = read(1)
-            if not isinstance(leading, (bytes, bytearray)):
-                raise ProtocolResponseError(
-                    f"{context} follow-up probe returned non-bytes data"
-                )
-            if not leading:
-                if not getattr(serial_port, "is_open", False):
-                    raise ConnectionError(
-                        f"{context} connection closed during the quiet boundary"
-                    )
-                return ControllerLineExchangeResponse(
-                    expected_text,
-                    None,
-                    "terminal-only",
-                )
-            if bytes(leading) != b"A":
-                raise ProtocolResponseError(
-                    f"{context} returned trailing unframed data"
-                )
-            second = _read_serial_framed_line(
-                serial_port,
-                readline,
-                read_until,
-                deadline,
-                timeout,
-                initial_bytes=leading,
-            )
-            second_kind, second_position = (
-                _parse_controller_line_exchange_frame(second)
-            )
-            if second_kind != "estop-event":
-                raise ProtocolResponseError(
-                    f"{context} returned an invalid post-terminal frame"
-                )
-            publish_estop(second_position)
-            response = parse_controller_line_exchange_frames(
-                (expected_text, second)
-            )
-        elif first_kind == "estop-admission":
-            publish_estop(first_position)
-            response = parse_controller_line_exchange_frames((first,))
-        else:
-            publish_estop(first_position)
-            second_type, second, second_kind, _ = read_item()
-            if second_kind == "estop-event":
-                raise ProtocolResponseError(
-                    f"{context} returned duplicate physical-stop events"
-                )
-            if second_type == "terminal":
-                response = parse_controller_line_exchange_frames(
-                    (first, expected_text)
-                )
-            else:
-                response = parse_controller_line_exchange_frames(
-                    (first, second)
-                )
-
-        _read_serial_quiet_boundary(
-            serial_port,
-            read,
-            deadline - time.monotonic(),
-            context,
-        )
-        return response
-    except (SerialTransportQuarantinedError, SerialTransportTimeout) as exc:
-        operation_error = exc
-        raise
-    except Exception as exc:
-        operation_error = exc
-        _raise_quarantined_transport(
-            serial_port,
-            f"{context} ended without trusted framing: {exc}",
-            cause=exc,
-        )
-    finally:
-        try:
-            _set_serial_timeout(serial_port, original_timeout)
-        except Exception as exc:
-            reason = "unable to restore the serial read timeout"
-            if operation_error is not None:
-                reason = f"{operation_error}; {reason}"
-            _raise_quarantined_transport(
-                serial_port,
-                reason,
-                cause=exc,
-            )
-
-
-def read_controller_modbus_exchange_response(
-    serial_port,
-    command,
-    timeout,
-    estop_callback,
-):
-    """Own a complete Modbus terminal response and optional E-stop frame."""
-    validate_controller_modbus_command(command)
-    if not callable(estop_callback):
-        raise MotionInputError(
-            "controller Modbus E-stop callback must be callable"
-        )
-    timeout = finite_number(timeout, "controller Modbus response timeout")
-    if timeout <= 0:
-        raise MotionInputError(
-            "controller Modbus response timeout must be positive"
-        )
-    response = read_controller_line_exchange_response(
-        serial_port,
-        timeout,
-        estop_callback=estop_callback,
-        terminal_validator=lambda terminal: (
-            _parse_controller_modbus_exchange_frame(command, terminal)
-        ),
-        context="controller Modbus response",
-    )
-    return ControllerModbusExchangeResponse(
-        response.terminal_response,
-        response.estop_position,
-        response.frame_order,
-        response.admission_position,
-    )
-
-
-def _is_physical_estop_position_response(response):
-    try:
-        return position_response_is_physical_estop(
-            parse_position_response(response)
-        )
-    except ProtocolResponseError:
-        return False
-
-
 @dataclass(frozen=True)
 class MotionSubmission:
     target: Tuple[float, ...]
@@ -5961,6 +3199,7 @@ class MotionEvent:
     telemetry: Optional[JointTelemetry] = None
     error: Optional[str] = None
     pending_discarded: bool = False
+    confirmed_position_unchanged: bool = False
     _acknowledgement: Optional[threading.Event] = None
 
     def acknowledge(self):
@@ -6135,7 +3374,7 @@ class CoalescingJointDispatcher:
 
     def __init__(
         self,
-        exchange: Callable[[str], str],
+        exchange: Callable[[str], JointMotionExchangeResult],
         calibration_provider: Callable[[], ControllerJointCalibration],
         thread_name="ar4-joint-motion",
         transport_lock=None,
@@ -6555,21 +3794,35 @@ class CoalescingJointDispatcher:
                 self._next_event_record_locked(event)
             )
 
-    def publish_telemetry(self, telemetry):
-        if not isinstance(telemetry, JointTelemetry):
+    def publish_position_telemetry(self, raw, joints):
+        if (
+            not isinstance(raw, str)
+            or not raw
+            or raw != raw.strip()
+            or "\r" in raw
+            or "\n" in raw
+            or len(raw) > MAX_RESPONSE_PAYLOAD_LENGTH
+        ):
             raise MotionInputError(
-                "joint telemetry event must contain validated telemetry"
+                "joint telemetry wire evidence is invalid"
             )
         try:
-            validated = parse_joint_telemetry_response(telemetry.raw)
-        except ProtocolResponseError as exc:
+            raw.encode("ascii")
+        except UnicodeEncodeError as exc:
             raise MotionInputError(
-                "joint telemetry event must contain validated telemetry"
+                "joint telemetry wire evidence must contain ASCII only"
             ) from exc
-        if telemetry != validated:
-            raise MotionInputError(
-                "joint telemetry event must match its validated wire frame"
-            )
+        validated = JointTelemetry(
+            raw=raw,
+            joints=_finite_tuple(
+                joints,
+                JOINT_TELEMETRY_AXIS_COUNT,
+                "joint telemetry positions",
+            ),
+        )
+        return self._publish_validated_telemetry(validated)
+
+    def _publish_validated_telemetry(self, telemetry):
         with self._lock:
             if self._closed:
                 return False
@@ -6582,7 +3835,7 @@ class CoalescingJointDispatcher:
                 MotionEvent(
                     kind="telemetry",
                     move=move,
-                    telemetry=validated,
+                    telemetry=telemetry,
                 )
             )
         return True
@@ -6628,17 +3881,28 @@ class CoalescingJointDispatcher:
             )
             response = None
             position = None
+            confirmed_position_unchanged = False
             try:
-                response = self._exchange(move.command)
-                if not isinstance(response, str):
-                    raise ProtocolResponseError("serial exchange returned a non-text response")
-                if response.startswith("E"):
-                    raise ProtocolResponseError(f"controller rejected motion: {response}")
-                parsed_position = parse_position_response(response)
+                exchange_result = self._exchange(move.command)
+                if isinstance(exchange_result, JointMotionExchangeResult):
+                    response = exchange_result.response
+                    parsed_position = exchange_result.position
+                    exchange_error = exchange_result.error
+                    confirmed_position_unchanged = (
+                        exchange_result.confirmed_position_unchanged
+                    )
+                else:
+                    raise ProtocolResponseError(
+                        "joint exchange returned an invalid result"
+                    )
+                if confirmed_position_unchanged:
+                    raise ProtocolResponseError(exchange_error)
                 move.calibration.validate_positions(
                     parsed_position.joints + parsed_position.external
                 )
                 position = parsed_position
+                if exchange_error is not None:
+                    raise ProtocolResponseError(exchange_error)
                 if parsed_position.flag:
                     raise ProtocolResponseError(
                         f"controller reported motion fault: {parsed_position.flag}"
@@ -6648,12 +3912,19 @@ class CoalescingJointDispatcher:
                 with self._lock:
                     pending_discarded = self._pending is not None
                     self._pending = None
-                    self._desired = None
-                    self._confirmed = None
+                    if confirmed_position_unchanged:
+                        self._desired = self._confirmed
+                    else:
+                        self._desired = None
+                        self._confirmed = None
                     self._inflight = None
                     self._inflight_start = None
                     if not self._closed:
-                        self._fault_reason = str(exc)
+                        self._fault_reason = (
+                            None
+                            if confirmed_position_unchanged
+                            else str(exc)
+                        )
                         self._result_acknowledgement = acknowledgement
                     else:
                         acknowledgement.set()
@@ -6665,6 +3936,9 @@ class CoalescingJointDispatcher:
                         position=position,
                         error=str(exc),
                         pending_discarded=pending_discarded,
+                        confirmed_position_unchanged=(
+                            confirmed_position_unchanged
+                        ),
                         _acknowledgement=acknowledgement,
                     )
                 )

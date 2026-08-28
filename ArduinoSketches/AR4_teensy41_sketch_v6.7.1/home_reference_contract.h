@@ -58,6 +58,56 @@ inline bool primary_home_reference_millidegrees(
   return true;
 }
 
+inline bool primary_parking_reference_from_steps(
+  size_t axis,
+  int calibration_switch_step,
+  int zero_step,
+  float steps_per_degree,
+  float negative_limit_degrees,
+  float positive_limit_degrees,
+  int32_t &millidegrees
+) {
+  if (
+    axis >= kPrimaryHomeReferenceAxisCount
+    || !isfinite(steps_per_degree)
+    || steps_per_degree <= 0.0f
+    || !isfinite(negative_limit_degrees)
+    || negative_limit_degrees < 0.0f
+    || !isfinite(positive_limit_degrees)
+    || positive_limit_degrees < 0.0f
+  ) return false;
+  const float home_degrees = (
+    static_cast<float>(calibration_switch_step)
+    - static_cast<float>(zero_step)
+  ) / steps_per_degree;
+  int32_t home_millidegrees = 0;
+  if (
+    !primary_home_reference_millidegrees(
+      home_degrees,
+      home_millidegrees
+    )
+  ) return false;
+
+  // Quantized limits stay inside the configured envelope for named motion.
+  const double minimum_scaled = ceil(
+    -static_cast<double>(negative_limit_degrees) * 1000.0
+  );
+  const double maximum_scaled = floor(
+    static_cast<double>(positive_limit_degrees) * 1000.0
+  );
+  if (
+    minimum_scaled < static_cast<double>(INT32_MIN)
+    || maximum_scaled > static_cast<double>(INT32_MAX)
+    || minimum_scaled > maximum_scaled
+  ) return false;
+  const int32_t minimum = static_cast<int32_t>(minimum_scaled);
+  const int32_t maximum = static_cast<int32_t>(maximum_scaled);
+  if (home_millidegrees < minimum) home_millidegrees = minimum;
+  if (home_millidegrees > maximum) home_millidegrees = maximum;
+  millidegrees = home_millidegrees;
+  return true;
+}
+
 inline bool set_primary_home_reference(
   PrimaryHomeReferenceState &state,
   size_t axis,

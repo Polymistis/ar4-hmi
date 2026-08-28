@@ -314,14 +314,24 @@ class TeensyFirmwareCompileTests(unittest.TestCase):
         ) as directory:
             child_pid_path = Path(directory) / "child.pid"
             child_source = (
-                "import os,sys,time;"
-                "open(sys.argv[1],'x',encoding='ascii').write(str(os.getpid()));"
-                "time.sleep(60)"
+                "import time\n"
+                "print('ready',flush=True)\n"
+                "time.sleep(60)\n"
             )
             parent_source = (
-                "import subprocess,sys,time;"
-                "subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[1]]);"
-                "time.sleep(60)"
+                "from pathlib import Path\n"
+                "import subprocess,sys,time\n"
+                "child=subprocess.Popen([sys.executable,'-c',sys.argv[2]],"
+                "stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)\n"
+                "ready=child.stdout.readline()\n"
+                "if ready != 'ready\\n':\n"
+                "    print(f'child readiness failed: {ready!r}',"
+                "file=sys.stderr,flush=True)\n"
+                "elif child.poll() is not None:\n"
+                "    print('child exited after readiness',file=sys.stderr,flush=True)\n"
+                "else:\n"
+                "    Path(sys.argv[1]).write_text(str(child.pid),encoding='ascii')\n"
+                "time.sleep(60)\n"
             )
             command = (
                 sys.executable,
@@ -330,15 +340,18 @@ class TeensyFirmwareCompileTests(unittest.TestCase):
                 str(child_pid_path),
                 child_source,
             )
-            with self.assertRaises(subprocess.TimeoutExpired):
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:
                 _run_bounded_process_tree(
                     command,
                     cwd=PROJECT_ROOT,
-                    timeout=1,
+                    timeout=5,
                 )
+            diagnostic = caught.exception.stderr or caught.exception.output or ""
+            diagnostic = diagnostic.strip()
             self.assertTrue(
                 child_pid_path.is_file(),
-                "descendant process did not publish an identity",
+                "parent process did not record a ready child identity"
+                + (f": {diagnostic}" if diagnostic else ""),
             )
             child_pid = int(child_pid_path.read_text(encoding="ascii"))
 
@@ -363,24 +376,28 @@ class TeensyFirmwareCompileTests(unittest.TestCase):
                 wintypes.DWORD,
             ]
             kernel32.OpenProcess.restype = wintypes.HANDLE
-            kernel32.GetExitCodeProcess.argtypes = [
+            kernel32.WaitForSingleObject.argtypes = [
                 wintypes.HANDLE,
-                ctypes.POINTER(wintypes.DWORD),
+                wintypes.DWORD,
             ]
-            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
             kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
             kernel32.CloseHandle.restype = wintypes.BOOL
-            handle = kernel32.OpenProcess(0x1000, False, process_id)
+            handle = kernel32.OpenProcess(0x00100000, False, process_id)
             if not handle:
-                return False
+                error_code = ctypes.get_last_error()
+                if error_code == 87:
+                    return False
+                raise ctypes.WinError(error_code)
             try:
-                exit_code = wintypes.DWORD()
-                if not kernel32.GetExitCodeProcess(
-                    handle,
-                    ctypes.byref(exit_code),
-                ):
+                wait_result = kernel32.WaitForSingleObject(handle, 0)
+                if wait_result == 0xFFFFFFFF:
                     raise ctypes.WinError(ctypes.get_last_error())
-                return exit_code.value == 259
+                if wait_result not in (0, 258):
+                    raise OSError(
+                        f"unexpected process wait result {wait_result}"
+                    )
+                return wait_result == 258
             finally:
                 kernel32.CloseHandle(handle)
 
@@ -404,6 +421,7 @@ class TeensyFirmwareCompileTests(unittest.TestCase):
     def test_tracked_teensy_source_compiles_without_upload(self):
         variable_names = (
             "AR4_ARDUINO_CLI",
+            "AR4_ARDUINOJSON_LIBRARY",
             "AR4_TEENSY_BUILD_DIRECTORY",
             "AR4_TEENSY_SPI_LIBRARY",
         )
@@ -425,6 +443,9 @@ class TeensyFirmwareCompileTests(unittest.TestCase):
         spi_library = Path(
             values["AR4_TEENSY_SPI_LIBRARY"]
         ).resolve(strict=True)
+        arduinojson_library = Path(
+            values["AR4_ARDUINOJSON_LIBRARY"]
+        ).resolve(strict=True)
         self.assertTrue(cli.is_file(), "Arduino CLI path is not a file")
         self.assertTrue(
             build_parent.is_dir(),
@@ -433,6 +454,22 @@ class TeensyFirmwareCompileTests(unittest.TestCase):
         self.assertTrue(
             spi_library.is_dir(),
             "Teensy SPI library path is not a directory",
+        )
+        self.assertTrue(
+            arduinojson_library.is_dir(),
+            "ArduinoJson library path is not a directory",
+        )
+        arduinojson_properties = (
+            arduinojson_library / "library.properties"
+        )
+        self.assertTrue(
+            arduinojson_properties.is_file(),
+            "ArduinoJson library properties are absent",
+        )
+        self.assertRegex(
+            arduinojson_properties.read_text(encoding="utf-8"),
+            r"(?m)^version=7\.4\.3$",
+            "ArduinoJson dependency is not pinned to 7.4.3",
         )
         self.assertEqual(
             tuple(part.casefold() for part in spi_library.parts[-6:]),
@@ -469,6 +506,8 @@ class TeensyFirmwareCompileTests(unittest.TestCase):
                 build_directory,
                 "--library",
                 str(spi_library),
+                "--library",
+                str(arduinojson_library),
                 str(TEENSY_SKETCH),
             )
             self.assertNotIn("--upload", command)
@@ -503,6 +542,11 @@ class TeensyFirmwareCompileTests(unittest.TestCase):
             set(_reported_library_paths(output, "SdFat", "2.1.2")),
             {sd_fat_library},
             "compile did not select the bundled platform SdFat library",
+        )
+        self.assertEqual(
+            set(_reported_library_paths(output, "ArduinoJson", "7.4.3")),
+            {arduinojson_library},
+            "compile did not select the pinned ArduinoJson library",
         )
         self.assertRegex(
             output,

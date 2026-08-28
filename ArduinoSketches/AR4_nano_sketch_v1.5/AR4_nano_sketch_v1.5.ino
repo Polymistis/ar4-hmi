@@ -68,7 +68,7 @@ Servo servoChannels[kServoCount];
 bool servoAttached[kServoCount] = {false, false, false, false, false, false};
 ar4_auxiliary::FrameBuffer commandFrames;
 int currentSensorZeroRaw = 512;
-ar4_auxiliary::WaitState waitOperation = {false, 0, 0, 0, 0};
+ar4_auxiliary::WaitState waitOperation = {false, 0, 0, 0, 0, 0};
 
 void calibrateCurrentSensor() {
   long sampleTotal = 0;
@@ -139,12 +139,137 @@ bool writeServo(uint8_t channel, uint16_t position) {
   return true;
 }
 
-void stopWait() {
-  if (ar4_auxiliary::cancelWait(&waitOperation)) {
-    Serial.println(F("Nano Stopped"));
-  } else {
-    Serial.println(F("Error"));
+void printCommandName(ar4_auxiliary::CommandKind kind) {
+  switch (kind) {
+    case ar4_auxiliary::kHelloCommand:
+      Serial.print(F("hello"));
+      return;
+    case ar4_auxiliary::kServoCommand:
+      Serial.print(F("servo"));
+      return;
+    case ar4_auxiliary::kInputReadCommand:
+      Serial.print(F("input_read"));
+      return;
+    case ar4_auxiliary::kSetOutputCommand:
+      Serial.print(F("set_output"));
+      return;
+    case ar4_auxiliary::kWaitInputCommand:
+      Serial.print(F("wait_input"));
+      return;
+    case ar4_auxiliary::kGripperCurrentCommand:
+      Serial.print(F("test_gripper_amps"));
+      return;
+    case ar4_auxiliary::kStopCommand:
+      Serial.print(F("stop"));
+      return;
+    case ar4_auxiliary::kGripperDetachCommand:
+      Serial.print(F("gripper_detach"));
+      return;
+    case ar4_auxiliary::kUnknownCommand:
+      return;
   }
+}
+
+void beginCompletedResponse(
+  ar4_auxiliary::CommandKind kind,
+  uint32_t requestId
+) {
+  Serial.print(F("{\"cmd\":\""));
+  printCommandName(kind);
+  Serial.print(F("\",\"id\":"));
+  Serial.print(static_cast<unsigned long>(requestId));
+  Serial.print(F(",\"result\":"));
+}
+
+void finishCompletedResponse() {
+  Serial.println(
+    F(",\"status\":\"completed\",\"type\":\"response\",\"v\":1}")
+  );
+}
+
+void sendCompletedEmpty(
+  ar4_auxiliary::CommandKind kind,
+  uint32_t requestId
+) {
+  beginCompletedResponse(kind, requestId);
+  Serial.print(F("{}"));
+  finishCompletedResponse();
+}
+
+void sendCommandError(
+  ar4_auxiliary::CommandKind kind,
+  uint32_t requestId,
+  const __FlashStringHelper* status,
+  const __FlashStringHelper* code,
+  const __FlashStringHelper* message
+) {
+  Serial.print(F("{\"cmd\":\""));
+  printCommandName(kind);
+  Serial.print(F("\",\"error\":{\"code\":\""));
+  Serial.print(code);
+  Serial.print(F("\",\"details\":{},\"message\":\""));
+  Serial.print(message);
+  Serial.print(F("\"},\"id\":"));
+  Serial.print(static_cast<unsigned long>(requestId));
+  Serial.print(F(",\"status\":\""));
+  Serial.print(status);
+  Serial.println(F("\",\"type\":\"response\",\"v\":1}"));
+}
+
+void sendProtocolError() {
+  Serial.println(
+    F("{\"error\":{\"code\":\"invalid_request\",\"details\":{},"
+      "\"message\":\"Invalid request\"},\"type\":\"protocol_error\","
+      "\"v\":1}")
+  );
+}
+
+void sendInvalidParameters(
+  ar4_auxiliary::CommandKind kind,
+  uint32_t requestId
+) {
+  Serial.print(F("{\"cmd\":\""));
+  printCommandName(kind);
+  Serial.print(
+    F("\",\"error\":{\"code\":\"invalid_parameter\","
+      "\"details\":{\"field\":\"params\"},"
+      "\"message\":\"Invalid command parameters\"},\"id\":")
+  );
+  Serial.print(static_cast<unsigned long>(requestId));
+  Serial.println(
+    F(",\"status\":\"rejected\",\"type\":\"response\",\"v\":1}")
+  );
+}
+
+void sendHello(uint32_t requestId) {
+  beginCompletedResponse(ar4_auxiliary::kHelloCommand, requestId);
+  Serial.print(
+    F("{\"board\":\"nano\",\"commands\":[\"hello\",\"servo\","
+      "\"input_read\",\"set_output\",\"wait_input\","
+      "\"test_gripper_amps\",\"stop\",\"gripper_detach\"],"
+      "\"device\":\"auxiliary_controller\",\"firmware\":{"
+      "\"build\":\"ar4hmi\",\"name\":\"AR4 Nano IO\","
+      "\"version\":\"2.0\"},\"protocol\":{"
+      "\"max_payload_bytes\":")
+  );
+  Serial.print(
+    static_cast<unsigned long>(ar4_auxiliary::kMaximumPayloadLength)
+  );
+  Serial.print(F(",\"name\":\"ar4_json\",\"version\":1}}"));
+  finishCompletedResponse();
+}
+
+void stopWait(const ar4_auxiliary::ParsedCommand& stopCommand) {
+  const uint32_t waitRequestId = waitOperation.requestId;
+  ar4_auxiliary::cancelWait(&waitOperation);
+  sendCompletedEmpty(stopCommand.kind, stopCommand.requestId);
+  sendCommandError(
+    ar4_auxiliary::kWaitInputCommand,
+    waitRequestId,
+    F("cancelled"),
+    F("stop_requested"),
+    F("Input wait stopped")
+  );
 }
 
 void serviceWait() {
@@ -165,14 +290,22 @@ void serviceWait() {
     case ar4_auxiliary::kWaitPending:
       return;
     case ar4_auxiliary::kWaitMatched:
-      Serial.println(F("Done"));
+      sendCompletedEmpty(
+        ar4_auxiliary::kWaitInputCommand,
+        waitOperation.requestId
+      );
       return;
     case ar4_auxiliary::kWaitTimedOut:
-      Serial.println(F("Timeout"));
+      sendCommandError(
+        ar4_auxiliary::kWaitInputCommand,
+        waitOperation.requestId,
+        F("failed"),
+        F("timeout"),
+        F("Input wait timed out")
+      );
       return;
     case ar4_auxiliary::kWaitInactive:
       ar4_auxiliary::cancelWait(&waitOperation);
-      Serial.println(F("Error"));
       return;
   }
 }
@@ -180,81 +313,112 @@ void serviceWait() {
 bool beginWait(const ar4_auxiliary::ParsedCommand& command) {
   return ar4_auxiliary::startWait(
     &waitOperation,
-    command.pin,
-    command.state,
-    command.timeoutSeconds,
+    command,
     static_cast<uint32_t>(millis())
   );
 }
 
-void writeEcho(const ar4_auxiliary::ParsedCommand& command) {
-  if (command.payloadLength > 0) {
-    Serial.write(
-      reinterpret_cast<const uint8_t*>(command.payload),
-      command.payloadLength
-    );
-  }
-  Serial.write('\n');
-}
-
 void handleFrame(const ar4_auxiliary::Frame& frame) {
-  ar4_auxiliary::ParsedCommand command;
-  if (
-    !ar4_auxiliary::parseCommand(
+  ar4_auxiliary::ParsedCommand command = {
+    ar4_auxiliary::kUnknownCommand,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+  };
+  const ar4_auxiliary::RequestParseStatus status = (
+    ar4_auxiliary::parseRequest(
       frame.data,
       frame.length,
       kBoardProfile,
       &command
     )
-  ) {
-    Serial.println(F("Error"));
+  );
+  if (status == ar4_auxiliary::kRequestInvalidParameters) {
+    sendInvalidParameters(command.kind, command.requestId);
+    return;
+  }
+  if (status != ar4_auxiliary::kRequestReady) {
+    sendProtocolError();
     return;
   }
 
-  const ar4_auxiliary::CommandDisposition disposition = (
-    ar4_auxiliary::commandDisposition(waitOperation.active, command.kind)
-  );
-  if (disposition == ar4_auxiliary::kStopActiveWait) {
-    stopWait();
-    return;
-  }
-  if (disposition == ar4_auxiliary::kRejectDuringWait) {
-    Serial.println(F("Error"));
+  if (waitOperation.active) {
+    if (command.kind == ar4_auxiliary::kStopCommand) {
+      stopWait(command);
+    } else {
+      sendCommandError(
+        command.kind,
+        command.requestId,
+        F("rejected"),
+        F("busy"),
+        F("Input wait is active")
+      );
+    }
     return;
   }
 
   switch (command.kind) {
+    case ar4_auxiliary::kHelloCommand:
+      sendHello(command.requestId);
+      break;
     case ar4_auxiliary::kServoCommand:
       if (writeServo(command.channel, command.position)) {
-        Serial.print(F("Servo Done"));
+        sendCompletedEmpty(command.kind, command.requestId);
       } else {
-        Serial.println(F("Error"));
+        sendCommandError(
+          command.kind,
+          command.requestId,
+          F("failed"),
+          F("servo_unavailable"),
+          F("Servo attachment failed")
+        );
       }
       break;
     case ar4_auxiliary::kInputReadCommand:
-      Serial.println(digitalRead(command.pin) == HIGH ? F("T") : F("F"));
+      beginCompletedResponse(command.kind, command.requestId);
+      Serial.print(
+        digitalRead(command.pin) == HIGH
+          ? F("{\"state\":true}")
+          : F("{\"state\":false}")
+      );
+      finishCompletedResponse();
       break;
-    case ar4_auxiliary::kOutputOnCommand:
-      digitalWrite(command.pin, HIGH);
-      Serial.print(F("Done"));
-      break;
-    case ar4_auxiliary::kOutputOffCommand:
-      digitalWrite(command.pin, LOW);
-      Serial.print(F("Done"));
+    case ar4_auxiliary::kSetOutputCommand:
+      digitalWrite(command.pin, command.state == 1 ? HIGH : LOW);
+      sendCompletedEmpty(command.kind, command.requestId);
       break;
     case ar4_auxiliary::kWaitInputCommand:
       if (!beginWait(command)) {
-        Serial.println(F("Error"));
+        sendCommandError(
+          command.kind,
+          command.requestId,
+          F("rejected"),
+          F("busy"),
+          F("Input wait is active")
+        );
       }
       break;
     case ar4_auxiliary::kGripperCurrentCommand:
-      Serial.println(readCurrentAmps(), 3);
+      beginCompletedResponse(command.kind, command.requestId);
+      Serial.print(F("{\"amps\":"));
+      Serial.print(readCurrentAmps(), 3);
+      Serial.print(F("}"));
+      finishCompletedResponse();
       break;
     case ar4_auxiliary::kStopCommand:
-      Serial.println(F("Nano Inactive Stopped"));
+      sendCompletedEmpty(command.kind, command.requestId);
       break;
-    case ar4_auxiliary::kEchoCommand:
-      writeEcho(command);
+    case ar4_auxiliary::kGripperDetachCommand:
+      if (servoAttached[0]) {
+        servoChannels[0].detach();
+      }
+      servoAttached[0] = false;
+      sendCompletedEmpty(command.kind, command.requestId);
+      break;
+    case ar4_auxiliary::kUnknownCommand:
       break;
   }
 }
@@ -297,7 +461,7 @@ void loop() {
     if (status == ar4_auxiliary::kFrameReady) {
       handleFrame(frame);
     } else if (status == ar4_auxiliary::kFrameRejected) {
-      Serial.println(F("Error"));
+      sendProtocolError();
     }
     serviceWait();
   }

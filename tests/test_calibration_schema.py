@@ -303,6 +303,29 @@ class CalibrationSchemaTests(unittest.TestCase):
         ):
             normalize_calibration_data(external_ratio)
 
+        load_max_encoder_scale = copy.deepcopy(self.defaults)
+        load_max_encoder_scale["J1DriveMS"] = 12800
+        load_max_encoder_scale["J1EncCPR"] = 4000
+        normalized = normalize_calibration_data(load_max_encoder_scale)
+        self.assertEqual(normalized["J1DriveMS"], 12800)
+        self.assertEqual(normalized["J1EncCPR"], 4000)
+
+        upper_encoder_scale = copy.deepcopy(self.defaults)
+        upper_encoder_scale["J1DriveMS"] = 1
+        upper_encoder_scale["J1EncCPR"] = 2147483647
+        with self.assertRaisesRegex(
+            CalibrationSchemaError,
+            "J1 encoder multiplier",
+        ):
+            normalize_calibration_data(upper_encoder_scale)
+
+        exact_lower_encoder_scale = copy.deepcopy(self.defaults)
+        exact_lower_encoder_scale["J1DriveMS"] = 800
+        exact_lower_encoder_scale["J1EncCPR"] = 800
+        normalized = normalize_calibration_data(exact_lower_encoder_scale)
+        self.assertEqual(normalized["J1DriveMS"], 800)
+        self.assertEqual(normalized["J1EncCPR"], 800)
+
     def test_saved_joint_positions_use_plain_decimal_and_calibrated_limits(self):
         for token in ("1_000", "+1", "1e2"):
             with self.subTest(token=token):

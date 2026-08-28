@@ -16,8 +16,8 @@ constexpr size_t kIdentitySetCommandMaximumLength =
 constexpr size_t kEscapedIdentityCapacity =
     2 * kIdentityFieldMaximumLength + 1;
 constexpr size_t kProtocolCapabilityMaximumLength = 31;
-constexpr size_t kProtocolCapabilityMaximumCount = 16;
-constexpr size_t kIdentityJsonCapacity = 1536;
+constexpr size_t kProtocolCapabilityMaximumCount = 32;
+constexpr size_t kIdentityJsonCapacity = 4096;
 constexpr size_t kControllerHardwareIdLength = 6;
 constexpr size_t kControllerHardwareIdCapacity =
     kControllerHardwareIdLength + 1;

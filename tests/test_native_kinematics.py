@@ -22,7 +22,6 @@ from ARrobots.HMI.joint_motion import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HARNESS_SOURCE = PROJECT_ROOT / "tests" / "native" / "kinematics_contract_test.cpp"
-BINDINGS_SOURCE = PROJECT_ROOT / "ARrobots" / "src" / "bindings.cpp"
 LINUX_BUILD_SCRIPT = PROJECT_ROOT / "ARrobots" / "src" / "build_kinematics.sh"
 
 
@@ -183,34 +182,6 @@ class NativeKinematicsContractTests(unittest.TestCase):
                     firmware_accepts("filename", filename),
                     filename,
                 )
-
-    def test_python_binding_routes_active_configuration(self):
-        source = BINDINGS_SOURCE.read_text(encoding="utf-8")
-        self.assertIn('"SolveInverseKinematicsConfigured"', source)
-        self.assertIn('"set_robot_configuration"', source)
-        self.assertIn("std::vector<float> CheckedMotionVector(", source)
-        self.assertIn("const std::vector<double>& target_xyzuvw", source)
-        self.assertIn("const std::vector<double>& joints", source)
-        self.assertIn(
-            'm.def("SolveInverseKinematics", &SolveInverseKinematicsDegrees',
-            source,
-        )
-        self.assertIn("&SolveInverseKinematicsConfiguredChecked", source)
-        self.assertIn(
-            'm.def("inverse_kinematics", &SolveInverseKinematicsRadians)',
-            source,
-        )
-        self.assertNotIn("inverse_kinematics_robot_xyzuvw<float>", source)
-        self.assertIn(
-            "Robot_JointLimits_Upper[joint] = positive[joint]",
-            source,
-        )
-        self.assertIn(
-            "Robot_JointLimits_Lower[joint] = negative[joint]",
-            source,
-        )
-        self.assertNotIn("JointPosLimit", source)
-        self.assertNotIn("JointNegLimit", source)
 
     def test_linux_python_binding_source_build_and_import(self):
         if sys.platform != "linux":

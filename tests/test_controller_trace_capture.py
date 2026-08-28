@@ -114,6 +114,26 @@ class ControllerTraceCaptureTests(unittest.TestCase):
         ):
             capture.freeze()
 
+    def test_callable_write_admission_never_blocks_motion(self):
+        capture = ControllerTraceCapture(
+            trace_metadata(),
+            clock=SequenceClock(1.0),
+        )
+
+        self.assertIs(capture(), True)
+        self.assertFalse(capture.finalized)
+
+        def failed_clock():
+            raise RuntimeError("monotonic unavailable")
+
+        failed = ControllerTraceCapture(
+            trace_metadata(),
+            clock=failed_clock,
+        )
+        self.assertIs(failed(), True)
+        self.assertTrue(failed.finalized)
+        self.assertIn("capture clock failed", failed.discard_reason)
+
     def test_invalid_capture_sequence_discards_without_late_recovery(self):
         early_sample = ControllerTraceCapture(
             trace_metadata(),

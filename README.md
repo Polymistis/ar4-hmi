@@ -1,5 +1,5 @@
 # AR4 Control Software
-**Host source 6.7 — tracked Teensy derivative 6.7.1-ar4hmi.10**
+**Host source 6.7 — tracked Teensy derivative 6.7.1-ar4hmi.38**
 
 ![AR4 Logo](AR.png)
 
@@ -69,13 +69,16 @@ and active profile before launch. The main-controller startup sequence sends no
 motor-drive command. Opening a configured auxiliary port can reset the board and
 invoke firmware-defined digital-I/O initialization. The tracked Mega firmware
 preloads pins 28-35 high before switching output pins to output mode. Both
-tracked auxiliary firmware builds leave servos detached until an `SV` command
-supplies a target.
+tracked auxiliary firmware builds leave servos detached until a JSON `servo`
+request supplies a target.
+Orderly shutdown submits one best-effort correlated `gripper_detach {}` after
+auxiliary activity settles. Failure after write admission is diagnosed without
+automatic retry.
 
 ## 🧠 Troubleshooting
-- **Serial connection issues** → Verify the correct COM port and a Teensy 4.1 firmware build identifying version `6.7.1-ar4hmi.10` and advertising `JT_WRIST_CONFIG_V1`, `GCODE_DIRECTORY_FRAMING_V1`, `GCODE_DELETE_IDENTITY_V1`, `GCODE_WRITE_IDENTITY_V1`, `ESTOP_ADMISSION_V1`, and `CALIBRATION_SWITCH_POLARITY_V1`.
-- **Motion tracking shows estimates only** → `JOINT_TELEMETRY_V1` is optional; the matching firmware adds request-scoped J1-J6 encoder telemetry while J7-J9 remain estimated.
-- **Shutdown Position unavailable** → `HOME_REFERENCE_V2` is optional for connection but required for the corrected parking action; complete J2 and J3 homing after controller startup or parameter and forced-position updates. Legacy `HOME_REFERENCE_V1` controllers remain connectable but cannot supply the required J3 switch reference.
+- **Serial connection issues** → Verify the correct COM port and matched JSON-only firmware: Teensy `6.7.1-ar4hmi.38` plus Nano/Mega `2.0`. Startup requires the exact command manifests defined by the [JSON protocol](docs/json-protocol-v1.md); legacy serial commands and fallback are not supported.
+- **Motion tracking shows estimates only** → Request-scoped J1-J6 encoder telemetry is selected by JSON `move_joints`. J7-J9 remain estimated because no matching encoder sources are configured.
+- **Shutdown Position unavailable** → JSON startup obtains the J1-J3 home reference after configuration. Complete J2 and J3 homing after controller startup or parameter and forced-position updates.
 - **Display lag in visualization** → Disable real-time rendering under *Settings → Viewer Options*.
 
 ---

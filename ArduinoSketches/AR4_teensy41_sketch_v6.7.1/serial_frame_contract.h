@@ -2,6 +2,7 @@
 #define AR4_SERIAL_FRAME_CONTRACT_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 namespace ar4_protocol {
 
@@ -10,6 +11,7 @@ namespace ar4_protocol {
 constexpr size_t kSerialCommandFrameMaximumLength = 4096;
 constexpr size_t kStoredCommandRowMaximumLength =
   kSerialCommandFrameMaximumLength - 1;
+constexpr uint32_t kSerialFrameReceiveTimeoutMilliseconds = 5000;
 
 enum class SerialFrameReadStatus {
   kPending,
@@ -24,17 +26,106 @@ enum class StoredRowReadStatus {
   kRejected,
 };
 
-enum class LiveControlFrameStatus {
-  kPending,
-  kStop,
-  kRejected,
+struct SerialFrameReceiveDeadline {
+  bool active;
+  bool discarding_timed_out_frame;
+  uint32_t started_at_milliseconds;
 };
 
-enum class LiveTerminalResponseKind {
-  kPosition,
-  kError,
-  kAxisLimit,
-};
+template <typename Text>
+inline SerialFrameReadStatus append_serial_frame_byte(
+  Text &frame,
+  bool &discarding,
+  int received
+);
+
+inline void abandon_serial_frame_receive_deadline(
+  SerialFrameReceiveDeadline &deadline
+) {
+  deadline = {};
+}
+
+inline void update_serial_frame_receive_deadline(
+  uint32_t now_milliseconds,
+  SerialFrameReadStatus status,
+  size_t partial_frame_length,
+  bool discarding,
+  SerialFrameReceiveDeadline &deadline
+) {
+  if (deadline.discarding_timed_out_frame) {
+    if (!discarding) abandon_serial_frame_receive_deadline(deadline);
+    return;
+  }
+  const bool pending = partial_frame_length != 0 || discarding;
+  if (status == SerialFrameReadStatus::kComplete || !pending) {
+    abandon_serial_frame_receive_deadline(deadline);
+    return;
+  }
+  if (!deadline.active) {
+    deadline.active = true;
+    deadline.started_at_milliseconds = now_milliseconds;
+  }
+}
+
+template <typename Text>
+inline void expire_serial_frame_receive(
+  Text &frame,
+  bool &discarding,
+  SerialFrameReceiveDeadline &deadline
+) {
+  frame = "";
+  discarding = true;
+  deadline.active = false;
+  deadline.discarding_timed_out_frame = true;
+  deadline.started_at_milliseconds = 0;
+}
+
+inline bool serial_frame_receive_timed_out(
+  uint32_t now_milliseconds,
+  const SerialFrameReceiveDeadline &deadline
+) {
+  return deadline.active
+    && static_cast<uint32_t>(
+      now_milliseconds - deadline.started_at_milliseconds
+    ) >= kSerialFrameReceiveTimeoutMilliseconds;
+}
+
+template <typename ReadByte, typename Text>
+inline SerialFrameReadStatus service_serial_frame_input(
+  uint32_t now_milliseconds,
+  ReadByte &read_byte,
+  Text &frame,
+  bool &discarding,
+  SerialFrameReceiveDeadline &deadline,
+  size_t maximum_bytes = kSerialCommandFrameMaximumLength
+) {
+  if (maximum_bytes == 0 || maximum_bytes > kSerialCommandFrameMaximumLength) {
+    return SerialFrameReadStatus::kOverflow;
+  }
+  SerialFrameReadStatus status = SerialFrameReadStatus::kPending;
+  size_t consumed = 0;
+  int received = -1;
+  while (consumed < maximum_bytes && (received = read_byte()) >= 0) {
+    status = append_serial_frame_byte(frame, discarding, received);
+    update_serial_frame_receive_deadline(
+      now_milliseconds,
+      status,
+      frame.length(),
+      discarding,
+      deadline
+    );
+    ++consumed;
+    if (status != SerialFrameReadStatus::kPending) return status;
+  }
+  return status;
+}
+
+inline bool retain_serial_frame_discarding(
+  bool discarding,
+  size_t partial_frame_length
+) {
+  return discarding || partial_frame_length != 0;
+}
 
 template <typename Text>
 inline SerialFrameReadStatus append_serial_frame_byte(
@@ -86,45 +177,6 @@ inline StoredRowReadStatus finish_stored_row(const Text &row) {
   return row.length() == 0
     ? StoredRowReadStatus::kRejected
     : StoredRowReadStatus::kComplete;
-}
-
-inline LiveControlFrameStatus classify_live_control_frame(
-  SerialFrameReadStatus status,
-  const char *frame,
-  size_t frame_length
-) {
-  if (status == SerialFrameReadStatus::kPending) {
-    return LiveControlFrameStatus::kPending;
-  }
-  if (status == SerialFrameReadStatus::kOverflow || frame == nullptr) {
-    return LiveControlFrameStatus::kRejected;
-  }
-  const bool line_feed_stop =
-    frame_length == 2 && frame[0] == 'S' && frame[1] == '\n';
-  const bool carriage_return_stop =
-    frame_length == 3
-    && frame[0] == 'S'
-    && frame[1] == '\r'
-    && frame[2] == '\n';
-  return line_feed_stop || carriage_return_stop
-    ? LiveControlFrameStatus::kStop
-    : LiveControlFrameStatus::kRejected;
-}
-
-inline LiveTerminalResponseKind select_live_terminal_response(
-  LiveControlFrameStatus control_status,
-  int kinematic_error,
-  int axis_fault
-) {
-  if (
-    control_status == LiveControlFrameStatus::kRejected
-    || kinematic_error != 0
-  ) {
-    return LiveTerminalResponseKind::kError;
-  }
-  return axis_fault == 0
-    ? LiveTerminalResponseKind::kPosition
-    : LiveTerminalResponseKind::kAxisLimit;
 }
 
 }  // namespace ar4_protocol

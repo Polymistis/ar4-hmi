@@ -3,10 +3,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 namespace ar4_auxiliary {
 
-static const size_t kMaximumCommandLength = 96;
+static const size_t kMaximumPayloadLength = 384;
 static const uint32_t kMaximumWaitSeconds = 32767UL;
 
 enum BoardProfile : uint8_t {
@@ -15,25 +16,31 @@ enum BoardProfile : uint8_t {
 };
 
 enum CommandKind : uint8_t {
+  kHelloCommand,
   kServoCommand,
   kInputReadCommand,
-  kOutputOnCommand,
-  kOutputOffCommand,
+  kSetOutputCommand,
   kWaitInputCommand,
   kGripperCurrentCommand,
   kStopCommand,
-  kEchoCommand,
+  kGripperDetachCommand,
+  kUnknownCommand,
 };
 
 struct ParsedCommand {
   CommandKind kind;
+  uint32_t requestId;
   uint8_t channel;
   uint8_t pin;
   uint8_t state;
   uint16_t position;
   uint16_t timeoutSeconds;
-  const char* payload;
-  size_t payloadLength;
+};
+
+enum RequestParseStatus : uint8_t {
+  kRequestReady,
+  kRequestInvalidEnvelope,
+  kRequestInvalidParameters,
 };
 
 enum WaitResult : uint8_t {
@@ -47,14 +54,9 @@ struct WaitState {
   bool active;
   uint8_t pin;
   uint8_t expectedState;
+  uint32_t requestId;
   uint32_t startedAtMilliseconds;
   uint32_t timeoutMilliseconds;
-};
-
-enum CommandDisposition : uint8_t {
-  kExecuteCommand,
-  kRejectDuringWait,
-  kStopActiveWait,
 };
 
 enum FrameStatus : uint8_t {
@@ -77,11 +79,22 @@ class FrameBuffer {
   FrameStatus push(char byte, Frame* frame) {
     const uint8_t value = static_cast<uint8_t>(byte);
     if (value == static_cast<uint8_t>('\n')) {
-      const bool rejected = discarding_ || length_ == 0 || frame == NULL;
+      size_t payloadLength = length_;
+      if (
+        payloadLength > 0
+        && data_[payloadLength - 1] == '\r'
+      ) {
+        --payloadLength;
+      }
+      const bool rejected = (
+        discarding_
+        || payloadLength == 0
+        || frame == NULL
+      );
       if (!rejected) {
-        data_[length_] = '\0';
+        data_[payloadLength] = '\0';
         frame->data = data_;
-        frame->length = length_;
+        frame->length = payloadLength;
       }
       length_ = 0;
       discarding_ = false;
@@ -92,37 +105,25 @@ class FrameBuffer {
       return kFramePending;
     }
     if (
-      value < static_cast<uint8_t>(' ')
-      || value > static_cast<uint8_t>('~')
-      || length_ >= kMaximumCommandLength
+      (value != static_cast<uint8_t>('\r')
+        && (value < static_cast<uint8_t>(' ')
+          || value > static_cast<uint8_t>('~')))
+      || length_ >= kMaximumPayloadLength
     ) {
-      // Discard through LF so one malformed frame produces one response.
+      // Retain framing ownership through LF after one malformed payload.
       discarding_ = true;
       return kFramePending;
     }
 
-    data_[length_] = byte;
-    ++length_;
+    data_[length_++] = byte;
     return kFramePending;
   }
 
-  size_t length() const {
-    return length_;
-  }
-
-  bool discarding() const {
-    return discarding_;
-  }
-
  private:
-  char data_[kMaximumCommandLength + 1];
+  char data_[kMaximumPayloadLength + 1];
   size_t length_;
   bool discarding_;
 };
-
-inline bool boardProfileValid(BoardProfile board) {
-  return board == kNanoBoard || board == kMegaBoard;
-}
 
 inline bool inputPinValid(BoardProfile board, uint32_t pin) {
   if (board == kNanoBoard) {
@@ -145,97 +146,171 @@ inline bool servoChannelValid(BoardProfile board, uint32_t channel) {
   return board == kMegaBoard && channel <= 6UL;
 }
 
-inline bool literalMatches(
-  const char* text,
-  size_t length,
-  const char* literal,
-  size_t literalLength
-) {
-  if (text == NULL || literal == NULL || length != literalLength) {
-    return false;
-  }
-  for (size_t index = 0; index < length; ++index) {
-    if (text[index] != literal[index]) {
-      return false;
-    }
-  }
-  return true;
-}
+// Canonical host key order permits fixed-memory parsing on the 2 KiB Nano.
+class RequestCursor {
+ public:
+  RequestCursor(const char* text, size_t length)
+    : text_(text), length_(length), index_(0) {}
 
-inline bool prefixMatches(
-  const char* text,
-  size_t length,
-  const char* prefix,
-  size_t prefixLength
-) {
-  if (
-    text == NULL
-    || prefix == NULL
-    || length < prefixLength
-  ) {
-    return false;
-  }
-  for (size_t index = 0; index < prefixLength; ++index) {
-    if (text[index] != prefix[index]) {
-      return false;
-    }
-  }
-  return true;
-}
-
-inline bool parseUnsigned(
-  const char* text,
-  size_t begin,
-  size_t end,
-  uint32_t maximum,
-  uint32_t* result
-) {
-  if (
-    text == NULL
-    || result == NULL
-    || begin >= end
-  ) {
-    return false;
-  }
-  uint32_t value = 0;
-  for (size_t index = begin; index < end; ++index) {
-    const char digitCharacter = text[index];
-    if (digitCharacter < '0' || digitCharacter > '9') {
-      return false;
-    }
-    const uint32_t digit = static_cast<uint32_t>(
-      digitCharacter - '0'
-    );
+  bool take(const char* literal) {
+    if (literal == NULL) return false;
+    const size_t literalLength = strlen(literal);
     if (
-      digit > maximum
-      || value > (maximum - digit) / 10UL
+      text_ == NULL
+      || literalLength > length_ - index_
+      || memcmp(text_ + index_, literal, literalLength) != 0
     ) {
       return false;
     }
-    value = value * 10UL + digit;
+    index_ += literalLength;
+    return true;
   }
-  *result = value;
-  return true;
-}
 
-inline size_t findMarker(
-  const char* text,
-  size_t begin,
-  size_t length,
-  char marker
-) {
-  if (text == NULL || begin >= length) {
-    return length;
-  }
-  for (size_t index = begin; index < length; ++index) {
-    if (text[index] == marker) {
-      return index;
+  bool takeUnsigned(uint32_t maximum, uint32_t* result) {
+    if (text_ == NULL || result == NULL || index_ >= length_) return false;
+    if (text_[index_] < '0' || text_[index_] > '9') return false;
+
+    uint32_t value = 0;
+    if (text_[index_] == '0') {
+      ++index_;
+      if (
+        index_ < length_
+        && text_[index_] >= '0'
+        && text_[index_] <= '9'
+      ) {
+        return false;
+      }
+    } else {
+      while (
+        index_ < length_
+        && text_[index_] >= '0'
+        && text_[index_] <= '9'
+      ) {
+        const uint32_t digit = static_cast<uint32_t>(text_[index_] - '0');
+        if (value > (maximum - digit) / 10UL) return false;
+        value = value * 10UL + digit;
+        ++index_;
+      }
     }
+    if (value > maximum) return false;
+    *result = value;
+    return true;
   }
-  return length;
+
+  bool takeBoolean(uint8_t* result) {
+    if (result == NULL) return false;
+    if (take("true")) {
+      *result = 1;
+      return true;
+    }
+    if (take("false")) {
+      *result = 0;
+      return true;
+    }
+    return false;
+  }
+
+  bool complete() const {
+    return index_ == length_;
+  }
+
+ private:
+  const char* text_;
+  size_t length_;
+  size_t index_;
+};
+
+inline CommandKind takeCommandName(RequestCursor* cursor) {
+  if (cursor == NULL) return kUnknownCommand;
+  if (cursor->take("hello\"")) return kHelloCommand;
+  if (cursor->take("servo\"")) return kServoCommand;
+  if (cursor->take("input_read\"")) return kInputReadCommand;
+  if (cursor->take("set_output\"")) return kSetOutputCommand;
+  if (cursor->take("wait_input\"")) return kWaitInputCommand;
+  if (cursor->take("test_gripper_amps\"")) {
+    return kGripperCurrentCommand;
+  }
+  if (cursor->take("stop\"")) return kStopCommand;
+  if (cursor->take("gripper_detach\"")) return kGripperDetachCommand;
+  return kUnknownCommand;
 }
 
-inline bool parseCommand(
+inline bool takeParameters(
+  RequestCursor* cursor,
+  BoardProfile board,
+  ParsedCommand* command
+) {
+  if (cursor == NULL || command == NULL) return false;
+  uint32_t first = 0;
+  uint32_t second = 0;
+  switch (command->kind) {
+    case kHelloCommand:
+    case kGripperCurrentCommand:
+    case kStopCommand:
+    case kGripperDetachCommand:
+      return cursor->take("{}");
+    case kServoCommand:
+      if (
+        !cursor->take("{\"channel\":")
+        || !cursor->takeUnsigned(6UL, &first)
+        || !cursor->take(",\"position\":")
+        || !cursor->takeUnsigned(180UL, &second)
+        || !cursor->take("}")
+        || !servoChannelValid(board, first)
+      ) {
+        return false;
+      }
+      command->channel = static_cast<uint8_t>(first);
+      command->position = static_cast<uint16_t>(second);
+      return true;
+    case kInputReadCommand:
+      if (
+        !cursor->take("{\"pin\":")
+        || !cursor->takeUnsigned(53UL, &first)
+        || !cursor->take("}")
+        || !inputPinValid(board, first)
+      ) {
+        return false;
+      }
+      command->pin = static_cast<uint8_t>(first);
+      return true;
+    case kSetOutputCommand:
+      if (
+        !cursor->take("{\"pin\":")
+        || !cursor->takeUnsigned(53UL, &first)
+        || !cursor->take(",\"state\":")
+        || !cursor->takeBoolean(&command->state)
+        || !cursor->take("}")
+        || !outputPinValid(board, first)
+      ) {
+        return false;
+      }
+      command->pin = static_cast<uint8_t>(first);
+      return true;
+    case kWaitInputCommand:
+      if (
+        !cursor->take("{\"pin\":")
+        || !cursor->takeUnsigned(53UL, &first)
+        || !cursor->take(",\"state\":")
+        || !cursor->takeBoolean(&command->state)
+        || !cursor->take(",\"timeout_seconds\":")
+        || !cursor->takeUnsigned(kMaximumWaitSeconds, &second)
+        || second == 0UL
+        || !cursor->take("}")
+        || !inputPinValid(board, first)
+      ) {
+        return false;
+      }
+      command->pin = static_cast<uint8_t>(first);
+      command->timeoutSeconds = static_cast<uint16_t>(second);
+      return true;
+    case kUnknownCommand:
+      return false;
+  }
+  return false;
+}
+
+inline RequestParseStatus parseRequest(
   const char* text,
   size_t length,
   BoardProfile board,
@@ -245,119 +320,46 @@ inline bool parseCommand(
     text == NULL
     || result == NULL
     || length == 0
-    || length > kMaximumCommandLength
-    || !boardProfileValid(board)
+    || length > kMaximumPayloadLength
+    || (board != kNanoBoard && board != kMegaBoard)
   ) {
-    return false;
+    return kRequestInvalidEnvelope;
   }
 
-  ParsedCommand parsed;
-  parsed.channel = 0;
-  parsed.pin = 0;
-  parsed.state = 0;
-  parsed.position = 0;
-  parsed.timeoutSeconds = 0;
-  parsed.payload = NULL;
-  parsed.payloadLength = 0;
-
-  if (literalMatches(text, length, "TG", 2)) {
-    parsed.kind = kGripperCurrentCommand;
-  } else if (
-    literalMatches(text, length, "STOP", 4)
-    || literalMatches(text, length, "STOPWI", 6)
+  ParsedCommand parsed = {
+    kUnknownCommand,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+  };
+  RequestCursor cursor(text, length);
+  if (!cursor.take("{\"cmd\":\"")) return kRequestInvalidEnvelope;
+  parsed.kind = takeCommandName(&cursor);
+  if (
+    parsed.kind == kUnknownCommand
+    || !cursor.take(",\"id\":")
+    || !cursor.takeUnsigned(UINT32_MAX, &parsed.requestId)
+    || parsed.requestId == 0
+    || !cursor.take(",\"params\":")
   ) {
-    parsed.kind = kStopCommand;
-  } else if (prefixMatches(text, length, "TM", 2)) {
-    parsed.kind = kEchoCommand;
-    parsed.payload = text + 2;
-    parsed.payloadLength = length - 2;
-  } else if (prefixMatches(text, length, "SV", 2)) {
-    const size_t positionMarker = findMarker(text, 2, length, 'P');
-    uint32_t channel = 0;
-    uint32_t position = 0;
-    if (
-      positionMarker == length
-      || !parseUnsigned(text, 2, positionMarker, 6UL, &channel)
-      || !parseUnsigned(
-        text,
-        positionMarker + 1,
-        length,
-        180UL,
-        &position
-      )
-      || !servoChannelValid(board, channel)
-    ) {
-      return false;
-    }
-    parsed.kind = kServoCommand;
-    parsed.channel = static_cast<uint8_t>(channel);
-    parsed.position = static_cast<uint16_t>(position);
-  } else if (prefixMatches(text, length, "JFX", 3)) {
-    uint32_t pin = 0;
-    if (
-      !parseUnsigned(text, 3, length, 53UL, &pin)
-      || !inputPinValid(board, pin)
-    ) {
-      return false;
-    }
-    parsed.kind = kInputReadCommand;
-    parsed.pin = static_cast<uint8_t>(pin);
-  } else if (
-    prefixMatches(text, length, "ONX", 3)
-    || prefixMatches(text, length, "OFX", 3)
-  ) {
-    uint32_t pin = 0;
-    if (
-      !parseUnsigned(text, 3, length, 53UL, &pin)
-      || !outputPinValid(board, pin)
-    ) {
-      return false;
-    }
-    parsed.kind = text[1] == 'N' ? kOutputOnCommand : kOutputOffCommand;
-    parsed.pin = static_cast<uint8_t>(pin);
-  } else if (prefixMatches(text, length, "WIA", 3)) {
-    const size_t stateMarker = findMarker(text, 3, length, 'B');
-    const size_t timeoutMarker = (
-      stateMarker == length
-      ? length
-      : findMarker(text, stateMarker + 1, length, 'C')
-    );
-    uint32_t pin = 0;
-    uint32_t state = 0;
-    uint32_t timeout = 0;
-    if (
-      stateMarker == length
-      || timeoutMarker == length
-      || !parseUnsigned(text, 3, stateMarker, 53UL, &pin)
-      || !parseUnsigned(
-        text,
-        stateMarker + 1,
-        timeoutMarker,
-        1UL,
-        &state
-      )
-      || !parseUnsigned(
-        text,
-        timeoutMarker + 1,
-        length,
-        kMaximumWaitSeconds,
-        &timeout
-      )
-      || timeout == 0UL
-      || !inputPinValid(board, pin)
-    ) {
-      return false;
-    }
-    parsed.kind = kWaitInputCommand;
-    parsed.pin = static_cast<uint8_t>(pin);
-    parsed.state = static_cast<uint8_t>(state);
-    parsed.timeoutSeconds = static_cast<uint16_t>(timeout);
-  } else {
-    return false;
+    return kRequestInvalidEnvelope;
   }
 
   *result = parsed;
-  return true;
+  if (!takeParameters(&cursor, board, &parsed)) {
+    return kRequestInvalidParameters;
+  }
+  if (
+    !cursor.take(",\"type\":\"request\",\"v\":1}")
+    || !cursor.complete()
+  ) {
+    return kRequestInvalidEnvelope;
+  }
+  *result = parsed;
+  return kRequestReady;
 }
 
 inline bool waitExpired(
@@ -365,39 +367,34 @@ inline bool waitExpired(
   uint32_t timeoutMilliseconds,
   uint32_t nowMilliseconds
 ) {
-  // Unsigned subtraction preserves elapsed time across millis() rollover.
-  return (
-    static_cast<uint32_t>(
-      nowMilliseconds - startedAtMilliseconds
-    )
-    >= timeoutMilliseconds
-  );
+  return static_cast<uint32_t>(
+    nowMilliseconds - startedAtMilliseconds
+  ) >= timeoutMilliseconds;
 }
 
 inline bool startWait(
   WaitState* state,
-  uint8_t pin,
-  uint8_t expectedState,
-  uint16_t timeoutSeconds,
+  const ParsedCommand& command,
   uint32_t nowMilliseconds
 ) {
   if (
     state == NULL
     || state->active
-    || expectedState > 1
-    || timeoutSeconds == 0
-    || timeoutSeconds > kMaximumWaitSeconds
+    || command.kind != kWaitInputCommand
+    || command.requestId == 0
+    || command.timeoutSeconds == 0
+    || command.timeoutSeconds > kMaximumWaitSeconds
+    || command.state > 1
   ) {
     return false;
   }
   WaitState started = {
     true,
-    pin,
-    expectedState,
+    command.pin,
+    command.state,
+    command.requestId,
     nowMilliseconds,
-    static_cast<uint32_t>(
-      static_cast<uint32_t>(timeoutSeconds) * 1000UL
-    ),
+    static_cast<uint32_t>(command.timeoutSeconds) * 1000UL,
   };
   *state = started;
   return true;
@@ -408,24 +405,18 @@ inline WaitResult updateWait(
   uint8_t observedState,
   uint32_t nowMilliseconds
 ) {
-  if (
-    state == NULL
-    || !state->active
-    || observedState > 1
-  ) {
+  if (state == NULL || !state->active || observedState > 1) {
     return kWaitInactive;
   }
   if (observedState == state->expectedState) {
     state->active = false;
     return kWaitMatched;
   }
-  if (
-    waitExpired(
+  if (waitExpired(
       state->startedAtMilliseconds,
       state->timeoutMilliseconds,
       nowMilliseconds
-    )
-  ) {
+  )) {
     state->active = false;
     return kWaitTimedOut;
   }
@@ -433,24 +424,9 @@ inline WaitResult updateWait(
 }
 
 inline bool cancelWait(WaitState* state) {
-  if (state == NULL || !state->active) {
-    return false;
-  }
+  if (state == NULL || !state->active) return false;
   state->active = false;
   return true;
-}
-
-inline CommandDisposition commandDisposition(
-  bool waitActive,
-  CommandKind kind
-) {
-  if (!waitActive) {
-    return kExecuteCommand;
-  }
-  if (kind == kStopCommand) {
-    return kStopActiveWait;
-  }
-  return kRejectDuringWait;
 }
 
 }  // namespace ar4_auxiliary

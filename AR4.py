@@ -201,36 +201,37 @@ from ARrobots.controller_trace_capture import (
   controller_configuration_fingerprint,
 )
 from ARrobots.HMI.Calibration import apply_calibration
+from ARrobots.HMI.program_model import (
+  decode_program_row_content as _decode_program_row_content,
+  normalize_program_tab_number as _normalize_program_tab_number,
+  program_bounded_index as _program_bounded_index,
+  program_row_error_detail as _program_row_error_detail,
+  program_row_index as _program_row_index,
+  program_row_is_supported as _program_row_is_supported,
+  program_tab_row_index as _program_tab_row_index,
+)
 from ARrobots.HMI.joint_motion import (
   AUXILIARY_BOARD_MEGA,
   AUXILIARY_BOARD_NANO,
   AUXILIARY_BOARD_NONE,
   AUXILIARY_WAIT_MAXIMUM_SECONDS,
-  CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
-  CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
-  CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
-  CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
-  CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
-  CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1,
-  CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
   CONTROLLER_ESTOP_ADMISSION_FLAG,
   CONTROLLER_ESTOP_EVENT_FLAG,
   CONTROLLER_PHYSICAL_ESTOP_FLAGS,
-  CONTROLLER_HARDWARE_ID_LENGTH,
   CONTROLLER_MEDIA_ID_LENGTH,
   CoalescingJointDispatcher,
-  CONTROL_POLL_INTERVAL_SECONDS,
+  CommandTiming,
   ControllerIdentity,
   ControllerJointCalibration,
-  ControllerLineExchangeResponse,
-  ControllerModbusExchangeResponse,
+  CartesianMotionCommand,
+  JointMotionCommand,
+  ToolJogCommand,
+  JointMotionExchangeResult,
   DeferredJointDispatchOutcome,
   DeferredLiveMotionArbiter,
   LiveMotionScheduleResult,
   DeferredJointAdjustments,
-  MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES,
   MAX_COMMAND_LENGTH,
-  MAX_RESPONSE_FRAME_LENGTH,
   MAX_RESPONSE_PAYLOAD_LENGTH,
   MotionInputError,
   MotionQueueFault,
@@ -259,49 +260,35 @@ from ARrobots.HMI.joint_motion import (
   controller_number,
   controller_protocol_decimal,
   controller_ratio,
-  decode_serial_response_line,
   encode_calibration_switch_mask,
-  exchange_serial_line,
-  exchange_serial_line_until_cancelled,
   finite_number,
-  joint_telemetry_response_budget,
   motion_timing_response_timeout,
   normalize_auxiliary_board_profile,
   parse_auxiliary_output_command,
-  parse_auxiliary_gripper_current_response,
   parse_auxiliary_servo_command,
   parse_command_timing,
-  parse_controller_identity_response,
-  parse_controller_modbus_exchange_frames,
+  parse_cartesian_motion_command,
+  parse_controller_modbus_command,
   parse_controller_modbus_response,
-  parse_joint_motion_exchange_response,
+  parse_joint_motion_command,
+  parse_tool_jog_command,
   parse_motion_wrist_config,
   parse_position_response,
   position_response_is_physical_estop,
-  parse_primary_home_reference_capability_response,
   parse_virtual_command_timing,
-  primary_home_reference_command,
   primary_shutdown_position,
   quarantine_serial_transport,
-  read_controller_exact_exchange_response,
-  read_controller_line_exchange_response,
-  read_controller_modbus_exchange_response,
-  read_pending_controller_estop_response,
-  read_serial_exact_response,
-  read_serial_line_response,
-  read_serial_line_response_with_optional_followup,
-  request_joint_telemetry,
   serial_transport_quarantined,
   validate_auxiliary_output_command,
   validate_auxiliary_gripper_current_command,
   validate_auxiliary_input_command,
   validate_auxiliary_servo_command,
   validate_auxiliary_wait_command,
-  validate_controller_modbus_command,
+  validate_controller_encoder_scale,
   validate_controller_filename,
   validate_controller_hardware_id,
   validate_controller_media_id,
-  write_serial_control,
+  validate_controller_modbus_command,
 )
 from ARrobots.HMI.joint_visualization import (
   ENCODER_MARKER_ROLE,
@@ -310,6 +297,39 @@ from ARrobots.HMI.joint_visualization import (
   GhostSliderMarker,
   JointMotionVisualization,
   set_joint_slider_positions,
+)
+from ARrobots.protocol import (
+  JSON_CONTROLLER_WAIT_MAXIMUM_SECONDS,
+  JSON_COORDINATOR_DEFAULT_CLOSE_TIMEOUT_SECONDS,
+  JSON_LIVE_MOTION_LEASE_MAXIMUM_MILLISECONDS,
+  JSON_MAIN_FIRMWARE_FRAME_RECEIVE_TIMEOUT_SECONDS,
+  JSON_SERIAL_DEFAULT_POLL_INTERVAL_SECONDS,
+  Event,
+  JsonEventDelivery,
+  JsonAuxiliaryControllerClient,
+  JsonAuxiliaryCurrentResult,
+  JsonAuxiliaryHelloResult,
+  JsonAuxiliaryInputResult,
+  JsonMainControllerClient,
+  JsonMainControllerPersistentStartupResult,
+  JsonMainControllerPhysicalStop,
+  JsonMainControllerStartupCleanupError,
+  JsonMainControllerStartupConfiguration,
+  JsonMainCalibrationResult,
+  JsonMainCartesianMotionResult,
+  JsonMainDeleteSdProgramResult,
+  JsonMainHomeReferenceResult,
+  JsonMainPositionResult,
+  JsonMainSdProgramListResult,
+  JsonScalarResult,
+  JsonResponseDelivery,
+  JsonTelemetryDelivery,
+  controller_identity_from_json_hello,
+  encode_message,
+  parse_main_joint_position_telemetry,
+  parse_main_motion_position_result,
+  retain_main_controller_startup_disposition_error,
+  run_main_controller_json_startup,
 )
 from ARrobots.HMI.vision_io import (
   MAX_CAMERA_PREVIEW_EVENT_DETAIL,
@@ -805,9 +825,6 @@ manual_controller_active_request = None
 manual_controller_activity_lease = None
 manual_controller_next_request_id = 0
 manual_controller_state_lock = threading.Lock()
-manual_controller_pending_stop_event = None
-manual_controller_estop_applied_request_id = None
-manual_controller_estop_applied_position = None
 manual_controller_cleanup_lock = threading.Lock()
 manual_controller_cleanup_pending = None
 gcode_storage_event_queue = Queue()
@@ -870,11 +887,12 @@ acknowledged_forced_position_lock = threading.Lock()
 acknowledged_forced_position_target = None
 virtual_motion_event_queue = Queue()
 offline_live_jog_operation = None
-legacy_serial_result_pending = threading.Event()
+serial_result_pending = threading.Event()
 live_serial_result_pending = threading.Event()
 live_jog_stop_requested = threading.Event()
 application_closing = threading.Event()
 application_shutdown_started_at = None
+auxiliary_gripper_detach_shutdown_attempted = False
 camera_preview_shutdown_started_at = None
 camera_preview_shutdown_timeout_reported = False
 shutdown_serial_cancel_requested = set()
@@ -913,34 +931,23 @@ class SerialWriteCancellationBoundary:
     return cancelled
 
   def cancel(self):
-    acquired = self._lock.acquire()
-    if acquired is False:
-      raise RuntimeError(
-        f"{self._context} cancellation boundary acquisition failed"
-      )
-    try:
+    with self._lock:
       self._event.set()
-    finally:
-      self._lock.release()
     return True
 
   def set(self):
     return self.cancel()
 
   def clear(self):
-    acquired = self._lock.acquire()
-    if acquired is False:
-      raise RuntimeError(
-        f"{self._context} cancellation boundary acquisition failed"
-      )
-    try:
+    with self._lock:
       self._event.clear()
-    finally:
-      self._lock.release()
     return True
 
   def wait(self, timeout=None):
     return self._event.wait(timeout)
+
+  def write_reservation(self):
+    return self._lock
 
   def acquire(self):
     return self._lock.acquire()
@@ -1008,10 +1015,17 @@ AUXILIARY_DEVICE_MAX_PORT_NUMBER = 65535
 AUXILIARY_DEVICE_MAX_ERROR_DETAIL = 512
 AUXILIARY_DEVICE_CLEANUP_RETRY_SECONDS = 1.0
 AUXILIARY_DEVICE_SHUTDOWN_CLOSE_ATTEMPTS = 3
-# Teensy WJ, WK, and WT convert seconds to signed 32-bit milliseconds.
-MAIN_FIRMWARE_WAIT_MAX_SECONDS = 2147483
+# Main-controller Modbus waits convert seconds to signed 32-bit milliseconds.
+MAIN_MODBUS_WAIT_MAX_SECONDS = 2147483
 # Firmware emits the live acknowledgement before entering segment execution.
 SERIAL_LIVE_ACK_TIMEOUT_SECONDS = 5
+JSON_LIVE_MOTION_RENEWAL_INTERVAL_SECONDS = (
+  JSON_LIVE_MOTION_LEASE_MAXIMUM_MILLISECONDS / 2000.0
+)
+JSON_LIVE_MOTION_RESPONSE_TIMEOUT_SECONDS = (
+  JSON_LIVE_MOTION_LEASE_MAXIMUM_MILLISECONDS / 1000.0 +
+  2.0 * JSON_MAIN_FIRMWARE_FRAME_RECEIVE_TIMEOUT_SECONDS + 1.0
+)
 SERIAL_STARTUP_READ_TIMEOUT_SECONDS = 10
 SERIAL_SHUTDOWN_POLL_MS = 25
 SERIAL_SHUTDOWN_RETRY_MS = 1000
@@ -1019,13 +1033,14 @@ SERIAL_SHUTDOWN_ACTIVITY_GRACE_SECONDS = 1.0
 FIRMWARE_AXIS_COUNT = 9
 FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS = 30
 FIRMWARE_MAX_MILLIMETERS_PER_SECOND = 192
-AUXILIARY_WAIT_TERMINAL_RESPONSES = ("Done", "Timeout", "Nano Stopped")
-AUXILIARY_WAIT_NATURAL_RESPONSES = ("Done", "Timeout")
-AUXILIARY_INACTIVE_STOP_RESPONSE = "Nano Inactive Stopped"
-AUXILIARY_STOP_OWNER_RESPONSES = (
-  *AUXILIARY_WAIT_TERMINAL_RESPONSES,
-  AUXILIARY_INACTIVE_STOP_RESPONSE,
-)
+FIRMWARE_CALIBRATION_SEARCH_SPEED_PERCENTAGES = (25.0, 2.0)
+FIRMWARE_CALIBRATION_RELEASE_SPEED_PERCENT = 5.0
+FIRMWARE_CALIBRATION_RELEASE_TRAVEL_UNITS = 10.0
+FIRMWARE_CALIBRATION_STEP_PULSE_MICROSECONDS = 5
+FIRMWARE_CALIBRATION_SEARCH_LOOP_MICROSECONDS = 100
+FIRMWARE_CALIBRATION_SWITCH_STABLE_MICROSECONDS = 3000
+FIRMWARE_CALIBRATION_CENTER_MAXIMUM_DELAY_MULTIPLIER = 5.0
+AUXILIARY_STOP_OWNER_RESPONSES = ("Done", "Timeout", "Stopped")
 AUXILIARY_STOP_NOT_REQUIRED = "not-required"
 AUXILIARY_STOP_PENDING = "pending"
 AUXILIARY_STOP_DISPATCHED = "dispatched"
@@ -1033,39 +1048,24 @@ XBOX_AUXILIARY_PENDING_KEYS = {
   "_grip_closed": "_grip_pending_request_id",
   "_pneu_open": "_pneu_pending_request_id",
 }
-XBOX_AUXILIARY_FIXED_TOGGLE_COMMANDS = {
-  "_grip_closed": {
-    False: ("SV0P50\n", b"Servo Done"),
-    True: ("SV0P0\n", b"Servo Done"),
-  },
-}
-XBOX_AUXILIARY_TOGGLE_RESPONSES = {
-  "_grip_closed": b"Servo Done",
-  "_pneu_open": b"Done",
-}
-XBOX_AUXILIARY_FIXED_EXCHANGES = frozenset(
-  exchange
-  for commands in XBOX_AUXILIARY_FIXED_TOGGLE_COMMANDS.values()
-  for exchange in commands.values()
-)
 MANUAL_AUXILIARY_QUEUE_LIMIT = 64
 PROGRAM_EXECUTION_MODES = frozenset(("run", "step-forward", "step-reverse"))
 PROGRAM_CAMERA_OPERATIONS = frozenset(("on", "off"))
 PROGRAM_SELECTION_INITIALIZE_RUN = "initialize-run"
 PROGRAM_SELECTION_PREPARE_RUN = "prepare-run"
 PROGRAM_SELECTION_ADVANCE = "advance"
+PROGRAM_SELECTION_CAPTURE_SPAN = "capture-span"
+PROGRAM_SELECTION_COMMIT_SPAN = "commit-span"
 PROGRAM_SELECTION_ACTIONS = frozenset(
   (
     PROGRAM_SELECTION_INITIALIZE_RUN,
     PROGRAM_SELECTION_PREPARE_RUN,
     PROGRAM_SELECTION_ADVANCE,
+    PROGRAM_SELECTION_CAPTURE_SPAN,
+    PROGRAM_SELECTION_COMMIT_SPAN,
   )
 )
 GCODE_STORAGE_OPERATIONS = frozenset(("delete", "list"))
-GCODE_STORAGE_DELETE_TERMINAL_RESPONSES = frozenset(("P", "F", "ER"))
-GCODE_STORAGE_DETAILED_ERROR_PREFIX = "EG: "
-GCODE_STORAGE_DIRECTORY_IDENTITY_PREFIX = "MID:"
-GCODE_STORAGE_DIRECTORY_IDENTITY_SEPARATOR = "|"
 GCODE_STORAGE_MEDIA_MARKER = "Mi"
 GCODE_STORAGE_FILENAME_MARKER = "Fn"
 GCODE_STORAGE_STATE_SCHEMA_VERSION = 1
@@ -1085,14 +1085,6 @@ GCODE_LISTBOX_STYLE_OPTIONS = (
   "foreground",
   "selectbackground",
   "selectforeground",
-)
-CONTROLLER_STARTUP_REQUIRED_CAPABILITIES = (
-  CONTROLLER_CAPABILITY_CALIBRATION_SWITCH_POLARITY_V1,
-  CONTROLLER_CAPABILITY_JT_WRIST_CONFIG_V1,
-  CONTROLLER_CAPABILITY_GCODE_DIRECTORY_FRAMING_V1,
-  CONTROLLER_CAPABILITY_GCODE_DELETE_IDENTITY_V1,
-  CONTROLLER_CAPABILITY_GCODE_WRITE_IDENTITY_V1,
-  CONTROLLER_CAPABILITY_ESTOP_ADMISSION_V1,
 )
 EVENT_POLL_INTERVAL_MS = 25
 CAMERA_PREVIEW_SHUTDOWN_GRACE_SECONDS = 2.0
@@ -1449,7 +1441,7 @@ class ProgramVisionOperation:
     return True
 
   def wait(self):
-    while not self._completion.wait(CONTROL_POLL_INTERVAL_SECONDS):
+    while not self._completion.wait(JSON_SERIAL_DEFAULT_POLL_INTERVAL_SECONDS):
       if self.execution_request.cancellation_boundary.is_set():
         return False
     with self._settlement_lock:
@@ -1460,10 +1452,40 @@ class ProgramVisionOperation:
       return self._succeeded
 
 
+@dataclass(frozen=True)
+class ProgramRowSpanSnapshot:
+  rows: tuple
+  selected_row: int
+  loop_modes: str
+  disable_wrist_rotation: str
+
+  def __post_init__(self):
+    if (
+      not isinstance(self.rows, tuple)
+      or not self.rows
+      or any(
+        not isinstance(row, str) or "\r" in row or "\n" in row
+        for row in self.rows
+      )
+      or isinstance(self.selected_row, bool)
+      or not isinstance(self.selected_row, int)
+      or not 0 <= self.selected_row < len(self.rows)
+      or not isinstance(self.loop_modes, str)
+      or re.fullmatch(r"[01]{6}", self.loop_modes) is None
+      or not isinstance(self.disable_wrist_rotation, str)
+      or self.disable_wrist_rotation not in ("0", "1")
+    ):
+      raise MotionInputError("program row-span snapshot is invalid")
+
+  @property
+  def selected_command(self):
+    return self.rows[self.selected_row]
+
+
 class ProgramSelectionResult:
   """Describe one Tk-owned program-selection transition."""
 
-  def __init__(self, ready, return_program=None):
+  def __init__(self, ready, return_program=None, span_snapshot=None):
     if not isinstance(ready, bool):
       raise TypeError("program selection readiness must be boolean")
     if return_program is not None:
@@ -1481,14 +1503,28 @@ class ProgramSelectionResult:
         or return_program[1] < 0
       ):
         raise TypeError("program selection return state is invalid")
+    if span_snapshot is not None and (
+      not ready
+      or return_program is not None
+      or not isinstance(span_snapshot, ProgramRowSpanSnapshot)
+    ):
+      raise TypeError("program selection span snapshot is invalid")
     self.ready = ready
     self.return_program = return_program
+    self.span_snapshot = span_snapshot
 
 
 class ProgramSelectionEvent:
   """Carry one program-selection operation to the Tk event owner."""
 
-  def __init__(self, execution_request, action, style_rows=False):
+  def __init__(
+    self,
+    execution_request,
+    action,
+    style_rows=False,
+    span_snapshot=None,
+    final_row=None,
+  ):
     if not isinstance(execution_request, ProgramExecutionRequest):
       raise TypeError("program selection request is invalid")
     if (
@@ -1502,9 +1538,23 @@ class ProgramSelectionEvent:
       raise ValueError(
         "program row styling is valid only while advancing a row"
       )
+    if action == PROGRAM_SELECTION_COMMIT_SPAN:
+      if (
+        not isinstance(span_snapshot, ProgramRowSpanSnapshot)
+        or isinstance(final_row, bool)
+        or not isinstance(final_row, int)
+        or not span_snapshot.selected_row <= final_row < len(span_snapshot.rows)
+      ):
+        raise ValueError("program span commitment is invalid")
+    elif span_snapshot is not None or final_row is not None:
+      raise ValueError(
+        "program span data requires a span-commitment action"
+      )
     self.execution_request = execution_request
     self.action = action
     self.style_rows = style_rows
+    self.span_snapshot = span_snapshot
+    self.final_row = final_row
     self._completion = threading.Event()
     self._settlement_lock = threading.Lock()
     self._settled = False
@@ -1656,7 +1706,7 @@ class ManualAuxiliaryRequest:
   request_id: int
   serial_port: object
   command: str
-  expected_response: bytes
+  parameters: dict
   calibration_key: str
   calibration_value: str
 
@@ -1678,10 +1728,10 @@ class ManualAuxiliaryRequest:
       or not self.command.isascii()
     ):
       raise MotionInputError("manual auxiliary command is invalid")
-    if self.expected_response not in (b"Servo Done", b"Done"):
-      raise MotionInputError(
-        "manual auxiliary expected response is invalid"
-      )
+    if self.command not in ("servo", "set_output"):
+      raise MotionInputError("manual auxiliary command is invalid")
+    if type(self.parameters) is not dict:
+      raise MotionInputError("manual auxiliary parameters are invalid")
     if self.calibration_key not in MANUAL_AUXILIARY_CALIBRATION_KEYS:
       raise MotionInputError("manual auxiliary calibration key is invalid")
     if (
@@ -1692,12 +1742,18 @@ class ManualAuxiliaryRequest:
     ):
       raise MotionInputError("manual auxiliary calibration value is invalid")
 
-    if self.expected_response == b"Servo Done":
-      board_profile = _connected_auxiliary_board_profile(self.serial_port)
-      validate_auxiliary_servo_command(self.command, board_profile)
-      channel, position = parse_auxiliary_servo_command(self.command)
+    _connected_auxiliary_board_profile(self.serial_port)
+    if self.command == "servo":
+      if set(self.parameters) != {"channel", "position"}:
+        raise MotionInputError("manual auxiliary servo parameters are invalid")
+      channel = self.parameters["channel"]
+      position = self.parameters["position"]
       if (
-        self.calibration_key
+        isinstance(channel, bool)
+        or not isinstance(channel, int)
+        or isinstance(position, bool)
+        or not isinstance(position, int)
+        or self.calibration_key
         not in (f"Servo{channel}on", f"Servo{channel}off")
         or int(self.calibration_value) != position
       ):
@@ -1705,12 +1761,16 @@ class ManualAuxiliaryRequest:
           "manual auxiliary servo persistence contract is invalid"
         )
     else:
-      board_profile = _connected_auxiliary_board_profile(self.serial_port)
-      validate_auxiliary_output_command(self.command, board_profile)
-      prefix, output_pin = parse_auxiliary_output_command(self.command)
-      expected_suffix = "on" if prefix == "ON" else "off"
+      if set(self.parameters) != {"pin", "state"}:
+        raise MotionInputError("manual auxiliary output parameters are invalid")
+      output_pin = self.parameters["pin"]
+      output_state = self.parameters["state"]
+      expected_suffix = "on" if output_state else "off"
       if (
-        not self.calibration_key.startswith("DO")
+        isinstance(output_pin, bool)
+        or not isinstance(output_pin, int)
+        or not isinstance(output_state, bool)
+        or not self.calibration_key.startswith("DO")
         or not self.calibration_key.endswith(expected_suffix)
         or int(self.calibration_value) != output_pin
       ):
@@ -1766,47 +1826,12 @@ class ManualControllerRequest:
 
 
 @dataclass(frozen=True)
-class ManualControllerStopEvent:
-  request_id: int
-  position: PositionResponse
-
-  def __post_init__(self):
-    if (
-      isinstance(self.request_id, bool)
-      or not isinstance(self.request_id, int)
-      or self.request_id <= 0
-    ):
-      raise MotionInputError(
-        "manual controller E-stop event ID must be positive"
-      )
-    if (
-      not isinstance(self.position, PositionResponse)
-      or not position_response_is_physical_estop(self.position)
-    ):
-      raise MotionInputError(
-        "manual controller E-stop event position is invalid"
-      )
-    try:
-      parsed_position = parse_position_response(self.position.raw)
-    except ProtocolResponseError as exc:
-      raise MotionInputError(
-        "manual controller E-stop event framing is invalid"
-      ) from exc
-    if parsed_position != self.position:
-      raise MotionInputError(
-        "manual controller E-stop event fields do not match the frame"
-      )
-
-
-@dataclass(frozen=True)
 class ManualControllerResult:
   request_id: int
   outcome: str
   value: str
   serial_write_started: bool
-  position: Optional[PositionResponse] = None
-  frame_order: Optional[str] = None
-  admission_position: Optional[PositionResponse] = None
+  unpositioned_stop_observed: bool = False
 
   def __post_init__(self):
     if (
@@ -1817,7 +1842,6 @@ class ManualControllerResult:
       raise MotionInputError("manual controller result ID must be positive")
     if self.outcome not in (
       "completed",
-      "estop",
       "rejected",
       "indeterminate",
       "failed",
@@ -1827,6 +1851,11 @@ class ManualControllerResult:
       raise MotionInputError(
         "manual controller serial write state must be boolean"
       )
+    if type(self.unpositioned_stop_observed) is not bool or (
+      self.unpositioned_stop_observed
+      and self.outcome not in ("completed", "rejected", "indeterminate", "failed")
+    ):
+      raise MotionInputError("manual controller unpositioned-stop evidence is invalid")
     if (
       not isinstance(self.value, str)
       or not self.value.strip()
@@ -1836,76 +1865,9 @@ class ManualControllerResult:
       or len(self.value) > MAX_RESPONSE_PAYLOAD_LENGTH
     ):
       raise MotionInputError("manual controller result value is invalid")
-    if self.outcome == "estop":
-      if (
-        not isinstance(self.position, PositionResponse)
-        or not position_response_is_physical_estop(self.position)
-        or self.frame_order not in (
-          "estop-only",
-          "admission-estop",
-          "estop-admission",
-          "estop-terminal",
-          "terminal-estop",
-        )
-      ):
-        raise MotionInputError(
-          "manual controller E-stop result position is invalid"
-        )
-      if self.frame_order == "estop-only" and (
-        self.serial_write_started
-        or self.position.flag != CONTROLLER_ESTOP_EVENT_FLAG
-      ):
-        raise MotionInputError(
-          "manual controller E-stop write state is invalid"
-        )
-      if self.frame_order == "admission-estop" and (
-        self.position.flag != CONTROLLER_ESTOP_ADMISSION_FLAG
-        or self.admission_position is not None
-      ):
-        raise MotionInputError(
-          "manual controller E-stop write state is invalid"
-        )
-      if self.frame_order in (
-        "estop-terminal",
-        "terminal-estop",
-      ) and (
-        not self.serial_write_started
-        or self.position.flag != CONTROLLER_ESTOP_EVENT_FLAG
-        or self.admission_position is not None
-      ):
-        raise MotionInputError(
-          "manual controller E-stop write state is invalid"
-        )
-      if self.frame_order == "estop-only" and (
-        self.admission_position is not None
-      ):
-        raise MotionInputError(
-          "manual controller E-stop write state is invalid"
-        )
-      if self.frame_order == "estop-admission" and (
-        not self.serial_write_started
-        or self.position.flag != CONTROLLER_ESTOP_EVENT_FLAG
-        or not isinstance(
-          self.admission_position,
-          PositionResponse,
-        )
-        or self.admission_position.flag
-          != CONTROLLER_ESTOP_ADMISSION_FLAG
-      ):
-        raise MotionInputError(
-          "manual controller E-stop admission pair is invalid"
-        )
-    elif (
-      self.position is not None
-      or self.frame_order is not None
-      or self.admission_position is not None
-    ):
-      raise MotionInputError(
-        "manual controller non-position result contains a position"
-      )
-    if (
+    if not self.serial_write_started and (
       self.outcome in ("completed", "rejected", "indeterminate")
-      and not self.serial_write_started
+      or self.unpositioned_stop_observed
     ):
       raise MotionInputError(
         "manual controller terminal result lacks a serial write"
@@ -2120,7 +2082,7 @@ class ManualControllerCleanup:
           raise RuntimeError(
             "manual controller program admission was already released"
           )
-        legacy_serial_result_pending.clear()
+        serial_result_pending.clear()
         manual_controller_program_admission_active = False
       self._program_admission_owned = False
       self._pending_event_owned = False
@@ -2129,9 +2091,6 @@ class ManualControllerCleanup:
   def release(self):
     global manual_controller_active_request
     global manual_controller_activity_lease
-    global manual_controller_estop_applied_request_id
-    global manual_controller_estop_applied_position
-    global manual_controller_pending_stop_event
     global manual_controller_program_admission_active
 
     with self._state_lock:
@@ -2163,54 +2122,8 @@ class ManualControllerCleanup:
               raise RuntimeError(
                 "manual controller cleanup request ownership changed"
               )
-            applied_request_id = manual_controller_estop_applied_request_id
-            pending_stop_event = manual_controller_pending_stop_event
-            if pending_stop_event is not None:
-              if (
-                not isinstance(
-                  pending_stop_event,
-                  ManualControllerStopEvent,
-                )
-                or pending_stop_event.request_id != self.request.request_id
-              ):
-                raise RuntimeError(
-                  "manual controller cleanup pending E-stop ownership changed"
-                )
-              raise RuntimeError(
-                "manual controller cleanup cannot release an unapplied "
-                "E-stop event"
-              )
-            if (
-              applied_request_id is not None
-              and (
-                isinstance(applied_request_id, bool)
-                or not isinstance(applied_request_id, int)
-                or applied_request_id != self.request.request_id
-              )
-            ):
-              raise RuntimeError(
-                "manual controller cleanup E-stop ownership changed"
-              )
-            applied_position = manual_controller_estop_applied_position
-            if (
-              (applied_request_id is None) != (applied_position is None)
-              or (
-                applied_position is not None
-                and (
-                  not isinstance(applied_position, PositionResponse)
-                  or not position_response_is_physical_estop(
-                    applied_position
-                  )
-                )
-              )
-            ):
-              raise RuntimeError(
-                "manual controller cleanup E-stop position is invalid"
-              )
             manual_controller_active_request = None
             manual_controller_activity_lease = None
-            manual_controller_estop_applied_request_id = None
-            manual_controller_estop_applied_position = None
         self._active_request_owned = False
       if self._serial_lock_owned:
         if not serial_lock.locked():
@@ -2228,6 +2141,7 @@ class MainControllerIdentityBinding:
   identity: ControllerIdentity
   home_reference: Optional[PrimaryHomeReference] = None
   configuration_fingerprint: Optional[str] = None
+  json_client: object = None
 
   def __post_init__(self):
     if self.serial_port is None or not getattr(self.serial_port, "is_open", False):
@@ -2243,15 +2157,9 @@ class MainControllerIdentityBinding:
       raise MotionInputError(
         "main controller home-reference binding is invalid"
       )
-    supports_home_reference = (
-      primary_home_reference_command(
-        self.identity.protocol_capabilities
-      )
-      is not None
-    )
-    if supports_home_reference != (self.home_reference is not None):
+    if self.home_reference is None:
       raise MotionInputError(
-        "main controller home-reference capability is inconsistent"
+        "main controller home-reference binding is missing"
       )
     validate_controller_hardware_id(
       self.identity.controller_hardware_id
@@ -2265,6 +2173,33 @@ class MainControllerIdentityBinding:
     ):
       raise MotionInputError(
         "main controller configuration fingerprint is invalid"
+      )
+    if (
+      type(self.json_client) is not JsonMainControllerClient
+      or self.json_client.serial_port is not self.serial_port
+      or self.json_client.closed
+      or self.json_client.closing
+      or self.json_client.quarantined
+    ):
+      raise MotionInputError(
+        "main controller JSON binding is invalid"
+      )
+    session = self.json_client.session_binding
+    if (
+      session is None
+      or session.identity.controller_hardware_id
+        != self.identity.controller_hardware_id
+      or session.identity.driver_model != self.identity.driver_model
+      or session.identity.robot_model != self.identity.robot_model
+      or session.identity.robot_version != self.identity.robot_version
+      or session.identity.serial_number != self.identity.serial_number
+      or session.identity.asset_tag != self.identity.asset_tag
+      or session.firmware.version != self.identity.firmware_version
+      or frozenset(session.capabilities)
+        != frozenset(self.identity.protocol_capabilities)
+    ):
+      raise MotionInputError(
+        "main controller JSON identity is inconsistent"
       )
 
 
@@ -2455,7 +2390,6 @@ class GCodeStorageRequest:
   request_id: int
   operation: str
   serial_port: object
-  command: str
   filename: Optional[str]
   announce_listing: bool
   view_generation: int
@@ -2537,8 +2471,7 @@ class GCodeStorageRequest:
 
     if self.operation == "list":
       if (
-        self.command != "RG\n"
-        or self.filename is not None
+        self.filename is not None
         or self.media_id is not None
         or self.completion_callback is not None
         or cancellation_enabled
@@ -2548,14 +2481,13 @@ class GCodeStorageRequest:
         )
       return
 
-    filename = _validate_gcode_storage_filename(
+    _validate_gcode_storage_filename(
       self.filename,
       "G-code storage filename",
     )
-    media_id = validate_controller_media_id(self.media_id)
+    validate_controller_media_id(self.media_id)
     if (
-      self.command != _gcode_storage_delete_command(media_id, filename)
-      or self.announce_listing
+      self.announce_listing
       or cancellation_enabled != (self.completion_callback is not None)
     ):
       raise MotionInputError(
@@ -2651,14 +2583,6 @@ class GCodeStorageResult:
       raise MotionInputError(
         "G-code storage result contains duplicate filenames"
       )
-    if any(
-      not filename.casefold().endswith(".txt")
-      or filename[:-len(".txt")] in ("", ".", "..")
-      for filename in validated_filenames
-    ):
-      raise MotionInputError(
-        "G-code storage result contains a non-actionable filename"
-      )
     if self.outcome != "completed" and self.filenames:
       raise MotionInputError(
         "non-completed G-code storage results cannot contain filenames"
@@ -2669,6 +2593,16 @@ class GCodeStorageResult:
       raise MotionInputError(
         "non-completed G-code storage results cannot contain a media ID"
       )
+    if self.outcome == "completed":
+      if self.media_id is None:
+        if self.filenames or self.value not in ("P", "F"):
+          raise MotionInputError(
+            "completed G-code delete result is invalid"
+          )
+      elif self.value:
+        raise MotionInputError(
+          "completed G-code directory result contains raw response text"
+        )
     if self.pending_delete is not None and not isinstance(
       self.pending_delete,
       GCodeDeleteReconciliation,
@@ -2934,7 +2868,7 @@ class RobotProgramViewSnapshot:
       )
 
 
-def _bind_auxiliary_board_profile(serial_port, board_profile):
+def _bind_auxiliary_board_profile(serial_port, board_profile, json_client):
   if serial_port is None or not getattr(serial_port, "is_open", False):
     raise ConnectionError(
       "auxiliary-board profile requires an open auxiliary connection"
@@ -2944,7 +2878,21 @@ def _bind_auxiliary_board_profile(serial_port, board_profile):
       "auxiliary-board profile requires the active auxiliary connection"
     )
   profile = normalize_auxiliary_board_profile(board_profile)
-  RUN['ser2BoardProfile'] = (serial_port, profile)
+  if (
+    type(json_client) is not JsonAuxiliaryControllerClient
+    or json_client.serial_port is not serial_port
+    or not json_client.session_ready
+    or json_client.closed
+    or json_client.closing
+  ):
+    raise ConnectionError("auxiliary JSON session is not ready")
+  identity = json_client.session_binding
+  if (
+    type(identity) is not JsonAuxiliaryHelloResult
+    or identity.board != profile.lower()
+  ):
+    raise ConnectionError("auxiliary JSON board identity does not match selection")
+  RUN['ser2BoardProfile'] = (serial_port, profile, json_client)
   return profile
 
 
@@ -2952,7 +2900,7 @@ def _clear_auxiliary_board_profile(serial_port=None):
   binding = RUN.get('ser2BoardProfile')
   if serial_port is None or (
     isinstance(binding, tuple)
-    and len(binding) == 2
+    and len(binding) == 3
     and binding[0] is serial_port
   ):
     RUN['ser2BoardProfile'] = None
@@ -2970,13 +2918,33 @@ def _connected_auxiliary_board_profile(serial_port=None):
   binding = RUN.get('ser2BoardProfile')
   if (
     not isinstance(binding, tuple)
-    or len(binding) != 2
+    or len(binding) != 3
     or binding[0] is not serial_port
   ):
     raise MotionInputError(
       "auxiliary-board profile is not bound to the active connection"
     )
-  return normalize_auxiliary_board_profile(binding[1])
+  profile = normalize_auxiliary_board_profile(binding[1])
+  json_client = binding[2]
+  if (
+    type(json_client) is not JsonAuxiliaryControllerClient
+    or json_client.serial_port is not serial_port
+    or not json_client.session_ready
+    or json_client.closed
+    or json_client.closing
+    or json_client.quarantined
+    or type(json_client.session_binding) is not JsonAuxiliaryHelloResult
+    or json_client.session_binding.board != profile.lower()
+  ):
+    raise ConnectionError("auxiliary JSON session binding is invalid")
+  return profile
+
+
+def _connected_auxiliary_json_client(serial_port=None):
+  if serial_port is None:
+    serial_port = RUN.get('ser2')
+  _connected_auxiliary_board_profile(serial_port)
+  return RUN['ser2BoardProfile'][2]
 
 
 def _xbox_auxiliary_toggle_exchange(
@@ -2990,36 +2958,11 @@ def _xbox_auxiliary_toggle_exchange(
     raise MotionInputError("Xbox auxiliary target state must be boolean")
   profile = _connected_auxiliary_board_profile(serial_port)
   if state_name == "_grip_closed":
-    return XBOX_AUXILIARY_FIXED_TOGGLE_COMMANDS[state_name][target_state]
+    return "servo", {"channel": 0, "position": 0 if target_state else 50}
   if state_name != "_pneu_open":
     raise MotionInputError("Xbox pneumatic state name is invalid")
   output_pin = auxiliary_pneumatic_output_pin(profile)
-  output_prefix = "OF" if target_state else "ON"
-  command = f"{output_prefix}X{output_pin}\n"
-  expected_response = _xbox_auxiliary_expected_response(command, serial_port)
-  return command, expected_response
-
-
-def _xbox_auxiliary_expected_response(command, serial_port=None):
-  if (
-    not isinstance(command, str)
-    or not command
-    or len(command) > MAX_COMMAND_LENGTH
-  ):
-    raise MotionInputError("Xbox auxiliary command is invalid")
-  fixed_responses = {
-    expected_response
-    for supported_command, expected_response in XBOX_AUXILIARY_FIXED_EXCHANGES
-    if supported_command == command
-  }
-  if len(fixed_responses) == 1:
-    return fixed_responses.pop()
-  output_match = re.fullmatch(r"(?:ON|OF)X([0-9]+)\n", command)
-  if output_match is None:
-    raise MotionInputError("Xbox auxiliary exchange is not supported")
-  profile = _connected_auxiliary_board_profile(serial_port)
-  validate_auxiliary_output_command(command, profile)
-  return b"Done"
+  return "set_output", {"pin": output_pin, "state": not target_state}
 
 
 def _main_serial_transmit_required(transmit=True):
@@ -3251,126 +3194,267 @@ def _tracked_auxiliary_operation(control_injectable=False):
     auxiliary_serial_lock.release()
 
 
-def _write_legacy_auxiliary_command(command):
-  with manual_auxiliary_state_lock:
-    if _manual_auxiliary_stop_in_progress():
-      raise SerialActivityRejected(
-        "auxiliary command cancelled by stop admission"
+def _await_auxiliary_json_terminal(client, ticket, operation_name):
+  while True:
+    delivery = client.pop_delivery()
+    if delivery is None:
+      if not client.poll():
+        time.sleep(JSON_SERIAL_DEFAULT_POLL_INTERVAL_SECONDS)
+      continue
+    if type(delivery) is not JsonResponseDelivery or delivery.ticket is not ticket:
+      raise ProtocolResponseError(
+        f"auxiliary {operation_name} received an unrelated JSON delivery"
       )
-    serial_port = RUN.get('ser2')
-    try:
-      board_profile = _connected_auxiliary_board_profile(serial_port)
-      if isinstance(command, str) and command.startswith("SV"):
-        validate_auxiliary_servo_command(command, board_profile)
-      elif isinstance(command, str) and command[:2] in ("ON", "OF"):
-        validate_auxiliary_output_command(command, board_profile)
-      elif isinstance(command, str) and command.startswith("JF"):
-        validate_auxiliary_input_command(command, board_profile)
-      elif isinstance(command, str) and command.startswith("WI"):
-        validate_auxiliary_wait_command(command, board_profile)
-      elif command == "TG\n":
-        validate_auxiliary_gripper_current_command(
-          command,
-          board_profile,
-        )
-      else:
-        raise MotionInputError("unsupported auxiliary controller command")
-      return write_serial_control(
-        serial_port,
-        command,
-        write_lock=auxiliary_serial_write_lock,
-        reset_input=True,
+    if not delivery.response.terminal:
+      continue
+    terminal = client.take_terminal(ticket)
+    client.acknowledge_terminal(ticket)
+    if terminal.response is not delivery.response:
+      raise ProtocolResponseError(
+        f"auxiliary {operation_name} terminal ownership changed"
       )
-    finally:
+    if client.release_reader() is not True:
+      raise ProtocolResponseError(
+        f"auxiliary {operation_name} reader ownership was not released"
+      )
+    if terminal.response.status != "completed":
+      failure = terminal.failure
+      detail = (
+        f"{failure.code}: {' '.join(failure.message.split())}"
+        if failure is not None else terminal.response.status
+      )
+      raise ProtocolResponseError(
+        f"auxiliary {operation_name} {terminal.response.status}: {detail}"
+      )
+    return terminal
+
+
+def _detach_auxiliary_gripper_for_shutdown():
+  global auxiliary_gripper_detach_shutdown_attempted
+
+  if auxiliary_gripper_detach_shutdown_attempted:
+    return False
+  auxiliary_gripper_detach_shutdown_attempted = True
+  serial_port = RUN.get('ser2')
+  if serial_port is None:
+    return True
+
+  admitted = threading.Event()
+  try:
+    binding = RUN.get('ser2BoardProfile')
+    client = _connected_auxiliary_json_client(serial_port)
+    if (
+      not isinstance(binding, tuple)
+      or len(binding) != 3
+      or binding[0] is not serial_port
+      or binding[2] is not client
+      or not application_closing.is_set()
+      or not serial_activity_registry.idle()
+      or _auxiliary_stop_shutdown_pending()
+    ):
+      raise ConnectionError(
+        "auxiliary gripper detach lacks settled shutdown ownership"
+      )
+
+    def admit_detach():
       if (
-        RUN.get('ser2') is serial_port
-        and not getattr(serial_port, "is_open", False)
+        RUN.get('ser2') is not serial_port
+        or RUN.get('ser2BoardProfile') is not binding
+        or not application_closing.is_set()
+        or not serial_activity_registry.idle()
+        or _auxiliary_stop_shutdown_pending()
       ):
-        RUN['ser2'] = None
-        _clear_auxiliary_board_profile(serial_port)
+        raise SerialActivityRejected(
+          "auxiliary gripper detach ownership changed before write"
+        )
+      admitted.set()
+      return True
+
+    ticket = client.request_command(
+      "gripper_detach",
+      {},
+      timeout=SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+      write_admission=admit_detach,
+    )
+    if not admitted.is_set():
+      raise ProtocolResponseError(
+        "auxiliary gripper detach returned without write admission"
+      )
+    _await_auxiliary_json_terminal(client, ticket, "gripper detach")
+    logger.info("Gripper detach on exit completed")
+    return True
+  except Exception as exc:
+    detail = _manual_auxiliary_error_detail(
+      exc,
+      "gripper detach failed without details",
+    )
+    if admitted.is_set():
+      logger.warning(
+        "Unable to detach gripper on exit after write admission; request will "
+        "not be retried: %s",
+        detail,
+      )
+    else:
+      logger.warning("Unable to detach gripper on exit: %s", detail)
+    return False
 
 
-def _manual_auxiliary_expected_response(command, serial_port=None):
-  if isinstance(command, str) and command.startswith("SV"):
-    board_profile = _connected_auxiliary_board_profile(serial_port)
-    validate_auxiliary_servo_command(command, board_profile)
-    return b"Servo Done"
-  profile = _connected_auxiliary_board_profile(serial_port)
-  validate_auxiliary_output_command(command, profile)
-  return b"Done"
+def _await_auxiliary_json_wait(client, ticket):
+  _begin_auxiliary_stop_owner_wait()
+  stop_ticket = wait_terminal = stop_terminal = None
+  owner_result_published = False
+  try:
+    while True:
+      while wait_terminal is None or (
+        stop_ticket is not None and stop_terminal is None
+      ):
+        if auxiliary_stop_injected_event.is_set() and stop_ticket is None:
+          stop_ticket = client.request_command(
+            "stop", {}, timeout=SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+          )
+        delivery = client.pop_delivery()
+        if delivery is None:
+          if not client.poll():
+            time.sleep(JSON_SERIAL_DEFAULT_POLL_INTERVAL_SECONDS)
+          continue
+        if type(delivery) is not JsonResponseDelivery or delivery.ticket not in (
+          ticket, stop_ticket,
+        ):
+          raise ProtocolResponseError(
+            "auxiliary input wait received an unrelated JSON delivery"
+          )
+        if not delivery.response.terminal:
+          continue
+        if auxiliary_stop_injected_event.is_set() and stop_ticket is None:
+          stop_ticket = client.request_command(
+            "stop", {}, timeout=SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+          )
+        terminal = client.take_terminal(delivery.ticket)
+        if terminal.response is not delivery.response:
+          raise ProtocolResponseError(
+            "auxiliary input-wait terminal ownership changed"
+          )
+        if delivery.ticket is ticket:
+          wait_terminal = terminal
+        else:
+          client.acknowledge_terminal(delivery.ticket)
+          stop_terminal = terminal
+
+      failure = wait_terminal.failure
+      if wait_terminal.response.status == "completed":
+        outcome = "Done"
+      elif (
+        wait_terminal.response.status == "failed"
+        and failure is not None
+        and failure.code == "timeout"
+      ):
+        outcome = "Timeout"
+      elif (
+        stop_terminal is not None
+        and wait_terminal.response.status == "cancelled"
+        and failure is not None
+        and failure.code == "stop_requested"
+      ):
+        outcome = "Stopped"
+      else:
+        raise ProtocolResponseError(
+          "auxiliary input wait returned an invalid terminal"
+        )
+      if (
+        stop_terminal is not None
+        and stop_terminal.response.status != "completed"
+      ):
+        raise ProtocolResponseError(
+          "auxiliary stop returned a non-completed terminal"
+        )
+      stop_transmitted = stop_terminal is not None
+      owner_outcome = "Stopped" if stop_transmitted else outcome
+      if _publish_auxiliary_stop_owner_result(
+        True,
+        owner_outcome,
+        stop_transmitted=stop_transmitted,
+      ):
+        owner_result_published = True
+        break
+      stop_ticket = client.request_command(
+        "stop", {}, timeout=SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+      )
+      stop_terminal = None
+    client.acknowledge_terminal(ticket)
+    if client.release_reader() is not True:
+      raise ProtocolResponseError("auxiliary input-wait reader was not released")
+    return outcome
+  except BaseException as exc:
+    if not owner_result_published:
+      _publish_auxiliary_stop_owner_result(False, str(exc))
+    raise
+
+
+def _exchange_json_auxiliary_command(
+  command,
+  parameters,
+  response_timeout,
+  expected_serial_port=None,
+):
+  if type(parameters) is not dict:
+    raise MotionInputError("auxiliary JSON parameters are invalid")
+  serial_port = RUN.get('ser2')
+  if expected_serial_port is not None and serial_port is not expected_serial_port:
+    raise ConnectionError("auxiliary connection changed before request dispatch")
+  client = _connected_auxiliary_json_client(serial_port)
+
+  def admit_write():
+    with manual_auxiliary_state_lock:
+      if command != "stop" and _manual_auxiliary_stop_in_progress():
+        raise SerialActivityRejected("auxiliary command cancelled by stop admission")
+    return True
+
+  ticket = None
+  try:
+    ticket = client.request_command(
+      command,
+      parameters,
+      timeout=response_timeout,
+      write_admission=admit_write,
+    )
+    if command == "wait_input":
+      return _await_auxiliary_json_wait(client, ticket)
+    terminal = _await_auxiliary_json_terminal(client, ticket, command)
+    return terminal.parsed_result
+  except BaseException:
+    if (ticket is not None or client.quarantined) and RUN.get('ser2') is serial_port:
+      _close_serial_port('ser2', f"auxiliary {command} failure")
+    raise
 
 
 @_tracked_serial_operation("ser2")
 def _exchange_manual_auxiliary_command(
   command,
-  expected_response,
+  parameters,
   expected_serial_port,
 ):
-  if not isinstance(expected_response, bytes):
-    raise MotionInputError(
-      "manual auxiliary exchange response contract is invalid"
-    )
-  serial_port = RUN.get('ser2')
-  if serial_port is not expected_serial_port:
-    raise ConnectionError(
-      "manual auxiliary connection changed before request dispatch"
-    )
-  if expected_response != _manual_auxiliary_expected_response(
+  _exchange_json_auxiliary_command(
     command,
-    serial_port,
-  ):
-    raise MotionInputError(
-      "manual auxiliary expected response does not match the command"
-    )
-
-  try:
-    _write_legacy_auxiliary_command(command)
-    return read_serial_exact_response(
-      serial_port,
-      expected_response,
-      SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
-    )
-  except Exception:
-    if RUN.get('ser2') is serial_port:
-      _close_serial_port('ser2', "manual auxiliary response failure")
-    raise
+    parameters,
+    SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+    expected_serial_port,
+  )
+  return "Done"
 
 
 @_tracked_serial_operation("ser2")
 def _exchange_xbox_auxiliary_command(
   command,
-  expected_response,
+  parameters,
   expected_serial_port=None,
 ):
-  if not isinstance(command, str) or not isinstance(expected_response, bytes):
-    raise MotionInputError("Xbox auxiliary exchange contract is invalid")
-  serial_port = RUN.get('ser2')
-  if (
-    expected_serial_port is not None
-    and serial_port is not expected_serial_port
-  ):
-    raise ConnectionError(
-      "Xbox auxiliary connection changed before request dispatch"
-    )
-  _connected_auxiliary_board_profile(serial_port)
-  if expected_response != _xbox_auxiliary_expected_response(
+  _exchange_json_auxiliary_command(
     command,
-    serial_port,
-  ):
-    raise MotionInputError("Xbox auxiliary expected response is invalid")
-
-  try:
-    _write_legacy_auxiliary_command(command)
-    response = read_serial_exact_response(
-      serial_port,
-      expected_response,
-      SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
-    )
-  except Exception:
-    if RUN.get('ser2') is serial_port:
-      _close_serial_port('ser2', "Xbox auxiliary response failure")
-    raise
-  return response
+    parameters,
+    SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+    expected_serial_port,
+  )
+  return "Done"
 
 
 def _run_xbox_auxiliary_request(
@@ -3379,12 +3463,12 @@ def _run_xbox_auxiliary_request(
   target_state,
   serial_port,
   command,
-  expected_response,
+  parameters,
 ):
   try:
     response = _exchange_xbox_auxiliary_command(
       command,
-      expected_response,
+      parameters,
       serial_port,
     )
     if response is False:
@@ -3426,7 +3510,7 @@ def _start_xbox_auxiliary_request(request_id, state_name, target_state):
   if not isinstance(target_state, bool):
     raise MotionInputError("Xbox auxiliary target state must be boolean")
   serial_port = RUN.get('ser2')
-  command, expected_response = _xbox_auxiliary_toggle_exchange(
+  command, parameters = _xbox_auxiliary_toggle_exchange(
     state_name,
     target_state,
     serial_port,
@@ -3440,7 +3524,7 @@ def _start_xbox_auxiliary_request(request_id, state_name, target_state):
         target_state,
         serial_port,
         command,
-        expected_response,
+        parameters,
       ),
       daemon=True,
     )
@@ -4033,16 +4117,12 @@ def _run_manual_auxiliary_request(request):
       raise TypeError("manual auxiliary worker request is invalid")
     response = _exchange_manual_auxiliary_command(
       request.command,
-      request.expected_response,
+      request.parameters,
       request.serial_port,
     )
     if response is False:
       raise SerialActivityRejected(
         "auxiliary controller transport changed before dispatch"
-      )
-    elif response != request.expected_response.decode("ascii"):
-      raise ProtocolResponseError(
-        "manual auxiliary acknowledgement did not match the request"
       )
     else:
       result = ManualAuxiliaryResult(
@@ -4132,6 +4212,7 @@ def _try_dispatch_manual_auxiliary_request():
 
 def _queue_manual_auxiliary_command(
   command,
+  parameters,
   calibration_key,
   calibration_value,
 ):
@@ -4169,10 +4250,7 @@ def _queue_manual_auxiliary_command(
 
   try:
     serial_port = RUN.get('ser2')
-    expected_response = _manual_auxiliary_expected_response(
-      command,
-      serial_port,
-    )
+    _connected_auxiliary_json_client(serial_port)
   except Exception as exc:
     detail = _manual_auxiliary_error_detail(
       exc,
@@ -4217,7 +4295,7 @@ def _queue_manual_auxiliary_command(
           request_id,
           serial_port,
           command,
-          expected_response,
+          parameters,
           calibration_key,
           calibration_value,
         )
@@ -4265,6 +4343,7 @@ def _request_manual_servo(channel, on_state, entry):
     raise TypeError("manual servo entry must provide get()")
   try:
     value = get_value()
+    position = int(value)
   except Exception as exc:
     detail = _manual_auxiliary_error_detail(
       exc,
@@ -4275,7 +4354,8 @@ def _request_manual_servo(channel, on_state, entry):
     return _render_manual_auxiliary_rejection(message)
   state_name = "on" if on_state else "off"
   return _queue_manual_auxiliary_command(
-    f"SV{channel}P{value}\n",
+    "servo",
+    {"channel": channel, "position": position},
     f"Servo{channel}{state_name}",
     value,
   )
@@ -4291,6 +4371,7 @@ def _request_manual_output(row, on_state, entry):
     raise TypeError("manual output entry must provide get()")
   try:
     value = get_value()
+    pin = int(value)
   except Exception as exc:
     detail = _manual_auxiliary_error_detail(
       exc,
@@ -4299,10 +4380,10 @@ def _request_manual_output(row, on_state, entry):
     message = f"Manual output entry could not be read: {detail}"
     logger.error(message)
     return _render_manual_auxiliary_rejection(message)
-  prefix = "ON" if on_state else "OF"
   state_name = "on" if on_state else "off"
   return _queue_manual_auxiliary_command(
-    f"{prefix}X{value}\n",
+    "set_output",
+    {"pin": pin, "state": on_state},
     f"DO{row}{state_name}",
     value,
   )
@@ -4313,6 +4394,7 @@ def _bind_main_controller_identity(
   identity,
   home_reference=None,
   configuration_fingerprint=None,
+  json_client=None,
 ):
   global main_controller_connection_epoch
   global main_controller_identity_binding
@@ -4324,6 +4406,7 @@ def _bind_main_controller_identity(
     identity,
     home_reference,
     configuration_fingerprint,
+    json_client,
   )
   with controller_identity_state_lock:
     if RUN.get('ser') is not serial_port:
@@ -4363,12 +4446,6 @@ def _bind_main_controller_home_reference(serial_port, home_reference):
       or binding.serial_port is not serial_port
       or RUN.get('ser') is not serial_port
       or not getattr(serial_port, "is_open", False)
-      or (
-        primary_home_reference_command(
-          binding.identity.protocol_capabilities
-        )
-        is None
-      )
     ):
       raise ConnectionError(
         "main controller changed before home-reference binding"
@@ -4378,45 +4455,124 @@ def _bind_main_controller_home_reference(serial_port, home_reference):
       binding.identity,
       home_reference,
       binding.configuration_fingerprint,
+      binding.json_client,
     )
     return main_controller_identity_binding
 
 
-def _clear_main_controller_identity(serial_port=None):
+def _require_persistent_json_client_cleanup(
+  json_client,
+  serial_port,
+  context,
+):
+  if json_client is None:
+    return True
+  if (
+    type(json_client) not in (
+      JsonMainControllerClient,
+      JsonAuxiliaryControllerClient,
+    )
+    or json_client.serial_port is not serial_port
+  ):
+    raise RuntimeError(
+      f"persistent JSON cleanup ownership is invalid during {context}"
+    )
+  cleanup_error = None
+  if not json_client.closed:
+    try:
+      json_client.close(
+        timeout=JSON_COORDINATOR_DEFAULT_CLOSE_TIMEOUT_SECONDS
+      )
+    except Exception as exc:
+      cleanup_error = exc
+  if json_client.closed and getattr(serial_port, "is_open", False):
+    try:
+      serial_port.close()
+    except Exception as exc:
+      if cleanup_error is None:
+        cleanup_error = exc
+  try:
+    verified_closed = (
+      json_client.closed
+      and getattr(serial_port, "is_open") is False
+    )
+  except Exception:
+    verified_closed = False
+  if not verified_closed:
+    raise RuntimeError(
+      f"persistent JSON cleanup failed during {context}"
+    ) from cleanup_error
+  if cleanup_error is not None:
+    logger.error(
+      "Persistent JSON cleanup reported a terminal error after verified "
+      "serial closure during %s",
+      context,
+      exc_info=(
+        type(cleanup_error),
+        cleanup_error,
+        cleanup_error.__traceback__,
+      ),
+    )
+  return True
+
+
+def _require_main_controller_identity_cleanup(serial_port, context):
   global main_controller_identity_binding
   global joint_actual_position_source_snapshot
   global gcode_storage_media_binding
 
   with controller_identity_state_lock:
-    binding = main_controller_identity_binding
-    if (
-      serial_port is not None
-      and isinstance(binding, MainControllerIdentityBinding)
-      and binding.serial_port is not serial_port
-    ):
+    expected_binding = main_controller_identity_binding
+    binding_mismatch = (
+      isinstance(expected_binding, MainControllerIdentityBinding)
+      and expected_binding.serial_port is not serial_port
+    )
+    if binding_mismatch:
       logger.error(
         "Main-controller identity cleanup rejected because the bound "
         "controller changed"
       )
-      return False
+  if binding_mismatch:
+    raise RuntimeError(
+      f"main-controller identity cleanup invariant failed during {context}"
+    )
+  json_client = (
+    expected_binding.json_client
+    if (
+      isinstance(expected_binding, MainControllerIdentityBinding)
+      and expected_binding.serial_port is serial_port
+    )
+    else None
+  )
+  _require_persistent_json_client_cleanup(json_client, serial_port, context)
+  if getattr(serial_port, "is_open", False):
+    raise RuntimeError(
+      f"main-controller transport remained open during {context}"
+    )
+  with controller_identity_state_lock:
+    binding = main_controller_identity_binding
+    current_port = RUN.get('ser')
+    if (
+      binding is not expected_binding
+      or (
+        current_port is not None
+        and current_port is not serial_port
+      )
+    ):
+      raise RuntimeError(
+        f"main-controller identity cleanup invariant failed during {context}"
+      )
     joint_actual_position_source_snapshot = None
     media_binding = gcode_storage_media_binding
     if (
-      serial_port is None
-      or not isinstance(media_binding, GCodeStorageMediaBinding)
+      not isinstance(media_binding, GCodeStorageMediaBinding)
       or media_binding.serial_port is serial_port
     ):
       gcode_storage_media_binding = None
     main_controller_identity_binding = None
+    if current_port is serial_port:
+      RUN['ser'] = None
   return True
-
-
-def _require_main_controller_identity_cleanup(serial_port, context):
-  if _clear_main_controller_identity(serial_port):
-    return True
-  raise RuntimeError(
-    f"main-controller identity cleanup invariant failed during {context}"
-  )
 
 
 def _current_main_controller_identity(serial_port=None):
@@ -4460,6 +4616,7 @@ def _bind_main_controller_configuration(serial_port, command):
       binding.identity,
       binding.home_reference,
       fingerprint,
+      binding.json_client,
     )
   return fingerprint
 
@@ -4484,17 +4641,6 @@ def _invalidate_bound_primary_home_reference(serial_port):
       reason = "the active controller changed"
     elif not getattr(serial_port, "is_open", False):
       reason = "the controller connection is closed"
-    elif (
-      primary_home_reference_command(
-        binding.identity.protocol_capabilities
-      )
-      is None
-    ):
-      if binding.home_reference is None:
-        return True
-      reason = (
-        "a controller without home-reference capability retained a reference"
-      )
     else:
       reason = None
     if reason is not None:
@@ -4512,6 +4658,7 @@ def _invalidate_bound_primary_home_reference(serial_port):
           (0.0, 0.0, 0.0),
         ),
         binding.configuration_fingerprint,
+        binding.json_client,
       )
     except ConnectionError as exc:
       logger.warning(
@@ -4599,8 +4746,30 @@ def _close_serial_port(
       )
       return False
   else:
+    binding = _current_main_controller_identity(serial_port)
+    json_client = None
+    if serial_name == 'ser' and isinstance(
+      binding,
+      MainControllerIdentityBinding,
+    ):
+      json_client = binding.json_client
+    elif serial_name == 'ser2':
+      auxiliary_binding = RUN.get('ser2BoardProfile')
+      if (
+        isinstance(auxiliary_binding, tuple)
+        and len(auxiliary_binding) == 3
+        and auxiliary_binding[0] is serial_port
+      ):
+        json_client = auxiliary_binding[2]
     try:
-      serial_port.close()
+      if json_client is None:
+        serial_port.close()
+      else:
+        _require_persistent_json_client_cleanup(
+          json_client,
+          serial_port,
+          context,
+        )
     except Exception:
       logger.exception("Unable to close %s during %s", serial_name, context)
       return False
@@ -4608,14 +4777,16 @@ def _close_serial_port(
     logger.error("Serial port %s remained open during %s", serial_name, context)
     return False
   if RUN.get(serial_name) is serial_port:
-    RUN[serial_name] = None
     if serial_name == 'ser':
       try:
         _require_main_controller_identity_cleanup(serial_port, context)
       except RuntimeError:
         return False
     elif serial_name == 'ser2':
+      RUN[serial_name] = None
       _clear_auxiliary_board_profile(serial_port)
+    else:
+      RUN[serial_name] = None
   return True
 
 
@@ -4855,18 +5026,40 @@ def _close_failed_controller_startup(
   serial_port,
   activity_lease,
   request_lease,
+  json_client=None,
 ):
-  identity_invariant_error = None
+  if json_client is not None:
+    try:
+      _require_persistent_json_client_cleanup(
+        json_client,
+        serial_port,
+        "failed controller connection cleanup",
+      )
+    except RuntimeError:
+      logger.exception(
+        "Persistent JSON startup cleanup remains pending"
+      )
+      return False
   if not getattr(serial_port, "is_open", False):
-    if RUN.get('ser') is serial_port:
-      RUN['ser'] = None
+    with controller_identity_state_lock:
+      binding = main_controller_identity_binding
+    if (
+      RUN.get('ser') is serial_port
+      or (
+        isinstance(binding, MainControllerIdentityBinding)
+        and binding.serial_port is serial_port
+      )
+    ):
       try:
         _require_main_controller_identity_cleanup(
           serial_port,
           "failed controller connection cleanup",
         )
-      except RuntimeError as exc:
-        identity_invariant_error = exc
+      except RuntimeError:
+        logger.exception(
+          "Failed controller startup identity cleanup remains pending"
+        )
+        return False
     closed = True
   elif RUN.get('ser') is serial_port:
     closed = _close_serial_port('ser', "failed controller connection cleanup")
@@ -4888,11 +5081,6 @@ def _close_failed_controller_startup(
   except Exception:
     logger.exception("Unable to release failed controller startup ownership")
     return False
-  if identity_invariant_error is not None:
-    logger.error(
-      "Failed controller startup cleanup encountered an identity invariant: %s",
-      identity_invariant_error,
-    )
   return True
 
 
@@ -4908,21 +5096,23 @@ def _run_startup_controller_cleanup():
 
     completed_any = False
     for key, entry in pending:
-      serial_port, activity_lease, request_lease = entry
+      serial_port, activity_lease, request_lease, json_client = entry
       if not _close_failed_controller_startup(
         serial_port,
         activity_lease,
         request_lease,
+        json_client,
       ):
         continue
       with startup_controller_cleanup_lock:
         current = startup_controller_cleanup_pending.get(key)
         if (
           isinstance(current, tuple)
-          and len(current) == 3
+          and len(current) == 4
           and current[0] is serial_port
           and current[1] is activity_lease
           and current[2] is request_lease
+          and current[3] is json_client
         ):
           del startup_controller_cleanup_pending[key]
       completed_any = True
@@ -4959,17 +5149,19 @@ def _retain_failed_controller_startup(
   serial_port,
   activity_lease,
   request_lease,
+  json_client=None,
 ):
-  entry = (serial_port, activity_lease, request_lease)
+  entry = (serial_port, activity_lease, request_lease, json_client)
   with startup_controller_cleanup_lock:
     key = id(serial_port)
     existing = startup_controller_cleanup_pending.get(key)
     if existing is not None and not (
       isinstance(existing, tuple)
-      and len(existing) == 3
+      and len(existing) == 4
       and existing[0] is serial_port
       and existing[1] is activity_lease
       and existing[2] is request_lease
+      and existing[3] is json_client
     ):
       raise RuntimeError("controller startup cleanup identity collision")
     startup_controller_cleanup_pending[key] = entry
@@ -4981,11 +5173,13 @@ def _poll_failed_controller_close(
   serial_port,
   activity_lease,
   request_lease,
+  json_client=None,
 ):
   if _close_failed_controller_startup(
     serial_port,
     activity_lease,
     request_lease,
+    json_client,
   ):
     return True
 
@@ -5001,6 +5195,7 @@ def _poll_failed_controller_close(
         serial_port,
         activity_lease,
         request_lease,
+        json_client,
       ),
     )
   except Exception:
@@ -5009,6 +5204,7 @@ def _poll_failed_controller_close(
       serial_port,
       activity_lease,
       request_lease,
+      json_client,
     )
   return False
 
@@ -5017,11 +5213,13 @@ def _abandon_failed_controller_startup(
   serial_port,
   activity_lease,
   request_lease,
+  json_client=None,
 ):
   if _close_failed_controller_startup(
     serial_port,
     activity_lease,
     request_lease,
+    json_client,
   ):
     return True
   logger.error("Controller startup cleanup retained for a durable retry")
@@ -5029,6 +5227,7 @@ def _abandon_failed_controller_startup(
     serial_port,
     activity_lease,
     request_lease,
+    json_client,
   )
 
 
@@ -5228,6 +5427,7 @@ def _poll_application_close():
       logger.exception("Unable to flush final controller state during shutdown")
     if persisted:
       closed = _close_serial_port('ser')
+      _detach_auxiliary_gripper_for_shutdown()
       closed = _close_serial_port('ser2') and closed
       if not _close_serial_port('ser3'):
         logger.error(
@@ -5304,6 +5504,7 @@ RUN['pick180'] = IntVar()
 RUN['pickClosest'] = IntVar()
 RUN['autoBG'] = IntVar()
 RUN['estopActive'] = False
+RUN['mainControllerStopPositionUnavailable'] = False
 RUN['posOutreach'] = False
 RUN['programStopStatusLatched'] = False
 RUN['gcodeSpeed'] = "10"
@@ -6149,33 +6350,6 @@ def driveMotorsJ(
     RUN['J1StepM'], RUN['J2StepM'], RUN['J3StepM'], RUN['J4StepM'], RUN['J5StepM'], RUN['J6StepM'] = RUN['StepMonitors']
 
 
-def parse_mj_command(inData):
-    try:
-        normalized = canonicalize_virtual_command(inData)
-    except MotionInputError as exc:
-        logger.error("MJ command parse failed: %s", exc)
-        return None
-    pattern = r"X([-+]?[0-9.]+)Y([-+]?[0-9.]+)Z([-+]?[0-9.]+)Rz([-+]?[0-9.]+)Ry([-+]?[0-9.]+)Rx([-+]?[0-9.]+)S[psm]([-+]?[0-9.]+)Ac([-+]?[0-9.]+)Dc([-+]?[0-9.]+)Rm([-+]?[0-9.]+)"
-    match = re.search(pattern, normalized)
-    if not match:
-        logger.error("MJ command parse failed")
-        return None
-
-    vals = [float(v) for v in match.groups()]
-    return {
-        "xyzuvw": _external_cartesian_pose_to_native(
-            vals[:6],
-            "MJ Cartesian pose",
-        ),
-        "SpeedType": normalized[normalized.find("S") + 1],
-        "Speed": vals[6],
-        "Acc": vals[7],
-        "Dec": vals[8],
-        "Ramp": vals[9],
-        "WristConfig": parse_motion_wrist_config(normalized, virtual=True),
-    }
-
-
 def _vision_rotation_degrees(in_data):
     normalized = canonicalize_virtual_command(in_data)
     vision_start = normalized.find("Vr")
@@ -6211,105 +6385,19 @@ def _temporary_vision_tool_rotation(vision_rotation_degrees):
     finally:
         robot.set_robot_tool_frame(*original_tool_frame)
 
-def parse_mt_command(inData):
-    try:
-        normalized = canonicalize_virtual_command(inData)
-    except MotionInputError as exc:
-        logger.error("Tool jog command parse failed: %s", exc)
-        return None
-    axis_map = {
-        'JTX': 0, 'JTY': 1, 'JTZ': 2,
-        'JTW': 3, 'JTP': 4, 'JTR': 5
-    }
-
-    # Extract axis and direction (e.g., JTX1 or JTP0)
-    axis_match = re.search(r'(JT[XYZRPW])([01])([-+]?[0-9.]+)', normalized)
-    if not axis_match:
-        logger.error("Tool jog command parse failed (axis part)")
-        return None
-
-    axis_str = axis_match.group(1)
-    direction = int(axis_match.group(2))
-    value = float(axis_match.group(3))
-
-    if axis_str not in axis_map:
-        logger.warning(f"Unknown axis code: {axis_str}")
-        return None
-
-    axis_index = axis_map[axis_str]
-    offset_vector = [0.0] * 6
-    offset_vector[axis_index] = value if direction == 1 else -value
-
-    # Extract speed and ramp values
-    try:
-        timing = parse_virtual_command_timing(normalized)
-        SpeedType = timing.mode
-        Speed = timing.speed
-        Acc = timing.acceleration
-        Dec = timing.deceleration
-        Ramp = timing.ramp
-        LoopMode = normalized.split("Lm")[1].strip()
-        wrist_config = parse_motion_wrist_config(normalized, virtual=True)
-    except Exception as e:
-        logger.error(f"Tool jog command parse failed (parameters): {e}")
-        return None
-
-    return {
-        "offset_vector": offset_vector,
-        "SpeedType": SpeedType,
-        "Speed": Speed,
-        "Acc": Acc,
-        "Dec": Dec,
-        "Ramp": Ramp,
-        "LoopMode": LoopMode,
-        "WristConfig": wrist_config,
-    }
-
-
 def rj_command(in_data):
-    #global J1StepM, J2StepM, J3StepM, J4StepM, J5StepM, J6StepM
-    # global RUN['cur_steps'], RUN['Alarm']
-
-    # Find start positions
-    Jidx = {label: in_data.find(label) for label in ['A', 'B', 'C', 'D', 'E', 'F']}
-    SPstart = in_data.find("S")
-    AcStart = in_data.find("Ac")
-    DcStart = in_data.find("Dc")
-    RmStart = in_data.find("Rm")
-    WristConStart = in_data.find("W")
-    LoopModeStart = in_data.find("Lm")
-
-    # Parse joint angles
-    Jangles = [
-        float(in_data[Jidx['A']+1:Jidx['B']]),
-        float(in_data[Jidx['B']+1:Jidx['C']]),
-        float(in_data[Jidx['C']+1:Jidx['D']]),
-        float(in_data[Jidx['D']+1:Jidx['E']]),
-        float(in_data[Jidx['E']+1:Jidx['F']]),
-        float(in_data[Jidx['F']+1:SPstart]),
-    ]
-
-    SpeedType = in_data[SPstart + 1]
-    SpeedVal = float(in_data[SPstart + 2:AcStart])
-    ACCspd = float(in_data[AcStart + 2:DcStart])
-    DCCspd = float(in_data[DcStart + 2:RmStart])
-    ACCramp = float(in_data[RmStart + 2:WristConStart])
-    WristCon = in_data[WristConStart + 1:LoopModeStart]
-    LoopMode = in_data[LoopModeStart + 2:].strip()
-    LoopModes = list(map(int, list(LoopMode)))
-
+    try:
+        target = parse_joint_motion_command(in_data, virtual=True)
+    except (TypeError, ValueError, MotionInputError) as exc:
+        logger.error("RJ command parse failed: %s", exc)
+        return False
     fut_steps = [
-    int(round((Jangles[0] + RUN['J1axisLimNeg']) * float(CAL['J1StepDeg']))),
-    int(round((Jangles[1] + RUN['J2axisLimNeg']) * float(CAL['J2StepDeg']))),
-    int(round((Jangles[2] + RUN['J3axisLimNeg']) * float(CAL['J3StepDeg']))),
-    int(round((Jangles[3] + RUN['J4axisLimNeg']) * float(CAL['J4StepDeg']))),
-    int(round((Jangles[4] + RUN['J5axisLimNeg']) * float(CAL['J5StepDeg']))),
-    int(round((Jangles[5] + RUN['J6axisLimNeg']) * float(CAL['J6StepDeg']))),
+      int(round((angle + RUN[f'J{axis}axisLimNeg']) * float(CAL[f'J{axis}StepDeg'])))
+      for axis, angle in enumerate(target.robot_joints_degrees, start=1)
     ]
 
 
-    RUN['cur_steps'] = [RUN['J1StepM'], RUN['J2StepM'], RUN['J3StepM'], RUN['J4StepM'], RUN['J5StepM'], RUN['J6StepM']]
-    step_degs = [CAL['J1StepDeg'], CAL['J2StepDeg'], CAL['J3StepDeg'], CAL['J4StepDeg'], CAL['J5StepDeg'], CAL['J6StepDeg']]
+    RUN['cur_steps'] = [RUN[f'J{axis}StepM'] for axis in range(1, 7)]
     step_lims = [J1StepLim, J2StepLim, J3StepLim, J4StepLim, J5StepLim, J6StepLim]
 
     step_difs = [int(round(cur - fut)) for cur, fut in zip(RUN['cur_steps'], fut_steps)]
@@ -6333,11 +6421,11 @@ def rj_command(in_data):
         return start_driveMotorsJ_thread(
             *[abs(d) for d in step_difs],
             *dirs,
-            SpeedType,
-            SpeedVal,
-            ACCspd,
-            DCCspd,
-            ACCramp
+            target.timing.mode,
+            target.timing.speed,
+            target.timing.acceleration,
+            target.timing.deceleration,
+            target.timing.ramp,
         )
     else:
         if RUN['offlineMode']:
@@ -6355,19 +6443,24 @@ def mj_command(inData):
 
     logger.info(inData)
 
-    result = parse_mj_command(inData)
-    if not result:
+    try:
+        target = parse_cartesian_motion_command(inData, virtual=True)
+    except (TypeError, ValueError, MotionInputError) as exc:
+        logger.error("MJ command parse failed: %s", exc)
         if RUN['offlineMode']:
           ErrorHandler("ER")
         return False
 
     # Extract values
-    target_xyzuvw = np.array(result["xyzuvw"], dtype=float)
-    SpeedVal = result["Speed"]
-    ACCspd = result["Acc"]
-    DCCspd = result["Dec"]
-    ACCramp = result["Ramp"]
-    SpeedType = result["SpeedType"]
+    target_xyzuvw = np.array(
+        target.translation_millimeters + target.orientation_degrees,
+        dtype=float,
+    )
+    SpeedVal = target.timing.speed
+    ACCspd = target.timing.acceleration
+    DCCspd = target.timing.deceleration
+    ACCramp = target.timing.ramp
+    SpeedType = target.timing.mode
 
     cartesian_start = None
     cartesian_target = None
@@ -6401,7 +6494,7 @@ def mj_command(inData):
         RUN['JangleOut'] = _solve_inverse_kinematics(
             RUN['xyzuvw_In'],
             RUN['VR_angles'],
-            result["WristConfig"],
+            target.wrist_configuration,
         )
     except Exception as exc:
         logger.error("Virtual Cartesian IK failed: %s", exc)
@@ -6485,13 +6578,26 @@ def mt_command(inData):
     # global RUN['cur_steps']
     #global offlineMode
 
-    result = parse_mt_command(inData)
-    if not result:
+    try:
+        target = parse_tool_jog_command(inData, virtual=True)
+    except (TypeError, ValueError, MotionInputError) as exc:
+        logger.error("Tool jog command parse failed: %s", exc)
         if RUN['offlineMode']:
             ErrorHandler("ER")
         return
-    
-    offset = [float(v) for v in result["offset_vector"]]
+
+    axis_index = {
+        "x": 0,
+        "y": 1,
+        "z": 2,
+        "rx": 3,
+        "ry": 4,
+        "rz": 5,
+    }[target.axis]
+    offset = [0.0] * 6
+    offset[axis_index] = (
+        target.distance if target.direction == "positive" else -target.distance
+    )
     original_tool_frame = _active_tool_frame()
     jogged_tool_frame = tuple(
         original + delta
@@ -6516,7 +6622,7 @@ def mt_command(inData):
         RUN['JangleOut'] = _solve_inverse_kinematics(
             RUN['xyzuvw_In'],
             RUN['VR_angles'],
-            result["WristConfig"],
+            target.wrist_configuration,
         )
     finally:
         robot.set_robot_tool_frame(*original_tool_frame)
@@ -6556,11 +6662,11 @@ def mt_command(inData):
         return start_driveMotorsJ_thread(
             *[abs(d) for d in step_difs],
             *dirs,
-            result["SpeedType"],
-            result["Speed"],
-            result["Acc"],
-            result["Dec"],
-            result["Ramp"]
+            target.timing.mode,
+            target.timing.speed,
+            target.timing.acceleration,
+            target.timing.deceleration,
+            target.timing.ramp
         )
     else:
         if RUN['offlineMode']:
@@ -6584,14 +6690,14 @@ def _start_offline_virtual_segment(stop_event, args):
             return operation
         if operation is not False:
             raise TypeError("offline virtual segment returned an invalid operation")
-        time.sleep(CONTROL_POLL_INTERVAL_SECONDS)
+        time.sleep(JSON_SERIAL_DEFAULT_POLL_INTERVAL_SECONDS)
 
 
 def _await_offline_virtual_segment(operation):
     if not isinstance(operation, VirtualMotionOperation):
         raise TypeError("offline virtual segment has an invalid operation")
     while not operation.completed:
-        operation.wait(CONTROL_POLL_INTERVAL_SECONDS)
+        operation.wait(JSON_SERIAL_DEFAULT_POLL_INTERVAL_SECONDS)
     succeeded, error = operation.result()
     if not succeeded:
         logger.error("Offline virtual segment failed: %s", error)
@@ -7026,7 +7132,7 @@ def _mode_change_is_blocked(request_lease=None, transport_reserved=False):
     elif (
         _virtual_motion_active(request_lease)
         or live_serial_result_pending.is_set()
-        or legacy_serial_result_pending.is_set()
+        or serial_result_pending.is_set()
         or joint_motion_dispatcher.active
         or (serial_lock.locked() and not transport_reserved)
     ):
@@ -7726,12 +7832,49 @@ def _build_startup_numeric_command(prefix, fields):
     return _validated_startup_command("".join(parts) + "\n", prefix)
 
 
+def _controller_startup_mapping_snapshot(values, field_name):
+    if not isinstance(values, dict):
+        raise MotionInputError(f"{field_name} must be a dictionary")
+    snapshot = []
+    for key, value in values.items():
+        if not isinstance(key, str) or not key:
+            raise MotionInputError(f"{field_name} keys must be non-empty text")
+        if type(value) not in (str, int, float):
+            raise MotionInputError(f"{field_name} values must be scalar")
+        if type(value) is float and not math.isfinite(value):
+            raise MotionInputError(f"{field_name} values must be finite")
+        snapshot.append((key, value))
+    return tuple(sorted(snapshot))
+
+
+def _controller_startup_position_snapshot(values):
+    if isinstance(values, (str, bytes)):
+        raise MotionInputError(
+            "controller startup position must be a numeric sequence"
+        )
+    try:
+        values = tuple(values)
+    except TypeError as exc:
+        raise MotionInputError(
+            "controller startup position must be a numeric sequence"
+        ) from exc
+    if len(values) != 9:
+        raise MotionInputError("controller startup position must contain 9 values")
+    return tuple(
+        finite_number(value, f"J{axis} controller startup position")
+        for axis, value in enumerate(values, start=1)
+    )
+
+
 @dataclass(frozen=True)
 class ControllerStartupRequest:
     auxiliary_port: Optional[str]
     update_parameters_command: str
     external_axis_command: str
     position_command: str
+    semantic_update_values: object
+    semantic_external_values: object
+    semantic_position_target: object
     auxiliary_board: Optional[str] = None
 
     def __post_init__(self):
@@ -7764,6 +7907,29 @@ class ControllerStartupRequest:
             "position_command",
             _validated_startup_command(self.position_command, "SP"),
         )
+        object.__setattr__(
+            self,
+            "semantic_update_values",
+            _controller_startup_mapping_snapshot(
+                self.semantic_update_values,
+                "controller startup update-parameter values",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "semantic_external_values",
+            _controller_startup_mapping_snapshot(
+                self.semantic_external_values,
+                "controller startup external-axis values",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "semantic_position_target",
+            _controller_startup_position_snapshot(
+                self.semantic_position_target,
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -7774,6 +7940,7 @@ class ControllerStartupResult:
     controller_identity: ControllerIdentity
     home_reference: Optional[PrimaryHomeReference] = None
     auxiliary_error: Optional[str] = None
+    json_bootstrap: object = None
 
     def __post_init__(self):
         if not isinstance(self.position, PositionResponse):
@@ -7784,12 +7951,14 @@ class ControllerStartupResult:
             raise ProtocolResponseError(
                 "controller startup identity has an invalid type"
             )
-        supports_home_reference = (
-            primary_home_reference_command(
-                self.controller_identity.protocol_capabilities
+        if (
+            self.json_bootstrap is not None
+            and type(self.json_bootstrap)
+            is not JsonMainControllerPersistentStartupResult
+        ):
+            raise ProtocolResponseError(
+                "controller JSON startup result has an invalid type"
             )
-            is not None
-        )
         if (
             self.home_reference is not None
             and not isinstance(self.home_reference, PrimaryHomeReference)
@@ -7797,9 +7966,9 @@ class ControllerStartupResult:
             raise ProtocolResponseError(
                 "controller startup home reference has an invalid type"
             )
-        if supports_home_reference != (self.home_reference is not None):
+        if self.home_reference is None:
             raise ProtocolResponseError(
-                "controller startup home-reference capability is inconsistent"
+                "controller startup home reference is missing"
             )
         if isinstance(self.visual_options, (str, bytes)):
             raise ProtocolResponseError("visual options must be a sequence")
@@ -7841,153 +8010,59 @@ def _startup_visual_options():
     ))
 
 
-def _startup_controller_exchange(
-    command,
-    cancellation_boundary,
-    expected_response=None,
-):
-    if not isinstance(command, str):
-        raise MotionInputError("controller startup command must be text")
-    command = _validated_startup_command(command, command[:2])
-    if not isinstance(
-        cancellation_boundary,
-        SerialWriteCancellationBoundary,
-    ):
-        raise TypeError(
-            "controller startup cancellation boundary is invalid"
-        )
-    if expected_response is not None and (
-        not isinstance(expected_response, bytes) or not expected_response
-    ):
-        raise MotionInputError("expected startup response must be non-empty bytes")
-    framed_expected_response = (
-        expected_response is not None and expected_response.endswith(b"\n")
-    )
-    expected_payload = expected_response
-    if framed_expected_response:
-        try:
-            expected_payload = decode_serial_response_line(
-                expected_response
-            ).encode("ascii")
-        except ProtocolResponseError as exc:
-            raise MotionInputError(
-                "expected framed startup response is invalid"
-            ) from exc
-    elif expected_response is not None and (
-        len(expected_response) > MAX_RESPONSE_PAYLOAD_LENGTH
-        or expected_response != expected_response.strip()
-        or b"\r" in expected_response
-        or b"\n" in expected_response
-        or not expected_response.isascii()
-    ):
-        raise MotionInputError(
-            "expected startup response must contain normalized unframed ASCII bytes"
-        )
-    serial_port = RUN.get('ser')
-    if serial_port is None or not getattr(serial_port, "is_open", False):
-        raise ConnectionError("controller serial connection is not open")
-    if serial_transport_quarantined(serial_port):
-        raise SerialTransportQuarantinedError(
-            "controller serial connection is quarantined; reconnect required"
-        )
-
-    def cancellation_requested():
-        requested = cancellation_boundary.is_set()
-        if not isinstance(requested, bool):
-            raise ProtocolResponseError(
-                "controller startup cancellation state must be boolean"
-            )
-        return requested
-
-    if cancellation_requested():
-        raise TimeoutError("controller startup cancelled")
-    publish_stop = _prepare_startup_main_controller_stop_exchange(
-        serial_port
-    )
-    if cancellation_requested():
-        raise TimeoutError("controller startup cancelled")
-    write_started_event = threading.Event()
-    write_serial_control(
-        serial_port,
-        command,
-        write_lock=serial_write_lock,
-        reset_input=False,
-        write_started_event=write_started_event,
-        cancellation_event=cancellation_boundary,
-        write_boundary_lock=cancellation_boundary,
-    )
-
-    if expected_response is not None and not framed_expected_response:
-        response = read_controller_exact_exchange_response(
-            serial_port,
-            expected_response,
-            SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
-            estop_callback=publish_stop,
-            context="controller startup exact response",
-        )
-    else:
-        accepted_responses = (
-            None
-            if expected_payload is None
-            else (expected_payload.decode("ascii"),)
-        )
-        response = read_controller_line_exchange_response(
-            serial_port,
-            SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
-            accepted_responses=accepted_responses,
-            estop_callback=publish_stop,
-            context="controller startup line response",
-        )
-    if cancellation_requested():
-        raise TimeoutError("controller startup cancelled")
-    return response
-
-
-def _startup_exchange_response(
-    command,
-    cancellation_boundary,
-    expected_response=None,
-):
-    response = _startup_controller_exchange(
-        command,
-        cancellation_boundary,
-        expected_response,
-    )
-    if (
-        response.estop_position is not None
-        or response.admission_position is not None
-    ):
-        _raise_legacy_controller_stop(RUN.get('ser'), response)
-    return response.terminal_response
-
-
-def _startup_controller_identity(cancellation_boundary):
-  response = _startup_controller_exchange(
-    "HO\n",
-    cancellation_boundary,
+def _publish_startup_main_controller_json_stop(serial_port, physical_stop):
+  if type(physical_stop) is not JsonMainControllerPhysicalStop:
+    raise TypeError("controller JSON startup stop evidence is invalid")
+  stop_context = _capture_startup_main_controller_stop_context(serial_port)
+  return _publish_main_controller_unpositioned_stop(
+    stop_context,
+    physical_stop,
   )
-  released_latch_retry = response.frame_order == "admission-estop"
-  if released_latch_retry:
-    response = _startup_controller_exchange(
-      "HO\n",
-      cancellation_boundary,
+
+
+def _close_persistent_json_startup_result(json_bootstrap):
+  if json_bootstrap is None:
+    return True
+  if type(json_bootstrap) is not JsonMainControllerPersistentStartupResult:
+    raise TypeError("controller JSON startup result is invalid")
+  client = json_bootstrap.client
+  client.close(timeout=JSON_COORDINATOR_DEFAULT_CLOSE_TIMEOUT_SECONDS)
+  if not client.closed or getattr(client.serial_port, "is_open", False):
+    raise OSError("persistent controller JSON startup remained open")
+  return True
+
+
+def _json_startup_position_disposition(json_bootstrap):
+  if json_bootstrap is None:
+    return None
+  if type(json_bootstrap) is not JsonMainControllerPersistentStartupResult:
+    raise TypeError("controller JSON startup result is invalid")
+  json_position = json_bootstrap.position
+  if type(json_position) is not JsonMainPositionResult:
+    raise ProtocolResponseError("invalid JSON startup position")
+  if json_position.motion_fault:
+    raise ProtocolResponseError(
+      "controller reported a JSON startup fault: "
+      f"{json_position.motion_fault}"
     )
-  if (
-    response.estop_position is not None
-    or response.admission_position is not None
-  ):
-    _raise_legacy_controller_stop(RUN.get('ser'), response)
-  try:
-    return parse_controller_identity_response(response.terminal_response)
-  except Exception:
-    if released_latch_retry:
-      serial_port = RUN.get('ser')
-      if serial_port is not None:
-        quarantine_serial_transport(
-          serial_port,
-          "controller identity retry returned a non-identity response",
-        )
-    raise
+  return json_position
+
+
+def _retain_json_startup_disposition_error(
+  json_bootstrap,
+  operation_error,
+  context,
+):
+  if type(json_bootstrap) is not JsonMainControllerPersistentStartupResult:
+    return operation_error
+  json_position = getattr(json_bootstrap, "position", None)
+  if type(json_position) is not JsonMainPositionResult:
+    return operation_error
+  return retain_main_controller_startup_disposition_error(
+    json_position,
+    operation_error,
+    context,
+  )
 
 
 def _close_startup_auxiliary(serial_port):
@@ -7997,10 +8072,9 @@ def _close_startup_auxiliary(serial_port):
         logger.error("Auxiliary startup cleanup could not reserve the transport")
         return False
     try:
+        if RUN.get('ser2') is serial_port:
+            return _close_serial_port('ser2', "auxiliary startup cleanup")
         if getattr(serial_port, "is_open", None) is False:
-            if RUN.get('ser2') is serial_port:
-                RUN['ser2'] = None
-                _clear_auxiliary_board_profile(serial_port)
             return True
         try:
             serial_port.close()
@@ -8010,9 +8084,6 @@ def _close_startup_auxiliary(serial_port):
         if getattr(serial_port, "is_open", False):
             logger.error("Auxiliary startup connection remained open during cleanup")
             return False
-        if RUN.get('ser2') is serial_port:
-            RUN['ser2'] = None
-            _clear_auxiliary_board_profile(serial_port)
         return True
     finally:
         auxiliary_serial_lock.release()
@@ -8153,7 +8224,7 @@ def startup_with_spinner(
             result = exc
         q.put((time.monotonic(), result))
         work_complete.set()
-        while not finalization_complete.wait(CONTROL_POLL_INTERVAL_SECONDS):
+        while not finalization_complete.wait(JSON_SERIAL_DEFAULT_POLL_INTERVAL_SECONDS):
             if scheduler_failed.is_set():
                 try:
                     on_abandoned(result)
@@ -8272,22 +8343,19 @@ def startup(startup_request, cancellation_boundary=None):
     SerialWriteCancellationBoundary,
   ):
     raise TypeError("controller startup cancellation boundary is invalid")
+  serial_port = RUN.get('ser')
+  if serial_port is None or not getattr(serial_port, "is_open", False):
+    raise ConnectionError("controller serial connection is not open")
+
   auxiliary_serial = None
   auxiliary_error = None
+  json_bootstrap = None
   try:
-    controller_identity = _startup_controller_identity(
-      cancellation_boundary
-    )
-    missing_capabilities = tuple(
-      capability
-      for capability in CONTROLLER_STARTUP_REQUIRED_CAPABILITIES
-      if capability not in controller_identity.protocol_capabilities
-    )
-    if missing_capabilities:
-      raise ProtocolResponseError(
-        "controller firmware lacks required protocol capabilities: "
-        + ", ".join(missing_capabilities)
+    configuration = (
+      _prepare_main_controller_json_startup_configuration_from_request(
+        startup_request
       )
+    )
     if startup_request.auxiliary_port is None:
       _clear_unavailable_startup_auxiliary()
     elif startup_request.auxiliary_board is None:
@@ -8302,42 +8370,39 @@ def startup(startup_request, cancellation_boundary=None):
       except Exception as exc:
         _clear_unavailable_startup_auxiliary()
         auxiliary_error = str(exc).strip() or type(exc).__name__
-    _startup_exchange_response(
-      startup_request.update_parameters_command,
+
+    json_bootstrap = run_main_controller_json_startup(
+      serial_port,
+      configuration,
       cancellation_boundary,
-      expected_response=b"Done",
+      physical_stop_callback=(
+        lambda physical_stop: _publish_startup_main_controller_json_stop(
+          serial_port,
+          physical_stop,
+        )
+      ),
+      request_timeout=SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+      close_timeout=JSON_COORDINATOR_DEFAULT_CLOSE_TIMEOUT_SECONDS,
     )
-    _startup_exchange_response(
-      startup_request.external_axis_command,
-      cancellation_boundary,
-      expected_response=b"Done",
-    )
-    _startup_exchange_response(
-      startup_request.position_command,
-      cancellation_boundary,
-      expected_response=b"Done\n",
-    )
-    home_reference_command = primary_home_reference_command(
-      controller_identity.protocol_capabilities
-    )
-    home_reference = None
-    if home_reference_command is not None:
-      home_reference = parse_primary_home_reference_capability_response(
-        _startup_exchange_response(
-          home_reference_command,
-          cancellation_boundary,
-        ),
-        controller_identity.protocol_capabilities,
-      )
-    position_text = _startup_exchange_response(
-      "RP\n",
-      cancellation_boundary,
-    )
-    position = parse_position_response(position_text)
-    if position.flag:
+    if type(json_bootstrap) is not JsonMainControllerPersistentStartupResult:
       raise ProtocolResponseError(
-        f"controller reported a startup fault: {position.flag}"
+        "controller JSON startup returned an invalid result"
       )
+    controller_identity = controller_identity_from_json_hello(
+      json_bootstrap.hello
+    )
+    json_position = _json_startup_position_disposition(json_bootstrap)
+    position = _json_joint_position_response(
+      "JSON startup position",
+      json_position,
+      speed_violation=json_position.speed_limited,
+      debug=json_position.controller_debug,
+      flag=json_position.motion_fault,
+    )
+    home_reference = PrimaryHomeReference(
+      valid=json_bootstrap.home_reference.valid,
+      positions=json_bootstrap.home_reference.positions_degrees,
+    )
     return ControllerStartupResult(
       position=position,
       visual_options=_startup_visual_options(),
@@ -8345,11 +8410,38 @@ def startup(startup_request, cancellation_boundary=None):
       controller_identity=controller_identity,
       home_reference=home_reference,
       auxiliary_error=auxiliary_error,
+      json_bootstrap=json_bootstrap,
     )
-  except BaseException:
+  except BaseException as operation_error:
+    retained_error = (
+      _retain_json_startup_disposition_error(
+        json_bootstrap,
+        operation_error,
+        "main-controller startup failed",
+      )
+      if json_bootstrap is not None
+      else operation_error
+    )
+    cleanup_error = None
+    try:
+      _close_persistent_json_startup_result(json_bootstrap)
+    except BaseException as exc:
+      cleanup_error = exc
     if auxiliary_serial is not None:
       _request_startup_auxiliary_cleanup(auxiliary_serial)
-    raise
+    if cleanup_error is not None:
+      raise JsonMainControllerStartupCleanupError(
+        retained_error,
+        cleanup_error,
+        (
+          json_bootstrap.client
+          if type(json_bootstrap) is JsonMainControllerPersistentStartupResult
+          else None
+        ),
+      ) from cleanup_error
+    if retained_error is operation_error:
+      raise
+    raise retained_error from operation_error
 
 
 
@@ -8359,6 +8451,253 @@ def startup(startup_request, cancellation_boundary=None):
 ###############################################################################################################################################################
 
 ###############################################################################################################################################################
+def _controller_json_milliunit(value, field_name):
+  number = finite_number(value, field_name)
+  scaled = number * 1000.0
+  if not math.isfinite(scaled):
+    raise MotionInputError(
+      f"{field_name} cannot be represented in JSON fixed-point units"
+    )
+  encoded = round(scaled)
+  if encoded < -(2 ** 31) or encoded > (2 ** 31) - 1:
+    raise MotionInputError(
+      f"{field_name} exceeds the JSON fixed-point range"
+    )
+  if number != 0.0 and encoded == 0:
+    raise MotionInputError(
+      f"{field_name} is below JSON fixed-point resolution"
+    )
+  representation_tolerance = 2.0 * max(
+    math.ulp(scaled),
+    math.ulp(float(encoded)),
+  )
+  if abs(scaled - encoded) > representation_tolerance:
+    raise MotionInputError(
+      f"{field_name} is not exactly representable in JSON fixed-point units"
+    )
+  controller_number(encoded / 1000.0, field_name)
+  return encoded
+
+
+def _prepare_main_controller_json_startup_configuration(
+  update_values,
+  external_values,
+  position_target,
+  calibration_values,
+):
+  if not isinstance(update_values, dict):
+    raise MotionInputError("JSON update-parameter values must be a dictionary")
+  if not isinstance(external_values, dict):
+    raise MotionInputError("JSON external-axis values must be a dictionary")
+  if not isinstance(calibration_values, dict):
+    raise MotionInputError("JSON calibration values must be a dictionary")
+  if isinstance(position_target, (str, bytes)):
+    raise MotionInputError("JSON startup position must be a numeric sequence")
+  try:
+    position_target = tuple(position_target)
+  except TypeError as exc:
+    raise MotionInputError(
+      "JSON startup position must be a numeric sequence"
+    ) from exc
+  if len(position_target) != 9:
+    raise MotionInputError("JSON startup position must contain 9 values")
+
+  required_update_fields = (
+    'TFx',
+    'TFy',
+    'TFz',
+    'TFrx',
+    'TFry',
+    'TFrz',
+    *tuple(
+      f'J{axis}{suffix}'
+      for suffix in (
+        'MotDir',
+        'CalDir',
+        'CalSwitch',
+      )
+      for axis in range(1, 10)
+    ),
+    *tuple(
+      f'J{axis}{suffix}'
+      for suffix in (
+        'PosLim',
+        'NegLim',
+        'StepDeg',
+        'DriveMS',
+        'EncCPR',
+        'ΘDHpar',
+        'αDHpar',
+        'dDHpar',
+        'aDHpar',
+      )
+      for axis in range(1, 7)
+    ),
+  )
+  required_external_fields = (
+    'J7PosLim',
+    'J8length',
+    'J9length',
+    *tuple(
+      f'J{axis}{suffix}'
+      for suffix in ('rotation', 'steps')
+      for axis in range(7, 10)
+    ),
+  )
+  missing_fields = tuple(sorted(
+    (
+      key
+      for key in required_update_fields
+      if key not in update_values
+    ),
+  )) + tuple(sorted(
+    (
+      key
+      for key in required_external_fields
+      if key not in external_values
+    ),
+  ))
+  if missing_fields:
+    raise MotionInputError(
+      "JSON startup configuration is missing required fields: "
+      + ", ".join(missing_fields)
+    )
+
+  switch_states = tuple(
+    update_values[f'J{axis}CalSwitch']
+    for axis in range(1, 10)
+  )
+  encode_calibration_switch_mask(switch_states)
+  encoder_counts_per_step = tuple(
+    controller_ratio(
+      update_values[f'J{axis}EncCPR'],
+      update_values[f'J{axis}DriveMS'],
+      f"J{axis} encoder multiplier",
+    )
+    for axis in range(1, 7)
+  )
+  encoded_position = tuple(
+    _controller_json_milliunit(value, f"J{axis} startup position")
+    for axis, value in enumerate(position_target, start=1)
+  )
+  _controller_joint_calibration_from_values(
+    calibration_values
+  ).validate_positions(
+    tuple(value / 1000.0 for value in encoded_position)
+  )
+  return JsonMainControllerStartupConfiguration(
+    tool_translation_millimeters=tuple(
+      controller_number(update_values[key], f"JSON startup {key}")
+      for key in ('TFx', 'TFy', 'TFz')
+    ),
+    tool_rotation_degrees=tuple(
+      controller_number(update_values[key], f"JSON startup {key}")
+      for key in ('TFrx', 'TFry', 'TFrz')
+    ),
+    motor_directions=tuple(
+      update_values[f'J{axis}MotDir']
+      for axis in range(1, 10)
+    ),
+    calibration_directions=tuple(
+      update_values[f'J{axis}CalDir']
+      for axis in range(1, 10)
+    ),
+    calibration_switch_active_high=tuple(
+      state == "HIGH"
+      for state in switch_states
+    ),
+    positive_joint_limits_degrees=tuple(
+      controller_number(
+        update_values[f'J{axis}PosLim'],
+        f"JSON startup J{axis} positive limit",
+      )
+      for axis in range(1, 7)
+    ),
+    negative_joint_limits_degrees=tuple(
+      controller_number(
+        update_values[f'J{axis}NegLim'],
+        f"JSON startup J{axis} negative limit",
+      )
+      for axis in range(1, 7)
+    ),
+    steps_per_degree=tuple(
+      controller_number(
+        update_values[f'J{axis}StepDeg'],
+        f"JSON startup J{axis} steps per degree",
+      )
+      for axis in range(1, 7)
+    ),
+    encoder_counts_per_step=encoder_counts_per_step,
+    dh_theta_degrees=tuple(
+      controller_number(
+        update_values[f'J{axis}ΘDHpar'],
+        f"JSON startup J{axis} DH theta",
+      )
+      for axis in range(1, 7)
+    ),
+    dh_alpha_degrees=tuple(
+      controller_number(
+        update_values[f'J{axis}αDHpar'],
+        f"JSON startup J{axis} DH alpha",
+      )
+      for axis in range(1, 7)
+    ),
+    dh_d_millimeters=tuple(
+      controller_number(
+        update_values[f'J{axis}dDHpar'],
+        f"JSON startup J{axis} DH d",
+      )
+      for axis in range(1, 7)
+    ),
+    dh_a_millimeters=tuple(
+      controller_number(
+        update_values[f'J{axis}aDHpar'],
+        f"JSON startup J{axis} DH a",
+      )
+      for axis in range(1, 7)
+    ),
+    external_axis_travel_units=tuple(
+      controller_number(external_values[key], f"JSON startup {key}")
+      for key in ('J7PosLim', 'J8length', 'J9length')
+    ),
+    external_axis_drive_rotations=tuple(
+      controller_number(
+        external_values[f'J{axis}rotation'],
+        f"JSON startup J{axis} drive rotations",
+      )
+      for axis in range(7, 10)
+    ),
+    external_axis_motor_steps=tuple(
+      controller_number(
+        external_values[f'J{axis}steps'],
+        f"JSON startup J{axis} motor steps",
+      )
+      for axis in range(7, 10)
+    ),
+    robot_joints_millidegrees=encoded_position[:6],
+    external_axes_milliunits=encoded_position[6:],
+  )
+
+
+def _prepare_main_controller_json_startup_configuration_from_request(
+  startup_request,
+):
+  if not isinstance(startup_request, ControllerStartupRequest):
+    raise MotionInputError(
+      "controller startup request is invalid for JSON configuration"
+    )
+  update_values = dict(startup_request.semantic_update_values)
+  external_values = dict(startup_request.semantic_external_values)
+  calibration_values = dict(update_values)
+  calibration_values.update(external_values)
+  return _prepare_main_controller_json_startup_configuration(
+    update_values,
+    external_values,
+    startup_request.semantic_position_target,
+    calibration_values,
+  )
+
+
 def _prepare_controller_startup():
   auxiliary_port = com2SelectedValue.get()
   auxiliary_board = auxiliaryBoardSelectedValue.get()
@@ -8372,12 +8711,16 @@ def _prepare_controller_startup():
   merged_values.update(update_values)
   merged_values.update(external_values)
   _prepare_cpp_kinematics_configuration(merged_values)
+  position_target = _prepare_position_target(merged_values)
   request = ControllerStartupRequest(
     auxiliary_port=auxiliary_port,
     auxiliary_board=auxiliary_board,
     update_parameters_command=update_command,
     external_axis_command=external_command,
-    position_command=_prepare_position_command(merged_values),
+    position_command=_position_command_from_target(position_target),
+    semantic_update_values=update_values,
+    semantic_external_values=external_values,
+    semantic_position_target=position_target,
   )
   return request, update_values, external_values
 
@@ -8397,11 +8740,29 @@ def _clear_controller_fault_latches_after_confirmed_startup(
   with auxiliary_stop_state_lock:
     with program_stop_state_lock:
       RUN['estopActive'] = False
+      RUN['mainControllerStopPositionUnavailable'] = False
       RUN['posOutreach'] = False
       if _program_execution_stop_admission_reason_locked() is None:
         RUN['programStopStatusLatched'] = False
         RUN['programStopState'] = "completed"
   return True
+
+
+def _controller_startup_cleanup_json_client(result):
+  if isinstance(result, ControllerStartupResult):
+    json_bootstrap = result.json_bootstrap
+    client = (
+      json_bootstrap.client
+      if type(json_bootstrap) is JsonMainControllerPersistentStartupResult
+      else None
+    )
+  elif isinstance(result, JsonMainControllerStartupCleanupError):
+    client = result.client
+  else:
+    client = None
+  if client is not None and type(client) is not JsonMainControllerClient:
+    raise TypeError("controller startup cleanup client is invalid")
+  return client
 
 
 def _apply_controller_startup_result(
@@ -8412,16 +8773,19 @@ def _apply_controller_startup_result(
   startup_serial,
   original_startup_timeout,
 ):
-  staged_values = dict(CAL)
-  staged_values.update(update_values)
-  staged_values.update(external_values)
-  staged_calibration = _controller_joint_calibration_from_values(staged_values)
-  staged_calibration.validate_positions(
-    result.position.joints + result.position.external
-  )
-
   calibration_applied = False
   try:
+    json_bootstrap = getattr(result, "json_bootstrap", None)
+    json_position = _json_startup_position_disposition(json_bootstrap)
+    if result.position.flag:
+      raise ProtocolResponseError(f"controller reported a startup fault: {result.position.flag}")
+    staged_values = dict(CAL)
+    staged_values.update(update_values)
+    staged_values.update(external_values)
+    staged_calibration = _controller_joint_calibration_from_values(staged_values)
+    staged_calibration.validate_positions(
+      result.position.joints + result.position.external
+    )
     _apply_controller_calibration(update_values, external_values)
     calibration_applied = True
     applied_position = displayPosition(
@@ -8432,6 +8796,20 @@ def _apply_controller_startup_result(
       raise ProtocolResponseError(
         "controller startup position could not be applied"
       )
+    if json_position is not None:
+      startup_debug = result.position.debug or json_position.controller_debug
+      if startup_debug != result.position.debug:
+        manEntryField.delete(0, 'end')
+        manEntryField.insert(0, startup_debug)
+      if json_position.speed_limited and not result.position.speed_violation:
+        message = (
+          "Max Speed Violation - Reduce Speed Setpoint or Travel Distance"
+        )
+        logger.warning(message)
+        value = tab8.ElogView.get(0, END)
+        with open("ErrorLog", "wb") as error_log:
+          pickle.dump(value, error_log)
+        _set_application_status(text=message, style="Warn.TLabel")
     updateVisOp(result.visual_options)
     startup_serial.timeout = original_startup_timeout
     value = tab8.ElogView.get(0, END)
@@ -8448,12 +8826,18 @@ def _apply_controller_startup_result(
       controller_configuration_fingerprint(
         startup_request.update_parameters_command
       ),
+      (
+        getattr(result, "json_bootstrap", None).client
+        if type(getattr(result, "json_bootstrap", None))
+          is JsonMainControllerPersistentStartupResult
+        else None
+      ),
     )
     _clear_controller_fault_latches_after_confirmed_startup(
       startup_serial,
       result.position,
     )
-  except Exception:
+  except Exception as operation_error:
     if calibration_applied:
       try:
         _invalidate_joint_motion_state(
@@ -8464,7 +8848,19 @@ def _apply_controller_startup_result(
         logger.exception(
           "Unable to invalidate motion after controller startup finalization"
         )
-    raise
+    json_bootstrap = getattr(result, "json_bootstrap", None)
+    retained_error = (
+      _retain_json_startup_disposition_error(
+        json_bootstrap,
+        operation_error,
+        "main-controller startup finalization failed",
+      )
+      if json_bootstrap is not None
+      else operation_error
+    )
+    if retained_error is operation_error:
+      raise
+    raise retained_error from operation_error
   return applied_position
 
 
@@ -8624,17 +9020,14 @@ def _set_com_admitted(
 
     existing_serial = RUN.get('ser')
     if existing_serial is not None:
-      if getattr(existing_serial, "is_open", False):
-        existing_serial.close()
-        if getattr(existing_serial, "is_open", False):
-          raise OSError("Existing Teensy serial connection remained open")
+      existing_was_open = getattr(existing_serial, "is_open", False)
+      if not _close_serial_port(
+        'ser',
+        "controller connection replacement",
+      ):
+        raise OSError("Existing Teensy serial connection remained open")
+      if existing_was_open:
         time.sleep(0.2)  # Windows can retain a just-closed COM handle briefly.
-      if RUN.get('ser') is existing_serial:
-        RUN['ser'] = None
-        _require_main_controller_identity_cleanup(
-          existing_serial,
-          "controller connection replacement",
-        )
 
     if selected_main_port in ("", "None"):
       raise ValueError("No COM port selected")
@@ -8682,6 +9075,7 @@ def _set_com_admitted(
       set_startup_status(message, "Alarm.TLabel")
 
     def finish_startup(result, timed_out):
+      startup_json_client = _controller_startup_cleanup_json_client(result)
       if RUN.get('ser') is not startup_serial:
         restore_port_selection()
         logger.error("Main serial reference changed during controller startup")
@@ -8691,6 +9085,7 @@ def _set_com_admitted(
           startup_serial,
           activity_lease,
           request_lease,
+          startup_json_client,
         )
         return
 
@@ -8721,6 +9116,7 @@ def _set_com_admitted(
           startup_serial,
           activity_lease,
           request_lease,
+          startup_json_client,
         )
         return
 
@@ -8745,6 +9141,7 @@ def _set_com_admitted(
           startup_serial,
           activity_lease,
           request_lease,
+          startup_json_client,
         )
         return
 
@@ -8754,7 +9151,16 @@ def _set_com_admitted(
           "Auxiliary controller unavailable during main startup: %s",
           result.auxiliary_error,
         )
-      if not startup_position.speed_violation:
+      json_position = _json_startup_position_disposition(
+        getattr(result, "json_bootstrap", None)
+      )
+      if not (
+        startup_position.speed_violation
+        or (
+          json_position is not None
+          and json_position.speed_limited
+        )
+      ):
         if result.auxiliary_error is not None:
           set_startup_status(
             "SYSTEM READY; AUXILIARY CONTROLLER UNAVAILABLE",
@@ -8771,12 +9177,14 @@ def _set_com_admitted(
       _release_async_main_serial_transport(activity_lease, request_lease)
 
     def abandon_startup(result):
+      startup_json_client = _controller_startup_cleanup_json_client(result)
       if isinstance(result, ControllerStartupResult):
         _request_startup_auxiliary_cleanup(result.auxiliary_serial)
       _abandon_failed_controller_startup(
         startup_serial,
         activity_lease,
         request_lease,
+        startup_json_client,
       )
 
     release_transport = False
@@ -8836,14 +9244,10 @@ def _replace_auxiliary_serial(port, board_profile):
   board_profile = normalize_auxiliary_board_profile(board_profile)
 
   existing_serial = RUN.get('ser2')
-  if existing_serial is not None:
-    if getattr(existing_serial, "is_open", False):
-      existing_serial.close()
-      if getattr(existing_serial, "is_open", False):
-        raise OSError("Existing auxiliary serial connection remained open")
-    if RUN.get('ser2') is existing_serial:
-      RUN['ser2'] = None
-      _clear_auxiliary_board_profile(existing_serial)
+  if existing_serial is not None and not _close_serial_port(
+    'ser2', "auxiliary connection replacement",
+  ):
+    raise OSError("Existing auxiliary serial connection remained open")
 
   replacement = serial.Serial(
     port=port,
@@ -8857,30 +9261,62 @@ def _replace_auxiliary_serial(port, board_profile):
     finally:
       raise OSError("Auxiliary serial connection did not open")
   RUN['ser2'] = replacement
+  json_client = None
   try:
-    _bind_auxiliary_board_profile(replacement, board_profile)
+    json_client = JsonAuxiliaryControllerClient(replacement)
+    hello_ticket = json_client.request_hello(
+      timeout=SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+    )
+    _await_auxiliary_json_terminal(
+      json_client,
+      hello_ticket,
+      "hello",
+    )
+    _bind_auxiliary_board_profile(
+      replacement,
+      board_profile,
+      json_client,
+    )
   except Exception as bind_error:
-    close_error = None
+    cleanup_error = None
     try:
-      replacement.close()
+      if json_client is None:
+        replacement.close()
+      else:
+        _require_persistent_json_client_cleanup(
+          json_client, replacement, "auxiliary profile binding failure",
+        )
     except Exception as exc:
-      close_error = exc
+      cleanup_error = exc
       logger.exception(
         "Unable to close auxiliary replacement after profile binding failed"
       )
-    closed = not getattr(replacement, "is_open", False)
+      if json_client is not None:
+        try:
+          replacement.close()
+        except Exception:
+          logger.exception("Unable to close the auxiliary transport fallback")
+        try:
+          _require_persistent_json_client_cleanup(
+            json_client, replacement, "auxiliary profile binding retry",
+          )
+        except Exception as retry_error:
+          cleanup_error = retry_error
+          logger.exception("Auxiliary JSON cleanup retry remained incomplete")
+    cleanup_complete = (
+      (json_client is None or json_client.closed)
+      and not getattr(replacement, "is_open", False)
+    )
+    if not cleanup_complete:
+      if json_client is not None:
+        # Preserve the cleanup owner; semantic access still requires a ready session.
+        RUN['ser2BoardProfile'] = (replacement, board_profile, json_client)
+      raise OSError(
+        "Auxiliary profile binding failed and cleanup remained incomplete"
+      ) from (cleanup_error or bind_error)
     _clear_auxiliary_board_profile(replacement)
-    if closed:
-      if RUN.get('ser2') is replacement:
-        RUN['ser2'] = None
-    if close_error is not None:
-      raise OSError(
-        "Auxiliary profile binding failed and the replacement remained open"
-      ) from bind_error
-    if not closed:
-      raise OSError(
-        "Auxiliary profile binding failed and the replacement remained open"
-      ) from bind_error
+    if RUN.get('ser2') is replacement:
+      RUN['ser2'] = None
     raise
   return replacement
 
@@ -9393,12 +9829,11 @@ def setCom2(misc=None):
       not connection_change_completed
       and active_serial is not None
       and active_serial is not previous_serial
-      and not _close_serial_port(
+    ):
+      _close_serial_port(
         'ser2',
         "failed auxiliary connection replacement",
       )
-    ):
-      _clear_auxiliary_board_profile(active_serial)
     if connection_change_completed and staged_calibration is not None:
       target_calibration = staged_calibration
       target_output_values = staged_calibration
@@ -9446,11 +9881,10 @@ def setCom2(misc=None):
     if not target_verified:
       active_serial = RUN.get('ser2')
       if active_serial is not None:
-        if not _close_serial_port(
+        _close_serial_port(
           'ser2',
           "failed auxiliary configuration recovery",
-        ):
-          _clear_auxiliary_board_profile(active_serial)
+        )
       else:
         _clear_auxiliary_board_profile()
       try:
@@ -9481,7 +9915,10 @@ def setCom2(misc=None):
         )
         active_serial = RUN.get('ser2')
         if active_serial is not None:
-          _clear_auxiliary_board_profile(active_serial)
+          _close_serial_port(
+            'ser2',
+            "failed prior auxiliary configuration restoration",
+          )
         else:
           _clear_auxiliary_board_profile()
 
@@ -9629,30 +10066,85 @@ VIRTUAL_JOINT_SECONDS_SCALE = 4.5
 VIRTUAL_CARTESIAN_SECONDS_SCALE = 4.7
 VIRTUAL_TOOL_SECONDS_SCALE = 5.1
 LIVE_TOOL_JOG_INCREMENT = 0.25
-PROGRAM_ROW_COMMAND_PREFIXES = frozenset({
-  "Call P", "Run Gc", "Stop P", "Test L", "Test G", "Set En",
-  "Read E", "Servo ", "If Inp", "Read C", "If Reg", "If COM",
-  "If MBc", "If MBi", "If MBh", "If MBI", "Jump T", "Wait T",
-  "Regist", "Positi", "Calibr", "Cal_J1", "Cal_J2", "Cal_J3",
-  "Cal_J4", "Cal_J5", "Cal_J6", "Cal_J7", "Cal_J8", "Cal_J9",
-  "Tool S", "Move J", "OFF J ", "Move V", "Move P", "OFF PR",
-  "Move L", "Move R", "Move A", "Move C", "Start ", "End Sp",
-  "Cam On", "Cam Of", "Vis Fi",
-})
-PROGRAM_ROW_LONG_COMMAND_PREFIXES = frozenset({
-  "Wait 5v Inp",
-  "Wait MBcoil",
-  "Wait MBinpu",
-  "Set 5v Outp",
-  "Set MBcoil ",
-  "Set MBoutpu",
-})
-
-
 @dataclass(frozen=True)
 class ProgramMotionPoseSnapshot:
   controller_positions: Optional[tuple]
   virtual_pose: tuple
+
+
+@dataclass(frozen=True)
+class ProgramJsonCartesianMotion:
+  command_name: str
+  motion_commands: tuple
+  control_points: tuple = ()
+  roundings_millimeters: tuple = ()
+
+  def __post_init__(self):
+    if (
+      not isinstance(self.motion_commands, tuple)
+      or not isinstance(self.control_points, tuple)
+      or not isinstance(self.roundings_millimeters, tuple)
+      or any(
+        not isinstance(command, str) or not command.endswith("\n")
+        for command in self.motion_commands
+      )
+    ):
+      raise MotionInputError("program JSON Cartesian motion shape is invalid")
+    command_count = len(self.motion_commands)
+    if self.command_name == "move_arc":
+      shape_valid = (
+        command_count == 1
+        and self.motion_commands[0].startswith("MJ")
+        and len(self.control_points) == 1
+        and not self.roundings_millimeters
+      )
+    elif self.command_name == "move_circle":
+      shape_valid = (
+        command_count == 1
+        and self.motion_commands[0].startswith("MJ")
+        and len(self.control_points) == 2
+        and not self.roundings_millimeters
+      )
+    elif self.command_name == "move_spline":
+      shape_valid = (
+        1 <= command_count <= 6
+        and all(command.startswith("ML") for command in self.motion_commands)
+        and not self.control_points
+        and len(self.roundings_millimeters) == command_count
+        and self.roundings_millimeters[-1] == 0.0
+      )
+    else:
+      shape_valid = False
+    if not shape_valid:
+      raise MotionInputError("program JSON Cartesian motion shape is invalid")
+    for point in self.control_points:
+      if not isinstance(point, tuple) or len(point) != 3:
+        raise MotionInputError("program JSON motion control point is invalid")
+      for value in point:
+        finite_number(value, "program JSON motion control-point coordinate")
+    for rounding in self.roundings_millimeters:
+      if finite_number(rounding, "program spline rounding") < 0:
+        raise MotionInputError("program spline rounding must be non-negative")
+
+
+def _motion_command_source_opcode(command):
+  if isinstance(command, ProgramJsonCartesianMotion):
+    return {
+      "move_arc": "MA",
+      "move_circle": "MC",
+      "move_spline": "MS",
+    }[command.command_name]
+  if not isinstance(command, str) or len(command) < 2:
+    raise MotionInputError("motion source command is invalid")
+  return command[:2]
+
+
+def _motion_command_display_text(command):
+  if isinstance(command, ProgramJsonCartesianMotion):
+    return command.command_name
+  if not isinstance(command, str):
+    raise MotionInputError("motion display command is invalid")
+  return command
 
 
 @dataclass(frozen=True)
@@ -9686,16 +10178,39 @@ class MainControllerStopContext:
 @dataclass(frozen=True)
 class MainControllerStopEvent:
   context: MainControllerStopContext
-  position: PositionResponse
+  position: object = None
+  physical_stop: object = None
+  upgrades_unpositioned_stop: bool = False
 
   def __post_init__(self):
     if not isinstance(self.context, MainControllerStopContext):
       raise MotionInputError(
         "main controller stop event requires a session context"
       )
-    if not position_response_is_physical_estop(self.position):
+    positioned = self.position is not None
+    unpositioned = self.physical_stop is not None
+    if positioned == unpositioned:
+      raise MotionInputError(
+        "main controller stop event requires exactly one evidence variant"
+      )
+    if type(self.upgrades_unpositioned_stop) is not bool:
+      raise MotionInputError(
+        "main controller stop position-upgrade state is invalid"
+      )
+    if self.upgrades_unpositioned_stop and not positioned:
+      raise MotionInputError(
+        "main controller stop position upgrade requires positioned evidence"
+      )
+    if positioned and not position_response_is_physical_estop(self.position):
       raise MotionInputError(
         "main controller stop event requires a physical-stop position"
+      )
+    if (
+      unpositioned
+      and type(self.physical_stop) is not JsonMainControllerPhysicalStop
+    ):
+      raise MotionInputError(
+        "unpositioned main controller stop evidence is invalid"
       )
 
 
@@ -9752,6 +10267,7 @@ class MainControllerIdleStopReadResult:
   serial_port: object
   ownership: MainControllerIdleStopOwnership
   position: Optional[PositionResponse] = None
+  physical_stop: object = None
   error: Optional[str] = None
 
   def __post_init__(self):
@@ -9773,6 +10289,17 @@ class MainControllerIdleStopReadResult:
       raise MotionInputError(
         "idle main-controller stop result position is invalid"
       )
+    if (
+      self.physical_stop is not None
+      and type(self.physical_stop) is not JsonMainControllerPhysicalStop
+    ):
+      raise MotionInputError(
+        "idle main-controller JSON stop result is invalid"
+      )
+    if self.position is not None and self.physical_stop is not None:
+      raise MotionInputError(
+        "idle main-controller stop result has conflicting evidence"
+      )
     if self.error is not None and (
       not isinstance(self.error, str)
       or not self.error
@@ -9783,31 +10310,26 @@ class MainControllerIdleStopReadResult:
       raise MotionInputError(
         "idle main-controller stop result error is invalid"
       )
-    if self.position is None and self.error is None:
+    if (
+      self.position is None
+      and self.physical_stop is None
+      and self.error is None
+    ):
       raise MotionInputError(
-        "idle main-controller stop result requires a position or error"
+        "idle main-controller stop result requires evidence or an error"
       )
-
-
-class LegacyControllerPhysicalStop(ProtocolResponseError):
-  def __init__(self, position):
-    if not position_response_is_physical_estop(position):
-      raise MotionInputError(
-        "legacy controller stop requires a physical-stop position"
-      )
-    self.position = position
-    super().__init__(
-      f"physical E-stop received ({position.flag}); reconnect required"
-    )
 
 
 def _apply_valid_position_response(response):
-  try:
-    parsed = parse_position_response(response)
-  except ProtocolResponseError:
-    displayPosition(response)
-    return None
-  applied_position = displayPosition(response, parsed=parsed)
+  if isinstance(response, PositionResponse):
+    parsed = response
+  else:
+    try:
+      parsed = parse_position_response(response)
+    except ProtocolResponseError:
+      displayPosition(response)
+      return None
+  applied_position = displayPosition(parsed.raw, parsed=parsed)
   if applied_position is None or applied_position.flag:
     return None
   return applied_position
@@ -9974,12 +10496,29 @@ def _clear_manual_auxiliary_stop_barrier_if_settled():
   return settled
 
 
-def _latch_main_controller_stop_state(position):
+def _latch_main_controller_stop_state(
+  position=None,
+  *,
+  unpositioned_stop=None,
+):
   global main_controller_auxiliary_stop_request_id
 
-  if not position_response_is_physical_estop(position):
+  positioned = position is not None
+  unpositioned = unpositioned_stop is not None
+  if positioned == unpositioned:
+    raise MotionInputError(
+      "main controller stop state requires exactly one stop evidence variant"
+    )
+  if positioned and not position_response_is_physical_estop(position):
     raise MotionInputError(
       "main controller stop state requires a physical-stop position"
+    )
+  if (
+    unpositioned
+    and type(unpositioned_stop) is not JsonMainControllerPhysicalStop
+  ):
+    raise MotionInputError(
+      "main controller unpositioned stop evidence is invalid"
     )
   discarded = 0
   repaired_program_request = False
@@ -10001,7 +10540,18 @@ def _latch_main_controller_stop_state(position):
             "auxiliary STOP; fail-safe reservation retained"
           )
 
+        position_unavailable = RUN.get(
+          'mainControllerStopPositionUnavailable',
+          False,
+        )
+        if not isinstance(position_unavailable, bool):
+          raise RuntimeError(
+            "main controller stop position-availability latch is invalid"
+          )
         RUN['estopActive'] = True
+        RUN['mainControllerStopPositionUnavailable'] = (
+          position_unavailable or unpositioned
+        )
         manual_auxiliary_stop_barrier.set()
         if not isinstance(manual_auxiliary_request_queue, list):
           raise RuntimeError("manual auxiliary request queue is invalid")
@@ -10071,9 +10621,17 @@ def _latch_main_controller_stop_state(position):
   return True
 
 
-def _publish_main_controller_stop(context, position):
-  event = MainControllerStopEvent(context, position)
-  _latch_main_controller_stop_state(position)
+def _complete_main_controller_stop_publication(event, detail):
+  if not isinstance(event, MainControllerStopEvent):
+    raise MotionInputError("main controller stop event is invalid")
+  if (
+    not isinstance(detail, str)
+    or not detail
+    or detail != detail.strip()
+    or "\r" in detail
+    or "\n" in detail
+  ):
+    raise MotionInputError("main controller stop detail is invalid")
   main_controller_stop_event_queue.put(event)
   try:
     _try_dispatch_auxiliary_stop()
@@ -10082,13 +10640,43 @@ def _publish_main_controller_stop(context, position):
       "Unable to dispatch the reserved physical E-stop auxiliary STOP"
     )
   try:
-    _invalidate_joint_motion_state(
-      f"controller reported physical E-stop: {position.flag}"
-    )
+    _invalidate_joint_motion_state(detail)
   except Exception:
     logger.exception(
       "Unable to invalidate joint motion after physical E-stop publication"
     )
+  return True
+
+
+def _publish_main_controller_stop(context, position):
+  event = MainControllerStopEvent(context, position)
+  _latch_main_controller_stop_state(position)
+  return _complete_main_controller_stop_publication(
+    event,
+    f"controller reported physical E-stop: {position.flag}",
+  )
+
+
+def _publish_main_controller_unpositioned_stop(context, physical_stop):
+  event = MainControllerStopEvent(
+    context,
+    physical_stop=physical_stop,
+  )
+  _latch_main_controller_stop_state(unpositioned_stop=physical_stop)
+  return _complete_main_controller_stop_publication(
+    event,
+    "controller reported physical E-stop during correlated JSON ownership; "
+    "controller position is unavailable",
+  )
+
+
+def _publish_main_controller_stop_position_upgrade(context, position):
+  event = MainControllerStopEvent(
+    context,
+    position,
+    upgrades_unpositioned_stop=True,
+  )
+  main_controller_stop_event_queue.put(event)
   return True
 
 
@@ -10104,6 +10692,7 @@ def _queue_main_controller_idle_stop_result(
   ownership,
   *,
   position=None,
+  physical_stop=None,
   error=None,
 ):
   if not isinstance(ownership, MainControllerIdleStopOwnership):
@@ -10115,7 +10704,12 @@ def _queue_main_controller_idle_stop_result(
     if error is None
     else _main_controller_idle_stop_error_detail(error)
   )
-  if position is None and error_detail is None and not ownership.complete:
+  if (
+    position is None
+    and physical_stop is None
+    and error_detail is None
+    and not ownership.complete
+  ):
     try:
       if ownership.release() is not True:
         raise RuntimeError(
@@ -10128,7 +10722,7 @@ def _queue_main_controller_idle_stop_result(
         if error_detail is not None
         else f"ownership cleanup failed: {cleanup_detail}"
       )
-  if position is None and error_detail is None:
+  if position is None and physical_stop is None and error_detail is None:
     return False
   try:
     main_controller_idle_stop_result_queue.put(
@@ -10136,6 +10730,7 @@ def _queue_main_controller_idle_stop_result(
         serial_port,
         ownership,
         position=position,
+        physical_stop=physical_stop,
         error=error_detail,
       )
     )
@@ -10169,51 +10764,98 @@ def _quarantine_main_controller_idle_stop_failure(serial_port, error):
   return RuntimeError(detail)
 
 
-def _consume_main_controller_idle_stop(serial_port, context):
-  def publish_idle_stop(candidate):
-    if (
-      not isinstance(candidate, PositionResponse)
-      or candidate.flag != CONTROLLER_ESTOP_EVENT_FLAG
-    ):
-      raise ProtocolResponseError(
-        "idle main-controller frame is not a standalone physical E-stop event"
-      )
-    return _publish_main_controller_stop(context, candidate)
-
-  position = read_pending_controller_estop_response(
-    serial_port,
-    publish_idle_stop,
-  )
-  if position is None:
+def _consume_main_controller_idle_json_stop(
+  serial_port,
+  context,
+  json_client,
+):
+  if (
+    not isinstance(json_client, JsonMainControllerClient)
+    or json_client.serial_port is not serial_port
+  ):
     raise ProtocolResponseError(
-      "idle main-controller buffer reported data without a complete frame"
+      "idle main-controller JSON ownership is invalid"
     )
-  if position.flag != CONTROLLER_ESTOP_EVENT_FLAG:
+  delivery = None
+  while delivery is None:
+    delivery = json_client.pop_delivery()
+    if delivery is not None:
+      break
+    polled = json_client.poll()
+    if not polled and not json_client.has_unread_input:
+      raise ProtocolResponseError(
+        "idle main-controller JSON buffer lacked a complete frame"
+      )
+  _validate_json_joint_motion_event(delivery)
+  physical_stop = JsonMainControllerPhysicalStop(
+    "idle",
+    "emergency_stop_event",
+  )
+  _publish_main_controller_unpositioned_stop(context, physical_stop)
+
+  while True:
+    extra = json_client.pop_delivery()
+    if extra is None:
+      polled = json_client.poll()
+      if not polled and not json_client.has_unread_input:
+        break
+      continue
     raise ProtocolResponseError(
-      "idle main-controller reader returned a non-event E-stop frame"
+      "idle main-controller JSON stop contained additional data"
+    )
+  if json_client.release_reader() is not True:
+    raise ProtocolResponseError(
+      "idle main-controller JSON reader ownership was not released"
     )
   quarantine_serial_transport(
     serial_port,
-    "idle main-controller physical E-stop requires reconnection",
+    "idle main-controller JSON physical E-stop requires reconnection",
   )
-  return position
+  return physical_stop
+
+
+def _consume_main_controller_idle_stop(
+  serial_port,
+  context,
+  json_client,
+):
+  return _consume_main_controller_idle_json_stop(
+    serial_port,
+    context,
+    json_client,
+  )
 
 
 def _run_main_controller_idle_stop_reader(
   serial_port,
   context,
   ownership,
+  json_client,
 ):
   position = None
+  physical_stop = None
   error = None
   try:
-    position = _consume_main_controller_idle_stop(serial_port, context)
+    result = _consume_main_controller_idle_stop(
+      serial_port,
+      context,
+      json_client,
+    )
+    if isinstance(result, PositionResponse):
+      position = result
+    elif type(result) is JsonMainControllerPhysicalStop:
+      physical_stop = result
+    else:
+      raise ProtocolResponseError(
+        "idle main-controller reader returned invalid stop evidence"
+      )
   except Exception as exc:
     error = exc
   _queue_main_controller_idle_stop_result(
     serial_port,
     ownership,
     position=position,
+    physical_stop=physical_stop,
     error=error,
   )
 
@@ -10258,6 +10900,15 @@ def _try_start_main_controller_idle_stop_reader():
   )
   try:
     context = _capture_main_controller_stop_context(serial_port)
+    binding = _current_main_controller_identity(serial_port)
+    if binding is None or not isinstance(
+      binding.json_client,
+      JsonMainControllerClient,
+    ):
+      raise ProtocolResponseError(
+        "idle JSON controller stop lost controller ownership"
+      )
+    json_client = binding.json_client
   except ConnectionError:
     _queue_main_controller_idle_stop_result(serial_port, ownership)
     return False
@@ -10301,7 +10952,7 @@ def _try_start_main_controller_idle_stop_reader():
   try:
     worker = threading.Thread(
       target=_run_main_controller_idle_stop_reader,
-      args=(serial_port, context, ownership),
+      args=(serial_port, context, ownership, json_client),
       name="ar4-main-controller-idle-stop",
       daemon=True,
     )
@@ -10349,7 +11000,6 @@ def _apply_main_controller_idle_stop_results():
         result.serial_port,
         "idle main-controller stop handling",
       )
-      RUN['ser'] = None
     if result.error is not None:
       message = (
         "IDLE MAIN-CONTROLLER EVENT MONITOR FAILED: "
@@ -10361,220 +11011,6 @@ def _apply_main_controller_idle_stop_results():
     applied = True
     main_controller_idle_stop_pending_result = None
   return applied
-
-
-def _raise_legacy_controller_stop(serial_port, response):
-  if not isinstance(response, ControllerLineExchangeResponse):
-    raise TypeError(
-      "legacy controller stop exchange response is invalid"
-    )
-  position = (
-    response.admission_position
-    if response.admission_position is not None
-    else response.estop_position
-  )
-  if not position_response_is_physical_estop(position):
-    raise TypeError(
-      "legacy controller stop exchange omitted a physical-stop position"
-    )
-  quarantine_serial_transport(
-    serial_port,
-    "legacy controller physical E-stop requires reconnection",
-  )
-  raise LegacyControllerPhysicalStop(position)
-
-
-def _prepare_main_controller_stop_exchange(serial_port):
-  stop_context = _capture_main_controller_stop_context(serial_port)
-
-  def publish_stop(position):
-    return _publish_main_controller_stop(stop_context, position)
-
-  pending_stop = read_pending_controller_estop_response(
-    serial_port,
-    publish_stop,
-  )
-  if pending_stop is not None:
-    _raise_legacy_controller_stop(
-      serial_port,
-      ControllerLineExchangeResponse(
-        None,
-        pending_stop,
-        (
-          "admission-estop"
-          if pending_stop.flag == CONTROLLER_ESTOP_ADMISSION_FLAG
-          else "estop-only"
-        ),
-      ),
-    )
-  return publish_stop
-
-
-def _prepare_startup_main_controller_stop_exchange(serial_port):
-  stop_context = _capture_startup_main_controller_stop_context(
-    serial_port
-  )
-
-  def publish_stop(position):
-    return _publish_main_controller_stop(stop_context, position)
-
-  pending_stop = read_pending_controller_estop_response(
-    serial_port,
-    publish_stop,
-  )
-  if pending_stop is not None:
-    _raise_legacy_controller_stop(
-      serial_port,
-      ControllerLineExchangeResponse(
-        None,
-        pending_stop,
-        (
-          "admission-estop"
-          if pending_stop.flag == CONTROLLER_ESTOP_ADMISSION_FLAG
-          else "estop-only"
-        ),
-      ),
-    )
-  return publish_stop
-
-
-def _exchange_legacy_main_command(
-  command,
-  *,
-  read_line=True,
-  response_timeout=SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
-  accepted_responses=None,
-  expected_response=None,
-  write_started_event=None,
-  cancellation_event=None,
-  write_boundary_lock=None,
-  interim_response_handler=None,
-  interim_response_limit=None,
-  terminal_validator=None,
-  expected_serial_port=None,
-):
-  if not isinstance(read_line, bool):
-    raise TypeError("read_line must be boolean")
-  response_timeout = finite_number(
-    response_timeout,
-    "legacy controller response timeout",
-  )
-  if response_timeout <= 0:
-    raise MotionInputError("legacy controller response timeout must be positive")
-  if read_line == (expected_response is not None):
-    raise MotionInputError(
-      "legacy controller commands require exactly one framed or exact response contract"
-    )
-  if not read_line and accepted_responses is not None:
-    raise MotionInputError(
-      "accepted legacy responses require line-response ownership"
-    )
-  if not read_line and (
-    interim_response_handler is not None
-    or interim_response_limit is not None
-    or terminal_validator is not None
-  ):
-    raise MotionInputError(
-      "exact legacy responses cannot use line-response handlers"
-    )
-
-  serial_port = RUN.get('ser')
-  if (
-    expected_serial_port is not None
-    and serial_port is not expected_serial_port
-  ):
-    raise ConnectionError(
-      "main controller connection changed before legacy exchange"
-    )
-  try:
-    publish_stop = _prepare_main_controller_stop_exchange(serial_port)
-    write_options = {
-      "write_lock": serial_write_lock,
-      "reset_input": False,
-      "write_started_event": write_started_event,
-    }
-    if cancellation_event is not None:
-      write_options["cancellation_event"] = cancellation_event
-    if write_boundary_lock is not None:
-      write_options["write_boundary_lock"] = write_boundary_lock
-    write_serial_control(
-      serial_port,
-      command,
-      **write_options,
-    )
-    if read_line:
-      response = read_controller_line_exchange_response(
-        serial_port,
-        response_timeout,
-        accepted_responses=accepted_responses,
-        estop_callback=publish_stop,
-        interim_response_handler=interim_response_handler,
-        interim_response_limit=interim_response_limit,
-        terminal_validator=terminal_validator,
-        context="legacy controller line response",
-      )
-    else:
-      response = read_controller_exact_exchange_response(
-        serial_port,
-        expected_response,
-        response_timeout,
-        estop_callback=publish_stop,
-        context="legacy controller exact response",
-      )
-    if response.estop_position is not None:
-      _raise_legacy_controller_stop(serial_port, response)
-    return response.terminal_response
-  finally:
-    if (
-      RUN.get('ser') is serial_port
-      and not getattr(serial_port, "is_open", False)
-    ):
-      RUN['ser'] = None
-      _require_main_controller_identity_cleanup(
-        serial_port,
-        "legacy controller exchange cleanup",
-      )
-
-
-def _exchange_main_controller_line_until_cancelled(
-  serial_port,
-  command,
-  cancellation_event,
-  *,
-  write_started_event=None,
-  write_boundary_lock=None,
-  write_cancellation_event=None,
-):
-  publish_stop = _prepare_main_controller_stop_exchange(serial_port)
-  response = exchange_serial_line_until_cancelled(
-    serial_port,
-    command,
-    cancellation_event,
-    write_lock=serial_write_lock,
-    write_started_event=write_started_event,
-    write_boundary_lock=write_boundary_lock,
-    write_cancellation_event=write_cancellation_event,
-    reset_input=False,
-    estop_callback=publish_stop,
-  )
-  try:
-    position = parse_position_response(response)
-  except ProtocolResponseError:
-    return response
-  if position_response_is_physical_estop(position):
-    _raise_legacy_controller_stop(
-      serial_port,
-      ControllerLineExchangeResponse(
-        None,
-        position,
-        (
-          "admission-estop"
-          if position.flag == CONTROLLER_ESTOP_ADMISSION_FLAG
-          else "estop-only"
-        ),
-      ),
-    )
-  return response
 
 
 def _manual_controller_error_detail(error, fallback):
@@ -10653,8 +11089,6 @@ def _close_manual_controller_cleanup_transport(request, context):
     raise RuntimeError(
       "manual controller cleanup connection ownership changed"
     )
-  if current_port is request.serial_port:
-    RUN['ser'] = None
   _require_main_controller_identity_cleanup(
     request.serial_port,
     context,
@@ -10708,8 +11142,6 @@ def _finalize_manual_controller_cleanup(cleanup):
         cleanup.request.serial_port,
         "manual controller connection lost during settlement",
       )
-    if RUN.get('ser') is cleanup.request.serial_port:
-      RUN['ser'] = None
     _require_main_controller_identity_cleanup(
       cleanup.request.serial_port,
       "manual controller connection-loss settlement",
@@ -10836,45 +11268,8 @@ def _release_manual_controller_operation(
   return request
 
 
-def _publish_manual_controller_estop(request, position):
-  global manual_controller_pending_stop_event
-
-  if not isinstance(request, ManualControllerRequest):
-    raise TypeError("manual controller E-stop request is invalid")
-  event = ManualControllerStopEvent(request.request_id, position)
-  _latch_main_controller_stop_state(position)
-  with manual_controller_state_lock:
-    if manual_controller_active_request is not request:
-      raise RuntimeError(
-        "manual controller E-stop request ownership changed"
-      )
-    if (
-      manual_controller_pending_stop_event is not None
-      or manual_controller_estop_applied_request_id is not None
-      or manual_controller_estop_applied_position is not None
-    ):
-      raise RuntimeError("manual controller E-stop event was duplicated")
-    manual_controller_pending_stop_event = event
-  try:
-    _try_dispatch_auxiliary_stop()
-  except Exception:
-    logger.exception(
-      "Unable to dispatch the reserved manual-controller E-stop "
-      "auxiliary STOP"
-    )
-  try:
-    _invalidate_joint_motion_state(
-      f"controller reported physical E-stop: {position.flag}"
-    )
-  except Exception:
-    logger.exception(
-      "Unable to invalidate joint motion after manual-controller "
-      "E-stop publication"
-    )
-  return True
-
-
-def _exchange_manual_controller_request(request, serial_write_started_event):
+def _exchange_manual_controller_request(request, serial_write_started_event,
+                                        unpositioned_stop_event):
   if not isinstance(request, ManualControllerRequest):
     raise TypeError("manual controller worker request is invalid")
   if (
@@ -10888,120 +11283,44 @@ def _exchange_manual_controller_request(request, serial_write_started_event):
     raise ConnectionError(
       "manual controller connection changed before request dispatch"
     )
-  try:
-    pending_estop = read_pending_controller_estop_response(
-      request.serial_port,
-      lambda position: _publish_manual_controller_estop(
-        request,
-        position,
-      ),
-    )
-    if (
-      pending_estop is not None
-      and (
-        not isinstance(pending_estop, PositionResponse)
-        or not position_response_is_physical_estop(pending_estop)
-      )
-    ):
-      raise TypeError(
-        "pending manual controller E-stop response is invalid"
-      )
-  except (SerialTransportQuarantinedError, SerialTransportTimeout):
-    raise
-  except Exception as exc:
-    detail = _manual_controller_error_detail(
-      exc,
-      "pre-write response ownership failed without details",
-    )
-    try:
-      quarantine_serial_transport(
-        request.serial_port,
-        f"manual controller pre-write ownership failed: {detail}",
-      )
-    except SerialTransportQuarantinedError as quarantine_error:
-      raise quarantine_error from exc
-    raise
-  if pending_estop is not None:
-    frame_order = (
-      "admission-estop"
-      if pending_estop.flag == CONTROLLER_ESTOP_ADMISSION_FLAG
-      else "estop-only"
-    )
-    return ManualControllerResult(
-      request.request_id,
-      "estop",
-      "PHYSICAL E-STOP RECEIVED BEFORE COMMAND TRANSMISSION",
-      False,
-      pending_estop,
-      frame_order,
-    )
-  write_serial_control(
-    request.serial_port,
-    request.command,
-    write_lock=serial_write_lock,
-    reset_input=False,
-    write_started_event=serial_write_started_event,
-  )
-  try:
-    exchange = read_controller_modbus_exchange_response(
-      request.serial_port,
+  opcode = request.command[:2]
+  if opcode in ("BA", "BH", "BB", "BC", "BD"):
+    value = _exchange_main_controller_modbus_read(
       request.command,
-      SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
-      lambda position: _publish_manual_controller_estop(
-        request,
-        position,
-      ),
+      write_started_event=serial_write_started_event,
+      completed_stop_event=unpositioned_stop_event,
     )
-    if not isinstance(exchange, ControllerModbusExchangeResponse):
-      raise TypeError("manual controller exchange response is invalid")
-  except (SerialTransportQuarantinedError, SerialTransportTimeout):
-    raise
-  except Exception as exc:
-    detail = _manual_controller_error_detail(
-      exc,
-      "response ownership failed without details",
+  elif opcode in ("BE", "BF"):
+    value = _exchange_main_controller_modbus_write(
+      request.command,
+      write_started_event=serial_write_started_event,
+      completed_stop_event=unpositioned_stop_event,
     )
-    try:
-      quarantine_serial_transport(
-        request.serial_port,
-        f"manual controller response ownership failed: {detail}",
-      )
-    except SerialTransportQuarantinedError as quarantine_error:
-      raise quarantine_error from exc
-    raise
-  if exchange.estop_position is not None:
-    response_value = exchange.terminal_response
-    if response_value is None:
-      response_value = "PHYSICAL E-STOP BLOCKED COMMAND ADMISSION"
-    return ManualControllerResult(
-      request.request_id,
-      "estop",
-      response_value,
-      True,
-      exchange.estop_position,
-      exchange.frame_order,
-      exchange.admission_position,
-    )
+  else:
+    raise MotionInputError("manual controller command lacks a JSON route")
   outcome = classify_controller_modbus_terminal_response(
     request.command,
-    exchange.terminal_response,
+    value,
   )
   return ManualControllerResult(
     request.request_id,
     outcome,
-    exchange.terminal_response,
-    True,
+    value,
+    serial_write_started_event.is_set(),
+    unpositioned_stop_observed=unpositioned_stop_event.is_set(),
   )
 
 
 def _run_manual_controller_request(request):
   serial_write_started_event = threading.Event()
+  unpositioned_stop_event = threading.Event()
   try:
     result = _exchange_manual_controller_request(
       request,
       serial_write_started_event,
+      unpositioned_stop_event,
     )
-  except Exception as exc:
+  except BaseException as exc:
     message = _manual_controller_error_detail(
       exc,
       "manual controller command failed without details",
@@ -11027,6 +11346,7 @@ def _run_manual_controller_request(request):
       outcome,
       message,
       serial_write_started,
+      unpositioned_stop_observed=unpositioned_stop_event.is_set(),
     )
   manual_controller_event_queue.put(result)
 
@@ -11104,14 +11424,6 @@ def _start_manual_controller_request(command):
       ):
         raise RuntimeError("manual controller request ownership is already active")
       if (
-        manual_controller_pending_stop_event is not None
-        or manual_controller_estop_applied_request_id is not None
-        or manual_controller_estop_applied_position is not None
-      ):
-        raise RuntimeError(
-          "manual controller E-stop application state is already active"
-        )
-      if (
         isinstance(manual_controller_next_request_id, bool)
         or not isinstance(manual_controller_next_request_id, int)
         or manual_controller_next_request_id < 0
@@ -11133,7 +11445,7 @@ def _start_manual_controller_request(command):
       manual_controller_active_request = request
       manual_controller_activity_lease = activity_lease
       state_assigned = True
-    legacy_serial_result_pending.set()
+    serial_result_pending.set()
     worker.start()
   except Exception as exc:
     if state_assigned:
@@ -11197,12 +11509,19 @@ def _request_manual_modbus(opcode):
   "Program controller command",
   rejection_result=(ROW_EXECUTION_REJECTED, None),
   requires_kinematics=False,
+  inherited_lease_keyword="request_lease",
 )
 @_tracked_serial_operation(
   "ser",
   rejection_result=(ROW_EXECUTION_REJECTED, None),
 )
-def _execute_row_main_command(command, **response_contract):
+def _execute_row_main_command(
+  command,
+  *,
+  request_lease=None,
+  controller_wait_seconds=None,
+  **response_contract,
+):
   execution_request = _active_program_execution_request()
   if _program_execution_request_cancelled(execution_request):
     _abort_program_row_execution()
@@ -11218,22 +11537,96 @@ def _execute_row_main_command(command, **response_contract):
     )
   write_started_event = threading.Event()
   try:
-    response = _exchange_legacy_main_command(
-      command,
-      write_started_event=write_started_event,
-      cancellation_event=execution_request.cancellation_boundary,
-      write_boundary_lock=execution_request.cancellation_boundary,
-      **response_contract,
-    )
-  except LegacyControllerPhysicalStop:
-    logger.warning(
-      "Program controller command stopped by the physical E-stop"
-    )
-    return ROW_EXECUTION_REJECTED, None
+    if command in (
+      "read_encoders",
+      "set_encoders",
+      "test_limit_switches",
+    ):
+      if controller_wait_seconds is not None or response_contract:
+        raise MotionInputError(
+          "controller diagnostics do not accept wait or response contracts"
+        )
+      response = _exchange_main_controller_diagnostic(
+        command,
+        write_started_event=write_started_event,
+        write_cancellation_boundary=execution_request.cancellation_boundary,
+      )
+    elif isinstance(command, str) and command[:2] in ("BA", "BH", "BB", "BC", "BD"):
+      if controller_wait_seconds is not None or response_contract:
+        raise MotionInputError("Modbus reads reject response contracts")
+      response = _exchange_main_controller_modbus_read(
+        command,
+        write_started_event=write_started_event,
+        write_cancellation_boundary=execution_request.cancellation_boundary,
+      )
+    elif isinstance(command, str) and command[:2] in ("SC", "SO"):
+      if controller_wait_seconds is not None or response_contract:
+        raise MotionInputError("Modbus writes reject response contracts")
+      response = _exchange_main_controller_modbus_write(
+        command,
+        write_started_event=write_started_event,
+        write_cancellation_boundary=execution_request.cancellation_boundary,
+      )
+    elif isinstance(command, str) and command[:2] in ("WH", "WJ", "WK"):
+      if controller_wait_seconds is not None or set(response_contract) != {
+        "response_timeout"
+      }:
+        raise MotionInputError(
+          "Modbus waits require one response-timeout contract"
+        )
+      response = _exchange_main_controller_modbus_wait(
+        command,
+        response_timeout=response_contract["response_timeout"],
+        write_started_event=write_started_event,
+        write_cancellation_boundary=execution_request.cancellation_boundary,
+      )
+    elif controller_wait_seconds is not None:
+      if set(response_contract) != {"response_timeout"}:
+        raise MotionInputError(
+          "controller wait requires one response-timeout contract"
+        )
+      response = _exchange_main_controller_wait(
+        command,
+        controller_wait_seconds,
+        response_timeout=response_contract["response_timeout"],
+        write_started_event=write_started_event,
+        write_cancellation_boundary=execution_request.cancellation_boundary,
+      )
+    else:
+      raise MotionInputError("program controller command lacks a JSON route")
   except Exception as exc:
-    message = f"Program controller command failed: {exc}"
+    detail = " ".join(str(exc).split()) or type(exc).__name__
+    if write_started_event.is_set() and isinstance(command, str) and (
+      command[:2] in ("BE", "BF", "SC", "SO")):
+      reason = f"program Modbus {command[:2]} external write outcome is unknown"
+      cleanup_errors = []
+      try:
+        if not _close_serial_port('ser', reason, quarantine=True):
+          cleanup_errors.append("main controller cleanup remains pending")
+      except Exception as cleanup_exc:
+        cleanup_detail = (
+          " ".join(str(cleanup_exc).split())
+          or type(cleanup_exc).__name__
+        )
+        cleanup_errors.append(cleanup_detail)
+      try:
+        _invalidate_joint_motion_state(reason)
+      except Exception as cleanup_exc:
+        cleanup_detail = (
+          " ".join(str(cleanup_exc).split())
+          or type(cleanup_exc).__name__
+        )
+        cleanup_errors.append(cleanup_detail)
+      message = (
+        f"Program Modbus {command[:2]} write outcome unknown ({detail}); "
+        "reconnect and verify external device state"
+      )
+      if cleanup_errors:
+        message = f"{message}; cleanup pending: {'; '.join(cleanup_errors)}"
+    else:
+      message = f"Program controller command failed: {detail}"
     logger.exception(message)
-    _set_application_status(message, "Alarm.TLabel")
+    _queue_program_execution_status(message, "Alarm.TLabel")
     return ROW_EXECUTION_REJECTED, None
   if _program_execution_request_cancelled(execution_request):
     _abort_program_row_execution()
@@ -11243,12 +11636,8 @@ def _execute_row_main_command(command, **response_contract):
 
 def _execute_row_main_response(
   command,
-  *,
-  response_parser=None,
   **response_contract,
 ):
-  if response_parser is not None and not callable(response_parser):
-    raise TypeError("controller response parser must be callable or None")
   execution_state, response = _execute_row_main_command(
     command,
     **response_contract,
@@ -11256,15 +11645,6 @@ def _execute_row_main_response(
   if execution_state != ROW_EXECUTION_COMPLETE:
     _finish_execute_row()
     return execution_state, None
-  if response_parser is not None:
-    try:
-      response = response_parser(command, response)
-    except ProtocolResponseError as exc:
-      message = f"Program controller response rejected: {exc}"
-      logger.error(message)
-      _set_application_status(message, "Alarm.TLabel")
-      _finish_execute_row()
-      return ROW_EXECUTION_REJECTED, None
   return execution_state, response
 
 
@@ -11295,14 +11675,8 @@ def _reject_indeterminate_program_modbus_write(command, response):
   reason = f"program Modbus {opcode} external write outcome is unknown"
   cleanup_errors = []
   try:
-    if not _close_serial_port(
-      'ser',
-      reason,
-      quarantine=True,
-    ):
-      cleanup_errors.append(
-        "main controller quarantine remains pending"
-      )
+    if not _close_serial_port('ser', reason, quarantine=True):
+      cleanup_errors.append("main controller cleanup remains pending")
   except Exception as exc:
     detail = " ".join(str(exc).split()) or type(exc).__name__
     cleanup_errors.append(detail)
@@ -11336,23 +11710,11 @@ def _execute_row_main_modbus_write_response(command):
   if execution_state != ROW_EXECUTION_COMPLETE:
     _finish_execute_row()
     return execution_state, None
-  try:
-    outcome = classify_controller_modbus_terminal_response(
-      command,
-      response,
-    )
-  except ProtocolResponseError:
-    return _reject_indeterminate_program_modbus_write(
-      command,
-      response,
-    )
+  outcome = classify_controller_modbus_terminal_response(command, response)
   if outcome == "completed":
     return execution_state, response
   if outcome == "indeterminate":
-    return _reject_indeterminate_program_modbus_write(
-      command,
-      response,
-    )
+    return _reject_indeterminate_program_modbus_write(command, response)
   if outcome != "rejected":
     raise RuntimeError("program Modbus write outcome is invalid")
   message = f"Program controller write rejected: {response}"
@@ -11363,6 +11725,11 @@ def _execute_row_main_modbus_write_response(command):
 
 
 def _apply_controller_position_response(response):
+  if type(response) is PositionResponse:
+    if position_response_is_physical_estop(response):
+      return False
+    applied = displayPosition(response.raw, parsed=response)
+    return applied is not None and not response.flag
   if isinstance(response, str) and response.startswith("E"):
     _invalidate_joint_motion_state(f"controller rejected request: {response}")
     ErrorHandler(response)
@@ -11401,63 +11768,17 @@ def _reject_cancelled_program_row(execution_request):
 def _execute_row_auxiliary_command(
   command,
   *,
-  read_line=False,
   control_injectable=False,
-  response_delay=0.1,
   response_timeout=SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
-  accepted_responses=None,
-  expected_response=None,
-  response_parser=None,
 ):
-  if not isinstance(read_line, bool):
-    raise TypeError("read_line must be boolean")
   if not isinstance(control_injectable, bool):
     raise TypeError("control_injectable must be boolean")
-  response_delay = finite_number(response_delay, "auxiliary response delay")
-  if response_delay < 0:
-    raise MotionInputError("auxiliary response delay must not be negative")
   response_timeout = finite_number(
     response_timeout,
     "auxiliary response timeout",
   )
   if response_timeout <= 0:
     raise MotionInputError("auxiliary response timeout must be positive")
-  if control_injectable and (
-    not read_line or accepted_responses is None
-  ):
-    raise MotionInputError(
-      "injectable auxiliary operations require validated line responses"
-    )
-  if read_line == (expected_response is not None):
-    raise MotionInputError(
-      "auxiliary commands require exactly one framed or exact response contract"
-    )
-  if not read_line and accepted_responses is not None:
-    raise MotionInputError(
-      "accepted auxiliary responses require line-response ownership"
-    )
-  if response_parser is not None and not callable(response_parser):
-    raise TypeError("auxiliary response parser must be callable")
-  if not read_line and response_parser is not None:
-    raise MotionInputError(
-      "auxiliary response parsers require line-response ownership"
-    )
-  if accepted_responses is not None and response_parser is not None:
-    raise MotionInputError(
-      "auxiliary line responses require one validation contract"
-    )
-  if expected_response is not None and (
-    not isinstance(expected_response, bytes)
-    or not expected_response
-    or len(expected_response) > MAX_RESPONSE_PAYLOAD_LENGTH
-    or expected_response != expected_response.strip()
-    or b"\r" in expected_response
-    or b"\n" in expected_response
-    or not expected_response.isascii()
-  ):
-    raise MotionInputError(
-      "expected auxiliary response must contain normalized unframed ASCII bytes"
-    )
   try:
     with _tracked_auxiliary_operation(
       control_injectable=control_injectable,
@@ -11466,73 +11787,54 @@ def _execute_row_auxiliary_command(
         raise SerialActivityRejected(
           "program auxiliary command cancelled by stop admission"
         )
-      _write_legacy_auxiliary_command(command)
-      time.sleep(response_delay)
       serial_port = RUN.get('ser2')
-      try:
-        if read_line:
-          if control_injectable:
-            _begin_auxiliary_stop_owner_wait()
-          try:
-            if control_injectable:
-              response, stop_response = (
-                read_serial_line_response_with_optional_followup(
-                  serial_port,
-                  response_timeout,
-                  accepted_responses=accepted_responses,
-                  followup_after_responses=AUXILIARY_WAIT_NATURAL_RESPONSES,
-                  accepted_followup_responses=(
-                    AUXILIARY_INACTIVE_STOP_RESPONSE,
-                  ),
-                  control_event=auxiliary_stop_injected_event,
-                  control_response_timeout_seconds=(
-                    SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS
-                  ),
-                  control_response_deadline_provider=(
-                    _auxiliary_stop_acknowledgement_deadline_value
-                  ),
-                )
-              )
-            else:
-              response = read_serial_line_response(
-                serial_port,
-                response_timeout,
-                accepted_responses=accepted_responses,
-              )
-              stop_response = None
-            if response_parser is not None:
-              response = response_parser(command, response)
-          except Exception as exc:
-            if control_injectable:
-              _publish_auxiliary_stop_owner_result(False, str(exc))
-            raise
-          else:
-            if control_injectable:
-              stop_result_published = _publish_auxiliary_stop_owner_result(
-                True,
-                response if stop_response is None else stop_response,
-              )
-              if stop_response is not None and not stop_result_published:
-                quarantine_serial_transport(
-                  serial_port,
-                  "auxiliary stop acknowledgement had no active stop request",
-                )
-                raise ProtocolResponseError(
-                  "auxiliary stop acknowledgement had no active stop request"
-                )
-        else:
-          response = read_serial_exact_response(
-            serial_port,
-            expected_response,
-            response_timeout,
-          )
-      finally:
-        if (
-          RUN.get('ser2') is serial_port
-          and not getattr(serial_port, "is_open", False)
-        ):
-          RUN['ser2'] = None
-          _clear_auxiliary_board_profile(serial_port)
+      profile = _connected_auxiliary_board_profile(serial_port)
+      if command == "TG\n":
+        validate_auxiliary_gripper_current_command(command, profile)
+        command_name, parameters = "test_gripper_amps", {}
+      elif command.startswith("SV"):
+        validate_auxiliary_servo_command(command, profile)
+        channel, position = parse_auxiliary_servo_command(command)
+        command_name = "servo"
+        parameters = {"channel": channel, "position": position}
+      elif (match := re.fullmatch(r"JFX([0-9]+)\n", command)) is not None:
+        validate_auxiliary_input_command(command, profile)
+        command_name, parameters = "input_read", {"pin": int(match.group(1))}
+      elif (
+        match := re.fullmatch(r"WIA([0-9]+)B([01])C([0-9]+)\n", command)
+      ) is not None:
+        validate_auxiliary_wait_command(command, profile)
+        command_name = "wait_input"
+        parameters = {
+          "pin": int(match.group(1)),
+          "state": match.group(2) == "1",
+          "timeout_seconds": int(match.group(3)),
+        }
+      elif command.startswith(("ONX", "OFX")):
+        validate_auxiliary_output_command(command, profile)
+        opcode, pin = parse_auxiliary_output_command(command)
+        command_name = "set_output"
+        parameters = {"pin": pin, "state": opcode == "ON"}
+      else:
+        raise MotionInputError("program auxiliary command is unsupported")
+      if control_injectable != (command_name == "wait_input"):
+        raise MotionInputError("auxiliary wait stop ownership is invalid")
+      result = _exchange_json_auxiliary_command(
+        command_name,
+        parameters,
+        response_timeout,
+        serial_port,
+      )
+      if command_name == "input_read":
+        if type(result) is not JsonAuxiliaryInputResult:
+          raise ProtocolResponseError("auxiliary input result is invalid")
+        response = "T" if result.state else "F"
+      elif command_name == "test_gripper_amps":
+        if type(result) is not JsonAuxiliaryCurrentResult:
+          raise ProtocolResponseError("auxiliary current result is invalid")
+        response = f"{result.amps:.3f}"
+      else:
+        response = result if command_name == "wait_input" else "Done"
   except SerialActivityRejected as exc:
     logger.warning("Program auxiliary command rejected: %s", exc)
     _finish_execute_row()
@@ -11581,51 +11883,135 @@ def _main_modbus_wait_timeout_seconds(value):
     raise MotionInputError(
       "controller Modbus wait timeout must be a positive integer"
     )
-  if timeout > MAIN_FIRMWARE_WAIT_MAX_SECONDS:
+  if timeout > MAIN_MODBUS_WAIT_MAX_SECONDS:
     raise MotionInputError(
       "controller Modbus wait timeout exceeds the firmware range"
     )
   return timeout
 
 
-def _build_program_modbus_register_read(
-  opcode,
-  slave_id,
-  address,
-  quantity,
-):
-  if opcode not in ("BH", "BD"):
-    raise MotionInputError(
-      "program Modbus register-read opcode is unsupported"
+def _execute_program_modbus_wait(command, opcode, execution_request):
+  contract = {
+    "WH": ("Wait MBhold", "Input", 65535),
+    "WJ": ("Wait MBcoil", "Coil", 1),
+    "WK": ("Wait MBinput", "Input", 1),
+  }.get(opcode)
+  if contract is None or not isinstance(command, str):
+    raise MotionInputError("program Modbus wait contract is invalid")
+  prefix, address_label, maximum_expected = contract
+  match = re.fullmatch(
+    rf"{prefix} - SlaveID \((?P<slave>[0-9]+)\) - "
+    rf"{address_label} # (?P<address>[0-9]+) = "
+    r"(?P<expected>[0-9]+) : Timeout = (?P<timeout>[0-9]+)",
+    command,
+  )
+  if match is None:
+    raise MotionInputError("program Modbus wait framing is invalid")
+  if _reject_cancelled_program_row(execution_request):
+    return ROW_EXECUTION_REJECTED
+  if RUN['offlineMode']:
+    _set_application_status(
+      text="IO not supported in offline programming mode",
+      style="Alarm.TLabel",
     )
+    _finish_execute_row()
+    return ROW_EXECUTION_REJECTED
+  if RUN['moveInProc'] == 1:
+    RUN['moveInProc'] = 2
+  expected = int(match.group("expected"))
+  if expected > maximum_expected:
+    raise MotionInputError("program Modbus wait value is out of range")
+  timeout = _main_modbus_wait_timeout_seconds(match.group("timeout"))
+  controller_command = (
+    f"{opcode}A{match.group('slave')}B{match.group('address')}"
+    f"C{expected}D{timeout}\n"
+  )
+  serial_event_queue.put(
+    ("started", controller_command, None, None, False, None, None)
+  )
+  execution_state, _ = _execute_row_main_response(
+    controller_command,
+    response_timeout=timeout + SERIAL_RESPONSE_MARGIN_SECONDS,
+  )
+  return execution_state
+
+
+def _parse_program_modbus_condition(command, command_type):
+  contract = {
+    "If MBc": ("BB", "If MBcoil", "Coil", False),
+    "If MBi": ("BC", "If MBinput", "Input", False),
+    "If MBh": ("BH", "If MBhold reg", "Reg", True),
+    "If MBI": ("BD", "If MBInput Reg", "Input Reg", True),
+  }.get(command_type)
+  if contract is None:
+    raise MotionInputError("program Modbus condition framing is invalid")
+  opcode, prefix, address_label, has_quantity = contract
+  quantity_pattern = (
+    r" Num Reg's \((?P<quantity>[0-9]+)\)" if has_quantity else ""
+  )
+  match = re.fullmatch(
+    rf"{prefix} - SlaveID \((?P<slave>[0-9]+)\)"
+    rf"{quantity_pattern} - {address_label} # "
+    r"(?P<address>[0-9]+) = (?P<expected>[0-9]+) : "
+    r"(?P<action>Call Prog .+|Jump to Tab \d+|Stop)",
+    command,
+  )
+  if match is None:
+    raise MotionInputError("program Modbus condition framing is invalid")
+  quantity = match.groupdict().get("quantity") or "1"
   try:
-    return build_controller_modbus_command(
-      opcode,
-      slave_id,
-      address,
-      quantity,
+    subcommand = build_controller_modbus_command(
+      opcode, match.group("slave"), match.group("address"), quantity,
     )
   except MotionInputError as exc:
-    quantity_text = str(quantity).strip()
-    if (
-      re.fullmatch(r"[0-9]+", quantity_text) is not None
-      and int(quantity_text) > 1
-    ):
+    if quantity.isdigit() and int(quantity) > 1:
       raise MotionInputError(
-        "legacy multi-register read requires migration: split the row "
-        "into one row per register with Num Reg's (1)"
+        "Modbus condition quantity must equal one"
       ) from exc
     raise
+  action_text = match.group("action")
+  if action_text == "Stop":
+    action = ("stop", None)
+  elif action_text.startswith("Call Prog "):
+    action = ("call_program", action_text.removeprefix("Call Prog ") + ".ar4")
+  else:
+    action = ("jump_tab", action_text.removeprefix("Jump to Tab "))
+  return subcommand, match.group("expected"), action
+
+
+def _settle_program_modbus_condition(
+  succeeded, expected, response, action, execution_request, selected_row,
+  caller_program=None,
+):
+  if not succeeded or _reject_cancelled_program_row(execution_request):
+    return False
+  if response != expected:
+    return True
+  action_name, action_value = action
+  if action_name == "call_program":
+    return _call_program_from_current_row(
+      action_value, execution_request, selected_row,
+      caller_program=caller_program,
+    )
+  if action_name == "jump_tab":
+    index = _program_tab_row_index(tab1.progView.get(0, "end"), action_value) - 1
+    tab1.progView.selection_clear(0, END)
+    tab1.progView.select_set(index)
+  elif action_name == "stop" and action_value is None:
+    stopProg()
+  else:
+    raise MotionInputError("program Modbus condition action is invalid")
+  return True
 
 
 def _main_timed_wait_seconds(value):
   wait_seconds = finite_number(value, "controller timed wait")
   if wait_seconds < 0:
     raise MotionInputError("controller timed wait must be non-negative")
+  if wait_seconds > JSON_CONTROLLER_WAIT_MAXIMUM_SECONDS:
+    raise MotionInputError("controller timed wait exceeds the firmware range")
   encoded = controller_protocol_decimal(wait_seconds, "controller timed wait")
   encoded_seconds = float(encoded)
-  if encoded_seconds > MAIN_FIRMWARE_WAIT_MAX_SECONDS:
-    raise MotionInputError("controller timed wait exceeds the firmware range")
   return encoded_seconds, encoded
 
 
@@ -11646,6 +12032,20 @@ def _finish_step_reverse_selection(sel_row):
   except Exception:
     curRowEntryField.delete(0, 'end')
     curRowEntryField.insert(0, "---")
+
+
+def _tk_program_rows_snapshot():
+  if threading.get_ident() != application_tk_thread_id:
+    raise RuntimeError("program rows must be captured on the Tk event thread")
+  raw_rows = tab1.progView.get(0, "end")
+  if isinstance(raw_rows, (str, bytes, bytearray)) or not isinstance(
+    raw_rows,
+    (tuple, list),
+  ):
+    raise RuntimeError("robot program rows are not a sequence")
+  return tuple(
+    _decode_program_row_content(row).strip() for row in raw_rows
+  )
 
 
 def _apply_program_selection_event(event):
@@ -11679,6 +12079,47 @@ def _apply_program_selection_event(event):
     or not 0 <= selected_rows[0] < last_row
   ):
     raise RuntimeError("robot program selection is out of range")
+
+  if event.action == PROGRAM_SELECTION_CAPTURE_SPAN:
+    if len(selected_rows) != 1:
+      raise RuntimeError(
+        "program span capture requires exactly one selected row"
+      )
+    rows = _tk_program_rows_snapshot()
+    if len(rows) != last_row:
+      raise RuntimeError("robot program row count changed during capture")
+    snapshot = ProgramRowSpanSnapshot(
+      rows,
+      selected_rows[0],
+      "".join(
+        str(CAL[f'J{axis}OpenLoopVal'].get())
+        for axis in range(1, 7)
+      ),
+      str(CAL['DisableWristRotVal'].get()),
+    )
+    try:
+      tab1.progView.see(snapshot.selected_row + 2)
+    except Exception:
+      logger.exception("Unable to scroll the robot program view")
+    return ProgramSelectionResult(True, span_snapshot=snapshot)
+
+  if event.action == PROGRAM_SELECTION_COMMIT_SPAN:
+    snapshot = event.span_snapshot
+    if tuple(selected_rows) != (snapshot.selected_row,):
+      raise RuntimeError(
+        "robot program selection changed before span commitment"
+      )
+    if _tk_program_rows_snapshot() != snapshot.rows:
+      raise RuntimeError("robot program changed before span commitment")
+    tab1.progView.selection_clear(0, END)
+    tab1.progView.select_set(event.final_row)
+    if tuple(tab1.progView.curselection()) != (event.final_row,):
+      raise RuntimeError("completed program span could not be selected")
+    try:
+      tab1.progView.see(event.final_row + 2)
+    except Exception:
+      logger.exception("Unable to scroll the robot program view")
+    return ProgramSelectionResult(True)
 
   if event.action == PROGRAM_SELECTION_INITIALIZE_RUN:
     for row in range(0, last_row):
@@ -12063,6 +12504,9 @@ def _start_manual_motion(
   controller_state = {
     "succeeded": physical_command is None,
     "speed_violation": False,
+    "position_known": physical_command is None,
+    "confirmed_position_unchanged": False,
+    "error": None,
   }
   if physical_command is not None:
     manual_motion_pose_pending.set()
@@ -12078,17 +12522,20 @@ def _start_manual_motion(
           )
         else:
           pose_confirmed = restore_untransmitted_preview()
-      elif controller_state["succeeded"]:
-        try:
-          controller_positions = _current_joint_positions()
-        except (KeyError, TypeError, ValueError, MotionInputError) as exc:
-          logger.error("Unable to read confirmed controller pose: %s", exc)
-          pose_confirmed = False
+      elif controller_state["position_known"]:
+        if controller_state["confirmed_position_unchanged"]:
+          pose_confirmed = restore_untransmitted_preview()
         else:
-          pose_confirmed = apply_confirmed_pose(
-            controller_positions,
-            controller_positions[:6],
-          )
+          try:
+            controller_positions = _current_joint_positions()
+          except (KeyError, TypeError, ValueError, MotionInputError) as exc:
+            logger.error("Unable to read confirmed controller pose: %s", exc)
+            pose_confirmed = False
+          else:
+            pose_confirmed = apply_confirmed_pose(
+              controller_positions,
+              controller_positions[:6],
+            )
       elif not controller_write_started.is_set():
         pose_confirmed = restore_untransmitted_preview()
       else:
@@ -12113,32 +12560,61 @@ def _start_manual_motion(
       message = (
         f"{motion_name} failed; controller position resynchronization is required"
       )
+    elif controller_state["error"] is not None:
+      message = f"{motion_name} failed: {controller_state['error']}"
     else:
       message = f"{motion_name} failed during controller or virtual settlement"
     logger.error(message)
     _set_application_status(message, "Alarm.TLabel")
 
-  def settle(controller_position):
+  def settle(controller_result):
     if physical_command is None:
-      if controller_position is not None:
+      if controller_result is not None:
         raise RuntimeError(
           "offline manual motion received a physical controller result"
         )
       controller_state["succeeded"] = True
       controller_state["speed_violation"] = False
+      controller_state["position_known"] = True
+      controller_state["confirmed_position_unchanged"] = False
+      controller_state["error"] = None
     else:
-      if controller_position is not None and not isinstance(
-        controller_position,
-        PositionResponse,
+      if controller_result is not None and not isinstance(
+        controller_result,
+        (PositionResponse, JointMotionExchangeResult),
       ):
         raise RuntimeError(
           "manual motion completion returned an invalid controller result"
         )
-      controller_state["succeeded"] = controller_position is not None
-      controller_state["speed_violation"] = (
-        controller_position is not None
-        and controller_position.speed_violation
-      )
+      if isinstance(controller_result, JointMotionExchangeResult):
+        position = controller_result.position
+        physical_stop = position_response_is_physical_estop(position)
+        controller_state["succeeded"] = (
+          controller_result.error is None and not physical_stop
+        )
+        controller_state["speed_violation"] = (
+          position is not None and position.speed_violation
+        )
+        controller_state["position_known"] = (
+          not physical_stop
+          and (
+            position is not None
+            or controller_result.confirmed_position_unchanged
+          )
+        )
+        controller_state["confirmed_position_unchanged"] = (
+          controller_result.confirmed_position_unchanged
+        )
+        controller_state["error"] = controller_result.error
+      else:
+        controller_state["succeeded"] = controller_result is not None
+        controller_state["speed_violation"] = (
+          controller_result is not None
+          and controller_result.speed_violation
+        )
+        controller_state["position_known"] = controller_result is not None
+        controller_state["confirmed_position_unchanged"] = False
+        controller_state["error"] = None
     _complete_program_motion_when_virtual_idle(
       complete_manual_motion,
       request_lease,
@@ -12155,7 +12631,15 @@ def _start_manual_motion(
     return True
 
   try:
-    controller_started = _start_legacy_motion(
+    if physical_command.startswith(("MJ", "ML", "MV")):
+      motion_starter = _start_cartesian_motion
+    elif physical_command.startswith("JT"):
+      motion_starter = _start_tool_jog
+    elif physical_command.startswith("RJ"):
+      motion_starter = _start_program_joint_motion
+    else:
+      raise MotionInputError("manual motion command lacks a JSON route")
+    controller_started = motion_starter(
       physical_command,
       motion_name,
       completion_callback=settle,
@@ -12209,7 +12693,7 @@ def _finish_settled_motion_request(
       raise TypeError("motion settlement callback must be callable")
     try:
       succeeded = settlement_callback(succeeded)
-    except Exception:
+    except BaseException:
       logger.exception("Unable to reconcile motion state before ownership release")
       succeeded = False
     if not isinstance(succeeded, bool):
@@ -12306,7 +12790,7 @@ def _program_completion_fallback_result(
     if not timed_out and time.monotonic() >= deadline:
       logger.error("Virtual program motion did not finish before timeout")
       timed_out = True
-    operation.wait(CONTROL_POLL_INTERVAL_SECONDS)
+    operation.wait(JSON_SERIAL_DEFAULT_POLL_INTERVAL_SECONDS)
   if not timed_out and time.monotonic() >= deadline:
     logger.error("Virtual program motion did not finish before timeout")
     timed_out = True
@@ -12384,7 +12868,7 @@ def _wait_for_virtual_motion_operation(operation, timeout, deadline=None):
     if not timed_out and remaining <= 0:
       logger.error("Virtual program motion did not finish before timeout")
       timed_out = True
-    operation.wait(CONTROL_POLL_INTERVAL_SECONDS)
+    operation.wait(JSON_SERIAL_DEFAULT_POLL_INTERVAL_SECONDS)
   if not timed_out and time.monotonic() >= deadline:
     logger.error("Virtual program motion did not finish before timeout")
     timed_out = True
@@ -12400,7 +12884,92 @@ def _complete_step_reverse_motion(sel_row, succeeded):
     _finish_step_reverse_selection(sel_row)
 
 
-def _start_legacy_motion(
+def _start_program_controller_exchange(
+  command, operation_name, completion_callback, *,
+  controller_wait_seconds=None, response_timeout=None,
+  settlement_callback_factory=None,
+):
+  if not isinstance(operation_name, str) or not operation_name or (
+    operation_name != operation_name.strip()
+  ):
+    raise TypeError("program controller operation name is invalid")
+  if not callable(completion_callback):
+    raise TypeError("program controller completion callback is invalid")
+  if settlement_callback_factory is not None and not callable(
+    settlement_callback_factory
+  ):
+    raise TypeError("program controller settlement factory is invalid")
+  request_lease = _acquire_motion_request(operation_name, requires_kinematics=False)
+  if request_lease is None:
+    message = _motion_request_rejection_message(
+      f"{operation_name} not started; motion admission was rejected"
+    )
+    _set_application_status(message, "Warn.TLabel")
+    return False
+
+  def exchange_worker():
+    succeeded = False
+    settlement_callback = None
+    try:
+      exchange_options = {"request_lease": request_lease}
+      if controller_wait_seconds is not None or response_timeout is not None:
+        exchange_options.update(
+          controller_wait_seconds=controller_wait_seconds, response_timeout=response_timeout,
+        )
+      execution_state, value = _execute_row_main_command(command, **exchange_options)
+      succeeded = execution_state == ROW_EXECUTION_COMPLETE
+      if succeeded and settlement_callback_factory is not None:
+        settlement_callback = settlement_callback_factory(value)
+        if not callable(settlement_callback):
+          raise RuntimeError("program controller settlement is invalid")
+    except BaseException:
+      succeeded = False
+      settlement_callback = None
+      logger.exception("Program controller exchange worker failed")
+      _queue_program_execution_status(f"{operation_name.upper()} FAILED", "Alarm.TLabel")
+    finally:
+      virtual_motion_event_queue.put((
+        "program-completion",
+        (completion_callback, request_lease, succeeded, settlement_callback),
+      ))
+
+  try:
+    threading.Thread(target=exchange_worker, daemon=True).start()
+  except Exception:
+    logger.exception("Unable to start program controller exchange worker")
+    _finish_motion_request(request_lease)
+    _set_application_status(f"UNABLE TO START {operation_name.upper()}", "Alarm.TLabel")
+    return False
+  return True
+
+
+def _start_controller_motion(
+  command,
+  motion_name,
+  *,
+  exchange,
+  completion_callback=None,
+  request_lease=None,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  if not motion_request_registry.owns(request_lease):
+    raise RuntimeError("controller motion requires matching request ownership")
+  if start_send_serial_thread(
+    command,
+    completion_callback=completion_callback,
+    write_started_event=write_started_event,
+    write_cancellation_boundary=write_cancellation_boundary,
+    exchange=exchange,
+  ):
+    return True
+  message = f"{motion_name} not started; controller transport is unavailable"
+  logger.warning(message)
+  _set_application_status(text=message, style="Warn.TLabel")
+  return False
+
+
+def _start_cartesian_motion(
   command,
   motion_name,
   completion_callback=None,
@@ -12409,12 +12978,61 @@ def _start_legacy_motion(
   write_cancellation_boundary=None,
 ):
   if not motion_request_registry.owns(request_lease):
-    raise RuntimeError("legacy motion requires matching request ownership")
+    raise RuntimeError("Cartesian motion requires matching request ownership")
   if start_send_serial_thread(
     command,
     completion_callback=completion_callback,
     write_started_event=write_started_event,
     write_cancellation_boundary=write_cancellation_boundary,
+    exchange=_exchange_cartesian_motion,
+  ):
+    return True
+  message = f"{motion_name} not started; controller transport is unavailable"
+  logger.warning(message)
+  _set_application_status(text=message, style="Warn.TLabel")
+  return False
+
+
+def _start_tool_jog(
+  command,
+  motion_name,
+  completion_callback=None,
+  request_lease=None,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  if not motion_request_registry.owns(request_lease):
+    raise RuntimeError("tool-frame jog requires matching request ownership")
+  if start_send_serial_thread(
+    command,
+    completion_callback=completion_callback,
+    write_started_event=write_started_event,
+    write_cancellation_boundary=write_cancellation_boundary,
+    exchange=_exchange_tool_jog,
+  ):
+    return True
+  message = f"{motion_name} not started; controller transport is unavailable"
+  logger.warning(message)
+  _set_application_status(text=message, style="Warn.TLabel")
+  return False
+
+
+def _start_program_joint_motion(
+  command,
+  motion_name,
+  completion_callback=None,
+  request_lease=None,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  if not motion_request_registry.owns(request_lease):
+    raise RuntimeError("program joint motion requires matching request ownership")
+  if start_send_serial_thread(
+    command,
+    completion_callback=completion_callback,
+    write_started_event=write_started_event,
+    write_cancellation_boundary=write_cancellation_boundary,
+    exchange=_exchange_program_joint_motion,
   ):
     return True
   message = f"{motion_name} not started; controller transport is unavailable"
@@ -12481,6 +13099,7 @@ def _reconcile_program_motion_pose(
   controller_position,
   controller_write_started,
   motion_succeeded,
+  confirmed_position_unchanged=False,
 ):
   if not isinstance(snapshot, ProgramMotionPoseSnapshot):
     raise TypeError("program motion pose snapshot has an invalid type")
@@ -12491,6 +13110,8 @@ def _reconcile_program_motion_pose(
     raise TypeError("program motion controller position has an invalid type")
   if not isinstance(motion_succeeded, bool):
     raise TypeError("program motion settlement result must be boolean")
+  if type(confirmed_position_unchanged) is not bool:
+    raise TypeError("program motion confirmed-position state must be boolean")
 
   online_motion = snapshot.controller_positions is not None
   if online_motion:
@@ -12501,6 +13122,14 @@ def _reconcile_program_motion_pose(
       raise TypeError("program motion write boundary has an invalid event")
   elif controller_write_started is not None or controller_position is not None:
     raise RuntimeError("offline program motion received physical controller state")
+  if confirmed_position_unchanged and (
+    not online_motion
+    or controller_position is not None
+    or motion_succeeded
+  ):
+    raise RuntimeError(
+      "unchanged program position requires a positionless online failure"
+    )
 
   if not online_motion:
     virtual_pose = (
@@ -12513,6 +13142,11 @@ def _reconcile_program_motion_pose(
     pose_confirmed = _apply_program_motion_pose(
       controller_position.joints + controller_position.external,
       controller_position.joints,
+    )
+  elif confirmed_position_unchanged:
+    pose_confirmed = _apply_program_motion_pose(
+      snapshot.controller_positions,
+      snapshot.virtual_pose,
     )
   elif not controller_write_started.is_set():
     pose_confirmed = _apply_program_motion_pose(
@@ -12544,9 +13178,69 @@ def _reconcile_program_motion_pose(
   return motion_succeeded and pose_confirmed
 
 
-def _dispatch_program_controller_sequence(commands, completion_callback):
+def _program_motion_controller_outcome(controller_result):
+  if isinstance(controller_result, PositionResponse):
+    return controller_result, True, False
+  if isinstance(controller_result, JointMotionExchangeResult):
+    physical_stop = position_response_is_physical_estop(
+      controller_result.position
+    )
+    return (
+      None if physical_stop else controller_result.position,
+      controller_result.error is None and not physical_stop,
+      controller_result.confirmed_position_unchanged,
+    )
+  if controller_result is None:
+    return None, False, False
+  raise TypeError("program motion returned an invalid controller result")
+
+
+def _start_program_controller_motion(
+  command,
+  motion_name,
+  completion_callback=None,
+  request_lease=None,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  source_opcode = _motion_command_source_opcode(command)
+  if source_opcode in ("MA", "MC", "MJ", "ML", "MS", "MV"):
+    motion_starter = _start_cartesian_motion
+  elif source_opcode == "RJ":
+    motion_starter = _start_program_joint_motion
+  else:
+    raise MotionInputError("program motion command lacks a JSON route")
+  return motion_starter(
+    command,
+    motion_name,
+    completion_callback=completion_callback,
+    request_lease=request_lease,
+    write_started_event=write_started_event,
+    write_cancellation_boundary=write_cancellation_boundary,
+  )
+
+
+def _dispatch_program_controller_sequence(
+  commands,
+  completion_callback,
+  *,
+  completed_span_snapshot=None,
+  completed_span_final_row=None,
+):
   if completion_callback is not None and not callable(completion_callback):
     raise TypeError("program motion completion callback must be callable")
+  if (completed_span_snapshot is None) != (completed_span_final_row is None):
+    raise MotionInputError(
+      "program motion span settlement requires paired snapshot data"
+    )
+  if completed_span_snapshot is not None and (
+    not isinstance(completed_span_snapshot, ProgramRowSpanSnapshot)
+    or isinstance(completed_span_final_row, bool)
+    or not isinstance(completed_span_final_row, int)
+    or not completed_span_snapshot.selected_row
+      <= completed_span_final_row < len(completed_span_snapshot.rows)
+  ):
+    raise MotionInputError("program motion span settlement is invalid")
   execution_request = _active_program_execution_request()
   if _program_execution_request_cancelled(execution_request):
     return ROW_EXECUTION_REJECTED
@@ -12562,9 +13256,12 @@ def _dispatch_program_controller_sequence(commands, completion_callback):
       commands = tuple(commands)
     except TypeError as exc:
       raise MotionInputError("program motion commands must be a sequence") from exc
-  if not commands or any(not isinstance(command, str) for command in commands):
+  if not commands or any(
+    not isinstance(command, (str, ProgramJsonCartesianMotion))
+    for command in commands
+  ):
     raise MotionInputError(
-      "program motion commands must contain controller command text"
+      "program motion commands contain an invalid request"
     )
 
   try:
@@ -12602,7 +13299,10 @@ def _dispatch_program_controller_sequence(commands, completion_callback):
     return ROW_EXECUTION_REJECTED
 
   controller_write_started = threading.Event()
-  controller_result = {"position": None}
+  controller_result = {
+    "position": None,
+    "confirmed_position_unchanged": False,
+  }
   completion_event = threading.Event()
   completion_result = {"succeeded": False}
   completion_lock = threading.Lock()
@@ -12620,16 +13320,36 @@ def _dispatch_program_controller_sequence(commands, completion_callback):
         logger.error("Program motion sequence emitted duplicate completion")
         return False
       completion_state["finished"] = True
-    return _finish_settled_motion_request(
-      publish_completion,
-      request_lease,
-      succeeded is True,
-      lambda motion_succeeded: _reconcile_program_motion_pose(
+    def settle_sequence(motion_succeeded):
+      pose_succeeded = _reconcile_program_motion_pose(
         pose_snapshot,
         controller_result["position"],
         controller_write_started,
         motion_succeeded,
-      ),
+        controller_result["confirmed_position_unchanged"],
+      )
+      if not pose_succeeded or completed_span_snapshot is None:
+        return pose_succeeded
+      selection_result = _dispatch_program_selection(
+        ProgramSelectionEvent(
+          execution_request,
+          PROGRAM_SELECTION_COMMIT_SPAN,
+          span_snapshot=completed_span_snapshot,
+          final_row=completed_span_final_row,
+        )
+      )
+      if not selection_result.ready:
+        logger.error(
+          "Completed program motion span could not commit its final row"
+        )
+        return False
+      return True
+
+    return _finish_settled_motion_request(
+      publish_completion,
+      request_lease,
+      succeeded is True,
+      settle_sequence,
     )
 
   def start_command(index):
@@ -12637,22 +13357,33 @@ def _dispatch_program_controller_sequence(commands, completion_callback):
       return False
     controller_write_started.clear()
 
-    def complete_command(controller_position):
-      if controller_position is not None and not isinstance(
-        controller_position,
-        PositionResponse,
-      ):
-        logger.error("Program motion sequence returned an invalid controller result")
-        if controller_write_started.is_set():
-          controller_result["position"] = None
+    def complete_command(controller_exchange):
+      try:
+        position, succeeded, confirmed_unchanged = (
+          _program_motion_controller_outcome(controller_exchange)
+        )
+      except (TypeError, ValueError, MotionInputError):
+        logger.exception(
+          "Program motion sequence returned an invalid controller result"
+        )
+        position = None
+        succeeded = False
+        confirmed_unchanged = False
+
+      if position is not None:
+        controller_result["position"] = position
+        controller_result["confirmed_position_unchanged"] = False
+      elif confirmed_unchanged:
+        controller_result["confirmed_position_unchanged"] = (
+          controller_result["position"] is None
+        )
+      elif controller_write_started.is_set():
+        controller_result["position"] = None
+        controller_result["confirmed_position_unchanged"] = False
+
+      if not succeeded:
         finalize_sequence(False)
         return
-      if controller_position is None:
-        if controller_write_started.is_set():
-          controller_result["position"] = None
-        finalize_sequence(False)
-        return
-      controller_result["position"] = controller_position
       if _program_execution_request_cancelled(execution_request):
         finalize_sequence(False)
         return
@@ -12664,7 +13395,7 @@ def _dispatch_program_controller_sequence(commands, completion_callback):
         finalize_sequence(False)
 
     try:
-      started = _start_legacy_motion(
+      started = _start_program_controller_motion(
         commands[index],
         "Program motion",
         completion_callback=complete_command,
@@ -12765,7 +13496,11 @@ def _dispatch_program_motion(
     if RUN['offlineMode']
     else threading.Event()
   )
-  controller_result = {"position": None}
+  controller_result = {
+    "position": None,
+    "confirmed_position_unchanged": False,
+    "succeeded": False,
+  }
 
   def settle_program_pose(succeeded):
     return _reconcile_program_motion_pose(
@@ -12773,7 +13508,23 @@ def _dispatch_program_motion(
       controller_result["position"],
       controller_write_started,
       succeeded,
+      controller_result["confirmed_position_unchanged"],
     )
+
+  def record_controller_result(controller_exchange):
+    try:
+      position, succeeded, confirmed_unchanged = (
+        _program_motion_controller_outcome(controller_exchange)
+      )
+    except (TypeError, ValueError, MotionInputError):
+      logger.exception("Program motion returned an invalid controller result")
+      position = None
+      succeeded = False
+      confirmed_unchanged = False
+    controller_result["position"] = position
+    controller_result["confirmed_position_unchanged"] = confirmed_unchanged
+    controller_result["succeeded"] = succeeded
+    return succeeded
 
   try:
     if _program_execution_request_cancelled(execution_request):
@@ -12823,7 +13574,7 @@ def _dispatch_program_motion(
 
   def start_controller_motion(callback):
     try:
-      return _start_legacy_motion(
+      return _start_program_controller_motion(
         command,
         "Program motion",
         completion_callback=callback,
@@ -12851,21 +13602,14 @@ def _dispatch_program_motion(
       )
       return ROW_EXECUTION_PENDING
 
-    def complete_controller_and_virtual(controller_position):
-      if controller_position is not None and not isinstance(
-        controller_position,
-        PositionResponse,
-      ):
-        raise RuntimeError(
-          "program motion completion returned an invalid controller result"
-        )
-      controller_result["position"] = controller_position
+    def complete_controller_and_virtual(controller_exchange):
+      controller_succeeded = record_controller_result(controller_exchange)
       _complete_program_motion_when_virtual_idle(
         completion_callback,
         request_lease,
         virtual_operation,
         virtual_completion_timeout,
-        controller_succeeded=controller_position is not None,
+        controller_succeeded=controller_succeeded,
         deadline=virtual_completion_deadline,
         settlement_callback=settle_program_pose,
       )
@@ -12887,15 +13631,8 @@ def _dispatch_program_motion(
     if not RUN['offlineMode']:
       controller_completion = threading.Event()
 
-      def record_controller_completion(controller_position):
-        if controller_position is not None and not isinstance(
-          controller_position,
-          PositionResponse,
-        ):
-          raise RuntimeError(
-            "program motion completion returned an invalid controller result"
-          )
-        controller_result["position"] = controller_position
+      def record_controller_completion(controller_exchange):
+        record_controller_result(controller_exchange)
         controller_completion.set()
 
       if not start_controller_motion(record_controller_completion):
@@ -12917,7 +13654,7 @@ def _dispatch_program_motion(
         controller_completion.wait()
       controller_succeeded = (
         not controller_timed_out
-        and controller_result["position"] is not None
+        and controller_result["succeeded"]
       )
 
     virtual_finished = _wait_for_virtual_motion_operation(
@@ -12950,9 +13687,6 @@ def _dispatch_program_command(
   virtual_command,
   completion_callback,
 ):
-  if not RUN['offlineMode']:
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, command)
   if RUN['vtk_running']:
     return _dispatch_program_motion(
       command,
@@ -13002,23 +13736,6 @@ def _validate_gcode_storage_filename(filename, field_name):
   return validate_controller_filename(filename, field_name)
 
 
-def _gcode_storage_delete_command(media_id, filename):
-  media_id = validate_controller_media_id(media_id)
-  filename = _validate_gcode_storage_filename(
-    filename,
-    "G-code storage filename",
-  )
-  command = (
-    f"DG{GCODE_STORAGE_MEDIA_MARKER}{media_id}"
-    f"{GCODE_STORAGE_FILENAME_MARKER}{filename}\n"
-  )
-  if len(command.encode("ascii")) > MAX_COMMAND_LENGTH:
-    raise MotionInputError(
-      "G-code delete command exceeds the controller frame limit"
-    )
-  return command
-
-
 def _gcode_storage_write_target(filename, media_id=None):
   filename = _validate_gcode_storage_filename(
     filename,
@@ -13062,85 +13779,6 @@ def _gcode_storage_selection_name(filename):
   return selection_name
 
 
-def _parse_gcode_storage_listing(response):
-  if not isinstance(response, str):
-    raise ProtocolResponseError("G-code storage listing must be text")
-  if len(response) > MAX_CONTROLLER_DIRECTORY_PAYLOAD_BYTES:
-    raise ProtocolResponseError(
-      "G-code storage listing exceeds the protocol payload limit"
-    )
-  if not response.isascii() or "\r" in response or "\n" in response:
-    raise ProtocolResponseError(
-      "G-code storage listing contains invalid response text"
-    )
-  if response != response.strip():
-    raise ProtocolResponseError(
-      "G-code storage listing contains payload whitespace"
-    )
-  media_begin = len(GCODE_STORAGE_DIRECTORY_IDENTITY_PREFIX)
-  media_end = media_begin + CONTROLLER_MEDIA_ID_LENGTH
-  listing_begin = media_end + len(
-    GCODE_STORAGE_DIRECTORY_IDENTITY_SEPARATOR
-  )
-  if (
-    not response.startswith(GCODE_STORAGE_DIRECTORY_IDENTITY_PREFIX)
-    or len(response) < listing_begin
-    or response[media_end:listing_begin]
-      != GCODE_STORAGE_DIRECTORY_IDENTITY_SEPARATOR
-  ):
-    raise ProtocolResponseError(
-      "G-code storage listing identity framing is invalid"
-    )
-  try:
-    media_id = validate_controller_media_id(
-      response[media_begin:media_end]
-    )
-  except MotionInputError as exc:
-    raise ProtocolResponseError(
-      "G-code storage listing media identity is invalid"
-    ) from exc
-
-  listing = response[listing_begin:]
-  if listing == "":
-    return media_id, ()
-  if not listing.endswith(","):
-    raise ProtocolResponseError(
-      "G-code storage listing is missing the terminal separator"
-    )
-  filenames = tuple(listing.split(",")[:-1])
-  if not filenames or any(not filename for filename in filenames):
-    raise ProtocolResponseError(
-      "G-code storage listing contains an empty filename"
-    )
-  try:
-    filenames = tuple(
-      validate_controller_filename(filename, "G-code storage filename")
-      for filename in filenames
-    )
-  except MotionInputError as exc:
-    raise ProtocolResponseError(
-      f"G-code storage listing contains an invalid filename: {exc}"
-    ) from exc
-  normalized_names = tuple(filename.casefold() for filename in filenames)
-  if len(set(normalized_names)) != len(normalized_names):
-    raise ProtocolResponseError(
-      "G-code storage listing contains duplicate filenames"
-    )
-  actionable_filenames = []
-  for filename in filenames:
-    if not filename.casefold().endswith(".txt"):
-      continue
-    try:
-      _gcode_storage_selection_name(filename)
-    except MotionInputError as exc:
-      raise ProtocolResponseError(
-        "G-code storage listing contains a non-actionable .txt filename: "
-        f"{exc}"
-      ) from exc
-    actionable_filenames.append(filename)
-  return media_id, tuple(actionable_filenames)
-
-
 def _gcode_storage_error_detail(error, fallback):
   if (
     not isinstance(fallback, str)
@@ -13155,125 +13793,6 @@ def _gcode_storage_error_detail(error, fallback):
   if len(detail) > MAX_RESPONSE_PAYLOAD_LENGTH:
     return fallback
   return detail or fallback
-
-
-def _is_gcode_storage_detailed_error(response):
-  if not isinstance(response, str):
-    raise ProtocolResponseError(
-      "G-code storage response must be text"
-    )
-  if not response.startswith(GCODE_STORAGE_DETAILED_ERROR_PREFIX):
-    return False
-  detail = response[len(GCODE_STORAGE_DETAILED_ERROR_PREFIX):]
-  return (
-    bool(detail)
-    and detail == detail.strip()
-    and detail.isascii()
-    and all(32 <= ord(character) <= 126 for character in detail)
-  )
-
-
-def _gcode_storage_detailed_error_message(response):
-  if not _is_gcode_storage_detailed_error(response):
-    raise ProtocolResponseError(
-      "G-code storage response is not a detailed controller error"
-    )
-  return (
-    "G-CODE STORAGE CONTROLLER ERROR: "
-    f"{response[len(GCODE_STORAGE_DETAILED_ERROR_PREFIX):]}"
-  )
-
-
-def _is_gcode_storage_controller_error(request, response):
-  if not isinstance(request, GCodeStorageRequest):
-    raise TypeError(
-      "G-code storage error classification requires a valid request"
-    )
-  if _is_gcode_storage_detailed_error(response):
-    return True
-  return request.operation == "delete" and response == "ER"
-
-
-def _gcode_storage_estop_position(response):
-  if not isinstance(response, str):
-    raise ProtocolResponseError(
-      "G-code storage response must be text"
-    )
-  try:
-    parsed = parse_position_response(response)
-  except ProtocolResponseError:
-    return None
-  if not position_response_is_physical_estop(parsed):
-    return None
-  return parsed
-
-
-def _gcode_storage_controller_error_message(request, response):
-  if not _is_gcode_storage_controller_error(request, response):
-    raise ProtocolResponseError(
-      "G-code storage response is not a controller error"
-    )
-  if response == "ER":
-    return "G-CODE STORAGE COMMAND REJECTED BY CONTROLLER"
-  return _gcode_storage_detailed_error_message(response)
-
-
-def _render_gcode_storage_controller_error(request, response):
-  message = _gcode_storage_controller_error_message(request, response)
-  logger.error("%s [%s]", message, response)
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0, response)
-  GCalmStatusLab.config(text=message, style="Alarm.TLabel")
-  return False
-
-
-def _render_gcode_storage_detailed_error(response):
-  message = _gcode_storage_detailed_error_message(response)
-  logger.error("%s [%s]", message, response)
-  cmdRecEntryField.delete(0, 'end')
-  cmdRecEntryField.insert(0, response)
-  GCalmStatusLab.config(text=message, style="Alarm.TLabel")
-  return False
-
-
-def _validate_gcode_storage_response(
-  request,
-  response,
-):
-  if not isinstance(request, GCodeStorageRequest):
-    raise TypeError("G-code storage response requires a valid request")
-  if not isinstance(response, str):
-    raise ProtocolResponseError(
-      "G-code storage response must be text"
-    )
-  estop_position = _gcode_storage_estop_position(response)
-  if estop_position is not None:
-    raise RuntimeError(
-      "G-code storage physical-stop response escaped framed ownership"
-    )
-  if _is_gcode_storage_controller_error(request, response):
-    if (
-      request.operation == "delete"
-      and _is_gcode_storage_detailed_error(response)
-    ):
-      raise ProtocolResponseError(
-        "G-code delete returned an indeterminate controller error: "
-        f"{response}"
-      )
-    return None, ()
-  if request.operation == "list":
-    try:
-      return _parse_gcode_storage_listing(response)
-    except ProtocolResponseError as exc:
-      quarantine_serial_transport(request.serial_port, str(exc))
-      raise
-  if response not in GCODE_STORAGE_DELETE_TERMINAL_RESPONSES:
-    error = ProtocolResponseError(
-      f"G-code delete returned an unexpected response: {response!r}"
-    )
-    quarantine_serial_transport(request.serial_port, str(error))
-    raise error
-  return None, ()
 
 
 def _render_gcode_storage_rejection(message):
@@ -14322,11 +14841,13 @@ def _reconcile_gcode_storage_delete_locked(
   media_id = validate_controller_media_id(media_id)
   if not isinstance(filenames, tuple):
     raise TypeError("G-code delete reconciliation requires a filename tuple")
-  normalized_names = []
-  for filename in filenames:
-    _gcode_storage_selection_name(filename)
-    normalized_names.append(filename.casefold())
-  normalized_names = tuple(normalized_names)
+  normalized_names = tuple(
+    validate_controller_filename(
+      filename,
+      "G-code storage filename",
+    ).casefold()
+    for filename in filenames
+  )
   with gcode_storage_state_lock:
     _load_gcode_storage_state_locked(state_path)
     pending = _require_gcode_storage_state_available_locked()
@@ -14500,68 +15021,37 @@ def _run_gcode_storage_request(request):
             request,
             state_path,
           )
-        publish_stop = _prepare_main_controller_stop_exchange(
-          request.serial_port
-        )
-        write_options = {
-          "write_lock": serial_write_lock,
-          "reset_input": False,
-          "write_started_event": write_started,
-        }
-        if request.cancellation_event is not None:
-          write_options.update({
-            "cancellation_event": request.cancellation_event,
-            "write_boundary_lock": request.cancellation_lock,
-          })
-        write_serial_control(
-          request.serial_port,
-          request.command,
-          **write_options,
-        )
-        exchange_response = read_controller_line_exchange_response(
-          request.serial_port,
-          SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
-          estop_callback=publish_stop,
-          context="G-code storage controller response",
-        )
-        admission_position = exchange_response.admission_position
-        if (
-          admission_position is None
-          and exchange_response.estop_position is not None
-          and (
-            exchange_response.estop_position.flag
-            == CONTROLLER_ESTOP_ADMISSION_FLAG
-          )
+        if not isinstance(
+          controller_binding.json_client,
+          JsonMainControllerClient,
         ):
-          admission_position = exchange_response.estop_position
-        if admission_position is not None:
-          try:
-            quarantine_serial_transport(
-              request.serial_port,
-              "physical E-stop blocked G-code storage command admission",
-            )
-          except Exception as exc:
-            raise GCodeStorageAdmissionRejected(
-              admission_position
-            ) from exc
-          raise GCodeStorageAdmissionRejected(admission_position)
-        if exchange_response.estop_position is not None:
-          reason = (
-            "G-code storage response was interrupted by a physical E-stop"
-          )
-          quarantine_serial_transport(request.serial_port, reason)
-          raise SerialTransportQuarantinedError(
-            f"{reason}; reconnect required"
-          )
-        response = exchange_response.terminal_response
-        if response is None:
           raise ProtocolResponseError(
-            "G-code storage exchange lacks a terminal response"
+            "G-code storage lost JSON controller ownership"
           )
-        media_id, filenames = _validate_gcode_storage_response(
-          request,
-          response,
-        )
+        if request.operation == "delete":
+          deletion = _exchange_json_main_command(
+            "delete_sd_program",
+            {"media_id": request.media_id, "filename": request.filename},
+            write_started_event=write_started,
+          )
+          if type(deletion) is not JsonMainDeleteSdProgramResult:
+            raise ProtocolResponseError(
+              "controller returned an invalid G-code deletion result"
+            )
+          response = "P" if deletion.deleted else "F"
+          media_id, filenames = None, ()
+        else:
+          listing = _exchange_json_main_command(
+            "list_sd_programs",
+            {},
+            write_started_event=write_started,
+          )
+          if type(listing) is not JsonMainSdProgramListResult:
+            raise ProtocolResponseError(
+              "controller returned an invalid G-code directory"
+            )
+          media_id = listing.media_id
+          filenames = listing.files
         reconciliation = None
         if request.operation == "delete":
           completed_result = GCodeStorageResult(
@@ -14589,7 +15079,7 @@ def _run_gcode_storage_request(request):
           result = GCodeStorageResult(
             request.request_id,
             "completed",
-            response,
+            "",
             filenames,
             write_started.is_set(),
             media_id,
@@ -14761,9 +15251,7 @@ def _start_gcode_storage_request(
       controller_binding.identity.controller_hardware_id
     )
     media_id = None
-    if operation == "list":
-      command = "RG\n"
-    else:
+    if operation != "list":
       media_binding = _current_gcode_storage_media(serial_port)
       if media_binding is None:
         raise ConnectionError(
@@ -14777,7 +15265,6 @@ def _start_gcode_storage_request(
           "G-code storage controller identity changed after directory refresh"
         )
       media_id = media_binding.media_id
-      command = _gcode_storage_delete_command(media_id, filename)
     with gcode_storage_state_lock:
       if gcode_storage_active_request is not None:
         if not isinstance(
@@ -14791,7 +15278,6 @@ def _start_gcode_storage_request(
         request_id,
         operation,
         serial_port,
-        command,
         filename,
         announce_listing,
         _current_gcode_view_generation(),
@@ -15250,34 +15736,11 @@ def _apply_gcode_storage_result(result):
         raise RuntimeError(
           "completed G-code storage result lacks a committed write"
         )
-      estop_position = _gcode_storage_estop_position(result.value)
-      if estop_position is not None:
-        raise RuntimeError(
-          "G-code storage E-stop response escaped worker handling"
-        )
-      media_id, filenames = _validate_gcode_storage_response(
-        request,
-        result.value,
-      )
-      if (
-        filenames != result.filenames
-        or media_id != result.media_id
-      ):
-        raise RuntimeError(
-          "G-code storage result does not match the controller response"
-        )
-      controller_error = _is_gcode_storage_controller_error(
-        request,
-        result.value
-      )
       if request.operation == "delete":
         if result.pending_delete is not None:
           raise RuntimeError(
             "completed G-code delete retained reconciliation state"
           )
-      if controller_error:
-        _render_gcode_storage_controller_error(request, result.value)
-      elif request.operation == "delete":
         completion_succeeded = result.value in ("P", "F")
         if result.value == "P":
           if request.completion_callback is None:
@@ -15300,10 +15763,19 @@ def _apply_gcode_storage_result(result):
               style="Alarm.TLabel",
             )
       else:
+        media_id = result.media_id
+        filenames = result.filenames
         if media_id is None:
           raise RuntimeError(
             "G-code storage listing lacks a media identity"
           )
+        actionable_filenames = tuple(
+          filename
+          for filename in filenames
+          if filename.casefold().endswith(".txt")
+        )
+        for filename in actionable_filenames:
+          _gcode_storage_selection_name(filename)
         _bind_gcode_storage_media(
           request.serial_port,
           request.controller_hardware_id,
@@ -15319,7 +15791,7 @@ def _apply_gcode_storage_result(result):
             "the local program view changed"
           )
         else:
-          _replace_gcode_storage_listing(filenames)
+          _replace_gcode_storage_listing(actionable_filenames)
 
         if reconciliation is not None:
           pending, deletion_confirmed = reconciliation
@@ -15358,7 +15830,7 @@ def _apply_gcode_storage_result(result):
         elif request.announce_listing:
           status = (
             "G-CODE .TXT PROGRAMS FOUND ON SD CARD:"
-            if filenames
+            if actionable_filenames
             else "NO G-CODE .TXT PROGRAMS FOUND ON SD CARD"
           )
           GCalmStatusLab.config(text=status, style="OK.TLabel")
@@ -15369,7 +15841,6 @@ def _apply_gcode_storage_result(result):
     RUN.get('ser') is request.serial_port
     and not getattr(request.serial_port, "is_open", False)
   ):
-    RUN['ser'] = None
     try:
       _require_main_controller_identity_cleanup(
         request.serial_port,
@@ -15474,6 +15945,42 @@ def _gcode_playback_command(filename):
   return f"PGFn{_gcode_storage_filename(filename)}\n"
 
 
+def _exchange_gcode_playback(
+  command,
+  *,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  command = _canonicalize_main_serial_command(command)
+  if not command.startswith("PGFn"):
+    raise MotionInputError("G-code playback command is invalid")
+  filename = _validate_gcode_storage_filename(
+    command[len("PGFn"):-1],
+    "G-code playback filename",
+  )
+  media_binding = _current_gcode_storage_media(RUN.get('ser'))
+  if media_binding is None:
+    raise MotionInputError(
+      "G-code playback requires a directory refresh for the active SD card"
+    )
+  terminal = _exchange_json_main_command(
+    "play_gcode_file",
+    {"media_id": media_binding.media_id, "filename": filename},
+    response_timeout=SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+    write_started_event=write_started_event,
+    write_cancellation_boundary=write_cancellation_boundary,
+    result_type=JsonMainCartesianMotionResult,
+    return_terminal=True,
+  )
+  result = terminal.parsed_result
+  return _json_joint_position_response(
+    _canonical_json_message_text(terminal.response),
+    result.position,
+    speed_violation=result.speed_limited,
+    debug=result.controller_debug,
+  )
+
+
 def _gcode_feed_rate_mm_per_second(value, imperial):
   if not isinstance(imperial, bool):
     raise MotionInputError("G-code unit mode must be boolean")
@@ -15537,85 +16044,6 @@ def _dispatch_program_gcode(filename, completion_callback):
     _set_application_status(message, "Alarm.TLabel")
     return ROW_EXECUTION_REJECTED
   return ROW_EXECUTION_COMPLETE
-
-
-def _decode_program_row_content(row):
-  if isinstance(row, (bytes, bytearray)):
-    try:
-      text = bytes(row).decode('utf-8')
-    except UnicodeDecodeError as exc:
-      raise MotionInputError(
-        "program rows must contain UTF-8 text"
-      ) from exc
-  elif isinstance(row, str):
-    text = row
-  else:
-    raise MotionInputError("program rows must contain encoded or text rows")
-  if text.endswith('\r\n'):
-    text = text[:-2]
-  elif text.endswith('\n'):
-    text = text[:-1]
-  if '\r' in text or '\n' in text:
-    raise MotionInputError("program rows must contain one logical line")
-  return text
-
-
-def _program_row_index(rows, expected_row):
-  if (
-    isinstance(rows, (str, bytes, bytearray))
-    or not isinstance(rows, (tuple, list))
-  ):
-    raise MotionInputError("program rows must be a sequence")
-  if (
-    not isinstance(expected_row, str)
-    or '\r' in expected_row
-    or '\n' in expected_row
-  ):
-    raise MotionInputError("program row target must be one text line")
-  for index, row in enumerate(rows):
-    if _decode_program_row_content(row) == expected_row:
-      return index
-  raise MotionInputError(f"program row {expected_row!r} does not exist")
-
-
-def _normalize_program_tab_number(tab_number):
-  if not isinstance(tab_number, str):
-    raise MotionInputError("program tab number must be text")
-  normalized = tab_number.strip()
-  if not normalized or not normalized.isdecimal():
-    raise MotionInputError(
-      "program tab number must contain decimal digits"
-    )
-  return normalized
-
-
-def _program_tab_row_index(rows, tab_number):
-  tab_number = _normalize_program_tab_number(tab_number)
-  return _program_row_index(rows, f"Tab Number {tab_number}")
-
-
-def _program_bounded_index(value, label, maximum):
-  if (
-    isinstance(maximum, bool)
-    or not isinstance(maximum, int)
-    or maximum <= 0
-  ):
-    raise RuntimeError(f"{label} maximum is invalid")
-  if (
-    not isinstance(value, str)
-    or re.fullmatch(r"[1-9][0-9]*", value) is None
-  ):
-    raise MotionInputError(f"{label} must be a positive integer")
-  maximum_text = str(maximum)
-  if (
-    len(value) > len(maximum_text)
-    or (
-      len(value) == len(maximum_text)
-      and value > maximum_text
-    )
-  ):
-    raise MotionInputError(f"{label} must be between 1 and {maximum}")
-  return int(value)
 
 
 def _program_registry_entry(registry, key, label):
@@ -15712,42 +16140,225 @@ def _selected_program_row(allow_empty=False):
   return selected_row
 
 
-def _read_selected_program_command():
-  selected_row = _selected_program_row()
-  raw_command = tab1.progView.get(selected_row)
-  try:
-    command = _decode_program_row_content(raw_command)
-  except MotionInputError as exc:
-    raise MotionInputError(
-      f"selected robot program row is invalid: {exc}"
-    ) from exc
-  return selected_row, command.strip()
+def _parse_program_cartesian_row(command, kind, *, rounding=False):
+  if kind not in ("Move A Mid", "Move A End", "Move C Center", "Move L"):
+    raise MotionInputError("program Cartesian row kind is invalid")
+  rounding_field = r" Rnd (?P<rounding>\S+)" if rounding else ""
+  match = re.fullmatch(
+    rf"{re.escape(kind)} \[\*\] X (?P<x>\S+) Y (?P<y>\S+) "
+    rf"Z (?P<z>\S+) Rz (?P<rz>\S+) Ry (?P<ry>\S+) "
+    rf"Rx (?P<rx>\S+) J7 (?P<j7>\S+) J8 (?P<j8>\S+) "
+    rf"J9 (?P<j9>\S+) (?P<speed_prefix>S[psm]) (?P<speed>\S+) "
+    rf"Ac (?P<acceleration>\S+) Dc (?P<deceleration>\S+) "
+    rf"Rm (?P<ramp>\S+){rounding_field} \$ (?P<wrist>[ANF])",
+    command,
+  )
+  if match is None:
+    raise MotionInputError(f"{kind} row framing is invalid")
+  fields = match.groupdict()
+  for name in (
+    "x", "y", "z", "rz", "ry", "rx", "j7", "j8", "j9",
+    "speed", "acceleration", "deceleration", "ramp",
+  ):
+    finite_number(fields[name], f"{kind} {name}")
+  fields["translation"] = tuple(
+    finite_number(fields[name], f"{kind} {name}")
+    for name in ("x", "y", "z")
+  )
+  if rounding:
+    fields["rounding_value"] = finite_number(
+      fields["rounding"],
+      "Move L rounding",
+    )
+    if fields["rounding_value"] < 0:
+      raise MotionInputError("Move L rounding must be non-negative")
+  return fields
 
 
-def _program_row_is_supported(command):
-  if not isinstance(command, str):
-    raise TypeError("robot program command must be text")
-  if not command or command.startswith("##"):
-    return True
-  if command.startswith("Tab Number "):
-    tab_number = command[len("Tab Number "):]
-    try:
-      normalized_tab_number = _normalize_program_tab_number(tab_number)
-    except MotionInputError:
-      return False
-    return tab_number == normalized_tab_number
+def _parse_program_translation_row(command, kind):
+  if kind not in ("Move C Start", "Move C Plane"):
+    raise MotionInputError("program translation row kind is invalid")
+  match = re.fullmatch(
+    rf"{re.escape(kind)} \[\*\] X (?P<x>\S+) Y (?P<y>\S+) Z (?P<z>\S+)",
+    command,
+  )
+  if match is None:
+    raise MotionInputError(f"{kind} row framing is invalid")
+  fields = match.groupdict()
+  fields["translation"] = tuple(
+    finite_number(fields[name], f"{kind} {name}")
+    for name in ("x", "y", "z")
+  )
+  return fields
+
+
+def _program_cartesian_controller_command(
+  fields,
+  opcode,
+  loop_modes,
+  disable_wrist_rotation,
+  *,
+  translation=None,
+  virtual=False,
+):
+  if (
+    opcode not in ("MJ", "ML")
+    or type(fields) is not dict
+    or not isinstance(loop_modes, str)
+    or re.fullmatch(r"[01]{6}", loop_modes) is None
+    or not isinstance(disable_wrist_rotation, str)
+    or disable_wrist_rotation not in ("0", "1")
+  ):
+    raise MotionInputError("program Cartesian controller contract is invalid")
+  if translation is None:
+    translation = tuple(fields[name] for name in ("x", "y", "z"))
+  if not isinstance(translation, tuple) or len(translation) != 3:
+    raise MotionInputError("program Cartesian target translation is invalid")
+  translation = tuple(
+    finite_number(value, "program Cartesian target coordinate")
+    for value in translation
+  )
+  external = "" if virtual else (
+    f"J7{fields['j7']}J8{fields['j8']}J9{fields['j9']}"
+  )
+  command = (
+    f"{opcode}X{translation[0]}Y{translation[1]}Z{translation[2]}"
+    f"Rz{fields['rz']}Ry{fields['ry']}Rx{fields['rx']}{external}"
+    f"{fields['speed_prefix']}{fields['speed']}"
+    f"Ac{fields['acceleration']}Dc{fields['deceleration']}"
+    f"Rm{fields['ramp']}"
+  )
+  if opcode == "ML":
+    command += f"Rnd{fields['rounding']}"
+  command += f"W{fields['wrist']}Lm{loop_modes}"
+  if opcode == "ML" and not virtual:
+    command += f"Q{disable_wrist_rotation}"
+  return command + "\n"
+
+
+def _compile_program_arc(snapshot):
+  if not isinstance(snapshot, ProgramRowSpanSnapshot):
+    raise MotionInputError("arc program span snapshot is invalid")
+  rows = snapshot.rows
+  first_row = snapshot.selected_row
+  midpoint = _parse_program_cartesian_row(rows[first_row], "Move A Mid")
+  final_row = first_row + 1
+  if final_row >= len(rows):
+    raise MotionInputError("Move A Mid must be followed by Move A End")
+  endpoint = _parse_program_cartesian_row(rows[final_row], "Move A End")
+  motion_command = _program_cartesian_controller_command(
+    endpoint,
+    "MJ",
+    snapshot.loop_modes,
+    snapshot.disable_wrist_rotation,
+  )
   return (
-    command[:6] in PROGRAM_ROW_COMMAND_PREFIXES
-    or command[:11] in PROGRAM_ROW_LONG_COMMAND_PREFIXES
+    ProgramJsonCartesianMotion(
+      "move_arc",
+      (motion_command,),
+      (midpoint["translation"],),
+    ),
+  ), final_row
+
+
+def _compile_program_circle(snapshot):
+  if not isinstance(snapshot, ProgramRowSpanSnapshot):
+    raise MotionInputError("circle program span snapshot is invalid")
+  rows = snapshot.rows
+  first_row = snapshot.selected_row
+  center = _parse_program_cartesian_row(rows[first_row], "Move C Center")
+  if first_row + 2 >= len(rows):
+    raise MotionInputError(
+      "Move C Center must be followed by Move C Start and Move C Plane"
+    )
+  start = _parse_program_translation_row(rows[first_row + 1], "Move C Start")
+  plane = _parse_program_translation_row(rows[first_row + 2], "Move C Plane")
+  motion_command = _program_cartesian_controller_command(
+    center,
+    "MJ",
+    snapshot.loop_modes,
+    snapshot.disable_wrist_rotation,
+    translation=tuple(start[name] for name in ("x", "y", "z")),
+  )
+  return (
+    motion_command,
+    ProgramJsonCartesianMotion(
+      "move_circle",
+      (motion_command,),
+      (center["translation"], plane["translation"]),
+    ),
+  ), first_row + 2
+
+
+def _program_spline_descriptor(snapshot, segment_fields):
+  if not isinstance(snapshot, ProgramRowSpanSnapshot):
+    raise MotionInputError("spline program span snapshot is invalid")
+  if not isinstance(segment_fields, tuple) or not segment_fields:
+    raise MotionInputError("program spline requires at least one target")
+  return ProgramJsonCartesianMotion(
+    "move_spline",
+    tuple(
+      _program_cartesian_controller_command(
+        fields,
+        "ML",
+        snapshot.loop_modes,
+        snapshot.disable_wrist_rotation,
+      )
+      for fields in segment_fields
+    ),
+    roundings_millimeters=tuple(
+      fields["rounding_value"] for fields in segment_fields
+    ),
   )
 
 
-def _program_row_error_detail(error):
-  try:
-    detail = " ".join(str(error).split())
-  except Exception:
-    return type(error).__name__
-  return detail or type(error).__name__
+def _compile_explicit_program_spline(snapshot):
+  if not isinstance(snapshot, ProgramRowSpanSnapshot):
+    raise MotionInputError("spline program span snapshot is invalid")
+  rows = snapshot.rows
+  first_row = snapshot.selected_row
+  if rows[first_row] != "Start Spline":
+    raise MotionInputError("spline path must begin with Start Spline")
+  segments = []
+  row = first_row + 1
+  while row < len(rows) and rows[row] != "End Spline":
+    if len(segments) >= 6:
+      raise MotionInputError("program spline exceeds six targets")
+    segments.append(_parse_program_cartesian_row(rows[row], "Move L", rounding=True))
+    row += 1
+  if row >= len(rows):
+    raise MotionInputError("Start Spline has no matching End Spline")
+  if segments:
+    segments[-1] = dict(
+      segments[-1],
+      rounding="0",
+      rounding_value=0.0,
+    )
+  return (_program_spline_descriptor(snapshot, tuple(segments)),), row
+
+
+def _compile_rounded_program_spline(snapshot):
+  if not isinstance(snapshot, ProgramRowSpanSnapshot):
+    raise MotionInputError("rounded program span snapshot is invalid")
+  rows = snapshot.rows
+  first_row = snapshot.selected_row
+  segments = []
+  row = first_row
+  while row < len(rows):
+    if len(segments) >= 6:
+      raise MotionInputError("rounded linear path exceeds six targets")
+    fields = _parse_program_cartesian_row(rows[row], "Move L", rounding=True)
+    segments.append(fields)
+    if fields["rounding_value"] == 0.0:
+      return (_program_spline_descriptor(snapshot, tuple(segments)),), row
+    row += 1
+    if row >= len(rows) or not rows[row].startswith("Move L "):
+      raise MotionInputError(
+        "rounded Move L path must end with a zero-rounding Move L target"
+      )
+  raise MotionInputError(
+    "rounded Move L path must end with a zero-rounding Move L target"
+  )
 
 
 def _reject_program_row_before_execution(error):
@@ -15766,8 +16377,11 @@ def _call_program_from_current_row(
   program_name,
   execution_request,
   caller_row,
+  *,
+  caller_program=None,
 ):
-  caller_program = ProgEntryField.get()
+  if caller_program is None:
+    caller_program = ProgEntryField.get()
   if callProg(
     program_name,
     execution_request,
@@ -16150,9 +16764,23 @@ def _set_program_stop_status(auxiliary_state):
   if auxiliary_state not in ("pending", "completed", "failed"):
     raise ValueError("unknown auxiliary program-stop state")
   with program_stop_state_lock:
+    position_unavailable = RUN.get(
+      'mainControllerStopPositionUnavailable',
+      False,
+    )
+    if not isinstance(position_unavailable, bool):
+      raise RuntimeError(
+        "main controller stop position-availability latch is invalid"
+      )
     RUN['programStopState'] = auxiliary_state
     RUN['programStopStatusLatched'] = True
-    if RUN['estopActive']:
+    if RUN['estopActive'] and position_unavailable:
+      message = (
+        "PHYSICAL E-STOP REPORTED DURING CORRELATED JSON OPERATION; "
+        "CONTROLLER POSITION UNAVAILABLE; RECONNECT REQUIRED"
+      )
+      style = "Alarm.TLabel"
+    elif RUN['estopActive']:
       message = "Estop Button was Pressed"
       style = "Alarm.TLabel"
     elif RUN['posOutreach']:
@@ -16287,19 +16915,43 @@ def _apply_main_controller_stop_events():
       applied = True
       main_controller_stop_pending_event = None
       continue
-    position = displayPosition(
-      event.position.raw,
-      parsed=event.position,
-    )
-    if position is None:
-      ErrorHandler(event.position.flag)
-    elif (
-      not position_response_is_physical_estop(position)
-      or position != event.position
-    ):
-      raise RuntimeError(
-        "main controller physical-stop position application is invalid"
+    if event.position is None:
+      _set_application_status(
+        "PHYSICAL E-STOP REPORTED DURING CORRELATED JSON OPERATION; "
+        "CONTROLLER POSITION UNAVAILABLE; RECONNECT REQUIRED",
+        "Alarm.TLabel",
+        stop_authoritative=True,
       )
+    else:
+      position = displayPosition(
+        event.position.raw,
+        parsed=event.position,
+      )
+      if position is None:
+        ErrorHandler(event.position.flag)
+      elif (
+        not position_response_is_physical_estop(position)
+        or position != event.position
+      ):
+        raise RuntimeError(
+          "main controller physical-stop position application is invalid"
+        )
+      if event.upgrades_unpositioned_stop and position is not None:
+        with program_stop_state_lock:
+          position_unavailable = RUN.get(
+            'mainControllerStopPositionUnavailable',
+            False,
+          )
+          if not isinstance(position_unavailable, bool):
+            raise RuntimeError(
+              "main controller stop position-availability latch is invalid"
+            )
+          if not RUN.get('estopActive') or not position_unavailable:
+            raise RuntimeError(
+              "main controller stop position upgrade lacks an active "
+              "unpositioned stop"
+            )
+          RUN['mainControllerStopPositionUnavailable'] = False
     _clear_manual_auxiliary_stop_barrier_if_settled()
     applied = True
     main_controller_stop_pending_event = None
@@ -16373,13 +17025,22 @@ def executeRow(motion_complete=None, execution_request=None):
   with program_stop_state_lock:
     RUN['progRunning'] = True
   try:
-    selRow, command = _read_selected_program_command()
+    selection_result = _dispatch_program_selection(
+      ProgramSelectionEvent(
+        execution_request,
+        PROGRAM_SELECTION_CAPTURE_SPAN,
+      )
+    )
+    snapshot = selection_result.span_snapshot
+    if not selection_result.ready or not isinstance(
+      snapshot,
+      ProgramRowSpanSnapshot,
+    ):
+      raise MotionInputError("selected robot program row is unavailable")
+    selRow = snapshot.selected_row
+    command = snapshot.selected_command
   except Exception as exc:
     return _reject_program_row_before_execution(exc)
-  try:
-    tab1.progView.see(selRow+2)
-  except Exception:
-    logger.exception("Unable to scroll the robot program view")
 
   RUN['cmdType'] = command[:6]
   RUN['cmdTypeLong'] = command[:11]
@@ -16441,7 +17102,7 @@ def executeRow(motion_complete=None, execution_request=None):
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
-    command = "TL\n" 
+    command = "test_limit_switches"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
     execution_state, response = _execute_row_main_response(command)
@@ -16464,9 +17125,6 @@ def executeRow(motion_complete=None, execution_request=None):
     cmdSentEntryField.insert(0,command)
     execution_state, response = _execute_row_auxiliary_command(
       command,
-      read_line=True,
-      response_delay=.05,
-      response_parser=parse_auxiliary_gripper_current_response,
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
@@ -16482,14 +17140,10 @@ def executeRow(motion_complete=None, execution_request=None):
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
-    command = "SE\n" 
+    command = "set_encoders"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    execution_state, _ = _execute_row_main_response(
-      command,
-      read_line=False,
-      expected_response=b"Done",
-    )
+    execution_state, _ = _execute_row_main_response(command)
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
 
@@ -16502,7 +17156,7 @@ def executeRow(motion_complete=None, execution_request=None):
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 1):
       RUN['moveInProc'] = 2
-    command = "RE\n" 
+    command = "read_encoders"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
     execution_state, response = _execute_row_main_response(command)
@@ -16529,7 +17183,6 @@ def executeRow(motion_complete=None, execution_request=None):
     cmdSentEntryField.insert(0,command)
     execution_state, _ = _execute_row_auxiliary_command(
       command,
-      expected_response=b"Servo Done",
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
@@ -16554,8 +17207,6 @@ def executeRow(motion_complete=None, execution_request=None):
     cmdSentEntryField.insert(0,cmd)   
     execution_state, response = _execute_row_auxiliary_command(
       cmd,
-      read_line=True,
-      accepted_responses=("T", "F"),
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
@@ -16696,133 +17347,18 @@ def executeRow(motion_complete=None, execution_request=None):
       elif(action == "Stop"):
         stopProg()           
 
-  if (RUN['cmdType'] == "If MBc"):
+  if RUN['cmdType'] in ("If MBc", "If MBi", "If MBh", "If MBI"):
     if _reject_cancelled_program_row(execution_request):
       return ROW_EXECUTION_REJECTED
     if RUN['offlineMode']:
       _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
-    if (RUN['moveInProc'] == 1):
+    if RUN['moveInProc'] == 1:
       RUN['moveInProc'] = 2
-    inputIndex = command.find("# ")
-    valIndex = command.find("= ")
-    actionIndex = command.find(": ")
-    slavestartIndex = command.find("(")
-    slaveendIndex = command.find(")")
-    inputNum = str(command[inputIndex+2:valIndex-1])
-    valNum = str(command[valIndex+2:actionIndex-1])
-    action = str(command[actionIndex+2:actionIndex+6])
-    slaveID = str(command[slavestartIndex+1:slaveendIndex])
-    opVal = "1"
-    subcommand = "BB"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
-    execution_state, response = _execute_row_main_response(
-      subcommand,
-      response_parser=parse_controller_modbus_response,
-    )
-    if execution_state != ROW_EXECUTION_COMPLETE:
-      return execution_state
-    if _reject_cancelled_program_row(execution_request):
-      return ROW_EXECUTION_REJECTED
-    if (response == valNum):
-      if(action == "Call"):
-        progIndex = command.find("Prog")
-        progName = str(command[actionIndex+12:]) + ".ar4" 
-        if not _call_program_from_current_row(
-          progName,
-          execution_request,
-          selRow,
-        ):
-          return ROW_EXECUTION_REJECTED
-      elif(action == "Jump"):
-        tabIndex = command.find("Tab")
-        tabNum = str(command[tabIndex+4:])
-        index = _program_tab_row_index(
-          tab1.progView.get(0, "end"),
-          tabNum,
-        )
-        index = index-1
-        tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(index)
-      elif(action == "Stop"):
-        stopProg()   
-
-  if (RUN['cmdType'] == "If MBi"):
-    if _reject_cancelled_program_row(execution_request):
-      return ROW_EXECUTION_REJECTED
-    if RUN['offlineMode']:
-      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      _finish_execute_row()
-      return ROW_EXECUTION_REJECTED
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    inputIndex = command.find("# ")
-    valIndex = command.find("= ")
-    actionIndex = command.find(": ")
-    slavestartIndex = command.find("(")
-    slaveendIndex = command.find(")")
-    inputNum = str(command[inputIndex+2:valIndex-1])
-    valNum = str(command[valIndex+2:actionIndex-1])
-    action = str(command[actionIndex+2:actionIndex+6])
-    slaveID = str(command[slavestartIndex+1:slaveendIndex])
-    opVal = "1"
-    subcommand = "BC"+"A"+slaveID+"B"+inputNum+"C"+opVal+"\n"
-    execution_state, response = _execute_row_main_response(
-      subcommand,
-      response_parser=parse_controller_modbus_response,
-    )
-    if execution_state != ROW_EXECUTION_COMPLETE:
-      return execution_state
-    if _reject_cancelled_program_row(execution_request):
-      return ROW_EXECUTION_REJECTED
-    if (response == valNum):
-      if(action == "Call"):
-        progIndex = command.find("Prog")
-        progName = str(command[actionIndex+12:]) + ".ar4" 
-        if not _call_program_from_current_row(
-          progName,
-          execution_request,
-          selRow,
-        ):
-          return ROW_EXECUTION_REJECTED
-      elif(action == "Jump"):
-        tabIndex = command.find("Tab")
-        tabNum = str(command[tabIndex+4:])
-        index = _program_tab_row_index(
-          tab1.progView.get(0, "end"),
-          tabNum,
-        )
-        index = index-1
-        tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(index)
-      elif(action == "Stop"):
-        stopProg()
-
-  if (RUN['cmdType'] == "If MBh"):
-    if _reject_cancelled_program_row(execution_request):
-      return ROW_EXECUTION_REJECTED
-    if RUN['offlineMode']:
-      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      _finish_execute_row()
-      return ROW_EXECUTION_REJECTED
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    inputIndex = command.find("# ")
-    valIndex = command.find("= ")
-    actionIndex = command.find(": ")
-    slavestartIndex = command.find("SlaveID (")
-    regNumstartIndex = command.find("Num Reg's (")
-    inputNum = str(command[inputIndex+2:valIndex-1])
-    valNum = str(command[valIndex+2:actionIndex-1])
-    action = str(command[actionIndex+2:actionIndex+6])
-    slaveID = str(command[slavestartIndex+9:regNumstartIndex-2])
-    opVal = str(command[regNumstartIndex+11:inputIndex-8])
     try:
-      subcommand = _build_program_modbus_register_read(
-        "BH",
-        slaveID,
-        inputNum,
-        opVal,
+      subcommand, expected, action = _parse_program_modbus_condition(
+        command, RUN['cmdType'],
       )
     except MotionInputError as exc:
       message = f"Program Modbus row rejected: {exc}"
@@ -16830,99 +17366,36 @@ def executeRow(motion_complete=None, execution_request=None):
       _set_application_status(message, "Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
-    execution_state, response = _execute_row_main_response(
-      subcommand,
-      response_parser=parse_controller_modbus_response,
-    )
-    if execution_state != ROW_EXECUTION_COMPLETE:
-      return execution_state
-    if _reject_cancelled_program_row(execution_request):
-      return ROW_EXECUTION_REJECTED
-    if (response == valNum):
-      if(action == "Call"):
-        progIndex = command.find("Prog")
-        progName = str(command[actionIndex+12:]) + ".ar4" 
-        if not _call_program_from_current_row(
-          progName,
-          execution_request,
-          selRow,
-        ):
-          return ROW_EXECUTION_REJECTED
-      elif(action == "Jump"):
-        tabIndex = command.find("Tab")
-        tabNum = str(command[tabIndex+4:])
-        index = _program_tab_row_index(
-          tab1.progView.get(0, "end"),
-          tabNum,
-        )
-        index = index-1
-        tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(index)
-      elif(action == "Stop"):
-        stopProg()  
 
-  if (RUN['cmdType'] == "If MBI"):
-    if _reject_cancelled_program_row(execution_request):
-      return ROW_EXECUTION_REJECTED
-    if RUN['offlineMode']:
-      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
+    if motion_complete is not None:
+      caller_program = ProgEntryField.get() if action[0] == "call_program" else None
+
+      def settlement_factory(response):
+        settlement = (expected, response, action, execution_request, selRow)
+        if response == expected and action[0] == "call_program":
+          call_succeeded = _settle_program_modbus_condition(
+            True, *settlement, caller_program,
+          )
+          return lambda succeeded: succeeded and call_succeeded
+        return lambda succeeded: _settle_program_modbus_condition(succeeded, *settlement)
+
+      if _start_program_controller_exchange(
+        subcommand,
+        "Program Modbus read",
+        motion_complete,
+        settlement_callback_factory=settlement_factory,
+      ):
+        return ROW_EXECUTION_PENDING
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    inputIndex = command.find("# ")
-    valIndex = command.find("= ")
-    actionIndex = command.find(": ")
-    slavestartIndex = command.find("SlaveID (")
-    regNumstartIndex = command.find("Num Reg's (")
-    inputNum = str(command[inputIndex+2:valIndex-1])
-    valNum = str(command[valIndex+2:actionIndex-1])
-    action = str(command[actionIndex+2:actionIndex+6])
-    slaveID = str(command[slavestartIndex+9:regNumstartIndex-2])
-    opVal = str(command[regNumstartIndex+11:inputIndex-14])
-    try:
-      subcommand = _build_program_modbus_register_read(
-        "BD",
-        slaveID,
-        inputNum,
-        opVal,
-      )
-    except MotionInputError as exc:
-      message = f"Program Modbus row rejected: {exc}"
-      logger.error(message)
-      _set_application_status(message, "Alarm.TLabel")
-      _finish_execute_row()
-      return ROW_EXECUTION_REJECTED
-    execution_state, response = _execute_row_main_response(
-      subcommand,
-      response_parser=parse_controller_modbus_response,
-    )
+
+    execution_state, response = _execute_row_main_response(subcommand)
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
-    if _reject_cancelled_program_row(execution_request):
+    if not _settle_program_modbus_condition(
+      True, expected, response, action, execution_request, selRow,
+    ):
       return ROW_EXECUTION_REJECTED
-    if (response == valNum):
-      if(action == "Call"):
-        progIndex = command.find("Prog")
-        progName = str(command[actionIndex+12:]) + ".ar4" 
-        if not _call_program_from_current_row(
-          progName,
-          execution_request,
-          selRow,
-        ):
-          return ROW_EXECUTION_REJECTED
-      elif(action == "Jump"):
-        tabIndex = command.find("Tab")
-        tabNum = str(command[tabIndex+4:])
-        index = _program_tab_row_index(
-          tab1.progView.get(0, "end"),
-          tabNum,
-        )
-        index = index-1
-        tab1.progView.selection_clear(0, END)
-        tab1.progView.select_set(index)
-      elif(action == "Stop"):
-        stopProg()
 
   if (RUN['cmdTypeLong'] == "Wait 5v Inp"):
     if _reject_cancelled_program_row(execution_request):
@@ -16951,82 +17424,31 @@ def executeRow(motion_complete=None, execution_request=None):
     cmdSentEntryField.insert(0,command)
     execution_state, _ = _execute_row_auxiliary_command(
       command,
-      read_line=True,
       control_injectable=True,
       response_timeout=timeout + SERIAL_AUXILIARY_WAIT_MARGIN_SECONDS,
-      accepted_responses=AUXILIARY_WAIT_TERMINAL_RESPONSES,
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
  
 
-  if (RUN['cmdTypeLong'] == "Wait MBcoil"):
-    if _reject_cancelled_program_row(execution_request):
-      return ROW_EXECUTION_REJECTED
-    if RUN['offlineMode']:
-      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      _finish_execute_row()
-      return ROW_EXECUTION_REJECTED
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    slavestartIndex = command.find("SlaveID (")  
-    inputIndex = command.find("# ")
-    valIndex = command.find("= ")
-    timeoutIndex = command.find("Timeout =")
-    slaveID = str(command[slavestartIndex+9:inputIndex-9])
-    inputNum = str(command[inputIndex+2:valIndex-1])
-    valNum = str(command[valIndex+2:timeoutIndex-3])
+  modbus_wait_opcode = {
+    "Wait MBcoil": "WJ",
+    "Wait MBhold": "WH",
+    "Wait MBinpu": "WK",
+  }.get(RUN['cmdTypeLong'])
+  if modbus_wait_opcode is not None:
     try:
-      timeout = _main_modbus_wait_timeout_seconds(command[timeoutIndex+10:])
+      execution_state = _execute_program_modbus_wait(
+        command,
+        modbus_wait_opcode,
+        execution_request,
+      )
     except MotionInputError as exc:
       message = f"Controller Modbus wait rejected: {exc}"
       logger.error(message)
       _set_application_status(text=message, style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
-    command = "WJ"+"A"+slaveID+"B"+inputNum+"C"+valNum+"D"+str(timeout)+"\n"
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0,command)
-    execution_state, _ = _execute_row_main_response(
-      command,
-      response_parser=parse_controller_modbus_response,
-      response_timeout=timeout + SERIAL_RESPONSE_MARGIN_SECONDS,
-    )
-    if execution_state != ROW_EXECUTION_COMPLETE:
-      return execution_state
-
-  if (RUN['cmdTypeLong'] == "Wait MBinpu"):
-    if _reject_cancelled_program_row(execution_request):
-      return ROW_EXECUTION_REJECTED
-    if RUN['offlineMode']:
-      _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
-      _finish_execute_row()
-      return ROW_EXECUTION_REJECTED
-    if (RUN['moveInProc'] == 1):
-      RUN['moveInProc'] = 2
-    slavestartIndex = command.find("SlaveID (")  
-    inputIndex = command.find("# ")
-    valIndex = command.find("= ")
-    timeoutIndex = command.find("Timeout =")
-    slaveID = str(command[slavestartIndex+9:inputIndex-9])
-    inputNum = str(command[inputIndex+2:valIndex-1])
-    valNum = str(command[valIndex+2:timeoutIndex-3])
-    try:
-      timeout = _main_modbus_wait_timeout_seconds(command[timeoutIndex+10:])
-    except MotionInputError as exc:
-      message = f"Controller Modbus wait rejected: {exc}"
-      logger.error(message)
-      _set_application_status(text=message, style="Alarm.TLabel")
-      _finish_execute_row()
-      return ROW_EXECUTION_REJECTED
-    command = "WK"+"A"+slaveID+"B"+inputNum+"C"+valNum+"D"+str(timeout)+"\n"
-    cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0,command)
-    execution_state, _ = _execute_row_main_response(
-      command,
-      response_parser=parse_controller_modbus_response,
-      response_timeout=timeout + SERIAL_RESPONSE_MARGIN_SECONDS,
-    )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
    
@@ -17082,7 +17504,6 @@ def executeRow(motion_complete=None, execution_request=None):
     cmdSentEntryField.insert(0,command)
     execution_state, _ = _execute_row_auxiliary_command(
       command,
-      expected_response=b"Done",
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
@@ -17117,9 +17538,7 @@ def executeRow(motion_complete=None, execution_request=None):
       return ROW_EXECUTION_REJECTED
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    execution_state, _ = _execute_row_main_modbus_write_response(
-      command,
-    )
+    execution_state, _ = _execute_row_main_modbus_write_response(command)
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
 
@@ -17153,9 +17572,7 @@ def executeRow(motion_complete=None, execution_request=None):
       return ROW_EXECUTION_REJECTED
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
-    execution_state, _ = _execute_row_main_modbus_write_response(
-      command,
-    )
+    execution_state, _ = _execute_row_main_modbus_write_response(command)
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
  
@@ -17184,10 +17601,22 @@ def executeRow(motion_complete=None, execution_request=None):
     command = "WTS"+encoded_wait+"\n"
     cmdSentEntryField.delete(0, 'end')
     cmdSentEntryField.insert(0,command)
+    response_timeout = timeSeconds + SERIAL_RESPONSE_MARGIN_SECONDS
+    if motion_complete is not None:
+      if _start_program_controller_exchange(
+        command,
+        "Program controller wait",
+        motion_complete,
+        controller_wait_seconds=timeSeconds,
+        response_timeout=response_timeout,
+      ):
+        return ROW_EXECUTION_PENDING
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     execution_state, _ = _execute_row_main_response(
       command,
-      accepted_responses=("WTdone",),
-      response_timeout=timeSeconds + SERIAL_RESPONSE_MARGIN_SECONDS,
+      controller_wait_seconds=timeSeconds,
+      response_timeout=response_timeout,
     )
     if execution_state != ROW_EXECUTION_COMPLETE:
       return execution_state
@@ -17547,49 +17976,46 @@ def executeRow(motion_complete=None, execution_request=None):
       return ROW_EXECUTION_REJECTED
     if (RUN['moveInProc'] == 0):
       RUN['moveInProc'] == 1
-    xIndex = command.find(" X ")
-    yIndex = command.find(" Y ")
-    zIndex = command.find(" Z ")
-    rzIndex = command.find(" Rz ")
-    ryIndex = command.find(" Ry ")
-    rxIndex = command.find(" Rx ")
-    J7Index = command.find(" J7 ")
-    J8Index = command.find(" J8 ")
-    J9Index = command.find(" J9 ")
-    SpeedIndex = command.find(" S")
-    ACCspdIndex = command.find(" Ac ")
-    DECspdIndex = command.find(" Dc ")
-    ACCrampIndex = command.find(" Rm ")
-    RoundingIndex = command.find(" Rnd ")
-    WristConfIndex = command.find(" $")
-    RUN['xVal'] = command[xIndex+3:yIndex]
-    RUN['yVal'] = command[yIndex+3:zIndex]
-    RUN['zVal'] = command[zIndex+3:rzIndex]
-    rzVal = command[rzIndex+4:ryIndex]
-    #if (np.sign(float(rzVal)) != np.sign(float(CAL['RzcurPos']))):
-    #  rzVal=str(float(rzVal)*-1)
-    ryVal = command[ryIndex+4:rxIndex]
-    rxVal = command[rxIndex+4:J7Index]
-    J7Val = command[J7Index+4:J8Index]
-    J8Val = command[J8Index+4:J9Index]
-    J9Val = command[J9Index+4:SpeedIndex]
-    speedPrefix = command[SpeedIndex+1:SpeedIndex+3]
-    Speed = command[SpeedIndex+4:ACCspdIndex]
-    ACCspd = command[ACCspdIndex+4:DECspdIndex]
-    DECspd = command[DECspdIndex+4:ACCrampIndex]
-    ACCramp = command[ACCrampIndex+4:RoundingIndex]
-    Rounding = command[RoundingIndex+5:WristConfIndex]
-    RUN['WC'] = command[WristConfIndex+3:]
-    LoopMode = str(CAL['J1OpenLoopVal'].get())+str(CAL['J2OpenLoopVal'].get())+str(CAL['J3OpenLoopVal'].get())+str(CAL['J4OpenLoopVal'].get())+str(CAL['J5OpenLoopVal'].get())+str(CAL['J6OpenLoopVal'].get())
-    DisWrist = str(CAL['DisableWristRotVal'].get())
-    command = "ML"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+"J7"+J7Val+"J8"+J8Val+"J9"+J9Val+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"Rnd"+Rounding+"W"+RUN['WC']+"Lm"+LoopMode+"Q"+DisWrist+"\n"
-    commandVR = "MJ"+"X"+RUN['xVal']+"Y"+RUN['yVal']+"Z"+RUN['zVal']+"Rz"+rzVal+"Ry"+ryVal+"Rx"+rxVal+speedPrefix+Speed+"Ac"+ACCspd+"Dc"+DECspd+"Rm"+ACCramp+"W"+RUN['WC']+"Lm"+LoopMode+"\n"
-    motion_state = _dispatch_program_command(
-      command,
-      mj_command,
-      commandVR,
-      motion_complete,
-    )
+    try:
+      fields = _parse_program_cartesian_row(command, "Move L", rounding=True)
+      RUN['xVal'], RUN['yVal'], RUN['zVal'] = (
+        fields["x"], fields["y"], fields["z"]
+      )
+      RUN['WC'] = fields["wrist"]
+      if fields["rounding_value"] == 0.0 or RUN['offlineMode']:
+        controller_command = _program_cartesian_controller_command(
+          fields,
+          "ML",
+          snapshot.loop_modes,
+          snapshot.disable_wrist_rotation,
+        )
+        virtual_command = _program_cartesian_controller_command(
+          fields,
+          "MJ",
+          snapshot.loop_modes,
+          snapshot.disable_wrist_rotation,
+          virtual=True,
+        )
+        motion_state = _dispatch_program_command(
+          controller_command,
+          mj_command,
+          virtual_command,
+          motion_complete,
+        )
+      else:
+        commands, final_row = _compile_rounded_program_spline(snapshot)
+        motion_state = _dispatch_program_controller_sequence(
+          commands,
+          motion_complete,
+          completed_span_snapshot=snapshot,
+          completed_span_final_row=final_row,
+        )
+    except Exception as exc:
+      message = f"Move L program row rejected: {_program_row_error_detail(exc)}"
+      logger.error(message)
+      _set_application_status(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
     if motion_state != ROW_EXECUTION_COMPLETE:
       if motion_state == ROW_EXECUTION_REJECTED:
         _finish_execute_row()
@@ -17649,38 +18075,73 @@ def executeRow(motion_complete=None, execution_request=None):
   if (RUN['cmdType'] == "Move A"):
     if _reject_cancelled_program_row(execution_request):
       return ROW_EXECUTION_REJECTED
-    message = (
-      "Arc program motion is disabled pending a safe Teensy MA protocol"
-    )
-    logger.error(message)
-    _set_application_status(text=message, style="Alarm.TLabel")
-    _finish_execute_row()
-    return ROW_EXECUTION_REJECTED
+    try:
+      commands, final_row = _compile_program_arc(snapshot)
+      motion_state = _dispatch_program_controller_sequence(
+        commands,
+        motion_complete,
+        completed_span_snapshot=snapshot,
+        completed_span_final_row=final_row,
+      )
+    except Exception as exc:
+      message = f"Arc program row rejected: {_program_row_error_detail(exc)}"
+      logger.error(message)
+      _set_application_status(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
+    if motion_state != ROW_EXECUTION_COMPLETE:
+      if motion_state == ROW_EXECUTION_REJECTED:
+        _finish_execute_row()
+      return motion_state
 
   if (RUN['cmdType'] == "Move C"):
     if _reject_cancelled_program_row(execution_request):
       return ROW_EXECUTION_REJECTED
-    message = (
-      "Circle program motion is disabled pending a safe Teensy MC protocol"
-    )
-    logger.error(message)
-    _set_application_status(text=message, style="Alarm.TLabel")
-    _finish_execute_row()
-    return ROW_EXECUTION_REJECTED
+    try:
+      commands, final_row = _compile_program_circle(snapshot)
+      motion_state = _dispatch_program_controller_sequence(
+        commands,
+        motion_complete,
+        completed_span_snapshot=snapshot,
+        completed_span_final_row=final_row,
+      )
+    except Exception as exc:
+      message = f"Circle program row rejected: {_program_row_error_detail(exc)}"
+      logger.error(message)
+      _set_application_status(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
+    if motion_state != ROW_EXECUTION_COMPLETE:
+      if motion_state == ROW_EXECUTION_REJECTED:
+        _finish_execute_row()
+      return motion_state
 
   if (RUN['cmdType'] == "Start "):
     if _reject_cancelled_program_row(execution_request):
       return ROW_EXECUTION_REJECTED
-    message = "Spline program motion is disabled pending an owned response protocol"
-    logger.error(message)
-    _set_application_status(text=message, style="Alarm.TLabel")
-    _finish_execute_row()
-    return ROW_EXECUTION_REJECTED
+    try:
+      commands, final_row = _compile_explicit_program_spline(snapshot)
+      motion_state = _dispatch_program_controller_sequence(
+        commands,
+        motion_complete,
+        completed_span_snapshot=snapshot,
+        completed_span_final_row=final_row,
+      )
+    except Exception as exc:
+      message = f"Spline program row rejected: {_program_row_error_detail(exc)}"
+      logger.error(message)
+      _set_application_status(text=message, style="Alarm.TLabel")
+      _finish_execute_row()
+      return ROW_EXECUTION_REJECTED
+    if motion_state != ROW_EXECUTION_COMPLETE:
+      if motion_state == ROW_EXECUTION_REJECTED:
+        _finish_execute_row()
+      return motion_state
 
   if (RUN['cmdType'] == "End Sp"):
     if _reject_cancelled_program_row(execution_request):
       return ROW_EXECUTION_REJECTED
-    message = "Spline program motion is disabled pending an owned response protocol"
+    message = "End Spline must be executed through a matching Start Spline row"
     logger.error(message)
     _set_application_status(text=message, style="Alarm.TLabel")
     _finish_execute_row()
@@ -17969,6 +18430,7 @@ if CE['Platform']['IS_WINDOWS']:
       return None
 
   def _tool_code(axis, d):
+      # LT direction bits describe TCP travel after inverse kinematics.
       if axis == 'Tz': return 30 if d < 0 else 31
       return None
 
@@ -18270,9 +18732,12 @@ else:
   def xbox():
     def send_xbox_auxiliary(command):
       serial_port = RUN.get('ser2')
+      profile = _connected_auxiliary_board_profile(serial_port)
+      validate_auxiliary_output_command(command, profile)
+      opcode, pin = parse_auxiliary_output_command(command)
       return _exchange_xbox_auxiliary_command(
-        command,
-        _xbox_auxiliary_expected_response(command, serial_port),
+        "set_output",
+        {"pin": pin, "state": opcode == "ON"},
         serial_port,
       )
 
@@ -18324,30 +18789,16 @@ else:
                 jogMode = 1
                 _set_application_status(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
             ##JOINT JOG
-            elif (mainMode == 1 and event.code == 'ABS_HAT0X' and event.state == 1 and jogMode == 1): 
-              J1jogNeg(float(incrementEntryField.get()))    
-            elif (mainMode == 1 and event.code == 'ABS_HAT0X' and event.state == -1 and jogMode == 1): 
-              J1jogPos(float(incrementEntryField.get()))
-            elif (mainMode == 1 and event.code == 'ABS_HAT0Y' and event.state == -1 and jogMode == 1): 
-              J2jogNeg(float(incrementEntryField.get()))    
-            elif (mainMode == 1 and event.code == 'ABS_HAT0Y' and event.state == 1 and jogMode == 1): 
-              J2jogPos(float(incrementEntryField.get()))           
-            elif (mainMode == 1 and event.code == 'ABS_HAT0Y' and event.state == -1 and jogMode == 2): 
-              J3jogNeg(float(incrementEntryField.get()))    
-            elif (mainMode == 1 and event.code == 'ABS_HAT0Y' and event.state == 1 and jogMode == 2): 
-              J3jogPos(float(incrementEntryField.get()))
-            elif (mainMode == 1 and event.code == 'ABS_HAT0X' and event.state == 1 and jogMode == 2): 
-              J4jogNeg(float(incrementEntryField.get()))    
-            elif (mainMode == 1 and event.code == 'ABS_HAT0X' and event.state == -1 and jogMode == 2): 
-              J4jogPos(float(incrementEntryField.get()))           
-            elif (mainMode == 1 and event.code == 'ABS_HAT0Y' and event.state == -1 and jogMode == 3): 
-              J5jogNeg(float(incrementEntryField.get()))    
-            elif (mainMode == 1 and event.code == 'ABS_HAT0Y' and event.state == 1 and jogMode == 3): 
-              J5jogPos(float(incrementEntryField.get()))
-            elif (mainMode == 1 and event.code == 'ABS_HAT0X' and event.state == 1 and jogMode == 3): 
-              J6jogNeg(float(incrementEntryField.get()))    
-            elif (mainMode == 1 and event.code == 'ABS_HAT0X' and event.state == -1 and jogMode == 3): 
-              J6jogPos(float(incrementEntryField.get()))                      
+            elif (
+              (joint_jog := _non_windows_gamepad_joint_jog(
+                mainMode, jogMode, event.code, event.state
+              )) is not None
+            ):
+              axis, direction = joint_jog
+              _queue_joint_jog(
+                axis,
+                direction * float(incrementEntryField.get()),
+              )
           ##CARTESIAN DIR MODE
             elif (event.code == 'BTN_SOUTH' and event.state == 1): 
               if mainMode != 2:
@@ -18404,11 +18855,6 @@ else:
             elif (event.code == 'BTN_START' and event.state == 1): 
               mainMode = 4
               _set_application_status(text='JOGGING TRACK', style="Warn.TLabel")
-            ##TRACK JOG
-            elif (mainMode == 4 and event.code == 'ABS_HAT0X' and event.state == 1): 
-              J7jogPos(float(incrementEntryField.get()))    
-            elif (mainMode == 4 and event.code == 'ABS_HAT0X' and event.state == -1): 
-              J7jogNeg(float(incrementEntryField.get()))                   
             ##TEACH POS          
             elif (event.code == 'BTN_NORTH' and event.state == 1): 
               teachInsertBelSelected()
@@ -18555,12 +19001,27 @@ def _configured_motion_timeout_bounds():
 
 
 def _controller_response_timeout(command):
+  if isinstance(command, ProgramJsonCartesianMotion):
+    if command.command_name != "move_spline":
+      return _controller_response_timeout(command.motion_commands[0])
+    minimum_ramp_full_scale_seconds, millimeter_motion_distance_bound = (
+      _configured_motion_timeout_bounds()
+    )
+    deadline = sum(
+      command_response_timeout(
+        segment,
+        SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+        minimum_ramp_full_scale_seconds,
+        millimeter_motion_distance_bound,
+        margin_seconds=0.0,
+      )
+      for segment in command.motion_commands
+    ) + SERIAL_RESPONSE_MARGIN_SECONDS
+    if not math.isfinite(deadline) or deadline <= 0:
+      raise MotionInputError("derived spline response deadline is invalid")
+    return deadline
   timing = parse_command_timing(command)
   if timing is None:
-    if command[:2] == "PG":
-      raise MotionInputError(
-        "G-code playback has no fixed response deadline"
-      )
     return SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS
 
   minimum_ramp_full_scale_seconds, millimeter_motion_distance_bound = (
@@ -18576,126 +19037,22 @@ def _controller_response_timeout(command):
 
 
 def _canonicalize_main_serial_command(command):
+  if isinstance(command, ProgramJsonCartesianMotion):
+    return ProgramJsonCartesianMotion(
+      command.command_name,
+      tuple(
+        _canonicalize_main_serial_command(segment)
+        for segment in command.motion_commands
+      ),
+      command.control_points,
+      command.roundings_millimeters,
+    )
   calibration = None
   if isinstance(command, str) and command[:2] in (
-    "MG", "MJ", "ML", "MV", "RJ", "WC", "WG",
+    "MJ", "ML", "MV", "RJ", "WC",
   ):
     calibration = _current_controller_joint_calibration()
   return canonicalize_serial_command(command, calibration)
-
-
-def _exchange_serial_line(
-  command,
-  control_event=None,
-  write_started_event=None,
-  write_cancellation_event=None,
-  write_boundary_lock=None,
-  interim_response_handler=None,
-  interim_response_limit=None,
-  reset_input=False,
-):
-  if reset_input is not False:
-    raise MotionInputError(
-      "main controller exchanges must preserve pending input"
-    )
-  command = _canonicalize_main_serial_command(command)
-  serial_port = RUN.get('ser')
-  try:
-    if command[:2] == "PG":
-      if control_event is not None:
-        raise MotionInputError(
-          "G-code playback does not support live-jog control injection"
-        )
-      if (
-        interim_response_handler is not None
-        or interim_response_limit is not None
-      ):
-        raise MotionInputError(
-          "G-code playback does not support interim response handling"
-        )
-      parse_command_timing(command)
-      return _exchange_main_controller_line_until_cancelled(
-        serial_port,
-        command,
-        application_closing,
-        write_started_event=write_started_event,
-        write_boundary_lock=write_boundary_lock,
-        write_cancellation_event=write_cancellation_event,
-      )
-    else:
-      response_timeout = _controller_response_timeout(command)
-      publish_stop = _prepare_main_controller_stop_exchange(serial_port)
-      response = exchange_serial_line(
-        serial_port,
-        command,
-        response_timeout,
-        write_lock=serial_write_lock,
-        control_event=control_event,
-        control_command="S\n" if control_event is not None else None,
-        control_ack_timeout_seconds=(
-          SERIAL_LIVE_ACK_TIMEOUT_SECONDS
-          if control_event is not None
-          else None
-        ),
-        control_response_timeout_seconds=(
-          response_timeout
-          if control_event is not None
-          else None
-        ),
-        write_started_event=write_started_event,
-        cancellation_event=write_cancellation_event,
-        write_boundary_lock=write_boundary_lock,
-        reset_input=False,
-        interim_response_handler=interim_response_handler,
-        interim_response_limit=interim_response_limit,
-        estop_callback=publish_stop,
-      )
-    try:
-      position = parse_position_response(response)
-    except ProtocolResponseError:
-      return response
-    if position_response_is_physical_estop(position):
-      _raise_legacy_controller_stop(
-        serial_port,
-        ControllerLineExchangeResponse(
-          None,
-          position,
-          (
-            "admission-estop"
-            if position.flag == CONTROLLER_ESTOP_ADMISSION_FLAG
-            else "estop-only"
-          ),
-        ),
-      )
-    return response
-  finally:
-    if (
-      RUN.get('ser') is serial_port
-      and not getattr(serial_port, "is_open", False)
-    ):
-      RUN['ser'] = None
-      _require_main_controller_identity_cleanup(
-        serial_port,
-        "controller exchange cleanup",
-      )
-
-
-def _exchange_auxiliary_line(command):
-  serial_port = RUN.get('ser2')
-  try:
-    return exchange_serial_line(
-      serial_port,
-      command,
-      SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
-      write_lock=auxiliary_serial_write_lock,
-    )
-  finally:
-    if (
-      RUN.get('ser2') is serial_port
-      and not getattr(serial_port, "is_open", False)
-    ):
-      RUN['ser2'] = None
-      _clear_auxiliary_board_profile(serial_port)
 
 
 def _raise_auxiliary_stop_acknowledgement_timeout():
@@ -18713,33 +19070,6 @@ def _raise_auxiliary_stop_acknowledgement_timeout():
   )
 
 
-def _remaining_auxiliary_stop_acknowledgement_time(deadline):
-  deadline = finite_number(deadline, "auxiliary stop acknowledgement deadline")
-  remaining = deadline - time.monotonic()
-  if remaining <= 0:
-    _raise_auxiliary_stop_acknowledgement_timeout()
-  return remaining
-
-
-def _read_auxiliary_inactive_stop_response(deadline):
-  serial_port = RUN.get('ser2')
-  try:
-    remaining = _remaining_auxiliary_stop_acknowledgement_time(deadline)
-    return read_serial_line_response(
-      serial_port,
-      remaining,
-      accepted_responses=(AUXILIARY_INACTIVE_STOP_RESPONSE,),
-      response_deadline=deadline,
-    )
-  finally:
-    if (
-      RUN.get('ser2') is serial_port
-      and not getattr(serial_port, "is_open", False)
-    ):
-      RUN['ser2'] = None
-      _clear_auxiliary_board_profile(serial_port)
-
-
 def _begin_auxiliary_stop_owner_wait():
   global auxiliary_stop_acknowledgement_deadline
   global auxiliary_stop_owner_waiting
@@ -18747,22 +19077,16 @@ def _begin_auxiliary_stop_owner_wait():
   with auxiliary_stop_state_lock:
     if auxiliary_stop_owner_waiting:
       raise RuntimeError("auxiliary stop owner wait was already active")
-    auxiliary_stop_injected_event.clear()
     auxiliary_stop_acknowledgement_deadline = None
     auxiliary_stop_owner_waiting = True
 
 
-def _auxiliary_stop_acknowledgement_deadline_value():
-  with auxiliary_stop_state_lock:
-    deadline = auxiliary_stop_acknowledgement_deadline
-  if deadline is None:
-    raise ProtocolResponseError(
-      "auxiliary stop acknowledgement deadline is unavailable"
-    )
-  return deadline
-
-
-def _publish_auxiliary_stop_owner_result(succeeded, value):
+def _publish_auxiliary_stop_owner_result(
+  succeeded,
+  value,
+  *,
+  stop_transmitted=False,
+):
   global auxiliary_stop_acknowledgement_deadline
   global auxiliary_stop_owner_result
   global auxiliary_stop_owner_waiting
@@ -18770,6 +19094,8 @@ def _publish_auxiliary_stop_owner_result(succeeded, value):
   validation_error = None
   if not isinstance(succeeded, bool):
     validation_error = "auxiliary stop owner result must use a boolean status"
+  elif not isinstance(stop_transmitted, bool):
+    validation_error = "auxiliary stop transmission state must be boolean"
   elif not isinstance(value, str):
     validation_error = "auxiliary stop owner result must contain text"
   else:
@@ -18782,8 +19108,15 @@ def _publish_auxiliary_stop_owner_result(succeeded, value):
   with auxiliary_stop_state_lock:
     if not auxiliary_stop_owner_waiting:
       raise RuntimeError("auxiliary stop owner wait was not active")
-    auxiliary_stop_owner_waiting = False
     request_id = auxiliary_stop_active_request_id
+    if (
+      validation_error is None
+      and succeeded
+      and request_id is not None
+      and not stop_transmitted
+    ):
+      return False
+    auxiliary_stop_owner_waiting = False
     if request_id is not None:
       if auxiliary_stop_owner_result is not None:
         raise RuntimeError("auxiliary stop owner result was already published")
@@ -18796,8 +19129,6 @@ def _publish_auxiliary_stop_owner_result(succeeded, value):
     auxiliary_stop_acknowledgement_deadline = None
   if validation_error is not None:
     raise ProtocolResponseError(validation_error)
-  if request_id is None:
-    return False
   return True
 
 
@@ -18808,14 +19139,9 @@ def _run_auxiliary_stop_safe(request_id, control_mode):
 
   terminal_type = "completed"
   terminal_value = ""
-  auxiliary_serial_event_queue.put(("started", request_id, "STOP\n"))
+  auxiliary_serial_event_queue.put(("started", request_id, "stop"))
   try:
     if control_mode == SerialActivityRegistry.CONTROL_INJECT:
-      write_serial_control(
-        RUN.get('ser2'),
-        "STOP\n",
-        write_lock=auxiliary_serial_write_lock,
-      )
       acknowledgement_deadline = (
         time.monotonic() + SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS
       )
@@ -18829,7 +19155,7 @@ def _run_auxiliary_stop_safe(request_id, control_mode):
         if remaining <= 0:
           _raise_auxiliary_stop_acknowledgement_timeout()
         if auxiliary_stop_owner_result_event.wait(
-          min(CONTROL_POLL_INTERVAL_SECONDS, remaining)
+          min(JSON_SERIAL_DEFAULT_POLL_INTERVAL_SECONDS, remaining)
         ):
           break
       with auxiliary_stop_state_lock:
@@ -18847,36 +19173,20 @@ def _run_auxiliary_stop_safe(request_id, control_mode):
         auxiliary_stop_owner_result_event.clear()
       if not owner_succeeded:
         raise RuntimeError(terminal_value)
-      if terminal_value in AUXILIARY_WAIT_NATURAL_RESPONSES:
-        remaining = _remaining_auxiliary_stop_acknowledgement_time(
-          acknowledgement_deadline
-        )
-        acquired = auxiliary_serial_lock.acquire(
-          timeout=remaining
-        )
-        if acquired is False:
-          _raise_auxiliary_stop_acknowledgement_timeout()
-        try:
-          terminal_value = _read_auxiliary_inactive_stop_response(
-            acknowledgement_deadline
-          )
-        finally:
-          auxiliary_serial_lock.release()
-      elif terminal_value not in (
-        "Nano Stopped",
-        AUXILIARY_INACTIVE_STOP_RESPONSE,
-      ):
-        raise ProtocolResponseError("unexpected injected auxiliary stop response")
     elif control_mode == SerialActivityRegistry.CONTROL_EXCLUSIVE:
       acquired = auxiliary_serial_lock.acquire()
       if acquired is False:
         raise RuntimeError("auxiliary stop transport acquisition failed")
       try:
-        terminal_value = _exchange_auxiliary_line("STOP\n")
+        _exchange_json_auxiliary_command(
+          "stop",
+          {},
+          SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
+          RUN.get('ser2'),
+        )
       finally:
         auxiliary_serial_lock.release()
-      if terminal_value != AUXILIARY_INACTIVE_STOP_RESPONSE:
-        raise ProtocolResponseError("unexpected inactive auxiliary stop response")
+      terminal_value = "Stopped"
     else:
       raise RuntimeError("auxiliary stop received an invalid control mode")
   except Exception as exc:
@@ -19142,6 +19452,8 @@ def _request_auxiliary_stop(on_reserved=None):
 
 def start_send_serial_thread(
   command,
+  *,
+  exchange,
   live_jog=False,
   completion_callback=None,
   controller_recovery=False,
@@ -19152,6 +19464,15 @@ def start_send_serial_thread(
     raise TypeError("completion_callback must be callable")
   if not isinstance(controller_recovery, bool):
     raise TypeError("controller_recovery must be boolean")
+  if not callable(exchange):
+    raise TypeError("serial exchange must be callable")
+  if (
+    controller_recovery
+    and exchange is not _exchange_controller_correction
+  ):
+    raise TypeError(
+      "controller recovery requires the position-correction exchange"
+    )
   if write_started_event is not None and not all(
     callable(getattr(write_started_event, method, None))
     for method in ("set", "is_set")
@@ -19192,7 +19513,7 @@ def start_send_serial_thread(
     else:
       serial_lock.release()
     raise
-  legacy_serial_result_pending.set()
+  serial_result_pending.set()
   if live_jog:
     live_jog_stop_requested.clear()
     live_serial_result_pending.set()
@@ -19202,6 +19523,7 @@ def start_send_serial_thread(
       target=run_send_serial_safe,
       args=(
         command,
+        exchange,
         live_jog,
         completion_callback,
         activity_lease,
@@ -19212,7 +19534,7 @@ def start_send_serial_thread(
     )
     thread.start()
   except Exception:
-    legacy_serial_result_pending.clear()
+    serial_result_pending.clear()
     if live_jog:
       live_serial_result_pending.clear()
       live_jog_stop_requested.clear()
@@ -19240,6 +19562,13 @@ def _try_dispatch_controller_correction():
       return False
     if serial_lock.locked() or motion_request_registry.active:
       return False
+    binding = _current_main_controller_identity(serial_port)
+    if binding is None or not isinstance(
+      binding.json_client,
+      JsonMainControllerClient,
+    ):
+      logger.error("Controller correction requires JSON ownership")
+      return False
     request_lease = _acquire_motion_request(
       "Controller correction",
       allow_position_recovery=True,
@@ -19255,6 +19584,7 @@ def _try_dispatch_controller_correction():
           controller_position,
         ),
         controller_recovery=True,
+        exchange=_exchange_controller_correction,
       )
     except Exception:
       _finish_motion_request(request_lease)
@@ -19267,6 +19597,8 @@ def _try_dispatch_controller_correction():
 
 
 def _complete_controller_correction(request_lease, controller_position):
+  if isinstance(controller_position, JointMotionExchangeResult):
+    controller_position = controller_position.position
   if controller_position is not None and not isinstance(
     controller_position,
     PositionResponse,
@@ -19298,6 +19630,7 @@ def _request_controller_correction():
 
 def run_send_serial_safe(
   command,
+  exchange,
   live_jog=False,
   completion_callback=None,
   activity_lease=None,
@@ -19316,12 +19649,10 @@ def run_send_serial_safe(
     )
   )
   try:
-    response = _exchange_serial_line(
+    response = exchange(
       command,
-      control_event=live_jog_stop_requested if live_jog else None,
       write_started_event=write_started_event,
-      write_cancellation_event=write_cancellation_boundary,
-      write_boundary_lock=write_cancellation_boundary,
+      write_cancellation_boundary=write_cancellation_boundary,
     )
     serial_event_queue.put(
       (
@@ -19361,27 +19692,68 @@ def _invalidate_joint_motion_state(reason):
     logger.warning("Pending joint target discarded because controller state is unknown")
 
 
-def _apply_legacy_serial_response(response):
-  if not isinstance(response, str):
-    reason = "legacy serial exchange returned a non-text response"
-    _invalidate_joint_motion_state(reason)
-    raise ProtocolResponseError(reason)
-  if response.startswith('E'):
-    ErrorHandler(response)
-    _invalidate_joint_motion_state(f"controller rejected motion: {response}")
+def _apply_serial_motion_response(response, command=None):
+  if isinstance(response, PositionResponse):
+    if position_response_is_physical_estop(response):
+      return response
+    applied_position = displayPosition(response.raw, parsed=response)
+    if not isinstance(applied_position, PositionResponse):
+      raise ProtocolResponseError("JSON position response could not be applied")
+    return applied_position
+  if not isinstance(response, JointMotionExchangeResult):
+    raise ProtocolResponseError("JSON motion exchange returned an invalid result")
+  source_opcode = _motion_command_source_opcode(command)
+  motion_name = {
+    "CP": None,
+    "LC": "Live Cartesian",
+    "LJ": "Live joint",
+    "LT": "Live tool",
+    "MJ": "Cartesian",
+    "ML": "Linear",
+    "MA": "Arc",
+    "MC": "Circle",
+    "MS": "Spline",
+    "MV": "Vision",
+    "RJ": "Joint",
+    "JT": "Tool-frame",
+  }.get(source_opcode)
+  if source_opcode not in (
+    "CP", "LC", "LJ", "LT", "MA", "MC", "MJ", "ML", "MS", "MV", "RJ", "JT",
+  ):
+    raise ProtocolResponseError(
+      "typed JSON motion response has an unsupported source command"
+    )
+  operation_name = (
+    "Controller position correction"
+    if source_opcode == "CP"
+    else f"{motion_name} motion"
+  )
+  if response.confirmed_position_unchanged:
+    message = f"{operation_name} rejected: {response.error}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
     return None
 
-  try:
-    parsed = parse_position_response(response)
-  except ProtocolResponseError:
-    displayPosition(response)
-    return None
-
-  applied_position = displayPosition(response, parsed=parsed)
-  if applied_position is None:
-    return None
-  if parsed.flag:
-    return None
+  position = response.position
+  if position_response_is_physical_estop(position):
+    return position
+  applied_position = displayPosition(response.response, parsed=position)
+  if applied_position is None or not isinstance(
+    applied_position,
+    PositionResponse,
+  ):
+    position_error = (
+      "JSON controller position-correction position could not be applied"
+      if source_opcode == "CP"
+      else f"JSON {motion_name.lower()}-motion position could not be applied"
+    )
+    raise ProtocolResponseError(
+      position_error
+    )
+  if response.error is not None:
+    message = f"{operation_name} failed: {response.error}"
+    logger.error(message)
+    _set_application_status(message, "Alarm.TLabel")
   return applied_position
 
 
@@ -19474,7 +19846,7 @@ def _poll_serial_events():
 
       if event_type == "started":
         cmdSentEntryField.delete(0, 'end')
-        cmdSentEntryField.insert(0, command)
+        cmdSentEntryField.insert(0, _motion_command_display_text(command))
         if live_jog:
           _set_application_status("LIVE JOG IN PROGRESS", "OK.TLabel")
         continue
@@ -19483,6 +19855,7 @@ def _poll_serial_events():
         raise RuntimeError(f"serial worker emitted an unknown event: {event_type!r}")
 
       applied_position = None
+      structured_response = None
       try:
         if event_type == "failed":
           message = f"Serial command failed: {error}"
@@ -19490,7 +19863,9 @@ def _poll_serial_events():
           _set_application_status(message, "Alarm.TLabel")
           _invalidate_joint_motion_state(message)
         else:
-          applied_position = _apply_legacy_serial_response(response)
+          if isinstance(response, JointMotionExchangeResult):
+            structured_response = response
+          applied_position = _apply_serial_motion_response(response, command)
           if applied_position is not None and not isinstance(
             applied_position,
             PositionResponse,
@@ -19504,7 +19879,10 @@ def _poll_serial_events():
               for axis in range(1, 7)
             ]
             setStepMonitorsVR()
-            if not applied_position.speed_violation:
+            if (
+              not applied_position.speed_violation
+              and getattr(structured_response, "error", None) is None
+            ):
               _set_application_status("SYSTEM READY", "OK.TLabel")
       except Exception as exc:
         message = f"Unable to apply serial worker result: {exc}"
@@ -19513,7 +19891,7 @@ def _poll_serial_events():
       finally:
         if live_jog:
           RUN['liveJog'] = False
-        legacy_serial_result_pending.clear()
+        serial_result_pending.clear()
         live_serial_result_pending.clear()
         live_jog_stop_requested.clear()
         try:
@@ -19527,7 +19905,19 @@ def _poll_serial_events():
 
         if completion_callback is not None:
           try:
-            completion_callback(applied_position)
+            callback_result = (
+              structured_response
+              if structured_response is not None
+              and (
+                structured_response.confirmed_position_unchanged
+                or position_response_is_physical_estop(
+                  structured_response.position
+                )
+                or applied_position is structured_response.position
+              )
+              else applied_position
+            )
+            completion_callback(callback_result)
           except Exception:
             logger.exception("Unable to apply a serial completion callback")
         if (
@@ -19547,6 +19937,8 @@ def _poll_serial_events():
         if (
           applied_position is not None
           and not applied_position.speed_violation
+          and getattr(structured_response, "error", None) is None
+          and _motion_command_source_opcode(command) not in ("Z7", "Z8", "Z9")
           and deferred_dispatch is DeferredJointDispatchOutcome.IDLE
           and not joint_motion_dispatcher.active
           and not motion_request_registry.active
@@ -19573,97 +19965,7 @@ def _poll_serial_events():
       _reschedule_event_poll("serial")
 
 
-def _apply_pending_manual_controller_stop_event():
-  global manual_controller_estop_applied_position
-  global manual_controller_estop_applied_request_id
-  global manual_controller_pending_stop_event
-
-  with manual_controller_state_lock:
-    event = manual_controller_pending_stop_event
-  if event is None:
-    return True
-  if not isinstance(event, ManualControllerStopEvent):
-    raise RuntimeError(
-      "manual controller pending E-stop event is invalid"
-    )
-
-  request, _ = _manual_controller_operation()
-  if request.request_id != event.request_id:
-    raise RuntimeError(
-      "manual controller pending E-stop ownership is invalid"
-    )
-  with manual_controller_state_lock:
-    if (
-      manual_controller_active_request is not request
-      or manual_controller_pending_stop_event is not event
-      or manual_controller_estop_applied_request_id is not None
-      or manual_controller_estop_applied_position is not None
-    ):
-      raise RuntimeError(
-        "manual controller pending E-stop ownership changed"
-      )
-
-  try:
-    applied_position = displayPosition(
-      event.position.raw,
-      parsed=event.position,
-    )
-    if applied_position is None:
-      ErrorHandler(event.position.flag)
-    elif (
-      not isinstance(applied_position, PositionResponse)
-      or not position_response_is_physical_estop(applied_position)
-      or applied_position != event.position
-    ):
-      raise RuntimeError(
-        "manual controller E-stop position could not be applied"
-      )
-    _invalidate_joint_motion_state(
-      "manual controller physical E-stop received"
-    )
-    _set_manual_controller_feedback(
-      "PHYSICAL E-STOP RECEIVED; CONTROLLER RESPONSE SETTLING"
-    )
-    _set_manual_controller_status(
-      "PHYSICAL E-STOP RECEIVED",
-      "Alarm.TLabel",
-    )
-    _clear_manual_auxiliary_stop_barrier_if_settled()
-  except Exception:
-    logger.exception(
-      "Unable to apply a retained manual-controller E-stop event"
-    )
-    try:
-      _set_manual_controller_status(
-        "PHYSICAL E-STOP PRESENTATION PENDING",
-        "Alarm.TLabel",
-      )
-    except Exception:
-      logger.exception(
-        "Unable to render the pending manual-controller E-stop status"
-      )
-    return False
-
-  with manual_controller_state_lock:
-    if (
-      manual_controller_active_request is not request
-      or manual_controller_pending_stop_event is not event
-      or manual_controller_estop_applied_request_id is not None
-      or manual_controller_estop_applied_position is not None
-    ):
-      raise RuntimeError(
-        "manual controller E-stop ownership changed during application"
-      )
-    manual_controller_pending_stop_event = None
-    manual_controller_estop_applied_request_id = request.request_id
-    manual_controller_estop_applied_position = event.position
-  return True
-
-
 def _poll_manual_controller_events():
-  global manual_controller_estop_applied_request_id
-  global manual_controller_estop_applied_position
-
   try:
     with manual_controller_cleanup_lock:
       pending_cleanup = manual_controller_cleanup_pending
@@ -19699,9 +20001,6 @@ def _poll_manual_controller_events():
         ):
           _set_manual_controller_status("SYSTEM READY", "OK.TLabel")
 
-    if not _apply_pending_manual_controller_stop_event():
-      return
-
     while True:
       try:
         event = manual_controller_event_queue.get_nowait()
@@ -19715,116 +20014,36 @@ def _poll_manual_controller_events():
         raise RuntimeError(
           "manual controller worker result ownership is invalid"
         )
-      with manual_controller_state_lock:
-        applied_request_id = manual_controller_estop_applied_request_id
-        applied_estop_position = manual_controller_estop_applied_position
-      if (
-        (applied_request_id is None) != (applied_estop_position is None)
-        or (
-          applied_request_id is not None
-          and applied_request_id != request.request_id
-        )
-        or (
-          applied_estop_position is not None
-          and (
-            not isinstance(applied_estop_position, PositionResponse)
-            or not position_response_is_physical_estop(
-              applied_estop_position
-            )
-          )
-        )
-      ):
-        raise RuntimeError(
-          "manual controller applied E-stop ownership is invalid"
-        )
-      physical_estop_received = applied_request_id == request.request_id
       command_is_write = controller_modbus_command_is_write(
         request.command
       )
+      if result.unpositioned_stop_observed and (
+        RUN.get('estopActive') is not True
+        or RUN.get('mainControllerStopPositionUnavailable') is not True
+      ):
+        raise RuntimeError("manual controller unpositioned-stop evidence is invalid")
+      physical_estop_received = result.unpositioned_stop_observed
       terminal_classification = None
 
-      if result.outcome == "estop":
-        if (
-          not physical_estop_received
-          or result.position != applied_estop_position
-        ):
-          raise RuntimeError(
-            "manual controller E-stop result was not independently applied"
+      if result.outcome in ("completed", "rejected"):
+        terminal_classification = (
+          classify_controller_modbus_terminal_response(
+            request.command,
+            result.value,
           )
-        if result.frame_order == "estop-terminal":
-          frames = (result.position.raw, result.value)
-        elif result.frame_order == "terminal-estop":
-          frames = (result.value, result.position.raw)
-        elif result.frame_order == "estop-admission":
-          frames = (
-            result.position.raw,
-            result.admission_position.raw,
-          )
-        else:
-          frames = (result.position.raw,)
-        parsed_exchange = parse_controller_modbus_exchange_frames(
-          request.command,
-          frames,
         )
-        if (
-          (
-            result.frame_order in (
-              "estop-terminal",
-              "terminal-estop",
-            )
-            and parsed_exchange.terminal_response != result.value
-          )
-          or (
-            result.frame_order in (
-              "estop-only",
-              "admission-estop",
-            )
-            and parsed_exchange.terminal_response is not None
-          )
-          or parsed_exchange.estop_position != result.position
-          or (
-            parsed_exchange.admission_position
-            != result.admission_position
-          )
-          or parsed_exchange.frame_order != result.frame_order
-        ):
+        if terminal_classification != result.outcome:
           raise RuntimeError(
-            "manual controller E-stop result exchange is invalid"
+            "manual controller terminal classification is invalid"
           )
-        if parsed_exchange.terminal_response is not None:
-          terminal_classification = (
-            classify_controller_modbus_terminal_response(
-              request.command,
-              parsed_exchange.terminal_response,
-              paired_with_estop=(
-                parsed_exchange.estop_position is not None
-              ),
-            )
-          )
-      elif result.outcome in ("completed", "rejected", "indeterminate"):
-        try:
-          terminal_classification = (
-            classify_controller_modbus_terminal_response(
-              request.command,
-              result.value,
-            )
-          )
-        except ProtocolResponseError:
-          if not (
-            result.outcome == "indeterminate"
-            and command_is_write
-            and result.serial_write_started
-            and serial_transport_quarantined(request.serial_port)
-          ):
-            raise
-        else:
-          if terminal_classification != result.outcome:
-            raise RuntimeError(
-              "manual controller terminal classification is invalid"
-            )
-        if result.outcome == "indeterminate" and not command_is_write:
+      elif result.outcome == "indeterminate":
+        if not command_is_write:
           raise RuntimeError(
             "manual controller read result cannot be indeterminate"
+          )
+        if not result.serial_write_started:
+          raise RuntimeError(
+            "manual controller write uncertainty lacks write admission"
           )
       else:
         if result.serial_write_started and command_is_write:
@@ -19851,14 +20070,6 @@ def _poll_manual_controller_events():
             feedback = (
               "Physical E-stop received before command transmission; "
               "command not sent"
-            )
-          elif result.frame_order in (
-            "admission-estop",
-            "estop-admission",
-          ):
-            feedback = (
-              "Physical E-stop blocked command admission; command not "
-              "executed; reconnect before further commands"
             )
           elif (
             command_is_write
@@ -20223,11 +20434,6 @@ def _poll_manual_auxiliary_events():
         manual_auxiliary_active_request = None
 
       if result.outcome == "completed":
-        expected_response = request.expected_response.decode("ascii")
-        if result.value != expected_response:
-          raise RuntimeError(
-            "manual auxiliary worker result response is invalid"
-          )
         cmdRecEntryField.delete(0, 'end')
         cmdRecEntryField.insert(0, result.value)
         CAL[request.calibration_key] = request.calibration_value
@@ -20364,11 +20570,6 @@ def _poll_xbox_auxiliary_events():
       if not isinstance(current_state, bool) or target_state is current_state:
         raise RuntimeError("Xbox auxiliary result conflicts with confirmed state")
       value = value.strip()
-      if event_type == "completed":
-        expected_response = XBOX_AUXILIARY_TOGGLE_RESPONSES[state_name]
-        if value != expected_response.decode("ascii"):
-          raise RuntimeError("Xbox auxiliary acknowledgement contract changed")
-
       RUN[pending_name] = None
       if event_type == "completed":
         RUN[state_name] = target_state
@@ -20596,36 +20797,18 @@ def _start_joint_motion_trace(command, binding):
 def _finish_joint_motion_trace(capture, response):
   if capture is None:
     return False
-  if not isinstance(response, ControllerLineExchangeResponse):
-    return capture.fail("controller line exchange returned an invalid result")
-  admission_position = response.admission_position
-  if (
-    admission_position is None
-    and response.estop_position is not None
-    and response.estop_position.flag == CONTROLLER_ESTOP_ADMISSION_FLAG
-  ):
-    admission_position = response.estop_position
-  if admission_position is not None:
-    return capture.fail(
-      "joint motion rejected by physical E-stop admission",
-      admission_position.joints,
-    )
-  if response.estop_position is not None:
+  if not isinstance(response, JointMotionExchangeResult):
+    return capture.fail("JSON joint motion returned an invalid result")
+  position = response.position
+  if response.confirmed_position_unchanged:
+    return capture.fail(response.error)
+  if position_response_is_physical_estop(position):
     return capture.stop(
-      response.estop_position.joints,
-      f"physical E-stop response {response.estop_position.flag}",
-    )
-  try:
-    position = parse_position_response(response.authoritative_response)
-  except Exception as exc:
-    return capture.fail(
-      f"controller terminal response was invalid: {exc}"
-    )
-  if position.flag:
-    return capture.fail(
-      f"controller reported motion fault: {position.flag}",
       position.joints,
+      response.error or "physical E-stop response",
     )
+  if response.error is not None:
+    return capture.fail(response.error, position.joints)
   return capture.complete(position.joints)
 
 
@@ -20642,91 +20825,2313 @@ def _submit_joint_motion_trace(capture):
     return False
 
 
+def _canonical_json_message_text(message):
+  frame = encode_message(message)
+  if (
+    type(frame) is not bytes
+    or not frame.endswith(b"\n")
+    or frame.endswith(b"\r\n")
+  ):
+    raise ProtocolResponseError(
+      "canonical JSON message encoding returned an invalid frame"
+    )
+  try:
+    return frame[:-1].decode("ascii")
+  except UnicodeDecodeError as exc:
+    raise ProtocolResponseError(
+      "canonical JSON message encoding returned non-ASCII data"
+    ) from exc
+
+
+def _json_fixed_point_text(values, field_name):
+  if type(values) is not tuple:
+    raise ProtocolResponseError(f"{field_name} must be an immutable tuple")
+  encoded = []
+  for value in values:
+    if isinstance(value, bool) or not isinstance(value, int):
+      raise ProtocolResponseError(f"{field_name} contains an invalid value")
+    negative = value < 0
+    magnitude = -value if negative else value
+    whole, fraction = divmod(magnitude, 1000)
+    text = str(whole)
+    if fraction:
+      text += "." + f"{fraction:03d}".rstrip("0")
+    if negative:
+      text = "-" + text
+    encoded.append(text)
+  return tuple(encoded)
+
+
+def _json_joint_position_response(
+  response,
+  position,
+  *,
+  speed_violation=False,
+  debug="",
+  flag="",
+):
+  if type(position) is not JsonMainPositionResult:
+    raise ProtocolResponseError("JSON joint position result is invalid")
+  if type(speed_violation) is not bool:
+    raise ProtocolResponseError("JSON speed-limited state is invalid")
+  if (
+    not isinstance(debug, str)
+    or not debug.isascii()
+    or "\r" in debug
+    or "\n" in debug
+  ):
+    raise ProtocolResponseError("JSON controller debug value is invalid")
+  if (
+    not isinstance(flag, str)
+    or not flag.isascii()
+    or "\r" in flag
+    or "\n" in flag
+  ):
+    raise ProtocolResponseError("JSON controller position flag is invalid")
+  joint_text = _json_fixed_point_text(
+    position.robot_joints_millidegrees,
+    "JSON robot joint positions",
+  )
+  external_text = _json_fixed_point_text(
+    position.external_axes_milliunits,
+    "JSON external-axis positions",
+  )
+  cartesian_text = (
+    _json_fixed_point_text(
+      position.cartesian_micrometers,
+      "JSON Cartesian translation",
+    )
+    + _json_fixed_point_text(
+      position.orientation_millidegrees,
+      "JSON Cartesian orientation",
+    )
+  )
+  return PositionResponse(
+    raw=response,
+    joint_text=joint_text,
+    joints=position.robot_joints_degrees,
+    cartesian_text=cartesian_text,
+    cartesian=(
+      position.cartesian_translation_millimeters
+      + position.orientation_degrees
+    ),
+    external_text=external_text,
+    external=position.external_axes,
+    speed_violation=speed_violation,
+    debug=debug,
+    flag=flag,
+  )
+
+
+def _json_joint_motion_target_parameters(
+  target,
+  telemetry_enabled,
+):
+  if type(telemetry_enabled) is not bool:
+    raise MotionInputError("JSON joint telemetry selection is invalid")
+  if type(target) is not JointMotionCommand:
+    raise MotionInputError("JSON joint target is invalid")
+  timing = target.timing
+  if type(timing) is not CommandTiming or not isinstance(timing.mode, str):
+    raise MotionInputError("JSON joint motion timing is invalid")
+  if (
+    type(target.robot_joints_degrees) is not tuple
+    or type(target.external_axes_units) is not tuple
+    or type(target.loop_modes) is not tuple
+    or len(target.robot_joints_degrees) != 6
+    or len(target.external_axes_units) != 3
+    or len(target.loop_modes) != 6
+  ):
+    raise MotionInputError("JSON joint target axis count is invalid")
+  speed_mode = {
+    "p": "percent",
+    "s": "seconds",
+    "m": "millimeters_per_second",
+  }.get(timing.mode)
+  wrist_configuration = {
+    "A": "automatic",
+    "N": "near",
+    "F": "far",
+  }.get(
+    target.wrist_configuration
+    if isinstance(target.wrist_configuration, str)
+    else None
+  )
+  if speed_mode is None or wrist_configuration is None:
+    raise MotionInputError("JSON joint motion profile is unsupported")
+  if any(type(value) is not bool for value in target.loop_modes):
+    raise MotionInputError("JSON joint loop modes are invalid")
+  return {
+    "robot_joints_degrees": target.robot_joints_degrees,
+    "external_axes_units": target.external_axes_units,
+    "speed_mode": speed_mode,
+    "speed_value": timing.speed,
+    "acceleration_percent": timing.acceleration,
+    "deceleration_percent": timing.deceleration,
+    "ramp_percent": timing.ramp,
+    "wrist_configuration": wrist_configuration,
+    "loop_modes": target.loop_modes,
+    "telemetry_enabled": telemetry_enabled,
+  }
+
+
+def _json_joint_motion_parameters(command, telemetry_enabled):
+  snapshot = joint_motion_dispatcher.current_exchange_snapshot(command)
+  if snapshot is None:
+    raise MotionQueueFault(
+      "JSON joint motion requires an active exchange snapshot"
+    )
+  profile = snapshot.profile
+  if type(profile) is not MotionProfile:
+    raise MotionInputError("JSON joint dispatcher profile is invalid")
+  timing_mode = {
+    "Sp": "p",
+    "Ss": "s",
+  }.get(profile.speed_prefix)
+  if timing_mode is None:
+    raise MotionInputError("JSON joint dispatcher speed mode is unsupported")
+  return _json_joint_motion_target_parameters(
+    JointMotionCommand(
+      tuple(snapshot.target_positions[:6]),
+      tuple(snapshot.target_positions[6:]),
+      CommandTiming(
+        timing_mode,
+        profile.speed,
+        profile.acceleration,
+        profile.deceleration,
+        profile.ramp,
+      ),
+      profile.wrist_config,
+      tuple(value == "1" for value in profile.loop_mode),
+    ),
+    telemetry_enabled,
+  )
+
+
+def _json_cartesian_motion_parameters(command, telemetry_enabled=False):
+  if type(telemetry_enabled) is not bool:
+    raise MotionInputError("JSON Cartesian telemetry selection is invalid")
+  target = parse_cartesian_motion_command(command)
+  if type(target) is not CartesianMotionCommand:
+    raise MotionInputError("Cartesian command parser returned an invalid target")
+  speed_mode = {
+    "p": "percent",
+    "s": "seconds",
+    "m": "millimeters_per_second",
+  }.get(target.timing.mode)
+  wrist_configuration = {
+    "A": "automatic",
+    "N": "near",
+    "F": "far",
+  }.get(target.wrist_configuration)
+  if speed_mode is None or wrist_configuration is None:
+    raise MotionInputError("JSON Cartesian motion profile is unsupported")
+  return {
+    "translation_millimeters": target.translation_millimeters,
+    "orientation_degrees": target.orientation_degrees,
+    "external_axes_units": target.external_axes_units,
+    "speed_mode": speed_mode,
+    "speed_value": target.timing.speed,
+    "acceleration_percent": target.timing.acceleration,
+    "deceleration_percent": target.timing.deceleration,
+    "ramp_percent": target.timing.ramp,
+    "wrist_configuration": wrist_configuration,
+    "loop_modes": target.loop_modes,
+    "telemetry_enabled": telemetry_enabled,
+  }
+
+
+def _json_tool_jog_parameters(command):
+  target = parse_tool_jog_command(command)
+  if type(target) is not ToolJogCommand:
+    raise MotionInputError("tool-frame command parser returned an invalid target")
+  speed_mode = {
+    "p": "percent",
+    "s": "seconds",
+  }.get(target.timing.mode)
+  wrist_configuration = {
+    "A": "automatic",
+    "N": "near",
+    "F": "far",
+  }.get(target.wrist_configuration)
+  if speed_mode is None or wrist_configuration is None:
+    raise MotionInputError("JSON tool-frame jog profile is unsupported")
+  return {
+    "axis": target.axis,
+    "direction": target.direction,
+    "distance": target.distance,
+    "speed_mode": speed_mode,
+    "speed_value": target.timing.speed,
+    "acceleration_percent": target.timing.acceleration,
+    "deceleration_percent": target.timing.deceleration,
+    "ramp_percent": target.timing.ramp,
+    "wrist_configuration": wrist_configuration,
+    "loop_modes": target.loop_modes,
+  }
+
+
+def _json_motion_write_admission(
+  write_started_event,
+  write_cancellation_boundary,
+):
+  if write_started_event is None and write_cancellation_boundary is None:
+    return None
+
+  def admit():
+    if write_cancellation_boundary is None:
+      if write_started_event is not None:
+        write_started_event.set()
+      return True
+    with write_cancellation_boundary.write_reservation():
+      if write_cancellation_boundary.is_set():
+        return False
+      # Admission is the uncertainty boundary: a later write failure can
+      # represent a partial controller frame and therefore requires recovery.
+      if write_started_event is not None:
+        write_started_event.set()
+      return True
+
+  return admit
+
+
+def _json_joint_motion_failure_detail(terminal, motion_name="joint"):
+  if (
+    not isinstance(motion_name, str)
+    or not motion_name
+    or motion_name != motion_name.strip()
+  ):
+    raise ProtocolResponseError("JSON motion name is invalid")
+  failure = terminal.failure
+  if failure is None:
+    return (
+      f"controller returned a non-completed JSON {motion_name}-motion response "
+      f"without an error: {terminal.response.status}"
+    )
+  message = " ".join(failure.message.split())
+  return (
+    f"controller {terminal.response.status} JSON {motion_name} motion: "
+    f"{failure.code}: {message}"
+  )
+
+
+def _json_joint_motion_terminal_result(
+  terminal,
+  stop_context,
+  stop_already_published,
+  motion_name="joint",
+  positionless_rejection_codes=(
+    "joint_limit_violation",
+    "position_not_representable",
+  ),
+):
+  raw = _canonical_json_message_text(terminal.response)
+  if terminal.response.status == "completed":
+    result = terminal.parsed_result
+    position = _json_joint_position_response(
+      raw,
+      result.position,
+      speed_violation=result.speed_limited,
+      debug=result.controller_debug,
+      flag=(
+        CONTROLLER_ESTOP_EVENT_FLAG
+        if stop_already_published
+        else ""
+      ),
+    )
+    if stop_already_published:
+      _publish_main_controller_stop_position_upgrade(
+        stop_context,
+        position,
+      )
+    return JointMotionExchangeResult(
+      response=raw,
+      position=position,
+      error=(
+        "controller reported a JSON emergency stop alongside completed motion"
+        if stop_already_published
+        else None
+      ),
+    )
+
+  failure = terminal.failure
+  detail = _json_joint_motion_failure_detail(terminal, motion_name)
+  position_result = None
+  if failure is not None and "position" in failure.details:
+    position_result = parse_main_motion_position_result(
+      failure.details["position"]
+    )
+  if position_result is None:
+    if (
+      not stop_already_published
+      and failure is not None
+      and failure.code in positionless_rejection_codes
+    ):
+      return JointMotionExchangeResult(
+        response=raw,
+        position=None,
+        error=detail,
+        confirmed_position_unchanged=True,
+      )
+    raise ProtocolResponseError(detail)
+
+  flag = ""
+  if stop_already_published or failure.code == "emergency_stop":
+    flag = CONTROLLER_ESTOP_EVENT_FLAG
+  elif failure.code == "encoder_collision":
+    flag = "EC" + "".join(
+      "1" if active else "0"
+      for active in failure.details["axes"]
+    )
+  position = _json_joint_position_response(
+    raw,
+    position_result,
+    flag=flag,
+  )
+  if stop_already_published:
+    _publish_main_controller_stop_position_upgrade(
+      stop_context,
+      position,
+    )
+  elif failure.code == "emergency_stop":
+    _publish_main_controller_stop(stop_context, position)
+  return JointMotionExchangeResult(
+    response=raw,
+    position=position,
+    error=detail,
+  )
+
+
+def _json_controller_correction_terminal_result(
+  terminal,
+  stop_context,
+  stop_already_published,
+):
+  raw = _canonical_json_message_text(terminal.response)
+  if terminal.response.status == "completed":
+    result = terminal.parsed_result
+    if not isinstance(result, JsonMainPositionResult):
+      raise ProtocolResponseError(
+        "JSON position-correction result has an invalid type"
+      )
+    position_flag = result.motion_fault
+    if stop_already_published and not position_flag:
+      position_flag = CONTROLLER_ESTOP_EVENT_FLAG
+    position = _json_joint_position_response(
+      raw,
+      result,
+      speed_violation=result.speed_limited,
+      debug=result.controller_debug,
+      flag=position_flag,
+    )
+    reported_stop = (
+      stop_already_published
+      or position_response_is_physical_estop(position)
+    )
+    if stop_already_published:
+      stop_position = position
+      if not position_response_is_physical_estop(stop_position):
+        stop_position = _json_joint_position_response(
+          raw,
+          result,
+          speed_violation=result.speed_limited,
+          debug=result.controller_debug,
+          flag=CONTROLLER_ESTOP_EVENT_FLAG,
+        )
+      _publish_main_controller_stop_position_upgrade(
+        stop_context,
+        stop_position,
+      )
+    return JointMotionExchangeResult(
+      response=raw,
+      position=position,
+      error=(
+        "controller reported a JSON emergency stop during position correction"
+        if reported_stop
+        else None
+      ),
+    )
+
+  failure = terminal.failure
+  if failure is None:
+    raise ProtocolResponseError(
+      "controller returned a non-completed JSON position correction "
+      f"without an error: {terminal.response.status}"
+    )
+  detail = (
+    f"controller {terminal.response.status} JSON position correction: "
+    f"{failure.code}: {' '.join(failure.message.split())}"
+  )
+  if (
+    terminal.response.status != "failed"
+    or failure.code != "encoder_state_unavailable"
+  ):
+    raise ProtocolResponseError(detail)
+  position_result = parse_main_motion_position_result(
+    failure.details["position"]
+  )
+  axes = failure.details["axes"]
+  flag = "EC" + "".join("1" if active else "0" for active in axes)
+  position = _json_joint_position_response(raw, position_result, flag=flag)
+  if stop_already_published:
+    stop_position = _json_joint_position_response(
+      raw,
+      position_result,
+      flag=CONTROLLER_ESTOP_EVENT_FLAG,
+    )
+    _publish_main_controller_stop_position_upgrade(
+      stop_context,
+      stop_position,
+    )
+  return JointMotionExchangeResult(
+    response=raw,
+    position=position,
+    error=detail,
+  )
+
+
+def _validate_json_joint_motion_event(delivery, motion_name="joint"):
+  if type(delivery) is not JsonEventDelivery:
+    raise ProtocolResponseError(
+      f"JSON {motion_name}-motion event delivery is invalid"
+    )
+  event = delivery.event
+  if (
+    type(event) is not Event
+    or event.event != "emergency_stop"
+    or len(event.data) != 1
+    or frozenset(event.data) != frozenset(("asserted",))
+    or event.data.get("asserted") is not True
+  ):
+    raise ProtocolResponseError(
+      f"unexpected JSON {motion_name}-motion event: {event.event}"
+    )
+  return True
+
+
+def _json_live_jog_contract(command):
+  command = _canonicalize_main_serial_command(command)
+  opcode = command[:2]
+  command_name, motion_name = {
+    "LC": ("live_cart_jog", "live Cartesian"),
+    "LJ": ("live_joint_jog", "live joint"),
+    "LT": ("live_tool_jog", "live tool"),
+  }.get(opcode, (None, None))
+  if command_name is None:
+    raise MotionInputError("JSON live jog requires an LC, LJ, or LT command")
+  timing = parse_command_timing(command)
+  vector_match = re.match(r"^(?:LC|LJ|LT)V([0-9]+)S", command)
+  loop_match = re.search(r"Lm([01]{6})\n\Z", command)
+  if timing is None or timing.mode != "p" or vector_match is None:
+    raise MotionInputError("JSON live-jog command profile is invalid")
+  if loop_match is None:
+    raise MotionInputError("JSON live-jog loop modes are invalid")
+  vector = int(vector_match.group(1))
+  axis_group, direction_bit = divmod(vector, 10)
+  if opcode == "LJ":
+    axis = axis_group
+  else:
+    axis = {
+      1: "x",
+      2: "y",
+      3: "z",
+      4: "rz",
+      5: "ry",
+      6: "rx",
+    }.get(axis_group)
+  if axis is None:
+    raise MotionInputError("JSON live-jog axis is invalid")
+  # LT bit 0 creates a positive frame offset whose IK result is negative TCP travel.
+  direction = "positive" if direction_bit == 1 else "negative"
+  wrist_configuration = {
+    "A": "automatic",
+    "N": "near",
+    "F": "far",
+  }.get(parse_motion_wrist_config(command))
+  if wrist_configuration is None:
+    raise MotionInputError("JSON live-jog wrist configuration is invalid")
+  return command_name, motion_name, {
+    "axis": axis,
+    "direction": direction,
+    "speed_mode": "percent",
+    "speed_value": timing.speed,
+    "acceleration_percent": timing.acceleration,
+    "deceleration_percent": timing.deceleration,
+    "ramp_percent": timing.ramp,
+    "wrist_configuration": wrist_configuration,
+    "loop_modes": tuple(value == "1" for value in loop_match.group(1)),
+    "telemetry_enabled": False,
+    "lease_milliseconds": JSON_LIVE_MOTION_LEASE_MAXIMUM_MILLISECONDS,
+  }
+
+
+def _publish_json_live_jog_stop(stop_context, command_name, source):
+  return _publish_main_controller_unpositioned_stop(
+    stop_context,
+    JsonMainControllerPhysicalStop(command_name, source),
+  )
+
+
+def _exchange_json_live_jog(
+  command,
+  binding,
+  stop_context,
+  write_started_event,
+):
+  command_name, motion_name, parameters = _json_live_jog_contract(command)
+  client = binding.json_client
+  if not isinstance(client, JsonMainControllerClient):
+    raise ProtocolResponseError("persistent JSON live jog lacks a valid client")
+  request = getattr(client, f"request_{command_name}")
+  response_timeout = JSON_LIVE_MOTION_RESPONSE_TIMEOUT_SECONDS
+  motion_ticket = control_ticket = settlement_deadline = next_renewal = None
+  live_write_admitted_at = None
+  accepted = settling = stop_published = False
+  terminal = None
+
+  def admit_live_write():
+    nonlocal live_write_admitted_at
+    if live_jog_stop_requested.is_set():
+      raise SerialActivityRejected("live jog stopped before transmission")
+    live_write_admitted_at = time.monotonic()
+    if write_started_event is not None:
+      write_started_event.set()
+    return True
+
+  def live_renewal_deadline():
+    if live_write_admitted_at is None:
+      raise ProtocolResponseError("JSON live-jog write admission time is missing")
+    return live_write_admitted_at + JSON_LIVE_MOTION_RENEWAL_INTERVAL_SECONDS
+
+  try:
+    try:
+      motion_ticket = request(
+        **parameters,
+        timeout=response_timeout,
+        write_admission=admit_live_write,
+      )
+    except SerialActivityRejected as exc:
+      detail = str(exc)
+      return JointMotionExchangeResult(
+        detail, None, detail, confirmed_position_unchanged=True
+      )
+    while terminal is None:
+      delivery = client.pop_delivery()
+      if delivery is None:
+        if client.poll():
+          continue
+        if not accepted or control_ticket is not None:
+          continue
+        if settling:
+          if time.monotonic() >= settlement_deadline:
+            raise ProtocolResponseError(
+              f"JSON {motion_name} jog terminal settlement timed out"
+            )
+          continue
+        if live_jog_stop_requested.is_set():
+          control_ticket = client.request_stop_live_motion(
+            motion_ticket,
+            timeout=response_timeout,
+          )
+          settling = True
+          continue
+        if time.monotonic() >= next_renewal:
+          try:
+            control_ticket = client.request_renew_live_motion(
+              motion_ticket,
+              timeout=response_timeout,
+              write_admission=admit_live_write,
+            )
+          except SerialActivityRejected:
+            control_ticket = client.request_stop_live_motion(
+              motion_ticket,
+              timeout=response_timeout,
+            )
+            settling = True
+        continue
+
+      if type(delivery) is JsonTelemetryDelivery:
+        raise ProtocolResponseError(
+          f"JSON {motion_name} jog received unsolicited telemetry"
+        )
+      if type(delivery) is JsonEventDelivery:
+        _validate_json_joint_motion_event(delivery, f"{motion_name} jog")
+        if not stop_published:
+          _publish_json_live_jog_stop(
+            stop_context,
+            command_name,
+            "emergency_stop_event",
+          )
+          stop_published = True
+        continue
+      if type(delivery) is not JsonResponseDelivery:
+        raise ProtocolResponseError(
+          f"JSON {motion_name} jog received an unknown delivery type"
+        )
+
+      if delivery.ticket is motion_ticket:
+        if control_ticket is not None:
+          raise ProtocolResponseError(
+            f"JSON {motion_name} jog terminal preceded control settlement"
+          )
+        if delivery.response.status == "accepted":
+          if accepted:
+            raise ProtocolResponseError(
+              f"JSON {motion_name} jog received duplicate acceptance"
+            )
+          accepted = True
+          next_renewal = live_renewal_deadline()
+          continue
+        failure = delivery.response.error
+        if (
+          failure is not None
+          and failure.code == "emergency_stop_active"
+          and not stop_published
+        ):
+          _publish_json_live_jog_stop(
+            stop_context,
+            command_name,
+            "emergency_stop_active",
+          )
+          stop_published = True
+        terminal = client.take_terminal(motion_ticket)
+        client.acknowledge_terminal(motion_ticket)
+        if terminal.response is not delivery.response:
+          raise ProtocolResponseError(
+            f"JSON {motion_name} jog terminal ownership changed"
+          )
+        continue
+
+      if delivery.ticket is not control_ticket:
+        raise ProtocolResponseError(
+          f"JSON {motion_name} jog received a response for another request"
+        )
+      control_command = control_ticket.command
+      control_terminal = client.take_terminal(control_ticket)
+      client.acknowledge_terminal(control_ticket)
+      control_ticket = None
+      if control_terminal.response is not delivery.response:
+        raise ProtocolResponseError(
+          f"JSON {motion_name} jog control ownership changed"
+        )
+      if control_terminal.response.status == "completed":
+        if control_command == "renew_live_motion":
+          next_renewal = live_renewal_deadline()
+        else:
+          settlement_deadline = time.monotonic() + response_timeout
+        continue
+      failure = control_terminal.failure
+      if failure is not None and failure.code == "emergency_stop_active":
+        if not stop_published:
+          _publish_json_live_jog_stop(
+            stop_context,
+            command_name,
+            "emergency_stop_active",
+          )
+          stop_published = True
+        settling = True
+        settlement_deadline = time.monotonic() + response_timeout
+        continue
+      if (
+        failure is not None
+        and (
+          failure.code == "no_live_motion"
+          or (
+            control_command == "renew_live_motion"
+            and failure.code == "control_lease_expired"
+          )
+        )
+      ):
+        settling = True
+        settlement_deadline = time.monotonic() + response_timeout
+        continue
+      raise ProtocolResponseError(
+        _json_joint_motion_failure_detail(
+          control_terminal,
+          f"{motion_name} jog {control_command}",
+        )
+      )
+
+    while True:
+      delivery = client.pop_delivery()
+      if delivery is None:
+        polled = client.poll()
+        if not polled and not client.has_unread_input:
+          break
+        continue
+      if type(delivery) is JsonEventDelivery:
+        _validate_json_joint_motion_event(delivery, f"{motion_name} jog")
+        if not stop_published:
+          _publish_json_live_jog_stop(
+            stop_context,
+            command_name,
+            "emergency_stop_event",
+          )
+          stop_published = True
+        continue
+      raise ProtocolResponseError(
+        f"JSON {motion_name} jog received post-terminal non-event data"
+      )
+    if client.release_reader() is not True:
+      raise ProtocolResponseError(
+        f"JSON {motion_name} jog reader ownership was not released"
+      )
+
+    result = _json_joint_motion_terminal_result(
+      terminal,
+      stop_context,
+      stop_published,
+      motion_name=f"{motion_name} jog",
+      positionless_rejection_codes=(),
+    )
+  except BaseException:
+    cleanup_required = motion_ticket is not None or client.quarantined
+    if motion_ticket is None:
+      try:
+        motion_ticket = client.pending_motion_ticket
+      except BaseException:
+        cleanup_required = True
+      else:
+        cleanup_required = motion_ticket is not None or cleanup_required
+    if cleanup_required:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON live-jog failure cleanup",
+      )
+    raise
+
+  if position_response_is_physical_estop(result.position):
+    try:
+      quarantine_serial_transport(
+        client.serial_port,
+        "JSON live-jog physical E-stop requires reconnection",
+      )
+    finally:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON live-jog physical-stop quarantine",
+      )
+  return result
+
+
+def _exchange_live_jog(
+  command,
+  *,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  if write_cancellation_boundary is not None:
+    raise MotionInputError("live jog does not accept a write-cancellation boundary")
+  serial_port = RUN.get('ser')
+  try:
+    command = _canonicalize_main_serial_command(command)
+    binding = _current_main_controller_identity(serial_port)
+    if binding is None or not isinstance(
+      binding.json_client,
+      JsonMainControllerClient,
+    ):
+      raise ProtocolResponseError("JSON live jog lost controller ownership")
+    return _exchange_json_live_jog(
+      command,
+      binding,
+      _capture_main_controller_stop_context(serial_port),
+      write_started_event,
+    )
+  finally:
+    if (
+      RUN.get('ser') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      _require_main_controller_identity_cleanup(
+        serial_port,
+        "live-jog controller exchange cleanup",
+      )
+
+
+def _format_main_controller_diagnostic(command_name, result):
+  if command_name == "set_encoders":
+    return "Done"
+  if command_name == "test_limit_switches":
+    values = tuple(int(value) for value in result)
+  elif command_name == "read_encoders":
+    values = result
+  else:
+    raise MotionInputError("controller diagnostic command is invalid")
+  return "   ".join(
+    f"J{axis} = {value}"
+    for axis, value in enumerate(values, start=1)
+  )
+
+
+def _json_controller_diagnostic_failure_detail(terminal):
+  failure = terminal.failure
+  if failure is None:
+    return (
+      "controller returned a non-completed JSON diagnostic response "
+      f"without an error: {terminal.response.status}"
+    )
+  return (
+    f"controller {terminal.response.status} JSON diagnostic: "
+    f"{failure.code}: {' '.join(failure.message.split())}"
+  )
+
+
+def _exchange_json_controller_diagnostic(
+  command_name,
+  binding,
+  response_timeout,
+  write_started_event,
+  write_cancellation_boundary,
+):
+  client = binding.json_client
+  if not isinstance(client, JsonMainControllerClient):
+    raise ProtocolResponseError(
+      "persistent JSON diagnostic lacks a valid client"
+    )
+  request = {
+    "read_encoders": client.request_read_encoders,
+    "set_encoders": client.request_set_encoders,
+    "test_limit_switches": client.request_test_limit_switches,
+  }.get(command_name)
+  if request is None:
+    raise MotionInputError("controller diagnostic command is invalid")
+  ticket = None
+  try:
+    ticket = request(
+      timeout=response_timeout,
+      write_admission=_json_motion_write_admission(
+        write_started_event,
+        write_cancellation_boundary,
+      ),
+    )
+    terminal, stop_published = _await_json_joint_motion_terminal(
+      client,
+      ticket,
+      None,
+      _capture_main_controller_stop_context(client.serial_port),
+      False,
+      command_name=command_name,
+      motion_name="controller diagnostic",
+    )
+  except BaseException:
+    if (
+      ticket is not None
+      or client.quarantined
+      or (
+        write_started_event is not None
+        and write_started_event.is_set()
+      )
+    ):
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON controller diagnostic failure cleanup",
+      )
+    raise
+  if stop_published:
+    try:
+      quarantine_serial_transport(
+        client.serial_port,
+        "JSON controller diagnostic physical E-stop requires reconnection",
+      )
+    finally:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON controller diagnostic physical-stop cleanup",
+      )
+    raise ProtocolResponseError(
+      "physical E-stop interrupted the JSON controller diagnostic"
+    )
+  if terminal.response.status != "completed":
+    raise ProtocolResponseError(
+      _json_controller_diagnostic_failure_detail(terminal)
+    )
+  return _format_main_controller_diagnostic(
+    command_name,
+    terminal.parsed_result,
+  )
+
+
+def _exchange_main_controller_diagnostic(
+  command_name,
+  *,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  if command_name not in {
+    "read_encoders",
+    "set_encoders",
+    "test_limit_switches",
+  }:
+    raise MotionInputError("controller diagnostic command is invalid")
+  serial_port = RUN.get('ser')
+  binding = _current_main_controller_identity(serial_port)
+  if binding is None or not isinstance(
+    binding.json_client,
+    JsonMainControllerClient,
+  ):
+    raise ProtocolResponseError(
+      "JSON controller diagnostic lost controller ownership"
+    )
+  return _exchange_json_controller_diagnostic(
+    command_name,
+    binding,
+    SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+    write_started_event,
+    write_cancellation_boundary,
+  )
+
+
+def _await_json_joint_motion_terminal(
+  client,
+  ticket,
+  trace_capture,
+  stop_context,
+  telemetry_enabled,
+  command_name="move_joints",
+  motion_name="joint",
+  stop_publication_callback=None,
+  retain_failed_modbus_terminal=False,
+):
+  if type(telemetry_enabled) is not bool:
+    raise MotionInputError(
+      f"JSON {motion_name}-motion telemetry selection is invalid"
+    )
+  if stop_publication_callback is not None and not callable(
+    stop_publication_callback
+  ):
+    raise MotionInputError(
+      f"JSON {motion_name}-motion stop callback is invalid"
+    )
+  if type(retain_failed_modbus_terminal) is not bool:
+    raise MotionInputError(
+      f"JSON {motion_name}-motion terminal-retention selection is invalid"
+    )
+  terminal = None
+  stop_published = False
+  while terminal is None:
+    delivery = client.pop_delivery()
+    if delivery is None:
+      if not client.poll():
+        time.sleep(JSON_SERIAL_DEFAULT_POLL_INTERVAL_SECONDS)
+      continue
+    if type(delivery) is JsonTelemetryDelivery:
+      if not telemetry_enabled:
+        raise ProtocolResponseError(
+          f"JSON {motion_name} motion received unsolicited telemetry"
+        )
+      sample = parse_main_joint_position_telemetry(delivery.telemetry)
+      raw = _canonical_json_message_text(delivery.telemetry)
+      if trace_capture is not None:
+        trace_capture.record_telemetry(sample.robot_joints_degrees)
+      joint_motion_dispatcher.publish_position_telemetry(
+        raw,
+        sample.robot_joints_degrees,
+      )
+      continue
+    if type(delivery) is JsonEventDelivery:
+      _validate_json_joint_motion_event(delivery, motion_name)
+      if not stop_published:
+        _publish_main_controller_unpositioned_stop(
+          stop_context,
+          JsonMainControllerPhysicalStop(
+            command_name,
+            "emergency_stop_event",
+          ),
+        )
+        if stop_publication_callback is not None:
+          stop_publication_callback()
+        stop_published = True
+      continue
+    if type(delivery) is not JsonResponseDelivery:
+      raise ProtocolResponseError(
+        f"JSON {motion_name} motion received an unknown delivery type"
+      )
+    if delivery.ticket is not ticket:
+      raise ProtocolResponseError(
+        f"JSON {motion_name} motion received a response for another request"
+      )
+    if delivery.response.status == "accepted":
+      continue
+    terminal_physical_stop = (
+      delivery.response.error is not None
+      and delivery.response.error.code == "emergency_stop_active"
+    )
+    if terminal_physical_stop and not stop_published:
+      _publish_main_controller_unpositioned_stop(
+        stop_context,
+        JsonMainControllerPhysicalStop(
+          command_name,
+          "emergency_stop_active",
+        ),
+      )
+      if stop_publication_callback is not None:
+        stop_publication_callback()
+      stop_published = True
+    terminal = client.take_terminal(ticket)
+    retain_terminal = (
+      retain_failed_modbus_terminal
+      and terminal.response.status == "failed"
+      and terminal.failure is not None
+      and terminal.failure.code == "modbus_error"
+    )
+    if not retain_terminal:
+      client.acknowledge_terminal(ticket)
+    if terminal.response is not delivery.response:
+      raise ProtocolResponseError(
+        f"JSON {motion_name}-motion terminal ownership changed during settlement"
+      )
+    if terminal_physical_stop:
+      raise ProtocolResponseError(
+        _json_joint_motion_failure_detail(terminal, motion_name)
+      )
+
+  while True:
+    delivery = client.pop_delivery()
+    if delivery is None:
+      polled = client.poll()
+      if not polled and not client.has_unread_input:
+        break
+      continue
+    if type(delivery) is JsonEventDelivery:
+      _validate_json_joint_motion_event(delivery, motion_name)
+      if not stop_published:
+        _publish_main_controller_unpositioned_stop(
+          stop_context,
+          JsonMainControllerPhysicalStop(
+            command_name,
+            "emergency_stop_event",
+          ),
+        )
+        if stop_publication_callback is not None:
+          stop_publication_callback()
+        stop_published = True
+      continue
+    raise ProtocolResponseError(
+      f"JSON {motion_name} motion received post-terminal non-event data"
+    )
+  if client.release_reader() is not True:
+    raise ProtocolResponseError(
+      f"JSON {motion_name}-motion reader ownership was not released"
+    )
+  return terminal, stop_published
+
+
+def _exchange_json_controller_correction(
+  binding,
+  response_timeout,
+  write_started_event,
+  write_cancellation_boundary,
+):
+  client = binding.json_client
+  if not isinstance(client, JsonMainControllerClient):
+    raise ProtocolResponseError(
+      "persistent JSON position correction lacks a valid client"
+    )
+  stop_context = _capture_main_controller_stop_context(client.serial_port)
+  stop_observed = threading.Event()
+  ticket = None
+  stop_published = False
+  try:
+    ticket = client.request_correct_position(
+      timeout=response_timeout,
+      write_admission=_json_motion_write_admission(
+        write_started_event,
+        write_cancellation_boundary,
+      ),
+    )
+    terminal, stop_published = _await_json_joint_motion_terminal(
+      client,
+      ticket,
+      None,
+      stop_context,
+      False,
+      command_name="correct_position",
+      motion_name="position correction",
+      stop_publication_callback=stop_observed.set,
+    )
+    result = _json_controller_correction_terminal_result(
+      terminal,
+      stop_context,
+      stop_published,
+    )
+    if position_response_is_physical_estop(result.position):
+      if not stop_published:
+        stop_observed.set()
+        _publish_main_controller_stop(stop_context, result.position)
+      stop_published = True
+  except BaseException:
+    cleanup_required = ticket is not None or client.quarantined
+    if ticket is None:
+      try:
+        cleanup_required = bool(client.pending_tickets) or cleanup_required
+      except BaseException:
+        cleanup_required = True
+    if stop_observed.is_set():
+      try:
+        quarantine_serial_transport(
+          client.serial_port,
+          "JSON position-correction physical E-stop requires reconnection",
+        )
+      finally:
+        _require_main_controller_identity_cleanup(
+          client.serial_port,
+          "JSON position-correction physical-stop failure cleanup",
+        )
+    elif cleanup_required:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON position-correction failure cleanup",
+      )
+    raise
+
+  if stop_published:
+    try:
+      quarantine_serial_transport(
+        client.serial_port,
+        "JSON position-correction physical E-stop requires reconnection",
+      )
+    finally:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON position-correction physical-stop cleanup",
+      )
+  return result
+
+
+def _exchange_controller_correction(
+  command,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  if _canonicalize_main_serial_command(command) != "CP\n":
+    raise MotionInputError("controller correction command is invalid")
+  serial_port = RUN.get('ser')
+  binding = _current_main_controller_identity(serial_port)
+  if binding is None or not isinstance(
+    binding.json_client,
+    JsonMainControllerClient,
+  ):
+    raise ProtocolResponseError(
+      "persistent JSON position correction lost controller ownership"
+    )
+  return _exchange_json_controller_correction(
+    binding,
+    SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+    write_started_event,
+    write_cancellation_boundary,
+  )
+
+
+def _json_position_failure_response(terminal):
+  failure = terminal.failure
+  if failure is None:
+    raise ProtocolResponseError(
+      "controller returned a non-completed JSON position response "
+      f"without an error: {terminal.response.status}"
+    )
+  if terminal.response.status != "failed":
+    raise ProtocolResponseError(
+      "controller rejected JSON position refresh: "
+      f"{failure.code}: {' '.join(failure.message.split())}"
+    )
+  if failure.code == "controller_alarm":
+    alarm = failure.details.get("controller_alarm")
+    if not isinstance(alarm, str) or not alarm.startswith("E"):
+      raise ProtocolResponseError(
+        "JSON position refresh returned an invalid controller alarm"
+      )
+    return alarm
+  if failure.code == "position_unavailable":
+    raise ProtocolResponseError(
+      "controller position is unavailable; reconnect required"
+    )
+  raise ProtocolResponseError(
+    "controller failed JSON position refresh: "
+    f"{failure.code}: {' '.join(failure.message.split())}"
+  )
+
+
+def _exchange_json_completed_request(
+  binding,
+  request,
+  parameters,
+  response_timeout,
+  write_started_event,
+  command_name,
+  operation_name,
+  result_type=None,
+  completed_stop_event=None,
+  write_cancellation_boundary=None,
+  cancelled_physical_stop=False,
+  return_modbus_terminal=False,
+):
+  client = binding.json_client
+  if not isinstance(client, JsonMainControllerClient):
+    raise ProtocolResponseError(
+      f"persistent JSON {operation_name} lacks a valid client"
+    )
+  if not callable(request):
+    raise MotionInputError(f"JSON {operation_name} request is invalid")
+  if type(parameters) is not dict:
+    raise MotionInputError(f"JSON {operation_name} parameters are invalid")
+  if result_type is not None and not isinstance(result_type, type):
+    raise MotionInputError(f"JSON {operation_name} result type is invalid")
+  if completed_stop_event is not None and not all(
+    callable(getattr(completed_stop_event, method, None)) for method in ("set", "is_set")
+  ):
+    raise MotionInputError(f"JSON {operation_name} stop event is invalid")
+  if type(cancelled_physical_stop) is not bool:
+    raise MotionInputError(
+      f"JSON {operation_name} cancelled-stop selection is invalid"
+    )
+  if type(return_modbus_terminal) is not bool:
+    raise MotionInputError(f"JSON {operation_name} terminal-return selection is invalid")
+  ticket = None
+  stop_context = _capture_main_controller_stop_context(client.serial_port)
+  stop_observed = (
+    threading.Event() if completed_stop_event is None else completed_stop_event
+  )
+  try:
+    ticket = request(
+      **parameters,
+      timeout=response_timeout,
+      write_admission=_json_motion_write_admission(
+        write_started_event,
+        write_cancellation_boundary,
+      ),
+    )
+    return_modbus_write_terminal = (
+      return_modbus_terminal
+      and command_name in (
+        "modbus_write_coil",
+        "modbus_write_register",
+      )
+    )
+    terminal, stop_published = _await_json_joint_motion_terminal(
+      client,
+      ticket,
+      None,
+      stop_context,
+      False,
+      command_name=command_name,
+      motion_name=operation_name,
+      stop_publication_callback=stop_observed.set,
+      retain_failed_modbus_terminal=return_modbus_write_terminal,
+    )
+    failure = terminal.failure
+    if (
+      cancelled_physical_stop
+      and not stop_published
+      and terminal.response.status == "cancelled"
+      and failure is not None
+      and failure.code == "emergency_stop"
+    ):
+      stop_observed.set()
+      _publish_main_controller_unpositioned_stop(
+        stop_context,
+        JsonMainControllerPhysicalStop(
+          command_name,
+          "emergency_stop_event",
+        ),
+      )
+      stop_published = True
+    returned_cancelled_modbus_write = (
+      return_modbus_write_terminal
+      and terminal.response.status == "cancelled"
+      and failure is not None
+      and failure.code == "emergency_stop"
+    )
+    returned_rejected_modbus_write = (
+      return_modbus_write_terminal
+      and terminal.response.status == "rejected"
+    )
+    if stop_published and not (
+      terminal.response.status == "completed"
+      and (
+        completed_stop_event is not None
+        or return_modbus_write_terminal
+      )
+    ) and not (
+      returned_cancelled_modbus_write
+      or returned_rejected_modbus_write
+    ):
+      raise ProtocolResponseError(
+        f"physical E-stop interrupted JSON {operation_name}"
+      )
+    if terminal.response.status != "completed" and not (
+      (
+        return_modbus_terminal
+        and terminal.response.status == "failed"
+        and failure is not None
+        and failure.code == "modbus_error"
+      )
+      or returned_cancelled_modbus_write
+      or returned_rejected_modbus_write
+    ):
+      if failure is None:
+        raise ProtocolResponseError(
+          f"controller returned a non-completed JSON {operation_name} response "
+          f"without an error: {terminal.response.status}"
+        )
+      raise ProtocolResponseError(
+        f"controller {terminal.response.status} JSON {operation_name}: "
+        f"{failure.code}: {' '.join(failure.message.split())}"
+      )
+    result = terminal.parsed_result
+    if (
+      terminal.response.status == "completed"
+      and result_type is not None
+      and not isinstance(result, result_type)
+    ):
+      raise ProtocolResponseError(
+        f"JSON {operation_name} result has an invalid type"
+      )
+  except BaseException:
+    cleanup_required = (
+      ticket is not None
+      or client.quarantined
+      or (
+        write_started_event is not None
+        and write_started_event.is_set()
+      )
+    )
+    if ticket is None:
+      try:
+        cleanup_required = bool(client.pending_tickets) or cleanup_required
+      except BaseException:
+        cleanup_required = True
+    if stop_observed.is_set():
+      try:
+        quarantine_serial_transport(
+          client.serial_port,
+          f"JSON {operation_name} physical E-stop requires reconnection",
+        )
+      finally:
+        _require_main_controller_identity_cleanup(
+          client.serial_port,
+          f"JSON {operation_name} physical-stop failure cleanup",
+        )
+    elif cleanup_required:
+      _require_main_controller_identity_cleanup(
+        client.serial_port, f"JSON {operation_name} failure cleanup",
+      )
+    raise
+  return terminal
+
+
+def _exchange_json_main_command(
+  command_name,
+  parameters,
+  *,
+  response_timeout=SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+  completed_stop_event=None,
+  result_type=None,
+  return_terminal=False,
+):
+  if not isinstance(command_name, str) or not command_name:
+    raise MotionInputError("JSON main-controller command is invalid")
+  if type(parameters) is not dict:
+    raise MotionInputError("JSON main-controller parameters are invalid")
+  if type(return_terminal) is not bool:
+    raise MotionInputError("JSON terminal selection is invalid")
+  binding = _current_main_controller_identity(RUN.get('ser'))
+  if binding is None or not isinstance(
+    binding.json_client,
+    JsonMainControllerClient,
+  ):
+    raise ProtocolResponseError(
+      "JSON main-controller ownership is unavailable"
+    )
+  client = binding.json_client
+  terminal = _exchange_json_completed_request(
+    binding,
+    partial(client.request_command, command_name, parameters),
+    {},
+    response_timeout,
+    write_started_event,
+    command_name,
+    command_name.replace("_", " "),
+    result_type,
+    completed_stop_event=completed_stop_event,
+    write_cancellation_boundary=write_cancellation_boundary,
+    cancelled_physical_stop=True,
+  )
+  return terminal if return_terminal else terminal.parsed_result
+
+
+def _exchange_main_controller_modbus_read(
+  command, *, response_timeout=SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+  write_started_event=None, write_cancellation_boundary=None, completed_stop_event=None,
+):
+  opcode, slave_id, address, _ = parse_controller_modbus_command(command)
+  command_name = {
+    "BA": "modbus_read_holding_register", "BH": "modbus_read_holding_register",
+    "BB": "modbus_read_coil", "BC": "modbus_read_discrete_input",
+    "BD": "modbus_read_input_register"}.get(opcode)
+  if command_name is None:
+    raise MotionInputError("Modbus read opcode is unsupported")
+  serial_port = RUN.get('ser')
+  if serial_port is None:
+    raise ConnectionError("Modbus read requires a main connection")
+  binding = _current_main_controller_identity(serial_port)
+  if binding is None or not isinstance(
+    binding.json_client,
+    JsonMainControllerClient,
+  ):
+    raise ProtocolResponseError("Modbus read lost controller identity")
+  client = binding.json_client
+  terminal = _exchange_json_completed_request(
+    binding, partial(client.request_modbus_read, command_name),
+    {"slave_id": slave_id, "address": address},
+    response_timeout, write_started_event, command_name, "Modbus read",
+    completed_stop_event=completed_stop_event,
+    write_cancellation_boundary=write_cancellation_boundary,
+    cancelled_physical_stop=True,
+    return_modbus_terminal=True,
+  )
+  if terminal.response.status != "completed":
+    raise ProtocolResponseError(
+      f"controller failed JSON Modbus read: {terminal.failure.code}: "
+      f"{' '.join(terminal.failure.message.split())}"
+    )
+  if type(terminal.parsed_result) is not int:
+    raise ProtocolResponseError("controller returned an invalid Modbus read result")
+  return parse_controller_modbus_response(command, str(terminal.parsed_result))
+
+
+def _exchange_main_controller_modbus_write(
+  command,
+  *,
+  response_timeout=SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+  completed_stop_event=None,
+):
+  opcode, slave_id, address, value = parse_controller_modbus_command(command)
+  command_name = {
+    "BE": "modbus_write_coil",
+    "SC": "modbus_write_coil",
+    "BF": "modbus_write_register",
+    "SO": "modbus_write_register",
+  }.get(opcode)
+  if command_name is None:
+    raise MotionInputError("Modbus write opcode is unsupported")
+  binding = _current_main_controller_identity(RUN.get('ser'))
+  if binding is None or not isinstance(
+    binding.json_client,
+    JsonMainControllerClient,
+  ):
+    raise ProtocolResponseError("Modbus write lost controller identity")
+  client = binding.json_client
+  terminal = _exchange_json_completed_request(
+    binding,
+    partial(client.request_modbus_write, command_name),
+    {"slave_id": slave_id, "address": address, "value": value},
+    response_timeout,
+    write_started_event,
+    command_name,
+    "Modbus write",
+    write_cancellation_boundary=write_cancellation_boundary,
+    completed_stop_event=completed_stop_event,
+    cancelled_physical_stop=True,
+    return_modbus_terminal=True,
+  )
+  if terminal.response.status == "cancelled":
+    if terminal.failure is None or terminal.failure.code != "emergency_stop":
+      raise ProtocolResponseError(
+        "controller returned an invalid cancelled Modbus-write terminal"
+    )
+    return "ER" if opcode in ("BE", "BF") else "-2"
+  if terminal.response.status == "rejected":
+    return "ER" if opcode in ("BE", "BF") else "-2"
+  if terminal.response.status == "failed":
+    if terminal.failure is None or terminal.failure.code != "modbus_error":
+      raise ProtocolResponseError(
+        "controller returned an invalid Modbus-write failure terminal"
+      )
+    return "Modbus Error" if opcode in ("BE", "BF") else "-1"
+  return "Write Success" if opcode in ("BE", "BF") else "1"
+
+
+def _exchange_main_controller_modbus_wait(
+  command,
+  *,
+  response_timeout,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  if not isinstance(command, str):
+    raise MotionInputError("Modbus wait command is invalid")
+  match = re.fullmatch(
+    r"W(?P<kind>[HJK])A(?P<slave>[0-9]+)B(?P<address>[0-9]+)"
+    r"C(?P<expected>[0-9]+)D(?P<timeout>[0-9]+)\n",
+    command,
+  )
+  if match is None:
+    raise MotionInputError("Modbus wait command framing is invalid")
+  timeout_seconds = _main_modbus_wait_timeout_seconds(match.group("timeout"))
+  command_name = {
+    "H": "wait_modbus_holding_register",
+    "J": "wait_modbus_coil",
+    "K": "wait_modbus_discrete_input",
+  }[match.group("kind")]
+  result = _exchange_json_main_command(
+    command_name,
+    {
+      "slave_id": int(match.group("slave")),
+      "address": int(match.group("address")),
+      "expected": int(match.group("expected")),
+      "timeout_seconds": timeout_seconds,
+    },
+    response_timeout=response_timeout,
+    write_started_event=write_started_event,
+    write_cancellation_boundary=write_cancellation_boundary,
+  )
+  if type(result) is not JsonScalarResult:
+    raise ProtocolResponseError(
+      "controller returned an invalid Modbus wait result"
+    )
+  expected = int(match.group("expected"))
+  if result.value != expected:
+    raise ProtocolResponseError(
+      "controller Modbus wait result does not match the requested state"
+    )
+  return "Done"
+
+
+def _exchange_main_controller_wait(
+  command, wait_seconds, *, response_timeout,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  wait_seconds, encoded_wait = _main_timed_wait_seconds(wait_seconds)
+  if command != f"WTS{encoded_wait}\n":
+    raise MotionInputError("controller wait command does not match its duration")
+  serial_port = RUN.get('ser')
+  if serial_port is None:
+    raise ConnectionError("controller wait requires a main connection")
+  binding = _current_main_controller_identity(serial_port)
+  if binding is None or not isinstance(
+    binding.json_client,
+    JsonMainControllerClient,
+  ):
+    raise ProtocolResponseError(
+      "controller wait lost the bound main-controller identity"
+    )
+  terminal = _exchange_json_completed_request(
+    binding,
+    getattr(binding.json_client, "request_controller_wait", None),
+    {"seconds": wait_seconds},
+    response_timeout,
+    write_started_event,
+    "controller_wait",
+    "controller wait",
+    write_cancellation_boundary=write_cancellation_boundary,
+    cancelled_physical_stop=True,
+  )
+  return terminal.parsed_result
+
+
+def _exchange_json_configuration_acknowledgement(
+  binding,
+  command_name,
+  parameters,
+  response_timeout,
+  write_started_event,
+):
+  client = binding.json_client
+  request_name = {
+    "config_ext_axis": "request_config_ext_axis",
+    "set_position": "request_set_position",
+    "update_params": "request_update_params",
+  }.get(command_name)
+  if request_name is None:
+    raise MotionInputError("JSON configuration command is invalid")
+  _exchange_json_completed_request(
+    binding,
+    getattr(client, request_name, None),
+    parameters,
+    response_timeout,
+    write_started_event,
+    command_name,
+    "configuration",
+  )
+  return True
+
+
+def _exchange_external_axis_zero(
+  command,
+  *,
+  expected_serial_port,
+  expected_binding,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  axis = {"Z7\n": 7, "Z8\n": 8, "Z9\n": 9}.get(command)
+  if axis is None:
+    raise MotionInputError("external-axis zero command is invalid")
+  binding = _current_main_controller_identity(expected_serial_port)
+  if binding is None or binding is not expected_binding:
+    raise ProtocolResponseError("external-axis zero lost controller identity")
+  client = expected_binding.json_client
+  if not isinstance(client, JsonMainControllerClient):
+    raise ProtocolResponseError(
+      "JSON external-axis zero lost controller ownership"
+    )
+  if write_cancellation_boundary is None:
+    stop_context = _capture_main_controller_stop_context(client.serial_port)
+    stop_event = threading.Event()
+    terminal = _exchange_json_completed_request(
+      binding,
+      getattr(client, "request_zero_external_axis", None),
+      {"axis": axis},
+      SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+      write_started_event,
+      f"zero_j{axis}",
+      f"external-axis {axis} zero",
+      JsonMainPositionResult,
+      completed_stop_event=stop_event,
+    )
+    result = terminal.parsed_result
+    event_stop = stop_event.is_set()
+    reported_stop = event_stop or result.motion_fault in CONTROLLER_PHYSICAL_ESTOP_FLAGS
+    try:
+      if event_stop and result.motion_fault.startswith("EC"):
+        logger.error(
+          "External-axis zero also reported controller fault %s",
+          result.motion_fault,
+        )
+      raw = _canonical_json_message_text(terminal.response)
+      position_flag = (
+        CONTROLLER_ESTOP_EVENT_FLAG
+        if event_stop
+        else result.motion_fault
+      )
+      position = _json_joint_position_response(
+        raw, result, speed_violation=result.speed_limited,
+        debug=result.controller_debug, flag=position_flag,
+      )
+    except BaseException:
+      if reported_stop:
+        try:
+          quarantine_serial_transport(
+            client.serial_port,
+            "JSON external-axis zero physical E-stop requires reconnection",
+          )
+        finally:
+          _require_main_controller_identity_cleanup(
+            client.serial_port,
+            "JSON external-axis zero physical-stop translation cleanup",
+          )
+      raise
+    if reported_stop:
+      try:
+        if event_stop:
+          _publish_main_controller_stop_position_upgrade(
+            stop_context, position,
+          )
+        else:
+          _publish_main_controller_stop(stop_context, position)
+      finally:
+        try:
+          quarantine_serial_transport(
+            client.serial_port,
+            "JSON external-axis zero physical E-stop requires reconnection",
+          )
+        finally:
+          _require_main_controller_identity_cleanup(
+            client.serial_port,
+            "JSON external-axis zero physical-stop quarantine",
+          )
+    return position
+  raise MotionInputError("JSON external-axis zero rejects cancellation")
+
+
+def _exchange_json_controller_position(binding, response_timeout):
+  client = binding.json_client
+  if not isinstance(client, JsonMainControllerClient):
+    raise ProtocolResponseError(
+      "persistent JSON position refresh lacks a valid client"
+    )
+  ticket = None
+  write_started = threading.Event()
+  stop_observed = threading.Event()
+  stop_context = _capture_main_controller_stop_context(client.serial_port)
+  try:
+    ticket = client.request_position_disposition(
+      timeout=response_timeout,
+      write_admission=_json_motion_write_admission(write_started, None),
+    )
+    terminal, stop_published = _await_json_joint_motion_terminal(
+      client,
+      ticket,
+      None,
+      stop_context,
+      False,
+      command_name="get_position_disposition",
+      motion_name="position refresh",
+      stop_publication_callback=stop_observed.set,
+    )
+    if terminal.response.status == "completed":
+      result = terminal.parsed_result
+      raw = _canonical_json_message_text(terminal.response)
+      position_flag = result.motion_fault
+      if stop_published and not position_flag:
+        position_flag = CONTROLLER_ESTOP_EVENT_FLAG
+      position = _json_joint_position_response(
+        raw,
+        result,
+        speed_violation=result.speed_limited,
+        debug=result.controller_debug,
+        flag=position_flag,
+      )
+      if stop_published:
+        stop_position = position
+        if not position_response_is_physical_estop(stop_position):
+          stop_position = _json_joint_position_response(
+            raw,
+            result,
+            speed_violation=result.speed_limited,
+            debug=result.controller_debug,
+            flag=CONTROLLER_ESTOP_EVENT_FLAG,
+          )
+        _publish_main_controller_stop_position_upgrade(
+          stop_context,
+          stop_position,
+        )
+      elif position_response_is_physical_estop(position):
+        _publish_main_controller_stop(stop_context, position)
+        stop_published = True
+      response = position
+    else:
+      response = _json_position_failure_response(terminal)
+  except BaseException:
+    if stop_observed.is_set():
+      try:
+        quarantine_serial_transport(
+          client.serial_port,
+          "JSON position-refresh physical E-stop requires reconnection",
+        )
+      finally:
+        _require_main_controller_identity_cleanup(
+          client.serial_port,
+          "JSON position-refresh physical-stop failure cleanup",
+        )
+    elif ticket is not None or client.quarantined or write_started.is_set():
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON position-refresh failure cleanup",
+      )
+    raise
+
+  if stop_published:
+    try:
+      quarantine_serial_transport(
+        client.serial_port,
+        "JSON position-refresh physical E-stop requires reconnection",
+      )
+    finally:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON position-refresh physical-stop cleanup",
+      )
+  return response
+
+
+def _exchange_main_controller_position():
+  serial_port = RUN.get('ser')
+  try:
+    binding = _current_main_controller_identity(serial_port)
+    if binding is None or not isinstance(
+      binding.json_client,
+      JsonMainControllerClient,
+    ):
+      raise ProtocolResponseError(
+        "JSON position refresh lost controller ownership"
+      )
+    return _exchange_json_controller_position(
+      binding,
+      SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+    )
+  finally:
+    if (
+      RUN.get('ser') is serial_port
+      and serial_port is not None
+      and not getattr(serial_port, "is_open", False)
+    ):
+      _require_main_controller_identity_cleanup(
+        serial_port,
+        "position-refresh controller exchange cleanup",
+      )
+
+
+def _exchange_json_joint_motion_request(
+  parameters,
+  binding,
+  stop_context,
+  response_timeout,
+  telemetry_enabled,
+  trace_capture,
+  write_admission,
+):
+  client = binding.json_client
+  if not isinstance(client, JsonMainControllerClient):
+    raise ProtocolResponseError(
+      "persistent JSON joint motion lacks a valid client"
+    )
+  if type(parameters) is not dict:
+    raise MotionInputError("JSON joint motion parameters are invalid")
+  if (
+    type(telemetry_enabled) is not bool
+    or parameters.get("telemetry_enabled") is not telemetry_enabled
+  ):
+    raise MotionInputError("JSON joint motion telemetry contract is invalid")
+  ticket = None
+  try:
+    ticket = client.request_move_joints(
+      **parameters,
+      timeout=response_timeout,
+      write_admission=write_admission,
+    )
+    terminal, stop_published = _await_json_joint_motion_terminal(
+      client,
+      ticket,
+      trace_capture,
+      stop_context,
+      telemetry_enabled,
+    )
+    result = _json_joint_motion_terminal_result(
+      terminal,
+      stop_context,
+      stop_published,
+    )
+  except BaseException:
+    cleanup_required = ticket is not None or client.quarantined
+    if ticket is None:
+      try:
+        ticket = client.pending_joint_motion_ticket
+      except BaseException:
+        cleanup_required = True
+      else:
+        cleanup_required = ticket is not None or cleanup_required
+    if cleanup_required:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON joint-motion failure cleanup",
+      )
+    raise
+
+  if position_response_is_physical_estop(result.position):
+    try:
+      quarantine_serial_transport(
+        client.serial_port,
+        "JSON joint-motion physical E-stop requires reconnection",
+      )
+    finally:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON joint-motion physical-stop quarantine",
+      )
+  return result
+
+
+def _exchange_json_joint_motion(
+  command,
+  binding,
+  stop_context,
+  response_timeout,
+  telemetry_enabled,
+  trace_capture,
+):
+  return _exchange_json_joint_motion_request(
+    _json_joint_motion_parameters(command, telemetry_enabled),
+    binding,
+    stop_context,
+    response_timeout,
+    telemetry_enabled,
+    trace_capture,
+    trace_capture,
+  )
+
+
+def _exchange_json_program_joint_motion(
+  command,
+  binding,
+  stop_context,
+  response_timeout,
+  write_started_event,
+  write_cancellation_boundary,
+):
+  target = parse_joint_motion_command(command)
+  return _exchange_json_joint_motion_request(
+    _json_joint_motion_target_parameters(
+      target,
+      False,
+    ),
+    binding,
+    stop_context,
+    response_timeout,
+    False,
+    None,
+    _json_motion_write_admission(
+      write_started_event,
+      write_cancellation_boundary,
+    ),
+  )
+
+
+def _exchange_json_cartesian_motion(
+  command,
+  binding,
+  stop_context,
+  response_timeout,
+  write_started_event,
+  write_cancellation_boundary,
+):
+  client = binding.json_client
+  if not isinstance(client, JsonMainControllerClient):
+    raise ProtocolResponseError(
+      "JSON Cartesian motion lacks a valid client"
+    )
+  if isinstance(command, ProgramJsonCartesianMotion):
+    command_name = command.command_name
+    motions = tuple(
+      _json_cartesian_motion_parameters(segment)
+      for segment in command.motion_commands
+    )
+    if command_name == "move_arc":
+      params = {
+        "motion": motions[0],
+        "midpoint_translation_millimeters": command.control_points[0],
+      }
+    elif command_name == "move_circle":
+      params = {
+        "motion": motions[0],
+        "center_translation_millimeters": command.control_points[0],
+        "plane_translation_millimeters": command.control_points[1],
+      }
+    elif command_name == "move_spline":
+      params = {
+        "segments": [
+          {
+            "motion": motion,
+            "rounding_millimeters": rounding,
+          }
+          for motion, rounding in zip(
+            motions,
+            command.roundings_millimeters,
+          )
+        ]
+      }
+    else:
+      raise MotionInputError("program JSON Cartesian command is unsupported")
+  else:
+    command_name = {
+      "MJ": "move_cartesian",
+      "ML": "move_linear",
+      "MV": "move_vision",
+    }.get(command[:2])
+    if command_name is None:
+      raise MotionInputError("Cartesian motion opcode is unsupported")
+    motion = _json_cartesian_motion_parameters(command)
+    params = motion
+  if command_name == "move_linear":
+    match = re.search(r"Rnd(?P<value>[^W]+)W", command)
+    if match is None:
+      raise MotionInputError("linear motion rounding is missing")
+    rounding_millimeters = finite_number(
+      match.group("value"),
+      "linear motion rounding",
+    )
+    if rounding_millimeters != 0.0:
+      raise MotionInputError("linear motion rounding must equal zero")
+    params = {
+      "motion": motion,
+      "rounding_millimeters": rounding_millimeters,
+      "disable_wrist_rotation": False,
+    }
+  elif command_name == "move_vision":
+    match = re.search(r"Vr(?P<value>[^L]+)Lm", command)
+    if match is None:
+      raise MotionInputError("vision motion rotation is missing")
+    params = {
+      "motion": motion,
+      "vision_rotation_degrees": finite_number(
+        match.group("value"),
+        "vision motion rotation",
+      ),
+    }
+  write_admission = _json_motion_write_admission(
+    write_started_event,
+    write_cancellation_boundary,
+  )
+  ticket = None
+  try:
+    ticket = client.request_command(
+      command_name,
+      params,
+      timeout=response_timeout,
+      write_admission=write_admission,
+    )
+    terminal, stop_published = _await_json_joint_motion_terminal(
+      client,
+      ticket,
+      None,
+      stop_context,
+      False,
+      command_name=command_name,
+      motion_name=command_name.replace("_", " "),
+    )
+    result = _json_joint_motion_terminal_result(
+      terminal,
+      stop_context,
+      stop_published,
+      motion_name=command_name.replace("_", " "),
+      positionless_rejection_codes=(
+        "kinematics_unreachable",
+        "joint_limit_violation",
+        "position_not_representable",
+      ),
+    )
+  except BaseException:
+    cleanup_required = ticket is not None or client.quarantined
+    if ticket is None:
+      try:
+        cleanup_required = bool(client.pending_tickets) or cleanup_required
+      except BaseException:
+        cleanup_required = True
+    if cleanup_required:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON Cartesian-motion failure cleanup",
+      )
+    raise
+
+  if position_response_is_physical_estop(result.position):
+    try:
+      quarantine_serial_transport(
+        client.serial_port,
+        "JSON Cartesian-motion physical E-stop requires reconnection",
+      )
+    finally:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON Cartesian-motion physical-stop quarantine",
+      )
+  return result
+
+
+def _exchange_json_tool_jog(
+  command,
+  binding,
+  stop_context,
+  response_timeout,
+  write_started_event,
+  write_cancellation_boundary,
+):
+  client = binding.json_client
+  if not isinstance(client, JsonMainControllerClient):
+    raise ProtocolResponseError(
+      "persistent JSON tool-frame jog lacks a valid client"
+    )
+  params = _json_tool_jog_parameters(command)
+  write_admission = _json_motion_write_admission(
+    write_started_event,
+    write_cancellation_boundary,
+  )
+  ticket = None
+  try:
+    ticket = client.request_jog_tool(
+      **params,
+      timeout=response_timeout,
+      write_admission=write_admission,
+    )
+    terminal, stop_published = _await_json_joint_motion_terminal(
+      client,
+      ticket,
+      None,
+      stop_context,
+      False,
+      command_name="jog_tool",
+      motion_name="tool-frame jog",
+    )
+    result = _json_joint_motion_terminal_result(
+      terminal,
+      stop_context,
+      stop_published,
+      motion_name="tool-frame jog",
+      positionless_rejection_codes=(
+        "kinematics_unreachable",
+        "joint_limit_violation",
+        "position_not_representable",
+      ),
+    )
+  except BaseException:
+    cleanup_required = ticket is not None or client.quarantined
+    if ticket is None:
+      try:
+        ticket = client.pending_tool_jog_ticket
+      except BaseException:
+        cleanup_required = True
+      else:
+        cleanup_required = ticket is not None or cleanup_required
+    if cleanup_required:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON tool-frame jog failure cleanup",
+      )
+    raise
+
+  if position_response_is_physical_estop(result.position):
+    try:
+      quarantine_serial_transport(
+        client.serial_port,
+        "JSON tool-frame jog physical E-stop requires reconnection",
+      )
+    finally:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON tool-frame jog physical-stop quarantine",
+      )
+  return result
+
+
+def _exchange_cartesian_motion(
+  command,
+  *,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  serial_port = RUN.get('ser')
+  try:
+    command = _canonicalize_main_serial_command(command)
+    binding = _current_main_controller_identity(serial_port)
+    response_timeout = _controller_response_timeout(command)
+    if binding is None or not isinstance(
+      binding.json_client,
+      JsonMainControllerClient,
+    ):
+      raise ProtocolResponseError(
+        "JSON Cartesian motion lost controller ownership"
+      )
+    return _exchange_json_cartesian_motion(
+      command,
+      binding,
+      _capture_main_controller_stop_context(serial_port),
+      response_timeout,
+      write_started_event,
+      write_cancellation_boundary,
+    )
+  finally:
+    if (
+      RUN.get('ser') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      _require_main_controller_identity_cleanup(
+        serial_port,
+        "Cartesian-motion controller exchange cleanup",
+      )
+
+
+def _exchange_tool_jog(
+  command,
+  *,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  serial_port = RUN.get('ser')
+  try:
+    command = _canonicalize_main_serial_command(command)
+    binding = _current_main_controller_identity(serial_port)
+    response_timeout = _controller_response_timeout(command)
+    if binding is None or not isinstance(
+      binding.json_client,
+      JsonMainControllerClient,
+    ):
+      raise ProtocolResponseError("JSON tool jog lost controller ownership")
+    return _exchange_json_tool_jog(
+      command,
+      binding,
+      _capture_main_controller_stop_context(serial_port),
+      response_timeout,
+      write_started_event,
+      write_cancellation_boundary,
+    )
+  finally:
+    if (
+      RUN.get('ser') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      _require_main_controller_identity_cleanup(
+        serial_port,
+        "tool-jog controller exchange cleanup",
+      )
+
+
+def _exchange_program_joint_motion(
+  command,
+  *,
+  write_started_event=None,
+  write_cancellation_boundary=None,
+):
+  serial_port = RUN.get('ser')
+  try:
+    command = _canonicalize_main_serial_command(command)
+    binding = _current_main_controller_identity(serial_port)
+    response_timeout = _controller_response_timeout(command)
+    if binding is None or not isinstance(
+      binding.json_client,
+      JsonMainControllerClient,
+    ):
+      raise ProtocolResponseError(
+        "JSON program motion lost controller ownership"
+      )
+    return _exchange_json_program_joint_motion(
+      command,
+      binding,
+      _capture_main_controller_stop_context(serial_port),
+      response_timeout,
+      write_started_event,
+      write_cancellation_boundary,
+    )
+  finally:
+    if (
+      RUN.get('ser') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      _require_main_controller_identity_cleanup(
+        serial_port,
+        "program joint-motion controller exchange cleanup",
+      )
+
+
 def _exchange_joint_motion(command):
   serial_port = RUN.get('ser')
   trace_capture = None
   try:
     binding = _current_main_controller_identity(serial_port)
     stop_context = _capture_main_controller_stop_context(serial_port)
-    telemetry_enabled = (
-      binding is not None
-      and CONTROLLER_CAPABILITY_JOINT_TELEMETRY_V1
-        in binding.identity.protocol_capabilities
-    )
+    telemetry_enabled = True
     response_timeout = _controller_response_timeout(command)
     if telemetry_enabled:
       trace_capture = _start_joint_motion_trace(command, binding)
 
-    def publish_stop(position):
-      return _publish_main_controller_stop(stop_context, position)
-
-    def consume_joint_telemetry(response):
-      telemetry = parse_joint_motion_exchange_response(response)
-      if telemetry is None:
-        return False
-      if trace_capture is not None:
-        trace_capture.record_telemetry(telemetry.joints)
-      joint_motion_dispatcher.publish_telemetry(telemetry)
-      return True
-
-    def validate_joint_terminal(response):
-      if parse_joint_motion_exchange_response(response) is not None:
-        raise ProtocolResponseError(
-          "joint telemetry cannot terminate a motion exchange"
-        )
-
-    outbound_command = (
-      request_joint_telemetry(command)
-      if telemetry_enabled
-      else command
-    )
-    outbound_command = _canonicalize_main_serial_command(outbound_command)
-    write_serial_control(
-      serial_port,
-      outbound_command,
-      write_lock=serial_write_lock,
-      reset_input=False,
-      write_started_event=trace_capture,
-    )
-    response = read_controller_line_exchange_response(
-      serial_port,
-      response_timeout,
-      estop_callback=publish_stop,
-      allow_standalone_estop_event=telemetry_enabled,
-      interim_response_handler=(
-        consume_joint_telemetry
-        if telemetry_enabled
-        else None
-      ),
-      interim_response_limit=(
-        joint_telemetry_response_budget(response_timeout)
-        if telemetry_enabled
-        else None
-      ),
-      terminal_validator=validate_joint_terminal,
-      context="joint-motion controller response",
-    )
-    _finish_joint_motion_trace(trace_capture, response)
-    if (
-      response.estop_position is not None
-      or response.admission_position is not None
+    if binding is None or not isinstance(
+      binding.json_client,
+      JsonMainControllerClient,
     ):
-      try:
-        quarantine_serial_transport(
-          serial_port,
-          "joint-motion physical E-stop requires reconnection",
-        )
-      finally:
-        _require_main_controller_identity_cleanup(
-          serial_port,
-          "joint-motion physical-stop quarantine",
-        )
-        if (
-          RUN.get('ser') is serial_port
-          and not getattr(serial_port, "is_open", False)
-        ):
-          RUN['ser'] = None
-    return response.authoritative_response
+      raise ProtocolResponseError("JSON joint motion lost controller ownership")
+    result = _exchange_json_joint_motion(
+      command,
+      binding,
+      stop_context,
+      response_timeout,
+      telemetry_enabled,
+      trace_capture,
+    )
+    _finish_joint_motion_trace(trace_capture, result)
+    return result
   except Exception as exc:
     if trace_capture is not None:
       trace_capture.fail(exc)
@@ -20739,7 +23144,6 @@ def _exchange_joint_motion(command):
         RUN.get('ser') is serial_port
         and not getattr(serial_port, "is_open", False)
       ):
-        RUN['ser'] = None
         _require_main_controller_identity_cleanup(
           serial_port,
           "joint-motion controller exchange cleanup",
@@ -20910,7 +23314,7 @@ def _try_dispatch_deferred_joint_adjustments(allow_current_generation=False):
     return DeferredJointDispatchOutcome.IDLE
   if (
     controller_correction_requested.is_set()
-    or legacy_serial_result_pending.is_set()
+    or serial_result_pending.is_set()
     or serial_lock.locked()
     or joint_motion_dispatcher.active
     or motion_request_registry.active
@@ -21102,6 +23506,15 @@ def _poll_joint_motion_events():
       preserve_actual_position = False
       try:
         try:
+          confirmed_position_unchanged = getattr(
+            event,
+            "confirmed_position_unchanged",
+            False,
+          )
+          if type(confirmed_position_unchanged) is not bool:
+            raise RuntimeError(
+              "joint-motion event confirmed-position state is invalid"
+            )
           if event.kind == "started":
             cmdSentEntryField.delete(0, 'end')
             cmdSentEntryField.insert(0, event.move.command)
@@ -21187,6 +23600,36 @@ def _poll_joint_motion_events():
               )
             continue
 
+          if confirmed_position_unchanged:
+            if event.position is not None:
+              raise RuntimeError(
+                "unchanged joint-motion failure included a position"
+              )
+            detail = (
+              event.error.strip()
+              if isinstance(event.error, str) and event.error.strip()
+              else "controller rejected the joint target before motion"
+            )
+            message = f"Joint motion rejected: {detail}"
+            if _try_set_virtual_joint_target(
+              _current_joint_positions()
+            ) is not True:
+              preserve_actual_position = False
+              message = (
+                f"{message}; confirmed pose could not restore the virtual "
+                "model"
+              )
+              _invalidate_joint_motion_state(message)
+            else:
+              preserve_actual_position = True
+            logger.error(message)
+            _set_application_status(message, "Alarm.TLabel")
+            if event.pending_discarded:
+              logger.warning(
+                "Pending joint target discarded after controller rejection"
+              )
+            continue
+
           if event.position is not None:
             if position_response_is_physical_estop(event.position):
               if not RUN.get('estopActive'):
@@ -21217,6 +23660,16 @@ def _poll_joint_motion_events():
                 _invalidate_joint_motion_state(
                   "failed joint motion could not update the virtual model"
                 )
+              if not event.position.flag:
+                detail = (
+                  event.error.strip()
+                  if isinstance(event.error, str) and event.error.strip()
+                  else "controller returned an unspecified motion failure"
+                )
+                message = f"Joint motion failed: {detail}"
+                _invalidate_joint_motion_state(message)
+                logger.error(message)
+                _set_application_status(message, "Alarm.TLabel")
           elif event.response is not None and event.response.startswith('E'):
             _try_set_virtual_joint_target(_current_joint_positions())
             _invalidate_joint_motion_state(
@@ -21334,11 +23787,11 @@ def _queue_joint_motion(axis, value, absolute):
         if lease_created and not joint_motion_dispatcher.active:
           _abandon_joint_motion_request(request_lease)
         if (
-          not legacy_serial_result_pending.is_set()
+          not serial_result_pending.is_set()
           and not motion_request_registry.active
         ):
           raise MotionQueueFault(
-            "controller transport is busy outside the legacy motion queue"
+            "controller transport is busy outside the motion queue"
           )
         deferred = True
         if absolute:
@@ -21355,7 +23808,7 @@ def _queue_joint_motion(axis, value, absolute):
         if live_serial_result_pending.is_set():
           status = "LIVE JOG IN PROGRESS"
         elif (
-          legacy_serial_result_pending.is_set()
+          serial_result_pending.is_set()
           or serial_lock.locked()
           or joint_motion_dispatcher.active
         ):
@@ -21380,8 +23833,84 @@ def _queue_joint_jog(axis, delta):
   return _queue_joint_motion(axis, delta, absolute=False)
 
 
+def _non_windows_gamepad_joint_jog(
+  main_mode,
+  jog_mode,
+  event_code,
+  event_state,
+):
+  if event_state not in (-1, 1):
+    return None
+  if main_mode == 4:
+    return (6, event_state) if event_code == 'ABS_HAT0X' else None
+  if main_mode != 1 or jog_mode not in (1, 2, 3):
+    return None
+  if event_code == 'ABS_HAT0X':
+    return ((0, 3, 5)[jog_mode - 1], -event_state)
+  if event_code == 'ABS_HAT0Y':
+    return ((1, 2, 4)[jog_mode - 1], event_state)
+  return None
+
+
+def _joint_jog_button_press(axis, direction, _event):
+  if int(RUN['IncJogStat'].get()) == 1:
+    _queue_joint_jog(
+      axis,
+      direction * float(incrementEntryField.get()),
+    )
+  else:
+    LiveJointJog((axis + 1) * 10 + int(direction > 0))
+
+
+def _bind_joint_jog_buttons(axis, negative_button, positive_button):
+  negative_button.bind(
+    "<ButtonPress>",
+    partial(_joint_jog_button_press, axis, -1),
+  )
+  positive_button.bind(
+    "<ButtonPress>",
+    partial(_joint_jog_button_press, axis, 1),
+  )
+  negative_button.bind("<ButtonRelease>", StopJog)
+  positive_button.bind("<ButtonRelease>", StopJog)
+
+
+def _spatial_jog_button_press(incremental_jog, live_jog, live_code, _event):
+  if int(RUN['IncJogStat'].get()) == 1:
+    incremental_jog(float(incrementEntryField.get()))
+  else:
+    live_jog(live_code)
+
+
+def _bind_spatial_jog_buttons(controls, live_jog):
+  for component, control in enumerate(controls, start=1):
+    for direction, (button, incremental_jog) in enumerate(zip(
+      control[:2], control[2:]
+    )):
+      button.bind(
+        "<ButtonPress>",
+        partial(
+          _spatial_jog_button_press,
+          incremental_jog,
+          live_jog,
+          component * 10 + direction,
+        ),
+      )
+      button.bind("<ButtonRelease>", StopJog)
+
+
 def _queue_joint_target(axis, target):
   return _queue_joint_motion(axis, target, absolute=True)
+
+
+def _bind_joint_target_sliders(sliders):
+  for axis, slider in enumerate(sliders):
+    slider.bind(
+      "<ButtonRelease-1>",
+      lambda _event, axis=axis, slider=slider: _queue_joint_target(
+        axis, slider.get()
+      ),
+    )
 
 
 def _queue_primary_joint_position(
@@ -21483,11 +24012,11 @@ def _queue_primary_joint_position(
             "another motion request"
           )
         if (
-          not legacy_serial_result_pending.is_set()
+          not serial_result_pending.is_set()
           and not motion_request_registry.active
         ):
           raise MotionQueueFault(
-            "controller transport is busy outside the legacy motion queue"
+            "controller transport is busy outside the motion queue"
           )
         deferred = True
         coalesced = deferred_joint_adjustments.set_targets(
@@ -21505,7 +24034,7 @@ def _queue_primary_joint_position(
         if live_serial_result_pending.is_set():
           status = "LIVE JOG IN PROGRESS"
         elif (
-          legacy_serial_result_pending.is_set()
+          serial_result_pending.is_set()
           or serial_lock.locked()
           or joint_motion_dispatcher.active
         ):
@@ -21645,71 +24174,6 @@ def _bind_joint_target_entry(axis, entry):
   entry.bind("<FocusOut>", restore_on_blur)
 
 
-def J1jogNeg(value):
-  _queue_joint_jog(0, -value)
-
-def J1jogPos(value):
-  _queue_joint_jog(0, value)
-
-def J2jogNeg(value):
-  _queue_joint_jog(1, -value)
-
-def J2jogPos(value):
-  _queue_joint_jog(1, value)
-
-def J3jogNeg(value):
-  _queue_joint_jog(2, -value)
-
-def J3jogPos(value):
-  _queue_joint_jog(2, value)
-
-def J4jogNeg(value):
-  _queue_joint_jog(3, -value)
-
-def J4jogPos(value):
-  _queue_joint_jog(3, value)
-
-def J5jogNeg(value):
-  _queue_joint_jog(4, -value)
-
-def J5jogPos(value):
-  _queue_joint_jog(4, value)
-
-def J6jogNeg(value):
-  _queue_joint_jog(5, -value)
-
-def J6jogPos(value):
-  _queue_joint_jog(5, value)
-
-
-
-
-def J7jogNeg(value):
-  _queue_joint_jog(6, -value)
-
-def J7jogPos(value):
-  _queue_joint_jog(6, value)
-
-
-
-def J8jogNeg(value):
-  _queue_joint_jog(7, -value)
-
-
-
-def J8jogPos(value):
-  _queue_joint_jog(7, value)
-
-
-def J9jogNeg(value):
-  _queue_joint_jog(8, -value)
-
-
-
-def J9jogPos(value):
-  _queue_joint_jog(8, value)
-
-
 def _live_jog_start_is_blocked():
   offline_operation = None
   if application_closing.is_set():
@@ -21817,6 +24281,7 @@ def _dispatch_live_jog(command, motion_name):
       completion_callback=lambda controller_position: _finish_motion_request(
         request_lease,
       ),
+      exchange=_exchange_live_jog,
     )
   except Exception:
     if motion_request_registry.owns(request_lease):
@@ -23637,40 +26102,6 @@ def teachReplaceSelected():
 ############################################################################################################################################################## 
 
 
-def MBreadHoldReg():
-  return _request_manual_modbus("BA")
-
-def MBreadCoil():
-  return _request_manual_modbus("BB")
-
-def MBreadInput():
-  return _request_manual_modbus("BC")
-
-def MBreadInputReg():
-  return _request_manual_modbus("BD")
-
-def MBwriteCoil():
-  return _request_manual_modbus("BE")
-
-def MBwriteReg():
-  return _request_manual_modbus("BF")
-
-@_tracked_serial_operation("ser")
-def QueryModbus():
-  #command = "HD"+"\n"
-  command = "MQ"+"\n"
-  response = _exchange_legacy_main_command(command)
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,response)
-
-@_tracked_serial_operation("ser")
-def FaultReset():
-  command = "FR"+"\n"
-  response = _exchange_legacy_main_command(command)
-  cmdSentEntryField.delete(0, 'end')
-  cmdSentEntryField.insert(0,response)    
-
-  
 def deleteitem():
   selRow = tab1.progView.curselection()[0]
   selection = tab1.progView.curselection()  
@@ -24036,6 +26467,13 @@ def WaitCMDInsert():
       message = "Please enter expected Modbus Input" 
       _set_application_status(text=message, style="Alarm.TLabel")
     value = "Wait MBinput - SlaveID (1) - Input # " + variable + " = " + inputVal + " : Timeout = " + timoutVal  
+
+  elif (option == "MB Hold Reg"):
+    if(inputVal == ""):
+      localErrorFlag = True
+      message = "Please enter expected Modbus holding-register value"
+      _set_application_status(text=message, style="Alarm.TLabel")
+    value = "Wait MBhold - SlaveID (1) - Input # " + variable + " = " + inputVal + " : Timeout = " + timoutVal
 
   if(not localErrorFlag):        
     tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8')) 
@@ -26246,85 +28684,6 @@ def getSel():
   manEntryField.delete(0, 'end')
   manEntryField.insert(0, command)  
   
-def Servo0on():
-  return _request_manual_servo(0, True, servo0onEntryField)
-
-
-def Servo0off():
-  return _request_manual_servo(0, False, servo0offEntryField)
-
-
-def Servo1on():
-  return _request_manual_servo(1, True, servo1onEntryField)
-
-
-def Servo1off():
-  return _request_manual_servo(1, False, servo1offEntryField)
-
-
-def Servo2on():
-  return _request_manual_servo(2, True, servo2onEntryField)
-
-
-def Servo2off():
-  return _request_manual_servo(2, False, servo2offEntryField)
-
-
-def Servo3on():
-  return _request_manual_servo(3, True, servo3onEntryField)
-
-
-def Servo3off():
-  return _request_manual_servo(3, False, servo3offEntryField)
-
-
-def DO1on():
-  return _request_manual_output(1, True, DO1onEntryField)
-
-
-def DO1off():
-  return _request_manual_output(1, False, DO1offEntryField)
-
-
-def DO2on():
-  return _request_manual_output(2, True, DO2onEntryField)
-
-
-def DO2off():
-  return _request_manual_output(2, False, DO2offEntryField)
-
-
-def DO3on():
-  return _request_manual_output(3, True, DO3onEntryField)
-
-
-def DO3off():
-  return _request_manual_output(3, False, DO3offEntryField)
-
-
-def DO4on():
-  return _request_manual_output(4, True, DO4onEntryField)
-
-
-def DO4off():
-  return _request_manual_output(4, False, DO4offEntryField)
-
-
-def DO5on():
-  return _request_manual_output(5, True, DO5onEntryField)
-
-
-def DO5off():
-  return _request_manual_output(5, False, DO5offEntryField)
-
-
-def DO6on():
-  return _request_manual_output(6, True, DO6onEntryField)
-
-
-def DO6off():
-  return _request_manual_output(6, False, DO6offEntryField)
-
 def CalcLinDist(X2,Y2,Z2):
   # global RUN['LineDist']
   X1 = CAL['XcurPos']
@@ -26357,30 +28716,279 @@ def _calibration_available():
   return False
 
 
+def _exchange_json_home_reference(binding, response_timeout):
+  client = binding.json_client
+  if not isinstance(client, JsonMainControllerClient):
+    raise ProtocolResponseError(
+      "JSON home-reference query lost controller ownership"
+    )
+  terminal = _exchange_json_completed_request(
+    binding,
+    getattr(client, "request_home_reference", None),
+    {},
+    response_timeout,
+    None,
+    "get_home_reference",
+    "home-reference query",
+    JsonMainHomeReferenceResult,
+  )
+  result = terminal.parsed_result
+  return PrimaryHomeReference(result.valid, result.positions_degrees)
+
+
+def _require_calibration_home_reference_route(serial_port):
+  binding = _current_main_controller_identity(serial_port)
+  if binding is None:
+    raise ConnectionError(
+      "calibration requires the bound controller identity"
+    )
+  if not isinstance(binding.json_client, JsonMainControllerClient):
+    raise ProtocolResponseError(
+      "JSON calibration lost controller ownership"
+    )
+
+
 def _query_primary_home_reference(serial_port):
   binding = _current_main_controller_identity(serial_port)
   if binding is None:
     raise ConnectionError(
       "home-reference query requires the bound controller"
     )
-  command = primary_home_reference_command(
-    binding.identity.protocol_capabilities
+  return _exchange_json_home_reference(
+    binding,
+    SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
   )
-  if command is None:
-    return None
-  response = _exchange_legacy_main_command(
-    command,
-    response_timeout=SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
-    expected_serial_port=serial_port,
-  )
-  try:
-    return parse_primary_home_reference_capability_response(
-      response,
-      binding.identity.protocol_capabilities,
+
+
+def _exchange_json_calibration(
+  command,
+  binding,
+  response_timeout,
+  response_requirement,
+  write_commitment,
+):
+  if not isinstance(command, PreparedCalibrationCommand):
+    raise MotionInputError("JSON calibration command is invalid")
+  client = binding.json_client
+  if not isinstance(client, JsonMainControllerClient):
+    raise ProtocolResponseError(
+      "persistent JSON calibration lacks a valid client"
     )
-  except ProtocolResponseError as exc:
-    reason = f"controller home-reference response is invalid: {exc}"
-    raise ProtocolResponseError(reason) from exc
+  stop_context = _capture_main_controller_stop_context(client.serial_port)
+
+  def admit_write():
+    with application_lifecycle_lock:
+      if response_requirement.is_set():
+        return False
+      write_commitment.set()
+      return True
+
+  ticket = None
+  try:
+    ticket = client.request_calibrate(
+      axes=command.axes,
+      offsets=command.offsets,
+      timeout=response_timeout,
+      write_admission=admit_write,
+    )
+    terminal, stop_published = _await_json_joint_motion_terminal(
+      client,
+      ticket,
+      None,
+      stop_context,
+      False,
+      command_name="calibrate",
+      motion_name="calibration",
+    )
+    if (
+      terminal.response.status == "completed"
+      and not isinstance(terminal.parsed_result, JsonMainCalibrationResult)
+    ):
+      raise ProtocolResponseError(
+        "JSON calibration terminal result has an invalid type"
+      )
+    result = _json_joint_motion_terminal_result(
+      terminal,
+      stop_context,
+      stop_published,
+      motion_name="calibration",
+      positionless_rejection_codes=("calibration_not_representable",),
+    )
+  except BaseException:
+    cleanup_required = (
+      ticket is not None
+      or client.quarantined
+      or write_commitment.is_set()
+    )
+    if ticket is None:
+      try:
+        cleanup_required = (
+          client.pending_motion_ticket is not None
+          or cleanup_required
+        )
+      except BaseException:
+        cleanup_required = True
+    if cleanup_required:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON calibration failure cleanup",
+      )
+    raise
+
+  if position_response_is_physical_estop(result.position):
+    try:
+      quarantine_serial_transport(
+        client.serial_port,
+        "JSON calibration physical E-stop requires reconnection",
+      )
+    finally:
+      _require_main_controller_identity_cleanup(
+        client.serial_port,
+        "JSON calibration physical-stop quarantine",
+      )
+  return result
+
+
+def _calibration_response_timeout(command):
+  if not isinstance(command, PreparedCalibrationCommand):
+    raise MotionInputError("calibration timeout command is invalid")
+  calibration = _current_controller_joint_calibration()
+
+  def controller_float(value, field_name):
+    return float(controller_protocol_decimal(value, field_name))
+
+  def axis_float(values, axis, field_name):
+    return controller_float(values[axis - 1], f"J{axis} {field_name}")
+
+  minimum_delay = controller_float(
+    _runtime_number('minSpeedDelay'), "controller minimum step delay",
+  )
+  if minimum_delay <= 0:
+    raise MotionInputError("controller minimum step delay must be positive")
+  step_limits = []
+  release_limits = []
+  for axis, selected in enumerate(command.axes, start=1):
+    if not selected:
+      continue
+    negative = axis_float(calibration.negative_limits, axis, "negative limit")
+    positive = axis_float(calibration.positive_limits, axis, "positive limit")
+    scale = axis_float(calibration.steps_per_unit, axis, "steps per unit")
+    travel = controller_float(negative + positive, f"J{axis} calibrated travel")
+    step_limit = int(controller_float(
+      travel * scale, f"J{axis} calibrated step limit",
+    ))
+    if step_limit <= 0:
+      raise MotionInputError(
+        f"J{axis} calibration travel must contain at least one step"
+      )
+    step_limits.append(step_limit)
+    release_step_limit = math.ceil(
+      scale * FIRMWARE_CALIBRATION_RELEASE_TRAVEL_UNITS
+    )
+    release_limits.append(min(step_limit, release_step_limit))
+
+  total_steps = sum(step_limits)
+  maximum_steps = max(step_limits)
+  # Search and release loops inspect every axis on each iteration; retain the
+  # coordinated-drive distribution budget as conservative per-loop work.
+  axis_work = (
+    FIRMWARE_DISTRIBUTION_DELAY_MICROSECONDS * FIRMWARE_AXIS_COUNT
+  )
+
+  def percentage_step_gap(speed_percent):
+    speed_ratio = controller_float(
+      speed_percent / 100.0, "calibration speed ratio",
+    )
+    return math.ceil(controller_float(
+      minimum_delay / speed_ratio, "calibration step gap",
+    ))
+
+  def maximum_stage_iterations(maximum_progress_steps, minimum_loop_delay):
+    candidate_iterations = (
+      FIRMWARE_CALIBRATION_SWITCH_STABLE_MICROSECONDS
+      + minimum_loop_delay - 1
+    ) // minimum_loop_delay
+    return (
+      (maximum_progress_steps + 1) * (candidate_iterations + 1) + 1
+    )
+
+  search_microseconds = sum(
+    total_steps * (
+      percentage_step_gap(speed) + FIRMWARE_CALIBRATION_STEP_PULSE_MICROSECONDS
+    )
+    + maximum_stage_iterations(
+      total_steps,
+      FIRMWARE_CALIBRATION_SEARCH_LOOP_MICROSECONDS,
+    ) * (
+      FIRMWARE_CALIBRATION_SEARCH_LOOP_MICROSECONDS + axis_work
+    )
+    for speed in FIRMWARE_CALIBRATION_SEARCH_SPEED_PERCENTAGES
+  )
+  release_step_gap = percentage_step_gap(
+    FIRMWARE_CALIBRATION_RELEASE_SPEED_PERCENT
+  )
+  release_microseconds = (
+    sum(release_limits) * FIRMWARE_CALIBRATION_STEP_PULSE_MICROSECONDS
+    + maximum_stage_iterations(
+      sum(release_limits),
+      release_step_gap,
+    ) * (
+      release_step_gap + axis_work
+    )
+  )
+  center_tick_microseconds = max(
+    math.ceil(
+      minimum_delay
+      * FIRMWARE_CALIBRATION_CENTER_MAXIMUM_DELAY_MULTIPLIER
+    ),
+    math.ceil(minimum_delay) + axis_work,
+  )
+  center_microseconds = maximum_steps * center_tick_microseconds
+  motion_seconds = sum((
+    search_microseconds, release_microseconds, center_microseconds,
+  )) / 1_000_000.0
+  timeout = max(
+    float(SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS),
+    motion_seconds + SERIAL_RESPONSE_MARGIN_SECONDS,
+  )
+  if not math.isfinite(timeout):
+    raise MotionInputError("calibration response deadline is not representable")
+  return timeout
+
+
+def _exchange_calibration_command(
+  serial_port,
+  command,
+  response_requirement,
+  write_commitment,
+):
+  if not isinstance(command, PreparedCalibrationCommand):
+    raise MotionInputError("calibration command is invalid")
+  binding = _current_main_controller_identity(serial_port)
+  if binding is None:
+    raise ConnectionError(
+      "calibration requires the bound controller identity"
+    )
+  if not isinstance(binding.json_client, JsonMainControllerClient):
+    raise ProtocolResponseError("JSON calibration lost controller ownership")
+  return _exchange_json_calibration(
+    command,
+    binding,
+    _calibration_response_timeout(command),
+    response_requirement,
+    write_commitment,
+  )
+
+
+def _calibration_command_display(serial_port, command):
+  if not isinstance(command, PreparedCalibrationCommand):
+    raise MotionInputError("calibration display command is invalid")
+  binding = _current_main_controller_identity(serial_port)
+  if binding is None:
+    raise ConnectionError(
+      "calibration display requires the bound controller identity"
+    )
+  return "calibrate"
 
 
 def _apply_calibration_home_reference(
@@ -26420,6 +29028,32 @@ def _binary_controller_flag(value, field_name):
   return int(number)
 
 
+@dataclass(frozen=True)
+class PreparedCalibrationCommand:
+  axes: tuple
+  offsets: tuple
+
+  def __post_init__(self):
+    if (
+      type(self.axes) is not tuple
+      or len(self.axes) != 9
+      or any(type(selected) is not bool for selected in self.axes)
+      or not any(self.axes)
+    ):
+      raise MotionInputError(
+        "prepared calibration axes must select at least one of J1-J9"
+      )
+    if type(self.offsets) is not tuple or len(self.offsets) != 9:
+      raise MotionInputError(
+        "prepared calibration offsets must contain J1-J9 values"
+      )
+    normalized_offsets = tuple(
+      finite_number(value, f"J{axis} calibration offset")
+      for axis, value in enumerate(self.offsets, start=1)
+    )
+    object.__setattr__(self, "offsets", normalized_offsets)
+
+
 def _prepare_calibration_command(selections):
   if isinstance(selections, (str, bytes)):
     raise MotionInputError("calibration selections must be a numeric sequence")
@@ -26441,9 +29075,9 @@ def _prepare_calibration_command(selections):
     finite_number(CAL[f'J{axis}calOff'], f"J{axis} calibration offset")
     for axis in range(1, 10)
   )
-  return _build_startup_numeric_command(
-    "LL",
-    zip(tuple("ABCDEFGHIJKLMNOPQR"), normalized_selections + offsets),
+  return PreparedCalibrationCommand(
+    tuple(bool(selected) for selected in normalized_selections),
+    offsets,
   )
 
 
@@ -26468,11 +29102,21 @@ def _record_calibration_response(
   parsed_position = None
   applied_position = None
   position_validation_reason = None
-  if isinstance(response, str):
+  operation_error = None
+  confirmed_position_unchanged = False
+  raw_response = response
+  if isinstance(response, JointMotionExchangeResult):
+    raw_response = response.response
+    parsed_position = response.position
+    operation_error = response.error
+    confirmed_position_unchanged = response.confirmed_position_unchanged
+  elif isinstance(response, str):
     try:
       parsed_position = parse_position_response(response)
     except ProtocolResponseError:
       pass
+  elif response is not None:
+    raise TypeError("calibration response has an invalid type")
   if parsed_position is not None:
     try:
       _current_controller_joint_calibration().validate_positions(
@@ -26483,29 +29127,51 @@ def _record_calibration_response(
       position_validation_reason = (
         "calibration command returned a position outside calibrated limits"
       )
-  if parsed_position is not None and parsed_position.flag:
-    ErrorHandler(parsed_position.flag)
-    succeeded = False
-    if controller_write_started:
-      _invalidate_uncertain_controller_calibration(
-        "calibration command ended with a controller motion fault"
-      )
-  else:
-    applied_position = (
-      _apply_valid_position_response(response)
-      if parsed_position is not None
-      else None
-    )
-    succeeded = applied_position is not None
+  physical_stop_position = position_response_is_physical_estop(
+    parsed_position
+  )
+  if physical_stop_position:
+    # The correlated stop publisher owns Tk presentation and authoritative
+    # position application; calibration settlement must not compete with it.
+    applied_position = parsed_position
+  elif parsed_position is not None:
+    applied_position = displayPosition(raw_response, parsed=parsed_position)
     if (
-      parsed_position is not None
-      and applied_position is None
+      applied_position is None
       and controller_write_started
     ):
       _invalidate_uncertain_controller_calibration(
         "calibration command position could not be applied"
       )
-  if parsed_position is None and controller_write_started:
+  position_fault = (
+    parsed_position is not None
+    and bool(parsed_position.flag)
+  )
+  succeeded = (
+    applied_position is not None
+    and not position_fault
+    and operation_error is None
+  )
+  if (
+    controller_write_started
+    and applied_position is not None
+    and (position_fault or operation_error is not None)
+  ):
+    _invalidate_uncertain_controller_calibration(
+      (
+        "calibration command ended with a controller motion fault"
+        if position_fault
+        else (
+          "calibration command failed after controller motion: "
+          + operation_error
+        )
+      )
+    )
+  if (
+    parsed_position is None
+    and controller_write_started
+    and not confirmed_position_unchanged
+  ):
     _invalidate_uncertain_controller_calibration(
       position_validation_reason
       or uncertainty_reason
@@ -26526,7 +29192,7 @@ def _record_calibration_response(
     and applied_position.speed_violation
   ):
     _set_application_status(message, style)
-  if succeeded and update_virtual:
+  if applied_position is not None and not position_fault and update_virtual:
     RUN['VR_angles'] = [
       float(CAL['J1AngCur']),
       float(CAL['J2AngCur']),
@@ -26536,6 +29202,9 @@ def _record_calibration_response(
       float(CAL['J6AngCur']),
     ]
     setStepMonitorsVR()
+
+  if operation_error is not None:
+    logger.error("Calibration controller result: %s", operation_error)
 
   if succeeded:
     logger.info(message)
@@ -26548,17 +29217,16 @@ def _record_calibration_response(
 
 @dataclass(frozen=True)
 class CalibrationStage:
-  command: str
+  command: PreparedCalibrationCommand
   success_message: str
   failure_message: str
   update_virtual: bool = True
 
   def __post_init__(self):
-    object.__setattr__(
-      self,
-      "command",
-      _validated_startup_command(self.command, "LL"),
-    )
+    if not isinstance(self.command, PreparedCalibrationCommand):
+      raise MotionInputError(
+        "calibration stage requires a prepared semantic command"
+      )
     for field_name in ("success_message", "failure_message"):
       value = getattr(self, field_name)
       if (
@@ -27029,20 +29697,24 @@ def _run_calibration_stage_safe(
     with _require_calibration_terminal_response(
       write_commitment
     ) as response_requirement:
-      response = _exchange_main_controller_line_until_cancelled(
+      response = _exchange_calibration_command(
         serial_port,
         command,
         response_requirement,
-        write_boundary_lock=application_lifecycle_lock,
-        write_started_event=write_commitment,
+        write_commitment,
       )
-      try:
-        home_reference = _query_primary_home_reference(serial_port)
-      except Exception as exc:
-        home_reference_error = (
-          " ".join(str(exc).split())
-          or exc.__class__.__name__
-        )
+      response_allows_reference_query = (
+        not isinstance(response, JointMotionExchangeResult)
+        or not position_response_is_physical_estop(response.position)
+      )
+      if response_allows_reference_query:
+        try:
+          home_reference = _query_primary_home_reference(serial_port)
+        except Exception as exc:
+          home_reference_error = (
+            " ".join(str(exc).split())
+            or exc.__class__.__name__
+          )
     event = CalibrationWorkerResult(
       worker_token,
       request_id,
@@ -27096,7 +29768,10 @@ def _start_calibration_stage_worker(operation):
 
   try:
     cmdSentEntryField.delete(0, 'end')
-    cmdSentEntryField.insert(0, stage.command)
+    cmdSentEntryField.insert(
+      0,
+      _calibration_command_display(operation.serial_port, stage.command),
+    )
     _set_calibration_status(
       f"{operation.name.upper()} IN PROGRESS",
       "OK.TLabel",
@@ -27165,6 +29840,7 @@ def _start_calibration_sequence(name, stages, completion_callback=None):
       raise SerialTransportQuarantinedError(
         "calibration requires a reconnected controller transport"
       )
+    _require_calibration_home_reference_route(serial_port)
     with calibration_operation_lock:
       if calibration_operation is not None:
         raise RuntimeError("another calibration operation is already active")
@@ -27238,7 +29914,7 @@ def _claim_calibration_worker_result(event):
   if event_type == "completed":
     if (
       not write_started
-      or not isinstance(response, str)
+      or not isinstance(response, (str, JointMotionExchangeResult))
       or error is not None
     ):
       raise RuntimeError("calibration worker emitted an invalid success result")
@@ -27344,8 +30020,16 @@ def _apply_calibration_worker_result(event):
     home_reference_error,
   ) = _claim_calibration_worker_result(event)
   try:
+    response_text = (
+      response.response
+      if isinstance(response, JointMotionExchangeResult)
+      else response
+    )
     cmdRecEntryField.delete(0, 'end')
-    cmdRecEntryField.insert(0, response if event_type == "completed" else error)
+    cmdRecEntryField.insert(
+      0,
+      response_text if event_type == "completed" else error,
+    )
     if event_type == "failed":
       logger.error("Calibration controller exchange failed: %s", error)
     reference_synchronized = True
@@ -27455,27 +30139,35 @@ def _execute_calibration_command(
   home_reference_error = None
   try:
     try:
+      _require_calibration_home_reference_route(serial_port)
       with _require_calibration_terminal_response(
         write_commitment
       ) as response_requirement:
         cmdSentEntryField.delete(0, 'end')
-        cmdSentEntryField.insert(0, command)
-        response = _exchange_main_controller_line_until_cancelled(
+        cmdSentEntryField.insert(
+          0,
+          _calibration_command_display(serial_port, command),
+        )
+        response = _exchange_calibration_command(
           serial_port,
           command,
           response_requirement,
-          write_boundary_lock=application_lifecycle_lock,
-          write_started_event=write_commitment,
+          write_commitment,
         )
-        try:
-          home_reference = _query_primary_home_reference(
-            serial_port
-          )
-        except Exception as exc:
-          home_reference_error = (
-            " ".join(str(exc).split())
-            or exc.__class__.__name__
-          )
+        response_allows_reference_query = (
+          not isinstance(response, JointMotionExchangeResult)
+          or not position_response_is_physical_estop(response.position)
+        )
+        if response_allows_reference_query:
+          try:
+            home_reference = _query_primary_home_reference(
+              serial_port
+            )
+          except Exception as exc:
+            home_reference_error = (
+              " ".join(str(exc).split())
+              or exc.__class__.__name__
+            )
     except Exception:
       if write_commitment.is_set():
         uncertainty_reason = (
@@ -27484,8 +30176,13 @@ def _execute_calibration_command(
       logger.exception("Calibration controller exchange failed")
 
     try:
+      response_text = (
+        response.response
+        if isinstance(response, JointMotionExchangeResult)
+        else response
+      )
       cmdRecEntryField.delete(0, 'end')
-      cmdRecEntryField.insert(0, "" if response is None else response)
+      cmdRecEntryField.insert(0, "" if response_text is None else response_text)
       reference_synchronized = True
       if home_reference is not None:
         reference_synchronized = _apply_calibration_home_reference(
@@ -27780,7 +30477,7 @@ def correctPos():
 
 @_tracked_serial_operation("ser")
 def requestPos():
-  response = _exchange_serial_line("RP\n")
+  response = _exchange_main_controller_position()
   return _apply_controller_position_response(response)
 
 
@@ -27892,7 +30589,7 @@ def _prepare_update_parameters_from_values(source_values):
   calibration_switch_mask = encode_calibration_switch_mask(
     tuple(values[f'J{axis}CalSwitch'] for axis in range(1, 10))
   )
-  _robot_joint_calibration_from_values(values)
+  joint_calibration = _robot_joint_calibration_from_values(values)
   encoder_multipliers = []
   for axis in range(1, 7):
     drive_key = f'J{axis}DriveMS'
@@ -27918,9 +30615,15 @@ def _prepare_update_parameters_from_values(source_values):
     encoder_counts = int(encoder_counts)
     values[drive_key] = drive_microsteps
     values[encoder_key] = encoder_counts
-    encoder_multipliers.append(controller_ratio(
+    encoder_multiplier = controller_ratio(
       encoder_counts,
       drive_microsteps,
+      f"J{axis} encoder multiplier",
+    )
+    encoder_multipliers.append(validate_controller_encoder_scale(
+      joint_calibration,
+      axis,
+      encoder_multiplier,
       f"J{axis} encoder multiplier",
     ))
 
@@ -28010,41 +30713,38 @@ def _exchange_controller_calibration_acknowledgement(
   command,
   write_started_event=None,
 ):
-  invalidates_home_reference = (
-    isinstance(command, str)
-    and command.startswith("UP")
-  )
-  if invalidates_home_reference and write_started_event is None:
-    write_started_event = threading.Event()
   serial_port = RUN.get('ser')
-  acknowledged = False
+  json_preparation = _prepare_bound_main_controller_json_configuration(
+    serial_port
+  )
+  binding, json_configuration, _ = json_preparation
   try:
-    acknowledged = _exchange_legacy_main_command(
-      command,
-      read_line=False,
-      expected_response=b"Done",
-      response_timeout=SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
-      write_started_event=write_started_event,
-    ) == "Done"
+    if command.startswith("UP"):
+      command_name = "update_params"
+      parameters = json_configuration.update_params
+    elif command.startswith("CE"):
+      command_name = "config_ext_axis"
+      parameters = json_configuration.config_ext_axis
+    else:
+      raise MotionInputError(
+        "controller calibration command is invalid for JSON"
+      )
+    acknowledged = _exchange_json_configuration_acknowledgement(
+      binding,
+      command_name,
+      parameters,
+      SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+      write_started_event,
+    )
   finally:
-    try:
-      if (
-        invalidates_home_reference
-        and write_started_event.is_set()
-      ):
-        _invalidate_bound_primary_home_reference(serial_port)
-    finally:
-      if (
-        RUN.get('ser') is serial_port
-        and not getattr(serial_port, "is_open", False)
-      ):
-        RUN['ser'] = None
-        _require_main_controller_identity_cleanup(
-          serial_port,
-          "controller calibration exchange cleanup",
-        )
-  if acknowledged and invalidates_home_reference:
-    _bind_main_controller_configuration(serial_port, command)
+    if (
+      RUN.get('ser') is serial_port
+      and not getattr(serial_port, "is_open", False)
+    ):
+      _require_main_controller_identity_cleanup(
+        serial_port,
+        "controller calibration exchange cleanup",
+      )
   return acknowledged
 
 
@@ -28094,6 +30794,7 @@ def _apply_single_calibration_transaction(
   snapshot = snapshot_calibration_values(CAL)
   try:
     apply_values(values)
+    position_command = _prepare_position_command()
   except Exception:
     logger.exception("Local calibration application failed during %s", context)
     return _restore_prewrite_calibration(snapshot, context)
@@ -28118,6 +30819,27 @@ def _apply_single_calibration_transaction(
         f"controller calibration acknowledgement was invalid during {context}"
       )
     return _restore_prewrite_calibration(snapshot, context)
+  try:
+    position_acknowledged = _exchange_position_acknowledgement(
+      position_command
+    )
+  except Exception:
+    logger.exception(
+      "Controller position synchronization failed during %s",
+      context,
+    )
+    return _invalidate_uncertain_controller_calibration(
+      f"controller position synchronization failed during {context}"
+    )
+  if position_acknowledged is not True:
+    logger.error(
+      "Controller position synchronization returned a non-true "
+      "acknowledgement during %s",
+      context,
+    )
+    return _invalidate_uncertain_controller_calibration(
+      f"controller position synchronization was invalid during {context}"
+    )
   return True
 
 
@@ -28261,6 +30983,34 @@ def _prepare_controller_calibration():
   return update_values, update_command, external_values, external_command
 
 
+def _prepare_bound_main_controller_json_configuration(
+  serial_port,
+  position_target=None,
+):
+  binding = _current_main_controller_identity(serial_port)
+  if binding is None or not isinstance(
+    binding.json_client,
+    JsonMainControllerClient,
+  ):
+    raise ProtocolResponseError(
+      "JSON controller configuration lost controller ownership"
+    )
+  update_values, update_command = _prepare_update_parameters_from_values(CAL)
+  external_values, _ = _prepare_external_axis_parameters_from_values(
+    CAL,
+    CAL,
+  )
+  if position_target is None:
+    position_target = _prepare_position_target(CAL)
+  configuration = _prepare_main_controller_json_startup_configuration(
+    update_values,
+    external_values,
+    position_target,
+    CAL,
+  )
+  return binding, configuration, update_command
+
+
 def _apply_controller_calibration(update_values, external_values):
   snapshot = snapshot_calibration_values(CAL)
   try:
@@ -28299,53 +31049,93 @@ def calExtAxis(transmit=True):
     "external-axis application",
   )
 
-@_synchronous_motion_request("Zero external axis 7")
-@_tracked_serial_operation("ser")
+def _complete_external_axis_zero(axis, request_lease, response):
+  try:
+    if (
+      not isinstance(response, PositionResponse)
+      or position_response_is_physical_estop(response)
+      or response.flag
+    ):
+      return False
+
+    status = f"J{axis} Calibration Forced to Zero"
+    _set_application_status(text=status, style="Warn.TLabel")
+    message = f"{status} - this is for commissioning and testing - be careful!"
+    logger.warning(message)
+    with open("ErrorLog", "wb") as error_log:
+      pickle.dump(tab8.ElogView.get(0, END), error_log)
+    return True
+  finally:
+    _finish_motion_request(request_lease)
+
+
+def _start_external_axis_zero(axis):
+  if type(axis) is not int or axis not in (7, 8, 9):
+    raise MotionInputError("external-axis zero axis is invalid")
+  motion_name = f"Zero external axis {axis}"
+  binding = _current_main_controller_identity()
+  serial_port = None if binding is None else binding.serial_port
+  if binding is None:
+    message = f"{motion_name} not started; controller identity is unavailable"
+    logger.warning(message)
+    _set_application_status(message, "Warn.TLabel")
+    return False
+  if not isinstance(binding.json_client, JsonMainControllerClient):
+    message = f"{motion_name} not started; JSON ownership is unavailable"
+    logger.warning(message)
+    _set_application_status(message, "Warn.TLabel")
+    return False
+  request_lease = _acquire_motion_request(motion_name)
+  if request_lease is None:
+    message = _motion_request_rejection_message(
+      f"{motion_name} not started; another motion request is active"
+    )
+    _set_application_status(message, "Warn.TLabel")
+    return False
+
+  try:
+    write_started_event = threading.Event()
+    started = _start_controller_motion(
+      f"Z{axis}\n",
+      motion_name,
+      completion_callback=lambda response: _complete_external_axis_zero(
+        axis, request_lease, response,
+      ),
+      request_lease=request_lease,
+      write_started_event=write_started_event,
+      exchange=partial(
+        _exchange_external_axis_zero,
+        expected_serial_port=serial_port,
+        expected_binding=binding,
+      ),
+    )
+  except Exception:
+    if motion_request_registry.owns(request_lease):
+      _finish_motion_request(request_lease)
+    logger.exception("Unable to start J%s external-axis zero", axis)
+    _set_application_status(
+      f"J{axis} CALIBRATION ZERO NOT STARTED",
+      "Alarm.TLabel",
+    )
+    return False
+  if not started:
+    if motion_request_registry.owns(request_lease):
+      _finish_motion_request(request_lease)
+    return False
+  _set_application_status(f"J{axis} CALIBRATION ZERO IN PROGRESS", "Warn.TLabel")
+  return True
+
+
 def zeroAxis7():
-  command = "Z7"+"\n"
-  response = _exchange_legacy_main_command(command)
-  if not _apply_controller_position_response(response):
-    return False
-  _set_application_status(text="J7 Calibration Forced to Zero", style="Warn.TLabel")
-  message = "J7 Calibration Forced to Zero - this is for commissioning and testing - be careful!"
-  #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  #tab8.ElogView.insert(END, Curtime+" - "+message)
-  logger.warning(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb"))  
-  return True
+  return _start_external_axis_zero(7)
 
-@_synchronous_motion_request("Zero external axis 8")
-@_tracked_serial_operation("ser")
+
 def zeroAxis8():
-  command = "Z8"+"\n"
-  response = _exchange_legacy_main_command(command)
-  if not _apply_controller_position_response(response):
-    return False
-  _set_application_status(text="J8 Calibration Forced to Zero", style="Warn.TLabel")
-  message = "J8 Calibration Forced to Zero - this is for commissioning and testing - be careful!"
-  #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  #tab8.ElogView.insert(END, Curtime+" - "+message)
-  logger.warning(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb"))  
-  return True
+  return _start_external_axis_zero(8)
 
-@_synchronous_motion_request("Zero external axis 9")
-@_tracked_serial_operation("ser")
+
 def zeroAxis9():
-  command = "Z9"+"\n"
-  response = _exchange_legacy_main_command(command)
-  if not _apply_controller_position_response(response):
-    return False
-  _set_application_status(text="J9 Calibration Forced to Zero", style="Warn.TLabel")
-  message = "J9 Calibration Forced to Zero - this is for commissioning and testing - be careful!"
-  #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-  #tab8.ElogView.insert(END, Curtime+" - "+message)
-  logger.warning(message)
-  value=tab8.ElogView.get(0,END)
-  pickle.dump(value,open("ErrorLog","wb"))  
-  return True
+  return _start_external_axis_zero(9)
 
 
 def _acknowledged_forced_position_target_value():
@@ -28387,7 +31177,7 @@ def _clear_acknowledged_forced_position_target():
     acknowledged_forced_position_target = None
 
 
-def _prepare_position_command(calibration_values=None):
+def _prepare_position_target(calibration_values=None):
   positions = _acknowledged_forced_position_target_value()
   if positions is None:
     positions = _current_joint_positions()
@@ -28396,10 +31186,29 @@ def _prepare_position_command(calibration_values=None):
     if calibration_values is None
     else _controller_joint_calibration_from_values(calibration_values)
   )
-  calibration.validate_positions(positions)
+  return calibration.validate_positions(positions)
+
+
+def _position_command_from_target(positions):
+  if isinstance(positions, (str, bytes)):
+    raise MotionInputError("controller position target must be a numeric sequence")
+  try:
+    positions = tuple(positions)
+  except TypeError as exc:
+    raise MotionInputError(
+      "controller position target must be a numeric sequence"
+    ) from exc
+  if len(positions) != 9:
+    raise MotionInputError("controller position target must contain 9 values")
   return _build_startup_numeric_command(
     "SP",
     zip(tuple("ABCDEFGHI"), positions),
+  )
+
+
+def _prepare_position_command(calibration_values=None):
+  return _position_command_from_target(
+    _prepare_position_target(calibration_values)
   )
 
 
@@ -28436,7 +31245,7 @@ def _prepare_forced_position_command(primary_positions):
 
 def _force_controller_position(primary_positions):
   command, target = _prepare_forced_position_request(primary_positions)
-  if _exchange_position_acknowledgement(command) is not True:
+  if _exchange_position_acknowledgement(command, target) is not True:
     return False
   try:
     _record_acknowledged_forced_position_target(target)
@@ -28449,22 +31258,27 @@ def _force_controller_position(primary_positions):
 
 
 @_tracked_serial_operation("ser")
-def _exchange_position_acknowledgement(command):
+def _exchange_position_acknowledgement(command, position_target=None):
   command = _validated_startup_command(command, "SP")
   serial_port = RUN.get('ser')
   write_started = threading.Event()
+  json_preparation = _prepare_bound_main_controller_json_configuration(
+    serial_port,
+    position_target
+  )
+  binding, json_configuration, configuration_command = json_preparation
+  configuration_sync_required = False
   try:
-    response = _exchange_legacy_main_command(
-      command,
-      response_timeout=SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
-      accepted_responses=("Done",),
-      write_started_event=write_started,
+    configuration_sync_required = (
+      binding.json_client.configuration_sync_required
     )
-    if response != "Done":
-      raise ProtocolResponseError(
-        "controller returned an invalid set-position acknowledgement"
-      )
-    return True
+    acknowledged = _exchange_json_configuration_acknowledgement(
+      binding,
+      "set_position",
+      json_configuration.set_position,
+      SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+      write_started,
+    )
   except Exception:
     if write_started.is_set():
       try:
@@ -28485,11 +31299,16 @@ def _exchange_position_acknowledgement(command):
         RUN.get('ser') is serial_port
         and not getattr(serial_port, "is_open", False)
       ):
-        RUN['ser'] = None
         _require_main_controller_identity_cleanup(
           serial_port,
           "controller position exchange cleanup",
         )
+  if acknowledged and configuration_sync_required:
+    _bind_main_controller_configuration(
+      serial_port,
+      configuration_command,
+    )
+  return acknowledged
 
 
 @_synchronous_motion_request("Set controller position")
@@ -29516,7 +32335,6 @@ def _invalidate_uncertain_controller_calibration(reason):
         RUN.get('ser') is serial_port
         and not getattr(serial_port, "is_open", False)
       ):
-        RUN['ser'] = None
         try:
           _require_main_controller_identity_cleanup(
             serial_port,
@@ -29564,6 +32382,7 @@ def SaveAndApplyCalibration():
     staged_values.update(external_values)
     staged_values = normalize_calibration_data(staged_values)
     _validate_controller_pose(staged_values)
+    position_command = _prepare_position_command(staged_values)
     field_values = {
       key: staged_values[key]
       for key in field_values
@@ -29650,6 +32469,23 @@ def SaveAndApplyCalibration():
     )
     return _invalidate_uncertain_controller_calibration(
       "external-axis calibration was not applied after primary calibration"
+    )
+
+  try:
+    position_acknowledged = _exchange_position_acknowledgement(
+      position_command
+    )
+  except Exception:
+    logger.exception("Controller position synchronization failed")
+    return _invalidate_uncertain_controller_calibration(
+      "controller position synchronization failed after calibration"
+    )
+  if position_acknowledged is not True:
+    logger.error(
+      "Controller position synchronization returned a non-true result"
+    )
+    return _invalidate_uncertain_controller_calibration(
+      "controller position synchronization was invalid after calibration"
     )
 
   try:
@@ -32088,6 +34924,7 @@ def GCplayProg(
         if execution_request is not None
         else None
       ),
+      exchange=_exchange_gcode_playback,
     )
   except Exception:
     logger.exception("Unable to start G-code playback worker")
@@ -32472,14 +35309,53 @@ def _exchange_gcode_row(command):
           raise MotionInputError("G-code run state is invalid")
         return conversion_cancelled or closing or run_state != 1
 
+      @staticmethod
+      def write_reservation():
+        return gcode_conversion_cancel_lock
+
     try:
       try:
-        return _exchange_legacy_main_command(
-          command,
+        if GCodeRowCancellationBoundary.is_set():
+          raise SerialActivityRejected(
+            "G-code row cancelled before JSON submission"
+          )
+        filename_index = command.find("Fn")
+        media_index = filename_index - CONTROLLER_MEDIA_ID_LENGTH - 2
+        if (
+          filename_index < 0
+          or media_index < 0
+          or command[media_index:media_index + 2] != "Mi"
+        ):
+          raise MotionInputError(
+            "G-code row storage identity is invalid"
+          )
+        media_id = validate_controller_media_id(
+          command[media_index + 2:filename_index]
+        )
+        filename = _validate_gcode_storage_filename(
+          command[filename_index + 2:-1],
+          "G-code row filename",
+        )
+        terminal = _exchange_json_main_command(
+          "write_gcode_move",
+          {
+            "media_id": media_id,
+            "filename": filename,
+            "motion": _json_cartesian_motion_parameters(command),
+          },
           response_timeout=response_timeout,
           write_started_event=threading.Event(),
-          cancellation_event=GCodeRowCancellationBoundary(),
-          write_boundary_lock=gcode_conversion_cancel_lock,
+          write_cancellation_boundary=GCodeRowCancellationBoundary(),
+          result_type=JsonMainPositionResult,
+          return_terminal=True,
+        )
+        result = terminal.parsed_result
+        return _json_joint_position_response(
+          _canonical_json_message_text(terminal.response),
+          result,
+          speed_violation=result.speed_limited,
+          debug=result.controller_debug,
+          flag=result.motion_fault,
         )
       except SerialActivityRejected:
         return None
@@ -32488,7 +35364,6 @@ def _exchange_gcode_row(command):
         RUN.get('ser') is serial_port
         and not getattr(serial_port, "is_open", False)
       ):
-        RUN['ser'] = None
         _require_main_controller_identity_cleanup(
           serial_port,
           "G-code row exchange cleanup",
@@ -32510,27 +35385,6 @@ def GCstopProg():
     message = "GCODE SCHEDULING HALTED; ACTIVE CONTROLLER MOTION IS NOT PREEMPTED"
     GCalmStatusLab.config(text=message, style="Alarm.TLabel")
     return True
-
-
-def _reject_gcode_storage_write_response(response):
-    if not isinstance(response, str) or not response.startswith("E"):
-      raise ProtocolResponseError(
-        "G-code storage write rejection must be an error response"
-      )
-    detailed_error = _is_gcode_storage_detailed_error(response)
-    if not detailed_error:
-      ErrorHandler(response)
-    GCstopProg()
-    tab7.GCrunTrue = 0
-    RUN['GCrowinproc'] = 0
-    if detailed_error:
-      _render_gcode_storage_detailed_error(response)
-    else:
-      GCalmStatusLab.config(
-        text="UNABLE TO WRITE TO SD CARD",
-        style="Alarm.TLabel",
-      )
-    return ROW_EXECUTION_REJECTED
 
 
 @_synchronous_motion_request(
@@ -32665,17 +35519,14 @@ def GCexecuteRow(
         RUN['GCrowinproc'] = 0
         return ROW_EXECUTION_REJECTED
       print(str(response))
-      if (response[:1] == 'E'):
-        return _reject_gcode_storage_write_response(response)
-      else:
-        if _apply_valid_position_response(response) is None:
-          tab7.GCrunTrue = 0
-          RUN['GCrowinproc'] = 0
-          GCalmStatusLab.config(
-            text="INVALID G-CODE CONTROLLER RESPONSE",
-            style="Alarm.TLabel",
-          )
-          return ROW_EXECUTION_REJECTED
+      if _apply_valid_position_response(response) is None:
+        tab7.GCrunTrue = 0
+        RUN['GCrowinproc'] = 0
+        GCalmStatusLab.config(
+          text="INVALID G-CODE CONTROLLER RESPONSE",
+          style="Alarm.TLabel",
+        )
+        return ROW_EXECUTION_REJECTED
 
 
     #LINEAR MOVE
@@ -32862,17 +35713,14 @@ def GCexecuteRow(
       if response is None:
         RUN['GCrowinproc'] = 0
         return ROW_EXECUTION_REJECTED
-      if (response[:1] == 'E'):
-        return _reject_gcode_storage_write_response(response)
-      else:
-        if _apply_valid_position_response(response) is None:
-          tab7.GCrunTrue = 0
-          RUN['GCrowinproc'] = 0
-          GCalmStatusLab.config(
-            text="INVALID G-CODE CONTROLLER RESPONSE",
-            style="Alarm.TLabel",
-          )
-          return ROW_EXECUTION_REJECTED
+      if _apply_valid_position_response(response) is None:
+        tab7.GCrunTrue = 0
+        RUN['GCrowinproc'] = 0
+        GCalmStatusLab.config(
+          text="INVALID G-CODE CONTROLLER RESPONSE",
+          style="Alarm.TLabel",
+        )
+        return ROW_EXECUTION_REJECTED
 
   RUN['GCrowinproc'] = 0
   return ROW_EXECUTION_COMPLETE
@@ -33343,171 +36191,56 @@ def create_joint_jog_frame(parent, row, col, joint_name, joint_num):
 ##J1
 J1jogFrame, J1curAngEntryField, J1jogNegBut, J1jogPosBut, J1jogslide, J1slidelabel, J1negLimLab, J1posLimLab = create_joint_jog_frame(jointFrame, 0, 0, "J1", 1)
 
-# Bind J1 button events
-def SelJ1jogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J1jogNeg(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(10)  
-J1jogNegBut.bind("<ButtonPress>", SelJ1jogNeg)
-J1jogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelJ1jogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J1jogPos(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(11)  
-J1jogPosBut.bind("<ButtonPress>", SelJ1jogPos)
-J1jogPosBut.bind("<ButtonRelease>", StopJog)
+_bind_joint_jog_buttons(0, J1jogNegBut, J1jogPosBut)
 
 def J1sliderUpdate(foo):
   J1slidelabel.config(text=round(float(J1jogslide.get()),2))   
-def J1sliderExecute(foo): 
-  _queue_joint_target(0, J1jogslide.get())
 J1jogslide.config(command=J1sliderUpdate)
-J1jogslide.bind("<ButtonRelease-1>", J1sliderExecute)
 
 ##J2
 J2jogFrame, J2curAngEntryField, J2jogNegBut, J2jogPosBut, J2jogslide, J2slidelabel, J2negLimLab, J2posLimLab = create_joint_jog_frame(jointFrame, 1, 0, "J2", 2)
 
-def SelJ2jogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J2jogNeg(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(20)  
-J2jogNegBut.bind("<ButtonPress>", SelJ2jogNeg)
-J2jogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelJ2jogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J2jogPos(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(21)  
-J2jogPosBut.bind("<ButtonPress>", SelJ2jogPos)
-J2jogPosBut.bind("<ButtonRelease>", StopJog)
+_bind_joint_jog_buttons(1, J2jogNegBut, J2jogPosBut)
 
 def J2sliderUpdate(foo):
   J2slidelabel.config(text=round(float(J2jogslide.get()),2))   
-def J2sliderExecute(foo): 
-  _queue_joint_target(1, J2jogslide.get())
 J2jogslide.config(command=J2sliderUpdate)
-J2jogslide.bind("<ButtonRelease-1>", J2sliderExecute)
 
 ##J3
 J3jogFrame, J3curAngEntryField, J3jogNegBut, J3jogPosBut, J3jogslide, J3slidelabel, J3negLimLab, J3posLimLab = create_joint_jog_frame(jointFrame, 2, 0, "J3", 3)
 
-def SelJ3jogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J3jogNeg(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(30)  
-J3jogNegBut.bind("<ButtonPress>", SelJ3jogNeg)
-J3jogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelJ3jogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J3jogPos(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(31)  
-J3jogPosBut.bind("<ButtonPress>", SelJ3jogPos)
-J3jogPosBut.bind("<ButtonRelease>", StopJog)
+_bind_joint_jog_buttons(2, J3jogNegBut, J3jogPosBut)
 
 def J3sliderUpdate(foo):
   J3slidelabel.config(text=round(float(J3jogslide.get()),2))   
-def J3sliderExecute(foo): 
-  _queue_joint_target(2, J3jogslide.get())
 J3jogslide.config(command=J3sliderUpdate)
-J3jogslide.bind("<ButtonRelease-1>", J3sliderExecute)
 
 ##J4
 J4jogFrame, J4curAngEntryField, J4jogNegBut, J4jogPosBut, J4jogslide, J4slidelabel, J4negLimLab, J4posLimLab = create_joint_jog_frame(jointFrame, 3, 0, "J4", 4)
 
-def SelJ4jogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J4jogNeg(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(40)  
-J4jogNegBut.bind("<ButtonPress>", SelJ4jogNeg)
-J4jogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelJ4jogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J4jogPos(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(41)  
-J4jogPosBut.bind("<ButtonPress>", SelJ4jogPos)
-J4jogPosBut.bind("<ButtonRelease>", StopJog)
+_bind_joint_jog_buttons(3, J4jogNegBut, J4jogPosBut)
 
 def J4sliderUpdate(foo):
   J4slidelabel.config(text=round(float(J4jogslide.get()),2))   
-def J4sliderExecute(foo): 
-  _queue_joint_target(3, J4jogslide.get())
 J4jogslide.config(command=J4sliderUpdate)
-J4jogslide.bind("<ButtonRelease-1>", J4sliderExecute)
 
 ##J5
 J5jogFrame, J5curAngEntryField, J5jogNegBut, J5jogPosBut, J5jogslide, J5slidelabel, J5negLimLab, J5posLimLab = create_joint_jog_frame(jointFrame, 4, 0, "J5", 5)
 
-def SelJ5jogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J5jogNeg(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(50)  
-J5jogNegBut.bind("<ButtonPress>", SelJ5jogNeg)
-J5jogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelJ5jogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J5jogPos(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(51)  
-J5jogPosBut.bind("<ButtonPress>", SelJ5jogPos)
-J5jogPosBut.bind("<ButtonRelease>", StopJog)
+_bind_joint_jog_buttons(4, J5jogNegBut, J5jogPosBut)
 
 def J5sliderUpdate(foo):
   J5slidelabel.config(text=round(float(J5jogslide.get()),2))   
-def J5sliderExecute(foo): 
-  _queue_joint_target(4, J5jogslide.get())
 J5jogslide.config(command=J5sliderUpdate)
-J5jogslide.bind("<ButtonRelease-1>", J5sliderExecute)
 
 ##J6
 J6jogFrame, J6curAngEntryField, J6jogNegBut, J6jogPosBut, J6jogslide, J6slidelabel, J6negLimLab, J6posLimLab = create_joint_jog_frame(jointFrame, 5, 0, "J6", 6)
 
-def SelJ6jogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J6jogNeg(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(60)  
-J6jogNegBut.bind("<ButtonPress>", SelJ6jogNeg)
-J6jogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelJ6jogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J6jogPos(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(61)  
-J6jogPosBut.bind("<ButtonPress>", SelJ6jogPos)
-J6jogPosBut.bind("<ButtonRelease>", StopJog)
+_bind_joint_jog_buttons(5, J6jogNegBut, J6jogPosBut)
 
 def J6sliderUpdate(foo):
   J6slidelabel.config(text=round(float(J6jogslide.get()),2))   
-def J6sliderExecute(foo): 
-  _queue_joint_target(5, J6jogslide.get())
 J6jogslide.config(command=J6sliderUpdate)
-J6jogslide.bind("<ButtonRelease-1>", J6sliderExecute)
 
 motionTrackingFrame = Frame(jointFrame)
 motionTrackingFrame.grid(
@@ -33624,114 +36357,14 @@ Label(
   text="Cartesian travel is kinematics-limited; no fixed slider bounds.",
 ).grid(row=6, column=0, sticky="w", padx=4, pady=(6, 2))
 
-# Bind cartesian button events
-def SelXjogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    XjogNeg(float(incrementEntryField.get()))
-  else:
-    LiveCarJog(10)  
-XjogNegBut.bind("<ButtonPress>", SelXjogNeg)
-XjogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelXjogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    XjogPos(float(incrementEntryField.get()))
-  else:
-    LiveCarJog(11)  
-XjogPosBut.bind("<ButtonPress>", SelXjogPos)
-XjogPosBut.bind("<ButtonRelease>", StopJog)
-
-def SelYjogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    YjogNeg(float(incrementEntryField.get()))
-  else:
-    LiveCarJog(20)  
-YjogNegBut.bind("<ButtonPress>", SelYjogNeg)
-YjogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelYjogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    YjogPos(float(incrementEntryField.get()))
-  else:
-    LiveCarJog(21)  
-YjogPosBut.bind("<ButtonPress>", SelYjogPos)
-YjogPosBut.bind("<ButtonRelease>", StopJog)
-
-def SelZjogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    ZjogNeg(float(incrementEntryField.get()))
-  else:
-    LiveCarJog(30)  
-ZjogNegBut.bind("<ButtonPress>", SelZjogNeg)
-ZjogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelZjogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    ZjogPos(float(incrementEntryField.get()))
-  else:
-    LiveCarJog(31)  
-ZjogPosBut.bind("<ButtonPress>", SelZjogPos)
-ZjogPosBut.bind("<ButtonRelease>", StopJog)
-
-def SelRzjogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    RzjogNeg(float(incrementEntryField.get()))
-  else:
-    LiveCarJog(40)  
-RzjogNegBut.bind("<ButtonPress>", SelRzjogNeg)
-RzjogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelRzjogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    RzjogPos(float(incrementEntryField.get()))
-  else:
-    LiveCarJog(41)  
-RzjogPosBut.bind("<ButtonPress>", SelRzjogPos)
-RzjogPosBut.bind("<ButtonRelease>", StopJog)
-
-def SelRyjogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    RyjogNeg(float(incrementEntryField.get()))
-  else:
-    LiveCarJog(50)  
-RyjogNegBut.bind("<ButtonPress>", SelRyjogNeg)
-RyjogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelRyjogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    RyjogPos(float(incrementEntryField.get()))
-  else:
-    LiveCarJog(51)  
-RyjogPosBut.bind("<ButtonPress>", SelRyjogPos)
-RyjogPosBut.bind("<ButtonRelease>", StopJog)
-
-def SelRxjogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    RxjogNeg(float(incrementEntryField.get()))
-  else:
-    LiveCarJog(60)  
-RxjogNegBut.bind("<ButtonPress>", SelRxjogNeg)
-RxjogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelRxjogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    RxjogPos(float(incrementEntryField.get()))
-  else:
-    LiveCarJog(61)  
-RxjogPosBut.bind("<ButtonPress>", SelRxjogPos)
-RxjogPosBut.bind("<ButtonRelease>", StopJog)
+_bind_spatial_jog_buttons((
+  (XjogNegBut, XjogPosBut, XjogNeg, XjogPos),
+  (YjogNegBut, YjogPosBut, YjogNeg, YjogPos),
+  (ZjogNegBut, ZjogPosBut, ZjogNeg, ZjogPos),
+  (RzjogNegBut, RzjogPosBut, RzjogNeg, RzjogPos),
+  (RyjogNegBut, RyjogPosBut, RyjogNeg, RyjogPos),
+  (RxjogNegBut, RxjogPosBut, RxjogNeg, RxjogPos),
+), LiveCarJog)
 
 TooljogFrame.grid_columnconfigure(0, weight=1)
 
@@ -33771,114 +36404,14 @@ Label(
   text="Tool-frame motion is relative; no absolute slider position exists.",
 ).grid(row=6, column=0, sticky="w", padx=4, pady=(6, 2))
 
-# Bind tool frame button events
-def SelTXjogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    TXjogNeg(float(incrementEntryField.get()))
-  else:
-    LiveToolJog(10)
-TXjogNegBut.bind("<ButtonPress>", SelTXjogNeg)
-TXjogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelTXjogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    TXjogPos(float(incrementEntryField.get()))
-  else:
-    LiveToolJog(11)
-TXjogPosBut.bind("<ButtonPress>", SelTXjogPos)
-TXjogPosBut.bind("<ButtonRelease>", StopJog)
-
-def SelTYjogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    TYjogNeg(float(incrementEntryField.get()))
-  else:
-    LiveToolJog(20)
-TYjogNegBut.bind("<ButtonPress>", SelTYjogNeg)
-TYjogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelTYjogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    TYjogPos(float(incrementEntryField.get()))
-  else:
-    LiveToolJog(21)
-TYjogPosBut.bind("<ButtonPress>", SelTYjogPos)
-TYjogPosBut.bind("<ButtonRelease>", StopJog)
-
-def SelTZjogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    TZjogNeg(float(incrementEntryField.get()))
-  else:
-    LiveToolJog(30)
-TZjogNegBut.bind("<ButtonPress>", SelTZjogNeg)
-TZjogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelTZjogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    TZjogPos(float(incrementEntryField.get()))
-  else:
-    LiveToolJog(31)
-TZjogPosBut.bind("<ButtonPress>", SelTZjogPos)
-TZjogPosBut.bind("<ButtonRelease>", StopJog)
-
-def SelTRzjogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    TRzjogNeg(float(incrementEntryField.get()))
-  else:
-    LiveToolJog(40)
-TRzjogNegBut.bind("<ButtonPress>", SelTRzjogNeg)
-TRzjogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelTRzjogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    TRzjogPos(float(incrementEntryField.get()))
-  else:
-    LiveToolJog(41)
-TRzjogPosBut.bind("<ButtonPress>", SelTRzjogPos)
-TRzjogPosBut.bind("<ButtonRelease>", StopJog)
-
-def SelTRyjogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    TRyjogNeg(float(incrementEntryField.get()))
-  else:
-    LiveToolJog(50)
-TRyjogNegBut.bind("<ButtonPress>", SelTRyjogNeg)
-TRyjogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelTRyjogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    TRyjogPos(float(incrementEntryField.get()))
-  else:
-    LiveToolJog(51)
-TRyjogPosBut.bind("<ButtonPress>", SelTRyjogPos)
-TRyjogPosBut.bind("<ButtonRelease>", StopJog)
-
-def SelTRxjogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    TRxjogNeg(float(incrementEntryField.get()))
-  else:
-    LiveToolJog(60)
-TRxjogNegBut.bind("<ButtonPress>", SelTRxjogNeg)
-TRxjogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelTRxjogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    TRxjogPos(float(incrementEntryField.get()))
-  else:
-    LiveToolJog(61)
-TRxjogPosBut.bind("<ButtonPress>", SelTRxjogPos)
-TRxjogPosBut.bind("<ButtonRelease>", StopJog)
+_bind_spatial_jog_buttons((
+  (TXjogNegBut, TXjogPosBut, TXjogNeg, TXjogPos),
+  (TYjogNegBut, TYjogPosBut, TYjogNeg, TYjogPos),
+  (TZjogNegBut, TZjogPosBut, TZjogNeg, TZjogPos),
+  (TRzjogNegBut, TRzjogPosBut, TRzjogNeg, TRzjogPos),
+  (TRyjogNegBut, TRyjogPosBut, TRyjogNeg, TRyjogPos),
+  (TRxjogNegBut, TRxjogPosBut, TRxjogNeg, TRxjogPos),
+), LiveToolJog)
 
 
 # Extra axes (J7, J8, J9)
@@ -33927,34 +36460,14 @@ J7slideLimLab.grid(row=0, column=1, padx=2)
 J7jogPosBut = Button(J7buttonFrame, text="+", width=3)
 J7jogPosBut.grid(row=0, column=2, sticky="e", padx=(2, 0))
 
-# Bind J7 events
-def SelJ7jogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J7jogNeg(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(70) 
-J7jogNegBut.bind("<ButtonPress>", SelJ7jogNeg)
-J7jogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelJ7jogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J7jogPos(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(71)  
-J7jogPosBut.bind("<ButtonPress>", SelJ7jogPos)
-J7jogPosBut.bind("<ButtonRelease>", StopJog)
+_bind_joint_jog_buttons(6, J7jogNegBut, J7jogPosBut)
 
 def J7sliderUpdate(foo):
   J7slideLimLab.config(state="normal")
   J7slideLimLab.delete(0, END)
   J7slideLimLab.insert(0, round(float(J7jogslide.get()),2))
   J7slideLimLab.config(state="readonly")   
-def J7sliderExecute(foo): 
-  _queue_joint_target(6, J7jogslide.get())
 J7jogslide.config(command=J7sliderUpdate)
-J7jogslide.bind("<ButtonRelease-1>", J7sliderExecute)
 
 # J8 Frame
 J8jogFrame = Frame(extraAxesFrame, relief="raised", borderwidth=1, padding=5)
@@ -33994,34 +36507,14 @@ J8slideLimLab.grid(row=0, column=1, padx=2)
 J8jogPosBut = Button(J8buttonFrame, text="+", width=3)
 J8jogPosBut.grid(row=0, column=2, sticky="e", padx=(2, 0))
 
-# Bind J8 events
-def SelJ8jogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J8jogNeg(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(80) 
-J8jogNegBut.bind("<ButtonPress>", SelJ8jogNeg)
-J8jogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelJ8jogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J8jogPos(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(81)  
-J8jogPosBut.bind("<ButtonPress>", SelJ8jogPos)
-J8jogPosBut.bind("<ButtonRelease>", StopJog)
+_bind_joint_jog_buttons(7, J8jogNegBut, J8jogPosBut)
 
 def J8sliderUpdate(foo):
   J8slideLimLab.config(state="normal")
   J8slideLimLab.delete(0, END)
   J8slideLimLab.insert(0, round(float(J8jogslide.get()),2))
   J8slideLimLab.config(state="readonly")   
-def J8sliderExecute(foo): 
-  _queue_joint_target(7, J8jogslide.get())
 J8jogslide.config(command=J8sliderUpdate)
-J8jogslide.bind("<ButtonRelease-1>", J8sliderExecute)
 
 # J9 Frame
 J9jogFrame = Frame(extraAxesFrame, relief="raised", borderwidth=1, padding=5)
@@ -34061,34 +36554,20 @@ J9slideLimLab.grid(row=0, column=1, padx=2)
 J9jogPosBut = Button(J9buttonFrame, text="+", width=3)
 J9jogPosBut.grid(row=0, column=2, sticky="e", padx=(2, 0))
 
-# Bind J9 events
-def SelJ9jogNeg(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J9jogNeg(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(90) 
-J9jogNegBut.bind("<ButtonPress>", SelJ9jogNeg)
-J9jogNegBut.bind("<ButtonRelease>", StopJog)
-
-def SelJ9jogPos(self):
-  IncJogStatVal = int(RUN['IncJogStat'].get())
-  if (IncJogStatVal == 1):
-    J9jogPos(float(incrementEntryField.get()))
-  else:
-    LiveJointJog(91)  
-J9jogPosBut.bind("<ButtonPress>", SelJ9jogPos)
-J9jogPosBut.bind("<ButtonRelease>", StopJog)
+_bind_joint_jog_buttons(8, J9jogNegBut, J9jogPosBut)
 
 def J9sliderUpdate(foo):
   J9slideLimLab.config(state="normal")
   J9slideLimLab.delete(0, END)
   J9slideLimLab.insert(0, round(float(J9jogslide.get()),2))
   J9slideLimLab.config(state="readonly")   
-def J9sliderExecute(foo): 
-  _queue_joint_target(8, J9jogslide.get())
 J9jogslide.config(command=J9sliderUpdate)
-J9jogslide.bind("<ButtonRelease-1>", J9sliderExecute)
+
+_bind_joint_target_sliders((
+  J1jogslide, J2jogslide, J3jogslide,
+  J4jogslide, J5jogslide, J6jogslide,
+  J7jogslide, J8jogslide, J9jogslide,
+))
 
 joint_motion_visualization = JointMotionVisualization(
   sliders=(
@@ -34254,7 +36733,7 @@ insertSetBut.grid(row=1, column=8, sticky="ew", padx=2, pady=2)
 # Row 2: WAIT command - WAIT [Type] [Var#] = [Value] Timeout = [Time] • [Insert]
 Label(cmdFrame, text="WAIT", font=("Arial", 10, "bold")).grid(row=2, column=0, sticky="w", padx=(2, 5), pady=2)
 
-waitmenu = OptionMenu(cmdFrame, waitoption, "5v Input", "5v Input", "MB Coil", "MB Input")
+waitmenu = OptionMenu(cmdFrame, waitoption, "5v Input", "5v Input", "MB Coil", "MB Input", "MB Hold Reg")
 waitmenu.config(width=12)
 waitmenu.grid(row=2, column=1, sticky="ew", padx=2, pady=2)
 
@@ -35814,112 +38293,112 @@ for row in range(12):
     ioBoardFrame.grid_rowconfigure(row, minsize=25)
 
 # Servo 0 on
-servo0onBut = Button(ioBoardFrame, text="Servo 0", command=Servo0on)
+servo0onBut = Button(ioBoardFrame, text="Servo 0", command=lambda: _request_manual_servo(0, True, servo0onEntryField))
 servo0onBut.grid(row=0, column=0, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=0, column=1, padx=2, pady=1)
 servo0onEntryField = Entry(ioBoardFrame, width=4, justify="center")
 servo0onEntryField.grid(row=0, column=2, padx=2, pady=1)
 
 # DO on (row 0)
-DO1onBut = Button(ioBoardFrame, text="DO on", command=DO1on)
+DO1onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(1, True, DO1onEntryField))
 DO1onBut.grid(row=0, column=4, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=0, column=5, padx=2, pady=1)
 DO1onEntryField = Entry(ioBoardFrame, width=4, justify="center")
 DO1onEntryField.grid(row=0, column=6, padx=2, pady=1)
 
 # Servo 0 off
-servo0offBut = Button(ioBoardFrame, text="Servo 0", command=Servo0off)
+servo0offBut = Button(ioBoardFrame, text="Servo 0", command=lambda: _request_manual_servo(0, False, servo0offEntryField))
 servo0offBut.grid(row=1, column=0, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=1, column=1, padx=2, pady=1)
 servo0offEntryField = Entry(ioBoardFrame, width=4, justify="center")
 servo0offEntryField.grid(row=1, column=2, padx=2, pady=1)
 
 # DO off (row 1)
-DO1offBut = Button(ioBoardFrame, text="DO off", command=DO1off)
+DO1offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(1, False, DO1offEntryField))
 DO1offBut.grid(row=1, column=4, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=1, column=5, padx=2, pady=1)
 DO1offEntryField = Entry(ioBoardFrame, width=4, justify="center")
 DO1offEntryField.grid(row=1, column=6, padx=2, pady=1)
 
 # Servo 1 on
-servo1onBut = Button(ioBoardFrame, text="Servo 1", command=Servo1on)
+servo1onBut = Button(ioBoardFrame, text="Servo 1", command=lambda: _request_manual_servo(1, True, servo1onEntryField))
 servo1onBut.grid(row=2, column=0, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=2, column=1, padx=2, pady=1)
 servo1onEntryField = Entry(ioBoardFrame, width=4, justify="center")
 servo1onEntryField.grid(row=2, column=2, padx=2, pady=1)
 
 # DO on (row 2)
-DO2onBut = Button(ioBoardFrame, text="DO on", command=DO2on)
+DO2onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(2, True, DO2onEntryField))
 DO2onBut.grid(row=2, column=4, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=2, column=5, padx=2, pady=1)
 DO2onEntryField = Entry(ioBoardFrame, width=4, justify="center")
 DO2onEntryField.grid(row=2, column=6, padx=2, pady=1)
 
 # Servo 1 off
-servo1offBut = Button(ioBoardFrame, text="Servo 1", command=Servo1off)
+servo1offBut = Button(ioBoardFrame, text="Servo 1", command=lambda: _request_manual_servo(1, False, servo1offEntryField))
 servo1offBut.grid(row=3, column=0, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=3, column=1, padx=2, pady=1)
 servo1offEntryField = Entry(ioBoardFrame, width=4, justify="center")
 servo1offEntryField.grid(row=3, column=2, padx=2, pady=1)
 
 # DO off (row 3)
-DO2offBut = Button(ioBoardFrame, text="DO off", command=DO2off)
+DO2offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(2, False, DO2offEntryField))
 DO2offBut.grid(row=3, column=4, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=3, column=5, padx=2, pady=1)
 DO2offEntryField = Entry(ioBoardFrame, width=4, justify="center")
 DO2offEntryField.grid(row=3, column=6, padx=2, pady=1)
 
 # Servo 2 on
-servo2onBut = Button(ioBoardFrame, text="Servo 2", command=Servo2on)
+servo2onBut = Button(ioBoardFrame, text="Servo 2", command=lambda: _request_manual_servo(2, True, servo2onEntryField))
 servo2onBut.grid(row=4, column=0, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=4, column=1, padx=2, pady=1)
 servo2onEntryField = Entry(ioBoardFrame, width=4, justify="center")
 servo2onEntryField.grid(row=4, column=2, padx=2, pady=1)
 
 # DO on (row 4)
-DO3onBut = Button(ioBoardFrame, text="DO on", command=DO3on)
+DO3onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(3, True, DO3onEntryField))
 DO3onBut.grid(row=4, column=4, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=4, column=5, padx=2, pady=1)
 DO3onEntryField = Entry(ioBoardFrame, width=4, justify="center")
 DO3onEntryField.grid(row=4, column=6, padx=2, pady=1)
 
 # Servo 2 off
-servo2offBut = Button(ioBoardFrame, text="Servo 2", command=Servo2off)
+servo2offBut = Button(ioBoardFrame, text="Servo 2", command=lambda: _request_manual_servo(2, False, servo2offEntryField))
 servo2offBut.grid(row=5, column=0, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=5, column=1, padx=2, pady=1)
 servo2offEntryField = Entry(ioBoardFrame, width=4, justify="center")
 servo2offEntryField.grid(row=5, column=2, padx=2, pady=1)
 
 # DO off (row 5)
-DO3offBut = Button(ioBoardFrame, text="DO off", command=DO3off)
+DO3offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(3, False, DO3offEntryField))
 DO3offBut.grid(row=5, column=4, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=5, column=5, padx=2, pady=1)
 DO3offEntryField = Entry(ioBoardFrame, width=4, justify="center")
 DO3offEntryField.grid(row=5, column=6, padx=2, pady=1)
 
 # Servo 3 on
-servo3onBut = Button(ioBoardFrame, text="Servo 3", command=Servo3on)
+servo3onBut = Button(ioBoardFrame, text="Servo 3", command=lambda: _request_manual_servo(3, True, servo3onEntryField))
 servo3onBut.grid(row=6, column=0, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=6, column=1, padx=2, pady=1)
 servo3onEntryField = Entry(ioBoardFrame, width=4, justify="center")
 servo3onEntryField.grid(row=6, column=2, padx=2, pady=1)
 
 # DO on (row 6)
-DO4onBut = Button(ioBoardFrame, text="DO on", command=DO4on)
+DO4onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(4, True, DO4onEntryField))
 DO4onBut.grid(row=6, column=4, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=6, column=5, padx=2, pady=1)
 DO4onEntryField = Entry(ioBoardFrame, width=4, justify="center")
 DO4onEntryField.grid(row=6, column=6, padx=2, pady=1)
 
 # Servo 3 off
-servo3offBut = Button(ioBoardFrame, text="Servo 3", command=Servo3off)
+servo3offBut = Button(ioBoardFrame, text="Servo 3", command=lambda: _request_manual_servo(3, False, servo3offEntryField))
 servo3offBut.grid(row=7, column=0, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=7, column=1, padx=2, pady=1)
 servo3offEntryField = Entry(ioBoardFrame, width=4, justify="center")
 servo3offEntryField.grid(row=7, column=2, padx=2, pady=1)
 
 # DO off (row 7)
-DO4offBut = Button(ioBoardFrame, text="DO off", command=DO4off)
+DO4offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(4, False, DO4offEntryField))
 DO4offBut.grid(row=7, column=4, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=7, column=5, padx=2, pady=1)
 DO4offEntryField = Entry(ioBoardFrame, width=4, justify="center")
@@ -35928,7 +38407,7 @@ DO4offEntryField.grid(row=7, column=6, padx=2, pady=1)
 
 
 # DO on (row 8) - no servo
-DO5onBut = Button(ioBoardFrame, text="DO on", command=DO5on)
+DO5onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(5, True, DO5onEntryField))
 DO5onBut.grid(row=8, column=4, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=8, column=5, padx=2, pady=1)
 DO5onEntryField = Entry(ioBoardFrame, width=4, justify="center")
@@ -35937,7 +38416,7 @@ DO5onEntryField.grid(row=8, column=6, padx=2, pady=1)
 
 
 # DO off (row 9)
-DO5offBut = Button(ioBoardFrame, text="DO off", command=DO5off)
+DO5offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(5, False, DO5offEntryField))
 DO5offBut.grid(row=9, column=4, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=9, column=5, padx=2, pady=1)
 DO5offEntryField = Entry(ioBoardFrame, width=4, justify="center")
@@ -35946,7 +38425,7 @@ DO5offEntryField.grid(row=9, column=6, padx=2, pady=1)
 
 
 # DO on (row 10)
-DO6onBut = Button(ioBoardFrame, text="DO on", command=DO6on)
+DO6onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(6, True, DO6onEntryField))
 DO6onBut.grid(row=10, column=4, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=10, column=5, padx=2, pady=1)
 DO6onEntryField = Entry(ioBoardFrame, width=4, justify="center")
@@ -35955,7 +38434,7 @@ DO6onEntryField.grid(row=10, column=6, padx=2, pady=1)
 
 
 # DO off (row 11)
-DO6offBut = Button(ioBoardFrame, text="DO off", command=DO6off)
+DO6offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(6, False, DO6offEntryField))
 DO6offBut.grid(row=11, column=4, sticky="ew", padx=2, pady=1)
 Label(ioBoardFrame, text="=").grid(row=11, column=5, padx=2, pady=1)
 DO6offEntryField = Entry(ioBoardFrame, width=4, justify="center")
@@ -36011,22 +38490,22 @@ MBoperValEntryField = Entry(modbusFrame, width=10, justify="left")
 MBoperValEntryField.grid(row=2, column=1, sticky="w", padx=(2,5), pady=5)
 
 # Buttons
-MBreadCoilBut = Button(modbusFrame, text="Read Coil", width=30, command=MBreadCoil)
+MBreadCoilBut = Button(modbusFrame, text="Read Coil", width=30, command=partial(_request_manual_modbus, "BB"))
 MBreadCoilBut.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
-MBreadDinputBut = Button(modbusFrame, text="Read Discrete Input", width=30, command=MBreadInput)
+MBreadDinputBut = Button(modbusFrame, text="Read Discrete Input", width=30, command=partial(_request_manual_modbus, "BC"))
 MBreadDinputBut.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
-MBreadHoldRegBut = Button(modbusFrame, text="Read Holding Register", width=30, command=MBreadHoldReg)
+MBreadHoldRegBut = Button(modbusFrame, text="Read Holding Register", width=30, command=partial(_request_manual_modbus, "BA"))
 MBreadHoldRegBut.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
-MBreadInputRegBut = Button(modbusFrame, text="Read Input Register", width=30, command=MBreadInputReg)
+MBreadInputRegBut = Button(modbusFrame, text="Read Input Register", width=30, command=partial(_request_manual_modbus, "BD"))
 MBreadInputRegBut.grid(row=6, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
-MBwriteCoilBut = Button(modbusFrame, text="Write Coil", width=30, command=MBwriteCoil)
+MBwriteCoilBut = Button(modbusFrame, text="Write Coil", width=30, command=partial(_request_manual_modbus, "BE"))
 MBwriteCoilBut.grid(row=7, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
-MBwriteRegBut = Button(modbusFrame, text="Write Register", width=30, command=MBwriteReg)
+MBwriteRegBut = Button(modbusFrame, text="Write Register", width=30, command=partial(_request_manual_modbus, "BF"))
 MBwriteRegBut.grid(row=8, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
 
 # Output Response
@@ -36058,311 +38537,6 @@ Label(infoFrame, text="5v board inputs are high impedance and susceptable to flo
 
 
 
-# ### 4 LABELS#################################################################
-# #############################################################################
-# 
-# servo0onequalsLab = Label(tab4, text = "=")
-# servo0onequalsLab.place(x=70, y=42)
-# 
-# servo0offequalsLab = Label(tab4, text = "=")
-# servo0offequalsLab.place(x=70, y=82)
-# 
-# servo1onequalsLab = Label(tab4, text = "=")
-# servo1onequalsLab.place(x=70, y=122)
-# 
-# servo1offequalsLab = Label(tab4, text = "=")
-# servo1offequalsLab.place(x=70, y=162)
-# 
-# servo2onequalsLab = Label(tab4, text = "=")
-# servo2onequalsLab.place(x=70, y=202)
-# 
-# servo2offequalsLab = Label(tab4, text = "=")
-# servo2offequalsLab.place(x=70, y=242)
-# 
-# servo3onequalsLab = Label(tab4, text = "=")
-# servo3onequalsLab.place(x=70, y=282)
-# 
-# servo3offequalsLab = Label(tab4, text = "=")
-# servo3offequalsLab.place(x=70, y=322)
-# 
-# 
-# 
-# Do1onequalsLab = Label(tab4, text = "=")
-# Do1onequalsLab.place(x=210, y=42)
-# 
-# Do1offequalsLab = Label(tab4, text = "=")
-# Do1offequalsLab.place(x=210, y=82)
-# 
-# Do2onequalsLab = Label(tab4, text = "=")
-# Do2onequalsLab.place(x=210, y=122)
-# 
-# Do2offequalsLab = Label(tab4, text = "=")
-# Do2offequalsLab.place(x=210, y=162)
-# 
-# Do3onequalsLab = Label(tab4, text = "=")
-# Do3onequalsLab.place(x=210, y=202)
-# 
-# Do3offequalsLab = Label(tab4, text = "=")
-# Do3offequalsLab.place(x=210, y=242)
-# 
-# Do4onequalsLab = Label(tab4, text = "=")
-# Do4onequalsLab.place(x=210, y=282)
-# 
-# Do4offequalsLab = Label(tab4, text = "=")
-# Do4offequalsLab.place(x=210, y=322)
-# 
-# Do5onequalsLab = Label(tab4, text = "=")
-# Do5onequalsLab.place(x=210, y=362)
-# 
-# Do5offequalsLab = Label(tab4, text = "=")
-# Do5offequalsLab.place(x=210, y=402)
-# 
-# Do6onequalsLab = Label(tab4, text = "=")
-# Do6onequalsLab.place(x=210, y=442)
-# 
-# Do6offequalsLab = Label(tab4, text = "=")
-# Do6offequalsLab.place(x=210, y=482)
-# 
-# IOboardLab = Label(tab4, font=("Arial 10 bold"), text = "5v IO BOARD")
-# IOboardLab.place(x=95, y=10)
-# 
-# AuxComLab = Label(tab4, font=("Arial 10 bold"), text = "AUX COM DEVICE")
-# AuxComLab.place(x=400, y=10)
-# 
-# ModbusLab = Label(tab4, font=("Arial 10 bold"), text = "MODBUS DEVICE")
-# ModbusLab.place(x=700, y=10)
-# 
-# AuxPortNumLab= Label(tab4, text = "Aux Com Port")
-# AuxPortNumLab.place(x=440, y=42)
-# 
-# AuxPortCharLab= Label(tab4, text = "Char to Read")
-# AuxPortCharLab.place(x=440, y=82)
-# 
-# MBslaveLab= Label(tab4, text = "Slave ID")
-# MBslaveLab.place(x=750, y=42)
-# 
-# MBaddressLab= Label(tab4, text = "Modbus Address")
-# MBaddressLab.place(x=750, y=82)
-# 
-# MBwriteLab= Label(tab4, text = "Operation Value")
-# MBwriteLab.place(x=750, y=122)
-# 
-# MBoutputLab= Label(tab4, text = "Output Response:")
-# MBoutputLab.place(x=662, y=405)
-# 
-# 
-# 
-# inoutavailLab = Label(tab4, text = "The following IO are available when using the default 5v Nano board for IO:   Inputs = 2-7  /  Outputs = 8-13  /  Servos = A0-A5")
-# inoutavailLab.place(x=10, y=640)
-# 
-# inoutavailLab = Label(tab4, text = "The following IO are available when using the default 5v Mega board for IO:   Inputs = 2-27  /  Outputs = 28-53  /  Servos = A0-A6")
-# inoutavailLab.place(x=10, y=655)
-# 
-# inoutavailLab = Label(tab4, text = "Please review this tutorial video on using 5v IO boards:")
-# inoutavailLab.place(x=10, y=670)
-# 
-# inoutavailLab = Label(tab4, text = "5v board inputs are high impedance and susceptable to floating voltage - inputs use a pullup resistor and will read high when nothing is connected - its best to connect your input signal to GND and if/wait for the input signal to = 0")
-# inoutavailLab.place(x=10, y=685)
-# 
-# 
-# 
-# link2 = Label(tab4, font=("Arial", 8), text="https://youtu.be/76F6dS4ar8Y?si=Z6NstZy1zNeHgtCF", foreground="blue", cursor="hand2")
-# link2.bind("<Button-1>", lambda event: webbrowser.open(link2.cget("text")))
-# link2.place(x=300, y=671)
-# 
-# 
-# 
-# ### 4 BUTTONS################################################################
-# #############################################################################
-# 
-# servo0onBut = Button(tab4,  text="Servo 0",  command = Servo0on)
-# servo0onBut.place(x=10, y=40)
-# 
-# servo0offBut = Button(tab4,  text="Servo 0",  command = Servo0off)
-# servo0offBut.place(x=10, y=80)
-# 
-# servo1onBut = Button(tab4,  text="Servo 1",  command = Servo1on)
-# servo1onBut.place(x=10, y=120)
-# 
-# servo1offBut = Button(tab4,  text="Servo 1",  command = Servo1off)
-# servo1offBut.place(x=10, y=160)
-# 
-# servo2onBut = Button(tab4,  text="Servo 2",  command = Servo2on)
-# servo2onBut.place(x=10, y=200)
-# 
-# servo2offBut = Button(tab4,  text="Servo 2",  command = Servo2off)
-# servo2offBut.place(x=10, y=240)
-# 
-# servo3onBut = Button(tab4,  text="Servo 3",  command = Servo3on)
-# servo3onBut.place(x=10, y=280)
-# 
-# servo3offBut = Button(tab4,  text="Servo 3",  command = Servo3off)
-# servo3offBut.place(x=10, y=320)
-# 
-# 
-# 
-# 
-# 
-# DO1onBut = Button(tab4,  text="DO on",  command = DO1on)
-# DO1onBut.place(x=150, y=40)
-# 
-# DO1offBut = Button(tab4,  text="DO off",  command = DO1off)
-# DO1offBut.place(x=150, y=80)
-# 
-# DO2onBut = Button(tab4,  text="DO on",  command = DO2on)
-# DO2onBut.place(x=150, y=120)
-# 
-# DO2offBut = Button(tab4,  text="DO off",  command = DO2off)
-# DO2offBut.place(x=150, y=160)
-# 
-# DO3onBut = Button(tab4,  text="DO on",  command = DO3on)
-# DO3onBut.place(x=150, y=200)
-# 
-# DO3offBut = Button(tab4,  text="DO off",  command = DO3off)
-# DO3offBut.place(x=150, y=240)
-# 
-# DO4onBut = Button(tab4,  text="DO on",  command = DO4on)
-# DO4onBut.place(x=150, y=280)
-# 
-# DO4offBut = Button(tab4,  text="DO off",  command = DO4off)
-# DO4offBut.place(x=150, y=320)
-# 
-# DO5onBut = Button(tab4,  text="DO on",  command = DO5on)
-# DO5onBut.place(x=150, y=360)
-# 
-# DO5offBut = Button(tab4,  text="DO off",  command = DO5off)
-# DO5offBut.place(x=150, y=400)
-# 
-# DO6onBut = Button(tab4,  text="DO on",  command = DO6on)
-# DO6onBut.place(x=150, y=440)
-# 
-# DO6offBut = Button(tab4,  text="DO off",  command = DO6off)
-# DO6offBut.place(x=150, y=480)
-# 
-# 
-# comPortBut3 = Button(tab4,  text="Test Aux COM Device",   command = TestAuxCom)
-# comPortBut3.place(x=395, y=120)
-# 
-# MBreadCoilBut = Button(tab4,  text="Read Coil", width=30, command = MBreadCoil)
-# MBreadCoilBut.place(x=665, y=160)
-# 
-# MBreadDinputBut = Button(tab4,  text="Read Discrete Input", width=30, command = MBreadInput)
-# MBreadDinputBut.place(x=665, y=200)
-# 
-# MBreadHoldRegBut = Button(tab4,  text="Read Holding Register", width=30, command = MBreadHoldReg)
-# MBreadHoldRegBut.place(x=665, y=240)
-# 
-# MBreadInputRegBut = Button(tab4,  text="Read Input Register", width=30, command = MBreadInputReg)
-# MBreadInputRegBut.place(x=665, y=280)
-# 
-# MBwriteCoilBut = Button(tab4,  text="Write Coil", width=30, command = MBwriteCoil)
-# MBwriteCoilBut.place(x=665, y=320)
-# 
-# MBwriteRegBut = Button(tab4,  text="Write Register", width=30, command = MBwriteReg)
-# MBwriteRegBut.place(x=665, y=360)
-# 
-# 
-# 
-# 
-# 
-# #### 4 ENTRY FIELDS##########################################################
-# #############################################################################
-# 
-# 
-# servo0onEntryField = Entry(tab4,width=4,justify="center")
-# servo0onEntryField.place(x=90, y=45)
-# 
-# servo0offEntryField = Entry(tab4,width=4,justify="center")
-# servo0offEntryField.place(x=90, y=85)
-# 
-# servo1onEntryField = Entry(tab4,width=4,justify="center")
-# servo1onEntryField.place(x=90, y=125)
-# 
-# servo1offEntryField = Entry(tab4,width=4,justify="center")
-# servo1offEntryField.place(x=90, y=165)
-# 
-# servo2onEntryField = Entry(tab4,width=4,justify="center")
-# servo2onEntryField.place(x=90, y=205)
-# 
-# servo2offEntryField = Entry(tab4,width=4,justify="center")
-# servo2offEntryField.place(x=90, y=245)
-# 
-# 
-# servo3onEntryField = Entry(tab4,width=4,justify="center")
-# servo3onEntryField.place(x=90, y=285)
-# 
-# servo3offEntryField = Entry(tab4,width=4,justify="center")
-# servo3offEntryField.place(x=90, y=325)
-# 
-# 
-# 
-# 
-# 
-# DO1onEntryField = Entry(tab4,width=4,justify="center")
-# DO1onEntryField.place(x=230, y=45)
-# 
-# DO1offEntryField = Entry(tab4,width=4,justify="center")
-# DO1offEntryField.place(x=230, y=85)
-# 
-# DO2onEntryField = Entry(tab4,width=4,justify="center")
-# DO2onEntryField.place(x=230, y=125)
-# 
-# DO2offEntryField = Entry(tab4,width=4,justify="center")
-# DO2offEntryField.place(x=230, y=165)
-# 
-# DO3onEntryField = Entry(tab4,width=4,justify="center")
-# DO3onEntryField.place(x=230, y=205)
-# 
-# DO3offEntryField = Entry(tab4,width=4,justify="center")
-# DO3offEntryField.place(x=230, y=245)
-# 
-# DO4onEntryField = Entry(tab4,width=4,justify="center")
-# DO4onEntryField.place(x=230, y=285)
-# 
-# DO4offEntryField = Entry(tab4,width=4,justify="center")
-# DO4offEntryField.place(x=230, y=325)
-# 
-# DO5onEntryField = Entry(tab4,width=4,justify="center")
-# DO5onEntryField.place(x=230, y=365)
-# 
-# DO5offEntryField = Entry(tab4,width=4,justify="center")
-# DO5offEntryField.place(x=230, y=405)
-# 
-# DO6onEntryField = Entry(tab4,width=4,justify="center")
-# DO6onEntryField.place(x=230, y=445)
-# 
-# DO6offEntryField = Entry(tab4,width=4,justify="center")
-# DO6offEntryField.place(x=230, y=485)
-# 
-# 
-# 
-# com3PortEntryField = Entry(tab4,width=4,justify="center")
-# com3PortEntryField.place(x=400, y=40)
-# 
-# com3charPortEntryField = Entry(tab4,width=4,justify="center")
-# com3charPortEntryField.place(x=400, y=80)
-# 
-# com3outPortEntryField = Entry(tab4,width=25,justify="center")
-# com3outPortEntryField.place(x=385, y=160)
-# 
-# 
-# MBslaveEntryField = Entry(tab4,width=4,justify="center")
-# MBslaveEntryField.place(x=710, y=40)
-# 
-# MBaddressEntryField = Entry(tab4,width=5,justify="center")
-# MBaddressEntryField.place(x=690, y=80)
-# 
-# MBoperValEntryField = Entry(tab4,width=5,justify="center")
-# MBoperValEntryField.place(x=690, y=120)
-# 
-# MBoutputEntryField = Entry(tab4,width=33,justify="center")
-# MBoutputEntryField.place(x=662, y=425)
-# 
-# 
-# 
-# ####################################################################################################################################################
-# ####################################################################################################################################################
-# ####################################################################################################################################################
 ####TAB 5
 
 # ============================================================================

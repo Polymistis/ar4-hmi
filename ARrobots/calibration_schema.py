@@ -18,6 +18,7 @@ from ARrobots.HMI.joint_motion import (
     controller_number,
     controller_protocol_decimal,
     controller_ratio,
+    validate_controller_encoder_scale,
 )
 
 
@@ -562,8 +563,9 @@ def _validate_controller_fields(normalized):
     for axis in range(1, 7):
         drive_key = f"J{axis}DriveMS"
         encoder_key = f"J{axis}EncCPR"
+        encoder_multiplier = None
         if drive_key in normalized and encoder_key in normalized:
-            _controller_contract(
+            encoder_multiplier = _controller_contract(
                 controller_ratio,
                 normalized[encoder_key],
                 normalized[drive_key],
@@ -596,6 +598,14 @@ def _validate_controller_fields(normalized):
             positive,
             normalized[keys[2]],
         )
+        if encoder_multiplier is not None:
+            _controller_contract(
+                validate_controller_encoder_scale,
+                calibration,
+                axis,
+                encoder_multiplier,
+                f"J{axis} encoder multiplier",
+            )
         if position_key in normalized:
             _controller_contract(
                 calibration.validate_axis_positions,
