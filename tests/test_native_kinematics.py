@@ -31,7 +31,7 @@ class NativeKinematicsContractTests(unittest.TestCase):
         return (
             sys.platform == "win32"
             and sys.implementation.name == "cpython"
-            and sys.version_info[:2] == (3, 12)
+            and sys.version_info[:2] == (3, 14)
             and platform.machine().lower() in ("amd64", "x86_64")
             and sys.maxsize > 2**32
         )

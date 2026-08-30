@@ -27,6 +27,7 @@ if(MSVC)
         /INCREMENTAL:NO
         $<$<CONFIG:Release>:/OPT:REF>
         $<$<CONFIG:Release>:/OPT:ICF>
+        $<$<CONFIG:Release>:/Brepro>
     )
 else()
     target_compile_options(

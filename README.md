@@ -29,13 +29,21 @@ This repository contains:
 | Component | Recommended |
 |------------|-------------|
 | **Operating System** | Windows 10/11 ×64; Linux with a current native source build |
-| **Python** | 3.12 on Windows; matching local CPython on Linux |
+| **Python** | Official standard-GIL CPython 3.14.7 x64 on Windows; matching local CPython on Linux |
 | **Runtime libraries** | Python `tkinter` plus the packages in `requirements.txt` |
 | **Native source build** | CMake, a compatible C++ compiler, and `ARrobots/src/requirements-build.txt` |
 | **Hardware** | Teensy 4.1 controller + AR4-MK3 robot |
 | **Linux** | sudo apt-get install wmctrl |
 
-The repository provides a supported native binary for Windows CPython 3.12 x64. Bundled Linux extension files use the legacy native API and are rejected for motion; build the current tracked native source before running the HMI on Linux.
+Windows source mode supports official standard-GIL CPython 3.14.7 x64 through
+the reproducibly built, ABI-tagged
+`ARrobots/robot_kinematics.cp314-win_amd64.pyd`. The same runtime, complete
+Windows base and STEP locks, and native artifact govern the future Windows
+package. The package recipe, packaged executable, and clean-machine package
+validation remain incomplete; no Windows package artifact is ready. Windows
+CPython 3.12 support and the corresponding `cp312` artifact have been removed.
+Bundled Linux extension files use the legacy native API and are rejected for
+motion; build the current tracked native source before running the HMI on Linux.
 
 
 ---

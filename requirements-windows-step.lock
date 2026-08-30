@@ -1,0 +1,64 @@
+# AR4HMI STEP release profile for CPython 3.14.7 x64 on Windows.
+# Resolved from PyPI with pip 26.2.1; every selected artifact is wheel-only.
+--index-url https://pypi.org/simple
+--only-binary=:all:
+--require-hashes
+
+aiohappyeyeballs==2.7.1 --hash=sha256:9243213661e29250eb41368e5daa826fc017156c3b8a11440826b2e3ed376472  # wheel: aiohappyeyeballs-2.7.1-py3-none-any.whl
+aiohttp==3.14.3 --hash=sha256:8b3b60de05f3dcb6f6a00f818bb2ec781cee4de0645f59ccaf99b1d1823b6100  # wheel: aiohttp-3.14.3-cp314-cp314-win_amd64.whl
+aiosignal==1.4.0 --hash=sha256:053243f8b92b990551949e63930a839ff0cf0b0ebbe0597b0f3fb19e1a0fe82e  # wheel: aiosignal-1.4.0-py3-none-any.whl
+altgraph==0.17.5 --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597  # wheel: altgraph-0.17.5-py2.py3-none-any.whl
+attrs==26.1.0 --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309  # wheel: attrs-26.1.0-py3-none-any.whl
+cadquery==2.8.0 --hash=sha256:0acaddf36415551c26c3f8237907980ba86c277e211c32398121c839f719c81f  # wheel: cadquery-2.8.0-py3-none-any.whl
+cadquery-ocp==7.9.3.1.1 --hash=sha256:15518f34fbd968d6d353da6260c33ff4cb50fc3beed48aaae7b17f9ad1c5decc  # wheel: cadquery_ocp-7.9.3.1.1-cp314-cp314-win_amd64.whl
+cadquery-ocp-proxy==7.9.3.1.1 --hash=sha256:ca4164ec4b54956d9fc3e68c67d555b5486cb963c2f71e18df005ba16b921c91  # wheel: cadquery_ocp_proxy-7.9.3.1.1-py3-none-any.whl
+casadi==3.8.0 --hash=sha256:8630f9c68c7d05b49b538f05cc4f0873f0eaac720153c324f3dd00fc222b4d79  # wheel: casadi-3.8.0-cp311-abi3-win_amd64.whl
+comtypes==1.4.16 --hash=sha256:e18d85179ff12955524c5a8c3bc09cb3c0d890f1da4d7123d14244c7b78f84c8  # wheel: comtypes-1.4.16-py3-none-any.whl
+contourpy==1.3.3 --hash=sha256:cf9022ef053f2694e31d630feaacb21ea24224be1c3ad0520b13d844274614fd  # wheel: contourpy-1.3.3-cp314-cp314-win_amd64.whl
+cycler==0.12.1 --hash=sha256:85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30  # wheel: cycler-0.12.1-py3-none-any.whl
+ezdxf==1.4.4 --hash=sha256:666edda631ba717270293b734f5d58dd97a1d1aba4787187f09d0cc584645865  # wheel: ezdxf-1.4.4-py3-none-any.whl
+fonttools==4.63.0 --hash=sha256:7d782fac32985914c351556f68ac0855391572bcd87de50e05970d3cd4c96fc5  # wheel: fonttools-4.63.0-cp314-cp314-win_amd64.whl
+frozenlist==1.8.0 --hash=sha256:3e0761f4d1a44f1d1a47996511752cf3dcec5bbdd9cc2b4fe595caf97754b7a0  # wheel: frozenlist-1.8.0-cp314-cp314-win_amd64.whl
+idna==3.19 --hash=sha256:815e7be7a7806d54abb586dc943addc79e8b2ee16915059658cbeff4b1b43bf4  # wheel: idna-3.19-py3-none-any.whl
+inputs==0.5 --hash=sha256:13f894564e52134cf1e3862b1811da034875eb1f2b62e6021e3776e9669a96ec  # wheel: inputs-0.5-py2.py3-none-any.whl
+kiwisolver==1.5.1 --hash=sha256:f4167e87b397f273dc2356fcf1eaf50a6bac51e6105f45103ef7129c8efb0255  # wheel: kiwisolver-1.5.1-cp314-cp314-win_amd64.whl
+llvmlite==0.49.0 --hash=sha256:294e2f0b70aef8f92d0ae7b203e2609f08beb39437eee73de59a21669331aae9  # wheel: llvmlite-0.49.0-cp314-cp314-win_amd64.whl
+matplotlib==3.11.1 --hash=sha256:9601a1e90be21e4884c53b4f3dc3ee0544654946f9975258d691f1c2e2f119c6  # wheel: matplotlib-3.11.1-cp314-cp314-win_amd64.whl
+more-itertools==11.1.0 --hash=sha256:4b65538ae22f6fed0ce4874efd317463a7489796a0939fa66824dd542125a192  # wheel: more_itertools-11.1.0-py3-none-any.whl
+msgpack==1.2.2 --hash=sha256:1510f24612d4b983dff6935d9273e02c320cfd525727fbcb58836a75f589fdbc  # wheel: msgpack-1.2.2-cp314-cp314-win_amd64.whl
+multidict==6.7.1 --hash=sha256:5e01429a929600e7dab7b166062d9bb54a5eed752384c7384c968c2afab8f50f  # wheel: multidict-6.7.1-cp314-cp314-win_amd64.whl
+multimethod==1.12 --hash=sha256:fd0c473c43558908d97cc06e4d68e8f69202f167db46f7b4e4058893e7dbdf60  # wheel: multimethod-1.12-py3-none-any.whl
+nlopt==2.11.0 --hash=sha256:00d74c7c9fb63489973901f372c501541a2509c6d9f2d1a4089fee8193b8fd51  # wheel: nlopt-2.11.0-cp314-cp314-win_amd64.whl
+numba==0.67.0 --hash=sha256:4d576e62bf2c9370f61312b51573c4bb1f3fe96798bbab56730847a368a316c4  # wheel: numba-0.67.0-cp314-cp314-win_amd64.whl
+numpy==2.5.2 --hash=sha256:7587f53dfbd5edc0f7b87c6217b4c6d2d1f2ef9c3da70bc1315e7db5f8d7ec9d  # wheel: numpy-2.5.2-cp314-cp314-win_amd64.whl
+opencv-python==5.0.0.93 --hash=sha256:f90ba04b8f73bc5c3814037699739f0156f597338a98f05956c684e7c3ca10d2  # wheel: opencv_python-5.0.0.93-cp37-abi3-win_amd64.whl
+packaging==26.3 --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c  # wheel: packaging-26.3-py3-none-any.whl
+pefile==2024.8.26 --hash=sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f  # wheel: pefile-2024.8.26-py3-none-any.whl
+pillow==12.3.0 --hash=sha256:fdafc9cce40277e0f7a0feabce0ee50dd2fa1800f3b38015e51296b5e814048d  # wheel: pillow-12.3.0-cp314-cp314-win_amd64.whl
+pip==26.2.1 --hash=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e  # wheel: pip-26.2.1-py3-none-any.whl
+propcache==0.5.2 --hash=sha256:81e3a30b0bb60caa22033dd0f8a3618d1d67356212514f62c57db75cb0ef410c  # wheel: propcache-0.5.2-cp314-cp314-win_amd64.whl
+pygrabber==0.2 --hash=sha256:5ac8bbe5f6a5dfb7c1c9c55d80ca9b9457743abd3ac8efa21cb9e302bdbf03ac  # wheel: pygrabber-0.2-py3-none-any.whl
+pyinstaller==6.22.2 --hash=sha256:9b990fa6bbe143572f06644a984ad0d7aa2e2ccc6929d4916031343a5888e9a7  # wheel: pyinstaller-6.22.2-py3-none-win_amd64.whl
+pyinstaller-hooks-contrib==2026.7 --hash=sha256:24257a04c7a5a7a034cf28e39dcee20fbeeb9f043076729480f2e1b69904408a  # wheel: pyinstaller_hooks_contrib-2026.7-py3-none-any.whl
+pyparsing==3.3.2 --hash=sha256:850ba148bd908d7e2411587e247a1e4f0327839c40e2e5e6d05a007ecc69911d  # wheel: pyparsing-3.3.2-py3-none-any.whl
+pyserial==3.5 --hash=sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0  # wheel: pyserial-3.5-py2.py3-none-any.whl
+python-dateutil==2.9.0.post0 --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427  # wheel: python_dateutil-2.9.0.post0-py2.py3-none-any.whl
+pywin32==312 --hash=sha256:a4dd3a848290ef724347b19f301045831d8e802fa4464f491b98b1e0a081432e  # wheel: pywin32-312-cp314-cp314-win_amd64.whl
+pywin32-ctypes==0.2.3 --hash=sha256:8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8  # wheel: pywin32_ctypes-0.2.3-py3-none-any.whl
+pyyaml==6.0.3 --hash=sha256:4a2e8cebe2ff6ab7d1050ecd59c25d4c8bd7e6f400f5f82b96557ac0abafd0ac  # wheel: pyyaml-6.0.3-cp314-cp314-win_amd64.whl
+runtype==0.5.3 --hash=sha256:ea8cc6828217ebfda5c159dce969e832efd865a09d6ad1fc993f5bf5e1a627ee  # wheel: runtype-0.5.3-py3-none-any.whl
+scipy==1.18.1 --hash=sha256:78a0d7c918e74a232394117160e7e3db503377572a45bcef8826e4ab8a35feba  # wheel: scipy-1.18.1-cp314-cp314-win_amd64.whl
+setuptools==84.0.0 --hash=sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670  # wheel: setuptools-84.0.0-py3-none-any.whl
+six==1.17.0 --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274  # wheel: six-1.17.0-py2.py3-none-any.whl
+trame==3.13.2 --hash=sha256:23e87a65a6ea9241ce1060e9cd01426e48b3b8b72cd9f3cb974fc398649280b6  # wheel: trame-3.13.2-py3-none-any.whl
+trame-client==3.13.6 --hash=sha256:b4acf325d037a3d118c00a89ebbb32418dea9064844cc23e45c9deddea0628a4  # wheel: trame_client-3.13.6-py3-none-any.whl
+trame-common==1.2.7 --hash=sha256:14d50c651505c41f9144261b67bc0c7b3524bf72893d56ad544e255cfa1c1ba1  # wheel: trame_common-1.2.7-py3-none-any.whl
+trame-components==2.5.0 --hash=sha256:897a6c0ebcc72d95a461bde28d2c2e37c4bc4922013ad07df3a65e64d4884672  # wheel: trame_components-2.5.0-py3-none-any.whl
+trame-server==3.14.0 --hash=sha256:3519e99fdb962d0ecf29f0e8f969c84280ba0ef71d2cafe84a97e8b31d8052bd  # wheel: trame_server-3.14.0-py3-none-any.whl
+trame-vtk==2.11.16 --hash=sha256:2b5eadaf152d1cc59604f1a5e7cabab933a79bb4f889cf15eecec8db0cc8721d  # wheel: trame_vtk-2.11.16-py3-none-any.whl
+trame-vuetify==3.2.5 --hash=sha256:533470daa6f4d233f2eeb7434a312062bc30fb1b2d8cb341a5d9934ff7880303  # wheel: trame_vuetify-3.2.5-py3-none-any.whl
+ttkbootstrap==2.2.2 --hash=sha256:b268daf53e73fb3d50482ec743a675e325ec644afe7fb706b6bbee35fda489f8  # wheel: ttkbootstrap-2.2.2-py3-none-any.whl
+typing-extensions==4.16.0 --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8  # wheel: typing_extensions-4.16.0-py3-none-any.whl
+vtk==9.6.2 --hash=sha256:7b99aad09f712442345bb1c2a5529ad46da3a26fdc12cce54408ff800ccfbb19  # wheel: vtk-9.6.2-cp314-cp314-win_amd64.whl
+wslink==2.5.7 --hash=sha256:47d729f654d1ee0bb42b6f05b068c48d5fdacd3216e827c1e80ea09eca0fe287  # wheel: wslink-2.5.7-py3-none-any.whl
+yarl==1.24.5 --hash=sha256:5ba4f78df2bcc19f764a4b26a8a4f5049c110090ad5825993aacb052bf8003ad  # wheel: yarl-1.24.5-cp314-cp314-win_amd64.whl
