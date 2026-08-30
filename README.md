@@ -1,5 +1,5 @@
 # AR4 Control Software
-**Host source 6.7 — tracked Teensy derivative 6.7.1-ar4hmi.38**
+**Host source 7.0 — tracked Teensy derivative 6.7.1-ar4hmi.38**
 
 ![AR4 Logo](AR.png)
 
@@ -45,6 +45,7 @@ The repository provides a supported native binary for Windows CPython 3.12 x64. 
 
 Hardware boundaries are documented in
 [`SAFETY.md`](SAFETY.md).
+Typed scripting uses the [Python automation API](docs/python-automation-api.md).
 
 ```bash
 # Clone the repository

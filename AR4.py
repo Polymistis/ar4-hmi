@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 ############################################################################
-## Version AR4 6.7 CA LC                                        ############
+## Version AR4 7.0 CA LC                                        ############
 ############################################################################
 """ AR4 - robot control software
     Copyright (c) 2024, Chris Annin
@@ -180,6 +180,7 @@ from ARrobots.Calibration import (
 )
 from ARrobots.calibration_schema import (
   CalibrationSchemaError,
+  ar4_mk5_calibration_switch_profile,
   normalize_calibration_data,
   normalize_vision_background_color,
   reconcile_auxiliary_output_assignments,
@@ -329,6 +330,7 @@ from ARrobots.protocol import (
   JsonScalarResult,
   JsonResponseDelivery,
   JsonTelemetryDelivery,
+  SerialWriteCancellationBoundary,
   controller_identity_from_json_hello,
   encode_message,
   parse_main_joint_position_telemetry,
@@ -855,56 +857,6 @@ if __name__ == "__main__":
   joint_motion_request_lock = threading.Lock()
   joint_motion_request_lease = None
   offline_live_jog_motion_lease = None
-
-
-class SerialWriteCancellationBoundary:
-  """Order cancellation against the final serial write-admission check."""
-
-  def __init__(self, context):
-    if (
-      not isinstance(context, str)
-      or not context
-      or context != context.strip()
-      or "\r" in context
-      or "\n" in context
-    ):
-      raise TypeError("serial cancellation context must be normalized text")
-    self._context = context
-    self._event = threading.Event()
-    self._lock = threading.Lock()
-
-  def is_set(self):
-    cancelled = self._event.is_set()
-    if not isinstance(cancelled, bool):
-      raise RuntimeError(
-        f"{self._context} cancellation state must be boolean"
-      )
-    return cancelled
-
-  def cancel(self):
-    with self._lock:
-      self._event.set()
-    return True
-
-  def set(self):
-    return self.cancel()
-
-  def clear(self):
-    with self._lock:
-      self._event.clear()
-    return True
-
-  def wait(self, timeout=None):
-    return self._event.wait(timeout)
-
-  def write_reservation(self):
-    return self._lock
-
-  def acquire(self):
-    return self._lock.acquire()
-
-  def release(self):
-    return self._lock.release()
 
 
 class CalibrationCancellationBoundary:
@@ -31925,6 +31877,16 @@ def ClearKinTabFields():
     field.set("HIGH")
 
 
+def LoadAR4Mk5SwitchPolarity():
+  values = ar4_mk5_calibration_switch_profile()
+  J1CalSwitchField.set(values['J1CalSwitch'])
+  J2CalSwitchField.set(values['J2CalSwitch'])
+  J3CalSwitchField.set(values['J3CalSwitch'])
+  J4CalSwitchField.set(values['J4CalSwitch'])
+  J5CalSwitchField.set(values['J5CalSwitch'])
+  J6CalSwitchField.set(values['J6CalSwitch'])
+
+
 def LoadAR4Mk3default():
   ClearKinTabFields()
   J1MotDirEntryField.insert(0,str(0))
@@ -38203,6 +38165,9 @@ if __name__ == "__main__":
 
   loadMaxStepBut = Button(defaultsFrame, text="Load Max Microsteps", width=26, command=LoadMaxdefault)
   loadMaxStepBut.grid(row=8, column=0, padx=5, pady=5)
+
+  loadAR4Mk5SwitchBut = Button(defaultsFrame, text="Load AR4-MK5 Switch Polarity", width=26, command=LoadAR4Mk5SwitchPolarity)
+  loadAR4Mk5SwitchBut.grid(row=9, column=0, padx=5, pady=5)
 
 
 

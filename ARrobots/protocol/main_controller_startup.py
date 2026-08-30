@@ -5,6 +5,7 @@ import math
 import threading
 import time
 
+from .coordinator import close_unowned_serial_port
 from .main_controller import (
     JsonMainControllerClient,
     JsonMainControllerTerminal,
@@ -15,6 +16,7 @@ from .schemas import (
     JsonMainHelloResult,
     JsonMainHomeReferenceResult,
     JsonMainPositionResult,
+    parse_main_motion_position_result,
     validate_main_config_ext_axis_request,
     validate_main_set_position_request,
     validate_main_update_params_request,
@@ -36,6 +38,22 @@ _JSON_PHYSICAL_STOP_SOURCES = frozenset(
     (
         "emergency_stop_active",
         "emergency_stop_event",
+        "emergency_stop_terminal",
+    )
+)
+
+
+_JSON_TERMINAL_POSITION_PHYSICAL_STOP_COMMANDS = frozenset(
+    (
+        "calibrate",
+        "jog_tool",
+        "move_arc",
+        "move_cartesian",
+        "move_circle",
+        "move_joints",
+        "move_linear",
+        "move_spline",
+        "move_vision",
     )
 )
 
@@ -464,6 +482,7 @@ def _publish_physical_stop(
     physical_stop_callback,
     command,
     source,
+    position=None,
 ):
     physical_stop = JsonMainControllerPhysicalStop(
         command,
@@ -473,18 +492,16 @@ def _publish_physical_stop(
         published = physical_stop_callback(physical_stop)
     except BaseException as exc:
         raise JsonMainControllerPhysicalStopPublicationError(
-            physical_stop,
-            exc,
+            physical_stop, exc, position
         ) from exc
     if published is not True:
         publication_error = RuntimeError(
             "physical-stop publication callback must return true"
         )
         raise JsonMainControllerPhysicalStopPublicationError(
-            physical_stop,
-            publication_error,
+            physical_stop, publication_error, position
         ) from publication_error
-    raise JsonMainControllerPhysicalStopError(physical_stop)
+    raise JsonMainControllerPhysicalStopError(physical_stop, position)
 
 
 def _raise_event_delivery(
@@ -545,8 +562,19 @@ def _capture_terminal_physical_stop_error(
     response = terminal.response
     failure = response.error
     source = None
+    position = None
     if failure is not None and failure.code == "emergency_stop_active":
         source = "emergency_stop_active"
+    elif (
+        response.status == "cancelled"
+        and failure is not None
+        and failure.code == "emergency_stop"
+    ):
+        source = "emergency_stop_terminal"
+        if response.cmd in _JSON_TERMINAL_POSITION_PHYSICAL_STOP_COMMANDS:
+            position = parse_main_motion_position_result(
+                failure.details["position"]
+            )
     elif (
         response.status == "completed"
         and type(terminal.parsed_result) is JsonMainPositionResult
@@ -562,6 +590,7 @@ def _capture_terminal_physical_stop_error(
             physical_stop_callback,
             response.cmd,
             source,
+            position,
         )
     except (
         JsonMainControllerPhysicalStopError,
@@ -624,7 +653,7 @@ def _raise_after_terminal_drain(
     cause=None,
 ):
     try:
-        _drain_startup_input(
+        drain_main_controller_input(
             client,
             command,
             physical_stop_callback,
@@ -649,22 +678,44 @@ def _await_completed_terminal(
     *,
     physical_stop_callback,
     drain_timeout,
+    _return_terminal=False,
+    accepted_response_allowed=False,
 ):
+    retained_stop_error = None
     while True:
         delivery = client.pop_delivery()
         if delivery is None:
-            client.poll()
+            try:
+                client.poll()
+            except BaseException:
+                if retained_stop_error is not None:
+                    raise retained_stop_error
+                raise
             continue
         if type(delivery) is JsonResponseDelivery:
             if delivery.ticket is not ticket:
+                if retained_stop_error is not None:
+                    raise retained_stop_error
                 raise JsonMainControllerStartupError(
                     f"{context} received a response for another request"
                 )
-            retained_terminal = JsonMainControllerTerminal(delivery.response)
-            stop_error = _capture_terminal_physical_stop_error(
-                retained_terminal,
-                physical_stop_callback,
-            )
+            if (
+                delivery.response.status == "accepted"
+                and accepted_response_allowed
+            ):
+                continue
+            try:
+                retained_terminal = JsonMainControllerTerminal(delivery.response)
+            except BaseException:
+                if retained_stop_error is not None:
+                    raise retained_stop_error
+                raise
+            stop_error = retained_stop_error
+            if stop_error is None:
+                stop_error = _capture_terminal_physical_stop_error(
+                    retained_terminal,
+                    physical_stop_callback,
+                )
             try:
                 terminal = client.take_terminal(ticket)
                 client.acknowledge_terminal(ticket)
@@ -696,6 +747,8 @@ def _await_completed_terminal(
                     drain_timeout,
                     ownership_error,
                 )
+            if _return_terminal:
+                return terminal
             if terminal.response.status != "completed":
                 _raise_after_terminal_drain(
                     client,
@@ -723,11 +776,17 @@ def _await_completed_terminal(
                 )
             return parsed_result
         if type(delivery) is JsonEventDelivery:
-            _raise_event_delivery(
-                delivery,
-                ticket.command,
-                physical_stop_callback,
-            )
+            if retained_stop_error is not None:
+                raise retained_stop_error
+            try:
+                _raise_event_delivery(
+                    delivery, ticket.command, physical_stop_callback)
+            except (JsonMainControllerPhysicalStopError,
+                    JsonMainControllerPhysicalStopPublicationError) as error:
+                retained_stop_error = error
+            continue
+        if retained_stop_error is not None:
+            raise retained_stop_error
         if type(delivery) is JsonTelemetryDelivery:
             raise JsonMainControllerStartupError(
                 "unexpected controller telemetry during JSON startup"
@@ -737,16 +796,28 @@ def _await_completed_terminal(
         )
 
 
-def _drain_startup_input(
+def await_main_controller_terminal(
+    client, ticket, context, *, physical_stop_callback, drain_timeout,
+    accepted_response_allowed=False,
+):
+    """Return an acknowledged terminal; the caller retains reader ownership."""
+    return _await_completed_terminal(
+        client, ticket, context, physical_stop_callback=physical_stop_callback,
+        drain_timeout=drain_timeout, _return_terminal=True,
+        accepted_response_allowed=accepted_response_allowed)
+
+
+def drain_main_controller_input(
     client,
     command,
     physical_stop_callback,
     drain_timeout,
 ):
+    """Drain owned input while publishing emergency-stop evidence."""
     deadline = time.monotonic() + drain_timeout
     if not math.isfinite(deadline):
         raise JsonMainControllerStartupError(
-            "JSON startup input-drain deadline is not representable"
+            "JSON main-controller input-drain deadline is not representable"
         )
     while True:
         delivery = client.pop_delivery()
@@ -759,23 +830,23 @@ def _drain_startup_input(
                 )
             if type(delivery) is JsonTelemetryDelivery:
                 raise JsonMainControllerStartupError(
-                    "unexpected controller telemetry while draining JSON startup"
+                    "unexpected telemetry while draining main-controller JSON"
                 )
             if type(delivery) is JsonResponseDelivery:
                 raise JsonMainControllerStartupError(
-                    "unexpected controller response while draining JSON startup"
+                    "unexpected response while draining main-controller JSON"
                 )
             raise JsonMainControllerStartupError(
-                "JSON startup input drain received an unknown delivery type"
+                "main-controller JSON drain received an unknown delivery type"
             )
         if time.monotonic() >= deadline:
             raise JsonMainControllerStartupError(
-                "JSON startup input drain timed out"
+                "main-controller JSON input drain timed out"
             )
         polled = client.poll()
         if type(polled) is not bool:
             raise JsonMainControllerStartupError(
-                "JSON startup input poll returned an invalid disposition"
+                "main-controller JSON input poll returned an invalid disposition"
             )
         if not polled and not client.has_unread_input:
             return
@@ -790,7 +861,7 @@ def _submit_startup_request(
     drain_timeout,
 ):
     if _cancellation_requested(cancellation_boundary):
-        _drain_startup_input(
+        drain_main_controller_input(
             client,
             stop_context_command,
             physical_stop_callback,
@@ -804,7 +875,7 @@ def _submit_startup_request(
         )
     except TimeoutError:
         if _cancellation_requested(cancellation_boundary):
-            _drain_startup_input(
+            drain_main_controller_input(
                 client,
                 stop_context_command,
                 physical_stop_callback,
@@ -840,11 +911,20 @@ def run_main_controller_json_startup(
         normalized_request_timeout,
         JSON_SERIAL_DEFAULT_FRAME_TIMEOUT_SECONDS,
     )
-    if _cancellation_requested(cancellation_boundary):
-        raise TimeoutError("controller startup cancelled")
-    client = JsonMainControllerClient(serial_port)
+    if not all(callable(getattr(cancellation_boundary, name, None))
+               for name in ("is_set", "write_reservation")):
+        raise TypeError("controller startup cancellation boundary is invalid")
+    try:
+        client = JsonMainControllerClient(serial_port)
+    except BaseException as operation_error:
+        cleanup_error = close_unowned_serial_port(serial_port)
+        if cleanup_error is not None:
+            raise JsonMainControllerStartupCleanupError(operation_error, cleanup_error) from cleanup_error
+        raise
     position = None
     try:
+        if _cancellation_requested(cancellation_boundary):
+            raise TimeoutError("controller startup cancelled")
         hello_ticket = _submit_startup_request(
             client,
             cancellation_boundary,
@@ -978,7 +1058,7 @@ def run_main_controller_json_startup(
             raise TypeError(
                 "controller startup final ownership reservation is invalid"
             )
-        _drain_startup_input(
+        drain_main_controller_input(
             client,
             final_command,
             physical_stop_callback,
@@ -1002,7 +1082,7 @@ def run_main_controller_json_startup(
                     client,
                 )
         if cancelled:
-            _drain_startup_input(
+            drain_main_controller_input(
                 client,
                 final_command,
                 physical_stop_callback,
@@ -1042,7 +1122,9 @@ __all__ = (
     "JsonMainControllerStartupConfiguration",
     "JsonMainControllerStartupError",
     "JsonMainControllerStartupResult",
+    "await_main_controller_terminal",
     "controller_identity_from_json_hello",
+    "drain_main_controller_input",
     "retain_main_controller_startup_disposition_error",
     "run_main_controller_json_startup",
 )

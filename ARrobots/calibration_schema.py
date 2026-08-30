@@ -803,3 +803,19 @@ def normalize_calibration_data(
 
     _validate_controller_fields(normalized)
     return normalized
+
+
+def ar4_mk5_calibration_switch_profile():
+    return normalize_calibration_data(
+        {
+            "J1CalSwitch": "LOW",
+            "J2CalSwitch": "LOW",
+            "J3CalSwitch": "LOW",
+            "J4CalSwitch": "HIGH",
+            "J5CalSwitch": "HIGH",
+            "J6CalSwitch": "HIGH",
+        },
+        require_runtime_fields=False,
+        migrate_legacy_switches=False,
+        migrate_legacy_auxiliary_board=False,
+    )

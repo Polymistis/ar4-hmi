@@ -28,6 +28,7 @@ import ARrobots.Calibration as calibration_module
 from ARrobots.calibration_schema import (
     CALIBRATION_SWITCH_KEYS,
     CalibrationSchemaError,
+    ar4_mk5_calibration_switch_profile,
     normalize_calibration_data,
     normalize_vision_background_color,
 )
@@ -139,6 +140,21 @@ class CalibrationSchemaTests(unittest.TestCase):
                 "J1CalSwitch": "LOW",
             },
         )
+
+    def test_ar4_mk5_switch_profile_is_exact_normalized_and_fresh(self):
+        expected = {
+            "J1CalSwitch": "LOW",
+            "J2CalSwitch": "LOW",
+            "J3CalSwitch": "LOW",
+            "J4CalSwitch": "HIGH",
+            "J5CalSwitch": "HIGH",
+            "J6CalSwitch": "HIGH",
+        }
+
+        profile = ar4_mk5_calibration_switch_profile()
+        self.assertEqual(profile, expected)
+        profile["J1CalSwitch"] = "HIGH"
+        self.assertEqual(ar4_mk5_calibration_switch_profile(), expected)
 
     def test_invalid_numeric_and_enum_values_fail_without_mutation(self):
         cases = (

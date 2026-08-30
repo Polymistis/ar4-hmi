@@ -119,6 +119,49 @@ def _bounded_exception_detail(exc):
     return " ".join(detail.split())[:256]
 
 
+class SerialWriteCancellationBoundary:
+    """Order cancellation against the final serial write-admission check."""
+
+    def __init__(self, context):
+        if (not isinstance(context, str) or not context
+                or context != context.strip() or "\r" in context or "\n" in context):
+            raise TypeError("serial cancellation context must be normalized text")
+        self._context = context
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+
+    def is_set(self):
+        cancelled = self._event.is_set()
+        if not isinstance(cancelled, bool):
+            raise RuntimeError(f"{self._context} cancellation state must be boolean")
+        return cancelled
+
+    def cancel(self):
+        with self._lock:
+            self._event.set()
+        return True
+
+    def write_reservation(self):
+        return self._lock
+
+    def acquire(self):
+        return self._lock.acquire()
+
+    def release(self):
+        return self._lock.release()
+
+
+def close_unowned_serial_port(serial_port):
+    """Return any error from closing an unowned serial handle."""
+    try:
+        serial_port.close()
+        if getattr(serial_port, "is_open", None) is not False:
+            raise RuntimeError("serial connection did not verify closed")
+    except BaseException as error:
+        return error
+    return None
+
+
 class JsonSerialSessionCoordinator:
     """Take lifecycle ownership of one already-open serial handle.
 
@@ -1414,4 +1457,6 @@ __all__ = (
     "JsonSerialSessionCoordinatorCloseError",
     "JsonSerialSessionCoordinatorError",
     "JsonSerialSessionCoordinatorStateError",
+    "SerialWriteCancellationBoundary",
+    "close_unowned_serial_port",
 )

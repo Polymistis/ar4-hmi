@@ -10,6 +10,11 @@ from typing import Any
 import tkinter as tk
 import ttkbootstrap as ttk_bootstrap
 
+from ARrobots import __version__
+
+
+APPLICATION_TITLE = f"AR4 Software Ver {__version__}"
+
 
 @dataclass(frozen=True, eq=False)
 class ApplicationShell:
@@ -34,7 +39,7 @@ def create_application_shell(
 ) -> ApplicationShell:
     root = ttk_bootstrap.Tk()
     tk_thread_id = threading.get_ident()
-    root.wm_title("AR4 Software Ver 6.7")
+    root.wm_title(APPLICATION_TITLE)
     root.iconphoto(True, tk.PhotoImage(file=os.fspath(icon_path)))
 
     if (

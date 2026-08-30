@@ -261,6 +261,21 @@ class JsonAuxiliaryControllerClient:
                     "output pin is invalid for the bound auxiliary board"
                 )
 
+    def validate_command(self, command, params):
+        """Validate one active command against the bound board without writing."""
+        if command not in _AUXILIARY_SEMANTIC_COMMANDS:
+            raise JsonCommandSchemaError(
+                "auxiliary-controller semantic command is invalid"
+            )
+        with self._state_lock:
+            if self._binding is None:
+                raise JsonAuxiliaryControllerClientStateError(
+                    "auxiliary-controller session is not established"
+                )
+            contract, _parser = _AUXILIARY_COMMANDS_BY_NAME[command]
+            contract.request_validator(params)
+            self._validate_board_params(command, params)
+
     def request_hello(self, *, timeout, write_admission=None):
         self._begin_submission("hello")
         try:
@@ -292,9 +307,7 @@ class JsonAuxiliaryControllerClient:
             )
         self._begin_submission(command)
         try:
-            contract, _parser = _AUXILIARY_COMMANDS_BY_NAME[command]
-            contract.request_validator(params)
-            self._validate_board_params(command, params)
+            self.validate_command(command, params)
             return self._coordinator.submit(
                 command,
                 params,
