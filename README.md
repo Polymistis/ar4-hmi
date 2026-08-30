@@ -22,7 +22,6 @@ This repository contains:
 - Position teach, record, and playback  
 - VTK 3D robot visualization  
 - Integrated calibration tools  
-- Optional packaged Windows EXE build  
 
 ---
 
@@ -56,12 +55,18 @@ cd ar4-hmi
 python -m venv venv
 venv\Scripts\activate
 
-# Install dependencies
+# Install base dependencies
 pip install -r requirements.txt
+
+# Optional source STEP/STP import support
+pip install -r requirements-step.txt
 
 # Run the control interface
 python AR4.py
 ```
+
+The base install remains `requirements.txt`. Source STEP/STP import additionally
+requires `requirements-step.txt`. STEP/STP support in a frozen build requires bundling the optional STEP dependencies.
 
 Starting the interface explicitly admits the saved main-controller connection,
 validated configuration and position synchronization, configured auxiliary

@@ -132,7 +132,6 @@ if __name__ == "__main__":
 from os import path, execv
 import pathlib
 import subprocess
-from multiprocessing.resource_sharer import stop
 from dataclasses import dataclass
 from contextlib import contextmanager
 import threading
@@ -207,6 +206,13 @@ from ARrobots.serial_discovery import (
 )
 from ARrobots.HMI.Calibration import apply_calibration
 from ARrobots.HMI.application import create_application_shell, run_application
+from ARrobots.HMI.cad_scene import CadSceneError, PersistentCadScene
+from ARrobots.HMI.step_conversion import (
+  StepConversionControl,
+  StepConversionError,
+  StepConversionResult,
+  convert_step,
+)
 from ARrobots.HMI.program_model import (
   decode_program_row_content as _decode_program_row_content,
   normalize_program_tab_number as _normalize_program_tab_number,
@@ -417,6 +423,13 @@ if __name__ == "__main__":
 
   os.chdir(DIR)
 
+  RUN['cad_scene'], RUN['cad_scene_error'] = None, None
+  try:
+    RUN['cad_scene'] = PersistentCadScene(DIR / "cad-workspace")
+  except CadSceneError as exc:
+    RUN['cad_scene_error'] = f"CAD scene disabled: {exc}"
+    logger.error(RUN['cad_scene_error'])
+
   application_shell = create_application_shell(CE, logger, DIR / "AR.png")
   root = application_shell.root
   application_tk_thread_id = application_shell.tk_thread_id
@@ -576,6 +589,7 @@ def _close_joint_motion_trace_store_for_shutdown():
 def on_closing():
   global camera_preview_shutdown_started_at
   global camera_preview_shutdown_timeout_reported
+  global step_conversion_request
 
   closing_event = globals().get('application_closing')
   with application_lifecycle_lock:
@@ -696,6 +710,10 @@ def on_closing():
     runtime_state['visionSelectionKind'] = None
 
   _close_joint_motion_dispatcher_for_shutdown()
+
+  if step_conversion_request is not None:
+    if not step_conversion_request.cancel_for_shutdown():
+      step_conversion_request = None
 
   _set_application_status(text="SHUTDOWN WAITING FOR CONTROLLER", style="Warn.TLabel")
   _poll_application_close()
@@ -844,6 +862,8 @@ if __name__ == "__main__":
   live_serial_result_pending = threading.Event()
   live_jog_stop_requested = threading.Event()
   application_closing = threading.Event()
+  step_conversion_event_queue = Queue(maxsize=1)
+  step_conversion_request = None
   application_shutdown_started_at = None
   auxiliary_gripper_detach_shutdown_attempted = False
   camera_preview_shutdown_started_at = None
@@ -996,6 +1016,7 @@ CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS = 10.0
 # Dict insertion order is also the direct-run poll registration order.
 EVENT_POLL_CALLBACK_NAMES = {
   "camera-preview": "_poll_camera_preview_events",
+  "step-conversion": "_poll_step_conversion_events",
   "joint-motion": "_poll_joint_motion_events",
   "serial": "_poll_serial_events",
   "manual-controller": "_poll_manual_controller_events",
@@ -5183,6 +5204,7 @@ def _poll_application_close():
   _poll_joint_motion_events()
   _poll_virtual_motion_events()
   _poll_xbox_auxiliary_events()
+  _poll_step_conversion_events()
   _close_joint_motion_dispatcher_for_shutdown()
 
   try:
@@ -5277,6 +5299,14 @@ def _poll_application_close():
 
   conversion_active = globals().get('gcode_conversion_active')
   if conversion_active is not None and conversion_active.is_set():
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
+
+  if step_conversion_request is not None:
+    _set_application_status(
+      "SHUTDOWN WAITING FOR STEP CONVERSION",
+      "Warn.TLabel",
+    )
     root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
     return False
 
@@ -5411,6 +5441,8 @@ def _poll_application_close():
     return False
 
   _close_joint_motion_trace_store_for_shutdown()
+  if RUN['vtk_running']:
+    on_close_event(RUN['interactor'], None)
   cv2.destroyAllWindows()
   root.quit()
   root.destroy()
@@ -7170,36 +7202,6 @@ def toggle_offline_mode():
     finally:
         _finish_motion_request(request_lease)
 
-def update_joint_transforms():
-    angles = RUN['VR_angles']  # List of 6 joint angles in degrees
-
-    joint_stl_keys = [
-        "Link 1-1.STL",
-        "Link 2-1.STL",
-        "Link 3-1.STL",
-        "Link 4-1.STL",
-        "Link 5-1.STL",
-        "Link 6-1.STL",
-    ]
-
-    for i, stl_key in enumerate(joint_stl_keys):
-        joint_tf = RUN['joint_transforms'][stl_key]
-        joint_tf.Identity()
-
-        if i == 0:
-            joint_tf.RotateZ(angles[i])
-        elif i == 1:
-            joint_tf.RotateY(angles[i])
-        elif i == 2:
-            joint_tf.RotateY(angles[i])
-        elif i == 3:
-            joint_tf.RotateX(angles[i])
-        elif i == 4:
-            joint_tf.RotateY(angles[i])
-        elif i == 5:
-            joint_tf.RotateX(angles[i])  
-
-
 def build_robot_actors(renderer):
     # global RUN['actors'], RUN['assemblies'], RUN['base_transforms'], RUN['joint_transforms'], RUN['composite_transforms']
     #global color_map
@@ -7295,26 +7297,23 @@ def build_robot_actors(renderer):
         RUN['joint_transforms'][stl] = joint_tf
         RUN['composite_transforms'][stl] = comp_tf
 
-    # Build hierarchy
-    root = RUN['assemblies']["Link Base-1.STL"]
-    root.AddPart(RUN['assemblies']["Link Base-2.STL"])
-    RUN['assemblies']["Link Base-2.STL"].AddPart(RUN['assemblies']["Link Base-3.STL"])
-    RUN['assemblies']["Link Base-3.STL"].AddPart(RUN['assemblies']["Link 1-1.STL"])
-    RUN['assemblies']["Link 1-1.STL"].AddPart(RUN['assemblies']["Link 1-2.STL"])
-    RUN['assemblies']["Link 1-2.STL"].AddPart(RUN['assemblies']["Link 2-1.STL"])
-    RUN['assemblies']["Link 2-1.STL"].AddPart(RUN['assemblies']["Link 2-2.STL"])
-    RUN['assemblies']["Link 2-2.STL"].AddPart(RUN['assemblies']["Link 2-3.STL"])
-    RUN['assemblies']["Link 2-3.STL"].AddPart(RUN['assemblies']["Link 3-1.STL"])
-    RUN['assemblies']["Link 3-1.STL"].AddPart(RUN['assemblies']["Link 3-2.STL"])
-    RUN['assemblies']["Link 3-2.STL"].AddPart(RUN['assemblies']["Link 4-1.STL"])
-    RUN['assemblies']["Link 4-1.STL"].AddPart(RUN['assemblies']["Link 4-2.STL"])
-    RUN['assemblies']["Link 4-2.STL"].AddPart(RUN['assemblies']["Link 4-3.STL"])
-    RUN['assemblies']["Link 4-3.STL"].AddPart(RUN['assemblies']["Link 5-1.STL"])
-    RUN['assemblies']["Link 5-1.STL"].AddPart(RUN['assemblies']["Link 5-2.STL"])
-    RUN['assemblies']["Link 5-2.STL"].AddPart(RUN['assemblies']["Link 6-1.STL"])
-    RUN['assemblies']["Link 6-1.STL"].AddPart(RUN['assemblies']["Link 6-2.STL"])
+    for parent, child in zip(stl_files, stl_files[1:]):
+        RUN['assemblies'][parent].AddPart(RUN['assemblies'][child])
+    RUN['tool_mount'] = vtk.vtkAssembly()
+    RUN['assemblies']["Link 6-1.STL"].AddPart(RUN['tool_mount'])
+    renderer.AddActor(RUN['assemblies'][stl_files[0]])
 
-    renderer.AddActor(root)
+
+def _tool_mount_world_matrix():
+    world = vtk.vtkMatrix4x4()
+    world.Identity()
+    for stl in tuple(RUN['composite_transforms'])[:-1]:
+        product = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Multiply4x4(
+            world, RUN['composite_transforms'][stl].GetMatrix(), product
+        )
+        world = product
+    return world
 
 
 class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
@@ -7381,16 +7380,24 @@ def add_floor_grid(renderer, size=1000, spacing=50):
     RUN['renderer'].AddActor(actor)        
 
 def on_close_event(obj, event):
-    # global RUN['vtk_running']
     RUN['vtk_running'] = False
+    scene = RUN.get('cad_scene')
     try:
-        obj.GetRenderWindow().Finalize()
-        obj.TerminateApp()
-    except:
-        pass
+        if scene is not None:
+            scene.unbind_vtk()
+    except Exception:
+        logger.exception("CAD scene unbind failed during viewer close")
+    finally:
+        try:
+            obj.GetRenderWindow().Finalize()
+            obj.TerminateApp()
+        except Exception:
+            logger.exception("VTK viewer close failed")
+    if 'cad_tree' in globals():
+        _refresh_cad_controls()
 
 def update_vtk(render_window, root_widget):
-    if not RUN['vtk_running']:
+    if not RUN['vtk_running'] or render_window is not RUN.get('render_window'):
         return
 
     angles = tuple(
@@ -7410,40 +7417,10 @@ def update_vtk(render_window, root_widget):
     )
 
 
-def add_reset_view_button(renderer, interactor, camera):
-    # Create a text actor for the button
-    text_actor = vtk.vtkTextActor()
-    text_actor.SetInput("Reset View")
-    text_actor.GetTextProperty().SetFontSize(24)
-    text_actor.GetTextProperty().SetColor(1.0, 1.0, 1.0)  # white
-    text_actor.SetDisplayPosition(20, 20)  # bottom-left corner
-    renderer.AddActor2D(text_actor)
-
-    # Get a rough width/height for click bounds (trial and error)
-    click_bounds = {
-        'x1': 20,
-        'y1': 20,
-        'x2': 20 + 150,  # width of text
-        'y2': 20 + 40    # height of text
-    }
-
-    def click_callback(obj, event):
-        click_pos = RUN['interactor'].GetEventPosition()
-        x, y = click_pos
-        if click_bounds['x1'] <= x <= click_bounds['x2'] and click_bounds['y1'] <= y <= click_bounds['y2']:
-            camera.Azimuth(45)
-            camera.Elevation(35)
-            camera.SetViewUp(0, 0, 1)
-            RUN['renderer'].ResetCamera()
-            RUN['renderer'].ResetCameraClippingRange()
-            RUN['interactor'].GetRenderWindow().Render()
-
-    # Attach click handler
-    RUN['interactor'].AddObserver("LeftButtonPressEvent", click_callback)        
-
 def launch_vtk_nonblocking(root_widget):
-    #global renderer
-    # global RUN['vtk_running'], RUN['interactor'], RUN['render_window'], RUN['VR_angles']
+    if RUN['vtk_running']:
+        logger.warning("Virtual robot viewer is already active")
+        return False
 
     RUN['vtk_running'] = True
 
@@ -7461,6 +7438,18 @@ def launch_vtk_nonblocking(root_widget):
     RUN['renderer'].SetBackground(vtk.vtkNamedColors().GetColor3d("LightSlateGray"))
 
     build_robot_actors(RUN['renderer'])
+    scene = RUN.get('cad_scene')
+    if scene is not None:
+        try:
+            scene.bind_vtk(
+                RUN['renderer'], anchors={'tool_mount': RUN['tool_mount']}
+            )
+            if 'cad_status_var' in globals():
+                cad_status_var.set("CAD scene ready")
+        except Exception as exc:
+            logger.error("CAD viewer binding failed: %s", exc)
+            if 'cad_status_var' in globals():
+                cad_status_var.set(f"CAD viewer binding failed: {exc}")
     add_floor_grid(RUN['renderer'])
 
     camera = RUN['renderer'].GetActiveCamera()
@@ -7470,8 +7459,6 @@ def launch_vtk_nonblocking(root_widget):
     camera.Elevation(55)
     camera.SetViewUp(0, 0, 1)
     RUN['renderer'].ResetCameraClippingRange()
-
-    #add_reset_view_button(RUN['renderer'], interactor, camera)
 
     RUN['interactor'].AddObserver("ExitEvent", on_close_event)
     RUN['interactor'].Initialize()
@@ -7485,6 +7472,9 @@ def launch_vtk_nonblocking(root_widget):
 
     RUN['lastRenderedAngles'] = None
     update_vtk(RUN['render_window'], root_widget)
+    if 'cad_tree' in globals():
+        _refresh_cad_controls()
+    return True
 
 
 
@@ -7595,87 +7585,237 @@ def set_vtk_topmost_delayed():
 
 
 
-def update_stl_transform():
-    name = stl_name_var.get()
-    if name not in imported_actors:
-        logger.error("File not found in imported actors.")
-        return
+def _cad_scene_for_action():
+    scene, error = RUN.get('cad_scene'), RUN.get('cad_scene_error')
+    if scene is None or error:
+        raise CadSceneError(error or "CAD scene is unavailable")
+    return scene
 
-    actor = imported_actors[name]
+def _selected_cad_object():
+    selected = cad_tree.selection()
+    scene = RUN.get('cad_scene')
+    if len(selected) != 1 or scene is None:
+        return None
+    return next((item for item in scene.objects if item.object_id == selected[0]), None)
+
+def _set_cad_action_states(item=None):
+    available = RUN.get('cad_scene') is not None and not RUN.get('cad_scene_error')
+    converting = step_conversion_request is not None
+    cad_buttons['import'].config(state=NORMAL if available and not converting else DISABLED)
+    if converting:
+        cad_buttons['cancel'].grid()
+    else:
+        cad_buttons['cancel'].grid_remove()
+    selected = available and item is not None
+    for name in ('update', 'delete'):
+        cad_buttons[name].config(state=NORMAL if selected else DISABLED)
+    active = selected and RUN['vtk_running'] and RUN['cad_scene'].is_bound_to(RUN.get('renderer'))
+    cad_buttons['attach'].config(state=NORMAL if active and item.parent == 'world' else DISABLED)
+    cad_buttons['detach'].config(state=NORMAL if active and item.parent == 'tool_mount' else DISABLED)
+
+
+def _show_cad_selection(event=None):
+    item = _selected_cad_object()
+    if item is not None:
+        for field in ('label', 'x_mm', 'y_mm', 'z_mm', 'rx_deg', 'ry_deg', 'rz_deg'):
+            cad_fields[field].set(getattr(item, field))
+    _set_cad_action_states(item)
+
+
+def _refresh_cad_controls(select_id=None):
+    current = cad_tree.selection()
+    if select_id is None and len(current) == 1:
+        select_id = current[0]
+    rows = cad_tree.get_children()
+    if rows:
+        cad_tree.delete(*rows)
+    scene = RUN.get('cad_scene')
+    if scene is not None:
+        for item in scene.objects:
+            cad_tree.insert('', END, iid=item.object_id, text=item.object_id,
+                            values=(item.label, item.parent))
+    if select_id in cad_tree.get_children():
+        cad_tree.selection_set(select_id)
+    _show_cad_selection()
+    error = RUN.get('cad_scene_error')
+    if error:
+        cad_status_var.set(error)
+
+
+def _run_cad_mutation(operation, success_message, *, requires_selection=False):
+    selected = cad_tree.selection()
+    select_id = selected[0] if len(selected) == 1 else None
+    item = None
+    status = success_message
     try:
-        x = float(x_var.get())
-        y = float(y_var.get())
-        z = float(z_var.get())
-        rot = float(rot_var.get())
-    except ValueError:
-        logger.error("Invalid number entered.")
+        if requires_selection and select_id is None:
+            raise CadSceneError("select one CAD object")
+        scene = _cad_scene_for_action()
+        item = operation(scene, select_id)
+        if item is not None:
+            select_id = item.object_id
+    except (CadSceneError, ValueError, OverflowError) as exc:
+        status = f"CAD action failed: {exc}"
+        logger.error("CAD action failed: %s", exc)
+    finally:
+        scene = RUN.get('cad_scene')
+        if RUN['vtk_running'] and scene is not None and not scene.is_bound_to(RUN.get('renderer')):
+            status = f"{status}; CAD viewer binding failed"
+        cad_status_var.set(status)
+        _refresh_cad_controls(select_id)
+        if RUN['vtk_running'] and RUN.get('render_window') is not None:
+            RUN['render_window'].Render()
+    return item
+
+
+def _run_step_conversion(source, control):
+    try:
+        result = convert_step(source, control=control)
+    except StepConversionError as exc:
+        result = str(exc)
+    except Exception:
+        logger.exception("Unexpected STEP conversion failure")
+        result = "STEP conversion failed"
+    step_conversion_event_queue.put((control, result))
+
+
+def _commit_step_result(result):
+    temporary_path = None
+    item = None
+    cleanup_failed = False
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="ar4-step-handoff-", suffix=".stl", delete=False,
+        ) as destination:
+            temporary_path = destination.name
+            if destination.write(result.stl_payload) != len(result.stl_payload):
+                raise OSError("temporary STEP handoff write was incomplete")
+        item = _run_cad_mutation(
+            lambda scene, unused: scene.import_stl(temporary_path, label=result.label),
+            "STEP object imported",
+        )
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                cleanup_failed = True
+                logger.exception("Unable to remove the temporary STEP handoff")
+    if cleanup_failed:
+        if item is not None:
+            cad_status_var.set("STEP import committed; temporary cleanup failed")
+        else:
+            cad_status_var.set(f"{cad_status_var.get()}; temporary cleanup failed")
+    return item
+
+
+def _poll_step_conversion_events():
+    global step_conversion_request
+
+    _reschedule_event_poll("step-conversion")
+    try:
+        event = step_conversion_event_queue.get_nowait()
+    except Empty:
         return
+    request = step_conversion_request
+    if not isinstance(event, tuple) or len(event) != 2 or event[0] is not request:
+        if not application_closing.is_set():
+            logger.error("Discarding an invalid or stale STEP conversion result")
+    else:
+        result = event[1]
+        closing = application_closing.is_set()
+        try:
+            if closing or request.is_cancelled():
+                if not closing:
+                    cad_status_var.set("STEP import cancelled")
+            elif isinstance(result, StepConversionResult):
+                _commit_step_result(result)
+            elif isinstance(result, str) and result:
+                cad_status_var.set(f"STEP import failed: {result}")
+            else:
+                raise TypeError("STEP conversion result is invalid")
+        except Exception:
+            logger.exception("Unable to settle the STEP conversion result")
+            if not closing:
+                cad_status_var.set("STEP import failed")
+        finally:
+            step_conversion_request = None
+            if not closing:
+                _refresh_cad_controls()
 
-    transform = vtk.vtkTransform()
-    transform.Translate(x, y, z)
-    transform.RotateZ(rot)
 
-    actor.SetUserTransform(transform)
-    RUN['render_window'].Render()
+def _start_step_conversion(source):
+    global step_conversion_request
 
-
-
-
-
-if __name__ == "__main__":
-  imported_actors = {}  # filename -> actor mapping
-
-  stl_name_var = tk.StringVar()
-  x_var = tk.StringVar(value="0")
-  y_var = tk.StringVar(value="0")
-  z_var = tk.StringVar(value="0")
-  rot_var = tk.StringVar(value="0")
-
-def import_stl_file():
-    file_path = fd.askopenfilename(filetypes=[("STL files", "*.stl")])
-    if not file_path:
+    if application_closing.is_set() or step_conversion_request is not None:
         return
-
-    filename = os.path.basename(file_path)
-    stl_name_var.set(filename)
-
-    reader = vtk.vtkSTLReader()
-    reader.SetFileName(file_path)
-    reader.Update()
-
-    mapper = vtk.vtkPolyDataMapper()
-    mapper.SetInputConnection(reader.GetOutputPort())
-
-    actor = vtk.vtkActor()
-    actor.SetMapper(mapper)
-    actor.GetProperty().SetColor(0.254, 0.41, 0.882)
-    actor.SetPosition(0, 0, 0)
-
-    RUN['renderer'].AddActor(actor)
-    RUN['render_window'].Render()
-
-    imported_actors[filename] = actor
+    control = StepConversionControl()
+    step_conversion_request = control
+    cad_status_var.set("Converting STEP")
+    _set_cad_action_states(_selected_cad_object())
+    try:
+        threading.Thread(
+            target=_run_step_conversion,
+            args=(source, control),
+            name="ar4-step-conversion",
+            daemon=True,
+        ).start()
+    except Exception:
+        step_conversion_request = None
+        logger.exception("Unable to start STEP conversion")
+        cad_status_var.set("STEP import failed")
+        _set_cad_action_states(_selected_cad_object())
 
 
-def load_stl_into_scene(stl_path, renderer, render_window):
-    reader = vtk.vtkSTLReader()
-    reader.SetFileName(stl_path)
-    reader.Update()
+def cancel_step_conversion():
+    if step_conversion_request is not None:
+        step_conversion_request.cancel()
+        cad_status_var.set("STEP cancellation requested")
 
-    mapper = vtk.vtkPolyDataMapper()
-    mapper.SetInputConnection(reader.GetOutputPort())
 
-    actor = vtk.vtkActor()
-    actor.SetMapper(mapper)
-    actor.GetProperty().SetColor(0.254, 0.41, 0.882)  
+def import_cad_file():
+    source = fd.askopenfilename(filetypes=[
+        ("CAD files", ("*.stl", "*.step", "*.stp")),
+        ("All files", "*.*"),
+    ])
+    if not source:
+        return
+    suffix = Path(source).suffix.lower()
+    if suffix == ".stl":
+        cad_fields['label'].set(Path(source).stem)
+        _run_cad_mutation(
+            lambda scene, unused: scene.import_stl(source, label=cad_fields['label'].get()),
+            "CAD object imported",
+        )
+    elif suffix in (".step", ".stp"):
+        _start_step_conversion(source)
+    else:
+        cad_status_var.set("CAD action failed: select an STL, STEP, or STP file")
 
-    actor.SetPosition(0, 0, 0)  # Adjust as needed
 
-    renderer.AddActor(actor)
-    RUN['render_window'].Render()
+def update_cad_object():
+    def update(scene, object_id):
+        values = {name: float(cad_fields[name].get()) for name in
+                  ('x_mm', 'y_mm', 'z_mm', 'rx_deg', 'ry_deg', 'rz_deg')}
+        return scene.update_object(object_id, label=cad_fields['label'].get(), **values)
+    _run_cad_mutation(update, "CAD object updated", requires_selection=True)
 
-   
-    
+
+def delete_cad_object():
+    _run_cad_mutation(lambda scene, object_id: scene.delete_object(object_id),
+                      "CAD object deleted", requires_selection=True)
+
+
+def reparent_cad_object(parent):
+    def reparent(scene, object_id):
+        if not RUN['vtk_running'] or not scene.is_bound_to(RUN.get('renderer')):
+            raise CadSceneError("attach and detach require the active viewer")
+        return scene.reparent(object_id, parent, anchor_world_matrices={
+            'tool_mount': _tool_mount_world_matrix(),
+        })
+    _run_cad_mutation(reparent, f"CAD object moved to {parent}", requires_selection=True)
 
 
 
@@ -37137,7 +37277,7 @@ if __name__ == "__main__":
   tab2.grid_columnconfigure(3, weight=0, minsize=150)  # Encoder Control
   tab2.grid_columnconfigure(4, weight=0, minsize=180)  # External Axes
   tab2.grid_columnconfigure(5, weight=0, minsize=150)  # Theme
-  tab2.grid_columnconfigure(6, weight=0, minsize=180)  # Virtual Import
+  tab2.grid_columnconfigure(6, weight=0, minsize=420)
   tab2.grid_columnconfigure(7, weight=0, minsize=120)  # Save
   tab2.grid_columnconfigure(8, weight=1)  # Spacer (expands)
 
@@ -37596,51 +37736,46 @@ if __name__ == "__main__":
   axis9pinsetLab.grid(row=20, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 5))
 
 
-  # ============================================================================
-  # ROW 1, COLUMN 6: Virtual Import Frame
-  # ============================================================================
-  virtualImportFrame = LabelFrame(tab2, text="Virtual Import", padding=10)
-  virtualImportFrame.grid(row=1, column=6, sticky="nsew", padx=5, pady=5)
+  cadFrame = LabelFrame(tab2, text="Persistent CAD", padding=10)
+  cadFrame.grid(row=1, column=6, sticky="nsew", padx=5, pady=5)
+  cadFrame.grid_columnconfigure(1, weight=1)
 
-  virtualImportFrame.grid_columnconfigure(0, weight=1)
+  cad_tree = ttk.Treeview(cadFrame, columns=('label', 'parent'), show='tree headings', height=4)
+  for column, text in (('#0', 'Object ID'), ('label', 'Label'), ('parent', 'Parent')):
+    cad_tree.heading(column, text=text)
+  cad_tree.column('#0', width=205, stretch=False)
+  cad_tree.column('label', width=110)
+  cad_tree.column('parent', width=85, stretch=False)
+  cad_tree.grid(row=0, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
 
-  # Import STL button
-  importSTLBut = ttk.Button(virtualImportFrame, text="Import STL", command=import_stl_file)
-  importSTLBut.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+  cad_fields = {}
+  for row, (name, text, initial) in enumerate((
+    ('label', 'Label', ''), ('x_mm', 'X mm', '0'), ('y_mm', 'Y mm', '0'),
+    ('z_mm', 'Z mm', '0'), ('rx_deg', 'RX deg', '0'), ('ry_deg', 'RY deg', '0'), ('rz_deg', 'RZ deg', '0'),
+  ), start=1):
+    Label(cadFrame, text=text).grid(row=row, column=0, sticky="w", padx=5)
+    cad_fields[name] = tk.StringVar(value=initial)
+    Entry(cadFrame, textvariable=cad_fields[name], width=16).grid(row=row, column=1, sticky="ew", padx=5, pady=1)
 
-  # File Name
-  fileNameLab = Label(virtualImportFrame, text="File Name")
-  fileNameLab.grid(row=1, column=0, sticky="w", padx=5, pady=(10, 2))
-  stl_name_entry = Entry(virtualImportFrame, textvariable=stl_name_var, width=20)
-  stl_name_entry.grid(row=2, column=0, sticky="ew", padx=5, pady=2)
+  cadButtonFrame = Frame(cadFrame)
+  cadButtonFrame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+  cad_buttons = {
+    'import': ttk.Button(cadButtonFrame, text="Import", command=import_cad_file),
+    'cancel': ttk.Button(cadButtonFrame, text="Cancel", command=cancel_step_conversion),
+    'update': ttk.Button(cadButtonFrame, text="Update", command=update_cad_object),
+    'delete': ttk.Button(cadButtonFrame, text="Delete", command=delete_cad_object),
+    'attach': ttk.Button(cadButtonFrame, text="Attach", command=lambda: reparent_cad_object('tool_mount')),
+    'detach': ttk.Button(cadButtonFrame, text="Detach", command=lambda: reparent_cad_object('world')),
+  }
+  for column, button in enumerate(cad_buttons.values()):
+    button.grid(row=0, column=column, padx=2, sticky="ew")
+    cadButtonFrame.grid_columnconfigure(column, weight=1)
 
-  # X Position
-  xPosLab = Label(virtualImportFrame, text="X Position")
-  xPosLab.grid(row=3, column=0, sticky="w", padx=5, pady=(10, 2))
-  x_entry = Entry(virtualImportFrame, textvariable=x_var, width=10)
-  x_entry.grid(row=4, column=0, sticky="w", padx=5, pady=2)
-
-  # Y Position
-  yPosLab = Label(virtualImportFrame, text="Y Position")
-  yPosLab.grid(row=5, column=0, sticky="w", padx=5, pady=(10, 2))
-  y_entry = Entry(virtualImportFrame, textvariable=y_var, width=10)
-  y_entry.grid(row=6, column=0, sticky="w", padx=5, pady=2)
-
-  # Z Position
-  zPosLab = Label(virtualImportFrame, text="Z Position")
-  zPosLab.grid(row=7, column=0, sticky="w", padx=5, pady=(10, 2))
-  z_entry = Entry(virtualImportFrame, textvariable=z_var, width=10)
-  z_entry.grid(row=8, column=0, sticky="w", padx=5, pady=2)
-
-  # Z Rotation
-  zRotLab = Label(virtualImportFrame, text="Z Rotation")
-  zRotLab.grid(row=9, column=0, sticky="w", padx=5, pady=(10, 2))
-  rot_entry = Entry(virtualImportFrame, textvariable=rot_var, width=10)
-  rot_entry.grid(row=10, column=0, sticky="w", padx=5, pady=2)
-
-  # Update Position button
-  updatePosBut = ttk.Button(virtualImportFrame, text="Update Position", command=update_stl_transform)
-  updatePosBut.grid(row=11, column=0, sticky="ew", padx=5, pady=(10, 5))
+  Label(cadFrame, text="Visualization only -- not collision or physical-motion authority").grid(row=9, column=0, columnspan=2, sticky="w", padx=5)
+  cad_status_var = tk.StringVar(value=RUN.get('cad_scene_error') or "CAD scene ready")
+  Label(cadFrame, textvariable=cad_status_var, wraplength=390).grid(row=10, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 5))
+  cad_tree.bind('<<TreeviewSelect>>', _show_cad_selection)
+  _refresh_cad_controls()
 
   # ============================================================================
   # ROW 2, COLUMN 5: Save Frame (below and right of Commands)

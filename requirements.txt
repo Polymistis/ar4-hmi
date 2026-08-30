@@ -1,13 +1,11 @@
-ttkthemes
-matplotlib
 numpy
 Pillow
 vtk
 pyserial
 opencv-python
-opencv-contrib-python
 inputs
 ttkbootstrap
 
 # Only install on Windows
 pywin32; sys_platform == "win32"
+pygrabber; sys_platform == "win32"

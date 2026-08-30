@@ -28,6 +28,7 @@ dist/
 /gcode-storage-state.json.lock
 /.gcode-storage-state-*.tmp
 /controller-traces/
+/cad-workspace/
 
 # Editor and operating-system state
 .idea/
