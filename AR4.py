@@ -75,11 +75,6 @@
 '''
 ##########################################################################
 
-if __name__ != "__main__":
-    raise RuntimeError(
-        "AR4.py is an executable application entry point; "
-        "import ARrobots modules instead"
-    )
 
 import sys
 import os
@@ -99,37 +94,38 @@ Windows - 'set DEBUG=true'
 DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes", "on") #Check if DEBUG env var is set
 
 logger = logging.getLogger("ARrobots")
-logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+if __name__ == "__main__":
+  logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
 
-# Add console handler
-console = logging.StreamHandler(sys.stdout)
-console.setFormatter(logging.Formatter("%(name)s: %(asctime)s [%(levelname)s] %(message)s"))
-logger.addHandler(console)
-logger.propagate = False
+  # Add console handler
+  console = logging.StreamHandler(sys.stdout)
+  console.setFormatter(logging.Formatter("%(name)s: %(asctime)s [%(levelname)s] %(message)s"))
+  logger.addHandler(console)
+  logger.propagate = False
 
-# Function to log to Pane 8
-def pane8_log(message):
-    if tab8 and hasattr(tab8, "ElogView"):
-      Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-      try:
-          # Schedule insertion on Tkinter main thread
-          tab8.ElogView.after(0, lambda: tab8.ElogView.insert(END, f"{Curtime} - {message}"))
-      except tk.TclError:
-          pass  # widget likely gone
+  # Function to log to Pane 8
+  def pane8_log(message):
+      if tab8 and hasattr(tab8, "ElogView"):
+        Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
+        try:
+            # Schedule insertion on Tkinter main thread
+            tab8.ElogView.after(0, lambda: tab8.ElogView.insert(END, f"{Curtime} - {message}"))
+        except tk.TclError:
+            pass  # widget likely gone
 
-# Setup Pane8 as a logging handler and log there
-pane8_handler = CustomOutputHandler(pane8_log)
-pane8_handler.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
-# Pan8 should not try to log modules that init before pane8 is available.
-pane8_handler.addFilter(ModuleFilter("ARrobots.AR4config"))
-pane8_handler.addFilter(ModuleFilter("ARrobots.Logging"))
-logger.addHandler(pane8_handler)
+  # Setup Pane8 as a logging handler and log there
+  pane8_handler = CustomOutputHandler(pane8_log)
+  pane8_handler.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
+  # Pan8 should not try to log modules that init before pane8 is available.
+  pane8_handler.addFilter(ModuleFilter("ARrobots.AR4config"))
+  pane8_handler.addFilter(ModuleFilter("ARrobots.Logging"))
+  logger.addHandler(pane8_handler)
 
-if DEBUG:
-  dump_logger_info("ARrobots")
-  dump_logger_info("ARrobots.AR4config")
-  dump_logger_info("ARrobots.Calibration")
-  dump_logger_info("ARrobots.Logging")
+  if DEBUG:
+    dump_logger_info("ARrobots")
+    dump_logger_info("ARrobots.AR4config")
+    dump_logger_info("ARrobots.Calibration")
+    dump_logger_info("ARrobots.Logging")
 
 ## End Logging Configuration #######################################################################################
 
@@ -154,8 +150,6 @@ import numpy as np
 import pickle
 import serial
 import tempfile
-
-from matplotlib import pyplot as plt
 
 from tkinter import *
 # Import ttkbootstrap widgets to replace ttk widgets
@@ -200,7 +194,18 @@ from ARrobots.controller_trace_capture import (
   ControllerTraceStore,
   controller_configuration_fingerprint,
 )
+from ARrobots.serial_discovery import (
+  MAIN_CONTROLLER_USB_ID,
+  enumerate_serial_ports,
+  normalize_serial_ports,
+  port_identity,
+  resolve_auxiliary_identity,
+  resolve_main_identity,
+  resolve_selected_device,
+  selector_entries,
+)
 from ARrobots.HMI.Calibration import apply_calibration
+from ARrobots.HMI.application import create_application_shell, run_application
 from ARrobots.HMI.program_model import (
   decode_program_row_content as _decode_program_row_content,
   normalize_program_tab_number as _normalize_program_tab_number,
@@ -369,16 +374,16 @@ from ARrobots.HMI.vision_io import (
 
 from pathlib import Path
 import platform
-from serial.tools import list_ports
 from typing import List, Optional
 
 from ARrobots.AR4config import AR4_Configuration
 
-global Config, CE, CAL, RUN
-Config = AR4_Configuration()
-CE = Config.Environment
-CAL = Config.Calibration
-RUN = Config.RuntimeState # Not implemented yet
+if __name__ == "__main__":
+  global Config, CE, CAL, RUN
+  Config = AR4_Configuration.discover()
+  CE = Config.Environment
+  CAL = Config.Calibration
+  RUN = Config.RuntimeState # Not implemented yet
 PROGRAM_REGISTER_COUNT = 16
 PROGRAM_POSITION_REGISTER_ELEMENT_COUNT = 6
 program_register_entry_fields = {}
@@ -393,95 +398,40 @@ def _load_startup_calibration():
     )
   return calibration_values
 
-if CE['Platform']['IS_WINDOWS']:
-  from pygrabber.dshow_graph import FilterGraph
+if __name__ == "__main__":
+  if CE['Platform']['IS_WINDOWS']:
+    from pygrabber.dshow_graph import FilterGraph
 
 
-robot.robot_set()
+  robot.robot_set()
 
-#DIR = pathlib.Path(__file__).parent.resolve()
-#os.chdir(DIR)
+  #DIR = pathlib.Path(__file__).parent.resolve()
+  #os.chdir(DIR)
 
-if getattr(sys, "frozen", False):
-    DIR = pathlib.Path(sys.executable).resolve().parent   # folder containing the .exe
-else:
-    DIR = pathlib.Path(__file__).resolve().parent         # folder containing AR4.py
+  if getattr(sys, "frozen", False):
+      DIR = pathlib.Path(sys.executable).resolve().parent   # folder containing the .exe
+  else:
+      DIR = pathlib.Path(__file__).resolve().parent         # folder containing AR4.py
 
-os.chdir(DIR)    
+  os.chdir(DIR)
 
-root = Tk()
-application_tk_thread_id = threading.get_ident()
-root.wm_title("AR4 Software Ver 6.7")
-root.iconphoto(True, tk.PhotoImage(file="AR.png"))
-
-# Make headless RPi fit app on screen better
-if CE['Platform']['IS_RPI'] and CE['Platform']['IS_HEADLESS']:
-  rpi_scale = 0.75
-  rpi_x_size = 1590
-  rpi_y_size = 800
-  logger.debug(f"Running on headless Raspberry Pi - Adjusting scale to {rpi_scale} and window size to {rpi_x_size}x{rpi_y_size}")
-  root.tk.call('tk', 'scaling', rpi_scale)
-  root.geometry(f'{rpi_x_size}x{rpi_y_size}+0+0')
-else:
-  root.geometry('1600x900+0+0')  # Adjusted for RPI compatibility (1600x900 minimum)
-  #root.geometry("1850x980+0+0")  # Original size
-
-root.resizable(width=True, height=True)
-
-#UI_SCALE = 1.25  
-
-#_orig_place = tk.Widget.place
-#def _place_scaled(self, *args, **kw):
-#    # scale only absolute pixel arguments
-#    for k in ("x", "y", "width", "height"):
-#        if k in kw and kw[k] is not None:
-#            try:
-#                kw[k] = int(float(kw[k]) * UI_SCALE)
-#            except Exception:
-#                pass
-#    return _orig_place(self, *args, **kw)
-
-#tk.Widget.place = _place_scaled
+  application_shell = create_application_shell(CE, logger, DIR / "AR.png")
+  root = application_shell.root
+  application_tk_thread_id = application_shell.tk_thread_id
+  nb = application_shell.notebook
+  tab1 = application_shell.tab1
+  tab2 = application_shell.tab2
+  tab3 = application_shell.tab3
+  tab4 = application_shell.tab4
+  tab5 = application_shell.tab5
+  tab6 = application_shell.tab6
+  tab7 = application_shell.tab7
+  tab8 = application_shell.tab8
+  tab9 = application_shell.tab9
+  del application_shell
 
 
-
-
-nb = ttk_bootstrap.Notebook(root)
-
-# Configure root window for resizing
-root.grid_rowconfigure(0, weight=1)
-root.grid_columnconfigure(0, weight=1)
-nb.grid(row=0, column=0, sticky='nsew')
-
-tab1 = ttk_bootstrap.Frame(nb)
-nb.add(tab1, text=' Main Controls ')
-
-tab2 = ttk_bootstrap.Frame(nb)
-nb.add(tab2, text='  Config Settings  ')
-
-tab3 = ttk_bootstrap.Frame(nb)
-nb.add(tab3, text='   Kinematics    ')
-
-tab4 = ttk_bootstrap.Frame(nb)
-nb.add(tab4, text=' Inputs Outputs ')
-
-tab5 = ttk_bootstrap.Frame(nb)
-nb.add(tab5, text='   Registers    ')
-
-tab6 = ttk_bootstrap.Frame(nb)
-nb.add(tab6, text='   Vision    ')
-
-tab7 = ttk_bootstrap.Frame(nb)
-nb.add(tab7, text='    G-Code     ')
-
-tab8 = ttk_bootstrap.Frame(nb)
-nb.add(tab8, text='      Log      ')
-
-tab9 = ttk_bootstrap.Frame(nb)
-#nb.add(tab9, text='   Info    ')
-
-
-_joint_motion_shutdown_cleanup_diagnostics = set()
+  _joint_motion_shutdown_cleanup_diagnostics = set()
 JOINT_MOTION_TRACE_SHUTDOWN_WAIT_SECONDS = 1.0
 
 
@@ -749,161 +699,162 @@ def on_closing():
   _poll_application_close()
   return True
 
-root.wm_protocol("WM_DELETE_WINDOW", on_closing)
+if __name__ == "__main__":
+  root.wm_protocol("WM_DELETE_WINDOW", on_closing)
 
-root.runTrue = 0
-root.GCrunTrue = 0
+  root.runTrue = 0
+  root.GCrunTrue = 0
 
 
-RUN['selectedTemplate'] = StringVar()
-RUN['selectedTemplate'].set("")
+  RUN['selectedTemplate'] = StringVar()
+  RUN['selectedTemplate'].set("")
 
-live_jog_lock = threading.Lock()
-live_cartesian_lock = threading.Lock()
-live_tool_lock = threading.Lock()
-application_lifecycle_lock = threading.Lock()
-camera_selection_lock = threading.Lock()
-camera_preview_request_lock = threading.Lock()
-vision_capture_request_lock = threading.Lock()
-vision_match_request_lock = threading.Lock()
-vision_selection_request_lock = threading.Lock()
-program_vision_operation_lock = threading.Lock()
-vision_artifact_lock = threading.Lock()
-selected_vision_camera_source = None
-program_camera_completion_queue = Queue()
-program_vision_start_queue = Queue()
-program_vision_operations = {}
-program_vision_retired_request_ids = set()
-offline_live_jog_lock = threading.Lock()
-offline_live_jog_state_lock = threading.Lock()
-offline_live_jog_stop_event = threading.Event()
-offline_live_jog_stop_event.set()
-offline_live_jog_pose_snapshot = None
-drive_lock = threading.Lock()
-serial_lock = threading.Lock()
-main_serial_operation_state = threading.local()
-manual_motion_request_state = threading.local()
-motion_request_admission_state = threading.local()
-serial_write_lock = threading.Lock()
-serial_event_queue = Queue()
-called_program_navigation_event_queue = Queue()
-program_selection_event_queue = Queue()
-calibration_serial_event_queue = Queue()
-calibration_operation_lock = threading.Lock()
-calibration_operation = None
-calibration_next_request_id = 0
-calibration_terminal_owner_lock = threading.Lock()
-calibration_terminal_response_pending = threading.Event()
-calibration_serial_write_committed = threading.Event()
-auxiliary_serial_lock = threading.Lock()
-auxiliary_serial_write_lock = threading.Lock()
-auxiliary_serial_event_queue = Queue()
-program_stop_status_event_queue = Queue()
-program_stop_status_pending_event = None
-main_controller_stop_event_queue = Queue()
-main_controller_stop_pending_event = None
-main_controller_idle_stop_result_queue = Queue()
-main_controller_idle_stop_pending_result = None
-manual_auxiliary_event_queue = Queue()
-manual_auxiliary_request_queue = []
-manual_auxiliary_active_request = None
-manual_auxiliary_next_request_id = 0
-manual_auxiliary_state_lock = threading.Lock()
-manual_auxiliary_stop_barrier = threading.Event()
-auxiliary_device_event_queue = Queue()
-auxiliary_device_state_lock = threading.Lock()
-auxiliary_device_read_active = threading.Event()
-auxiliary_device_worker_active = threading.Event()
-auxiliary_device_cancel_requested = threading.Event()
-auxiliary_device_active_request = None
-auxiliary_device_active_serial = None
-auxiliary_device_retained_serials = []
-auxiliary_device_pending_result = None
-auxiliary_device_next_request_id = 0
-manual_controller_event_queue = Queue()
-manual_controller_active_request = None
-manual_controller_activity_lease = None
-manual_controller_next_request_id = 0
-manual_controller_state_lock = threading.Lock()
-manual_controller_cleanup_lock = threading.Lock()
-manual_controller_cleanup_pending = None
-gcode_storage_event_queue = Queue()
-gcode_storage_state_lock = threading.Lock()
-gcode_storage_active_request = None
-gcode_storage_next_request_id = 0
-gcode_storage_cleanup_lock = threading.Lock()
-gcode_storage_cleanup_pending = {}
-gcode_storage_cleanup_completed = {}
-gcode_storage_cleanup_worker = None
-gcode_storage_cleanup_next_id = 0
-gcode_storage_pending_delete_reconciliation = None
-gcode_storage_persistent_state_loaded = False
-gcode_storage_persistent_state_error = None
-gcode_storage_state_path_override = None
-controller_identity_state_lock = threading.Lock()
-main_controller_identity_binding = None
-main_controller_connection_epoch = 0
-joint_actual_position_source_snapshot = None
-gcode_storage_media_binding = None
-gcode_view_generation = 0
-gcode_conversion_active = threading.Event()
-gcode_conversion_cancel_requested = threading.Event()
-gcode_conversion_cancel_lock = threading.Lock()
-program_execution_state_lock = threading.Lock()
-program_execution_next_request_id = 0
-program_execution_active_request = None
-program_execution_cancelled = threading.Event()
-program_return_state_clear_requested = threading.Event()
-gcode_storage_program_admission_active = False
-manual_controller_program_admission_active = False
-event_poll_retry_lock = threading.Lock()
-event_poll_retry_pending = set()
-startup_auxiliary_cleanup_lock = threading.Lock()
-startup_auxiliary_cleanup_pending = {}
-startup_auxiliary_cleanup_worker = None
-startup_controller_cleanup_lock = threading.Lock()
-startup_controller_cleanup_pending = {}
-startup_controller_cleanup_worker = None
-xbox_auxiliary_event_queue = Queue()
-auxiliary_stop_requested = threading.Event()
-auxiliary_stop_state_lock = threading.Lock()
-program_stop_state_lock = threading.RLock()
-auxiliary_stop_next_request_id = 0
-auxiliary_stop_pending_request_id = None
-auxiliary_stop_active_request_id = None
-main_controller_auxiliary_stop_request_id = None
-auxiliary_stop_owner_waiting = False
-auxiliary_stop_owner_result = None
-auxiliary_stop_owner_result_event = threading.Event()
-auxiliary_stop_injected_event = threading.Event()
-auxiliary_stop_acknowledgement_deadline = None
-xbox_auxiliary_next_request_id = 0
-controller_correction_requested = threading.Event()
-controller_correction_state_lock = threading.Lock()
-manual_motion_pose_pending = threading.Event()
-controller_position_resynchronization_required = threading.Event()
-kinematics_configuration_ready = threading.Event()
-acknowledged_forced_position_lock = threading.Lock()
-acknowledged_forced_position_target = None
-virtual_motion_event_queue = Queue()
-offline_live_jog_operation = None
-serial_result_pending = threading.Event()
-live_serial_result_pending = threading.Event()
-live_jog_stop_requested = threading.Event()
-application_closing = threading.Event()
-application_shutdown_started_at = None
-auxiliary_gripper_detach_shutdown_attempted = False
-camera_preview_shutdown_started_at = None
-camera_preview_shutdown_timeout_reported = False
-shutdown_serial_cancel_requested = set()
-serial_activity_registry = SerialActivityRegistry(
-  ("ser", "ser2"),
-  single_owner_names=("ser2",),
-)
-motion_request_registry = MotionRequestRegistry()
-joint_motion_request_lock = threading.Lock()
-joint_motion_request_lease = None
-offline_live_jog_motion_lease = None
+  live_jog_lock = threading.Lock()
+  live_cartesian_lock = threading.Lock()
+  live_tool_lock = threading.Lock()
+  application_lifecycle_lock = threading.Lock()
+  camera_selection_lock = threading.Lock()
+  camera_preview_request_lock = threading.Lock()
+  vision_capture_request_lock = threading.Lock()
+  vision_match_request_lock = threading.Lock()
+  vision_selection_request_lock = threading.Lock()
+  program_vision_operation_lock = threading.Lock()
+  vision_artifact_lock = threading.Lock()
+  selected_vision_camera_source = None
+  program_camera_completion_queue = Queue()
+  program_vision_start_queue = Queue()
+  program_vision_operations = {}
+  program_vision_retired_request_ids = set()
+  offline_live_jog_lock = threading.Lock()
+  offline_live_jog_state_lock = threading.Lock()
+  offline_live_jog_stop_event = threading.Event()
+  offline_live_jog_stop_event.set()
+  offline_live_jog_pose_snapshot = None
+  drive_lock = threading.Lock()
+  serial_lock = threading.Lock()
+  main_serial_operation_state = threading.local()
+  manual_motion_request_state = threading.local()
+  motion_request_admission_state = threading.local()
+  serial_write_lock = threading.Lock()
+  serial_event_queue = Queue()
+  called_program_navigation_event_queue = Queue()
+  program_selection_event_queue = Queue()
+  calibration_serial_event_queue = Queue()
+  calibration_operation_lock = threading.Lock()
+  calibration_operation = None
+  calibration_next_request_id = 0
+  calibration_terminal_owner_lock = threading.Lock()
+  calibration_terminal_response_pending = threading.Event()
+  calibration_serial_write_committed = threading.Event()
+  auxiliary_serial_lock = threading.Lock()
+  auxiliary_serial_write_lock = threading.Lock()
+  auxiliary_serial_event_queue = Queue()
+  program_stop_status_event_queue = Queue()
+  program_stop_status_pending_event = None
+  main_controller_stop_event_queue = Queue()
+  main_controller_stop_pending_event = None
+  main_controller_idle_stop_result_queue = Queue()
+  main_controller_idle_stop_pending_result = None
+  manual_auxiliary_event_queue = Queue()
+  manual_auxiliary_request_queue = []
+  manual_auxiliary_active_request = None
+  manual_auxiliary_next_request_id = 0
+  manual_auxiliary_state_lock = threading.Lock()
+  manual_auxiliary_stop_barrier = threading.Event()
+  auxiliary_device_event_queue = Queue()
+  auxiliary_device_state_lock = threading.Lock()
+  auxiliary_device_read_active = threading.Event()
+  auxiliary_device_worker_active = threading.Event()
+  auxiliary_device_cancel_requested = threading.Event()
+  auxiliary_device_active_request = None
+  auxiliary_device_active_serial = None
+  auxiliary_device_retained_serials = []
+  auxiliary_device_pending_result = None
+  auxiliary_device_next_request_id = 0
+  manual_controller_event_queue = Queue()
+  manual_controller_active_request = None
+  manual_controller_activity_lease = None
+  manual_controller_next_request_id = 0
+  manual_controller_state_lock = threading.Lock()
+  manual_controller_cleanup_lock = threading.Lock()
+  manual_controller_cleanup_pending = None
+  gcode_storage_event_queue = Queue()
+  gcode_storage_state_lock = threading.Lock()
+  gcode_storage_active_request = None
+  gcode_storage_next_request_id = 0
+  gcode_storage_cleanup_lock = threading.Lock()
+  gcode_storage_cleanup_pending = {}
+  gcode_storage_cleanup_completed = {}
+  gcode_storage_cleanup_worker = None
+  gcode_storage_cleanup_next_id = 0
+  gcode_storage_pending_delete_reconciliation = None
+  gcode_storage_persistent_state_loaded = False
+  gcode_storage_persistent_state_error = None
+  gcode_storage_state_path_override = None
+  controller_identity_state_lock = threading.Lock()
+  main_controller_identity_binding = None
+  main_controller_connection_epoch = 0
+  joint_actual_position_source_snapshot = None
+  gcode_storage_media_binding = None
+  gcode_view_generation = 0
+  gcode_conversion_active = threading.Event()
+  gcode_conversion_cancel_requested = threading.Event()
+  gcode_conversion_cancel_lock = threading.Lock()
+  program_execution_state_lock = threading.Lock()
+  program_execution_next_request_id = 0
+  program_execution_active_request = None
+  program_execution_cancelled = threading.Event()
+  program_return_state_clear_requested = threading.Event()
+  gcode_storage_program_admission_active = False
+  manual_controller_program_admission_active = False
+  event_poll_retry_lock = threading.Lock()
+  event_poll_retry_pending = set()
+  startup_auxiliary_cleanup_lock = threading.Lock()
+  startup_auxiliary_cleanup_pending = {}
+  startup_auxiliary_cleanup_worker = None
+  startup_controller_cleanup_lock = threading.Lock()
+  startup_controller_cleanup_pending = {}
+  startup_controller_cleanup_worker = None
+  xbox_auxiliary_event_queue = Queue()
+  auxiliary_stop_requested = threading.Event()
+  auxiliary_stop_state_lock = threading.Lock()
+  program_stop_state_lock = threading.RLock()
+  auxiliary_stop_next_request_id = 0
+  auxiliary_stop_pending_request_id = None
+  auxiliary_stop_active_request_id = None
+  main_controller_auxiliary_stop_request_id = None
+  auxiliary_stop_owner_waiting = False
+  auxiliary_stop_owner_result = None
+  auxiliary_stop_owner_result_event = threading.Event()
+  auxiliary_stop_injected_event = threading.Event()
+  auxiliary_stop_acknowledgement_deadline = None
+  xbox_auxiliary_next_request_id = 0
+  controller_correction_requested = threading.Event()
+  controller_correction_state_lock = threading.Lock()
+  manual_motion_pose_pending = threading.Event()
+  controller_position_resynchronization_required = threading.Event()
+  kinematics_configuration_ready = threading.Event()
+  acknowledged_forced_position_lock = threading.Lock()
+  acknowledged_forced_position_target = None
+  virtual_motion_event_queue = Queue()
+  offline_live_jog_operation = None
+  serial_result_pending = threading.Event()
+  live_serial_result_pending = threading.Event()
+  live_jog_stop_requested = threading.Event()
+  application_closing = threading.Event()
+  application_shutdown_started_at = None
+  auxiliary_gripper_detach_shutdown_attempted = False
+  camera_preview_shutdown_started_at = None
+  camera_preview_shutdown_timeout_reported = False
+  shutdown_serial_cancel_requested = set()
+  serial_activity_registry = SerialActivityRegistry(
+    ("ser", "ser2"),
+    single_owner_names=("ser2",),
+  )
+  motion_request_registry = MotionRequestRegistry()
+  joint_motion_request_lock = threading.Lock()
+  joint_motion_request_lease = None
+  offline_live_jog_motion_lease = None
 
 
 class SerialWriteCancellationBoundary:
@@ -1010,6 +961,7 @@ SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS = 5
 SERIAL_AUXILIARY_WAIT_MARGIN_SECONDS = 5
 AUXILIARY_DEVICE_BAUD_RATE = 9600
 AUXILIARY_DEVICE_READ_TIMEOUT_SECONDS = 5
+AUXILIARY_DEVICE_PROGRAM_READ_TIMEOUT_SECONDS = 10
 AUXILIARY_DEVICE_MAX_READ_BYTES = 4096
 AUXILIARY_DEVICE_MAX_PORT_NUMBER = 65535
 AUXILIARY_DEVICE_MAX_ERROR_DETAIL = 512
@@ -1089,10 +1041,13 @@ GCODE_LISTBOX_STYLE_OPTIONS = (
 EVENT_POLL_INTERVAL_MS = 25
 CAMERA_PREVIEW_SHUTDOWN_GRACE_SECONDS = 2.0
 CAMERA_PREVIEW_SETTLE_TIMEOUT_SECONDS = 10.0
+# Dict insertion order is also the direct-run poll registration order.
 EVENT_POLL_CALLBACK_NAMES = {
   "camera-preview": "_poll_camera_preview_events",
+  "joint-motion": "_poll_joint_motion_events",
   "serial": "_poll_serial_events",
   "manual-controller": "_poll_manual_controller_events",
+  "calibration": "_poll_calibration_events",
   "auxiliary-serial": "_poll_auxiliary_serial_events",
   "manual-auxiliary": "_poll_manual_auxiliary_events",
   "auxiliary-device": "_poll_auxiliary_device_events",
@@ -1101,8 +1056,6 @@ EVENT_POLL_CALLBACK_NAMES = {
   "program-selection": "_poll_program_selection_events",
   "xbox-auxiliary": "_poll_xbox_auxiliary_events",
   "virtual-motion": "_poll_virtual_motion_events",
-  "joint-motion": "_poll_joint_motion_events",
-  "calibration": "_poll_calibration_events",
 }
 MANUAL_AUXILIARY_CALIBRATION_KEYS = frozenset(
   (
@@ -1209,6 +1162,9 @@ class AuxiliaryDeviceReadRequest:
   request_id: int
   port: str
   read_size: int
+  response_timeout_seconds: float = AUXILIARY_DEVICE_READ_TIMEOUT_SECONDS
+  execution_request: object = None
+  completion_callback: object = None
 
   def __post_init__(self):
     if (
@@ -1234,6 +1190,28 @@ class AuxiliaryDeviceReadRequest:
       or not 1 <= self.read_size <= AUXILIARY_DEVICE_MAX_READ_BYTES
     ):
       raise MotionInputError("auxiliary-device read size is invalid")
+    if (
+      isinstance(self.response_timeout_seconds, bool)
+      or not isinstance(self.response_timeout_seconds, (int, float))
+      or not math.isfinite(self.response_timeout_seconds)
+      or self.response_timeout_seconds <= 0
+    ):
+      raise MotionInputError("auxiliary-device response timeout is invalid")
+    if self.execution_request is None:
+      if (
+        self.response_timeout_seconds
+        != AUXILIARY_DEVICE_READ_TIMEOUT_SECONDS
+        or self.completion_callback is not None
+      ):
+        raise MotionInputError("manual auxiliary-device request is invalid")
+      return
+    if (
+      not isinstance(self.execution_request, ProgramExecutionRequest)
+      or self.response_timeout_seconds
+      != AUXILIARY_DEVICE_PROGRAM_READ_TIMEOUT_SECONDS
+      or not callable(self.completion_callback)
+    ):
+      raise MotionInputError("program auxiliary-device request is invalid")
 
 
 @dataclass(frozen=True)
@@ -1260,10 +1238,7 @@ class AuxiliaryDeviceReadResult:
         "auxiliary-device result value must be valid UTF-8"
       ) from exc
     if self.outcome == "completed":
-      if (
-        len(encoded_value) > AUXILIARY_DEVICE_MAX_READ_BYTES
-        or any(not character.isprintable() for character in self.value)
-      ):
+      if len(encoded_value) > AUXILIARY_DEVICE_MAX_READ_BYTES:
         raise MotionInputError("auxiliary-device response text is invalid")
       return
     if (
@@ -3835,6 +3810,13 @@ def _cancel_active_program_execution():
     if not isinstance(request, ProgramExecutionRequest):
       raise RuntimeError("active program execution request is invalid")
     request.cancellation_boundary.cancel()
+  try:
+    _cancel_auxiliary_device_read(
+      execution_request=request,
+      interrupt_serial=False,
+    )
+  except Exception:
+    logger.exception("Unable to propagate program cancellation to auxiliary-device I/O")
   return True
 
 
@@ -5252,7 +5234,7 @@ def _poll_application_close():
   _close_joint_motion_dispatcher_for_shutdown()
 
   try:
-    _cancel_auxiliary_device_read()
+    _cancel_auxiliary_device_read(interrupt_serial=False)
     auxiliary_device_pending = _auxiliary_device_read_pending()
   except Exception:
     logger.exception("Unable to settle auxiliary-device I/O during shutdown")
@@ -5314,6 +5296,14 @@ def _poll_application_close():
         if calibration_write_committed and serial_name == "ser":
           continue
         _interrupt_tracked_serial_activity(serial_name)
+
+  if _program_execution_active():
+    _set_application_status(
+      "SHUTDOWN WAITING FOR PROGRAM EXECUTION",
+      "Warn.TLabel",
+    )
+    root.after(SERIAL_SHUTDOWN_POLL_MS, _poll_application_close)
+    return False
 
   if _auxiliary_stop_shutdown_pending():
     message = "SHUTDOWN WAITING FOR AUXILIARY STOP"
@@ -5496,170 +5486,171 @@ RUN['J8CalStat2'] = IntVar()
 RUN['J9CalStat2'] = IntVar()
 '''
 
-RUN['IncJogStat'] = IntVar()
-RUN['showEstimatedMotion'] = IntVar(value=1)
-RUN['showEncoderTelemetry'] = IntVar(value=1)
-RUN['fullRot'] = IntVar()
-RUN['pick180'] = IntVar()
-RUN['pickClosest'] = IntVar()
-RUN['autoBG'] = IntVar()
-RUN['estopActive'] = False
-RUN['mainControllerStopPositionUnavailable'] = False
-RUN['posOutreach'] = False
-RUN['programStopStatusLatched'] = False
-RUN['gcodeSpeed'] = "10"
+if __name__ == "__main__":
+  RUN['IncJogStat'] = IntVar()
+  RUN['showEstimatedMotion'] = IntVar(value=1)
+  RUN['showEncoderTelemetry'] = IntVar(value=1)
+  RUN['fullRot'] = IntVar()
+  RUN['pick180'] = IntVar()
+  RUN['pickClosest'] = IntVar()
+  RUN['autoBG'] = IntVar()
+  RUN['estopActive'] = False
+  RUN['mainControllerStopPositionUnavailable'] = False
+  RUN['posOutreach'] = False
+  RUN['programStopStatusLatched'] = False
+  RUN['gcodeSpeed'] = "10"
 
-RUN['inchTrue'] = False
-RUN['moveInProc'] = 0
-RUN['liveJog'] = False
-RUN['progRunning'] = False
-RUN['offlineMode'] = False
+  RUN['inchTrue'] = False
+  RUN['moveInProc'] = 0
+  RUN['liveJog'] = False
+  RUN['progRunning'] = False
+  RUN['offlineMode'] = False
 
-RUN['color_map'] = {}
+  RUN['color_map'] = {}
 
-RUN['J1StepM'] = None
-RUN['J2StepM'] = None
-RUN['J3StepM'] = None
-RUN['J4StepM'] = None
-RUN['J5StepM'] = None
-RUN['J6StepM'] = None
+  RUN['J1StepM'] = None
+  RUN['J2StepM'] = None
+  RUN['J3StepM'] = None
+  RUN['J4StepM'] = None
+  RUN['J5StepM'] = None
+  RUN['J6StepM'] = None
 
-RUN['StepMonitors'] = [0] * 6
-RUN['minSpeedDelay'] = 200 #µs
-RUN['speedViolation'] = "0"
+  RUN['StepMonitors'] = [0] * 6
+  RUN['minSpeedDelay'] = 200 #µs
+  RUN['speedViolation'] = "0"
 
-RUN['xyzuvw_In'] = np.zeros(6)
-RUN['KinematicError'] = 0
+  RUN['xyzuvw_In'] = np.zeros(6)
+  RUN['KinematicError'] = 0
 
-RUN['cam_on'] = False
-RUN['cameraPreviewRequestId'] = None
-RUN['visionCaptureRequestId'] = None
-RUN['visionMatchRequestId'] = None
-RUN['visionMatchResult'] = None
-RUN['visionSelectionRequestId'] = None
-RUN['visionSelectionKind'] = None
+  RUN['cam_on'] = False
+  RUN['cameraPreviewRequestId'] = None
+  RUN['visionCaptureRequestId'] = None
+  RUN['visionMatchRequestId'] = None
+  RUN['visionMatchResult'] = None
+  RUN['visionSelectionRequestId'] = None
+  RUN['visionSelectionKind'] = None
 
-# Migrated global variables to RUN dictionary
-# Robot State & Control
-RUN['Alarm'] = None
-RUN['VR_angles'] = None
-RUN['JangleOut'] = None
-RUN['JstepCur'] = None
-RUN['JointMin'] = None
-RUN['JointMax'] = None
-RUN['cur_steps'] = None
-RUN['J1axisLimNeg'] = None
-RUN['J2axisLimNeg'] = None
-RUN['J3axisLimNeg'] = None
-RUN['J4axisLimNeg'] = None
-RUN['J5axisLimNeg'] = None
-RUN['J6axisLimNeg'] = None
-RUN['negLim'] = None
-RUN['stepDeg'] = None
-RUN['flag'] = None
-RUN['LineDist'] = None
-RUN['Xv'] = None
-RUN['Yv'] = None
-RUN['Zv'] = None
-RUN['xVal'] = None
-RUN['yVal'] = None
-RUN['zVal'] = None
+  # Migrated global variables to RUN dictionary
+  # Robot State & Control
+  RUN['Alarm'] = None
+  RUN['VR_angles'] = None
+  RUN['JangleOut'] = None
+  RUN['JstepCur'] = None
+  RUN['JointMin'] = None
+  RUN['JointMax'] = None
+  RUN['cur_steps'] = None
+  RUN['J1axisLimNeg'] = None
+  RUN['J2axisLimNeg'] = None
+  RUN['J3axisLimNeg'] = None
+  RUN['J4axisLimNeg'] = None
+  RUN['J5axisLimNeg'] = None
+  RUN['J6axisLimNeg'] = None
+  RUN['negLim'] = None
+  RUN['stepDeg'] = None
+  RUN['flag'] = None
+  RUN['LineDist'] = None
+  RUN['Xv'] = None
+  RUN['Yv'] = None
+  RUN['Zv'] = None
+  RUN['xVal'] = None
+  RUN['yVal'] = None
+  RUN['zVal'] = None
 
-# Serial Communication
-RUN['ser'] = None
-RUN['ser2'] = None
-RUN['ser2BoardProfile'] = None
-RUN['ser3'] = None
+  # Serial Communication
+  RUN['ser'] = None
+  RUN['ser2'] = None
+  RUN['ser2BoardProfile'] = None
+  RUN['ser3'] = None
 
-# Program Execution
-RUN['rowinproc'] = None
-RUN['GCrowinproc'] = None
+  # Program Execution
+  RUN['rowinproc'] = None
+  RUN['GCrowinproc'] = None
 
-# Live Jog State
-RUN['_current'] = None
-RUN['_pending_start'] = None
-RUN['_cart_current'] = None
-RUN['_cart_pending'] = None
-RUN['_tool_current'] = None
-RUN['_tool_pending'] = None
-RUN['_last_input_time'] = None
-RUN['_mainMode'] = None
-RUN['_smooth'] = None
-RUN['_grip_closed'] = None
-RUN['_pneu_open'] = None
-RUN['_grip_pending_request_id'] = None
-RUN['_pneu_pending_request_id'] = None
-RUN['cmdType'] = None
-RUN['cmdTypeLong'] = None
+  # Live Jog State
+  RUN['_current'] = None
+  RUN['_pending_start'] = None
+  RUN['_cart_current'] = None
+  RUN['_cart_pending'] = None
+  RUN['_tool_current'] = None
+  RUN['_tool_pending'] = None
+  RUN['_last_input_time'] = None
+  RUN['_mainMode'] = None
+  RUN['_smooth'] = None
+  RUN['_grip_closed'] = None
+  RUN['_pneu_open'] = None
+  RUN['_grip_pending_request_id'] = None
+  RUN['_pneu_pending_request_id'] = None
+  RUN['cmdType'] = None
+  RUN['cmdTypeLong'] = None
 
-# Vision System
-RUN['mX1'] = None
-RUN['mY1'] = None
-RUN['mX2'] = None
-RUN['mY2'] = None
-RUN['prevxVal'] = None
-RUN['prevyVal'] = None
-RUN['prevzVal'] = None
-RUN['xMMpos'] = None
-RUN['yMMpos'] = None
-RUN['BGavg'] = None
+  # Vision System
+  RUN['mX1'] = None
+  RUN['mY1'] = None
+  RUN['mX2'] = None
+  RUN['mY2'] = None
+  RUN['prevxVal'] = None
+  RUN['prevyVal'] = None
+  RUN['prevzVal'] = None
+  RUN['xMMpos'] = None
+  RUN['yMMpos'] = None
+  RUN['BGavg'] = None
 
-# 3D Visualization
-RUN['vtk_running'] = False
-RUN['actors'] = {}
-RUN['assemblies'] = {}
-RUN['base_transforms'] = {}
-RUN['joint_transforms'] = {}
-RUN['composite_transforms'] = {}
-RUN['interactor'] = None
-RUN['render_window'] = None
+  # 3D Visualization
+  RUN['vtk_running'] = False
+  RUN['actors'] = {}
+  RUN['assemblies'] = {}
+  RUN['base_transforms'] = {}
+  RUN['joint_transforms'] = {}
+  RUN['composite_transforms'] = {}
+  RUN['interactor'] = None
+  RUN['render_window'] = None
 
-# Input Devices
-RUN['xboxUse'] = None
-RUN['selectedTemplate'] = None
+  # Input Devices
+  RUN['xboxUse'] = None
+  RUN['selectedTemplate'] = None
 
 
-#declare axis limit vars
-#! These are probably not necesary anymore but verify
-CAL['J1PosLim'] = 0
-CAL['J1NegLim'] = 0
-CAL['J2PosLim'] = 0
-CAL['J2NegLim'] = 0
-CAL['J3PosLim'] = 0
-CAL['J3NegLim'] = 0
-CAL['J4PosLim'] = 0
-CAL['J4NegLim'] = 0
-CAL['J5PosLim'] = 0
-CAL['J5NegLim'] = 0
-CAL['J6PosLim'] = 0
-CAL['J6NegLim'] = 0
-CAL['J7PosLim'] = 0
-CAL['J1CalStatVal'] = tk.IntVar(value=0)
-CAL['J2CalStatVal'] = tk.IntVar(value=0)
-CAL['J3CalStatVal'] = tk.IntVar(value=0)
-CAL['J4CalStatVal'] = tk.IntVar(value=0)
-CAL['J5CalStatVal'] = tk.IntVar(value=0)
-CAL['J6CalStatVal'] = tk.IntVar(value=0)
-CAL['J7CalStatVal'] = tk.IntVar(value=0)
-CAL['J8CalStatVal'] = tk.IntVar(value=0)
-CAL['J9CalStatVal'] = tk.IntVar(value=0)
-CAL['J1CalStatVal2'] = tk.IntVar(value=0)
-CAL['J2CalStatVal2'] = tk.IntVar(value=0)
-CAL['J2CalStatVal2'] = tk.IntVar(value=0)
-CAL['J3CalStatVal2'] = tk.IntVar(value=0)
-CAL['J4CalStatVal2'] = tk.IntVar(value=0)
-CAL['J5CalStatVal2'] = tk.IntVar(value=0)
-CAL['J6CalStatVal2'] = tk.IntVar(value=0)
-CAL['J7CalStatVal2'] = tk.IntVar(value=0)
-CAL['J8CalStatVal2'] = tk.IntVar(value=0)
-CAL['J9CalStatVal2'] = tk.IntVar(value=0)
-CAL['J1OpenLoopVal'] = tk.IntVar(value=0)
-CAL['J2OpenLoopVal'] = tk.IntVar(value=0)
-CAL['J3OpenLoopVal'] = tk.IntVar(value=0)
-CAL['J4OpenLoopVal'] = tk.IntVar(value=0)
-CAL['J5OpenLoopVal'] = tk.IntVar(value=0)
-CAL['J6OpenLoopVal'] = tk.IntVar(value=0)
-CAL['DisableWristRotVal'] = tk.IntVar(value=0)
+  #declare axis limit vars
+  #! These are probably not necesary anymore but verify
+  CAL['J1PosLim'] = 0
+  CAL['J1NegLim'] = 0
+  CAL['J2PosLim'] = 0
+  CAL['J2NegLim'] = 0
+  CAL['J3PosLim'] = 0
+  CAL['J3NegLim'] = 0
+  CAL['J4PosLim'] = 0
+  CAL['J4NegLim'] = 0
+  CAL['J5PosLim'] = 0
+  CAL['J5NegLim'] = 0
+  CAL['J6PosLim'] = 0
+  CAL['J6NegLim'] = 0
+  CAL['J7PosLim'] = 0
+  CAL['J1CalStatVal'] = tk.IntVar(value=0)
+  CAL['J2CalStatVal'] = tk.IntVar(value=0)
+  CAL['J3CalStatVal'] = tk.IntVar(value=0)
+  CAL['J4CalStatVal'] = tk.IntVar(value=0)
+  CAL['J5CalStatVal'] = tk.IntVar(value=0)
+  CAL['J6CalStatVal'] = tk.IntVar(value=0)
+  CAL['J7CalStatVal'] = tk.IntVar(value=0)
+  CAL['J8CalStatVal'] = tk.IntVar(value=0)
+  CAL['J9CalStatVal'] = tk.IntVar(value=0)
+  CAL['J1CalStatVal2'] = tk.IntVar(value=0)
+  CAL['J2CalStatVal2'] = tk.IntVar(value=0)
+  CAL['J2CalStatVal2'] = tk.IntVar(value=0)
+  CAL['J3CalStatVal2'] = tk.IntVar(value=0)
+  CAL['J4CalStatVal2'] = tk.IntVar(value=0)
+  CAL['J5CalStatVal2'] = tk.IntVar(value=0)
+  CAL['J6CalStatVal2'] = tk.IntVar(value=0)
+  CAL['J7CalStatVal2'] = tk.IntVar(value=0)
+  CAL['J8CalStatVal2'] = tk.IntVar(value=0)
+  CAL['J9CalStatVal2'] = tk.IntVar(value=0)
+  CAL['J1OpenLoopVal'] = tk.IntVar(value=0)
+  CAL['J2OpenLoopVal'] = tk.IntVar(value=0)
+  CAL['J3OpenLoopVal'] = tk.IntVar(value=0)
+  CAL['J4OpenLoopVal'] = tk.IntVar(value=0)
+  CAL['J5OpenLoopVal'] = tk.IntVar(value=0)
+  CAL['J6OpenLoopVal'] = tk.IntVar(value=0)
+  CAL['DisableWristRotVal'] = tk.IntVar(value=0)
 
 
 
@@ -7103,12 +7094,13 @@ def live_tool_jog(in_data, original_tool_frame, stop_event):
 #############################################################################################
 
 # Global storage
-RUN['vtk_running'] = False
-RUN['actors'] = {}
-RUN['assemblies'] = {}
-RUN['base_transforms'] = {}
-RUN['joint_transforms'] = {}
-RUN['composite_transforms'] = {}
+if __name__ == "__main__":
+  RUN['vtk_running'] = False
+  RUN['actors'] = {}
+  RUN['assemblies'] = {}
+  RUN['base_transforms'] = {}
+  RUN['joint_transforms'] = {}
+  RUN['composite_transforms'] = {}
 
 
 def _mode_change_is_blocked(request_lease=None, transport_reserved=False):
@@ -7678,13 +7670,14 @@ def update_stl_transform():
 
 
 
-imported_actors = {}  # filename -> actor mapping
+if __name__ == "__main__":
+  imported_actors = {}  # filename -> actor mapping
 
-stl_name_var = tk.StringVar()
-x_var = tk.StringVar(value="0")
-y_var = tk.StringVar(value="0")
-z_var = tk.StringVar(value="0")
-rot_var = tk.StringVar(value="0")
+  stl_name_var = tk.StringVar()
+  x_var = tk.StringVar(value="0")
+  y_var = tk.StringVar(value="0")
+  z_var = tk.StringVar(value="0")
+  rot_var = tk.StringVar(value="0")
 
 def import_stl_file():
     file_path = fd.askopenfilename(filetypes=[("STL files", "*.stl")])
@@ -8873,49 +8866,92 @@ def _main_port_selector_value(port):
     raise MotionInputError(
       "accepted main-controller port selection must be normalized text"
     )
-  if (
-    not isinstance(port_choices, (tuple, list))
-    or "None" not in port_choices
-    or any(
-      not isinstance(choice, str)
-      or not choice
-      or choice != choice.strip()
-      for choice in port_choices
-    )
-  ):
-    raise RuntimeError("available main-controller ports are invalid")
-  return port if port in port_choices else "None"
+  return port
 
 
-def _startup_port_selector_values(calibration):
-  if not isinstance(calibration, dict):
-    raise TypeError("startup calibration must be a dictionary")
-  main_port = calibration.get('comPort')
-  auxiliary_port = calibration.get('com2Port')
-  if isinstance(main_port, str):
-    main_port = main_port.strip()
-  else:
-    main_port = "None"
-  if isinstance(auxiliary_port, str):
-    auxiliary_port = auxiliary_port.strip()
-  else:
-    auxiliary_port = "None"
-  if not main_port:
-    main_port = "None"
-  if auxiliary_port not in port_choices:
-    auxiliary_port = "None"
-  return _main_port_selector_value(main_port), auxiliary_port
+def _commit_main_port_enrollment(port, identity):
+  staged = snapshot_calibration_values(CAL)
+  staged['comPort'] = _main_port_selector_value(port)
+  staged['mainControllerPortIdentity'] = identity
+  snapshot = normalize_calibration_data(staged)
+  CAL['comPort'] = snapshot['comPort']
+  CAL['mainControllerPortIdentity'] = snapshot['mainControllerPortIdentity']
+  if not _retain_calibration_persistence_retry(snapshot):
+    logger.error("Main-controller port enrollment persistence remains pending")
 
 
 def setCom(misc=None):
   previous_main_port = CAL.get('comPort', "None")
-  if isinstance(previous_main_port, str):
-    previous_main_port = previous_main_port.strip()
-  else:
-    previous_main_port = "None"
-  if not previous_main_port:
-    previous_main_port = "None"
+  previous_main_port = (
+    previous_main_port.strip()
+    if isinstance(previous_main_port, str)
+    else "None"
+  ) or "None"
   restored_main_port = _main_port_selector_value(previous_main_port)
+  automatic_startup = misc is None
+  if automatic_startup:
+    main_resolution = resolve_main_identity(
+      serial_port_inventory, CAL.get('mainControllerPortIdentity', "None"),
+    )
+    auxiliary_resolution = resolve_auxiliary_identity(
+      serial_port_inventory, CAL.get('auxiliaryControllerPortIdentity', "None"),
+    )
+    com2SelectedValue.set(
+      auxiliary_resolution.record.device
+      if auxiliary_resolution.status == "selected" else "None"
+    )
+    if main_resolution.status != "selected":
+      com1SelectedValue.set("None")
+      _set_application_status(
+        f"MAIN CONTROLLER {main_resolution.status.upper()}; CONNECTION NOT STARTED",
+        "Warn.TLabel",
+      )
+      return False
+    selected_main_record = main_resolution.record
+    com1SelectedValue.set(selected_main_record.device)
+    auxiliary_discovery_status = auxiliary_resolution.status
+  else:
+    selected_main_port = _main_port_selector_value(com1SelectedValue.get())
+    if selected_main_port == "None":
+      selected_main_record = None
+    else:
+      main_resolution = resolve_selected_device(
+        serial_port_inventory,
+        selected_main_port,
+      )
+      if main_resolution.status != "selected":
+        com1SelectedValue.set(restored_main_port)
+        _set_application_status(
+          f"MAIN CONTROLLER {main_resolution.status.upper()}; CONNECTION NOT CHANGED",
+          "Warn.TLabel",
+        )
+        return False
+      selected_main_record = main_resolution.record
+    auxiliary_discovery_status = None
+    selected_auxiliary_port = com2SelectedValue.get()
+    if selected_main_record is not None and selected_auxiliary_port != "None":
+      auxiliary_resolution = resolve_selected_device(
+        serial_port_inventory, selected_auxiliary_port,
+      )
+      if auxiliary_resolution.status != "selected":
+        com1SelectedValue.set(restored_main_port)
+        _set_application_status(
+          f"AUXILIARY CONTROLLER {auxiliary_resolution.status.upper()}; CONNECTION NOT CHANGED",
+          "Warn.TLabel",
+        )
+        return False
+  selected_main_port = (
+    selected_main_record.device if selected_main_record else "None"
+  )
+  selected_main_identity = (
+    port_identity(selected_main_record)
+    if selected_main_record is not None
+    and (
+      selected_main_record.vid,
+      selected_main_record.pid,
+    ) == MAIN_CONTROLLER_USB_ID
+    else None
+  ) or "None"
   request_lease = _acquire_motion_request(
     "Controller connection change",
     allow_position_recovery=True,
@@ -8938,8 +8974,10 @@ def setCom(misc=None):
     return _set_com_admitted(
       request_lease,
       request_state,
-      misc,
       previous_main_port=previous_main_port,
+      selected_main_port=selected_main_port,
+      selected_main_identity=selected_main_identity,
+      auxiliary_discovery_status=auxiliary_discovery_status,
     )
   finally:
     if (
@@ -8952,9 +8990,11 @@ def setCom(misc=None):
 def _set_com_admitted(
   request_lease,
   request_state,
-  misc=None,
   *,
   previous_main_port,
+  selected_main_port,
+  selected_main_identity,
+  auxiliary_discovery_status,
 ):
   if (
     not isinstance(previous_main_port, str)
@@ -9012,10 +9052,6 @@ def _set_com_admitted(
     raise
   release_transport = True
   try:
-    selected_main_port = com1SelectedValue.get()
-    if not isinstance(selected_main_port, str):
-      raise MotionInputError("main controller port must be text")
-    selected_main_port = selected_main_port.strip()
     baud = 9600
 
     existing_serial = RUN.get('ser')
@@ -9029,8 +9065,10 @@ def _set_com_admitted(
       if existing_was_open:
         time.sleep(0.2)  # Windows can retain a just-closed COM handle briefly.
 
-    if selected_main_port in ("", "None"):
-      raise ValueError("No COM port selected")
+    if selected_main_port == "None":
+      _commit_main_port_enrollment("None", "None")
+      _set_application_status("MAIN CONTROLLER DISABLED", "Warn.TLabel")
+      return True
     # Command-specific read deadlines are applied by the owned transport path.
     RUN['ser'] = serial.Serial(
       port=selected_main_port,
@@ -9131,6 +9169,44 @@ def _set_com_admitted(
           startup_serial,
           original_startup_timeout,
         )
+        logger.info("COMMUNICATIONS STARTED WITH TEENSY 4.1 CONTROLLER")
+        if result.auxiliary_error is not None:
+          logger.warning(
+            "Auxiliary controller unavailable during main startup: %s",
+            result.auxiliary_error,
+          )
+        json_position = _json_startup_position_disposition(
+          getattr(result, "json_bootstrap", None)
+        )
+        if not (
+          startup_position.speed_violation
+          or (
+            json_position is not None
+            and json_position.speed_limited
+          )
+        ):
+          if result.auxiliary_error is not None:
+            set_startup_status(
+              "SYSTEM READY; AUXILIARY CONTROLLER UNAVAILABLE",
+              "Warn.TLabel",
+            )
+          elif auxiliary_discovery_status not in (None, "selected"):
+            set_startup_status(
+              "SYSTEM READY; AUXILIARY CONTROLLER "
+              f"{auxiliary_discovery_status.upper()}",
+              "Warn.TLabel",
+            )
+          elif startup_request.auxiliary_port is None:
+            set_startup_status(
+              "SYSTEM READY; AUXILIARY CONTROLLER NOT CONFIGURED",
+              "Warn.TLabel",
+            )
+          else:
+            set_startup_status("SYSTEM READY", "OK.TLabel")
+        _commit_main_port_enrollment(
+          selected_main_port,
+          selected_main_identity,
+        )
       except Exception:
         restore_port_selection()
         logger.exception("Unable to finalize the Teensy 4.1 controller connection")
@@ -9144,36 +9220,6 @@ def _set_com_admitted(
           startup_json_client,
         )
         return
-
-      logger.info("COMMUNICATIONS STARTED WITH TEENSY 4.1 CONTROLLER")
-      if result.auxiliary_error is not None:
-        logger.warning(
-          "Auxiliary controller unavailable during main startup: %s",
-          result.auxiliary_error,
-        )
-      json_position = _json_startup_position_disposition(
-        getattr(result, "json_bootstrap", None)
-      )
-      if not (
-        startup_position.speed_violation
-        or (
-          json_position is not None
-          and json_position.speed_limited
-        )
-      ):
-        if result.auxiliary_error is not None:
-          set_startup_status(
-            "SYSTEM READY; AUXILIARY CONTROLLER UNAVAILABLE",
-            "Warn.TLabel",
-          )
-        elif startup_request.auxiliary_port is None:
-          set_startup_status(
-            "SYSTEM READY; AUXILIARY CONTROLLER NOT CONFIGURED",
-            "Warn.TLabel",
-          )
-        else:
-          set_startup_status("SYSTEM READY", "OK.TLabel")
-      CAL['comPort'] = selected_main_port
       _release_async_main_serial_transport(activity_lease, request_lease)
 
     def abandon_startup(result):
@@ -9686,6 +9732,25 @@ def setCom2(misc=None):
       "Auxiliary connection change rejected during application shutdown"
     )
     return False
+  selected_port = com2SelectedValue.get()
+  if not isinstance(selected_port, str):
+    raise MotionInputError("auxiliary controller port must be text")
+  selected_port = selected_port.strip()
+  selected_record = None
+  if selected_port not in ("", "None"):
+    selected_resolution = resolve_selected_device(
+      serial_port_inventory,
+      selected_port,
+    )
+    if selected_resolution.status != "selected":
+      com2SelectedValue.set(CAL.get('com2Port', "None"))
+      _set_application_status(
+        f"AUXILIARY CONTROLLER {selected_resolution.status.upper()}; CONNECTION NOT CHANGED",
+        "Warn.TLabel",
+      )
+      return False
+    selected_record = selected_resolution.record
+    selected_port = selected_record.device
   if not auxiliary_serial_lock.acquire(blocking=False):
     logger.warning("Auxiliary connection change rejected while the transport is busy")
     return False
@@ -9736,10 +9801,6 @@ def setCom2(misc=None):
   staged_calibration = None
   connection_change_completed = False
   try:
-    selected_port = com2SelectedValue.get()
-    if not isinstance(selected_port, str):
-      raise MotionInputError("auxiliary controller port must be text")
-    selected_port = selected_port.strip()
     if selected_port in ("", "None"):
       selected_port = None
     selected_board = normalize_auxiliary_board_profile(
@@ -9751,6 +9812,12 @@ def setCom2(misc=None):
     staged_calibration = dict(previous_calibration)
     staged_calibration.update(previous_output_values)
     staged_calibration['com2Port'] = committed_port
+    identity = (
+      port_identity(selected_record)
+      if selected_record and selected_board
+      else None
+    )
+    staged_calibration['auxiliaryControllerPortIdentity'] = identity or "None"
     staged_calibration = reconcile_auxiliary_output_assignments(
       staged_calibration,
       committed_board,
@@ -17012,6 +17079,125 @@ def stopProg():
 
 
 
+def _execute_program_auxiliary_device_read(
+  command,
+  *,
+  execution_request,
+  completion_callback=None,
+):
+  if not isinstance(execution_request, ProgramExecutionRequest):
+    raise TypeError("program auxiliary-device request is invalid")
+  reverse = execution_request.mode == "step-reverse"
+  if (completion_callback is not None) != reverse:
+    raise MotionInputError("program auxiliary-device completion is invalid")
+  if reverse and not callable(completion_callback):
+    raise TypeError("program auxiliary-device completion is not callable")
+  match = re.fullmatch(r"Read COM # ([0-9]+) Char: ([0-9]+)", command)
+  if match is None:
+    message = "PROGRAM AUXILIARY COM ROW IS INVALID"
+    logger.error(message)
+    _queue_program_execution_status(message, "Alarm.TLabel")
+    return ROW_EXECUTION_REJECTED
+
+  completion_event = threading.Event()
+  state = {"settled": False, "deadline_missed": False,
+           "succeeded": False, "cleanup_deadline": None}
+  primary_deadline = (
+    time.monotonic() + AUXILIARY_DEVICE_PROGRAM_READ_TIMEOUT_SECONDS
+    + SERIAL_EVENT_APPLICATION_MARGIN_SECONDS
+  )
+  cleanup_wait = (
+    AUXILIARY_DEVICE_SHUTDOWN_CLOSE_ATTEMPTS * AUXILIARY_DEVICE_CLEANUP_RETRY_SECONDS
+    + SERIAL_EVENT_APPLICATION_MARGIN_SECONDS
+  )
+  def cancel_request():
+    try:
+      return _cancel_auxiliary_device_read(
+        execution_request=execution_request,
+        interrupt_serial=False,
+      )
+    except Exception:
+      logger.exception("Unable to cancel the program auxiliary-device request")
+      return False
+  def mark_deadline_missed():
+    if state["deadline_missed"]:
+      return
+    state["deadline_missed"] = True
+    cancel_request()
+    message = "PROGRAM AUXILIARY COM DEADLINE MISSED"
+    logger.error(message)
+    _queue_program_execution_status(message, "Alarm.TLabel")
+  def settle_reverse(succeeded):
+    if state["settled"]:
+      return
+    state["settled"] = True
+    completion_callback(succeeded is True)
+  def complete_request(succeeded):
+    completed_at = time.monotonic()
+    if state["settled"]:
+      return
+    if completed_at > primary_deadline:
+      mark_deadline_missed()
+    state["succeeded"] = succeeded is True and not state["deadline_missed"]
+    if reverse:
+      completion_event.set()
+      settle_reverse(state["succeeded"])
+    else:
+      state["settled"] = True
+      completion_event.set()
+  def schedule(deadline, callback):
+    try:
+      root.after(max(0, math.ceil(1000 * (deadline - time.monotonic()))), callback)
+    except Exception:
+      logger.exception("Unable to schedule program auxiliary-device settlement")
+      return False
+    return True
+  def reject_schedule():
+    mark_deadline_missed()
+    settle_reverse(False)
+  def poll_cleanup():
+    if state["settled"]:
+      return
+    if time.monotonic() >= state["cleanup_deadline"]:
+      settle_reverse(False)
+    elif not schedule(state["cleanup_deadline"], poll_cleanup):
+      reject_schedule()
+  def poll_primary():
+    if state["settled"]:
+      return
+    if time.monotonic() < primary_deadline:
+      if not schedule(primary_deadline, poll_primary):
+        reject_schedule()
+      return
+    mark_deadline_missed()
+    state["cleanup_deadline"] = time.monotonic() + cleanup_wait
+    if not schedule(state["cleanup_deadline"], poll_cleanup):
+      settle_reverse(False)
+  started = _request_auxiliary_device_read(
+    match.group(1),
+    match.group(2),
+    response_timeout_seconds=AUXILIARY_DEVICE_PROGRAM_READ_TIMEOUT_SECONDS,
+    execution_request=execution_request,
+    completion_callback=complete_request,
+  )
+  if not started:
+    return ROW_EXECUTION_REJECTED
+  if reverse:
+    if not schedule(primary_deadline, poll_primary):
+      reject_schedule()
+      return ROW_EXECUTION_REJECTED
+    return ROW_EXECUTION_PENDING
+
+  completion_event.wait(max(0.0, primary_deadline - time.monotonic()))
+  if state["settled"]:
+    return ROW_EXECUTION_COMPLETE if state["succeeded"] and not state["deadline_missed"] else ROW_EXECUTION_REJECTED
+  mark_deadline_missed()
+  state["cleanup_deadline"] = time.monotonic() + cleanup_wait
+  completion_event.wait(max(0.0, state["cleanup_deadline"] - time.monotonic()))
+  state["settled"] = True
+  return ROW_EXECUTION_REJECTED
+
+
 def executeRow(motion_complete=None, execution_request=None):
   if execution_request is None:
     with program_execution_state_lock:
@@ -17248,28 +17434,15 @@ def executeRow(motion_complete=None, execution_request=None):
       _set_application_status(text="IO not supported in offline programming mode", style="Alarm.TLabel")
       _finish_execute_row()
       return ROW_EXECUTION_REJECTED
-    comIndex = command.find("# ")
-    charIndex = command.find("Char: ")
-    actionIndex = command.find(": ")
-    comNum = str(command[comIndex+2:charIndex-1])
-    charNum = int(command[charIndex+6:])
-    try:
-      # global RUN['ser3']    
-      port = "COM" + comNum   
-      baud = 9600    
-      RUN['ser3'] = serial.Serial(port,baud,timeout=10)
-    except:
-      #Curtime = datetime.now().strftime("%B %d %Y - %I:%M%p")
-      #tab8.ElogView.insert(END, Curtime+" - UNABLE TO ESTABLISH COMMUNICATIONS WITH SERIAL DEVICE")
-      logger.error("UNABLE TO ESTABLISH COMMUNICATIONS WITH SERIAL DEVICE")
-      value=tab8.ElogView.get(0,END)
-      pickle.dump(value,open("ErrorLog","wb"))
-    RUN['ser3'].flushInput()
-    response = str(RUN['ser3'].read(charNum).strip(),'utf-8')    
-    com3outPortEntryField.delete(0, 'end')
-    com3outPortEntryField.insert(0,response)
-    manEntryField.delete(0, 'end')
-    manEntryField.insert(0,response)
+    execution_state = _execute_program_auxiliary_device_read(
+      command,
+      execution_request=execution_request,
+      completion_callback=motion_complete,
+    )
+    if execution_state != ROW_EXECUTION_COMPLETE:
+      if execution_state == ROW_EXECUTION_REJECTED:
+        _finish_execute_row()
+      return execution_state
 
 
   
@@ -18245,679 +18418,680 @@ def executeRow(motion_complete=None, execution_request=None):
 # use old method when not on windows
 
 
-if CE['Platform']['IS_WINDOWS']:
-  # ---------- XINPUT (Xbox 360 / Xbox One) - Windows ----------
-  for _dll in ("XInput1_4.dll", "XInput9_1_0.dll", "XInput1_3.dll"):
-      try:
-          _xinput = ctypes.WinDLL(_dll); break
-      except OSError:
-          _xinput = None
-  if _xinput is None:
-      raise OSError("XInput DLL not found")
+if __name__ == "__main__":
+  if CE['Platform']['IS_WINDOWS']:
+    # ---------- XINPUT (Xbox 360 / Xbox One) - Windows ----------
+    for _dll in ("XInput1_4.dll", "XInput9_1_0.dll", "XInput1_3.dll"):
+        try:
+            _xinput = ctypes.WinDLL(_dll); break
+        except OSError:
+            _xinput = None
+    if _xinput is None:
+        raise OSError("XInput DLL not found")
 
-  class XINPUT_GAMEPAD(ctypes.Structure):
-      _fields_ = [
-          ("wButtons", ctypes.c_ushort),
-          ("bLeftTrigger", ctypes.c_ubyte),
-          ("bRightTrigger", ctypes.c_ubyte),
-          ("sThumbLX", ctypes.c_short),
-          ("sThumbLY", ctypes.c_short),
-          ("sThumbRX", ctypes.c_short),
-          ("sThumbRY", ctypes.c_short),
-      ]
-  class XINPUT_STATE(ctypes.Structure):
-      _fields_ = [("dwPacketNumber", ctypes.c_uint), ("Gamepad", XINPUT_GAMEPAD)]
-  XInputGetState = _xinput.XInputGetState
-  XInputGetState.argtypes = [ctypes.c_uint, ctypes.POINTER(XINPUT_STATE)]
-  XInputGetState.restype  = ctypes.c_uint
+    class XINPUT_GAMEPAD(ctypes.Structure):
+        _fields_ = [
+            ("wButtons", ctypes.c_ushort),
+            ("bLeftTrigger", ctypes.c_ubyte),
+            ("bRightTrigger", ctypes.c_ubyte),
+            ("sThumbLX", ctypes.c_short),
+            ("sThumbLY", ctypes.c_short),
+            ("sThumbRX", ctypes.c_short),
+            ("sThumbRY", ctypes.c_short),
+        ]
+    class XINPUT_STATE(ctypes.Structure):
+        _fields_ = [("dwPacketNumber", ctypes.c_uint), ("Gamepad", XINPUT_GAMEPAD)]
+    XInputGetState = _xinput.XInputGetState
+    XInputGetState.argtypes = [ctypes.c_uint, ctypes.POINTER(XINPUT_STATE)]
+    XInputGetState.restype  = ctypes.c_uint
 
-  # ---------- Buttons / DPAD ----------
-  BTN_A = 0x1000
-  BTN_B = 0x2000
-  BTN_X = 0x4000
-  BTN_Y = 0x8000
-  BTN_START = 0x0010
-  BTN_LB = 0x0100
-  BTN_RB = 0x0200
-  DPAD_UP    = 0x0001
-  DPAD_DOWN  = 0x0002
-  DPAD_LEFT  = 0x0004
-  DPAD_RIGHT = 0x0008
+    # ---------- Buttons / DPAD ----------
+    BTN_A = 0x1000
+    BTN_B = 0x2000
+    BTN_X = 0x4000
+    BTN_Y = 0x8000
+    BTN_START = 0x0010
+    BTN_LB = 0x0100
+    BTN_RB = 0x0200
+    DPAD_UP    = 0x0001
+    DPAD_DOWN  = 0x0002
+    DPAD_LEFT  = 0x0004
+    DPAD_RIGHT = 0x0008
 
-  # ---------- Stick robustness ----------
-  DZ_LX = 7849; DZ_LY = 7849
-  DZ_RX = 8689 + 1500; DZ_RY = 8689 + 1500
-  START_THR_L = 0.18; STOP_THR_L = 0.12
-  START_THR_R = 0.22; STOP_THR_R = 0.10
-  LPF_ALPHA_L = 0.30; LPF_ALPHA_R = 0.35
+    # ---------- Stick robustness ----------
+    DZ_LX = 7849; DZ_LY = 7849
+    DZ_RX = 8689 + 1500; DZ_RY = 8689 + 1500
+    START_THR_L = 0.18; STOP_THR_L = 0.12
+    START_THR_R = 0.22; STOP_THR_R = 0.10
+    LPF_ALPHA_L = 0.30; LPF_ALPHA_R = 0.35
 
-  def _norm_axis(v, dz):
-      if abs(v) < dz: return 0.0
-      n = v / 32767.0
-      return -1.0 if n < -1.0 else (1.0 if n > 1.0 else n)
+    def _norm_axis(v, dz):
+        if abs(v) < dz: return 0.0
+        n = v / 32767.0
+        return -1.0 if n < -1.0 else (1.0 if n > 1.0 else n)
 
-  def _lbl(text, style="Warn.TLabel"):
-      try:
-          root.after(
-              0,
-              lambda: _set_application_status(text, style),
-          )
-      except Exception:
-          pass
+    def _lbl(text, style="Warn.TLabel"):
+        try:
+            root.after(
+                0,
+                lambda: _set_application_status(text, style),
+            )
+        except Exception:
+            pass
 
-  # ---------- Mode state (A=Joint, B=Cartesian) ----------
-  RUN['_mainMode'] = 1
-  def _show_mode_banner():
-      try:
-          _lbl("JOINT MODE" if RUN['_mainMode'] == 1 else "CARTESIAN MODE", style="Warn.TLabel")
-      except Exception:
-          pass
+    # ---------- Mode state (A=Joint, B=Cartesian) ----------
+    RUN['_mainMode'] = 1
+    def _show_mode_banner():
+        try:
+            _lbl("JOINT MODE" if RUN['_mainMode'] == 1 else "CARTESIAN MODE", style="Warn.TLabel")
+        except Exception:
+            pass
 
-  # ---------- Tk-thread GUI calls ----------
-  def _tk_call(fn, *args):
-      if not callable(fn): return False
-      try:
-          root.after(0, (lambda f=fn, a=args: f(*a)))
-          return True
-      except Exception:
-          return False
+    # ---------- Tk-thread GUI calls ----------
+    def _tk_call(fn, *args):
+        if not callable(fn): return False
+        try:
+            root.after(0, (lambda f=fn, a=args: f(*a)))
+            return True
+        except Exception:
+            return False
 
-  def _gui_stop():
-      live_pending = globals().get('live_serial_result_pending')
-      stop_requested = globals().get('live_jog_stop_requested')
-      if (
-          live_pending is not None
-          and stop_requested is not None
-          and live_pending.is_set()
-      ):
-          stop_requested.set()
-      scheduled = _tk_call(globals().get("StopJog"), None)
-      if not scheduled:
-          logger.warning("Unable to schedule the live-jog stop callback")
-      return scheduled
+    def _gui_stop():
+        live_pending = globals().get('live_serial_result_pending')
+        stop_requested = globals().get('live_jog_stop_requested')
+        if (
+            live_pending is not None
+            and stop_requested is not None
+            and live_pending.is_set()
+        ):
+            stop_requested.set()
+        scheduled = _tk_call(globals().get("StopJog"), None)
+        if not scheduled:
+            logger.warning("Unable to schedule the live-jog stop callback")
+        return scheduled
 
-  def _gui_start_joint(active):
-      callback = globals().get("LiveJointJog")
-      return callable(callback) and callback(_lj_code(*active)) is True
+    def _gui_start_joint(active):
+        callback = globals().get("LiveJointJog")
+        return callable(callback) and callback(_lj_code(*active)) is True
 
-  def _gui_start_cart(active):
-      callback = globals().get("LiveCarJog")
-      axis, direction = active
-      code = _cart_code(axis, direction)
-      return callable(callback) and code is not None and callback(code) is True
+    def _gui_start_cart(active):
+        callback = globals().get("LiveCarJog")
+        axis, direction = active
+        code = _cart_code(axis, direction)
+        return callable(callback) and code is not None and callback(code) is True
 
-  def _gui_start_tool(active):
-      callback = globals().get("LiveToolJog")
-      axis, direction = active
-      code = _tool_code(axis, direction)
-      return callable(callback) and code is not None and callback(code) is True
+    def _gui_start_tool(active):
+        callback = globals().get("LiveToolJog")
+        axis, direction = active
+        code = _tool_code(axis, direction)
+        return callable(callback) and code is not None and callback(code) is True
 
-  def _schedule_xbox_motion(delay_ms, callback, reject_callback):
-      if application_closing.is_set():
-          return LiveMotionScheduleResult.CANCELLED
+    def _schedule_xbox_motion(delay_ms, callback, reject_callback):
+        if application_closing.is_set():
+            return LiveMotionScheduleResult.CANCELLED
 
-      def schedule_on_tk():
-          if application_closing.is_set():
-              reject_callback(LiveMotionScheduleResult.CANCELLED)
-              return
-          try:
-              if delay_ms > 0:
-                  root.after(delay_ms, callback)
-              else:
-                  callback()
-          except Exception as exc:
-              reject_callback(exc)
+        def schedule_on_tk():
+            if application_closing.is_set():
+                reject_callback(LiveMotionScheduleResult.CANCELLED)
+                return
+            try:
+                if delay_ms > 0:
+                    root.after(delay_ms, callback)
+                else:
+                    callback()
+            except Exception as exc:
+                reject_callback(exc)
 
-      return _tk_call(schedule_on_tk)
+        return _tk_call(schedule_on_tk)
 
-  # ----- Teach (X button) -----
-  def _teach_position():
-      if not _tk_call(globals().get("teachInsertBelSelected")):
-          logger.warning("Unable to schedule the Xbox teach-position callback")
+    # ----- Teach (X button) -----
+    def _teach_position():
+        if not _tk_call(globals().get("teachInsertBelSelected")):
+            logger.warning("Unable to schedule the Xbox teach-position callback")
 
-  # ----- Servo gripper toggle (Y button) over ser2 -----
-  RUN['_grip_closed'] = False  # False = open; first press closes (SV0P0)
-  RUN['_grip_pending_request_id'] = None
+    # ----- Servo gripper toggle (Y button) over ser2 -----
+    RUN['_grip_closed'] = False  # False = open; first press closes (SV0P0)
+    RUN['_grip_pending_request_id'] = None
 
-  def _toggle_servo_gripper():
-      if not _tk_call(_request_xbox_auxiliary_toggle, "_grip_closed"):
-          logger.warning("Unable to schedule the Xbox servo-gripper toggle")
+    def _toggle_servo_gripper():
+        if not _tk_call(_request_xbox_auxiliary_toggle, "_grip_closed"):
+            logger.warning("Unable to schedule the Xbox servo-gripper toggle")
 
-  # ----- Pneumatic gripper toggle (START) over ser2 -----
-  RUN['_pneu_open'] = False  # False = closed
-  RUN['_pneu_pending_request_id'] = None
+    # ----- Pneumatic gripper toggle (START) over ser2 -----
+    RUN['_pneu_open'] = False  # False = closed
+    RUN['_pneu_pending_request_id'] = None
 
-  def _toggle_pneu_gripper():
-      if not _tk_call(_request_xbox_auxiliary_toggle, "_pneu_open"):
-          logger.warning("Unable to schedule the Xbox pneumatic-gripper toggle")
+    def _toggle_pneu_gripper():
+        if not _tk_call(_request_xbox_auxiliary_toggle, "_pneu_open"):
+            logger.warning("Unable to schedule the Xbox pneumatic-gripper toggle")
 
-  # ----- Triggers adjust speedEntryField (smart stepping) -----
-  def _bump_speed_smart(delta_hint):
-      def do():
-          try:
-              val = int(speedEntryField.get())
-          except Exception:
-              val = 25
-          if delta_hint < 0:
-              # Decrease: above 5 → -5; at/under 5 → -1 (to a floor of 1)
-              step = -5 if val > 5 else -1
-          else:
-              # Increase: below 5 → +1 up to 5; above 5 → +5
-              step = +1 if val < 5 else +5
-          newv = max(1, min(100, val + step))
-          speedEntryField.delete(0, 'end')
-          speedEntryField.insert(0, str(newv))
-      try:
-          root.after(0, do)
-      except Exception:
-          do()
+    # ----- Triggers adjust speedEntryField (smart stepping) -----
+    def _bump_speed_smart(delta_hint):
+        def do():
+            try:
+                val = int(speedEntryField.get())
+            except Exception:
+                val = 25
+            if delta_hint < 0:
+                # Decrease: above 5 → -5; at/under 5 → -1 (to a floor of 1)
+                step = -5 if val > 5 else -1
+            else:
+                # Increase: below 5 → +1 up to 5; above 5 → +5
+                step = +1 if val < 5 else +5
+            newv = max(1, min(100, val + step))
+            speedEntryField.delete(0, 'end')
+            speedEntryField.insert(0, str(newv))
+        try:
+            root.after(0, do)
+        except Exception:
+            do()
 
-  RUN['_last_input_time'] = 0.0
-  RUN['_xbox_watchdog_failed'] = False
-  SWITCH_DELAY_MS = 60
-  WATCHDOG_MS     = 200
+    RUN['_last_input_time'] = 0.0
+    RUN['_xbox_watchdog_failed'] = False
+    SWITCH_DELAY_MS = 60
+    WATCHDOG_MS     = 200
 
-  def _lj_code(j, direction):  # J1- = 10, J1+ = 11; J2- = 20, J2+ = 21; ...
-      return j*10 + (1 if direction > 0 else 0)
+    def _lj_code(j, direction):  # J1- = 10, J1+ = 11; J2- = 20, J2+ = 21; ...
+        return j*10 + (1 if direction > 0 else 0)
 
-  def _cart_code(axis, d):
-      if axis == 'X':  return 10 if d < 0 else 11
-      if axis == 'Y':  return 20 if d < 0 else 21
-      if axis == 'Z':  return 30 if d < 0 else 31
-      if axis == 'Rz': return 40 if d < 0 else 41
-      if axis == 'Ry': return 50 if d < 0 else 51
-      if axis == 'Rx': return 60 if d < 0 else 61
-      return None
+    def _cart_code(axis, d):
+        if axis == 'X':  return 10 if d < 0 else 11
+        if axis == 'Y':  return 20 if d < 0 else 21
+        if axis == 'Z':  return 30 if d < 0 else 31
+        if axis == 'Rz': return 40 if d < 0 else 41
+        if axis == 'Ry': return 50 if d < 0 else 51
+        if axis == 'Rx': return 60 if d < 0 else 61
+        return None
 
-  def _tool_code(axis, d):
-      # LT direction bits describe TCP travel after inverse kinematics.
-      if axis == 'Tz': return 30 if d < 0 else 31
-      return None
+    def _tool_code(axis, d):
+        # LT direction bits describe TCP travel after inverse kinematics.
+        if axis == 'Tz': return 30 if d < 0 else 31
+        return None
 
-  def _report_xbox_motion_error(message):
-      logger.error("Xbox live-motion arbitration failed: %s", message)
-      _lbl("XBOX LIVE MOTION FAILED", style="Alarm.TLabel")
+    def _report_xbox_motion_error(message):
+        logger.error("Xbox live-motion arbitration failed: %s", message)
+        _lbl("XBOX LIVE MOTION FAILED", style="Alarm.TLabel")
 
-  joint_xbox_arbiter = DeferredLiveMotionArbiter(
-      _schedule_xbox_motion,
-      _gui_start_joint,
-      _gui_stop,
-      SWITCH_DELAY_MS,
-      _report_xbox_motion_error,
-  )
-  cartesian_xbox_arbiter = DeferredLiveMotionArbiter(
-      _schedule_xbox_motion,
-      _gui_start_cart,
-      _gui_stop,
-      SWITCH_DELAY_MS,
-      _report_xbox_motion_error,
-  )
-  tool_xbox_arbiter = DeferredLiveMotionArbiter(
-      _schedule_xbox_motion,
-      _gui_start_tool,
-      _gui_stop,
-      SWITCH_DELAY_MS,
-      _report_xbox_motion_error,
-  )
+    joint_xbox_arbiter = DeferredLiveMotionArbiter(
+        _schedule_xbox_motion,
+        _gui_start_joint,
+        _gui_stop,
+        SWITCH_DELAY_MS,
+        _report_xbox_motion_error,
+    )
+    cartesian_xbox_arbiter = DeferredLiveMotionArbiter(
+        _schedule_xbox_motion,
+        _gui_start_cart,
+        _gui_stop,
+        SWITCH_DELAY_MS,
+        _report_xbox_motion_error,
+    )
+    tool_xbox_arbiter = DeferredLiveMotionArbiter(
+        _schedule_xbox_motion,
+        _gui_start_tool,
+        _gui_stop,
+        SWITCH_DELAY_MS,
+        _report_xbox_motion_error,
+    )
 
-  def _request_switch(new_active):
-      return joint_xbox_arbiter.request(new_active)
+    def _request_switch(new_active):
+        return joint_xbox_arbiter.request(new_active)
 
-  def _request_switch_cart(new_active):
-      return cartesian_xbox_arbiter.request(new_active)
+    def _request_switch_cart(new_active):
+        return cartesian_xbox_arbiter.request(new_active)
 
-  def _request_switch_tool(new_active):
-      return tool_xbox_arbiter.request(new_active)
+    def _request_switch_tool(new_active):
+        return tool_xbox_arbiter.request(new_active)
 
-  def _fail_xbox_watchdog(error):
-      RUN['_xbox_watchdog_failed'] = True
-      live_stop = globals().get('live_jog_stop_requested')
-      if live_stop is not None:
-          live_stop.set()
-      offline_lock = globals().get('offline_live_jog_state_lock')
-      offline_stop = globals().get('offline_live_jog_stop_event')
-      if offline_lock is not None and offline_stop is not None:
-          with offline_lock:
-              offline_stop.set()
-      for requester in (
-          _request_switch,
-          _request_switch_cart,
-          _request_switch_tool,
-      ):
-          try:
-              requester(None)
-          except Exception:
-              logger.exception("Unable to stop Xbox motion after watchdog failure")
-      logger.error("Xbox watchdog scheduling failed: %s", error)
-      _lbl("XBOX WATCHDOG FAILED", style="Alarm.TLabel")
-      return False
+    def _fail_xbox_watchdog(error):
+        RUN['_xbox_watchdog_failed'] = True
+        live_stop = globals().get('live_jog_stop_requested')
+        if live_stop is not None:
+            live_stop.set()
+        offline_lock = globals().get('offline_live_jog_state_lock')
+        offline_stop = globals().get('offline_live_jog_stop_event')
+        if offline_lock is not None and offline_stop is not None:
+            with offline_lock:
+                offline_stop.set()
+        for requester in (
+            _request_switch,
+            _request_switch_cart,
+            _request_switch_tool,
+        ):
+            try:
+                requester(None)
+            except Exception:
+                logger.exception("Unable to stop Xbox motion after watchdog failure")
+        logger.error("Xbox watchdog scheduling failed: %s", error)
+        _lbl("XBOX WATCHDOG FAILED", style="Alarm.TLabel")
+        return False
 
-  def _schedule_watchdog():
-      try:
-          root.after(WATCHDOG_MS, _watchdog_tick)
-      except Exception as exc:
-          return _fail_xbox_watchdog(exc)
-      return True
+    def _schedule_watchdog():
+        try:
+            root.after(WATCHDOG_MS, _watchdog_tick)
+        except Exception as exc:
+            return _fail_xbox_watchdog(exc)
+        return True
 
-  def _watchdog_tick():
-      try:
-          if application_closing.is_set():
-              return
-          now = time.monotonic()
-          if (now - RUN['_last_input_time']) * 1000.0 > WATCHDOG_MS:
-              _request_switch(None)
-              _request_switch_cart(None)
-              _request_switch_tool(None)
-      finally:
-          if (
-              not application_closing.is_set()
-              and not RUN['_xbox_watchdog_failed']
-          ):
-              _schedule_watchdog()
+    def _watchdog_tick():
+        try:
+            if application_closing.is_set():
+                return
+            now = time.monotonic()
+            if (now - RUN['_last_input_time']) * 1000.0 > WATCHDOG_MS:
+                _request_switch(None)
+                _request_switch_cart(None)
+                _request_switch_tool(None)
+        finally:
+            if (
+                not application_closing.is_set()
+                and not RUN['_xbox_watchdog_failed']
+            ):
+                _schedule_watchdog()
 
-  # ---------- Axis selection (one axis per stick) ----------
-  RUN['_smooth'] = {'LX': 0, 'LY': 0, 'RX': 0, 'RY': 0}
-  def _lp(prev, new, alpha): return int(prev + alpha * (new - prev))
+    # ---------- Axis selection (one axis per stick) ----------
+    RUN['_smooth'] = {'LX': 0, 'LY': 0, 'RX': 0, 'RY': 0}
+    def _lp(prev, new, alpha): return int(prev + alpha * (new - prev))
 
-  def _stick_to_axis(raw_x, raw_y, dz_x, dz_y, alpha, start_thr, stop_thr, tag):
-      """
+    def _stick_to_axis(raw_x, raw_y, dz_x, dz_y, alpha, start_thr, stop_thr, tag):
+        """
       Returns (axis, dir) with axis in {'X','Y',None}, dir in {-1,0,+1}
       (One axis per stick; picks stronger if diagonal.)
       """
-      if tag == 'L':
-          RUN['_smooth']['LX'] = _lp(RUN['_smooth']['LX'], raw_x, alpha)
-          RUN['_smooth']['LY'] = _lp(RUN['_smooth']['LY'], raw_y, alpha)
-          nx = _norm_axis(RUN['_smooth']['LX'], dz_x); ny = _norm_axis(RUN['_smooth']['LY'], dz_y)
-      else:
-          RUN['_smooth']['RX'] = _lp(RUN['_smooth']['RX'], raw_x, alpha)
-          RUN['_smooth']['RY'] = _lp(RUN['_smooth']['RY'], raw_y, alpha)
-          nx = _norm_axis(RUN['_smooth']['RX'], dz_x); ny = _norm_axis(RUN['_smooth']['RY'], dz_y)
+        if tag == 'L':
+            RUN['_smooth']['LX'] = _lp(RUN['_smooth']['LX'], raw_x, alpha)
+            RUN['_smooth']['LY'] = _lp(RUN['_smooth']['LY'], raw_y, alpha)
+            nx = _norm_axis(RUN['_smooth']['LX'], dz_x); ny = _norm_axis(RUN['_smooth']['LY'], dz_y)
+        else:
+            RUN['_smooth']['RX'] = _lp(RUN['_smooth']['RX'], raw_x, alpha)
+            RUN['_smooth']['RY'] = _lp(RUN['_smooth']['RY'], raw_y, alpha)
+            nx = _norm_axis(RUN['_smooth']['RX'], dz_x); ny = _norm_axis(RUN['_smooth']['RY'], dz_y)
 
-      ix = 1 if nx >= start_thr else (-1 if nx <= -start_thr else 0)
-      iy = 1 if ny >= start_thr else (-1 if ny <= -start_thr else 0)
+        ix = 1 if nx >= start_thr else (-1 if nx <= -start_thr else 0)
+        iy = 1 if ny >= start_thr else (-1 if ny <= -start_thr else 0)
 
-      if ix == 0 and iy == 0:
-          return None, 0
-      if ix != 0 and iy != 0:
-          return ('X', 1 if nx>0 else -1) if abs(nx) >= abs(ny) else ('Y', 1 if ny>0 else -1)
-      return ('X', ix) if ix != 0 else ('Y', iy)
+        if ix == 0 and iy == 0:
+            return None, 0
+        if ix != 0 and iy != 0:
+            return ('X', 1 if nx>0 else -1) if abs(nx) >= abs(ny) else ('Y', 1 if ny>0 else -1)
+        return ('X', ix) if ix != 0 else ('Y', iy)
 
-  # --- Dominant-axis lock for CARTESIAN left stick (prevents X<->Y flip mid-hold)
-  _cartL_lock = {'which': None, 'dir': 0}
-  def _cart_left_locked(raw_lx, raw_ly):
-      # global RUN['_smooth']
-      RUN['_smooth']['LX'] = int(RUN['_smooth']['LX'] + LPF_ALPHA_L * (raw_lx - RUN['_smooth']['LX']))
-      RUN['_smooth']['LY'] = int(RUN['_smooth']['LY'] + LPF_ALPHA_L * (raw_ly - RUN['_smooth']['LY']))
-      nx = _norm_axis(RUN['_smooth']['LX'], DZ_LX)
-      ny = _norm_axis(RUN['_smooth']['LY'], DZ_LY)
-      ix =  1 if nx >= START_THR_L else (-1 if nx <= -START_THR_L else 0)
-      iy =  1 if ny >= START_THR_L else (-1 if ny <= -START_THR_L else 0)
-      lock = _cartL_lock
-      if lock['which'] == 'X':
-          if abs(nx) > STOP_THR_L:
-              lock['dir'] = 1 if nx > 0 else -1
-              return 'X', lock['dir']
-          else:
-              lock['which'] = None; lock['dir'] = 0
-      elif lock['which'] == 'Y':
-          if abs(ny) > STOP_THR_L:
-              lock['dir'] = 1 if ny > 0 else -1
-              return 'Y', lock['dir']
-          else:
-              lock['which'] = None; lock['dir'] = 0
-      if ix == 0 and iy == 0:
-          return None, 0
-      if ix != 0 and iy != 0:
-          if abs(nx) >= abs(ny):
-              lock['which'] = 'X'; lock['dir'] = 1 if nx > 0 else -1
-          else:
-              lock['which'] = 'Y'; lock['dir'] = 1 if ny > 0 else -1
-      elif ix != 0:
-          lock['which'] = 'X'; lock['dir'] = ix
-      else:
-          lock['which'] = 'Y'; lock['dir'] = iy
-      return lock['which'], lock['dir']
-
-  # ---------- Controller plumbing ----------
-  def _find_controller():
-      st = XINPUT_STATE()
-      for i in range(4):
-          if XInputGetState(i, ctypes.byref(st)) == 0:
-              return i
-      return None
-
-  def _poll_loop():
-      # global RUN['_mainMode'], RUN['_last_input_time']
-      idx = _find_controller()
-      if idx is None:
-          _lbl("No XInput controller detected"); return
-      _lbl(f"Xbox connected (slot {idx})")
-      if not _tk_call(_schedule_watchdog):
-          _fail_xbox_watchdog("initial Tk scheduling failed")
-          return
-
-      last_buttons = 0  # for edges X/Y/START/LB/RB
-      lt_down = False
-      rt_down = False
-      TRIG_THR = 30  # analog threshold for a 'press'
-
-      while (
-          not application_closing.is_set()
-          and not RUN['_xbox_watchdog_failed']
-      ):
-          st = XINPUT_STATE()
-          if XInputGetState(idx, ctypes.byref(st)) != 0:
-              _request_switch(None); _request_switch_cart(None); _request_switch_tool(None)
-              _lbl("XBOX CONTROLLER NOT RESPONDING", style="Alarm.TLabel")
-              time.sleep(0.2)
-              idx = _find_controller()
-              if idx is not None: _lbl(f"Xbox reconnected (slot {idx})")
-              continue
-
-          gp = st.Gamepad
-          buttons = gp.wButtons
-
-          # --- Button edges: X (teach), Y (servo gripper), START (pneumatic gripper) ---
-          pressed = buttons & ~last_buttons
-          if pressed & BTN_X:
-              _teach_position()
-          if pressed & BTN_Y:
-              _toggle_servo_gripper()
-          if pressed & BTN_START:
-              _toggle_pneu_gripper()
-
-          # --- Triggers: smart speed (edge) ---
-          if gp.bLeftTrigger >= TRIG_THR and not lt_down:
-              lt_down = True
-              _bump_speed_smart(-1)
-          elif gp.bLeftTrigger < TRIG_THR and lt_down:
-              lt_down = False
-
-          if gp.bRightTrigger >= TRIG_THR and not rt_down:
-              rt_down = True
-              _bump_speed_smart(+1)
-          elif gp.bRightTrigger < TRIG_THR and rt_down:
-              rt_down = False
-
-          # --- Mode switching (A=Joint, B=Cartesian) ---
-          if buttons & BTN_A:
-              if RUN['_mainMode'] != 1:
-                  _request_switch(None); _request_switch_cart(None); _request_switch_tool(None)
-                  RUN['_mainMode'] = 1; _show_mode_banner()
-          elif buttons & BTN_B:
-              if RUN['_mainMode'] != 2:
-                  _request_switch(None); _request_switch_cart(None); _request_switch_tool(None)
-                  RUN['_mainMode'] = 2; _show_mode_banner()
-
-          # --- Tool bumpers (priority over sticks/dpad) ---
-          # LB => Tz−, RB => Tz+
-          intended_tool = None
-          if (buttons & BTN_LB) and not (buttons & BTN_RB):
-              intended_tool = ('Tz', -1)
-          elif (buttons & BTN_RB) and not (buttons & BTN_LB):
-              intended_tool = ('Tz', +1)
-          else:
-              intended_tool = None
-
-          if intended_tool is not None:
-              # tool jog takes priority: stop other modes first
-              _request_switch(None)
-              _request_switch_cart(None)
-              _request_switch_tool(intended_tool)
-          else:
-              _request_switch_tool(None)
-
-              # --- Movement based on mode (only if no tool jog active) ---
-              if RUN['_mainMode'] == 1:
-                  # JOINT MODE (custom mapping)
-                  axL, dirL = _stick_to_axis(gp.sThumbLX, gp.sThumbLY, DZ_LX, DZ_LY,
-                                            LPF_ALPHA_L, START_THR_L, STOP_THR_L, 'L')
-                  axR, dirR = _stick_to_axis(gp.sThumbRX, gp.sThumbRY, DZ_RX, DZ_RY,
-                                            LPF_ALPHA_R, START_THR_R, STOP_THR_R, 'R')
-
-                  # D-pad: J5 (Down=+1, Up=-1), J6 (Right=+1, Left=-1)
-                  dJ5 = (+1 if (buttons & DPAD_DOWN) else -1 if (buttons & DPAD_UP) else 0)
-                  dJ6 = (+1 if (buttons & DPAD_RIGHT) else -1 if (buttons & DPAD_LEFT) else 0)
-
-                  intended = None
-                  if dJ5 != 0:
-                      intended = (5, dJ5)
-                  elif dJ6 != 0:
-                      intended = (6, dJ6)
-                  elif axL is not None:
-                      intended = (1, -dirL) if axL == 'X' else (2, -dirL)
-                  elif axR is not None:
-                      intended = (3, dirR) if axR == 'X' else (4, dirR)
-
-                  _request_switch(intended)
-
-              else:
-                  # CARTESIAN MODE (left-stick axis lock)
-                  axL, dirL = _cart_left_locked(gp.sThumbLX, gp.sThumbLY)
-                  axR, dirR = _stick_to_axis(gp.sThumbRX, gp.sThumbRY, DZ_RX, DZ_RY,
-                                            LPF_ALPHA_R, START_THR_R, STOP_THR_R, 'R')
-
-                  # D-pad: Rx / Ry
-                  dRx = (+1 if (buttons & DPAD_UP)    else -1 if (buttons & DPAD_DOWN) else 0)
-                  dRy = (+1 if (buttons & DPAD_RIGHT) else -1 if (buttons & DPAD_LEFT) else 0)
-
-                  intended_cart = None
-                  if dRx != 0:
-                      intended_cart = ('Rx', dRx)
-                  elif dRy != 0:
-                      intended_cart = ('Ry', dRy)
-                  elif axL is not None:
-                      intended_cart = ('X', dirL) if axL == 'Y' else ('Y', -dirL)
-                  elif axR is not None:
-                      intended_cart = ('Rz', dirR) if axR == 'X' else ('Z', dirR)
-
-                  _request_switch_cart(intended_cart)
-
-          RUN['_last_input_time'] = time.monotonic()
-          last_buttons = buttons
-          time.sleep(0.008)  # ~120 Hz
-
-      _request_switch(None)
-      _request_switch_cart(None)
-      _request_switch_tool(None)
-
-  # ---------- Public entry ----------
-  def start_xbox():
-      RUN['_xbox_watchdog_failed'] = False
-      threading.Thread(target=_poll_loop, daemon=True).start()
-      _lbl("Xbox ON / polling…", style="Warn.TLabel")
-
-else:
-  from inputs import get_gamepad
-  def xbox():
-    def send_xbox_auxiliary(command):
-      serial_port = RUN.get('ser2')
-      profile = _connected_auxiliary_board_profile(serial_port)
-      validate_auxiliary_output_command(command, profile)
-      opcode, pin = parse_auxiliary_output_command(command)
-      return _exchange_xbox_auxiliary_command(
-        "set_output",
-        {"pin": pin, "state": opcode == "ON"},
-        serial_port,
-      )
-
-    def threadxbox():
-      # global RUN['xboxUse']
-      jogMode = 1
-      if RUN['xboxUse'] == 0:
-        RUN['xboxUse'] = 1
-        mainMode = 1
-        jogMode = 1
-        grip = 0
-        _set_application_status(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
-        #xbcStatusLab.config(text='Xbox ON', )
-        ChgDis(2)
-      else:
-        RUN['xboxUse'] = 0
-        _set_application_status(text='XBOX CONTROLLER OFF', style="Warn.TLabel")
-        #xbcStatusLab.config(text='Xbox OFF', )
-      while RUN['xboxUse'] == 1 and not application_closing.is_set():
-        try:
-        #if (TRUE):
-          events = get_gamepad()
-          if application_closing.is_set() or RUN['xboxUse'] != 1:
-            break
-          for event in events:
-            ##DISTANCE
-            if (event.code == 'ABS_RZ' and event.state >= 100):
-              ChgDis(0)
-            elif (event.code == 'ABS_Z' and event.state >= 100): 
-              ChgDis(1)
-            ##SPEED
-            elif (event.code == 'BTN_TR' and event.state == 1): 
-              ChgSpd(0)
-            elif (event.code == 'BTN_TL' and event.state == 1): 
-              ChgSpd(1)
-            ##JOINT MODE
-            elif (event.code == 'BTN_WEST' and event.state == 1): 
-              if mainMode != 1:
-                mainMode = 1
-                jogMode = 1
-                _set_application_status(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
-              else:                
-                jogMode +=1        
-              if jogMode == 2:
-                _set_application_status(text='JOGGING JOINTS 3 & 4', style="Warn.TLabel")
-              elif jogMode == 3:
-                _set_application_status(text='JOGGING JOINTS 5 & 6', style="Warn.TLabel")
-              elif jogMode == 4:
-                jogMode = 1
-                _set_application_status(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
-            ##JOINT JOG
-            elif (
-              (joint_jog := _non_windows_gamepad_joint_jog(
-                mainMode, jogMode, event.code, event.state
-              )) is not None
-            ):
-              axis, direction = joint_jog
-              _queue_joint_jog(
-                axis,
-                direction * float(incrementEntryField.get()),
-              )
-          ##CARTESIAN DIR MODE
-            elif (event.code == 'BTN_SOUTH' and event.state == 1): 
-              if mainMode != 2:
-                mainMode = 2
-                jogMode = 1
-                _set_application_status(text='JOGGING X & Y AXIS', style="Warn.TLabel")
-              else:                
-                jogMode +=1        
-              if jogMode == 2:
-                _set_application_status(text='JOGGING Z AXIS', style="Warn.TLabel")
-              elif jogMode == 3:
-                jogMode = 1
-                _set_application_status(text='JOGGING X & Y AXIS', style="Warn.TLabel")
-            ##CARTESIAN DIR JOG
-            elif (mainMode == 2 and event.code == 'ABS_HAT0Y' and event.state == -1 and jogMode == 1): 
-              XjogNeg(float(incrementEntryField.get()))    
-            elif (mainMode == 2 and event.code == 'ABS_HAT0Y' and event.state == 1 and jogMode == 1): 
-              XjogPos(float(incrementEntryField.get()))
-            elif (mainMode == 2 and event.code == 'ABS_HAT0X' and event.state == 1 and jogMode == 1): 
-              YjogNeg(float(incrementEntryField.get()))    
-            elif (mainMode == 2 and event.code == 'ABS_HAT0X' and event.state == -1 and jogMode == 1): 
-              YjogPos(float(incrementEntryField.get()))           
-            elif (mainMode == 2 and event.code == 'ABS_HAT0Y' and event.state == 1 and jogMode == 2): 
-              ZjogNeg(float(incrementEntryField.get()))    
-            elif (mainMode == 2 and event.code == 'ABS_HAT0Y' and event.state == -1 and jogMode == 2): 
-              ZjogPos(float(incrementEntryField.get()))                          
-          ##CARTESIAN ORIENTATION MODE
-            elif (event.code == 'BTN_EAST' and event.state == 1): 
-              if mainMode != 3:
-                mainMode = 3
-                jogMode = 1
-                _set_application_status(text='JOGGING Rx & Ry AXIS', style="Warn.TLabel")
-              else:                
-                jogMode +=1        
-              if jogMode == 2:
-                _set_application_status(text='JOGGING Rz AXIS', style="Warn.TLabel")
-              elif jogMode == 3:
-                jogMode = 1
-                _set_application_status(text='JOGGING Rx & Ry AXIS', style="Warn.TLabel")
-            ##CARTESIAN ORIENTATION JOG
-            elif (mainMode == 3 and event.code == 'ABS_HAT0X' and event.state == -1 and jogMode == 1): 
-              RxjogNeg(float(incrementEntryField.get()))    
-            elif (mainMode == 3 and event.code == 'ABS_HAT0X' and event.state == 1 and jogMode == 1): 
-              RxjogPos(float(incrementEntryField.get()))
-            elif (mainMode == 3 and event.code == 'ABS_HAT0Y' and event.state == 1 and jogMode == 1): 
-              RyjogNeg(float(incrementEntryField.get()))    
-            elif (mainMode == 3 and event.code == 'ABS_HAT0Y' and event.state == -1 and jogMode == 1): 
-              RyjogPos(float(incrementEntryField.get()))           
-            elif (mainMode == 3 and event.code == 'ABS_HAT0X' and event.state == 1 and jogMode == 2): 
-              RzjogNeg(float(incrementEntryField.get()))    
-            elif (mainMode == 3 and event.code == 'ABS_HAT0X' and event.state == -1 and jogMode == 2): 
-              RzjogPos(float(incrementEntryField.get()))
-            ##J7 MODE
-            elif (event.code == 'BTN_START' and event.state == 1): 
-              mainMode = 4
-              _set_application_status(text='JOGGING TRACK', style="Warn.TLabel")
-            ##TEACH POS          
-            elif (event.code == 'BTN_NORTH' and event.state == 1): 
-              teachInsertBelSelected()
-            ##GRIPPER         
-            elif (event.code == 'BTN_SELECT' and event.state == 1): 
-              if grip == 0:
-                outputNum = DO1offEntryField.get()
-                command = "OFX"+outputNum+"\n"
-                if send_xbox_auxiliary(command):
-                  grip = 1
-              else:
-                outputNum = DO1onEntryField.get()
-                command = "ONX"+outputNum+"\n"
-                if send_xbox_auxiliary(command):
-                  grip = 0
-                  time.sleep(.1)
+    # --- Dominant-axis lock for CARTESIAN left stick (prevents X<->Y flip mid-hold)
+    _cartL_lock = {'which': None, 'dir': 0}
+    def _cart_left_locked(raw_lx, raw_ly):
+        # global RUN['_smooth']
+        RUN['_smooth']['LX'] = int(RUN['_smooth']['LX'] + LPF_ALPHA_L * (raw_lx - RUN['_smooth']['LX']))
+        RUN['_smooth']['LY'] = int(RUN['_smooth']['LY'] + LPF_ALPHA_L * (raw_ly - RUN['_smooth']['LY']))
+        nx = _norm_axis(RUN['_smooth']['LX'], DZ_LX)
+        ny = _norm_axis(RUN['_smooth']['LY'], DZ_LY)
+        ix =  1 if nx >= START_THR_L else (-1 if nx <= -START_THR_L else 0)
+        iy =  1 if ny >= START_THR_L else (-1 if ny <= -START_THR_L else 0)
+        lock = _cartL_lock
+        if lock['which'] == 'X':
+            if abs(nx) > STOP_THR_L:
+                lock['dir'] = 1 if nx > 0 else -1
+                return 'X', lock['dir']
             else:
-              pass   
-        except:
-        #else:
-          _set_application_status(text='XBOX CONTROLLER NOT RESPONDING', style="Alarm.TLabel")
-    t = threading.Thread(target=threadxbox)
-    t.start()
+                lock['which'] = None; lock['dir'] = 0
+        elif lock['which'] == 'Y':
+            if abs(ny) > STOP_THR_L:
+                lock['dir'] = 1 if ny > 0 else -1
+                return 'Y', lock['dir']
+            else:
+                lock['which'] = None; lock['dir'] = 0
+        if ix == 0 and iy == 0:
+            return None, 0
+        if ix != 0 and iy != 0:
+            if abs(nx) >= abs(ny):
+                lock['which'] = 'X'; lock['dir'] = 1 if nx > 0 else -1
+            else:
+                lock['which'] = 'Y'; lock['dir'] = 1 if ny > 0 else -1
+        elif ix != 0:
+            lock['which'] = 'X'; lock['dir'] = ix
+        else:
+            lock['which'] = 'Y'; lock['dir'] = iy
+        return lock['which'], lock['dir']
 
-  def ChgDis(val):
-    curSpd = int(incrementEntryField.get())
-    if curSpd >=100 and val == 0:
-      curSpd = 100 
-    elif curSpd < 5 and val == 0:  
-      curSpd += 1
-    elif val == 0:
-      curSpd += 5   
-    if curSpd <=1 and val == 1:
-      curSpd = 1 
-    elif curSpd <= 5 and val == 1:  
-      curSpd -= 1
-    elif val == 1:
-      curSpd -= 5
-    elif val == 2:
-      curSpd = 5  
-    incrementEntryField.delete(0, 'end')
-    incrementEntryField.insert(0,str(curSpd))
+    # ---------- Controller plumbing ----------
+    def _find_controller():
+        st = XINPUT_STATE()
+        for i in range(4):
+            if XInputGetState(i, ctypes.byref(st)) == 0:
+                return i
+        return None
 
-    time.sleep(.3)  
+    def _poll_loop():
+        # global RUN['_mainMode'], RUN['_last_input_time']
+        idx = _find_controller()
+        if idx is None:
+            _lbl("No XInput controller detected"); return
+        _lbl(f"Xbox connected (slot {idx})")
+        if not _tk_call(_schedule_watchdog):
+            _fail_xbox_watchdog("initial Tk scheduling failed")
+            return
 
-  def ChgSpd(val):
-    curSpd = int(speedEntryField.get())
-    if curSpd >=100 and val == 0:
-      curSpd = 100 
-    elif curSpd < 5 and val == 0:  
-      curSpd += 1
-    elif val == 0:
-      curSpd += 5   
-    if curSpd <=1 and val == 1:
-      curSpd = 1 
-    elif curSpd <= 5 and val == 1:  
-      curSpd -= 1
-    elif val == 1:
-      curSpd -= 5
-    elif val == 2:
-      curSpd = 5  
-    speedEntryField.delete(0, 'end')    
-    speedEntryField.insert(0,str(curSpd))  
+        last_buttons = 0  # for edges X/Y/START/LB/RB
+        lt_down = False
+        rt_down = False
+        TRIG_THR = 30  # analog threshold for a 'press'
+
+        while (
+            not application_closing.is_set()
+            and not RUN['_xbox_watchdog_failed']
+        ):
+            st = XINPUT_STATE()
+            if XInputGetState(idx, ctypes.byref(st)) != 0:
+                _request_switch(None); _request_switch_cart(None); _request_switch_tool(None)
+                _lbl("XBOX CONTROLLER NOT RESPONDING", style="Alarm.TLabel")
+                time.sleep(0.2)
+                idx = _find_controller()
+                if idx is not None: _lbl(f"Xbox reconnected (slot {idx})")
+                continue
+
+            gp = st.Gamepad
+            buttons = gp.wButtons
+
+            # --- Button edges: X (teach), Y (servo gripper), START (pneumatic gripper) ---
+            pressed = buttons & ~last_buttons
+            if pressed & BTN_X:
+                _teach_position()
+            if pressed & BTN_Y:
+                _toggle_servo_gripper()
+            if pressed & BTN_START:
+                _toggle_pneu_gripper()
+
+            # --- Triggers: smart speed (edge) ---
+            if gp.bLeftTrigger >= TRIG_THR and not lt_down:
+                lt_down = True
+                _bump_speed_smart(-1)
+            elif gp.bLeftTrigger < TRIG_THR and lt_down:
+                lt_down = False
+
+            if gp.bRightTrigger >= TRIG_THR and not rt_down:
+                rt_down = True
+                _bump_speed_smart(+1)
+            elif gp.bRightTrigger < TRIG_THR and rt_down:
+                rt_down = False
+
+            # --- Mode switching (A=Joint, B=Cartesian) ---
+            if buttons & BTN_A:
+                if RUN['_mainMode'] != 1:
+                    _request_switch(None); _request_switch_cart(None); _request_switch_tool(None)
+                    RUN['_mainMode'] = 1; _show_mode_banner()
+            elif buttons & BTN_B:
+                if RUN['_mainMode'] != 2:
+                    _request_switch(None); _request_switch_cart(None); _request_switch_tool(None)
+                    RUN['_mainMode'] = 2; _show_mode_banner()
+
+            # --- Tool bumpers (priority over sticks/dpad) ---
+            # LB => Tz−, RB => Tz+
+            intended_tool = None
+            if (buttons & BTN_LB) and not (buttons & BTN_RB):
+                intended_tool = ('Tz', -1)
+            elif (buttons & BTN_RB) and not (buttons & BTN_LB):
+                intended_tool = ('Tz', +1)
+            else:
+                intended_tool = None
+
+            if intended_tool is not None:
+                # tool jog takes priority: stop other modes first
+                _request_switch(None)
+                _request_switch_cart(None)
+                _request_switch_tool(intended_tool)
+            else:
+                _request_switch_tool(None)
+
+                # --- Movement based on mode (only if no tool jog active) ---
+                if RUN['_mainMode'] == 1:
+                    # JOINT MODE (custom mapping)
+                    axL, dirL = _stick_to_axis(gp.sThumbLX, gp.sThumbLY, DZ_LX, DZ_LY,
+                                              LPF_ALPHA_L, START_THR_L, STOP_THR_L, 'L')
+                    axR, dirR = _stick_to_axis(gp.sThumbRX, gp.sThumbRY, DZ_RX, DZ_RY,
+                                              LPF_ALPHA_R, START_THR_R, STOP_THR_R, 'R')
+
+                    # D-pad: J5 (Down=+1, Up=-1), J6 (Right=+1, Left=-1)
+                    dJ5 = (+1 if (buttons & DPAD_DOWN) else -1 if (buttons & DPAD_UP) else 0)
+                    dJ6 = (+1 if (buttons & DPAD_RIGHT) else -1 if (buttons & DPAD_LEFT) else 0)
+
+                    intended = None
+                    if dJ5 != 0:
+                        intended = (5, dJ5)
+                    elif dJ6 != 0:
+                        intended = (6, dJ6)
+                    elif axL is not None:
+                        intended = (1, -dirL) if axL == 'X' else (2, -dirL)
+                    elif axR is not None:
+                        intended = (3, dirR) if axR == 'X' else (4, dirR)
+
+                    _request_switch(intended)
+
+                else:
+                    # CARTESIAN MODE (left-stick axis lock)
+                    axL, dirL = _cart_left_locked(gp.sThumbLX, gp.sThumbLY)
+                    axR, dirR = _stick_to_axis(gp.sThumbRX, gp.sThumbRY, DZ_RX, DZ_RY,
+                                              LPF_ALPHA_R, START_THR_R, STOP_THR_R, 'R')
+
+                    # D-pad: Rx / Ry
+                    dRx = (+1 if (buttons & DPAD_UP)    else -1 if (buttons & DPAD_DOWN) else 0)
+                    dRy = (+1 if (buttons & DPAD_RIGHT) else -1 if (buttons & DPAD_LEFT) else 0)
+
+                    intended_cart = None
+                    if dRx != 0:
+                        intended_cart = ('Rx', dRx)
+                    elif dRy != 0:
+                        intended_cart = ('Ry', dRy)
+                    elif axL is not None:
+                        intended_cart = ('X', dirL) if axL == 'Y' else ('Y', -dirL)
+                    elif axR is not None:
+                        intended_cart = ('Rz', dirR) if axR == 'X' else ('Z', dirR)
+
+                    _request_switch_cart(intended_cart)
+
+            RUN['_last_input_time'] = time.monotonic()
+            last_buttons = buttons
+            time.sleep(0.008)  # ~120 Hz
+
+        _request_switch(None)
+        _request_switch_cart(None)
+        _request_switch_tool(None)
+
+    # ---------- Public entry ----------
+    def start_xbox():
+        RUN['_xbox_watchdog_failed'] = False
+        threading.Thread(target=_poll_loop, daemon=True).start()
+        _lbl("Xbox ON / polling…", style="Warn.TLabel")
+
+  else:
+    from inputs import get_gamepad
+    def xbox():
+      def send_xbox_auxiliary(command):
+        serial_port = RUN.get('ser2')
+        profile = _connected_auxiliary_board_profile(serial_port)
+        validate_auxiliary_output_command(command, profile)
+        opcode, pin = parse_auxiliary_output_command(command)
+        return _exchange_xbox_auxiliary_command(
+          "set_output",
+          {"pin": pin, "state": opcode == "ON"},
+          serial_port,
+        )
+
+      def threadxbox():
+        # global RUN['xboxUse']
+        jogMode = 1
+        if RUN['xboxUse'] == 0:
+          RUN['xboxUse'] = 1
+          mainMode = 1
+          jogMode = 1
+          grip = 0
+          _set_application_status(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
+          #xbcStatusLab.config(text='Xbox ON', )
+          ChgDis(2)
+        else:
+          RUN['xboxUse'] = 0
+          _set_application_status(text='XBOX CONTROLLER OFF', style="Warn.TLabel")
+          #xbcStatusLab.config(text='Xbox OFF', )
+        while RUN['xboxUse'] == 1 and not application_closing.is_set():
+          try:
+          #if (TRUE):
+            events = get_gamepad()
+            if application_closing.is_set() or RUN['xboxUse'] != 1:
+              break
+            for event in events:
+              ##DISTANCE
+              if (event.code == 'ABS_RZ' and event.state >= 100):
+                ChgDis(0)
+              elif (event.code == 'ABS_Z' and event.state >= 100):
+                ChgDis(1)
+              ##SPEED
+              elif (event.code == 'BTN_TR' and event.state == 1):
+                ChgSpd(0)
+              elif (event.code == 'BTN_TL' and event.state == 1):
+                ChgSpd(1)
+              ##JOINT MODE
+              elif (event.code == 'BTN_WEST' and event.state == 1):
+                if mainMode != 1:
+                  mainMode = 1
+                  jogMode = 1
+                  _set_application_status(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
+                else:
+                  jogMode +=1
+                if jogMode == 2:
+                  _set_application_status(text='JOGGING JOINTS 3 & 4', style="Warn.TLabel")
+                elif jogMode == 3:
+                  _set_application_status(text='JOGGING JOINTS 5 & 6', style="Warn.TLabel")
+                elif jogMode == 4:
+                  jogMode = 1
+                  _set_application_status(text='JOGGING JOINTS 1 & 2', style="Warn.TLabel")
+              ##JOINT JOG
+              elif (
+                (joint_jog := _non_windows_gamepad_joint_jog(
+                  mainMode, jogMode, event.code, event.state
+                )) is not None
+              ):
+                axis, direction = joint_jog
+                _queue_joint_jog(
+                  axis,
+                  direction * float(incrementEntryField.get()),
+                )
+            ##CARTESIAN DIR MODE
+              elif (event.code == 'BTN_SOUTH' and event.state == 1):
+                if mainMode != 2:
+                  mainMode = 2
+                  jogMode = 1
+                  _set_application_status(text='JOGGING X & Y AXIS', style="Warn.TLabel")
+                else:
+                  jogMode +=1
+                if jogMode == 2:
+                  _set_application_status(text='JOGGING Z AXIS', style="Warn.TLabel")
+                elif jogMode == 3:
+                  jogMode = 1
+                  _set_application_status(text='JOGGING X & Y AXIS', style="Warn.TLabel")
+              ##CARTESIAN DIR JOG
+              elif (mainMode == 2 and event.code == 'ABS_HAT0Y' and event.state == -1 and jogMode == 1):
+                XjogNeg(float(incrementEntryField.get()))
+              elif (mainMode == 2 and event.code == 'ABS_HAT0Y' and event.state == 1 and jogMode == 1):
+                XjogPos(float(incrementEntryField.get()))
+              elif (mainMode == 2 and event.code == 'ABS_HAT0X' and event.state == 1 and jogMode == 1):
+                YjogNeg(float(incrementEntryField.get()))
+              elif (mainMode == 2 and event.code == 'ABS_HAT0X' and event.state == -1 and jogMode == 1):
+                YjogPos(float(incrementEntryField.get()))
+              elif (mainMode == 2 and event.code == 'ABS_HAT0Y' and event.state == 1 and jogMode == 2):
+                ZjogNeg(float(incrementEntryField.get()))
+              elif (mainMode == 2 and event.code == 'ABS_HAT0Y' and event.state == -1 and jogMode == 2):
+                ZjogPos(float(incrementEntryField.get()))
+            ##CARTESIAN ORIENTATION MODE
+              elif (event.code == 'BTN_EAST' and event.state == 1):
+                if mainMode != 3:
+                  mainMode = 3
+                  jogMode = 1
+                  _set_application_status(text='JOGGING Rx & Ry AXIS', style="Warn.TLabel")
+                else:
+                  jogMode +=1
+                if jogMode == 2:
+                  _set_application_status(text='JOGGING Rz AXIS', style="Warn.TLabel")
+                elif jogMode == 3:
+                  jogMode = 1
+                  _set_application_status(text='JOGGING Rx & Ry AXIS', style="Warn.TLabel")
+              ##CARTESIAN ORIENTATION JOG
+              elif (mainMode == 3 and event.code == 'ABS_HAT0X' and event.state == -1 and jogMode == 1):
+                RxjogNeg(float(incrementEntryField.get()))
+              elif (mainMode == 3 and event.code == 'ABS_HAT0X' and event.state == 1 and jogMode == 1):
+                RxjogPos(float(incrementEntryField.get()))
+              elif (mainMode == 3 and event.code == 'ABS_HAT0Y' and event.state == 1 and jogMode == 1):
+                RyjogNeg(float(incrementEntryField.get()))
+              elif (mainMode == 3 and event.code == 'ABS_HAT0Y' and event.state == -1 and jogMode == 1):
+                RyjogPos(float(incrementEntryField.get()))
+              elif (mainMode == 3 and event.code == 'ABS_HAT0X' and event.state == 1 and jogMode == 2):
+                RzjogNeg(float(incrementEntryField.get()))
+              elif (mainMode == 3 and event.code == 'ABS_HAT0X' and event.state == -1 and jogMode == 2):
+                RzjogPos(float(incrementEntryField.get()))
+              ##J7 MODE
+              elif (event.code == 'BTN_START' and event.state == 1):
+                mainMode = 4
+                _set_application_status(text='JOGGING TRACK', style="Warn.TLabel")
+              ##TEACH POS
+              elif (event.code == 'BTN_NORTH' and event.state == 1):
+                teachInsertBelSelected()
+              ##GRIPPER
+              elif (event.code == 'BTN_SELECT' and event.state == 1):
+                if grip == 0:
+                  outputNum = DO1offEntryField.get()
+                  command = "OFX"+outputNum+"\n"
+                  if send_xbox_auxiliary(command):
+                    grip = 1
+                else:
+                  outputNum = DO1onEntryField.get()
+                  command = "ONX"+outputNum+"\n"
+                  if send_xbox_auxiliary(command):
+                    grip = 0
+                    time.sleep(.1)
+              else:
+                pass
+          except:
+          #else:
+            _set_application_status(text='XBOX CONTROLLER NOT RESPONDING', style="Alarm.TLabel")
+      t = threading.Thread(target=threadxbox)
+      t.start()
+
+    def ChgDis(val):
+      curSpd = int(incrementEntryField.get())
+      if curSpd >=100 and val == 0:
+        curSpd = 100
+      elif curSpd < 5 and val == 0:
+        curSpd += 1
+      elif val == 0:
+        curSpd += 5
+      if curSpd <=1 and val == 1:
+        curSpd = 1
+      elif curSpd <= 5 and val == 1:
+        curSpd -= 1
+      elif val == 1:
+        curSpd -= 5
+      elif val == 2:
+        curSpd = 5
+      incrementEntryField.delete(0, 'end')
+      incrementEntryField.insert(0,str(curSpd))
+
+      time.sleep(.3)
+
+    def ChgSpd(val):
+      curSpd = int(speedEntryField.get())
+      if curSpd >=100 and val == 0:
+        curSpd = 100
+      elif curSpd < 5 and val == 0:
+        curSpd += 1
+      elif val == 0:
+        curSpd += 5
+      if curSpd <=1 and val == 1:
+        curSpd = 1
+      elif curSpd <= 5 and val == 1:
+        curSpd -= 1
+      elif val == 1:
+        curSpd -= 5
+      elif val == 2:
+        curSpd = 5
+      speedEntryField.delete(0, 'end')
+      speedEntryField.insert(0,str(curSpd))
 
 
 ##end xbox ###################################################################################################################################################
@@ -20742,7 +20916,8 @@ def _current_joint_motion_profile():
   )
 
 
-joint_motion_trace_store = ControllerTraceStore()
+if __name__ == "__main__":
+  joint_motion_trace_store = ControllerTraceStore()
 
 
 def _start_joint_motion_trace(command, binding):
@@ -23150,14 +23325,15 @@ def _exchange_joint_motion(command):
         )
 
 
-joint_motion_dispatcher = CoalescingJointDispatcher(
-  _exchange_joint_motion,
-  _current_controller_joint_calibration,
-  transport_lock=serial_lock,
-  activity_factory=lambda: serial_activity_registry.lease("ser"),
-)
-confirmed_position_generation = 0
-deferred_joint_adjustments = DeferredJointAdjustments()
+if __name__ == "__main__":
+  joint_motion_dispatcher = CoalescingJointDispatcher(
+    _exchange_joint_motion,
+    _current_controller_joint_calibration,
+    transport_lock=serial_lock,
+    activity_factory=lambda: serial_activity_registry.lease("ser"),
+  )
+  confirmed_position_generation = 0
+  deferred_joint_adjustments = DeferredJointAdjustments()
 
 
 def _set_joint_motion_target_display(target_positions):
@@ -27039,6 +27215,7 @@ def _run_auxiliary_device_read(request):
   operation_error = None
   cleanup_error = None
   response = None
+  program_read = request.execution_request is not None
 
   def retain_error(error, *, cleanup):
     nonlocal operation_error
@@ -27108,7 +27285,7 @@ def _run_auxiliary_device_read(request):
     serial_port = serial.Serial(
       request.port,
       baudrate=AUXILIARY_DEVICE_BAUD_RATE,
-      timeout=AUXILIARY_DEVICE_READ_TIMEOUT_SECONDS,
+      timeout=request.response_timeout_seconds,
     )
     with auxiliary_device_state_lock:
       if auxiliary_device_active_request is not request:
@@ -27133,7 +27310,11 @@ def _run_auxiliary_device_read(request):
     payload = serial_port.read(request.read_size)
     if not isinstance(payload, (bytes, bytearray)):
       raise MotionInputError("auxiliary-device read returned invalid bytes")
-    if len(payload) != request.read_size:
+    if len(payload) > request.read_size:
+      raise MotionInputError(
+        "auxiliary-device read exceeded the requested byte count"
+      )
+    if not program_read and len(payload) != request.read_size:
       raise MotionInputError(
         "auxiliary-device read returned "
         f"{len(payload)} of {request.read_size} requested bytes"
@@ -27147,7 +27328,9 @@ def _run_auxiliary_device_read(request):
       raise MotionInputError(
         "auxiliary-device response is not valid UTF-8"
       ) from exc
-    if any(not character.isprintable() for character in response):
+    if not program_read and any(
+      not character.isprintable() for character in response
+    ):
       raise MotionInputError(
         "auxiliary-device response contains unsupported control characters"
       )
@@ -27342,12 +27525,20 @@ def _run_auxiliary_device_read_safe(request):
     auxiliary_device_worker_active.clear()
 
 
-def _request_auxiliary_device_read(port_value, read_size_value):
+def _request_auxiliary_device_read(
+  port_value,
+  read_size_value,
+  *,
+  response_timeout_seconds=AUXILIARY_DEVICE_READ_TIMEOUT_SECONDS,
+  execution_request=None,
+  completion_callback=None,
+):
   global auxiliary_device_active_request
   global auxiliary_device_active_serial
   global auxiliary_device_next_request_id
 
   worker_start_failed = False
+  program_request = execution_request is not None
   try:
     port = _auxiliary_device_port(port_value)
     read_size = _auxiliary_device_read_size(read_size_value)
@@ -27357,12 +27548,27 @@ def _request_auxiliary_device_read(port_value, read_size_value):
         raise RuntimeError("application shutdown state is invalid")
       if closing:
         raise MotionInputError("application shutdown is active")
-      if program_execution_active_request is not None:
+      active_program = program_execution_active_request
+      if active_program is not None and not isinstance(
+        active_program,
+        ProgramExecutionRequest,
+      ):
+        raise RuntimeError("active program execution request is invalid")
+      if program_request:
         if not isinstance(
-          program_execution_active_request,
+          execution_request,
           ProgramExecutionRequest,
         ):
-          raise RuntimeError("active program execution request is invalid")
+          raise MotionInputError("program execution request is invalid")
+        if active_program is not execution_request:
+          raise MotionInputError("program execution request is no longer active")
+        if (
+          program_execution_cancelled.is_set()
+          or program_return_state_clear_requested.is_set()
+          or execution_request.cancellation_boundary.is_set()
+        ):
+          raise MotionInputError("program execution cancellation is active")
+      elif active_program is not None:
         raise MotionInputError("robot program execution is active")
       with auxiliary_device_state_lock:
         active = auxiliary_device_read_active.is_set()
@@ -27406,6 +27612,9 @@ def _request_auxiliary_device_read(port_value, read_size_value):
           auxiliary_device_next_request_id + 1,
           port,
           read_size,
+          response_timeout_seconds,
+          execution_request,
+          completion_callback,
         )
         auxiliary_device_next_request_id = request.request_id
         auxiliary_device_active_request = request
@@ -27448,15 +27657,19 @@ def _request_auxiliary_device_read(port_value, read_size_value):
     else:
       logger.error(message)
     try:
-      _set_application_status(message, "Alarm.TLabel")
+      if program_request:
+        _queue_program_execution_status(message, "Alarm.TLabel")
+      else:
+        _set_application_status(message, "Alarm.TLabel")
     except Exception:
       logger.exception(presentation_error)
     return False
   try:
-    _set_application_status(
-      f"AUXILIARY COM READ IN PROGRESS: {request.port}",
-      "Warn.TLabel",
-    )
+    message = f"AUXILIARY COM READ IN PROGRESS: {request.port}"
+    if program_request:
+      _queue_program_execution_status(message, "Warn.TLabel")
+    else:
+      _set_application_status(message, "Warn.TLabel")
   except Exception:
     logger.exception("Unable to present auxiliary-device progress")
   return True
@@ -27501,7 +27714,18 @@ def _auxiliary_device_read_pending():
     return active
 
 
-def _cancel_auxiliary_device_read():
+def _cancel_auxiliary_device_read(
+  execution_request=None,
+  *,
+  interrupt_serial=True,
+):
+  if execution_request is not None and not isinstance(
+    execution_request,
+    ProgramExecutionRequest,
+  ):
+    raise TypeError("auxiliary-device cancellation request is invalid")
+  if not isinstance(interrupt_serial, bool):
+    raise TypeError("auxiliary-device serial interrupt option is invalid")
   with auxiliary_device_state_lock:
     request = auxiliary_device_active_request
     serial_port = auxiliary_device_active_serial
@@ -27517,6 +27741,11 @@ def _cancel_auxiliary_device_read():
       return False
     if not isinstance(request, AuxiliaryDeviceReadRequest):
       raise RuntimeError("active auxiliary-device request is invalid")
+    if (
+      execution_request is not None
+      and request.execution_request is not execution_request
+    ):
+      return False
     if not active:
       raise RuntimeError(
         "auxiliary-device cancellation found an inactive request"
@@ -27524,15 +27753,16 @@ def _cancel_auxiliary_device_read():
     cancellation_already_requested = auxiliary_device_cancel_requested.is_set()
     if not isinstance(cancellation_already_requested, bool):
       raise RuntimeError("auxiliary-device cancellation state is invalid")
-    if cancellation_already_requested:
-      return False
     if serial_port is not RUN.get('ser3'):
       raise RuntimeError(
         "auxiliary-device serial ownership is inconsistent"
       )
-    auxiliary_device_cancel_requested.set()
+    if not cancellation_already_requested:
+      auxiliary_device_cancel_requested.set()
   cancel_read = getattr(serial_port, "cancel_read", None)
   if (
+    interrupt_serial
+    and
     worker_active
     and callable(cancel_read)
   ):
@@ -27540,7 +27770,7 @@ def _cancel_auxiliary_device_read():
       cancel_read()
     except Exception:
       logger.exception("Unable to cancel the auxiliary-device serial read")
-  return True
+  return not cancellation_already_requested
 
 
 def _apply_auxiliary_device_result(result):
@@ -27582,9 +27812,25 @@ def _apply_auxiliary_device_result(result):
       "auxiliary-device worker result retained serial ownership"
     )
 
+  program_owner = request.execution_request
+  callback_eligible = False
+  if program_owner is not None:
+    with program_execution_state_lock:
+      active_program = program_execution_active_request
+      if active_program is not None and not isinstance(
+        active_program,
+        ProgramExecutionRequest,
+      ):
+        raise RuntimeError("active program execution request is invalid")
+      callback_eligible = (
+        active_program is program_owner
+        and not closing
+        and not application_closing.is_set()
+        and not program_execution_cancelled.is_set()
+        and not program_owner.cancellation_boundary.is_set()
+      )
+
   if result.outcome == "completed":
-    com3outPortEntryField.delete(0, 'end')
-    com3outPortEntryField.insert(0, result.value)
     message = "AUXILIARY COM READ COMPLETE"
     style = "OK.TLabel"
   elif result.outcome == "cancelled":
@@ -27595,7 +27841,26 @@ def _apply_auxiliary_device_result(result):
     message = f"AUXILIARY COM READ FAILED: {result.value}"
     style = "Alarm.TLabel"
     logger.error(message)
-  _set_application_status(message, style)
+
+  def present_result():
+    if result.outcome == "completed":
+      com3outPortEntryField.delete(0, 'end')
+      com3outPortEntryField.insert(0, result.value)
+      if program_owner is not None:
+        manEntryField.delete(0, 'end')
+        manEntryField.insert(0, result.value)
+    _set_application_status(message, style)
+
+  presentation_error = None
+  callback_succeeded = False
+  if program_owner is None:
+    present_result()
+  elif callback_eligible:
+    try:
+      present_result()
+      callback_succeeded = result.outcome == "completed"
+    except Exception as exc:
+      presentation_error = exc
   if serial_port is not None:
     logger.error(
       "Auxiliary-device serial cleanup remains pending at process exit"
@@ -27618,6 +27883,17 @@ def _apply_auxiliary_device_result(result):
     auxiliary_device_pending_result = None
     auxiliary_device_cancel_requested.clear()
     auxiliary_device_read_active.clear()
+  if program_owner is not None:
+    callback_error = None
+    try:
+      request.completion_callback(callback_succeeded)
+    except Exception as exc:
+      callback_error = exc
+      logger.exception("Program auxiliary-device completion callback failed")
+    if presentation_error is not None:
+      raise presentation_error
+    if callback_error is not None:
+      raise callback_error
   return True
 
 
@@ -32836,10 +33112,11 @@ def _open_camera_preview_capture(camera_source):
   return cv2.VideoCapture(camera_source)
 
 
-camera_preview_worker = CameraPreviewWorker(
-  _open_camera_preview_capture,
-  prepare_camera_preview_frame,
-)
+if __name__ == "__main__":
+  camera_preview_worker = CameraPreviewWorker(
+    _open_camera_preview_capture,
+    prepare_camera_preview_frame,
+  )
 
 
 def show_frame(preview_frame):
@@ -33799,33 +34076,34 @@ def _perform_vision_selection(settings, cancellation_event=None):
     return result
 
 
-vision_capture_worker = VisionOperationWorker(
-  _perform_vision_capture,
-  VisionCaptureSettings,
-  VisionCaptureResult,
-  "vision capture",
-  "ar4-vision-capture",
-)
+if __name__ == "__main__":
+  vision_capture_worker = VisionOperationWorker(
+    _perform_vision_capture,
+    VisionCaptureSettings,
+    VisionCaptureResult,
+    "vision capture",
+    "ar4-vision-capture",
+  )
 
 
-vision_match_worker = VisionOperationWorker(
-  _perform_vision_match,
-  VisionMatchSettings,
-  VisionMatchOperationResult,
-  "vision matching",
-  "ar4-vision-match",
-  coalesce=False,
-)
+  vision_match_worker = VisionOperationWorker(
+    _perform_vision_match,
+    VisionMatchSettings,
+    VisionMatchOperationResult,
+    "vision matching",
+    "ar4-vision-match",
+    coalesce=False,
+  )
 
 
-vision_selection_worker = VisionOperationWorker(
-  _perform_vision_selection,
-  VisionSelectionSettings,
-  VisionSelectionResult,
-  "vision selection",
-  "ar4-vision-selection",
-  coalesce=False,
-)
+  vision_selection_worker = VisionOperationWorker(
+    _perform_vision_selection,
+    VisionSelectionSettings,
+    VisionSelectionResult,
+    "vision selection",
+    "ar4-vision-selection",
+    coalesce=False,
+  )
 
 
 def _apply_vision_capture_state(result):
@@ -35756,4096 +36034,4136 @@ def posRegFieldVisible(self):
     SavePosEntryField.grid_remove()  # Hide the field
 
 # Tkinter variables for Tab 1
-speedOption = StringVar(tab1)
-options = StringVar(tab1)
-
-# Entry fields for command builders (created here, placed in frames later)
-waitTimeEntryField = Entry(tab1, width=4, justify="center")
-tabNumEntryField = Entry(tab1, width=4, justify="center")
-jumpTabEntryField = Entry(tab1, width=4, justify="center")
-servoNumEntryField = Entry(tab1, width=4, justify="center")
-servoPosEntryField = Entry(tab1, width=4, justify="center")
-regNumEntryField = Entry(tab1, width=4, justify="center")
-regEqEntryField = Entry(tab1, width=4, justify="center")
-visPassEntryField = Entry(tab1, width=4, justify="center")
-visFailEntryField = Entry(tab1, width=4, justify="center")
-changeProgEntryField = Entry(tab1, width=14, justify="center")
-PlayGCEntryField = Entry(tab1, width=14, justify="center")
-auxPortEntryField = Entry(tab1, width=4, justify="center")
-auxCharEntryField = Entry(tab1, width=4, justify="center")
-storPosNumEntryField = Entry(tab1, width=4, justify="center")
-storPosElEntryField = Entry(tab1, width=4, justify="center")
-storPosValEntryField = Entry(tab1, width=4, justify="center")
-waitTimeoutEntryField = Entry(tab1, width=4, justify="center")
-waitInputEntryField = Entry(tab1, width=4, justify="center")
-waitInputOffEntryField = Entry(tab1, width=4, justify="center")
-waitVarEntryField = Entry(tab1, width=4, justify="center")
-outputOnEntryField = Entry(tab1, width=4, justify="center")
-outputOffEntryField = Entry(tab1, width=4, justify="center")
-setInputEntryField = Entry(tab1, width=4, justify="center")
-setVarEntryField = Entry(tab1, width=4, justify="center")
-IfInputEntryField = Entry(tab1, width=4, justify="center")
-IfVarEntryField = Entry(tab1, width=4, justify="center")
-IfDestEntryField = Entry(tab1, width=4, justify="center")
-
-IfVarEntryField = Entry(tab1, width=4, justify="center")
-IfInputEntryField = Entry(tab1, width=4, justify="center")
-waitVarEntryField = Entry(tab1, width=4, justify="center")
-waitInputEntryField = Entry(tab1, width=4, justify="center")
-waitTimeoutEntryField = Entry(tab1, width=5, justify="center")
-setVarEntryField = Entry(tab1, width=4, justify="center")
-setInputEntryField = Entry(tab1, width=4, justify="center")
-auxPortEntryField = Entry(tab1, width=4, justify="center")
-auxCharEntryField = Entry(tab1, width=4, justify="center")
-storPosNumEntryField = Entry(tab1, width=4, justify="center")
-storPosElEntryField = Entry(tab1, width=4, justify="center")
-storPosValEntryField = Entry(tab1, width=4, justify="center")
-
-
-
-# All Entry Fields for Tab 1
-
-
-### TAB 1 - MAIN CONTROLS - REFACTORED TO USE GRID LAYOUT
-##########################################################################
-
-# Configure tab1 main grid layout (3-column design)
-tab1.grid_rowconfigure(0, weight=1)  # Main content area expands
-tab1.grid_columnconfigure(0, weight=0, minsize=200)  # Left panel - fixed minimum width (narrower)
-tab1.grid_columnconfigure(1, weight=1, minsize=550)  # Center panel - expands
-tab1.grid_columnconfigure(2, weight=0, minsize=800)  # Right panel - fixed minimum width
-
-# ============================================================================
-# LEFT PANEL - Program Controls
-# ============================================================================
-leftPanel = Frame(tab1, relief="raised", borderwidth=1)
-leftPanel.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
-
-# Configure left panel grid
-leftPanel.grid_rowconfigure(20, weight=1)  # Spacer row at bottom to push controls to top
-leftPanel.grid_columnconfigure(0, weight=1)
-leftPanel.grid_columnconfigure(1, weight=1)
-
-# Row 0: Program label and entry (with more top padding)
-ProgLab = Label(leftPanel, text="Program:")
-ProgLab.grid(row=0, column=0, sticky="w", padx=5, pady=(8, 2))
-
-ProgEntryField = Entry(leftPanel, width=15, justify="center")
-ProgEntryField.grid(row=0, column=1, sticky="ew", padx=5, pady=(8, 2))
-
-# Row 1: Load button
-loadBut = ttk.Button(leftPanel, text="Load", command=loadProg)
-loadBut.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-# Row 2: New Prog button
-savProg = ttk.Button(leftPanel, text="New Prog", command=CreateProg)
-savProg.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-# Row 3: Incremental Jog checkbox and entry field
-IncJogCbut = Checkbutton(leftPanel, text="Inc Jog", variable=RUN['IncJogStat'])
-IncJogCbut.grid(row=3, column=0, sticky="w", padx=5, pady=2)
-
-incrementEntryField = Entry(leftPanel, width=6, justify="center")
-incrementEntryField.grid(row=3, column=1, sticky="ew", padx=5, pady=2)
-
-# Row 4: Current Row
-curRowLab = Label(leftPanel, text="Current Row:")
-curRowLab.grid(row=4, column=0, sticky="w", padx=5, pady=2)
-
-curRowEntryField = Entry(leftPanel, width=6, justify="center")
-curRowEntryField.grid(row=4, column=1, sticky="ew", padx=5, pady=2)
-
-# Row 5: Motion controls frame (with Xbox button at bottom)
-speedFrame = LabelFrame(leftPanel, text="Motion", padding=5)
-speedFrame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+if __name__ == "__main__":
+  speedOption = StringVar(tab1)
+  options = StringVar(tab1)
+
+  # Entry fields for command builders (created here, placed in frames later)
+  waitTimeEntryField = Entry(tab1, width=4, justify="center")
+  tabNumEntryField = Entry(tab1, width=4, justify="center")
+  jumpTabEntryField = Entry(tab1, width=4, justify="center")
+  servoNumEntryField = Entry(tab1, width=4, justify="center")
+  servoPosEntryField = Entry(tab1, width=4, justify="center")
+  regNumEntryField = Entry(tab1, width=4, justify="center")
+  regEqEntryField = Entry(tab1, width=4, justify="center")
+  visPassEntryField = Entry(tab1, width=4, justify="center")
+  visFailEntryField = Entry(tab1, width=4, justify="center")
+  changeProgEntryField = Entry(tab1, width=14, justify="center")
+  PlayGCEntryField = Entry(tab1, width=14, justify="center")
+  auxPortEntryField = Entry(tab1, width=4, justify="center")
+  auxCharEntryField = Entry(tab1, width=4, justify="center")
+  storPosNumEntryField = Entry(tab1, width=4, justify="center")
+  storPosElEntryField = Entry(tab1, width=4, justify="center")
+  storPosValEntryField = Entry(tab1, width=4, justify="center")
+  waitTimeoutEntryField = Entry(tab1, width=4, justify="center")
+  waitInputEntryField = Entry(tab1, width=4, justify="center")
+  waitInputOffEntryField = Entry(tab1, width=4, justify="center")
+  waitVarEntryField = Entry(tab1, width=4, justify="center")
+  outputOnEntryField = Entry(tab1, width=4, justify="center")
+  outputOffEntryField = Entry(tab1, width=4, justify="center")
+  setInputEntryField = Entry(tab1, width=4, justify="center")
+  setVarEntryField = Entry(tab1, width=4, justify="center")
+  IfInputEntryField = Entry(tab1, width=4, justify="center")
+  IfVarEntryField = Entry(tab1, width=4, justify="center")
+  IfDestEntryField = Entry(tab1, width=4, justify="center")
+
+  IfVarEntryField = Entry(tab1, width=4, justify="center")
+  IfInputEntryField = Entry(tab1, width=4, justify="center")
+  waitVarEntryField = Entry(tab1, width=4, justify="center")
+  waitInputEntryField = Entry(tab1, width=4, justify="center")
+  waitTimeoutEntryField = Entry(tab1, width=5, justify="center")
+  setVarEntryField = Entry(tab1, width=4, justify="center")
+  setInputEntryField = Entry(tab1, width=4, justify="center")
+  auxPortEntryField = Entry(tab1, width=4, justify="center")
+  auxCharEntryField = Entry(tab1, width=4, justify="center")
+  storPosNumEntryField = Entry(tab1, width=4, justify="center")
+  storPosElEntryField = Entry(tab1, width=4, justify="center")
+  storPosValEntryField = Entry(tab1, width=4, justify="center")
+
+
+
+  # All Entry Fields for Tab 1
+
+
+  ### TAB 1 - MAIN CONTROLS - REFACTORED TO USE GRID LAYOUT
+  ##########################################################################
+
+  # Configure tab1 main grid layout (3-column design)
+  tab1.grid_rowconfigure(0, weight=1)  # Main content area expands
+  tab1.grid_columnconfigure(0, weight=0, minsize=200)  # Left panel - fixed minimum width (narrower)
+  tab1.grid_columnconfigure(1, weight=1, minsize=550)  # Center panel - expands
+  tab1.grid_columnconfigure(2, weight=0, minsize=800)  # Right panel - fixed minimum width
+
+  # ============================================================================
+  # LEFT PANEL - Program Controls
+  # ============================================================================
+  leftPanel = Frame(tab1, relief="raised", borderwidth=1)
+  leftPanel.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+
+  # Configure left panel grid
+  leftPanel.grid_rowconfigure(20, weight=1)  # Spacer row at bottom to push controls to top
+  leftPanel.grid_columnconfigure(0, weight=1)
+  leftPanel.grid_columnconfigure(1, weight=1)
+
+  # Row 0: Program label and entry (with more top padding)
+  ProgLab = Label(leftPanel, text="Program:")
+  ProgLab.grid(row=0, column=0, sticky="w", padx=5, pady=(8, 2))
+
+  ProgEntryField = Entry(leftPanel, width=15, justify="center")
+  ProgEntryField.grid(row=0, column=1, sticky="ew", padx=5, pady=(8, 2))
+
+  # Row 1: Load button
+  loadBut = ttk.Button(leftPanel, text="Load", command=loadProg)
+  loadBut.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  # Row 2: New Prog button
+  savProg = ttk.Button(leftPanel, text="New Prog", command=CreateProg)
+  savProg.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  # Row 3: Incremental Jog checkbox and entry field
+  IncJogCbut = Checkbutton(leftPanel, text="Inc Jog", variable=RUN['IncJogStat'])
+  IncJogCbut.grid(row=3, column=0, sticky="w", padx=5, pady=2)
+
+  incrementEntryField = Entry(leftPanel, width=6, justify="center")
+  incrementEntryField.grid(row=3, column=1, sticky="ew", padx=5, pady=2)
+
+  # Row 4: Current Row
+  curRowLab = Label(leftPanel, text="Current Row:")
+  curRowLab.grid(row=4, column=0, sticky="w", padx=5, pady=2)
+
+  curRowEntryField = Entry(leftPanel, width=6, justify="center")
+  curRowEntryField.grid(row=4, column=1, sticky="ew", padx=5, pady=2)
+
+  # Row 5: Motion controls frame (with Xbox button at bottom)
+  speedFrame = LabelFrame(leftPanel, text="Motion", padding=5)
+  speedFrame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
 
-speedFrame.grid_columnconfigure(1, weight=1)
+  speedFrame.grid_columnconfigure(1, weight=1)
 
-speedLab = Label(speedFrame, text="Speed")
-speedLab.grid(row=0, column=0, sticky="w", padx=2, pady=1)
+  speedLab = Label(speedFrame, text="Speed")
+  speedLab.grid(row=0, column=0, sticky="w", padx=2, pady=1)
 
-speedEntryField = Entry(speedFrame, width=4, justify="center")
-speedEntryField.grid(row=0, column=1, sticky="ew", padx=2, pady=1)
+  speedEntryField = Entry(speedFrame, width=4, justify="center")
+  speedEntryField.grid(row=0, column=1, sticky="ew", padx=2, pady=1)
 
-speedOptionMenu = OptionMenu(speedFrame, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
-speedOptionMenu.grid(row=0, column=2, sticky="ew", padx=2, pady=1)
+  speedOptionMenu = OptionMenu(speedFrame, speedOption, "Percent", "Percent", "Seconds", "mm per Sec")
+  speedOptionMenu.grid(row=0, column=2, sticky="ew", padx=2, pady=1)
 
-ACCLab = Label(speedFrame, text="Acceleration")
-ACCLab.grid(row=1, column=0, sticky="w", padx=2, pady=1)
+  ACCLab = Label(speedFrame, text="Acceleration")
+  ACCLab.grid(row=1, column=0, sticky="w", padx=2, pady=1)
 
-ACCspeedField = Entry(speedFrame, width=4, justify="center")
-ACCspeedField.grid(row=1, column=1, sticky="ew", padx=2, pady=1)
+  ACCspeedField = Entry(speedFrame, width=4, justify="center")
+  ACCspeedField.grid(row=1, column=1, sticky="ew", padx=2, pady=1)
 
-Label(speedFrame, text="%").grid(row=1, column=2, sticky="w", padx=2)
+  Label(speedFrame, text="%").grid(row=1, column=2, sticky="w", padx=2)
 
-DECLab = Label(speedFrame, text="Deceleration")
-DECLab.grid(row=2, column=0, sticky="w", padx=2, pady=1)
+  DECLab = Label(speedFrame, text="Deceleration")
+  DECLab.grid(row=2, column=0, sticky="w", padx=2, pady=1)
 
-DECspeedField = Entry(speedFrame, width=4, justify="center")
-DECspeedField.grid(row=2, column=1, sticky="ew", padx=2, pady=1)
+  DECspeedField = Entry(speedFrame, width=4, justify="center")
+  DECspeedField.grid(row=2, column=1, sticky="ew", padx=2, pady=1)
 
-Label(speedFrame, text="%").grid(row=2, column=2, sticky="w", padx=2)
+  Label(speedFrame, text="%").grid(row=2, column=2, sticky="w", padx=2)
 
-RampLab = Label(speedFrame, text="Ramp")
-RampLab.grid(row=3, column=0, sticky="w", padx=2, pady=1)
+  RampLab = Label(speedFrame, text="Ramp")
+  RampLab.grid(row=3, column=0, sticky="w", padx=2, pady=1)
 
-ACCrampField = Entry(speedFrame, width=4, justify="center")
-ACCrampField.grid(row=3, column=1, sticky="ew", padx=2, pady=1)
+  ACCrampField = Entry(speedFrame, width=4, justify="center")
+  ACCrampField.grid(row=3, column=1, sticky="ew", padx=2, pady=1)
 
-Label(speedFrame, text="%").grid(row=3, column=2, sticky="w", padx=2)
+  Label(speedFrame, text="%").grid(row=3, column=2, sticky="w", padx=2)
 
-RoundLab = Label(speedFrame, text="Rounding")
-RoundLab.grid(row=4, column=0, sticky="w", padx=2, pady=1)
+  RoundLab = Label(speedFrame, text="Rounding")
+  RoundLab.grid(row=4, column=0, sticky="w", padx=2, pady=1)
 
-roundEntryField = Entry(speedFrame, width=4, justify="center")
-roundEntryField.grid(row=4, column=1, sticky="ew", padx=2, pady=1)
+  roundEntryField = Entry(speedFrame, width=4, justify="center")
+  roundEntryField.grid(row=4, column=1, sticky="ew", padx=2, pady=1)
 
-Label(speedFrame, text="mm").grid(row=4, column=2, sticky="w", padx=2)
+  Label(speedFrame, text="mm").grid(row=4, column=2, sticky="w", padx=2)
 
-# Xbox button at bottom of Motion frame (centered)
-if CE['Platform']['IS_WINDOWS']:
-    xboxBut = Button(speedFrame, command=start_xbox)
-else:
-    xboxBut = Button(speedFrame, command=xbox)
-xboxPhoto = PhotoImage(file="xbox.png")
-xboxBut.config(image=xboxPhoto)
-xboxBut.grid(row=5, column=0, columnspan=3, pady=(5, 0))
+  # Xbox button at bottom of Motion frame (centered)
+  if CE['Platform']['IS_WINDOWS']:
+      xboxBut = Button(speedFrame, command=start_xbox)
+  else:
+      xboxBut = Button(speedFrame, command=xbox)
+  xboxPhoto = PhotoImage(file="xbox.png")
+  xboxBut.config(image=xboxPhoto)
+  xboxBut.grid(row=5, column=0, columnspan=3, pady=(5, 0))
 
-# Row 6: Virtual controls frame
-virtualFrame = LabelFrame(leftPanel, text="Virtual", padding=5)
-virtualFrame.grid(row=6, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+  # Row 6: Virtual controls frame
+  virtualFrame = LabelFrame(leftPanel, text="Virtual", padding=5)
+  virtualFrame.grid(row=6, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
 
-virtualFrame.grid_columnconfigure(0, weight=1)
+  virtualFrame.grid_columnconfigure(0, weight=1)
 
-virtRobBut = ttk.Button(virtualFrame, text="Virtual Robot", command=lambda: launch_vtk_nonblocking(tab1))
-virtRobBut.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
+  virtRobBut = ttk.Button(virtualFrame, text="Virtual Robot", command=lambda: launch_vtk_nonblocking(tab1))
+  virtRobBut.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
 
-offline_button = ttk.Button(virtualFrame, text="Run Offline", width=20, command=toggle_offline_mode, style="Online.TButton")
-offline_button.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
-# Row 7: Position Commands frame
-posFrame = LabelFrame(leftPanel, text="Position Commands", padding=5)
-posFrame.grid(row=7, column=0, columnspan=2, sticky="new", padx=5, pady=(2, 5))
+  offline_button = ttk.Button(virtualFrame, text="Run Offline", width=20, command=toggle_offline_mode, style="Online.TButton")
+  offline_button.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
+  # Row 7: Position Commands frame
+  posFrame = LabelFrame(leftPanel, text="Position Commands", padding=5)
+  posFrame.grid(row=7, column=0, columnspan=2, sticky="new", padx=5, pady=(2, 5))
 
-posFrame.grid_columnconfigure(0, weight=1)
+  posFrame.grid_columnconfigure(0, weight=1)
 
-moveSelMenu = OptionMenu(posFrame, options, "Move J", "Move J", "Move L", "Move R", "OFF J", "Move PR", "OFF PR ", "Teach PR", "Move A Mid", "Move A End", "Move C Center", "Move C Start", "Move C Plane", "Start Spline", "End Spline", "Move Vis", command=posRegFieldVisible)
-moveSelMenu.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
+  moveSelMenu = OptionMenu(posFrame, options, "Move J", "Move J", "Move L", "Move R", "OFF J", "Move PR", "OFF PR ", "Teach PR", "Move A Mid", "Move A End", "Move C Center", "Move C Start", "Move C Plane", "Start Spline", "End Spline", "Move Vis", command=posRegFieldVisible)
+  moveSelMenu.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
 
-# Position Register Entry Field (hidden by default, shown when PR moves selected)
-SavePosEntryField = Entry(posFrame, width=4, justify="center")
-SavePosEntryField.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
-SavePosEntryField.grid_remove()  # Hidden by default, shown by posRegFieldVisible()
+  # Position Register Entry Field (hidden by default, shown when PR moves selected)
+  SavePosEntryField = Entry(posFrame, width=4, justify="center")
+  SavePosEntryField.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
+  SavePosEntryField.grid_remove()  # Hidden by default, shown by posRegFieldVisible()
 
-teachPosBut = ttk.Button(posFrame, text="Teach New Position", command=teachInsertBelSelected)
-teachPosBut.grid(row=2, column=0, sticky="ew", padx=2, pady=2)
+  teachPosBut = ttk.Button(posFrame, text="Teach New Position", command=teachInsertBelSelected)
+  teachPosBut.grid(row=2, column=0, sticky="ew", padx=2, pady=2)
 
-modPosBut = ttk.Button(posFrame, text="Modify Position", command=teachReplaceSelected)
-modPosBut.grid(row=3, column=0, sticky="ew", padx=2, pady=2)
+  modPosBut = ttk.Button(posFrame, text="Modify Position", command=teachReplaceSelected)
+  modPosBut.grid(row=3, column=0, sticky="ew", padx=2, pady=2)
 
-deleteBut = ttk.Button(posFrame, text="Delete", command=deleteitem)
-deleteBut.grid(row=4, column=0, sticky="ew", padx=2, pady=2)
+  deleteBut = ttk.Button(posFrame, text="Delete", command=deleteitem)
+  deleteBut.grid(row=4, column=0, sticky="ew", padx=2, pady=2)
 
-autoCalBut = ttk.Button(posFrame, text="Auto Calibrate CMD", command=insCalibrate)
-CalibrateBut = autoCalBut  # Alias for compatibility
-autoCalBut.grid(row=5, column=0, sticky="ew", padx=2, pady=2)
+  autoCalBut = ttk.Button(posFrame, text="Auto Calibrate CMD", command=insCalibrate)
+  CalibrateBut = autoCalBut  # Alias for compatibility
+  autoCalBut.grid(row=5, column=0, sticky="ew", padx=2, pady=2)
 
-# Row 8: Vision container
-visionFrame = LabelFrame(leftPanel, text="Vision", padding=5)
-visionFrame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+  # Row 8: Vision container
+  visionFrame = LabelFrame(leftPanel, text="Vision", padding=5)
+  visionFrame.grid(row=8, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
 
-visionFrame.grid_columnconfigure(0, weight=1)
-visionFrame.grid_columnconfigure(1, weight=1)
-visionFrame.grid_columnconfigure(2, weight=1)
-visionFrame.grid_columnconfigure(3, weight=1)
+  visionFrame.grid_columnconfigure(0, weight=1)
+  visionFrame.grid_columnconfigure(1, weight=1)
+  visionFrame.grid_columnconfigure(2, weight=1)
+  visionFrame.grid_columnconfigure(3, weight=1)
 
-# Row 0: Camera On and Camera Off buttons
-camOnBut = ttk.Button(visionFrame, text="Camera On", command=cameraOn)
-camOnBut.grid(row=0, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+  # Row 0: Camera On and Camera Off buttons
+  camOnBut = ttk.Button(visionFrame, text="Camera On", command=cameraOn)
+  camOnBut.grid(row=0, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
 
-camOffBut = ttk.Button(visionFrame, text="Camera Off", command=cameraOff)
-camOffBut.grid(row=0, column=2, columnspan=2, sticky="ew", padx=2, pady=2)
+  camOffBut = ttk.Button(visionFrame, text="Camera Off", command=cameraOff)
+  camOffBut.grid(row=0, column=2, columnspan=2, sticky="ew", padx=2, pady=2)
 
-# Row 1: Vision Find button
-visFindBut = ttk.Button(visionFrame, text="Vision Find", command=insertvisFind)
-visFindBut.grid(row=1, column=0, columnspan=2, sticky="ew", padx=2, pady=(5, 2))
+  # Row 1: Vision Find button
+  visFindBut = ttk.Button(visionFrame, text="Vision Find", command=insertvisFind)
+  visFindBut.grid(row=1, column=0, columnspan=2, sticky="ew", padx=2, pady=(5, 2))
 
-# Row 2: Pass Tab and Fail Tab labels
-Label(visionFrame, text="Pass Tab", font=("Arial", 8)).grid(row=2, column=0, sticky="e", padx=(2, 1))
-Label(visionFrame, text="Fail Tab", font=("Arial", 8)).grid(row=2, column=1, sticky="w", padx=(1, 2))
+  # Row 2: Pass Tab and Fail Tab labels
+  Label(visionFrame, text="Pass Tab", font=("Arial", 8)).grid(row=2, column=0, sticky="e", padx=(2, 1))
+  Label(visionFrame, text="Fail Tab", font=("Arial", 8)).grid(row=2, column=1, sticky="w", padx=(1, 2))
 
-# Row 3: Pass Tab and Fail Tab entry fields
-visPassEntryField = Entry(visionFrame, width=6, justify="center")
-visPassEntryField.grid(row=3, column=0, sticky="ew", padx=(2, 1), pady=(0, 2))
+  # Row 3: Pass Tab and Fail Tab entry fields
+  visPassEntryField = Entry(visionFrame, width=6, justify="center")
+  visPassEntryField.grid(row=3, column=0, sticky="ew", padx=(2, 1), pady=(0, 2))
 
-visFailEntryField = Entry(visionFrame, width=6, justify="center")
-visFailEntryField.grid(row=3, column=1, sticky="ew", padx=(1, 2), pady=(0, 2))
+  visFailEntryField = Entry(visionFrame, width=6, justify="center")
+  visFailEntryField.grid(row=3, column=1, sticky="ew", padx=(1, 2), pady=(0, 2))
 
-# Vision Find additional fields (placeholders - full UI on Tab 6)
-VisBacColorEntryField = Entry(tab1, width=6)  # Hidden, used by insertvisFind
-VisScoreEntryField = Entry(tab1, width=6)  # Hidden, used by insertvisFind
-VisBacColorEntryField.insert(0, "[116, 116, 116]")
-VisScoreEntryField.insert(0, "85")
+  # Vision Find additional fields (placeholders - full UI on Tab 6)
+  VisBacColorEntryField = Entry(tab1, width=6)  # Hidden, used by insertvisFind
+  VisScoreEntryField = Entry(tab1, width=6)  # Hidden, used by insertvisFind
+  VisBacColorEntryField.insert(0, "[116, 116, 116]")
+  VisScoreEntryField.insert(0, "85")
 
-# Row 9: Wait container
-waitContainer = LabelFrame(leftPanel, text="Wait - Stop", padding=5)
-waitContainer.grid(row=9, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+  # Row 9: Wait container
+  waitContainer = LabelFrame(leftPanel, text="Wait - Stop", padding=5)
+  waitContainer.grid(row=9, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
 
-waitContainer.grid_columnconfigure(0, weight=1)
-waitContainer.grid_columnconfigure(1, weight=0)
+  waitContainer.grid_columnconfigure(0, weight=1)
+  waitContainer.grid_columnconfigure(1, weight=0)
 
-waitSecBut = ttk.Button(waitContainer, text="Wait Time (seconds)", command=waitTime)
-waitSecBut.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
+  waitSecBut = ttk.Button(waitContainer, text="Wait Time (seconds)", command=waitTime)
+  waitSecBut.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
 
-waitSecField = Entry(waitContainer, width=8, justify="center")
-waitSecField.grid(row=0, column=1, sticky="w", padx=2, pady=2)
+  waitSecField = Entry(waitContainer, width=8, justify="center")
+  waitSecField.grid(row=0, column=1, sticky="w", padx=2, pady=2)
 
-stopBut = ttk.Button(waitContainer, text="Stop", command=insertStop)
-stopBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
+  stopBut = ttk.Button(waitContainer, text="Stop", command=insertStop)
+  stopBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
 
-# ============================================================================
-# CENTER PANEL - Program Display and Controls
-# ============================================================================
-centerPanel = Frame(tab1)
-centerPanel.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
+  # ============================================================================
+  # CENTER PANEL - Program Display and Controls
+  # ============================================================================
+  centerPanel = Frame(tab1)
+  centerPanel.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
 
-# Configure center panel grid
-centerPanel.grid_rowconfigure(0, weight=0)  # Status message
-centerPanel.grid_rowconfigure(1, weight=0)  # Play controls
-centerPanel.grid_rowconfigure(2, weight=3)  # Program view (more weight) (expands)
-centerPanel.grid_rowconfigure(3, weight=0)  # Manual entry (at bottom)
-centerPanel.grid_rowconfigure(4, weight=0)  # Position controls
-centerPanel.grid_rowconfigure(5, weight=0)  # Command builders
-centerPanel.grid_rowconfigure(6, weight=0)  # Bottom buttons
-centerPanel.grid_columnconfigure(0, weight=1)
+  # Configure center panel grid
+  centerPanel.grid_rowconfigure(0, weight=0)  # Status message
+  centerPanel.grid_rowconfigure(1, weight=0)  # Play controls
+  centerPanel.grid_rowconfigure(2, weight=3)  # Program view (more weight) (expands)
+  centerPanel.grid_rowconfigure(3, weight=0)  # Manual entry (at bottom)
+  centerPanel.grid_rowconfigure(4, weight=0)  # Position controls
+  centerPanel.grid_rowconfigure(5, weight=0)  # Command builders
+  centerPanel.grid_rowconfigure(6, weight=0)  # Bottom buttons
+  centerPanel.grid_columnconfigure(0, weight=1)
 
-# Row 0: Status message
-runStatusLab = Label(centerPanel, text="SYSTEM STARTING - PLEASE WAIT", font=("Arial", 10, "bold"), style="OK.TLabel")
-runStatusLab.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+  # Row 0: Status message
+  runStatusLab = Label(centerPanel, text="SYSTEM STARTING - PLEASE WAIT", font=("Arial", 10, "bold"), style="OK.TLabel")
+  runStatusLab.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
 
-# Create alias for compatibility with existing code
-almStatusLab = runStatusLab
+  # Create alias for compatibility with existing code
+  almStatusLab = runStatusLab
 
-# Row 0.5: Play controls
-playFrame = Frame(centerPanel)
-playFrame.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
+  # Row 0.5: Play controls
+  playFrame = Frame(centerPanel)
+  playFrame.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
 
-for i in range(4):
-    playFrame.grid_columnconfigure(i, weight=1)
+  for i in range(4):
+      playFrame.grid_columnconfigure(i, weight=1)
 
-# Load play/stop button images
-try:
-    playPhoto = PhotoImage(file="play-icon.png")
-    stopPhoto = PhotoImage(file="stop-icon.png")
-    use_images = True
-except:
-    use_images = False
+  # Load play/stop button images
+  try:
+      playPhoto = PhotoImage(file="play-icon.png")
+      stopPhoto = PhotoImage(file="stop-icon.png")
+      use_images = True
+  except:
+      use_images = False
 
-# Import tk to get regular Button (not ttk.Button)
-import tkinter as tk_base
+  # Import tk to get regular Button (not ttk.Button)
+  import tkinter as tk_base
 
-playBut = tk_base.Button(playFrame, command=runProg)
-if use_images:
-    playBut.config(image=playPhoto)
-    playBut.image = playPhoto  # Keep reference
-else:
-    playBut.config(text="▶", width=8, height=2)
-playBut.grid(row=0, column=0, sticky="nsew", padx=2, pady=0)
+  playBut = tk_base.Button(playFrame, command=runProg)
+  if use_images:
+      playBut.config(image=playPhoto)
+      playBut.image = playPhoto  # Keep reference
+  else:
+      playBut.config(text="▶", width=8, height=2)
+  playBut.grid(row=0, column=0, sticky="nsew", padx=2, pady=0)
 
-revBut = tk_base.Button(playFrame, text="REV", command=stepRev, height=2, font=("Arial", 10))
-revBut.grid(row=0, column=1, sticky="nsew", padx=2, pady=0)
+  revBut = tk_base.Button(playFrame, text="REV", command=stepRev, height=2, font=("Arial", 10))
+  revBut.grid(row=0, column=1, sticky="nsew", padx=2, pady=0)
 
-fwdBut = tk_base.Button(playFrame, text="FWD", command=stepFwd, height=2, font=("Arial", 10))
-fwdBut.grid(row=0, column=2, sticky="nsew", padx=2, pady=0)
+  fwdBut = tk_base.Button(playFrame, text="FWD", command=stepFwd, height=2, font=("Arial", 10))
+  fwdBut.grid(row=0, column=2, sticky="nsew", padx=2, pady=0)
 
-stopBut = tk_base.Button(playFrame, command=stopProg)
-if use_images:
-    stopBut.config(image=stopPhoto)
-    stopBut.image = stopPhoto  # Keep reference
-else:
-    stopBut.config(text="⬛", width=8, height=2)
-stopBut.grid(row=0, column=3, sticky="nsew", padx=2, pady=0)
+  stopBut = tk_base.Button(playFrame, command=stopProg)
+  if use_images:
+      stopBut.config(image=stopPhoto)
+      stopBut.image = stopPhoto  # Keep reference
+  else:
+      stopBut.config(text="⬛", width=8, height=2)
+  stopBut.grid(row=0, column=3, sticky="nsew", padx=2, pady=0)
 
-# Row 2: Program view with scrollbar
-progframe = Frame(centerPanel, relief="sunken", borderwidth=1)
-progframe.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
+  # Row 2: Program view with scrollbar
+  progframe = Frame(centerPanel, relief="sunken", borderwidth=1)
+  progframe.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
 
-scrollbar = Scrollbar(progframe)
-scrollbar.pack(side=RIGHT, fill=Y)
+  scrollbar = Scrollbar(progframe)
+  scrollbar.pack(side=RIGHT, fill=Y)
 
-tab1.progView = Listbox(progframe, exportselection=0, width=70, height=28, yscrollcommand=scrollbar.set)
-tab1.progView.bind('<<ListboxSelect>>', progViewselect)
-tab1.progView.pack(side=LEFT, fill=BOTH, expand=True)
+  tab1.progView = Listbox(progframe, exportselection=0, width=70, height=28, yscrollcommand=scrollbar.set)
+  tab1.progView.bind('<<ListboxSelect>>', progViewselect)
+  tab1.progView.pack(side=LEFT, fill=BOTH, expand=True)
 
-scrollbar.config(command=tab1.progView.yview)
+  scrollbar.config(command=tab1.progView.yview)
 
-# Row 3: Manual Program Entry
-manEntryFrame = LabelFrame(centerPanel, text="Manual Program Entry", padding=5)
-manEntryFrame.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+  # Row 3: Manual Program Entry
+  manEntryFrame = LabelFrame(centerPanel, text="Manual Program Entry", padding=5)
+  manEntryFrame.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
 
-# Configure equal width columns for buttons
-for i in range(5):
-    manEntryFrame.grid_columnconfigure(i, weight=1)
+  # Configure equal width columns for buttons
+  for i in range(5):
+      manEntryFrame.grid_columnconfigure(i, weight=1)
 
-# Entry field at top (full width)
-manEntryField = Entry(manEntryFrame, width=60)
-manEntryField.grid(row=0, column=0, columnspan=5, sticky="ew", padx=2, pady=(2, 5))
+  # Entry field at top (full width)
+  manEntryField = Entry(manEntryFrame, width=60)
+  manEntryField.grid(row=0, column=0, columnspan=5, sticky="ew", padx=2, pady=(2, 5))
 
-# Five buttons below entry field (equal width)
-getSelBut = ttk.Button(manEntryFrame, text="Copy", command=getSel)
-getSelBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
+  # Five buttons below entry field (equal width)
+  getSelBut = ttk.Button(manEntryFrame, text="Copy", command=getSel)
+  getSelBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
 
-insertBut = ttk.Button(manEntryFrame, text="Paste", command=manInsItem)
-insertBut.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
+  insertBut = ttk.Button(manEntryFrame, text="Paste", command=manInsItem)
+  insertBut.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
 
-replaceBut = ttk.Button(manEntryFrame, text="Replace", command=manReplItem)
-replaceBut.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
+  replaceBut = ttk.Button(manEntryFrame, text="Replace", command=manReplItem)
+  replaceBut.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
 
-openTextBut = ttk.Button(manEntryFrame, text="Open .txt File", command=openText)
-openTextBut.grid(row=1, column=3, sticky="ew", padx=2, pady=2)
+  openTextBut = ttk.Button(manEntryFrame, text="Open .txt File", command=openText)
+  openTextBut.grid(row=1, column=3, sticky="ew", padx=2, pady=2)
 
-reloadBut = ttk.Button(manEntryFrame, text="Reload", command=reloadProg)
-reloadBut.grid(row=1, column=4, sticky="ew", padx=2, pady=2)
+  reloadBut = ttk.Button(manEntryFrame, text="Reload", command=reloadProg)
+  reloadBut.grid(row=1, column=4, sticky="ew", padx=2, pady=2)
 
-# Row 3: Position controls
-# Position Commands moved to left panel
+  # Row 3: Position controls
+  # Position Commands moved to left panel
 
-# Wait Time moved to left panel Wait container
+  # Wait Time moved to left panel Wait container
 
-# Row 5: Tab and Servo controls
-# Duplicate buttons removed - now in proper containers
+  # Row 5: Tab and Servo controls
+  # Duplicate buttons removed - now in proper containers
 
-# ============================================================================
-# RIGHT PANEL - Motion and Command Controls
-# ============================================================================
-rightPanel = Frame(tab1)
-rightPanel.grid(row=0, column=2, sticky="nsew", padx=2, pady=2)
+  # ============================================================================
+  # RIGHT PANEL - Motion and Command Controls
+  # ============================================================================
+  rightPanel = Frame(tab1)
+  rightPanel.grid(row=0, column=2, sticky="nsew", padx=2, pady=2)
 
-# Configure right panel grid
-rightPanel.grid_rowconfigure(0, weight=1)
-rightPanel.grid_rowconfigure(1, weight=0)
-rightPanel.grid_rowconfigure(2, weight=0)
-rightPanel.grid_rowconfigure(3, weight=0)
-rightPanel.grid_rowconfigure(4, weight=0)
-rightPanel.grid_rowconfigure(5, weight=0)
-rightPanel.grid_rowconfigure(6, weight=1)
-rightPanel.grid_columnconfigure(0, weight=1)
-rightPanel.grid_columnconfigure(1, weight=1)
+  # Configure right panel grid
+  rightPanel.grid_rowconfigure(0, weight=1)
+  rightPanel.grid_rowconfigure(1, weight=0)
+  rightPanel.grid_rowconfigure(2, weight=0)
+  rightPanel.grid_rowconfigure(3, weight=0)
+  rightPanel.grid_rowconfigure(4, weight=0)
+  rightPanel.grid_rowconfigure(5, weight=0)
+  rightPanel.grid_rowconfigure(6, weight=1)
+  rightPanel.grid_columnconfigure(0, weight=1)
+  rightPanel.grid_columnconfigure(1, weight=1)
 
-# Coordinate-space tabs keep unrelated jog modes out of the active workspace.
-motionControlNotebook = ttk_bootstrap.Notebook(rightPanel)
-motionControlNotebook.grid(
-  row=0,
-  column=0,
-  columnspan=2,
-  sticky="nsew",
-  padx=5,
-  pady=5,
-)
+  # Coordinate-space tabs keep unrelated jog modes out of the active workspace.
+  motionControlNotebook = ttk_bootstrap.Notebook(rightPanel)
+  motionControlNotebook.grid(
+    row=0,
+    column=0,
+    columnspan=2,
+    sticky="nsew",
+    padx=5,
+    pady=5,
+  )
 
-jointFrame = ttk_bootstrap.Frame(motionControlNotebook, padding=5)
-CartjogFrame = ttk_bootstrap.Frame(motionControlNotebook, padding=5)
-TooljogFrame = ttk_bootstrap.Frame(motionControlNotebook, padding=5)
-motionControlNotebook.add(jointFrame, text=" Joint ")
-motionControlNotebook.add(CartjogFrame, text=" Cartesian ")
-motionControlNotebook.add(TooljogFrame, text=" Tool Frame ")
+  jointFrame = ttk_bootstrap.Frame(motionControlNotebook, padding=5)
+  CartjogFrame = ttk_bootstrap.Frame(motionControlNotebook, padding=5)
+  TooljogFrame = ttk_bootstrap.Frame(motionControlNotebook, padding=5)
+  motionControlNotebook.add(jointFrame, text=" Joint ")
+  motionControlNotebook.add(CartjogFrame, text=" Cartesian ")
+  motionControlNotebook.add(TooljogFrame, text=" Tool Frame ")
 
-jointFrame.grid_columnconfigure(0, weight=1)
+  jointFrame.grid_columnconfigure(0, weight=1)
 
-def create_joint_jog_frame(parent, row, col, joint_name, joint_num):
-    frame = Frame(parent)
-    frame.grid(row=row, column=col, sticky="ew", padx=2, pady=2)
+  def create_joint_jog_frame(parent, row, col, joint_name, joint_num):
+      frame = Frame(parent)
+      frame.grid(row=row, column=col, sticky="ew", padx=2, pady=2)
     
-    frame.grid_columnconfigure(0, weight=0)
-    frame.grid_columnconfigure(1, weight=0)
-    frame.grid_columnconfigure(2, weight=0)
-    frame.grid_columnconfigure(3, weight=1)
-    frame.grid_columnconfigure(4, weight=0)
+      frame.grid_columnconfigure(0, weight=0)
+      frame.grid_columnconfigure(1, weight=0)
+      frame.grid_columnconfigure(2, weight=0)
+      frame.grid_columnconfigure(3, weight=1)
+      frame.grid_columnconfigure(4, weight=0)
     
-    lab = Label(frame, font=("Arial", 14), text=joint_name)
-    lab.grid(row=0, column=0, padx=2)
+      lab = Label(frame, font=("Arial", 14), text=joint_name)
+      lab.grid(row=0, column=0, padx=2)
     
-    entry = Entry(frame, width=8, justify="center")
-    entry.grid(row=0, column=1, padx=2)
-    _bind_joint_target_entry(joint_num - 1, entry)
+      entry = Entry(frame, width=8, justify="center")
+      entry.grid(row=0, column=1, padx=2)
+      _bind_joint_target_entry(joint_num - 1, entry)
     
-    neg_but = Button(frame, text="-", width=3)
-    neg_but.grid(row=0, column=2, padx=2)
+      neg_but = Button(frame, text="-", width=3)
+      neg_but.grid(row=0, column=2, padx=2)
     
-    slider = Scale(frame, from_=-170, to=170, orient=HORIZONTAL, length=150)
-    slider.grid(row=0, column=3, sticky="ew", padx=2)
+      slider = Scale(frame, from_=-170, to=170, orient=HORIZONTAL, length=150)
+      slider.grid(row=0, column=3, sticky="ew", padx=2)
     
-    pos_but = Button(frame, text="+", width=3)
-    pos_but.grid(row=0, column=4, padx=2)
+      pos_but = Button(frame, text="+", width=3)
+      pos_but.grid(row=0, column=4, padx=2)
     
-    neg_lim_lab = Label(frame, font=("Arial", 8), text="-170", style="Jointlim.TLabel")
-    neg_lim_lab.grid(row=1, column=2, sticky="w")
+      neg_lim_lab = Label(frame, font=("Arial", 8), text="-170", style="Jointlim.TLabel")
+      neg_lim_lab.grid(row=1, column=2, sticky="w")
     
-    pos_lim_lab = Label(frame, font=("Arial", 8), text="170", style="Jointlim.TLabel")
-    pos_lim_lab.grid(row=1, column=4, sticky="e")
+      pos_lim_lab = Label(frame, font=("Arial", 8), text="170", style="Jointlim.TLabel")
+      pos_lim_lab.grid(row=1, column=4, sticky="e")
     
-    slide_label = Label(frame, font=("Arial", 8))
-    slide_label.grid(row=1, column=3)
+      slide_label = Label(frame, font=("Arial", 8))
+      slide_label.grid(row=1, column=3)
     
-    return frame, entry, neg_but, pos_but, slider, slide_label, neg_lim_lab, pos_lim_lab
-
-##J1
-J1jogFrame, J1curAngEntryField, J1jogNegBut, J1jogPosBut, J1jogslide, J1slidelabel, J1negLimLab, J1posLimLab = create_joint_jog_frame(jointFrame, 0, 0, "J1", 1)
-
-_bind_joint_jog_buttons(0, J1jogNegBut, J1jogPosBut)
-
-def J1sliderUpdate(foo):
-  J1slidelabel.config(text=round(float(J1jogslide.get()),2))   
-J1jogslide.config(command=J1sliderUpdate)
-
-##J2
-J2jogFrame, J2curAngEntryField, J2jogNegBut, J2jogPosBut, J2jogslide, J2slidelabel, J2negLimLab, J2posLimLab = create_joint_jog_frame(jointFrame, 1, 0, "J2", 2)
-
-_bind_joint_jog_buttons(1, J2jogNegBut, J2jogPosBut)
-
-def J2sliderUpdate(foo):
-  J2slidelabel.config(text=round(float(J2jogslide.get()),2))   
-J2jogslide.config(command=J2sliderUpdate)
-
-##J3
-J3jogFrame, J3curAngEntryField, J3jogNegBut, J3jogPosBut, J3jogslide, J3slidelabel, J3negLimLab, J3posLimLab = create_joint_jog_frame(jointFrame, 2, 0, "J3", 3)
-
-_bind_joint_jog_buttons(2, J3jogNegBut, J3jogPosBut)
-
-def J3sliderUpdate(foo):
-  J3slidelabel.config(text=round(float(J3jogslide.get()),2))   
-J3jogslide.config(command=J3sliderUpdate)
-
-##J4
-J4jogFrame, J4curAngEntryField, J4jogNegBut, J4jogPosBut, J4jogslide, J4slidelabel, J4negLimLab, J4posLimLab = create_joint_jog_frame(jointFrame, 3, 0, "J4", 4)
-
-_bind_joint_jog_buttons(3, J4jogNegBut, J4jogPosBut)
-
-def J4sliderUpdate(foo):
-  J4slidelabel.config(text=round(float(J4jogslide.get()),2))   
-J4jogslide.config(command=J4sliderUpdate)
-
-##J5
-J5jogFrame, J5curAngEntryField, J5jogNegBut, J5jogPosBut, J5jogslide, J5slidelabel, J5negLimLab, J5posLimLab = create_joint_jog_frame(jointFrame, 4, 0, "J5", 5)
-
-_bind_joint_jog_buttons(4, J5jogNegBut, J5jogPosBut)
-
-def J5sliderUpdate(foo):
-  J5slidelabel.config(text=round(float(J5jogslide.get()),2))   
-J5jogslide.config(command=J5sliderUpdate)
-
-##J6
-J6jogFrame, J6curAngEntryField, J6jogNegBut, J6jogPosBut, J6jogslide, J6slidelabel, J6negLimLab, J6posLimLab = create_joint_jog_frame(jointFrame, 5, 0, "J6", 6)
-
-_bind_joint_jog_buttons(5, J6jogNegBut, J6jogPosBut)
-
-def J6sliderUpdate(foo):
-  J6slidelabel.config(text=round(float(J6jogslide.get()),2))   
-J6jogslide.config(command=J6sliderUpdate)
-
-motionTrackingFrame = Frame(jointFrame)
-motionTrackingFrame.grid(
-  row=6,
-  column=0,
-  sticky="ew",
-  padx=4,
-  pady=(2, 0),
-)
-motionTrackingFrame.grid_columnconfigure(0, weight=1)
-motionTrackingFrame.grid_columnconfigure(1, weight=1)
-
-estimatedMotionCbut = Checkbutton(
-  motionTrackingFrame,
-  text="Estimated trajectory (cyan)",
-  variable=RUN['showEstimatedMotion'],
-  command=_refresh_joint_motion_visualization,
-)
-estimatedMotionCbut.grid(
-  row=0,
-  column=0,
-  sticky="w",
-)
-
-encoderTelemetryCbut = Checkbutton(
-  motionTrackingFrame,
-  text="Encoder sample (amber, J1-J6)",
-  variable=RUN['showEncoderTelemetry'],
-  command=_refresh_joint_motion_visualization,
-)
-encoderTelemetryCbut.grid(
-  row=0,
-  column=1,
-  sticky="w",
-)
-
-motionTrackingLegend = Label(
-  motionTrackingFrame,
-  text=(
-    "Slider thumb = desired input    "
-    "Violet bar = active move target\n"
-    "Cyan line = command estimate    "
-    "Amber marker = latest encoder sample"
-  ),
-  justify="left",
-)
-motionTrackingLegend.grid(
-  row=1,
-  column=0,
-  columnspan=2,
-  sticky="w",
-  pady=(2, 0),
-)
-
-namedPositionFrame = Frame(jointFrame)
-namedPositionFrame.grid(
-  row=7,
-  column=0,
-  sticky="ew",
-  padx=2,
-  pady=(4, 2),
-)
-namedPositionFrame.grid_columnconfigure(0, weight=1)
-namedPositionFrame.grid_columnconfigure(1, weight=1)
-
-startPositionBut = Button(
-  namedPositionFrame,
-  text="Start Position",
-  command=MoveToStartPosition,
-)
-startPositionBut.grid(row=0, column=0, sticky="ew", padx=(0, 2))
-
-shutdownPositionBut = Button(
-  namedPositionFrame,
-  text="Shutdown Position",
-  command=MoveToShutdownPosition,
-)
-shutdownPositionBut.grid(row=0, column=1, sticky="ew", padx=(2, 0))
-
-CartjogFrame.grid_columnconfigure(0, weight=1)
-
-
-def create_cart_control(parent, row, label_text):
-    frame = Frame(parent)
-    frame.grid(row=row, column=0, sticky="ew", padx=2, pady=3)
-    frame.grid_columnconfigure(0, weight=0)
-    frame.grid_columnconfigure(1, weight=0)
-    frame.grid_columnconfigure(2, weight=1)
-    frame.grid_columnconfigure(3, weight=0)
-
-    Label(frame, font=("Arial", 14), text=label_text, width=4).grid(
-      row=0,
-      column=0,
-      padx=2,
-    )
-    entry = Entry(frame, width=10, justify="center")
-    entry.grid(row=0, column=1, padx=2)
-    neg_but = Button(frame, text="-", width=5)
-    neg_but.grid(row=0, column=2, sticky="e", padx=2)
-    pos_but = Button(frame, text="+", width=5)
-    pos_but.grid(row=0, column=3, padx=2)
-    return entry, neg_but, pos_but
-
-# Create cartesian controls
-XcurEntryField, XjogNegBut, XjogPosBut = create_cart_control(CartjogFrame, 0, "X")
-YcurEntryField, YjogNegBut, YjogPosBut = create_cart_control(CartjogFrame, 1, "Y")
-ZcurEntryField, ZjogNegBut, ZjogPosBut = create_cart_control(CartjogFrame, 2, "Z")
-RzcurEntryField, RzjogNegBut, RzjogPosBut = create_cart_control(CartjogFrame, 3, "Rz")
-RycurEntryField, RyjogNegBut, RyjogPosBut = create_cart_control(CartjogFrame, 4, "Ry")
-RxcurEntryField, RxjogNegBut, RxjogPosBut = create_cart_control(CartjogFrame, 5, "Rx")
-
-Label(
-  CartjogFrame,
-  text="Cartesian travel is kinematics-limited; no fixed slider bounds.",
-).grid(row=6, column=0, sticky="w", padx=4, pady=(6, 2))
-
-_bind_spatial_jog_buttons((
-  (XjogNegBut, XjogPosBut, XjogNeg, XjogPos),
-  (YjogNegBut, YjogPosBut, YjogNeg, YjogPos),
-  (ZjogNegBut, ZjogPosBut, ZjogNeg, ZjogPos),
-  (RzjogNegBut, RzjogPosBut, RzjogNeg, RzjogPos),
-  (RyjogNegBut, RyjogPosBut, RyjogNeg, RyjogPos),
-  (RxjogNegBut, RxjogPosBut, RxjogNeg, RxjogPos),
-), LiveCarJog)
-
-TooljogFrame.grid_columnconfigure(0, weight=1)
-
-def create_tool_control(parent, row, label_text):
-    frame = Frame(parent)
-    frame.grid(row=row, column=0, sticky="ew", padx=2, pady=3)
-    frame.grid_columnconfigure(0, weight=0)
-    frame.grid_columnconfigure(1, weight=1)
-    frame.grid_columnconfigure(2, weight=0)
-    Label(frame, font=("Arial", 14), text=label_text, width=4).grid(
-      row=0,
-      column=0,
-      padx=2,
-    )
-    Label(frame, text="Relative jog").grid(
-      row=0,
-      column=1,
-      sticky="w",
-      padx=4,
-    )
-    neg_but = Button(frame, text="-", width=5)
-    neg_but.grid(row=0, column=2, padx=2)
-    pos_but = Button(frame, text="+", width=5)
-    pos_but.grid(row=0, column=3, padx=2)
-    return neg_but, pos_but
-
-# Create tool frame controls (no entry fields)
-TXjogNegBut, TXjogPosBut = create_tool_control(TooljogFrame, 0, "Tx")
-TYjogNegBut, TYjogPosBut = create_tool_control(TooljogFrame, 1, "Ty")
-TZjogNegBut, TZjogPosBut = create_tool_control(TooljogFrame, 2, "Tz")
-TRzjogNegBut, TRzjogPosBut = create_tool_control(TooljogFrame, 3, "Trz")
-TRyjogNegBut, TRyjogPosBut = create_tool_control(TooljogFrame, 4, "Try")
-TRxjogNegBut, TRxjogPosBut = create_tool_control(TooljogFrame, 5, "Trx")
-
-Label(
-  TooljogFrame,
-  text="Tool-frame motion is relative; no absolute slider position exists.",
-).grid(row=6, column=0, sticky="w", padx=4, pady=(6, 2))
-
-_bind_spatial_jog_buttons((
-  (TXjogNegBut, TXjogPosBut, TXjogNeg, TXjogPos),
-  (TYjogNegBut, TYjogPosBut, TYjogNeg, TYjogPos),
-  (TZjogNegBut, TZjogPosBut, TZjogNeg, TZjogPos),
-  (TRzjogNegBut, TRzjogPosBut, TRzjogNeg, TRzjogPos),
-  (TRyjogNegBut, TRyjogPosBut, TRyjogNeg, TRyjogPos),
-  (TRxjogNegBut, TRxjogPosBut, TRxjogNeg, TRxjogPos),
-), LiveToolJog)
-
-
-# Extra axes (J7, J8, J9)
-extraAxesFrame = LabelFrame(rightPanel, text="Additional Axes", padding=5)
-extraAxesFrame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
-
-extraAxesFrame.grid_columnconfigure(0, weight=1)
-extraAxesFrame.grid_columnconfigure(1, weight=1)
-extraAxesFrame.grid_columnconfigure(2, weight=1)
-
-# J7 Frame
-J7jogFrame = Frame(extraAxesFrame, relief="raised", borderwidth=1, padding=5)
-J7jogFrame.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
-
-J7jogFrame.grid_columnconfigure(0, weight=1)
-J7jogFrame.grid_columnconfigure(1, weight=0)
-J7jogFrame.grid_columnconfigure(2, weight=1)
-
-J7Lab = Label(J7jogFrame, font=("Arial", 12), text="7th Axis")
-J7Lab.grid(row=0, column=0, columnspan=3, pady=2)
-
-J7negLimLab = Label(J7jogFrame, font=("Arial", 8), text="0.00", style="Jointlim.TLabel")
-J7negLimLab.grid(row=1, column=0, sticky="w", padx=2)
-J7curAngEntryField = Entry(J7jogFrame, width=8, justify="center")
-J7curAngEntryField.grid(row=1, column=1, padx=5)
-J7posLimLab = Label(J7jogFrame, font=("Arial", 8), text="0", style="Jointlim.TLabel")
-J7posLimLab.grid(row=1, column=2, sticky="e", padx=2)
-
-J7jogslide = Scale(J7jogFrame, from_=0, to=0, orient=HORIZONTAL, length=120)
-J7jogslide.grid(row=2, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
-
-# Create frame for button layout (- entry +)
-J7buttonFrame = Frame(J7jogFrame)
-J7buttonFrame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
-
-J7buttonFrame.grid_columnconfigure(0, weight=1)
-J7buttonFrame.grid_columnconfigure(1, weight=0)
-J7buttonFrame.grid_columnconfigure(2, weight=1)
-
-J7jogNegBut = Button(J7buttonFrame, text="-", width=3)
-J7jogNegBut.grid(row=0, column=0, sticky="w", padx=(0, 2))
-
-J7slideLimLab = Entry(J7buttonFrame, width=8, justify="center", state="readonly")
-J7slideLimLab.grid(row=0, column=1, padx=2)
-
-J7jogPosBut = Button(J7buttonFrame, text="+", width=3)
-J7jogPosBut.grid(row=0, column=2, sticky="e", padx=(2, 0))
-
-_bind_joint_jog_buttons(6, J7jogNegBut, J7jogPosBut)
-
-def J7sliderUpdate(foo):
-  J7slideLimLab.config(state="normal")
-  J7slideLimLab.delete(0, END)
-  J7slideLimLab.insert(0, round(float(J7jogslide.get()),2))
-  J7slideLimLab.config(state="readonly")   
-J7jogslide.config(command=J7sliderUpdate)
-
-# J8 Frame
-J8jogFrame = Frame(extraAxesFrame, relief="raised", borderwidth=1, padding=5)
-J8jogFrame.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
-
-J8jogFrame.grid_columnconfigure(0, weight=1)
-J8jogFrame.grid_columnconfigure(1, weight=0)
-J8jogFrame.grid_columnconfigure(2, weight=1)
-
-J8Lab = Label(J8jogFrame, font=("Arial", 12), text="8th Axis")
-J8Lab.grid(row=0, column=0, columnspan=3, pady=2)
-
-J8negLimLab = Label(J8jogFrame, font=("Arial", 8), text="0.00", style="Jointlim.TLabel")
-J8negLimLab.grid(row=1, column=0, sticky="w", padx=2)
-J8curAngEntryField = Entry(J8jogFrame, width=8, justify="center")
-J8curAngEntryField.grid(row=1, column=1, padx=5)
-J8posLimLab = Label(J8jogFrame, font=("Arial", 8), text="0", style="Jointlim.TLabel")
-J8posLimLab.grid(row=1, column=2, sticky="e", padx=2)
-
-J8jogslide = Scale(J8jogFrame, from_=0, to=0, orient=HORIZONTAL, length=120)
-J8jogslide.grid(row=2, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
-
-# Create frame for button layout (- entry +)
-J8buttonFrame = Frame(J8jogFrame)
-J8buttonFrame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
-
-J8buttonFrame.grid_columnconfigure(0, weight=1)
-J8buttonFrame.grid_columnconfigure(1, weight=0)
-J8buttonFrame.grid_columnconfigure(2, weight=1)
-
-J8jogNegBut = Button(J8buttonFrame, text="-", width=3)
-J8jogNegBut.grid(row=0, column=0, sticky="w", padx=(0, 2))
-
-J8slideLimLab = Entry(J8buttonFrame, width=8, justify="center", state="readonly")
-J8slideLimLab.grid(row=0, column=1, padx=2)
-
-J8jogPosBut = Button(J8buttonFrame, text="+", width=3)
-J8jogPosBut.grid(row=0, column=2, sticky="e", padx=(2, 0))
-
-_bind_joint_jog_buttons(7, J8jogNegBut, J8jogPosBut)
-
-def J8sliderUpdate(foo):
-  J8slideLimLab.config(state="normal")
-  J8slideLimLab.delete(0, END)
-  J8slideLimLab.insert(0, round(float(J8jogslide.get()),2))
-  J8slideLimLab.config(state="readonly")   
-J8jogslide.config(command=J8sliderUpdate)
-
-# J9 Frame
-J9jogFrame = Frame(extraAxesFrame, relief="raised", borderwidth=1, padding=5)
-J9jogFrame.grid(row=0, column=2, sticky="nsew", padx=2, pady=2)
-
-J9jogFrame.grid_columnconfigure(0, weight=1)
-J9jogFrame.grid_columnconfigure(1, weight=0)
-J9jogFrame.grid_columnconfigure(2, weight=1)
-
-J9Lab = Label(J9jogFrame, font=("Arial", 12), text="9th Axis")
-J9Lab.grid(row=0, column=0, columnspan=3, pady=2)
-
-J9negLimLab = Label(J9jogFrame, font=("Arial", 8), text="0.00", style="Jointlim.TLabel")
-J9negLimLab.grid(row=1, column=0, sticky="w", padx=2)
-J9curAngEntryField = Entry(J9jogFrame, width=8, justify="center")
-J9curAngEntryField.grid(row=1, column=1, padx=5)
-J9posLimLab = Label(J9jogFrame, font=("Arial", 8), text="0", style="Jointlim.TLabel")
-J9posLimLab.grid(row=1, column=2, sticky="e", padx=2)
-
-J9jogslide = Scale(J9jogFrame, from_=0, to=0, orient=HORIZONTAL, length=120)
-J9jogslide.grid(row=2, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
-
-# Create frame for button layout (- entry +)
-J9buttonFrame = Frame(J9jogFrame)
-J9buttonFrame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
-
-J9buttonFrame.grid_columnconfigure(0, weight=1)
-J9buttonFrame.grid_columnconfigure(1, weight=0)
-J9buttonFrame.grid_columnconfigure(2, weight=1)
-
-J9jogNegBut = Button(J9buttonFrame, text="-", width=3)
-J9jogNegBut.grid(row=0, column=0, sticky="w", padx=(0, 2))
-
-J9slideLimLab = Entry(J9buttonFrame, width=8, justify="center", state="readonly")
-J9slideLimLab.grid(row=0, column=1, padx=2)
-
-J9jogPosBut = Button(J9buttonFrame, text="+", width=3)
-J9jogPosBut.grid(row=0, column=2, sticky="e", padx=(2, 0))
-
-_bind_joint_jog_buttons(8, J9jogNegBut, J9jogPosBut)
-
-def J9sliderUpdate(foo):
-  J9slideLimLab.config(state="normal")
-  J9slideLimLab.delete(0, END)
-  J9slideLimLab.insert(0, round(float(J9jogslide.get()),2))
-  J9slideLimLab.config(state="readonly")   
-J9jogslide.config(command=J9sliderUpdate)
-
-_bind_joint_target_sliders((
-  J1jogslide, J2jogslide, J3jogslide,
-  J4jogslide, J5jogslide, J6jogslide,
-  J7jogslide, J8jogslide, J9jogslide,
-))
-
-joint_motion_visualization = JointMotionVisualization(
-  sliders=(
+      return frame, entry, neg_but, pos_but, slider, slide_label, neg_lim_lab, pos_lim_lab
+
+  ##J1
+  J1jogFrame, J1curAngEntryField, J1jogNegBut, J1jogPosBut, J1jogslide, J1slidelabel, J1negLimLab, J1posLimLab = create_joint_jog_frame(jointFrame, 0, 0, "J1", 1)
+
+  _bind_joint_jog_buttons(0, J1jogNegBut, J1jogPosBut)
+
+  def J1sliderUpdate(foo):
+    J1slidelabel.config(text=round(float(J1jogslide.get()),2))
+  J1jogslide.config(command=J1sliderUpdate)
+
+  ##J2
+  J2jogFrame, J2curAngEntryField, J2jogNegBut, J2jogPosBut, J2jogslide, J2slidelabel, J2negLimLab, J2posLimLab = create_joint_jog_frame(jointFrame, 1, 0, "J2", 2)
+
+  _bind_joint_jog_buttons(1, J2jogNegBut, J2jogPosBut)
+
+  def J2sliderUpdate(foo):
+    J2slidelabel.config(text=round(float(J2jogslide.get()),2))
+  J2jogslide.config(command=J2sliderUpdate)
+
+  ##J3
+  J3jogFrame, J3curAngEntryField, J3jogNegBut, J3jogPosBut, J3jogslide, J3slidelabel, J3negLimLab, J3posLimLab = create_joint_jog_frame(jointFrame, 2, 0, "J3", 3)
+
+  _bind_joint_jog_buttons(2, J3jogNegBut, J3jogPosBut)
+
+  def J3sliderUpdate(foo):
+    J3slidelabel.config(text=round(float(J3jogslide.get()),2))
+  J3jogslide.config(command=J3sliderUpdate)
+
+  ##J4
+  J4jogFrame, J4curAngEntryField, J4jogNegBut, J4jogPosBut, J4jogslide, J4slidelabel, J4negLimLab, J4posLimLab = create_joint_jog_frame(jointFrame, 3, 0, "J4", 4)
+
+  _bind_joint_jog_buttons(3, J4jogNegBut, J4jogPosBut)
+
+  def J4sliderUpdate(foo):
+    J4slidelabel.config(text=round(float(J4jogslide.get()),2))
+  J4jogslide.config(command=J4sliderUpdate)
+
+  ##J5
+  J5jogFrame, J5curAngEntryField, J5jogNegBut, J5jogPosBut, J5jogslide, J5slidelabel, J5negLimLab, J5posLimLab = create_joint_jog_frame(jointFrame, 4, 0, "J5", 5)
+
+  _bind_joint_jog_buttons(4, J5jogNegBut, J5jogPosBut)
+
+  def J5sliderUpdate(foo):
+    J5slidelabel.config(text=round(float(J5jogslide.get()),2))
+  J5jogslide.config(command=J5sliderUpdate)
+
+  ##J6
+  J6jogFrame, J6curAngEntryField, J6jogNegBut, J6jogPosBut, J6jogslide, J6slidelabel, J6negLimLab, J6posLimLab = create_joint_jog_frame(jointFrame, 5, 0, "J6", 6)
+
+  _bind_joint_jog_buttons(5, J6jogNegBut, J6jogPosBut)
+
+  def J6sliderUpdate(foo):
+    J6slidelabel.config(text=round(float(J6jogslide.get()),2))
+  J6jogslide.config(command=J6sliderUpdate)
+
+  motionTrackingFrame = Frame(jointFrame)
+  motionTrackingFrame.grid(
+    row=6,
+    column=0,
+    sticky="ew",
+    padx=4,
+    pady=(2, 0),
+  )
+  motionTrackingFrame.grid_columnconfigure(0, weight=1)
+  motionTrackingFrame.grid_columnconfigure(1, weight=1)
+
+  estimatedMotionCbut = Checkbutton(
+    motionTrackingFrame,
+    text="Estimated trajectory (cyan)",
+    variable=RUN['showEstimatedMotion'],
+    command=_refresh_joint_motion_visualization,
+  )
+  estimatedMotionCbut.grid(
+    row=0,
+    column=0,
+    sticky="w",
+  )
+
+  encoderTelemetryCbut = Checkbutton(
+    motionTrackingFrame,
+    text="Encoder sample (amber, J1-J6)",
+    variable=RUN['showEncoderTelemetry'],
+    command=_refresh_joint_motion_visualization,
+  )
+  encoderTelemetryCbut.grid(
+    row=0,
+    column=1,
+    sticky="w",
+  )
+
+  motionTrackingLegend = Label(
+    motionTrackingFrame,
+    text=(
+      "Slider thumb = desired input    "
+      "Violet bar = active move target\n"
+      "Cyan line = command estimate    "
+      "Amber marker = latest encoder sample"
+    ),
+    justify="left",
+  )
+  motionTrackingLegend.grid(
+    row=1,
+    column=0,
+    columnspan=2,
+    sticky="w",
+    pady=(2, 0),
+  )
+
+  namedPositionFrame = Frame(jointFrame)
+  namedPositionFrame.grid(
+    row=7,
+    column=0,
+    sticky="ew",
+    padx=2,
+    pady=(4, 2),
+  )
+  namedPositionFrame.grid_columnconfigure(0, weight=1)
+  namedPositionFrame.grid_columnconfigure(1, weight=1)
+
+  startPositionBut = Button(
+    namedPositionFrame,
+    text="Start Position",
+    command=MoveToStartPosition,
+  )
+  startPositionBut.grid(row=0, column=0, sticky="ew", padx=(0, 2))
+
+  shutdownPositionBut = Button(
+    namedPositionFrame,
+    text="Shutdown Position",
+    command=MoveToShutdownPosition,
+  )
+  shutdownPositionBut.grid(row=0, column=1, sticky="ew", padx=(2, 0))
+
+  CartjogFrame.grid_columnconfigure(0, weight=1)
+
+
+  def create_cart_control(parent, row, label_text):
+      frame = Frame(parent)
+      frame.grid(row=row, column=0, sticky="ew", padx=2, pady=3)
+      frame.grid_columnconfigure(0, weight=0)
+      frame.grid_columnconfigure(1, weight=0)
+      frame.grid_columnconfigure(2, weight=1)
+      frame.grid_columnconfigure(3, weight=0)
+
+      Label(frame, font=("Arial", 14), text=label_text, width=4).grid(
+        row=0,
+        column=0,
+        padx=2,
+      )
+      entry = Entry(frame, width=10, justify="center")
+      entry.grid(row=0, column=1, padx=2)
+      neg_but = Button(frame, text="-", width=5)
+      neg_but.grid(row=0, column=2, sticky="e", padx=2)
+      pos_but = Button(frame, text="+", width=5)
+      pos_but.grid(row=0, column=3, padx=2)
+      return entry, neg_but, pos_but
+
+  # Create cartesian controls
+  XcurEntryField, XjogNegBut, XjogPosBut = create_cart_control(CartjogFrame, 0, "X")
+  YcurEntryField, YjogNegBut, YjogPosBut = create_cart_control(CartjogFrame, 1, "Y")
+  ZcurEntryField, ZjogNegBut, ZjogPosBut = create_cart_control(CartjogFrame, 2, "Z")
+  RzcurEntryField, RzjogNegBut, RzjogPosBut = create_cart_control(CartjogFrame, 3, "Rz")
+  RycurEntryField, RyjogNegBut, RyjogPosBut = create_cart_control(CartjogFrame, 4, "Ry")
+  RxcurEntryField, RxjogNegBut, RxjogPosBut = create_cart_control(CartjogFrame, 5, "Rx")
+
+  Label(
+    CartjogFrame,
+    text="Cartesian travel is kinematics-limited; no fixed slider bounds.",
+  ).grid(row=6, column=0, sticky="w", padx=4, pady=(6, 2))
+
+  _bind_spatial_jog_buttons((
+    (XjogNegBut, XjogPosBut, XjogNeg, XjogPos),
+    (YjogNegBut, YjogPosBut, YjogNeg, YjogPos),
+    (ZjogNegBut, ZjogPosBut, ZjogNeg, ZjogPos),
+    (RzjogNegBut, RzjogPosBut, RzjogNeg, RzjogPos),
+    (RyjogNegBut, RyjogPosBut, RyjogNeg, RyjogPos),
+    (RxjogNegBut, RxjogPosBut, RxjogNeg, RxjogPos),
+  ), LiveCarJog)
+
+  TooljogFrame.grid_columnconfigure(0, weight=1)
+
+  def create_tool_control(parent, row, label_text):
+      frame = Frame(parent)
+      frame.grid(row=row, column=0, sticky="ew", padx=2, pady=3)
+      frame.grid_columnconfigure(0, weight=0)
+      frame.grid_columnconfigure(1, weight=1)
+      frame.grid_columnconfigure(2, weight=0)
+      Label(frame, font=("Arial", 14), text=label_text, width=4).grid(
+        row=0,
+        column=0,
+        padx=2,
+      )
+      Label(frame, text="Relative jog").grid(
+        row=0,
+        column=1,
+        sticky="w",
+        padx=4,
+      )
+      neg_but = Button(frame, text="-", width=5)
+      neg_but.grid(row=0, column=2, padx=2)
+      pos_but = Button(frame, text="+", width=5)
+      pos_but.grid(row=0, column=3, padx=2)
+      return neg_but, pos_but
+
+  # Create tool frame controls (no entry fields)
+  TXjogNegBut, TXjogPosBut = create_tool_control(TooljogFrame, 0, "Tx")
+  TYjogNegBut, TYjogPosBut = create_tool_control(TooljogFrame, 1, "Ty")
+  TZjogNegBut, TZjogPosBut = create_tool_control(TooljogFrame, 2, "Tz")
+  TRzjogNegBut, TRzjogPosBut = create_tool_control(TooljogFrame, 3, "Trz")
+  TRyjogNegBut, TRyjogPosBut = create_tool_control(TooljogFrame, 4, "Try")
+  TRxjogNegBut, TRxjogPosBut = create_tool_control(TooljogFrame, 5, "Trx")
+
+  Label(
+    TooljogFrame,
+    text="Tool-frame motion is relative; no absolute slider position exists.",
+  ).grid(row=6, column=0, sticky="w", padx=4, pady=(6, 2))
+
+  _bind_spatial_jog_buttons((
+    (TXjogNegBut, TXjogPosBut, TXjogNeg, TXjogPos),
+    (TYjogNegBut, TYjogPosBut, TYjogNeg, TYjogPos),
+    (TZjogNegBut, TZjogPosBut, TZjogNeg, TZjogPos),
+    (TRzjogNegBut, TRzjogPosBut, TRzjogNeg, TRzjogPos),
+    (TRyjogNegBut, TRyjogPosBut, TRyjogNeg, TRyjogPos),
+    (TRxjogNegBut, TRxjogPosBut, TRxjogNeg, TRxjogPos),
+  ), LiveToolJog)
+
+
+  # Extra axes (J7, J8, J9)
+  extraAxesFrame = LabelFrame(rightPanel, text="Additional Axes", padding=5)
+  extraAxesFrame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+
+  extraAxesFrame.grid_columnconfigure(0, weight=1)
+  extraAxesFrame.grid_columnconfigure(1, weight=1)
+  extraAxesFrame.grid_columnconfigure(2, weight=1)
+
+  # J7 Frame
+  J7jogFrame = Frame(extraAxesFrame, relief="raised", borderwidth=1, padding=5)
+  J7jogFrame.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+
+  J7jogFrame.grid_columnconfigure(0, weight=1)
+  J7jogFrame.grid_columnconfigure(1, weight=0)
+  J7jogFrame.grid_columnconfigure(2, weight=1)
+
+  J7Lab = Label(J7jogFrame, font=("Arial", 12), text="7th Axis")
+  J7Lab.grid(row=0, column=0, columnspan=3, pady=2)
+
+  J7negLimLab = Label(J7jogFrame, font=("Arial", 8), text="0.00", style="Jointlim.TLabel")
+  J7negLimLab.grid(row=1, column=0, sticky="w", padx=2)
+  J7curAngEntryField = Entry(J7jogFrame, width=8, justify="center")
+  J7curAngEntryField.grid(row=1, column=1, padx=5)
+  J7posLimLab = Label(J7jogFrame, font=("Arial", 8), text="0", style="Jointlim.TLabel")
+  J7posLimLab.grid(row=1, column=2, sticky="e", padx=2)
+
+  J7jogslide = Scale(J7jogFrame, from_=0, to=0, orient=HORIZONTAL, length=120)
+  J7jogslide.grid(row=2, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
+
+  # Create frame for button layout (- entry +)
+  J7buttonFrame = Frame(J7jogFrame)
+  J7buttonFrame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
+
+  J7buttonFrame.grid_columnconfigure(0, weight=1)
+  J7buttonFrame.grid_columnconfigure(1, weight=0)
+  J7buttonFrame.grid_columnconfigure(2, weight=1)
+
+  J7jogNegBut = Button(J7buttonFrame, text="-", width=3)
+  J7jogNegBut.grid(row=0, column=0, sticky="w", padx=(0, 2))
+
+  J7slideLimLab = Entry(J7buttonFrame, width=8, justify="center", state="readonly")
+  J7slideLimLab.grid(row=0, column=1, padx=2)
+
+  J7jogPosBut = Button(J7buttonFrame, text="+", width=3)
+  J7jogPosBut.grid(row=0, column=2, sticky="e", padx=(2, 0))
+
+  _bind_joint_jog_buttons(6, J7jogNegBut, J7jogPosBut)
+
+  def J7sliderUpdate(foo):
+    J7slideLimLab.config(state="normal")
+    J7slideLimLab.delete(0, END)
+    J7slideLimLab.insert(0, round(float(J7jogslide.get()),2))
+    J7slideLimLab.config(state="readonly")
+  J7jogslide.config(command=J7sliderUpdate)
+
+  # J8 Frame
+  J8jogFrame = Frame(extraAxesFrame, relief="raised", borderwidth=1, padding=5)
+  J8jogFrame.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
+
+  J8jogFrame.grid_columnconfigure(0, weight=1)
+  J8jogFrame.grid_columnconfigure(1, weight=0)
+  J8jogFrame.grid_columnconfigure(2, weight=1)
+
+  J8Lab = Label(J8jogFrame, font=("Arial", 12), text="8th Axis")
+  J8Lab.grid(row=0, column=0, columnspan=3, pady=2)
+
+  J8negLimLab = Label(J8jogFrame, font=("Arial", 8), text="0.00", style="Jointlim.TLabel")
+  J8negLimLab.grid(row=1, column=0, sticky="w", padx=2)
+  J8curAngEntryField = Entry(J8jogFrame, width=8, justify="center")
+  J8curAngEntryField.grid(row=1, column=1, padx=5)
+  J8posLimLab = Label(J8jogFrame, font=("Arial", 8), text="0", style="Jointlim.TLabel")
+  J8posLimLab.grid(row=1, column=2, sticky="e", padx=2)
+
+  J8jogslide = Scale(J8jogFrame, from_=0, to=0, orient=HORIZONTAL, length=120)
+  J8jogslide.grid(row=2, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
+
+  # Create frame for button layout (- entry +)
+  J8buttonFrame = Frame(J8jogFrame)
+  J8buttonFrame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
+
+  J8buttonFrame.grid_columnconfigure(0, weight=1)
+  J8buttonFrame.grid_columnconfigure(1, weight=0)
+  J8buttonFrame.grid_columnconfigure(2, weight=1)
+
+  J8jogNegBut = Button(J8buttonFrame, text="-", width=3)
+  J8jogNegBut.grid(row=0, column=0, sticky="w", padx=(0, 2))
+
+  J8slideLimLab = Entry(J8buttonFrame, width=8, justify="center", state="readonly")
+  J8slideLimLab.grid(row=0, column=1, padx=2)
+
+  J8jogPosBut = Button(J8buttonFrame, text="+", width=3)
+  J8jogPosBut.grid(row=0, column=2, sticky="e", padx=(2, 0))
+
+  _bind_joint_jog_buttons(7, J8jogNegBut, J8jogPosBut)
+
+  def J8sliderUpdate(foo):
+    J8slideLimLab.config(state="normal")
+    J8slideLimLab.delete(0, END)
+    J8slideLimLab.insert(0, round(float(J8jogslide.get()),2))
+    J8slideLimLab.config(state="readonly")
+  J8jogslide.config(command=J8sliderUpdate)
+
+  # J9 Frame
+  J9jogFrame = Frame(extraAxesFrame, relief="raised", borderwidth=1, padding=5)
+  J9jogFrame.grid(row=0, column=2, sticky="nsew", padx=2, pady=2)
+
+  J9jogFrame.grid_columnconfigure(0, weight=1)
+  J9jogFrame.grid_columnconfigure(1, weight=0)
+  J9jogFrame.grid_columnconfigure(2, weight=1)
+
+  J9Lab = Label(J9jogFrame, font=("Arial", 12), text="9th Axis")
+  J9Lab.grid(row=0, column=0, columnspan=3, pady=2)
+
+  J9negLimLab = Label(J9jogFrame, font=("Arial", 8), text="0.00", style="Jointlim.TLabel")
+  J9negLimLab.grid(row=1, column=0, sticky="w", padx=2)
+  J9curAngEntryField = Entry(J9jogFrame, width=8, justify="center")
+  J9curAngEntryField.grid(row=1, column=1, padx=5)
+  J9posLimLab = Label(J9jogFrame, font=("Arial", 8), text="0", style="Jointlim.TLabel")
+  J9posLimLab.grid(row=1, column=2, sticky="e", padx=2)
+
+  J9jogslide = Scale(J9jogFrame, from_=0, to=0, orient=HORIZONTAL, length=120)
+  J9jogslide.grid(row=2, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
+
+  # Create frame for button layout (- entry +)
+  J9buttonFrame = Frame(J9jogFrame)
+  J9buttonFrame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
+
+  J9buttonFrame.grid_columnconfigure(0, weight=1)
+  J9buttonFrame.grid_columnconfigure(1, weight=0)
+  J9buttonFrame.grid_columnconfigure(2, weight=1)
+
+  J9jogNegBut = Button(J9buttonFrame, text="-", width=3)
+  J9jogNegBut.grid(row=0, column=0, sticky="w", padx=(0, 2))
+
+  J9slideLimLab = Entry(J9buttonFrame, width=8, justify="center", state="readonly")
+  J9slideLimLab.grid(row=0, column=1, padx=2)
+
+  J9jogPosBut = Button(J9buttonFrame, text="+", width=3)
+  J9jogPosBut.grid(row=0, column=2, sticky="e", padx=(2, 0))
+
+  _bind_joint_jog_buttons(8, J9jogNegBut, J9jogPosBut)
+
+  def J9sliderUpdate(foo):
+    J9slideLimLab.config(state="normal")
+    J9slideLimLab.delete(0, END)
+    J9slideLimLab.insert(0, round(float(J9jogslide.get()),2))
+    J9slideLimLab.config(state="readonly")
+  J9jogslide.config(command=J9sliderUpdate)
+
+  _bind_joint_target_sliders((
     J1jogslide, J2jogslide, J3jogslide,
     J4jogslide, J5jogslide, J6jogslide,
     J7jogslide, J8jogslide, J9jogslide,
-  ),
-  target_markers=(
-    GhostSliderMarker(
-      J1jogFrame, J1jogslide, TARGET_MARKER_ROLE
+  ))
+
+  joint_motion_visualization = JointMotionVisualization(
+    sliders=(
+      J1jogslide, J2jogslide, J3jogslide,
+      J4jogslide, J5jogslide, J6jogslide,
+      J7jogslide, J8jogslide, J9jogslide,
     ),
-    GhostSliderMarker(
-      J2jogFrame, J2jogslide, TARGET_MARKER_ROLE
+    target_markers=(
+      GhostSliderMarker(
+        J1jogFrame, J1jogslide, TARGET_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J2jogFrame, J2jogslide, TARGET_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J3jogFrame, J3jogslide, TARGET_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J4jogFrame, J4jogslide, TARGET_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J5jogFrame, J5jogslide, TARGET_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J6jogFrame, J6jogslide, TARGET_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J7jogFrame, J7jogslide, TARGET_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J8jogFrame, J8jogslide, TARGET_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J9jogFrame, J9jogslide, TARGET_MARKER_ROLE
+      ),
     ),
-    GhostSliderMarker(
-      J3jogFrame, J3jogslide, TARGET_MARKER_ROLE
+    estimated_markers=(
+      GhostSliderMarker(
+        J1jogFrame, J1jogslide, ESTIMATED_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J2jogFrame, J2jogslide, ESTIMATED_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J3jogFrame, J3jogslide, ESTIMATED_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J4jogFrame, J4jogslide, ESTIMATED_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J5jogFrame, J5jogslide, ESTIMATED_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J6jogFrame, J6jogslide, ESTIMATED_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J7jogFrame, J7jogslide, ESTIMATED_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J8jogFrame, J8jogslide, ESTIMATED_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J9jogFrame, J9jogslide, ESTIMATED_MARKER_ROLE
+      ),
     ),
-    GhostSliderMarker(
-      J4jogFrame, J4jogslide, TARGET_MARKER_ROLE
+    encoder_markers=(
+      GhostSliderMarker(
+        J1jogFrame, J1jogslide, ENCODER_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J2jogFrame, J2jogslide, ENCODER_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J3jogFrame, J3jogslide, ENCODER_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J4jogFrame, J4jogslide, ENCODER_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J5jogFrame, J5jogslide, ENCODER_MARKER_ROLE
+      ),
+      GhostSliderMarker(
+        J6jogFrame, J6jogslide, ENCODER_MARKER_ROLE
+      ),
     ),
-    GhostSliderMarker(
-      J5jogFrame, J5jogslide, TARGET_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J6jogFrame, J6jogslide, TARGET_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J7jogFrame, J7jogslide, TARGET_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J8jogFrame, J8jogslide, TARGET_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J9jogFrame, J9jogslide, TARGET_MARKER_ROLE
-    ),
-  ),
-  estimated_markers=(
-    GhostSliderMarker(
-      J1jogFrame, J1jogslide, ESTIMATED_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J2jogFrame, J2jogslide, ESTIMATED_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J3jogFrame, J3jogslide, ESTIMATED_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J4jogFrame, J4jogslide, ESTIMATED_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J5jogFrame, J5jogslide, ESTIMATED_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J6jogFrame, J6jogslide, ESTIMATED_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J7jogFrame, J7jogslide, ESTIMATED_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J8jogFrame, J8jogslide, ESTIMATED_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J9jogFrame, J9jogslide, ESTIMATED_MARKER_ROLE
-    ),
-  ),
-  encoder_markers=(
-    GhostSliderMarker(
-      J1jogFrame, J1jogslide, ENCODER_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J2jogFrame, J2jogslide, ENCODER_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J3jogFrame, J3jogslide, ENCODER_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J4jogFrame, J4jogslide, ENCODER_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J5jogFrame, J5jogslide, ENCODER_MARKER_ROLE
-    ),
-    GhostSliderMarker(
-      J6jogFrame, J6jogslide, ENCODER_MARKER_ROLE
-    ),
-  ),
-  estimated_enabled_provider=RUN['showEstimatedMotion'].get,
-  encoder_enabled_provider=RUN['showEncoderTelemetry'].get,
-  actual_source_provider=_current_joint_actual_position_source,
-)
-
-# Command builders (IF, SET, WAIT - reordered and aligned)
-cmdFrame = LabelFrame(rightPanel, text="Command Builders", padding=5)
-cmdFrame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=(5, 2))
-
-# Configure columns for proper alignment
-cmdFrame.grid_columnconfigure(0, weight=0, minsize=45)   # Label
-cmdFrame.grid_columnconfigure(1, weight=0, minsize=130)  # Type dropdown
-cmdFrame.grid_columnconfigure(2, weight=0, minsize=60)   # Var entry
-cmdFrame.grid_columnconfigure(3, weight=0, minsize=25)   # "="
-cmdFrame.grid_columnconfigure(4, weight=0, minsize=60)   # Value entry
-cmdFrame.grid_columnconfigure(5, weight=0, minsize=100)  # Action dropdown (IF only)
-cmdFrame.grid_columnconfigure(6, weight=0, minsize=80)   # Dest entry / Timeout entry
-cmdFrame.grid_columnconfigure(7, weight=0, minsize=25)   # "•"
-cmdFrame.grid_columnconfigure(8, weight=1, minsize=120)  # Insert button
-
-# Create StringVars for OptionMenus
-iFoption = StringVar(cmdFrame)
-iFoption.set("5v Input")
-iFselection = StringVar(cmdFrame)
-iFselection.set("Call Prog")
-waitoption = StringVar(cmdFrame)
-waitoption.set("5v Input")
-setoption = StringVar(cmdFrame)
-setoption.set("5v Output")
-
-# Row 0: IF command - IF [Type] [Var#] = [Value] [Action] [Dest] • [Insert]
-Label(cmdFrame, text="IF", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="w", padx=(2, 5), pady=2)
-
-iFmenu = OptionMenu(cmdFrame, iFoption, "5v Input", "5v Input", "Register", "COM Device", "MB Coil", "MB Input", "MB Hold Reg", "MB Input Reg")
-iFmenu.config(width=12)
-iFmenu.grid(row=0, column=1, sticky="ew", padx=2, pady=2)
+    estimated_enabled_provider=RUN['showEstimatedMotion'].get,
+    encoder_enabled_provider=RUN['showEncoderTelemetry'].get,
+    actual_source_provider=_current_joint_actual_position_source,
+  )
 
-IfVarEntryField = Entry(cmdFrame, width=6, justify="center")
-IfVarEntryField.grid(row=0, column=2, sticky="ew", padx=2, pady=2)
+  # Command builders (IF, SET, WAIT - reordered and aligned)
+  cmdFrame = LabelFrame(rightPanel, text="Command Builders", padding=5)
+  cmdFrame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=(5, 2))
 
-Label(cmdFrame, text="=").grid(row=0, column=3, padx=2)
+  # Configure columns for proper alignment
+  cmdFrame.grid_columnconfigure(0, weight=0, minsize=45)   # Label
+  cmdFrame.grid_columnconfigure(1, weight=0, minsize=130)  # Type dropdown
+  cmdFrame.grid_columnconfigure(2, weight=0, minsize=60)   # Var entry
+  cmdFrame.grid_columnconfigure(3, weight=0, minsize=25)   # "="
+  cmdFrame.grid_columnconfigure(4, weight=0, minsize=60)   # Value entry
+  cmdFrame.grid_columnconfigure(5, weight=0, minsize=100)  # Action dropdown (IF only)
+  cmdFrame.grid_columnconfigure(6, weight=0, minsize=80)   # Dest entry / Timeout entry
+  cmdFrame.grid_columnconfigure(7, weight=0, minsize=25)   # "•"
+  cmdFrame.grid_columnconfigure(8, weight=1, minsize=120)  # Insert button
 
-IfInputEntryField = Entry(cmdFrame, width=6, justify="center")
-IfInputEntryField.grid(row=0, column=4, sticky="ew", padx=2, pady=2)
+  # Create StringVars for OptionMenus
+  iFoption = StringVar(cmdFrame)
+  iFoption.set("5v Input")
+  iFselection = StringVar(cmdFrame)
+  iFselection.set("Call Prog")
+  waitoption = StringVar(cmdFrame)
+  waitoption.set("5v Input")
+  setoption = StringVar(cmdFrame)
+  setoption.set("5v Output")
 
-iFSelmenu = OptionMenu(cmdFrame, iFselection, "Call Prog", "Call Prog", "Jump Tab", "Stop")
-iFSelmenu.config(width=9)
-iFSelmenu.grid(row=0, column=5, sticky="ew", padx=2, pady=2)
+  # Row 0: IF command - IF [Type] [Var#] = [Value] [Action] [Dest] • [Insert]
+  Label(cmdFrame, text="IF", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="w", padx=(2, 5), pady=2)
 
-IfDestEntryField = Entry(cmdFrame, width=8, justify="center")
-IfDestEntryField.grid(row=0, column=6, sticky="ew", padx=2, pady=2)
+  iFmenu = OptionMenu(cmdFrame, iFoption, "5v Input", "5v Input", "Register", "COM Device", "MB Coil", "MB Input", "MB Hold Reg", "MB Input Reg")
+  iFmenu.config(width=12)
+  iFmenu.grid(row=0, column=1, sticky="ew", padx=2, pady=2)
 
-Label(cmdFrame, text="•").grid(row=0, column=7, padx=2)
+  IfVarEntryField = Entry(cmdFrame, width=6, justify="center")
+  IfVarEntryField.grid(row=0, column=2, sticky="ew", padx=2, pady=2)
 
-insertIFBut = ttk.Button(cmdFrame, text="Insert IF CMD", command=IfCMDInsert)
-insertIFBut.grid(row=0, column=8, sticky="ew", padx=2, pady=2)
+  Label(cmdFrame, text="=").grid(row=0, column=3, padx=2)
 
-# Row 1: SET command - SET [Type] [Var#] = [Value] • [Insert]
-Label(cmdFrame, text="SET", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="w", padx=(2, 5), pady=2)
+  IfInputEntryField = Entry(cmdFrame, width=6, justify="center")
+  IfInputEntryField.grid(row=0, column=4, sticky="ew", padx=2, pady=2)
 
-setmenu = OptionMenu(cmdFrame, setoption, "5v Output", "5v Output", "MB Coil", "MB Register")
-setmenu.config(width=12)
-setmenu.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
+  iFSelmenu = OptionMenu(cmdFrame, iFselection, "Call Prog", "Call Prog", "Jump Tab", "Stop")
+  iFSelmenu.config(width=9)
+  iFSelmenu.grid(row=0, column=5, sticky="ew", padx=2, pady=2)
 
-setVarEntryField = Entry(cmdFrame, width=6, justify="center")
-setVarEntryField.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
+  IfDestEntryField = Entry(cmdFrame, width=8, justify="center")
+  IfDestEntryField.grid(row=0, column=6, sticky="ew", padx=2, pady=2)
 
-Label(cmdFrame, text="=").grid(row=1, column=3, padx=2)
+  Label(cmdFrame, text="•").grid(row=0, column=7, padx=2)
 
-setInputEntryField = Entry(cmdFrame, width=6, justify="center")
-setInputEntryField.grid(row=1, column=4, sticky="ew", padx=2, pady=2)
+  insertIFBut = ttk.Button(cmdFrame, text="Insert IF CMD", command=IfCMDInsert)
+  insertIFBut.grid(row=0, column=8, sticky="ew", padx=2, pady=2)
 
-Label(cmdFrame, text="•").grid(row=1, column=7, padx=2)
+  # Row 1: SET command - SET [Type] [Var#] = [Value] • [Insert]
+  Label(cmdFrame, text="SET", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="w", padx=(2, 5), pady=2)
 
-insertSetBut = ttk.Button(cmdFrame, text="Insert set CMD", command=SetCMDInsert)
-insertSetBut.grid(row=1, column=8, sticky="ew", padx=2, pady=2)
+  setmenu = OptionMenu(cmdFrame, setoption, "5v Output", "5v Output", "MB Coil", "MB Register")
+  setmenu.config(width=12)
+  setmenu.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
 
-# Row 2: WAIT command - WAIT [Type] [Var#] = [Value] Timeout = [Time] • [Insert]
-Label(cmdFrame, text="WAIT", font=("Arial", 10, "bold")).grid(row=2, column=0, sticky="w", padx=(2, 5), pady=2)
+  setVarEntryField = Entry(cmdFrame, width=6, justify="center")
+  setVarEntryField.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
 
-waitmenu = OptionMenu(cmdFrame, waitoption, "5v Input", "5v Input", "MB Coil", "MB Input", "MB Hold Reg")
-waitmenu.config(width=12)
-waitmenu.grid(row=2, column=1, sticky="ew", padx=2, pady=2)
+  Label(cmdFrame, text="=").grid(row=1, column=3, padx=2)
 
-waitVarEntryField = Entry(cmdFrame, width=6, justify="center")
-waitVarEntryField.grid(row=2, column=2, sticky="ew", padx=2, pady=2)
+  setInputEntryField = Entry(cmdFrame, width=6, justify="center")
+  setInputEntryField.grid(row=1, column=4, sticky="ew", padx=2, pady=2)
 
-Label(cmdFrame, text="=").grid(row=2, column=3, padx=2)
+  Label(cmdFrame, text="•").grid(row=1, column=7, padx=2)
 
-waitInputEntryField = Entry(cmdFrame, width=6, justify="center")
-waitInputEntryField.grid(row=2, column=4, sticky="ew", padx=2, pady=2)
+  insertSetBut = ttk.Button(cmdFrame, text="Insert set CMD", command=SetCMDInsert)
+  insertSetBut.grid(row=1, column=8, sticky="ew", padx=2, pady=2)
 
-Label(cmdFrame, text="Timeout =").grid(row=2, column=5, sticky="e", padx=2)
+  # Row 2: WAIT command - WAIT [Type] [Var#] = [Value] Timeout = [Time] • [Insert]
+  Label(cmdFrame, text="WAIT", font=("Arial", 10, "bold")).grid(row=2, column=0, sticky="w", padx=(2, 5), pady=2)
 
-waitTimeoutEntryField = Entry(cmdFrame, width=6, justify="center")
-waitTimeoutEntryField.grid(row=2, column=6, sticky="ew", padx=2, pady=2)
+  waitmenu = OptionMenu(cmdFrame, waitoption, "5v Input", "5v Input", "MB Coil", "MB Input", "MB Hold Reg")
+  waitmenu.config(width=12)
+  waitmenu.grid(row=2, column=1, sticky="ew", padx=2, pady=2)
 
-Label(cmdFrame, text="•").grid(row=2, column=7, padx=2)
+  waitVarEntryField = Entry(cmdFrame, width=6, justify="center")
+  waitVarEntryField.grid(row=2, column=2, sticky="ew", padx=2, pady=2)
 
-insertWaitBut = ttk.Button(cmdFrame, text="Insert WAIT CMD", command=WaitCMDInsert)
-insertWaitBut.grid(row=2, column=8, sticky="ew", padx=2, pady=2)
+  Label(cmdFrame, text="=").grid(row=2, column=3, padx=2)
 
-# Navigation container (2x2 grid layout)
-navFrame = LabelFrame(rightPanel, text="Navigation", padding=5)
-navFrame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+  waitInputEntryField = Entry(cmdFrame, width=6, justify="center")
+  waitInputEntryField.grid(row=2, column=4, sticky="ew", padx=2, pady=2)
 
-# Configure 4 columns for 2x2 grid (button, entry, button, entry)
-navFrame.grid_columnconfigure(0, weight=1, minsize=100)  # Button 1
-navFrame.grid_columnconfigure(1, weight=1, minsize=80)   # Entry 1
-navFrame.grid_columnconfigure(2, weight=1, minsize=100)  # Button 2
-navFrame.grid_columnconfigure(3, weight=1, minsize=80)   # Entry 2
+  Label(cmdFrame, text="Timeout =").grid(row=2, column=5, sticky="e", padx=2)
 
-# Row 0: Create Tab | Call Program
-createTabBut = ttk.Button(navFrame, text="Create Tab", command=tabNumber)
-createTabBut.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
+  waitTimeoutEntryField = Entry(cmdFrame, width=6, justify="center")
+  waitTimeoutEntryField.grid(row=2, column=6, sticky="ew", padx=2, pady=2)
 
-tabNumEntryField = Entry(navFrame, width=8, justify="center")
-tabNumEntryField.grid(row=0, column=1, sticky="ew", padx=2, pady=2)
+  Label(cmdFrame, text="•").grid(row=2, column=7, padx=2)
 
-callProgBut = ttk.Button(navFrame, text="Call Program", command=insertCallProg)
-callProgBut.grid(row=0, column=2, sticky="ew", padx=2, pady=2)
+  insertWaitBut = ttk.Button(cmdFrame, text="Insert WAIT CMD", command=WaitCMDInsert)
+  insertWaitBut.grid(row=2, column=8, sticky="ew", padx=2, pady=2)
+
+  # Navigation container (2x2 grid layout)
+  navFrame = LabelFrame(rightPanel, text="Navigation", padding=5)
+  navFrame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+
+  # Configure 4 columns for 2x2 grid (button, entry, button, entry)
+  navFrame.grid_columnconfigure(0, weight=1, minsize=100)  # Button 1
+  navFrame.grid_columnconfigure(1, weight=1, minsize=80)   # Entry 1
+  navFrame.grid_columnconfigure(2, weight=1, minsize=100)  # Button 2
+  navFrame.grid_columnconfigure(3, weight=1, minsize=80)   # Entry 2
+
+  # Row 0: Create Tab | Call Program
+  createTabBut = ttk.Button(navFrame, text="Create Tab", command=tabNumber)
+  createTabBut.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
 
-changeProgEntryField = Entry(navFrame, width=8, justify="center")
-changeProgEntryField.grid(row=0, column=3, sticky="ew", padx=2, pady=2)
+  tabNumEntryField = Entry(navFrame, width=8, justify="center")
+  tabNumEntryField.grid(row=0, column=1, sticky="ew", padx=2, pady=2)
 
-# Row 1: Jump to Tab | Play Gcode
-jumpTabBut = ttk.Button(navFrame, text="Jump to Tab", command=jumpTab)
-jumpTabBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
+  callProgBut = ttk.Button(navFrame, text="Call Program", command=insertCallProg)
+  callProgBut.grid(row=0, column=2, sticky="ew", padx=2, pady=2)
 
-jumpTabEntryField = Entry(navFrame, width=8, justify="center")
-jumpTabEntryField.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
+  changeProgEntryField = Entry(navFrame, width=8, justify="center")
+  changeProgEntryField.grid(row=0, column=3, sticky="ew", padx=2, pady=2)
 
-playGcodeBut = ttk.Button(navFrame, text="Play Gcode", command=insertGCprog)
-playGcodeBut.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
+  # Row 1: Jump to Tab | Play Gcode
+  jumpTabBut = ttk.Button(navFrame, text="Jump to Tab", command=jumpTab)
+  jumpTabBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
 
-PlayGCEntryField = Entry(navFrame, width=8, justify="center")
-PlayGCEntryField.grid(row=1, column=3, sticky="ew", padx=2, pady=2)
+  jumpTabEntryField = Entry(navFrame, width=8, justify="center")
+  jumpTabEntryField.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
 
-# Register Commands container
-regFrame = LabelFrame(rightPanel, text="Register Commands", padding=5)
-regFrame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+  playGcodeBut = ttk.Button(navFrame, text="Play Gcode", command=insertGCprog)
+  playGcodeBut.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
 
-# Configure columns for side-by-side layout
-regFrame.grid_columnconfigure(0, weight=1, minsize=120)  # Register button
-regFrame.grid_columnconfigure(1, weight=0, minsize=60)   # Register entry
-regFrame.grid_columnconfigure(2, weight=0, minsize=60)   # (++/--) entry
-regFrame.grid_columnconfigure(3, weight=1, minsize=140)  # Position Register button
-regFrame.grid_columnconfigure(4, weight=0, minsize=60)   # Pos Reg entry
-regFrame.grid_columnconfigure(5, weight=0, minsize=60)   # Element entry
-regFrame.grid_columnconfigure(6, weight=0, minsize=60)   # (++/--) entry
+  PlayGCEntryField = Entry(navFrame, width=8, justify="center")
+  PlayGCEntryField.grid(row=1, column=3, sticky="ew", padx=2, pady=2)
 
-# Row 0: Labels
-Label(regFrame, text="Register", font=("Arial", 8)).grid(row=0, column=1, sticky="w", padx=2)
-Label(regFrame, text="(++/--)", font=("Arial", 8)).grid(row=0, column=2, sticky="w", padx=2)
-Label(regFrame, text="Pos Reg", font=("Arial", 8)).grid(row=0, column=4, sticky="w", padx=2)
-Label(regFrame, text="Element", font=("Arial", 8)).grid(row=0, column=5, sticky="w", padx=2)
-Label(regFrame, text="(++/--)", font=("Arial", 8)).grid(row=0, column=6, sticky="w", padx=2)
+  # Register Commands container
+  regFrame = LabelFrame(rightPanel, text="Register Commands", padding=5)
+  regFrame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
 
-# Row 1: Buttons and entry fields
-RegNumBut = ttk.Button(regFrame, text="Register", command=insertRegister)
-RegNumBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
+  # Configure columns for side-by-side layout
+  regFrame.grid_columnconfigure(0, weight=1, minsize=120)  # Register button
+  regFrame.grid_columnconfigure(1, weight=0, minsize=60)   # Register entry
+  regFrame.grid_columnconfigure(2, weight=0, minsize=60)   # (++/--) entry
+  regFrame.grid_columnconfigure(3, weight=1, minsize=140)  # Position Register button
+  regFrame.grid_columnconfigure(4, weight=0, minsize=60)   # Pos Reg entry
+  regFrame.grid_columnconfigure(5, weight=0, minsize=60)   # Element entry
+  regFrame.grid_columnconfigure(6, weight=0, minsize=60)   # (++/--) entry
 
-regNumEntryField = Entry(regFrame, width=6, justify="center")
-regNumEntryField.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
+  # Row 0: Labels
+  Label(regFrame, text="Register", font=("Arial", 8)).grid(row=0, column=1, sticky="w", padx=2)
+  Label(regFrame, text="(++/--)", font=("Arial", 8)).grid(row=0, column=2, sticky="w", padx=2)
+  Label(regFrame, text="Pos Reg", font=("Arial", 8)).grid(row=0, column=4, sticky="w", padx=2)
+  Label(regFrame, text="Element", font=("Arial", 8)).grid(row=0, column=5, sticky="w", padx=2)
+  Label(regFrame, text="(++/--)", font=("Arial", 8)).grid(row=0, column=6, sticky="w", padx=2)
 
-regEqEntryField = Entry(regFrame, width=6, justify="center")
-regEqEntryField.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
+  # Row 1: Buttons and entry fields
+  RegNumBut = ttk.Button(regFrame, text="Register", command=insertRegister)
+  RegNumBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
 
-StorPosBut = ttk.Button(regFrame, text="Position Register", command=storPos)
-StorPosBut.grid(row=1, column=3, sticky="ew", padx=(10, 2), pady=2)
+  regNumEntryField = Entry(regFrame, width=6, justify="center")
+  regNumEntryField.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
 
-storPosNumEntryField = Entry(regFrame, width=6, justify="center")
-storPosNumEntryField.grid(row=1, column=4, sticky="ew", padx=2, pady=2)
+  regEqEntryField = Entry(regFrame, width=6, justify="center")
+  regEqEntryField.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
 
-storPosElEntryField = Entry(regFrame, width=6, justify="center")
-storPosElEntryField.grid(row=1, column=5, sticky="ew", padx=2, pady=2)
+  StorPosBut = ttk.Button(regFrame, text="Position Register", command=storPos)
+  StorPosBut.grid(row=1, column=3, sticky="ew", padx=(10, 2), pady=2)
 
-storPosValEntryField = Entry(regFrame, width=6, justify="center")
-storPosValEntryField.grid(row=1, column=6, sticky="ew", padx=2, pady=2)
+  storPosNumEntryField = Entry(regFrame, width=6, justify="center")
+  storPosNumEntryField.grid(row=1, column=4, sticky="ew", padx=2, pady=2)
 
-# Aliases for compatibility
-posRegBut = StorPosBut
-posRegEntryField = storPosNumEntryField
+  storPosElEntryField = Entry(regFrame, width=6, justify="center")
+  storPosElEntryField.grid(row=1, column=5, sticky="ew", padx=2, pady=2)
 
-# Device Commands container
-devFrame = LabelFrame(rightPanel, text="Device Commands", padding=5)
-devFrame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+  storPosValEntryField = Entry(regFrame, width=6, justify="center")
+  storPosValEntryField.grid(row=1, column=6, sticky="ew", padx=2, pady=2)
 
-# Configure columns
-devFrame.grid_columnconfigure(0, weight=1, minsize=100)  # Servo button
-devFrame.grid_columnconfigure(1, weight=0, minsize=60)   # Number entry
-devFrame.grid_columnconfigure(2, weight=0, minsize=60)   # Position entry
-devFrame.grid_columnconfigure(3, weight=1, minsize=140)  # Read COM button
-devFrame.grid_columnconfigure(4, weight=0, minsize=60)   # Port entry
-devFrame.grid_columnconfigure(5, weight=0, minsize=60)   # Char entry
+  # Aliases for compatibility
+  posRegBut = StorPosBut
+  posRegEntryField = storPosNumEntryField
 
-# Row 0: Labels
-Label(devFrame, text="Number", font=("Arial", 8)).grid(row=0, column=1, sticky="w", padx=2)
-Label(devFrame, text="Position", font=("Arial", 8)).grid(row=0, column=2, sticky="w", padx=2)
-Label(devFrame, text="Port", font=("Arial", 8)).grid(row=0, column=4, sticky="w", padx=2)
-Label(devFrame, text="Char", font=("Arial", 8)).grid(row=0, column=5, sticky="w", padx=2)
+  # Device Commands container
+  devFrame = LabelFrame(rightPanel, text="Device Commands", padding=5)
+  devFrame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
 
-# Row 1: Buttons and entry fields
-servoBut = ttk.Button(devFrame, text="Servo", command=Servo)
-servoBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
+  # Configure columns
+  devFrame.grid_columnconfigure(0, weight=1, minsize=100)  # Servo button
+  devFrame.grid_columnconfigure(1, weight=0, minsize=60)   # Number entry
+  devFrame.grid_columnconfigure(2, weight=0, minsize=60)   # Position entry
+  devFrame.grid_columnconfigure(3, weight=1, minsize=140)  # Read COM button
+  devFrame.grid_columnconfigure(4, weight=0, minsize=60)   # Port entry
+  devFrame.grid_columnconfigure(5, weight=0, minsize=60)   # Char entry
 
-servoNumEntryField = Entry(devFrame, width=6, justify="center")
-servoNumEntryField.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
+  # Row 0: Labels
+  Label(devFrame, text="Number", font=("Arial", 8)).grid(row=0, column=1, sticky="w", padx=2)
+  Label(devFrame, text="Position", font=("Arial", 8)).grid(row=0, column=2, sticky="w", padx=2)
+  Label(devFrame, text="Port", font=("Arial", 8)).grid(row=0, column=4, sticky="w", padx=2)
+  Label(devFrame, text="Char", font=("Arial", 8)).grid(row=0, column=5, sticky="w", padx=2)
 
-servoPosEntryField = Entry(devFrame, width=6, justify="center")
-servoPosEntryField.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
+  # Row 1: Buttons and entry fields
+  servoBut = ttk.Button(devFrame, text="Servo", command=Servo)
+  servoBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
 
-readCOMBut = ttk.Button(devFrame, text="Read COM Device", command=ReadAuxCom)
-readCOMBut.grid(row=1, column=3, sticky="ew", padx=(10, 2), pady=2)
+  servoNumEntryField = Entry(devFrame, width=6, justify="center")
+  servoNumEntryField.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
 
-auxPortEntryField = Entry(devFrame, width=6, justify="center")
-auxPortEntryField.grid(row=1, column=4, sticky="ew", padx=2, pady=2)
+  servoPosEntryField = Entry(devFrame, width=6, justify="center")
+  servoPosEntryField.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
 
-auxCharEntryField = Entry(devFrame, width=6, justify="center")
-auxCharEntryField.grid(row=1, column=5, sticky="ew", padx=2, pady=2)
+  readCOMBut = ttk.Button(devFrame, text="Read COM Device", command=ReadAuxCom)
+  readCOMBut.grid(row=1, column=3, sticky="ew", padx=(10, 2), pady=2)
 
-##########################################################################
-### END OF TAB 1 REFACTORING
+  auxPortEntryField = Entry(devFrame, width=6, justify="center")
+  auxPortEntryField.grid(row=1, column=4, sticky="ew", padx=2, pady=2)
 
+  auxCharEntryField = Entry(devFrame, width=6, justify="center")
+  auxCharEntryField.grid(row=1, column=5, sticky="ew", padx=2, pady=2)
 
+  ##########################################################################
+  ### END OF TAB 1 REFACTORING
 
 
 
 
 
-####TAB 2
 
-# Configure tab2 main grid
-tab2.grid_rowconfigure(0, weight=0)  # Status bar
-tab2.grid_rowconfigure(1, weight=1)  # Main content (expands)
-tab2.grid_rowconfigure(2, weight=0)  # Commands and Save row
 
-tab2.grid_columnconfigure(0, weight=0, minsize=180)  # Communication
-tab2.grid_columnconfigure(1, weight=0, minsize=180)  # Robot Calibration
-tab2.grid_columnconfigure(2, weight=0, minsize=150)  # Calibration Offsets
-tab2.grid_columnconfigure(3, weight=0, minsize=150)  # Encoder Control
-tab2.grid_columnconfigure(4, weight=0, minsize=180)  # External Axes
-tab2.grid_columnconfigure(5, weight=0, minsize=150)  # Theme
-tab2.grid_columnconfigure(6, weight=0, minsize=180)  # Virtual Import
-tab2.grid_columnconfigure(7, weight=0, minsize=120)  # Save
-tab2.grid_columnconfigure(8, weight=1)  # Spacer (expands)
+  ####TAB 2
 
-# ============================================================================
-# ROW 0: Status/Alarm Label (spans all columns)
-# ============================================================================
-almStatusLab2 = Label(tab2, text="SYSTEM STARTING - PLEASE WAIT", style="OK.TLabel")
-almStatusLab2.grid(row=0, column=0, columnspan=9, sticky="w", padx=25, pady=20)
+  # Configure tab2 main grid
+  tab2.grid_rowconfigure(0, weight=0)  # Status bar
+  tab2.grid_rowconfigure(1, weight=1)  # Main content (expands)
+  tab2.grid_rowconfigure(2, weight=0)  # Commands and Save row
 
-# ============================================================================
-# ROW 1, COLUMN 0: Communication Frame
-# ============================================================================
-commFrame = LabelFrame(tab2, text="Communication", padding=10)
-commFrame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+  tab2.grid_columnconfigure(0, weight=0, minsize=180)  # Communication
+  tab2.grid_columnconfigure(1, weight=0, minsize=180)  # Robot Calibration
+  tab2.grid_columnconfigure(2, weight=0, minsize=150)  # Calibration Offsets
+  tab2.grid_columnconfigure(3, weight=0, minsize=150)  # Encoder Control
+  tab2.grid_columnconfigure(4, weight=0, minsize=180)  # External Axes
+  tab2.grid_columnconfigure(5, weight=0, minsize=150)  # Theme
+  tab2.grid_columnconfigure(6, weight=0, minsize=180)  # Virtual Import
+  tab2.grid_columnconfigure(7, weight=0, minsize=120)  # Save
+  tab2.grid_columnconfigure(8, weight=1)  # Spacer (expands)
 
-commFrame.grid_columnconfigure(0, weight=1)
+  # ============================================================================
+  # ROW 0: Status/Alarm Label (spans all columns)
+  # ============================================================================
+  almStatusLab2 = Label(tab2, text="SYSTEM STARTING - PLEASE WAIT", style="OK.TLabel")
+  almStatusLab2.grid(row=0, column=0, columnspan=9, sticky="w", padx=25, pady=20)
 
-def detect_ports():
-  from serial.tools import list_ports
-  ports = list(list_ports.comports())
-  choices = ["None"]
-  for index, port in enumerate(ports):
-    device = getattr(port, "device", None)
-    if (
-      not isinstance(device, str)
-      or not device
-      or device != device.strip()
+  # ============================================================================
+  # ROW 1, COLUMN 0: Communication Frame
+  # ============================================================================
+  commFrame = LabelFrame(tab2, text="Communication", padding=10)
+  commFrame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+  commFrame.grid_columnconfigure(0, weight=1)
+
+  serial_port_inventory = normalize_serial_ports(())
+  serial_discovery_failed = False
+  try:
+    serial_port_inventory = enumerate_serial_ports()
+  except Exception:
+    serial_discovery_failed = True
+    logger.warning("Initial passive serial-port discovery failed")
+
+  def rebuild_serial_port_menus(entries, target_menu=None):
+    for menu, variable, callback in (
+      (com1Select, com1SelectedValue, setCom),
+      (com2Select, com2SelectedValue, setCom2),
     ):
-      logger.warning(
-        "Ignoring invalid serial-port enumeration entry at index %s",
-        index,
-      )
-      continue
-    if device not in choices:
-      choices.append(device)
-  return choices
-
-port_choices = detect_ports()
-logger.debug(f"Available Comm Ports: {port_choices}")
-
-# Teensy COM Port
-ComPortLab = Label(commFrame, text="TEENSY COM PORT:")
-ComPortLab.grid(row=0, column=0, sticky="w", padx=5, pady=(5, 2))
-
-com1SelectedValue = tk.StringVar(value="None")
-com1Select = tk.OptionMenu(commFrame, com1SelectedValue, *port_choices, command=setCom)
-com1Select.grid(row=1, column=0, sticky="ew", padx=5, pady=2)
-
-AuxiliaryBoardLab = Label(commFrame, text="5v IO BOARD PROFILE:")
-AuxiliaryBoardLab.grid(row=2, column=0, sticky="w", padx=5, pady=(15, 2))
-
-auxiliaryBoardSelectedValue = tk.StringVar(value=AUXILIARY_BOARD_NONE)
-auxiliaryBoardSelect = tk.OptionMenu(
-  commFrame,
-  auxiliaryBoardSelectedValue,
-  AUXILIARY_BOARD_NONE,
-  AUXILIARY_BOARD_NANO,
-  AUXILIARY_BOARD_MEGA,
-  command=setCom2,
-)
-auxiliaryBoardSelect.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
-
-# 5v IO Board COM Port
-ComPortLab2 = Label(commFrame, text="5v IO BOARD COM PORT:")
-ComPortLab2.grid(row=4, column=0, sticky="w", padx=5, pady=(15, 2))
-
-com2SelectedValue = tk.StringVar(value="None")
-com2Select = tk.OptionMenu(commFrame, com2SelectedValue, *port_choices, command=setCom2)
-com2Select.grid(row=5, column=0, sticky="ew", padx=5, pady=2)
-
-# ============================================================================
-# ROW 1, COLUMN 1: Robot Calibration Frame
-# ============================================================================
-calFrame = LabelFrame(tab2, text="Robot Calibration", padding=10)
-calFrame.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
-
-calFrame.grid_columnconfigure(0, weight=1)
-
-# Auto Calibrate button
-autoCalBut = Button(calFrame, text="  Auto Calibrate  ", command=startCalRobotAll)
-autoCalBut.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
-
-# First set of checkboxes (J1-J9)
-checkFrame1 = Frame(calFrame)
-checkFrame1.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
-
-checkFrame1.grid_columnconfigure(0, weight=1)
-checkFrame1.grid_columnconfigure(1, weight=1)
-checkFrame1.grid_columnconfigure(2, weight=1)
-
-J1calCbut = Checkbutton(checkFrame1, text="J1", variable=CAL['J1CalStatVal'])
-J1calCbut.grid(row=0, column=0, sticky="w", padx=2)
-
-J2calCbut = Checkbutton(checkFrame1, text="J2", variable=CAL['J2CalStatVal'])
-J2calCbut.grid(row=0, column=1, sticky="w", padx=2)
-
-J3calCbut = Checkbutton(checkFrame1, text="J3", variable=CAL['J3CalStatVal'])
-J3calCbut.grid(row=0, column=2, sticky="w", padx=2)
-
-J4calCbut = Checkbutton(checkFrame1, text="J4", variable=CAL['J4CalStatVal'])
-J4calCbut.grid(row=1, column=0, sticky="w", padx=2)
-
-J5calCbut = Checkbutton(checkFrame1, text="J5", variable=CAL['J5CalStatVal'])
-J5calCbut.grid(row=1, column=1, sticky="w", padx=2)
-
-J6calCbut = Checkbutton(checkFrame1, text="J6", variable=CAL['J6CalStatVal'])
-J6calCbut.grid(row=1, column=2, sticky="w", padx=2)
-
-J7calCbut = Checkbutton(checkFrame1, text="J7", variable=CAL['J7CalStatVal'])
-J7calCbut.grid(row=2, column=0, sticky="w", padx=2)
-
-J8calCbut = Checkbutton(checkFrame1, text="J8", variable=CAL['J8CalStatVal'])
-J8calCbut.grid(row=2, column=1, sticky="w", padx=2)
-
-J9calCbut = Checkbutton(checkFrame1, text="J9", variable=CAL['J9CalStatVal'])
-J9calCbut.grid(row=2, column=2, sticky="w", padx=2)
-
-# Second set of checkboxes (J1-J9)
-checkFrame2 = Frame(calFrame)
-checkFrame2.grid(row=2, column=0, sticky="ew", padx=5, pady=(10, 5))
-
-checkFrame2.grid_columnconfigure(0, weight=1)
-checkFrame2.grid_columnconfigure(1, weight=1)
-checkFrame2.grid_columnconfigure(2, weight=1)
-
-J1calCbut2 = Checkbutton(checkFrame2, text="J1", variable=CAL['J1CalStatVal2'])
-J1calCbut2.grid(row=0, column=0, sticky="w", padx=2)
-
-J2calCbut2 = Checkbutton(checkFrame2, text="J2", variable=CAL['J2CalStatVal2'])
-J2calCbut2.grid(row=0, column=1, sticky="w", padx=2)
-
-J3calCbut2 = Checkbutton(checkFrame2, text="J3", variable=CAL['J3CalStatVal2'])
-J3calCbut2.grid(row=0, column=2, sticky="w", padx=2)
-
-J4calCbut2 = Checkbutton(checkFrame2, text="J4", variable=CAL['J4CalStatVal2'])
-J4calCbut2.grid(row=1, column=0, sticky="w", padx=2)
-
-J5calCbut2 = Checkbutton(checkFrame2, text="J5", variable=CAL['J5CalStatVal2'])
-J5calCbut2.grid(row=1, column=1, sticky="w", padx=2)
-
-J6calCbut2 = Checkbutton(checkFrame2, text="J6", variable=CAL['J6CalStatVal2'])
-J6calCbut2.grid(row=1, column=2, sticky="w", padx=2)
-
-J7calCbut2 = Checkbutton(checkFrame2, text="J7", variable=CAL['J7CalStatVal2'])
-J7calCbut2.grid(row=2, column=0, sticky="w", padx=2)
-
-J8calCbut2 = Checkbutton(checkFrame2, text="J8", variable=CAL['J8CalStatVal2'])
-J8calCbut2.grid(row=2, column=1, sticky="w", padx=2)
-
-J9calCbut2 = Checkbutton(checkFrame2, text="J9", variable=CAL['J9CalStatVal2'])
-J9calCbut2.grid(row=2, column=2, sticky="w", padx=2)
-
-# Individual calibration buttons (EXACT names from original)
-CalJ1But = Button(calFrame, text="Calibrate J1 Only", command=startCalRobotJ1)
-CalJ1But.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
-
-CalJ2But = Button(calFrame, text="Calibrate J2 Only", command=startCalRobotJ2)
-CalJ2But.grid(row=4, column=0, sticky="ew", padx=5, pady=2)
-
-CalJ3But = Button(calFrame, text="Calibrate J3 Only", command=startCalRobotJ3)
-CalJ3But.grid(row=5, column=0, sticky="ew", padx=5, pady=2)
-
-CalJ4But = Button(calFrame, text="Calibrate J4 Only", command=startCalRobotJ4)
-CalJ4But.grid(row=6, column=0, sticky="ew", padx=5, pady=2)
-
-CalJ5But = Button(calFrame, text="Calibrate J5 Only", command=startCalRobotJ5)
-CalJ5But.grid(row=7, column=0, sticky="ew", padx=5, pady=2)
-
-CalJ6But = Button(calFrame, text="Calibrate J6 Only", command=startCalRobotJ6)
-CalJ6But.grid(row=8, column=0, sticky="ew", padx=5, pady=(5,20))
-
-ForceCalHomeBut = Button(calFrame, text="Force Cal Home", command=CalZeroPos)
-ForceCalHomeBut.grid(row=9, column=0, sticky="ew", padx=5, pady=2)
-
-ForceCalHomeBut = Button(calFrame, text="Force Cal Rest", command=CalRestPos)
-ForceCalHomeBut.grid(row=10, column=0, sticky="ew", padx=5, pady=2)
-
-
-# ============================================================================
-# ROW 1, COLUMN 2: Calibration Offsets Frame
-# ============================================================================
-calOffsetFrame = LabelFrame(tab2, text="Calibration Offsets", padding=10)
-calOffsetFrame.grid(row=1, column=2, sticky="nsew", padx=5, pady=5)
-
-calOffsetFrame.grid_columnconfigure(0, weight=1)
-calOffsetFrame.grid_columnconfigure(1, weight=1)
-
-# J1 Offset
-J1calLab = Label(calOffsetFrame, text="J1 Offset")
-J1calLab.grid(row=0, column=0, sticky="e", padx=2, pady=2)
-J1calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
-J1calOffEntryField.grid(row=0, column=1, sticky="w", padx=2, pady=2)
-
-# J2 Offset
-J2calLab = Label(calOffsetFrame, text="J2 Offset")
-J2calLab.grid(row=1, column=0, sticky="e", padx=2, pady=2)
-J2calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
-J2calOffEntryField.grid(row=1, column=1, sticky="w", padx=2, pady=2)
-
-# J3 Offset
-J3calLab = Label(calOffsetFrame, text="J3 Offset")
-J3calLab.grid(row=2, column=0, sticky="e", padx=2, pady=2)
-J3calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
-J3calOffEntryField.grid(row=2, column=1, sticky="w", padx=2, pady=2)
-
-# J4 Offset
-J4calLab = Label(calOffsetFrame, text="J4 Offset")
-J4calLab.grid(row=3, column=0, sticky="e", padx=2, pady=2)
-J4calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
-J4calOffEntryField.grid(row=3, column=1, sticky="w", padx=2, pady=2)
-
-# J5 Offset
-J5calLab = Label(calOffsetFrame, text="J5 Offset")
-J5calLab.grid(row=4, column=0, sticky="e", padx=2, pady=2)
-J5calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
-J5calOffEntryField.grid(row=4, column=1, sticky="w", padx=2, pady=2)
-
-# J6 Offset
-J6calLab = Label(calOffsetFrame, text="J6 Offset")
-J6calLab.grid(row=5, column=0, sticky="e", padx=2, pady=2)
-J6calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
-J6calOffEntryField.grid(row=5, column=1, sticky="w", padx=2, pady=2)
-
-# J7 Offset
-J7calLab = Label(calOffsetFrame, text="J7 Offset")
-J7calLab.grid(row=6, column=0, sticky="e", padx=2, pady=2)
-J7calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
-J7calOffEntryField.grid(row=6, column=1, sticky="w", padx=2, pady=2)
-
-# J8 Offset
-J8calLab = Label(calOffsetFrame, text="J8 Offset")
-J8calLab.grid(row=7, column=0, sticky="e", padx=2, pady=2)
-J8calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
-J8calOffEntryField.grid(row=7, column=1, sticky="w", padx=2, pady=2)
-
-# J9 Offset
-J9calLab = Label(calOffsetFrame, text="J9 Offset")
-J9calLab.grid(row=8, column=0, sticky="e", padx=2, pady=2)
-J9calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
-J9calOffEntryField.grid(row=8, column=1, sticky="w", padx=2, pady=2)
-
-
-# ============================================================================
-# ROW 1, COLUMN 3: Encoder Control Frame
-# ============================================================================
-encoderFrame = LabelFrame(tab2, text="Encoder Control", padding=10)
-encoderFrame.grid(row=1, column=3, sticky="nsew", padx=5, pady=5)
-
-encoderFrame.grid_columnconfigure(0, weight=1)
-
-# J1 Open Loop
-J1OpenLoopCbut = Checkbutton(encoderFrame, text="J1 Open Loop (disable encoder)", variable=CAL['J1OpenLoopVal'])
-J1OpenLoopCbut.grid(row=0, column=0, sticky="w", padx=5, pady=2)
-
-# J2 Open Loop
-J2OpenLoopCbut = Checkbutton(encoderFrame, text="J2 Open Loop (disable encoder)", variable=CAL['J2OpenLoopVal'])
-J2OpenLoopCbut.grid(row=1, column=0, sticky="w", padx=5, pady=2)
-
-# J3 Open Loop
-J3OpenLoopCbut = Checkbutton(encoderFrame, text="J3 Open Loop (disable encoder)", variable=CAL['J3OpenLoopVal'])
-J3OpenLoopCbut.grid(row=2, column=0, sticky="w", padx=5, pady=2)
-
-# J4 Open Loop
-J4OpenLoopCbut = Checkbutton(encoderFrame, text="J4 Open Loop (disable encoder)", variable=CAL['J4OpenLoopVal'])
-J4OpenLoopCbut.grid(row=3, column=0, sticky="w", padx=5, pady=2)
-
-# J5 Open Loop
-J5OpenLoopCbut = Checkbutton(encoderFrame, text="J5 Open Loop (disable encoder)", variable=CAL['J5OpenLoopVal'])
-J5OpenLoopCbut.grid(row=4, column=0, sticky="w", padx=5, pady=2)
-
-# J6 Open Loop
-J6OpenLoopCbut = Checkbutton(encoderFrame, text="J6 Open Loop (disable encoder)", variable=CAL['J6OpenLoopVal'])
-J6OpenLoopCbut.grid(row=5, column=0, sticky="w", padx=5, pady=2)
-
-
-
-# ============================================================================
-# Color Configuration for Robot Visualization
-# ============================================================================
-
-main_color_parts = ["Link Base-2.STL", "Link 2-2.STL", "Link 4-2.STL"]
-logo_color_parts = ["Link 2-3.STL", "Link 4-3.STL"]
-
-def update_main_color(*args):
-    selected = main_color_var.get()
-    CAL['setColor'] = selected
-    for part in main_color_parts:
-        RUN['color_map'][part] = selected 
-        RUN['actors'][part].GetProperty().SetColor(vtk.vtkNamedColors().GetColor3d(selected))
-    RUN['render_window'].Render()
-
-# Color options
-color_options = [
-    "Red", "IndianRed", "Crimson", "FireBrick", "DarkRed", "Maroon",
-    "RosyBrown", "MediumVioletRed", "DeepPink", "HotPink", "Orchid", "Magenta",
-    "Orange", "DarkOrange", "Tomato", "Gold", "Yellow", "Chartreuse", "YellowGreen",
-    "Green", "LimeGreen", "MediumSpringGreen", "DarkOliveGreen", 
-    "Teal", "DarkTurquoise", "Turquoise", "CadetBlue",
-    "DodgerBlue", "Blue", "RoyalBlue", "SlateBlue", "MediumSlateBlue", 
-    "Navy", "MidnightBlue", "SteelBlue",
-    "Black", "DimGray", "DarkGray", "Gray", "Silver", 
-    "LightSlateGray", "LightSteelBlue",
-    "White", "Gainsboro", "AntiqueWhite", "Cornsilk"
-]
-
-# Initialize color variable
-main_color_var = tk.StringVar(value="Royal Blue")
-
-
-# ============================================================================
-# ROW 1, COLUMN 5: Theme Frame
-# ============================================================================
-themeFrame = LabelFrame(tab2, text="Theme", padding=10)
-themeFrame.grid(row=1, column=5, sticky="nsew", padx=5, pady=5)
-
-themeFrame.grid_columnconfigure(0, weight=1)
-themeFrame.grid_columnconfigure(1, weight=1)
-
-# Theme buttons
-lightBut = Button(themeFrame, text="  Light  ", command=lightTheme)
-lightBut.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
-
-darkBut = Button(themeFrame, text="  Dark   ", command=darkTheme)
-darkBut.grid(row=0, column=1, sticky="ew", padx=2, pady=2)
-
-# Robot Color label and dropdown
-robotColorLab = Label(themeFrame, text="Robot Color", font=("Arial", 10, "bold"))
-robotColorLab.grid(row=1, column=0, columnspan=2, sticky="w", padx=2, pady=(10, 2))
-
-main_color_dropdown = ttk.OptionMenu(themeFrame, main_color_var, main_color_var.get(), *color_options, command=update_main_color)
-main_color_dropdown.grid(row=2, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
-
-
-
-
-# ============================================================================
-# ROW 1, COLUMN 4: External Axes Frame
-# ============================================================================
-externalAxesFrame = LabelFrame(tab2, text="External Axes", padding=10)
-externalAxesFrame.grid(row=1, column=4, sticky="nsew", padx=5, pady=5)
-
-externalAxesFrame.grid_columnconfigure(0, weight=0)  # Labels
-externalAxesFrame.grid_columnconfigure(1, weight=1)  # Entry fields
-
-# --- 7th Axis Calibration ---
-axis7Lab = Label(externalAxesFrame, font=("Arial 10 bold"), text="7th Axis Calibration")
-axis7Lab.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 10))
-
-axis7lengthLab = Label(externalAxesFrame, text="7th Axis Length:")
-axis7lengthLab.grid(row=1, column=0, sticky="e", padx=5, pady=2)
-axis7lengthEntryField = Entry(externalAxesFrame, width=5, justify="center")
-axis7lengthEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-
-axis7rotLab = Label(externalAxesFrame, text="MM per Rotation:")
-axis7rotLab.grid(row=2, column=0, sticky="e", padx=5, pady=2)
-axis7rotEntryField = Entry(externalAxesFrame, width=5, justify="center")
-axis7rotEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
-
-axis7stepsLab = Label(externalAxesFrame, text="Drive Steps:")
-axis7stepsLab.grid(row=3, column=0, sticky="e", padx=5, pady=2)
-axis7stepsEntryField = Entry(externalAxesFrame, width=5, justify="center")
-axis7stepsEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
-
-J7zerobut = Button(externalAxesFrame, text="Set Axis 7 Calibration to Zero", width=28, command=zeroAxis7)
-J7zerobut.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-J7calbut = Button(externalAxesFrame, text="Autocalibrate Axis 7", width=28, command=startCalRobotJ7)
-J7calbut.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-axis7pinsetLab = Label(externalAxesFrame, font=("Arial", 8), text="StepPin = 12 / DirPin = 13 / CalPin = 36")
-axis7pinsetLab.grid(row=6, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 15))
-
-# --- 8th Axis Calibration ---
-axis8Lab = Label(externalAxesFrame, font=("Arial 10 bold"), text="8th Axis Calibration")
-axis8Lab.grid(row=7, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 10))
-
-axis8lengthLab = Label(externalAxesFrame, text="8th Axis Length:")
-axis8lengthLab.grid(row=8, column=0, sticky="e", padx=5, pady=2)
-axis8lengthEntryField = Entry(externalAxesFrame, width=5, justify="center")
-axis8lengthEntryField.grid(row=8, column=1, sticky="w", padx=5, pady=2)
-
-axis8rotLab = Label(externalAxesFrame, text="MM per Rotation:")
-axis8rotLab.grid(row=9, column=0, sticky="e", padx=5, pady=2)
-axis8rotEntryField = Entry(externalAxesFrame, width=5, justify="center")
-axis8rotEntryField.grid(row=9, column=1, sticky="w", padx=5, pady=2)
-
-axis8stepsLab = Label(externalAxesFrame, text="Drive Steps:")
-axis8stepsLab.grid(row=10, column=0, sticky="e", padx=5, pady=2)
-axis8stepsEntryField = Entry(externalAxesFrame, width=5, justify="center")
-axis8stepsEntryField.grid(row=10, column=1, sticky="w", padx=5, pady=2)
-
-J8zerobut = Button(externalAxesFrame, text="Set Axis 8 Calibration to Zero", width=28, command=zeroAxis8)
-J8zerobut.grid(row=11, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-J8calbut = Button(externalAxesFrame, text="Autocalibrate Axis 8", width=28, command=startCalRobotJ8)
-J8calbut.grid(row=12, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-axis8pinsetLab = Label(externalAxesFrame, font=("Arial", 8), text="StepPin = 32 / DirPin = 33 / CalPin = 37")
-axis8pinsetLab.grid(row=13, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 15))
-
-# --- 9th Axis Calibration ---
-axis9Lab = Label(externalAxesFrame, font=("Arial 10 bold"), text="9th Axis Calibration")
-axis9Lab.grid(row=14, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 10))
-
-axis9lengthLab = Label(externalAxesFrame, text="9th Axis Length:")
-axis9lengthLab.grid(row=15, column=0, sticky="e", padx=5, pady=2)
-axis9lengthEntryField = Entry(externalAxesFrame, width=5, justify="center")
-axis9lengthEntryField.grid(row=15, column=1, sticky="w", padx=5, pady=2)
-
-axis9rotLab = Label(externalAxesFrame, text="MM per Rotation:")
-axis9rotLab.grid(row=16, column=0, sticky="e", padx=5, pady=2)
-axis9rotEntryField = Entry(externalAxesFrame, width=5, justify="center")
-axis9rotEntryField.grid(row=16, column=1, sticky="w", padx=5, pady=2)
-
-axis9stepsLab = Label(externalAxesFrame, text="Drive Steps:")
-axis9stepsLab.grid(row=17, column=0, sticky="e", padx=5, pady=2)
-axis9stepsEntryField = Entry(externalAxesFrame, width=5, justify="center")
-axis9stepsEntryField.grid(row=17, column=1, sticky="w", padx=5, pady=2)
-
-J9zerobut = Button(externalAxesFrame, text="Set Axis 9 Calibration to Zero", width=28, command=zeroAxis9)
-J9zerobut.grid(row=18, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-J9calbut = Button(externalAxesFrame, text="Autocalibrate Axis 9", width=28, command=startCalRobotJ9)
-J9calbut.grid(row=19, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-axis9pinsetLab = Label(externalAxesFrame, font=("Arial", 8), text="StepPin = 34 / DirPin = 35 / CalPin = 38")
-axis9pinsetLab.grid(row=20, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 5))
-
-
-# ============================================================================
-# ROW 1, COLUMN 6: Virtual Import Frame
-# ============================================================================
-virtualImportFrame = LabelFrame(tab2, text="Virtual Import", padding=10)
-virtualImportFrame.grid(row=1, column=6, sticky="nsew", padx=5, pady=5)
-
-virtualImportFrame.grid_columnconfigure(0, weight=1)
-
-# Import STL button
-importSTLBut = ttk.Button(virtualImportFrame, text="Import STL", command=import_stl_file)
-importSTLBut.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
-
-# File Name
-fileNameLab = Label(virtualImportFrame, text="File Name")
-fileNameLab.grid(row=1, column=0, sticky="w", padx=5, pady=(10, 2))
-stl_name_entry = Entry(virtualImportFrame, textvariable=stl_name_var, width=20)
-stl_name_entry.grid(row=2, column=0, sticky="ew", padx=5, pady=2)
-
-# X Position
-xPosLab = Label(virtualImportFrame, text="X Position")
-xPosLab.grid(row=3, column=0, sticky="w", padx=5, pady=(10, 2))
-x_entry = Entry(virtualImportFrame, textvariable=x_var, width=10)
-x_entry.grid(row=4, column=0, sticky="w", padx=5, pady=2)
-
-# Y Position
-yPosLab = Label(virtualImportFrame, text="Y Position")
-yPosLab.grid(row=5, column=0, sticky="w", padx=5, pady=(10, 2))
-y_entry = Entry(virtualImportFrame, textvariable=y_var, width=10)
-y_entry.grid(row=6, column=0, sticky="w", padx=5, pady=2)
-
-# Z Position
-zPosLab = Label(virtualImportFrame, text="Z Position")
-zPosLab.grid(row=7, column=0, sticky="w", padx=5, pady=(10, 2))
-z_entry = Entry(virtualImportFrame, textvariable=z_var, width=10)
-z_entry.grid(row=8, column=0, sticky="w", padx=5, pady=2)
-
-# Z Rotation
-zRotLab = Label(virtualImportFrame, text="Z Rotation")
-zRotLab.grid(row=9, column=0, sticky="w", padx=5, pady=(10, 2))
-rot_entry = Entry(virtualImportFrame, textvariable=rot_var, width=10)
-rot_entry.grid(row=10, column=0, sticky="w", padx=5, pady=2)
-
-# Update Position button
-updatePosBut = ttk.Button(virtualImportFrame, text="Update Position", command=update_stl_transform)
-updatePosBut.grid(row=11, column=0, sticky="ew", padx=5, pady=(10, 5))
-
-# ============================================================================
-# ROW 2, COLUMN 5: Save Frame (below and right of Commands)
-# ============================================================================
-saveFrame = LabelFrame(tab2, text="Save", padding=10)
-saveFrame.grid(row=2, column=5, columnspan=2, sticky="ew", padx=5, pady=5)
-
-saveFrame.grid_columnconfigure(0, weight=1)
-saveFrame.grid_rowconfigure(0, weight=1)  # Center vertically
-
-# Save All button
-saveCalBut = Button(saveFrame, text="SAVE ALL", width=15, command=SaveAndApplyCalibration)
-saveCalBut.grid(row=0, column=0, sticky="", padx=5, pady=5)
-
-# ============================================================================
-# ROW 2: Commands Frame (spans all columns)
-# ============================================================================
-cmdFrame = LabelFrame(tab2, text="Commands", padding=10)
-cmdFrame.grid(row=2, column=0, columnspan=5, sticky="ew", padx=5, pady=5)
-
-cmdFrame.grid_columnconfigure(0, weight=1)
-
-cmdSentLab = Label(cmdFrame, text="Last Requested Command")
-cmdSentLab.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 2))
-
-cmdSentEntryField = Entry(cmdFrame, width=120, justify="center")
-cmdSentEntryField.grid(row=1, column=0, sticky="ew", padx=5, pady=2)
-
-cmdRecLab = Label(cmdFrame, text="Last Response From Controller")
-cmdRecLab.grid(row=2, column=0, sticky="w", padx=5, pady=(10, 2))
-
-cmdRecEntryField = Entry(cmdFrame, width=120, justify="center")
-cmdRecEntryField.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
-
-####TAB 3
-
-# ============================================================================
-# Tab 3 Grid Layout Configuration
-# ============================================================================
-tab3.grid_rowconfigure(0, weight=1)
-tab3.grid_rowconfigure(1, weight=1)
-tab3.grid_columnconfigure(0, weight=0, minsize=300)  # Motor Dir, Cal Dir/Switch
-tab3.grid_columnconfigure(1, weight=0, minsize=180)  # Pos Limits, Steps/Deg
-tab3.grid_columnconfigure(2, weight=0, minsize=220)  # Drive MS, Encoder CPR
-tab3.grid_columnconfigure(3, weight=0, minsize=280)  # DH Parameters, Tool Frame
-tab3.grid_columnconfigure(4, weight=0, minsize=200)  # Defaults
-tab3.grid_columnconfigure(5, weight=1)  # Remaining .place() widgets
-
-# ============================================================================
-# Motor Direction Frame (Row 0, Column 0)
-# ============================================================================
-motorDirFrame = LabelFrame(tab3, text="Motor Direction", padding=10)
-motorDirFrame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-motorDirFrame.grid_columnconfigure(0, weight=0)
-motorDirFrame.grid_columnconfigure(1, weight=1)
-
-J1MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J1 Motor Direction")
-J1MotDirLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
-J1MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
-J1MotDirEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-
-J2MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J2 Motor Direction")
-J2MotDirLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
-J2MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
-J2MotDirEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-
-J3MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J3 Motor Direction")
-J3MotDirLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
-J3MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
-J3MotDirEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
-
-J4MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J4 Motor Direction")
-J4MotDirLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
-J4MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
-J4MotDirEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
-
-J5MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J5 Motor Direction")
-J5MotDirLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
-J5MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
-J5MotDirEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
-
-J6MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J6 Motor Direction")
-J6MotDirLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
-J6MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
-J6MotDirEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
-
-J7MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J7 Motor Direction")
-J7MotDirLab_grid.grid(row=6, column=0, sticky="w", padx=5, pady=2)
-J7MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
-J7MotDirEntryField.grid(row=6, column=1, sticky="w", padx=5, pady=2)
-
-J8MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J8 Motor Direction")
-J8MotDirLab_grid.grid(row=7, column=0, sticky="w", padx=5, pady=2)
-J8MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
-J8MotDirEntryField.grid(row=7, column=1, sticky="w", padx=5, pady=2)
-
-J9MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J9 Motor Direction")
-J9MotDirLab_grid.grid(row=8, column=0, sticky="w", padx=5, pady=2)
-J9MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
-J9MotDirEntryField.grid(row=8, column=1, sticky="w", padx=5, pady=2)
-
-# ============================================================================
-# Calibration Direction Frame (Row 1, Column 0)
-# ============================================================================
-calDirFrame = LabelFrame(
-  tab3,
-  text="Calibration Direction / Active Switch",
-  padding=10,
-)
-calDirFrame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
-calDirFrame.grid_columnconfigure(0, weight=0)
-calDirFrame.grid_columnconfigure(1, weight=0)
-calDirFrame.grid_columnconfigure(2, weight=0)
-calDirFrame.grid_columnconfigure(3, weight=1)
-
-
-def _create_calibration_switch_field(parent, row):
-  active_label = Label(parent, font=("Arial", 8), text="Active")
-  active_label.grid(row=row, column=2, sticky="e", padx=(8, 2), pady=2)
-  field = ttk.Combobox(
-    parent,
-    values=("HIGH", "LOW"),
-    state="readonly",
-    width=6,
-  )
-  field.grid(row=row, column=3, sticky="w", padx=(2, 5), pady=2)
-  return field
-
-J1CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J1 Calibration Dir.")
-J1CalDirLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
-J1CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
-J1CalDirEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-J1CalSwitchField = _create_calibration_switch_field(calDirFrame, 0)
-
-J2CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J2 Calibration Dir.")
-J2CalDirLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
-J2CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
-J2CalDirEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-J2CalSwitchField = _create_calibration_switch_field(calDirFrame, 1)
-
-J3CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J3 Calibration Dir.")
-J3CalDirLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
-J3CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
-J3CalDirEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
-J3CalSwitchField = _create_calibration_switch_field(calDirFrame, 2)
-
-J4CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J4 Calibration Dir.")
-J4CalDirLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
-J4CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
-J4CalDirEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
-J4CalSwitchField = _create_calibration_switch_field(calDirFrame, 3)
-
-J5CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J5 Calibration Dir.")
-J5CalDirLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
-J5CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
-J5CalDirEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
-J5CalSwitchField = _create_calibration_switch_field(calDirFrame, 4)
-
-J6CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J6 Calibration Dir.")
-J6CalDirLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
-J6CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
-J6CalDirEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
-J6CalSwitchField = _create_calibration_switch_field(calDirFrame, 5)
-
-J7CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J7 Calibration Dir.")
-J7CalDirLab_grid.grid(row=6, column=0, sticky="w", padx=5, pady=2)
-J7CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
-J7CalDirEntryField.grid(row=6, column=1, sticky="w", padx=5, pady=2)
-J7CalSwitchField = _create_calibration_switch_field(calDirFrame, 6)
-
-J8CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J8 Calibration Dir.")
-J8CalDirLab_grid.grid(row=7, column=0, sticky="w", padx=5, pady=2)
-J8CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
-J8CalDirEntryField.grid(row=7, column=1, sticky="w", padx=5, pady=2)
-J8CalSwitchField = _create_calibration_switch_field(calDirFrame, 7)
-
-J9CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J9 Calibration Dir.")
-J9CalDirLab_grid.grid(row=8, column=0, sticky="w", padx=5, pady=2)
-J9CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
-J9CalDirEntryField.grid(row=8, column=1, sticky="w", padx=5, pady=2)
-J9CalSwitchField = _create_calibration_switch_field(calDirFrame, 8)
-
-# ============================================================================
-# Position Limits Frame (Row 0, Column 1)
-# ============================================================================
-posLimFrame = LabelFrame(tab3, text="Position Limits", padding=10)
-posLimFrame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
-posLimFrame.grid_columnconfigure(0, weight=0)
-posLimFrame.grid_columnconfigure(1, weight=1)
-
-J1PosLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J1 Pos Limit")
-J1PosLimLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
-J1PosLimEntryField = Entry(posLimFrame, width=5, justify="center")
-J1PosLimEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-
-J1NegLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J1 Neg Limit")
-J1NegLimLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
-J1NegLimEntryField = Entry(posLimFrame, width=5, justify="center")
-J1NegLimEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-
-J2PosLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J2 Pos Limit")
-J2PosLimLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
-J2PosLimEntryField = Entry(posLimFrame, width=5, justify="center")
-J2PosLimEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
-
-J2NegLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J2 Neg Limit")
-J2NegLimLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
-J2NegLimEntryField = Entry(posLimFrame, width=5, justify="center")
-J2NegLimEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
-
-J3PosLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J3 Pos Limit")
-J3PosLimLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
-J3PosLimEntryField = Entry(posLimFrame, width=5, justify="center")
-J3PosLimEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
-
-J3NegLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J3 Neg Limit")
-J3NegLimLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
-J3NegLimEntryField = Entry(posLimFrame, width=5, justify="center")
-J3NegLimEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
-
-J4PosLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J4 Pos Limit")
-J4PosLimLab_grid.grid(row=6, column=0, sticky="w", padx=5, pady=2)
-J4PosLimEntryField = Entry(posLimFrame, width=5, justify="center")
-J4PosLimEntryField.grid(row=6, column=1, sticky="w", padx=5, pady=2)
-
-J4NegLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J4 Neg Limit")
-J4NegLimLab_grid.grid(row=7, column=0, sticky="w", padx=5, pady=2)
-J4NegLimEntryField = Entry(posLimFrame, width=5, justify="center")
-J4NegLimEntryField.grid(row=7, column=1, sticky="w", padx=5, pady=2)
-
-J5PosLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J5 Pos Limit")
-J5PosLimLab_grid.grid(row=8, column=0, sticky="w", padx=5, pady=2)
-J5PosLimEntryField = Entry(posLimFrame, width=5, justify="center")
-J5PosLimEntryField.grid(row=8, column=1, sticky="w", padx=5, pady=2)
-
-J5NegLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J5 Neg Limit")
-J5NegLimLab_grid.grid(row=9, column=0, sticky="w", padx=5, pady=2)
-J5NegLimEntryField = Entry(posLimFrame, width=5, justify="center")
-J5NegLimEntryField.grid(row=9, column=1, sticky="w", padx=5, pady=2)
-
-J6PosLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J6 Pos Limit")
-J6PosLimLab_grid.grid(row=10, column=0, sticky="w", padx=5, pady=2)
-J6PosLimEntryField = Entry(posLimFrame, width=5, justify="center")
-J6PosLimEntryField.grid(row=10, column=1, sticky="w", padx=5, pady=2)
-
-J6NegLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J6 Neg Limit")
-J6NegLimLab_grid.grid(row=11, column=0, sticky="w", padx=5, pady=2)
-J6NegLimEntryField = Entry(posLimFrame, width=5, justify="center")
-J6NegLimEntryField.grid(row=11, column=1, sticky="w", padx=5, pady=2)
-
-# ============================================================================
-# Steps per Degree Frame (Row 1, Column 1)
-# ============================================================================
-stepDegFrame = LabelFrame(tab3, text="Steps per Degree", padding=10)
-stepDegFrame.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
-stepDegFrame.grid_columnconfigure(0, weight=0)
-stepDegFrame.grid_columnconfigure(1, weight=1)
-
-J1StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J1 Step/Deg")
-J1StepDegLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
-J1StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
-J1StepDegEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-
-J2StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J2 Step/Deg")
-J2StepDegLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
-J2StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
-J2StepDegEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-
-J3StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J3 Step/Deg")
-J3StepDegLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
-J3StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
-J3StepDegEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
-
-J4StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J4 Step/Deg")
-J4StepDegLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
-J4StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
-J4StepDegEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
-
-J5StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J5 Step/Deg")
-J5StepDegLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
-J5StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
-J5StepDegEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
-
-J6StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J6 Step/Deg")
-J6StepDegLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
-J6StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
-J6StepDegEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
-
-# ============================================================================
-# Drive Microsteps Frame (Row 0, Column 2)
-# ============================================================================
-driveMSFrame = LabelFrame(tab3, text="Drive Microsteps", padding=10)
-driveMSFrame.grid(row=0, column=2, sticky="nsew", padx=5, pady=5)
-driveMSFrame.grid_columnconfigure(0, weight=0)
-driveMSFrame.grid_columnconfigure(1, weight=1)
-
-J1DriveMSLab_grid = Label(driveMSFrame, font=("Arial", 8), text="J1 Drive Microstep")
-J1DriveMSLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
-J1DriveMSEntryField = Entry(driveMSFrame, width=5, justify="center")
-J1DriveMSEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-
-J2DriveMSLab_grid = Label(driveMSFrame, font=("Arial", 8), text="J2 Drive Microstep")
-J2DriveMSLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
-J2DriveMSEntryField = Entry(driveMSFrame, width=5, justify="center")
-J2DriveMSEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-
-J3DriveMSLab_grid = Label(driveMSFrame, font=("Arial", 8), text="J3 Drive Microstep")
-J3DriveMSLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
-J3DriveMSEntryField = Entry(driveMSFrame, width=5, justify="center")
-J3DriveMSEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
-
-J4DriveMSLab_grid = Label(driveMSFrame, font=("Arial", 8), text="J4 Drive Microstep")
-J4DriveMSLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
-J4DriveMSEntryField = Entry(driveMSFrame, width=5, justify="center")
-J4DriveMSEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
-
-J5DriveMSLab_grid = Label(driveMSFrame, font=("Arial", 8), text="J5 Drive Microstep")
-J5DriveMSLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
-J5DriveMSEntryField = Entry(driveMSFrame, width=5, justify="center")
-J5DriveMSEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
-
-J6DriveMSLab_grid = Label(driveMSFrame, font=("Arial", 8), text="J6 Drive Microstep")
-J6DriveMSLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
-J6DriveMSEntryField = Entry(driveMSFrame, width=5, justify="center")
-J6DriveMSEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
-
-# ============================================================================
-# Encoder CPR Frame (Row 1, Column 2)
-# ============================================================================
-encCPRFrame = LabelFrame(tab3, text="Encoder CPR", padding=10)
-encCPRFrame.grid(row=1, column=2, sticky="nsew", padx=5, pady=5)
-encCPRFrame.grid_columnconfigure(0, weight=0)
-encCPRFrame.grid_columnconfigure(1, weight=1)
-
-J1EncCPRLab_grid = Label(encCPRFrame, font=("Arial", 8), text="J1 Encoder CPR")
-J1EncCPRLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
-J1EncCPREntryField = Entry(encCPRFrame, width=5, justify="center")
-J1EncCPREntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-
-J2EncCPRLab_grid = Label(encCPRFrame, font=("Arial", 8), text="J2 Encoder CPR")
-J2EncCPRLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
-J2EncCPREntryField = Entry(encCPRFrame, width=5, justify="center")
-J2EncCPREntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-
-J3EncCPRLab_grid = Label(encCPRFrame, font=("Arial", 8), text="J3 Encoder CPR")
-J3EncCPRLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
-J3EncCPREntryField = Entry(encCPRFrame, width=5, justify="center")
-J3EncCPREntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
-
-J4EncCPRLab_grid = Label(encCPRFrame, font=("Arial", 8), text="J4 Encoder CPR")
-J4EncCPRLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
-J4EncCPREntryField = Entry(encCPRFrame, width=5, justify="center")
-J4EncCPREntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
-
-J5EncCPRLab_grid = Label(encCPRFrame, font=("Arial", 8), text="J5 Encoder CPR")
-J5EncCPRLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
-J5EncCPREntryField = Entry(encCPRFrame, width=5, justify="center")
-J5EncCPREntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
-
-J6EncCPRLab_grid = Label(encCPRFrame, font=("Arial", 8), text="J6 Encoder CPR")
-J6EncCPRLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
-J6EncCPREntryField = Entry(encCPRFrame, width=5, justify="center")
-J6EncCPREntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
-
-# ============================================================================
-# DH Parameters Frame (Row 0, Column 3)
-# ============================================================================
-dhParamsFrame = LabelFrame(tab3, text="DH Parameters", padding=10)
-dhParamsFrame.grid(row=0, column=3, sticky="nsew", padx=5, pady=5)
-
-# Column headers
-dhParamsFrame.grid_columnconfigure(0, weight=0, minsize=30)   # J1-J6 labels
-dhParamsFrame.grid_columnconfigure(1, weight=0, minsize=50)   # DH-Θ
-dhParamsFrame.grid_columnconfigure(2, weight=0, minsize=50)   # DH-α
-dhParamsFrame.grid_columnconfigure(3, weight=0, minsize=50)   # DH-d
-dhParamsFrame.grid_columnconfigure(4, weight=0, minsize=50)   # DH-a
-
-# Header row
-Label(dhParamsFrame, font=("Arial", 8), text="").grid(row=0, column=0)
-Label(dhParamsFrame, font=("Arial", 8), text="DH-Θ").grid(row=0, column=1)
-Label(dhParamsFrame, font=("Arial", 8), text="DH-α").grid(row=0, column=2)
-Label(dhParamsFrame, font=("Arial", 8), text="DH-d").grid(row=0, column=3)
-Label(dhParamsFrame, font=("Arial", 8), text="DH-a").grid(row=0, column=4)
-
-# J1 row
-Label(dhParamsFrame, font=("Arial", 8), text="J1").grid(row=1, column=0, sticky="w", padx=5, pady=2)
-J1ΘEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J1ΘEntryField.grid(row=1, column=1, padx=2, pady=2)
-J1αEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J1αEntryField.grid(row=1, column=2, padx=2, pady=1)
-J1dEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J1dEntryField.grid(row=1, column=3, padx=2, pady=2)
-J1aEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J1aEntryField.grid(row=1, column=4, padx=2, pady=2)
-
-# J2 row
-Label(dhParamsFrame, font=("Arial", 8), text="J2").grid(row=2, column=0, sticky="w", padx=5, pady=2)
-J2ΘEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J2ΘEntryField.grid(row=2, column=1, padx=2, pady=2)
-J2αEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J2αEntryField.grid(row=2, column=2, padx=2, pady=1)
-J2dEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J2dEntryField.grid(row=2, column=3, padx=2, pady=2)
-J2aEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J2aEntryField.grid(row=2, column=4, padx=2, pady=2)
-
-# J3 row
-Label(dhParamsFrame, font=("Arial", 8), text="J3").grid(row=3, column=0, sticky="w", padx=5, pady=2)
-J3ΘEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J3ΘEntryField.grid(row=3, column=1, padx=2, pady=2)
-J3αEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J3αEntryField.grid(row=3, column=2, padx=2, pady=1)
-J3dEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J3dEntryField.grid(row=3, column=3, padx=2, pady=2)
-J3aEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J3aEntryField.grid(row=3, column=4, padx=2, pady=2)
-
-# J4 row
-Label(dhParamsFrame, font=("Arial", 8), text="J4").grid(row=4, column=0, sticky="w", padx=5, pady=2)
-J4ΘEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J4ΘEntryField.grid(row=4, column=1, padx=2, pady=2)
-J4αEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J4αEntryField.grid(row=4, column=2, padx=2, pady=1)
-J4dEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J4dEntryField.grid(row=4, column=3, padx=2, pady=2)
-J4aEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J4aEntryField.grid(row=4, column=4, padx=2, pady=2)
-
-# J5 row
-Label(dhParamsFrame, font=("Arial", 8), text="J5").grid(row=5, column=0, sticky="w", padx=5, pady=2)
-J5ΘEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J5ΘEntryField.grid(row=5, column=1, padx=2, pady=2)
-J5αEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J5αEntryField.grid(row=5, column=2, padx=2, pady=1)
-J5dEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J5dEntryField.grid(row=5, column=3, padx=2, pady=2)
-J5aEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J5aEntryField.grid(row=5, column=4, padx=2, pady=2)
-
-# J6 row
-Label(dhParamsFrame, font=("Arial", 8), text="J6").grid(row=6, column=0, sticky="w", padx=5, pady=2)
-J6ΘEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J6ΘEntryField.grid(row=6, column=1, padx=2, pady=2)
-J6αEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J6αEntryField.grid(row=6, column=2, padx=2, pady=1)
-J6dEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J6dEntryField.grid(row=6, column=3, padx=2, pady=2)
-J6aEntryField = Entry(dhParamsFrame, width=5, justify="center")
-J6aEntryField.grid(row=6, column=4, padx=2, pady=2)
-
-# ============================================================================
-# Tool Frame Offset Frame (Row 1, Column 3)
-# ============================================================================
-toolFrameFrame = LabelFrame(tab3, text="Tool Frame Offset", padding=10)
-toolFrameFrame.grid(row=1, column=3, sticky="nsew", padx=5, pady=5)
-
-toolFrameFrame.grid_columnconfigure(0, weight=1)
-toolFrameFrame.grid_columnconfigure(1, weight=1)
-toolFrameFrame.grid_columnconfigure(2, weight=1)
-toolFrameFrame.grid_columnconfigure(3, weight=1)
-toolFrameFrame.grid_columnconfigure(4, weight=1)
-toolFrameFrame.grid_columnconfigure(5, weight=1)
-
-# Header row
-Label(toolFrameFrame, font=("Arial", 11), text="X").grid(row=0, column=0, padx=2, pady=2)
-Label(toolFrameFrame, font=("Arial", 11), text="Y").grid(row=0, column=1, padx=2, pady=2)
-Label(toolFrameFrame, font=("Arial", 11), text="Z").grid(row=0, column=2, padx=2, pady=1)
-Label(toolFrameFrame, font=("Arial", 11), text="Rz").grid(row=0, column=3, padx=2, pady=2)
-Label(toolFrameFrame, font=("Arial", 11), text="Ry").grid(row=0, column=4, padx=2, pady=2)
-Label(toolFrameFrame, font=("Arial", 11), text="Rx").grid(row=0, column=5, padx=2, pady=2)
-
-# Entry fields row
-TFxEntryField = Entry(toolFrameFrame, width=4, justify="center")
-TFxEntryField.grid(row=1, column=0, padx=2, pady=2)
-TFyEntryField = Entry(toolFrameFrame, width=4, justify="center")
-TFyEntryField.grid(row=1, column=1, padx=2, pady=2)
-TFzEntryField = Entry(toolFrameFrame, width=4, justify="center")
-TFzEntryField.grid(row=1, column=2, padx=2, pady=1)
-TFrzEntryField = Entry(toolFrameFrame, width=4, justify="center")
-TFrzEntryField.grid(row=1, column=3, padx=2, pady=2)
-TFryEntryField = Entry(toolFrameFrame, width=4, justify="center")
-TFryEntryField.grid(row=1, column=4, padx=2, pady=2)
-TFrxEntryField = Entry(toolFrameFrame, width=4, justify="center")
-TFrxEntryField.grid(row=1, column=5, padx=2, pady=2)
-
-# Checkbox row
-DisableWristCbut = Checkbutton(toolFrameFrame, text="Disable Wrist Rotation - Linear Moves", variable=CAL['DisableWristRotVal'])
-DisableWristCbut.grid(row=2, column=0, columnspan=6, sticky="w", padx=5, pady=5)
-
-# ============================================================================
-# Defaults Frame (Row 0-1, Column 4)
-# ============================================================================
-defaultsFrame = LabelFrame(tab3, text="Defaults", padding=10)
-defaultsFrame.grid(row=0, column=4, rowspan=2, sticky="nsew", padx=5, pady=5)
-
-defaultsFrame.grid_columnconfigure(0, weight=1)
-
-loadAR4Mk4But = Button(defaultsFrame, text="Load AR4-MK4 Defaults", width=26, command=LoadAR4Mk3default)
-loadAR4Mk4But.grid(row=0, column=0, padx=5, pady=5)
-
-loadAR4Mk3But = Button(defaultsFrame, text="Load AR4-MK3 Defaults", width=26, command=LoadAR4Mk3default)
-loadAR4Mk3But.grid(row=1, column=0, padx=5, pady=5)
-
-loadAR4Mk2But = Button(defaultsFrame, text="Load AR4-MK2 Defaults", width=26, command=LoadAR4Mk2default)
-loadAR4Mk2But.grid(row=2, column=0, padx=5, pady=5)
-
-loadAR4But = Button(defaultsFrame, text="Load AR4-MK1 Defaults", width=26, command=LoadAR4default)
-loadAR4But.grid(row=3, column=0, padx=5, pady=5)
-
-loadAR3But = Button(defaultsFrame, text="Load AR3 Defaults", width=26, command=LoadAR3default)
-loadAR3But.grid(row=4, column=0, padx=5, pady=5)
-
-saveCalBut = Button(defaultsFrame, text="SAVE", width=26, command=SaveAndApplyCalibration)
-saveCalBut.grid(row=5, column=0, padx=5, pady=(10, 30)) # 10 pixels above, 30 below
-
-
-loadCustomBut = Button(defaultsFrame, text="Load Custom Calibration", width=26, command=load_custom_calibration)
-loadCustomBut .grid(row=6, column=0, padx=5, pady=(30, 5))
-
-saveCustomBut = Button(defaultsFrame, text="Save Custom Calibration", width=26, command=save_custom_calibration)
-saveCustomBut.grid(row=7, column=0, padx=5, pady=5)
-
-loadMaxStepBut = Button(defaultsFrame, text="Load Max Microsteps", width=26, command=LoadMaxdefault)
-loadMaxStepBut.grid(row=8, column=0, padx=5, pady=5)
-
-
-
-# #### TOOL FRAME ####
-# ToolFrameLab = Label(tab3, text = "Tool Frame Offset")
-# ToolFrameLab.place(x=970, y=60)
-# 
-# UFxLab = Label(tab3, font=("Arial", 11), text = "X")
-# UFxLab.place(x=920, y=90)
-# 
-# UFyLab = Label(tab3, font=("Arial", 11), text = "Y")
-# UFyLab.place(x=960, y=90)
-# 
-# UFzLab = Label(tab3, font=("Arial", 11), text = "Z")
-# UFzLab.place(x=1000, y=90)
-# 
-# UFRxLab = Label(tab3, font=("Arial", 11), text = "Rz")
-# UFRxLab.place(x=1040, y=90)
-# 
-# UFRyLab = Label(tab3, font=("Arial", 11), text = "Ry")
-# UFRyLab.place(x=1080, y=90)
-# 
-# UFRzLab = Label(tab3, font=("Arial", 11), text = "Rx")
-# UFRzLab.place(x=1120, y=90)
-# 
-# TFxEntryField = Entry(tab3,width=4,justify="center")
-# TFxEntryField.place(x=910, y=115)
-# TFyEntryField = Entry(tab3,width=4,justify="center")
-# TFyEntryField.place(x=950, y=115)
-# TFzEntryField = Entry(tab3,width=4,justify="center")
-# TFzEntryField.place(x=990, y=115)
-# TFrzEntryField = Entry(tab3,width=4,justify="center")
-# TFrzEntryField.place(x=1030, y=115)
-# TFryEntryField = Entry(tab3,width=4,justify="center")
-# TFryEntryField.place(x=1070, y=115)
-# TFrxEntryField = Entry(tab3,width=4,justify="center")
-# TFrxEntryField.place(x=1110, y=115)
-# 
-# DisableWristCbut = Checkbutton(tab3, text="Disable Wrist Rotation - Linear Moves",variable = CAL['DisableWristRotVal'])
-# DisableWristCbut.place(x=910, y=150)
-
-
-# # ####  MOTOR DIRECTIONS ####
-
-# # J1MotDirLab = Label(tab3, font=("Arial", 8), text = "J1 Motor Direction")
-# # J1MotDirLab.place(x=10, y=20)
-# # J2MotDirLab = Label(tab3, font=("Arial", 8), text = "J2 Motor Direction")
-# # J2MotDirLab.place(x=10, y=45)
-# # J3MotDirLab = Label(tab3, font=("Arial", 8), text = "J3 Motor Direction")
-# # J3MotDirLab.place(x=10, y=70)
-# # J4MotDirLab = Label(tab3, font=("Arial", 8), text = "J4 Motor Direction")
-# # J4MotDirLab.place(x=10, y=95)
-# # J5MotDirLab = Label(tab3, font=("Arial", 8), text = "J5 Motor Direction")
-# # J5MotDirLab.place(x=10, y=120)
-# # J6MotDirLab = Label(tab3, font=("Arial", 8), text = "J6 Motor Direction")
-# # J6MotDirLab.place(x=10, y=145)
-# # J7MotDirLab = Label(tab3, font=("Arial", 8), text = "J7 Motor Direction")
-# # J7MotDirLab.place(x=10, y=170)
-# # J8MotDirLab = Label(tab3, font=("Arial", 8), text = "J8 Motor Direction")
-# # J8MotDirLab.place(x=10, y=195)
-# # J9MotDirLab = Label(tab3, font=("Arial", 8), text = "J9 Motor Direction")
-# # J9MotDirLab.place(x=10, y=220)
-
-# # J1MotDirEntryField = Entry(tab3,width=5,justify="center")
-# # J1MotDirEntryField.place(x=110, y=20)
-# # J2MotDirEntryField = Entry(tab3,width=5,justify="center")
-# # J2MotDirEntryField.place(x=110, y=45)
-# # J3MotDirEntryField = Entry(tab3,width=5,justify="center")
-# # J3MotDirEntryField.place(x=110, y=70)
-# # J4MotDirEntryField = Entry(tab3,width=5,justify="center")
-# # J4MotDirEntryField.place(x=110, y=95)
-# # J5MotDirEntryField = Entry(tab3,width=5,justify="center")
-# # J5MotDirEntryField.place(x=110, y=120)
-# # J6MotDirEntryField = Entry(tab3,width=5,justify="center")
-# # J6MotDirEntryField.place(x=110, y=145)
-# # J7MotDirEntryField = Entry(tab3,width=5,justify="center")
-# # J7MotDirEntryField.place(x=110, y=170)
-# # J8MotDirEntryField = Entry(tab3,width=5,justify="center")
-# # J8MotDirEntryField.place(x=110, y=195)
-# # J9MotDirEntryField = Entry(tab3,width=5,justify="center")
-# # J9MotDirEntryField.place(x=110, y=220)
-
-
-# # ####  CALIBRATION DIRECTIONS ####
-
-# # J1CalDirLab = Label(tab3, font=("Arial", 8), text = "J1 Calibration Dir.")
-# # J1CalDirLab.place(x=10, y=280)
-# # J2CalDirLab = Label(tab3, font=("Arial", 8), text = "J2 Calibration Dir.")
-# # J2CalDirLab.place(x=10, y=305)
-# # J3CalDirLab = Label(tab3, font=("Arial", 8), text = "J3 Calibration Dir.")
-# # J3CalDirLab.place(x=10, y=330)
-# # J4CalDirLab = Label(tab3, font=("Arial", 8), text = "J4 Calibration Dir.")
-# # J4CalDirLab.place(x=10, y=355)
-# # J5CalDirLab = Label(tab3, font=("Arial", 8), text = "J5 Calibration Dir.")
-# # J5CalDirLab.place(x=10, y=380)
-# # J6CalDirLab = Label(tab3, font=("Arial", 8), text = "J6 Calibration Dir.")
-# # J6CalDirLab.place(x=10, y=405)
-# # J7CalDirLab = Label(tab3, font=("Arial", 8), text = "J7 Calibration Dir.")
-# # J7CalDirLab.place(x=10, y=430)
-# # J8CalDirLab = Label(tab3, font=("Arial", 8), text = "J8 Calibration Dir.")
-# # J8CalDirLab.place(x=10, y=455)
-# # J9CalDirLab = Label(tab3, font=("Arial", 8), text = "J9 Calibration Dir.")
-# # J9CalDirLab.place(x=10, y=480)
-
-# # J1CalDirEntryField = Entry(tab3,width=5,justify="center")
-# # J1CalDirEntryField.place(x=110, y=280)
-# # J2CalDirEntryField = Entry(tab3,width=5,justify="center")
-# # J2CalDirEntryField.place(x=110, y=305)
-# # J3CalDirEntryField = Entry(tab3,width=5,justify="center")
-# # J3CalDirEntryField.place(x=110, y=330)
-# # J4CalDirEntryField = Entry(tab3,width=5,justify="center")
-# # J4CalDirEntryField.place(x=110, y=355)
-# # J5CalDirEntryField = Entry(tab3,width=5,justify="center")
-# # J5CalDirEntryField.place(x=110, y=380)
-# # J6CalDirEntryField = Entry(tab3,width=5,justify="center")
-# # J6CalDirEntryField.place(x=110, y=405)
-# # J7CalDirEntryField = Entry(tab3,width=5,justify="center")
-# # J7CalDirEntryField.place(x=110, y=430)
-# # J8CalDirEntryField = Entry(tab3,width=5,justify="center")
-# # J8CalDirEntryField.place(x=110, y=455)
-# # J9CalDirEntryField = Entry(tab3,width=5,justify="center")
-# # J9CalDirEntryField.place(x=110, y=480)
-
-# # ### axis limits
-# # J1PosLimLab = Label(tab3, font=("Arial", 8), text = "J1 Pos Limit")
-# # J1PosLimLab.place(x=200, y=20)
-# # J1NegLimLab = Label(tab3, font=("Arial", 8), text = "J1 Neg Limit")
-# # J1NegLimLab.place(x=200, y=45)
-# # J2PosLimLab = Label(tab3, font=("Arial", 8), text = "J2 Pos Limit")
-# # J2PosLimLab.place(x=200, y=70)
-# # J2NegLimLab = Label(tab3, font=("Arial", 8), text = "J2 Neg Limit")
-# # J2NegLimLab.place(x=200, y=95)
-# # J3PosLimLab = Label(tab3, font=("Arial", 8), text = "J3 Pos Limit")
-# # J3PosLimLab.place(x=200, y=120)
-# # J3NegLimLab = Label(tab3, font=("Arial", 8), text = "J3 Neg Limit")
-# # J3NegLimLab.place(x=200, y=145)
-# # J4PosLimLab = Label(tab3, font=("Arial", 8), text = "J4 Pos Limit")
-# # J4PosLimLab.place(x=200, y=170)
-# # J4NegLimLab = Label(tab3, font=("Arial", 8), text = "J4 Neg Limit")
-# # J4NegLimLab.place(x=200, y=195)
-# # J5PosLimLab = Label(tab3, font=("Arial", 8), text = "J5 Pos Limit")
-# # J5PosLimLab.place(x=200, y=220)
-# # J5NegLimLab = Label(tab3, font=("Arial", 8), text = "J5 Neg Limit")
-# # J5NegLimLab.place(x=200, y=245)
-# # J6PosLimLab = Label(tab3, font=("Arial", 8), text = "J6 Pos Limit")
-# # J6PosLimLab.place(x=200, y=270)
-# # J6NegLimLab = Label(tab3, font=("Arial", 8), text = "J6 Neg Limit")
-# # J6NegLimLab.place(x=200, y=295)
-
-# # J1PosLimEntryField = Entry(tab3,width=5,justify="center")
-# # J1PosLimEntryField.place(x=280, y=20)
-# # J1NegLimEntryField = Entry(tab3,width=5,justify="center")
-# # J1NegLimEntryField.place(x=280, y=45)
-# # J2PosLimEntryField = Entry(tab3,width=5,justify="center")
-# # J2PosLimEntryField.place(x=280, y=70)
-# # J2NegLimEntryField = Entry(tab3,width=5,justify="center")
-# # J2NegLimEntryField.place(x=280, y=95)
-# # J3PosLimEntryField = Entry(tab3,width=5,justify="center")
-# # J3PosLimEntryField.place(x=280, y=120)
-# # J3NegLimEntryField = Entry(tab3,width=5,justify="center")
-# # J3NegLimEntryField.place(x=280, y=145)
-# # J4PosLimEntryField = Entry(tab3,width=5,justify="center")
-# # J4PosLimEntryField.place(x=280, y=170)
-# # J4NegLimEntryField = Entry(tab3,width=5,justify="center")
-# # J4NegLimEntryField.place(x=280, y=195)
-# # J5PosLimEntryField = Entry(tab3,width=5,justify="center")
-# # J5PosLimEntryField.place(x=280, y=220)
-# # J5NegLimEntryField = Entry(tab3,width=5,justify="center")
-# # J5NegLimEntryField.place(x=280, y=245)
-# # J6PosLimEntryField = Entry(tab3,width=5,justify="center")
-# # J6PosLimEntryField.place(x=280, y=270)
-# # J6NegLimEntryField = Entry(tab3,width=5,justify="center")
-# # J6NegLimEntryField.place(x=280, y=295)
-
-
-### steps per degress
-# # J1StepDegLab = Label(tab3, font=("Arial", 8), text = "J1 Step/Deg")
-# # J1StepDegLab.place(x=200, y=345)
-# # J2StepDegLab = Label(tab3, font=("Arial", 8), text = "J2 Step/Deg")
-# # J2StepDegLab.place(x=200, y=370)
-# # J3StepDegLab = Label(tab3, font=("Arial", 8), text = "J3 Step/Deg")
-# # J3StepDegLab.place(x=200, y=395)
-# # J4StepDegLab = Label(tab3, font=("Arial", 8), text = "J4 Step/Deg")
-# # J4StepDegLab.place(x=200, y=420)
-# # J5StepDegLab = Label(tab3, font=("Arial", 8), text = "J5 Step/Deg")
-# # J5StepDegLab.place(x=200, y=445)
-# # J6StepDegLab = Label(tab3, font=("Arial", 8), text = "J6 Step/Deg")
-# # J6StepDegLab.place(x=200, y=470)
-
-# # J1StepDegEntryField = Entry(tab3,width=5,justify="center")
-# # J1StepDegEntryField.place(x=280, y=345)
-# # J2StepDegEntryField = Entry(tab3,width=5,justify="center")
-# # J2StepDegEntryField.place(x=280, y=370)
-# # J3StepDegEntryField = Entry(tab3,width=5,justify="center")
-# # J3StepDegEntryField.place(x=280, y=395)
-# # J4StepDegEntryField = Entry(tab3,width=5,justify="center")
-# # J4StepDegEntryField.place(x=280, y=420)
-# # J5StepDegEntryField = Entry(tab3,width=5,justify="center")
-# # J5StepDegEntryField.place(x=280, y=445)
-# # J6StepDegEntryField = Entry(tab3,width=5,justify="center")
-# # J6StepDegEntryField.place(x=280, y=470)
-
-
-### DRIVER STEPS
-# # J1DriveMSLab = Label(tab3, font=("Arial", 8), text = "J1 Drive Microstep")
-# # J1DriveMSLab.place(x=390, y=20)
-# # J2DriveMSLab = Label(tab3, font=("Arial", 8), text = "J2 Drive Microstep")
-# # J2DriveMSLab.place(x=390, y=45)
-# # J3DriveMSLab = Label(tab3, font=("Arial", 8), text = "J3 Drive Microstep")
-# # J3DriveMSLab.place(x=390, y=70)
-# # J4DriveMSLab = Label(tab3, font=("Arial", 8), text = "J4 Drive Microstep")
-# # J4DriveMSLab.place(x=390, y=95)
-# # J5DriveMSLab = Label(tab3, font=("Arial", 8), text = "J5 Drive Microstep")
-# # J5DriveMSLab.place(x=390, y=120)
-# # J6DriveMSLab = Label(tab3, font=("Arial", 8), text = "J6 Drive Microstep")
-# # J6DriveMSLab.place(x=390, y=145)
-
-# # J1DriveMSEntryField = Entry(tab3,width=5,justify="center")
-# # J1DriveMSEntryField.place(x=500, y=20)
-# # J2DriveMSEntryField = Entry(tab3,width=5,justify="center")
-# # J2DriveMSEntryField.place(x=500, y=45)
-# # J3DriveMSEntryField = Entry(tab3,width=5,justify="center")
-# # J3DriveMSEntryField.place(x=500, y=70)
-# # J4DriveMSEntryField = Entry(tab3,width=5,justify="center")
-# # J4DriveMSEntryField.place(x=500, y=95)
-# # J5DriveMSEntryField = Entry(tab3,width=5,justify="center")
-# # J5DriveMSEntryField.place(x=500, y=120)
-# # J6DriveMSEntryField = Entry(tab3,width=5,justify="center")
-# # J6DriveMSEntryField.place(x=500, y=145)
-
-
-###ENCODER CPR
-# # J1EncCPRLab = Label(tab3, font=("Arial", 8), text = "J1 Encoder CPR")
-# # J1EncCPRLab.place(x=390, y=195)
-# # J2EncCPRLab = Label(tab3, font=("Arial", 8), text = "J2 Encoder CPR")
-# # J2EncCPRLab.place(x=390, y=220)
-# # J3EncCPRLab = Label(tab3, font=("Arial", 8), text = "J3 Encoder CPR")
-# # J3EncCPRLab.place(x=390, y=245)
-# # J4EncCPRLab = Label(tab3, font=("Arial", 8), text = "J4 Encoder CPR")
-# # J4EncCPRLab.place(x=390, y=270)
-# # J5EncCPRLab = Label(tab3, font=("Arial", 8), text = "J5 Encoder CPR")
-# # J5EncCPRLab.place(x=390, y=295)
-# # J6EncCPRLab = Label(tab3, font=("Arial", 8), text = "J6 Encoder CPR")
-# # J6EncCPRLab.place(x=390, y=320)
-
-# # J1EncCPREntryField = Entry(tab3,width=5,justify="center")
-# # J1EncCPREntryField.place(x=500, y=195)
-# # J2EncCPREntryField = Entry(tab3,width=5,justify="center")
-# # J2EncCPREntryField.place(x=500, y=220)
-# # J3EncCPREntryField = Entry(tab3,width=5,justify="center")
-# # J3EncCPREntryField.place(x=500, y=245)
-# # J4EncCPREntryField = Entry(tab3,width=5,justify="center")
-# # J4EncCPREntryField.place(x=500, y=270)
-# # J5EncCPREntryField = Entry(tab3,width=5,justify="center")
-# # J5EncCPREntryField.place(x=500, y=295)
-# # J6EncCPREntryField = Entry(tab3,width=5,justify="center")
-# # J6EncCPREntryField.place(x=500, y=320)
-
-
-# ### DH PARAMS
-# 
-# ### DRIVER STEPS
-# J1DHparamLab = Label(tab3, font=("Arial", 8), text = "J1")
-# J1DHparamLab.place(x=600, y=45)
-# J1DHparamLab = Label(tab3, font=("Arial", 8), text = "J2")
-# J1DHparamLab.place(x=600, y=70)
-# J1DHparamLab = Label(tab3, font=("Arial", 8), text = "J3")
-# J1DHparamLab.place(x=600, y=95)
-# J1DHparamLab = Label(tab3, font=("Arial", 8), text = "J4")
-# J1DHparamLab.place(x=600, y=120)
-# J1DHparamLab = Label(tab3, font=("Arial", 8), text = "J5")
-# J1DHparamLab.place(x=600, y=145)
-# J1DHparamLab = Label(tab3, font=("Arial", 8), text = "J6")
-# J1DHparamLab.place(x=600, y=170)
-# 
-# ΘDHparamLab = Label(tab3, font=("Arial", 8), text = "DH-Θ")
-# ΘDHparamLab.place(x=645, y=20)
-# αDHparamLab = Label(tab3, font=("Arial", 8), text = "DH-α")
-# αDHparamLab.place(x=700, y=20)
-# dDHparamLab = Label(tab3, font=("Arial", 8), text = "DH-d")
-# dDHparamLab.place(x=755, y=20)
-# aDHparamLab = Label(tab3, font=("Arial", 8), text = "DH-a")
-# aDHparamLab.place(x=810, y=20)
-# 
-# 
-# J1ΘEntryField = Entry(tab3,width=5,justify="center")
-# J1ΘEntryField.place(x=630, y=45)
-# J2ΘEntryField = Entry(tab3,width=5,justify="center")
-# J2ΘEntryField.place(x=630, y=70)
-# J3ΘEntryField = Entry(tab3,width=5,justify="center")
-# J3ΘEntryField.place(x=630, y=95)
-# J4ΘEntryField = Entry(tab3,width=5,justify="center")
-# J4ΘEntryField.place(x=630, y=120)
-# J5ΘEntryField = Entry(tab3,width=5,justify="center")
-# J5ΘEntryField.place(x=630, y=145)
-# J6ΘEntryField = Entry(tab3,width=5,justify="center")
-# J6ΘEntryField.place(x=630, y=170)
-# 
-# J1αEntryField = Entry(tab3,width=5,justify="center")
-# J1αEntryField.place(x=685, y=45)
-# J2αEntryField = Entry(tab3,width=5,justify="center")
-# J2αEntryField.place(x=685, y=70)
-# J3αEntryField = Entry(tab3,width=5,justify="center")
-# J3αEntryField.place(x=685, y=95)
-# J4αEntryField = Entry(tab3,width=5,justify="center")
-# J4αEntryField.place(x=685, y=120)
-# J5αEntryField = Entry(tab3,width=5,justify="center")
-# J5αEntryField.place(x=685, y=145)
-# J6αEntryField = Entry(tab3,width=5,justify="center")
-# J6αEntryField.place(x=685, y=170)
-# 
-# J1dEntryField = Entry(tab3,width=5,justify="center")
-# J1dEntryField.place(x=740, y=45)
-# J2dEntryField = Entry(tab3,width=5,justify="center")
-# J2dEntryField.place(x=740, y=70)
-# J3dEntryField = Entry(tab3,width=5,justify="center")
-# J3dEntryField.place(x=740, y=95)
-# J4dEntryField = Entry(tab3,width=5,justify="center")
-# J4dEntryField.place(x=740, y=120)
-# J5dEntryField = Entry(tab3,width=5,justify="center")
-# J5dEntryField.place(x=740, y=145)
-# J6dEntryField = Entry(tab3,width=5,justify="center")
-# J6dEntryField.place(x=740, y=170)
-# 
-# J1aEntryField = Entry(tab3,width=5,justify="center")
-# J1aEntryField.place(x=795, y=45)
-# J2aEntryField = Entry(tab3,width=5,justify="center")
-# J2aEntryField.place(x=795, y=70)
-# J3aEntryField = Entry(tab3,width=5,justify="center")
-# J3aEntryField.place(x=795, y=95)
-# J4aEntryField = Entry(tab3,width=5,justify="center")
-# J4aEntryField.place(x=795, y=120)
-# J5aEntryField = Entry(tab3,width=5,justify="center")
-# J5aEntryField.place(x=795, y=145)
-# J6aEntryField = Entry(tab3,width=5,justify="center")
-# J6aEntryField.place(x=795, y=170)
-
-
-# ### LOAD DEFAULT ###
-# 
-# loadAR4Mk2But = Button(tab3,  text="Load AR4-MK3 Defaults",  width=26, command = LoadAR4Mk3default)
-# loadAR4Mk2But.place(x=1150, y=470)
-# 
-# loadAR4Mk2But = Button(tab3,  text="Load AR4-MK2 Defaults",  width=26, command = LoadAR4Mk2default)
-# loadAR4Mk2But.place(x=1150, y=510)
-# 
-# loadAR4But = Button(tab3,  text="Load AR4 Defaults",  width=26, command = LoadAR4default)
-# loadAR4But.place(x=1150, y=550)
-# 
-# loadAR3But = Button(tab3,  text="Load AR3 Defaults",  width=26, command = LoadAR3default)
-# loadAR3But.place(x=1150, y=590)
-# 
-# 
-# 
-# 
-# 
-# 
-# #### SAVE ####
-# 
-# saveCalBut = Button(tab3,  text="SAVE",  width=26, command = SaveAndApplyCalibration)
-# saveCalBut.place(x=1150, y=630)
-
-
-
-####################################################################################################################################################
-####################################################################################################################################################
-####################################################################################################################################################
-####TAB 4
-
-# ============================================================================
-# Tab 4 Grid Layout Configuration
-# ============================================================================
-tab4.grid_rowconfigure(0, weight=1)
-tab4.grid_rowconfigure(1, weight=0)
-tab4.grid_columnconfigure(0, weight=0, minsize=300)  # 5v IO BOARD
-tab4.grid_columnconfigure(1, weight=0, minsize=250)  # AUX COM DEVICE
-tab4.grid_columnconfigure(2, weight=0, minsize=400)  # MODBUS DEVICE
-tab4.grid_columnconfigure(3, weight=1)  # Remaining space
-
-# ============================================================================
-# 5v IO BOARD Frame (Row 0, Column 0)
-# ============================================================================
-ioBoardFrame = LabelFrame(tab4, text="5v IO BOARD", padding=10)
-ioBoardFrame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-
-ioBoardFrame.grid_columnconfigure(0, weight=0, minsize=60)   # Servo buttons
-ioBoardFrame.grid_columnconfigure(1, weight=0, minsize=10)   # = labels
-ioBoardFrame.grid_columnconfigure(2, weight=0, minsize=35)   # Entry fields
-ioBoardFrame.grid_columnconfigure(3, weight=0, minsize=10)   # Spacer between columns
-ioBoardFrame.grid_columnconfigure(4, weight=0, minsize=60)   # DO buttons
-ioBoardFrame.grid_columnconfigure(5, weight=0, minsize=10)   # = labels
-ioBoardFrame.grid_columnconfigure(6, weight=0, minsize=35)   # Entry fields (no expansion)
-
-# Configure all rows to have uniform minimum height
-for row in range(12):
-    ioBoardFrame.grid_rowconfigure(row, minsize=25)
-
-# Servo 0 on
-servo0onBut = Button(ioBoardFrame, text="Servo 0", command=lambda: _request_manual_servo(0, True, servo0onEntryField))
-servo0onBut.grid(row=0, column=0, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=0, column=1, padx=2, pady=1)
-servo0onEntryField = Entry(ioBoardFrame, width=4, justify="center")
-servo0onEntryField.grid(row=0, column=2, padx=2, pady=1)
-
-# DO on (row 0)
-DO1onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(1, True, DO1onEntryField))
-DO1onBut.grid(row=0, column=4, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=0, column=5, padx=2, pady=1)
-DO1onEntryField = Entry(ioBoardFrame, width=4, justify="center")
-DO1onEntryField.grid(row=0, column=6, padx=2, pady=1)
-
-# Servo 0 off
-servo0offBut = Button(ioBoardFrame, text="Servo 0", command=lambda: _request_manual_servo(0, False, servo0offEntryField))
-servo0offBut.grid(row=1, column=0, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=1, column=1, padx=2, pady=1)
-servo0offEntryField = Entry(ioBoardFrame, width=4, justify="center")
-servo0offEntryField.grid(row=1, column=2, padx=2, pady=1)
-
-# DO off (row 1)
-DO1offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(1, False, DO1offEntryField))
-DO1offBut.grid(row=1, column=4, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=1, column=5, padx=2, pady=1)
-DO1offEntryField = Entry(ioBoardFrame, width=4, justify="center")
-DO1offEntryField.grid(row=1, column=6, padx=2, pady=1)
-
-# Servo 1 on
-servo1onBut = Button(ioBoardFrame, text="Servo 1", command=lambda: _request_manual_servo(1, True, servo1onEntryField))
-servo1onBut.grid(row=2, column=0, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=2, column=1, padx=2, pady=1)
-servo1onEntryField = Entry(ioBoardFrame, width=4, justify="center")
-servo1onEntryField.grid(row=2, column=2, padx=2, pady=1)
-
-# DO on (row 2)
-DO2onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(2, True, DO2onEntryField))
-DO2onBut.grid(row=2, column=4, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=2, column=5, padx=2, pady=1)
-DO2onEntryField = Entry(ioBoardFrame, width=4, justify="center")
-DO2onEntryField.grid(row=2, column=6, padx=2, pady=1)
-
-# Servo 1 off
-servo1offBut = Button(ioBoardFrame, text="Servo 1", command=lambda: _request_manual_servo(1, False, servo1offEntryField))
-servo1offBut.grid(row=3, column=0, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=3, column=1, padx=2, pady=1)
-servo1offEntryField = Entry(ioBoardFrame, width=4, justify="center")
-servo1offEntryField.grid(row=3, column=2, padx=2, pady=1)
-
-# DO off (row 3)
-DO2offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(2, False, DO2offEntryField))
-DO2offBut.grid(row=3, column=4, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=3, column=5, padx=2, pady=1)
-DO2offEntryField = Entry(ioBoardFrame, width=4, justify="center")
-DO2offEntryField.grid(row=3, column=6, padx=2, pady=1)
-
-# Servo 2 on
-servo2onBut = Button(ioBoardFrame, text="Servo 2", command=lambda: _request_manual_servo(2, True, servo2onEntryField))
-servo2onBut.grid(row=4, column=0, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=4, column=1, padx=2, pady=1)
-servo2onEntryField = Entry(ioBoardFrame, width=4, justify="center")
-servo2onEntryField.grid(row=4, column=2, padx=2, pady=1)
-
-# DO on (row 4)
-DO3onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(3, True, DO3onEntryField))
-DO3onBut.grid(row=4, column=4, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=4, column=5, padx=2, pady=1)
-DO3onEntryField = Entry(ioBoardFrame, width=4, justify="center")
-DO3onEntryField.grid(row=4, column=6, padx=2, pady=1)
-
-# Servo 2 off
-servo2offBut = Button(ioBoardFrame, text="Servo 2", command=lambda: _request_manual_servo(2, False, servo2offEntryField))
-servo2offBut.grid(row=5, column=0, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=5, column=1, padx=2, pady=1)
-servo2offEntryField = Entry(ioBoardFrame, width=4, justify="center")
-servo2offEntryField.grid(row=5, column=2, padx=2, pady=1)
-
-# DO off (row 5)
-DO3offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(3, False, DO3offEntryField))
-DO3offBut.grid(row=5, column=4, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=5, column=5, padx=2, pady=1)
-DO3offEntryField = Entry(ioBoardFrame, width=4, justify="center")
-DO3offEntryField.grid(row=5, column=6, padx=2, pady=1)
-
-# Servo 3 on
-servo3onBut = Button(ioBoardFrame, text="Servo 3", command=lambda: _request_manual_servo(3, True, servo3onEntryField))
-servo3onBut.grid(row=6, column=0, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=6, column=1, padx=2, pady=1)
-servo3onEntryField = Entry(ioBoardFrame, width=4, justify="center")
-servo3onEntryField.grid(row=6, column=2, padx=2, pady=1)
-
-# DO on (row 6)
-DO4onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(4, True, DO4onEntryField))
-DO4onBut.grid(row=6, column=4, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=6, column=5, padx=2, pady=1)
-DO4onEntryField = Entry(ioBoardFrame, width=4, justify="center")
-DO4onEntryField.grid(row=6, column=6, padx=2, pady=1)
-
-# Servo 3 off
-servo3offBut = Button(ioBoardFrame, text="Servo 3", command=lambda: _request_manual_servo(3, False, servo3offEntryField))
-servo3offBut.grid(row=7, column=0, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=7, column=1, padx=2, pady=1)
-servo3offEntryField = Entry(ioBoardFrame, width=4, justify="center")
-servo3offEntryField.grid(row=7, column=2, padx=2, pady=1)
-
-# DO off (row 7)
-DO4offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(4, False, DO4offEntryField))
-DO4offBut.grid(row=7, column=4, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=7, column=5, padx=2, pady=1)
-DO4offEntryField = Entry(ioBoardFrame, width=4, justify="center")
-DO4offEntryField.grid(row=7, column=6, padx=2, pady=1)
-
-
-
-# DO on (row 8) - no servo
-DO5onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(5, True, DO5onEntryField))
-DO5onBut.grid(row=8, column=4, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=8, column=5, padx=2, pady=1)
-DO5onEntryField = Entry(ioBoardFrame, width=4, justify="center")
-DO5onEntryField.grid(row=8, column=6, padx=2, pady=1)
-
-
-
-# DO off (row 9)
-DO5offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(5, False, DO5offEntryField))
-DO5offBut.grid(row=9, column=4, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=9, column=5, padx=2, pady=1)
-DO5offEntryField = Entry(ioBoardFrame, width=4, justify="center")
-DO5offEntryField.grid(row=9, column=6, padx=2, pady=1)
-
-
-
-# DO on (row 10)
-DO6onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(6, True, DO6onEntryField))
-DO6onBut.grid(row=10, column=4, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=10, column=5, padx=2, pady=1)
-DO6onEntryField = Entry(ioBoardFrame, width=4, justify="center")
-DO6onEntryField.grid(row=10, column=6, padx=2, pady=1)
-
-
-
-# DO off (row 11)
-DO6offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(6, False, DO6offEntryField))
-DO6offBut.grid(row=11, column=4, sticky="ew", padx=2, pady=1)
-Label(ioBoardFrame, text="=").grid(row=11, column=5, padx=2, pady=1)
-DO6offEntryField = Entry(ioBoardFrame, width=4, justify="center")
-DO6offEntryField.grid(row=11, column=6, padx=2, pady=1)
-
-# ============================================================================
-# AUX COM DEVICE Frame (Row 0, Column 1)
-# ============================================================================
-auxComFrame = LabelFrame(tab4, text="AUX COM DEVICE", padding=10)
-auxComFrame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
-
-auxComFrame.grid_columnconfigure(0, weight=1)
-
-# Aux Com Port
-Label(auxComFrame, text="Aux Com Port").grid(row=0, column=0, sticky="w", padx=(5,2), pady=5)
-com3PortEntryField = Entry(auxComFrame, width=10, justify="left")
-com3PortEntryField.grid(row=0, column=1, sticky="w", padx=(2,5), pady=5)
-
-# Char to Read
-Label(auxComFrame, text="Char to Read").grid(row=1, column=0, sticky="w", padx=(5,2), pady=5)
-com3charPortEntryField = Entry(auxComFrame, width=10, justify="left")
-com3charPortEntryField.grid(row=1, column=1, sticky="w", padx=(2,5), pady=5)
-
-# Test button
-comPortBut3 = Button(auxComFrame, text="Test Aux COM Device", command=TestAuxCom)
-comPortBut3.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
-
-# Output
-com3outPortEntryField = Entry(auxComFrame, width=25, justify="center")
-com3outPortEntryField.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
-
-# ============================================================================
-# MODBUS DEVICE Frame (Row 0, Column 2)
-# ============================================================================
-modbusFrame = LabelFrame(tab4, text="MODBUS DEVICE", padding=10)
-modbusFrame.grid(row=0, column=2, sticky="nsew", padx=5, pady=5)
-
-modbusFrame.grid_columnconfigure(0, weight=1)
-
-# Slave ID
-Label(modbusFrame, text="Slave ID").grid(row=0, column=0, sticky="w", padx=(5,2), pady=5)
-MBslaveEntryField = Entry(modbusFrame, width=10, justify="left")
-MBslaveEntryField.grid(row=0, column=1, sticky="w", padx=(2,5), pady=5)
-
-# Modbus Address
-Label(modbusFrame, text="Modbus Address").grid(row=1, column=0, sticky="w", padx=(5,2), pady=5)
-MBaddressEntryField = Entry(modbusFrame, width=10, justify="left")
-MBaddressEntryField.grid(row=1, column=1, sticky="w", padx=(2,5), pady=5)
-
-# Operation Value
-Label(modbusFrame, text="Operation Value").grid(row=2, column=0, sticky="w", padx=(5,2), pady=5)
-MBoperValEntryField = Entry(modbusFrame, width=10, justify="left")
-MBoperValEntryField.grid(row=2, column=1, sticky="w", padx=(2,5), pady=5)
-
-# Buttons
-MBreadCoilBut = Button(modbusFrame, text="Read Coil", width=30, command=partial(_request_manual_modbus, "BB"))
-MBreadCoilBut.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-MBreadDinputBut = Button(modbusFrame, text="Read Discrete Input", width=30, command=partial(_request_manual_modbus, "BC"))
-MBreadDinputBut.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-MBreadHoldRegBut = Button(modbusFrame, text="Read Holding Register", width=30, command=partial(_request_manual_modbus, "BA"))
-MBreadHoldRegBut.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-MBreadInputRegBut = Button(modbusFrame, text="Read Input Register", width=30, command=partial(_request_manual_modbus, "BD"))
-MBreadInputRegBut.grid(row=6, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-MBwriteCoilBut = Button(modbusFrame, text="Write Coil", width=30, command=partial(_request_manual_modbus, "BE"))
-MBwriteCoilBut.grid(row=7, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-MBwriteRegBut = Button(modbusFrame, text="Write Register", width=30, command=partial(_request_manual_modbus, "BF"))
-MBwriteRegBut.grid(row=8, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-# Output Response
-Label(modbusFrame, text="Output Response:").grid(row=9, column=0, columnspan=2, sticky="w", padx=5, pady=(10,2))
-MBoutputEntryField = Entry(modbusFrame, width=33, justify="center")
-MBoutputEntryField.grid(row=10, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
-
-# ============================================================================
-# Information Frame (Row 1, Column 0-2, spans 3 columns)
-# ============================================================================
-infoFrame = LabelFrame(tab4, text="Information", padding=10)
-infoFrame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
-
-infoFrame.grid_columnconfigure(0, weight=1)
-
-Label(infoFrame, text="The following IO are available when using the default 5v Nano board for IO:   Inputs = 2-7  /  Outputs = 8-13  /  Servos = A0-A5").grid(row=0, column=0, sticky="w", padx=5, pady=2)
-
-Label(infoFrame, text="The following IO are available when using the default 5v Mega board for IO:   Inputs = 2-27  /  Outputs = 28-53  /  Servos = A0-A6").grid(row=1, column=0, sticky="w", padx=5, pady=2)
-
-Label(infoFrame, text="Please review this tutorial video on using 5v IO boards:").grid(row=2, column=0, sticky="w", padx=5, pady=2)
-
-link2 = Label(infoFrame, font=("Arial", 8), text="https://youtu.be/76F6dS4ar8Y?si=Z6NstZy1zNeHgtCF", foreground="blue", cursor="hand2")
-link2.bind("<Button-1>", lambda event: webbrowser.open(link2.cget("text")))
-link2.grid(row=3, column=0, sticky="w", padx=5, pady=2)
-
-Label(infoFrame, text="5v board inputs are high impedance and susceptable to floating voltage - inputs use a pullup resistor and will read high when nothing is connected - its best to connect your input signal to GND and if/wait for the input signal to = 0").grid(row=4, column=0, sticky="w", padx=5, pady=2)
-
-
-
-
-
-####TAB 5
-
-# ============================================================================
-# Tab 5 Grid Layout Configuration
-# ============================================================================
-tab5.grid_rowconfigure(0, weight=1)
-tab5.grid_columnconfigure(0, weight=0, minsize=150)  # Registers
-tab5.grid_columnconfigure(1, weight=0, minsize=300)  # Position Registers
-
-# ============================================================================
-# Registers Container (Column 0)
-# ============================================================================
-registersFrame = LabelFrame(tab5, text="Registers", padding=10)
-registersFrame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-
-registersFrame.grid_columnconfigure(0, weight=0)  # Entry field column
-registersFrame.grid_columnconfigure(1, weight=1)  # Label column
-
-# R1
-R1EntryField = Entry(registersFrame, width=4, justify="center")
-R1EntryField.grid(row=0, column=0, padx=2, pady=2)
-R1Lab = Label(registersFrame, text="R1")
-R1Lab.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-
-# R2
-R2EntryField = Entry(registersFrame, width=4, justify="center")
-R2EntryField.grid(row=1, column=0, padx=2, pady=2)
-R2Lab = Label(registersFrame, text="R2")
-R2Lab.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-
-# R3
-R3EntryField = Entry(registersFrame, width=4, justify="center")
-R3EntryField.grid(row=2, column=0, padx=2, pady=2)
-R3Lab = Label(registersFrame, text="R3")
-R3Lab.grid(row=2, column=1, sticky="w", padx=5, pady=2)
-
-# R4
-R4EntryField = Entry(registersFrame, width=4, justify="center")
-R4EntryField.grid(row=3, column=0, padx=2, pady=2)
-R4Lab = Label(registersFrame, text="R4")
-R4Lab.grid(row=3, column=1, sticky="w", padx=5, pady=2)
-
-# R5
-R5EntryField = Entry(registersFrame, width=4, justify="center")
-R5EntryField.grid(row=4, column=0, padx=2, pady=2)
-R5Lab = Label(registersFrame, text="R5")
-R5Lab.grid(row=4, column=1, sticky="w", padx=5, pady=2)
-
-# R6
-R6EntryField = Entry(registersFrame, width=4, justify="center")
-R6EntryField.grid(row=5, column=0, padx=2, pady=2)
-R6Lab = Label(registersFrame, text="R6")
-R6Lab.grid(row=5, column=1, sticky="w", padx=5, pady=2)
-
-# R7
-R7EntryField = Entry(registersFrame, width=4, justify="center")
-R7EntryField.grid(row=6, column=0, padx=2, pady=2)
-R7Lab = Label(registersFrame, text="R7")
-R7Lab.grid(row=6, column=1, sticky="w", padx=5, pady=2)
-
-# R8
-R8EntryField = Entry(registersFrame, width=4, justify="center")
-R8EntryField.grid(row=7, column=0, padx=2, pady=2)
-R8Lab = Label(registersFrame, text="R8")
-R8Lab.grid(row=7, column=1, sticky="w", padx=5, pady=2)
-
-# R9
-R9EntryField = Entry(registersFrame, width=4, justify="center")
-R9EntryField.grid(row=8, column=0, padx=2, pady=2)
-R9Lab = Label(registersFrame, text="R9")
-R9Lab.grid(row=8, column=1, sticky="w", padx=5, pady=2)
-
-# R10
-R10EntryField = Entry(registersFrame, width=4, justify="center")
-R10EntryField.grid(row=9, column=0, padx=2, pady=2)
-R10Lab = Label(registersFrame, text="R10")
-R10Lab.grid(row=9, column=1, sticky="w", padx=5, pady=2)
-
-# R11
-R11EntryField = Entry(registersFrame, width=4, justify="center")
-R11EntryField.grid(row=10, column=0, padx=2, pady=2)
-R11Lab = Label(registersFrame, text="R11")
-R11Lab.grid(row=10, column=1, sticky="w", padx=5, pady=2)
-
-# R12
-R12EntryField = Entry(registersFrame, width=4, justify="center")
-R12EntryField.grid(row=11, column=0, padx=2, pady=2)
-R12Lab = Label(registersFrame, text="R12")
-R12Lab.grid(row=11, column=1, sticky="w", padx=5, pady=2)
-
-# R13
-R13EntryField = Entry(registersFrame, width=4, justify="center")
-R13EntryField.grid(row=12, column=0, padx=2, pady=2)
-R13Lab = Label(registersFrame, text="R13")
-R13Lab.grid(row=12, column=1, sticky="w", padx=5, pady=2)
-
-# R14
-R14EntryField = Entry(registersFrame, width=4, justify="center")
-R14EntryField.grid(row=13, column=0, padx=2, pady=2)
-R14Lab = Label(registersFrame, text="R14")
-R14Lab.grid(row=13, column=1, sticky="w", padx=5, pady=2)
-
-# R15
-R15EntryField = Entry(registersFrame, width=4, justify="center")
-R15EntryField.grid(row=14, column=0, padx=2, pady=2)
-R15Lab = Label(registersFrame, text="R15")
-R15Lab.grid(row=14, column=1, sticky="w", padx=5, pady=2)
-
-# R16
-R16EntryField = Entry(registersFrame, width=4, justify="center")
-R16EntryField.grid(row=15, column=0, padx=2, pady=2)
-R16Lab = Label(registersFrame, text="R16")
-R16Lab.grid(row=15, column=1, sticky="w", padx=5, pady=2)
-
-# ============================================================================
-# Position Registers Container (Column 1)
-# ============================================================================
-posRegistersFrame = LabelFrame(tab5, text="Position Registers", padding=10)
-posRegistersFrame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
-
-posRegistersFrame.grid_columnconfigure(0, weight=0, minsize=35)  # X
-posRegistersFrame.grid_columnconfigure(1, weight=0, minsize=35)  # Y
-posRegistersFrame.grid_columnconfigure(2, weight=0, minsize=35)  # Z
-posRegistersFrame.grid_columnconfigure(3, weight=0, minsize=35)  # Rz
-posRegistersFrame.grid_columnconfigure(4, weight=0, minsize=35)  # Ry
-posRegistersFrame.grid_columnconfigure(5, weight=0, minsize=35)  # Rx
-posRegistersFrame.grid_columnconfigure(6, weight=0, minsize=40)  # PR label
-
-# Header row
-Label(posRegistersFrame, text="X").grid(row=0, column=0, padx=1, pady=2)
-Label(posRegistersFrame, text="Y").grid(row=0, column=1, padx=1, pady=2)
-Label(posRegistersFrame, text="Z").grid(row=0, column=2, padx=1, pady=2)
-Label(posRegistersFrame, text="Rz").grid(row=0, column=3, padx=1, pady=2)
-Label(posRegistersFrame, text="Ry").grid(row=0, column=4, padx=1, pady=2)
-Label(posRegistersFrame, text="Rx").grid(row=0, column=5, padx=1, pady=2)
-
-# PR1
-SP_1_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_1_E1_EntryField.grid(row=1, column=0, padx=1, pady=2)
-SP_1_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_1_E2_EntryField.grid(row=1, column=1, padx=1, pady=2)
-SP_1_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_1_E3_EntryField.grid(row=1, column=2, padx=1, pady=2)
-SP_1_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_1_E4_EntryField.grid(row=1, column=3, padx=1, pady=2)
-SP_1_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_1_E5_EntryField.grid(row=1, column=4, padx=1, pady=2)
-SP_1_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_1_E6_EntryField.grid(row=1, column=5, padx=1, pady=2)
-SP1Lab = Label(posRegistersFrame, text="PR1")
-SP1Lab.grid(row=1, column=6, sticky="w", padx=2, pady=2)
-
-# PR2
-SP_2_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_2_E1_EntryField.grid(row=2, column=0, padx=1, pady=2)
-SP_2_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_2_E2_EntryField.grid(row=2, column=1, padx=1, pady=2)
-SP_2_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_2_E3_EntryField.grid(row=2, column=2, padx=1, pady=2)
-SP_2_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_2_E4_EntryField.grid(row=2, column=3, padx=1, pady=2)
-SP_2_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_2_E5_EntryField.grid(row=2, column=4, padx=1, pady=2)
-SP_2_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_2_E6_EntryField.grid(row=2, column=5, padx=1, pady=2)
-SP2Lab = Label(posRegistersFrame, text="PR2")
-SP2Lab.grid(row=2, column=6, sticky="w", padx=2, pady=2)
-
-# PR3
-SP_3_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_3_E1_EntryField.grid(row=3, column=0, padx=1, pady=2)
-SP_3_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_3_E2_EntryField.grid(row=3, column=1, padx=1, pady=2)
-SP_3_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_3_E3_EntryField.grid(row=3, column=2, padx=1, pady=2)
-SP_3_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_3_E4_EntryField.grid(row=3, column=3, padx=1, pady=2)
-SP_3_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_3_E5_EntryField.grid(row=3, column=4, padx=1, pady=2)
-SP_3_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_3_E6_EntryField.grid(row=3, column=5, padx=1, pady=2)
-SP3Lab = Label(posRegistersFrame, text="PR3")
-SP3Lab.grid(row=3, column=6, sticky="w", padx=2, pady=2)
-
-# PR4
-SP_4_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_4_E1_EntryField.grid(row=4, column=0, padx=1, pady=2)
-SP_4_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_4_E2_EntryField.grid(row=4, column=1, padx=1, pady=2)
-SP_4_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_4_E3_EntryField.grid(row=4, column=2, padx=1, pady=2)
-SP_4_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_4_E4_EntryField.grid(row=4, column=3, padx=1, pady=2)
-SP_4_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_4_E5_EntryField.grid(row=4, column=4, padx=1, pady=2)
-SP_4_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_4_E6_EntryField.grid(row=4, column=5, padx=1, pady=2)
-SP4Lab = Label(posRegistersFrame, text="PR4")
-SP4Lab.grid(row=4, column=6, sticky="w", padx=2, pady=2)
-
-# PR5
-SP_5_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_5_E1_EntryField.grid(row=5, column=0, padx=1, pady=2)
-SP_5_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_5_E2_EntryField.grid(row=5, column=1, padx=1, pady=2)
-SP_5_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_5_E3_EntryField.grid(row=5, column=2, padx=1, pady=2)
-SP_5_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_5_E4_EntryField.grid(row=5, column=3, padx=1, pady=2)
-SP_5_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_5_E5_EntryField.grid(row=5, column=4, padx=1, pady=2)
-SP_5_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_5_E6_EntryField.grid(row=5, column=5, padx=1, pady=2)
-SP5Lab = Label(posRegistersFrame, text="PR5")
-SP5Lab.grid(row=5, column=6, sticky="w", padx=2, pady=2)
-
-# PR6
-SP_6_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_6_E1_EntryField.grid(row=6, column=0, padx=1, pady=2)
-SP_6_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_6_E2_EntryField.grid(row=6, column=1, padx=1, pady=2)
-SP_6_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_6_E3_EntryField.grid(row=6, column=2, padx=1, pady=2)
-SP_6_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_6_E4_EntryField.grid(row=6, column=3, padx=1, pady=2)
-SP_6_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_6_E5_EntryField.grid(row=6, column=4, padx=1, pady=2)
-SP_6_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_6_E6_EntryField.grid(row=6, column=5, padx=1, pady=2)
-SP6Lab = Label(posRegistersFrame, text="PR6")
-SP6Lab.grid(row=6, column=6, sticky="w", padx=2, pady=2)
-
-# PR7
-SP_7_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_7_E1_EntryField.grid(row=7, column=0, padx=1, pady=2)
-SP_7_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_7_E2_EntryField.grid(row=7, column=1, padx=1, pady=2)
-SP_7_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_7_E3_EntryField.grid(row=7, column=2, padx=1, pady=2)
-SP_7_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_7_E4_EntryField.grid(row=7, column=3, padx=1, pady=2)
-SP_7_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_7_E5_EntryField.grid(row=7, column=4, padx=1, pady=2)
-SP_7_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_7_E6_EntryField.grid(row=7, column=5, padx=1, pady=2)
-SP7Lab = Label(posRegistersFrame, text="PR7")
-SP7Lab.grid(row=7, column=6, sticky="w", padx=2, pady=2)
-
-# PR8
-SP_8_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_8_E1_EntryField.grid(row=8, column=0, padx=1, pady=2)
-SP_8_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_8_E2_EntryField.grid(row=8, column=1, padx=1, pady=2)
-SP_8_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_8_E3_EntryField.grid(row=8, column=2, padx=1, pady=2)
-SP_8_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_8_E4_EntryField.grid(row=8, column=3, padx=1, pady=2)
-SP_8_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_8_E5_EntryField.grid(row=8, column=4, padx=1, pady=2)
-SP_8_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_8_E6_EntryField.grid(row=8, column=5, padx=1, pady=2)
-SP8Lab = Label(posRegistersFrame, text="PR8")
-SP8Lab.grid(row=8, column=6, sticky="w", padx=2, pady=2)
-
-# PR9
-SP_9_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_9_E1_EntryField.grid(row=9, column=0, padx=1, pady=2)
-SP_9_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_9_E2_EntryField.grid(row=9, column=1, padx=1, pady=2)
-SP_9_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_9_E3_EntryField.grid(row=9, column=2, padx=1, pady=2)
-SP_9_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_9_E4_EntryField.grid(row=9, column=3, padx=1, pady=2)
-SP_9_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_9_E5_EntryField.grid(row=9, column=4, padx=1, pady=2)
-SP_9_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_9_E6_EntryField.grid(row=9, column=5, padx=1, pady=2)
-SP9Lab = Label(posRegistersFrame, text="PR9")
-SP9Lab.grid(row=9, column=6, sticky="w", padx=2, pady=2)
-
-# PR10
-SP_10_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_10_E1_EntryField.grid(row=10, column=0, padx=1, pady=2)
-SP_10_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_10_E2_EntryField.grid(row=10, column=1, padx=1, pady=2)
-SP_10_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_10_E3_EntryField.grid(row=10, column=2, padx=1, pady=2)
-SP_10_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_10_E4_EntryField.grid(row=10, column=3, padx=1, pady=2)
-SP_10_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_10_E5_EntryField.grid(row=10, column=4, padx=1, pady=2)
-SP_10_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_10_E6_EntryField.grid(row=10, column=5, padx=1, pady=2)
-SP10Lab = Label(posRegistersFrame, text="PR10")
-SP10Lab.grid(row=10, column=6, sticky="w", padx=2, pady=2)
-
-# PR11
-SP_11_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_11_E1_EntryField.grid(row=11, column=0, padx=1, pady=2)
-SP_11_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_11_E2_EntryField.grid(row=11, column=1, padx=1, pady=2)
-SP_11_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_11_E3_EntryField.grid(row=11, column=2, padx=1, pady=2)
-SP_11_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_11_E4_EntryField.grid(row=11, column=3, padx=1, pady=2)
-SP_11_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_11_E5_EntryField.grid(row=11, column=4, padx=1, pady=2)
-SP_11_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_11_E6_EntryField.grid(row=11, column=5, padx=1, pady=2)
-SP11Lab = Label(posRegistersFrame, text="PR11")
-SP11Lab.grid(row=11, column=6, sticky="w", padx=2, pady=2)
-
-# PR12
-SP_12_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_12_E1_EntryField.grid(row=12, column=0, padx=1, pady=2)
-SP_12_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_12_E2_EntryField.grid(row=12, column=1, padx=1, pady=2)
-SP_12_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_12_E3_EntryField.grid(row=12, column=2, padx=1, pady=2)
-SP_12_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_12_E4_EntryField.grid(row=12, column=3, padx=1, pady=2)
-SP_12_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_12_E5_EntryField.grid(row=12, column=4, padx=1, pady=2)
-SP_12_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_12_E6_EntryField.grid(row=12, column=5, padx=1, pady=2)
-SP12Lab = Label(posRegistersFrame, text="PR12")
-SP12Lab.grid(row=12, column=6, sticky="w", padx=2, pady=2)
-
-# PR13
-SP_13_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_13_E1_EntryField.grid(row=13, column=0, padx=1, pady=2)
-SP_13_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_13_E2_EntryField.grid(row=13, column=1, padx=1, pady=2)
-SP_13_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_13_E3_EntryField.grid(row=13, column=2, padx=1, pady=2)
-SP_13_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_13_E4_EntryField.grid(row=13, column=3, padx=1, pady=2)
-SP_13_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_13_E5_EntryField.grid(row=13, column=4, padx=1, pady=2)
-SP_13_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_13_E6_EntryField.grid(row=13, column=5, padx=1, pady=2)
-SP13Lab = Label(posRegistersFrame, text="PR13")
-SP13Lab.grid(row=13, column=6, sticky="w", padx=2, pady=2)
-
-# PR14
-SP_14_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_14_E1_EntryField.grid(row=14, column=0, padx=1, pady=2)
-SP_14_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_14_E2_EntryField.grid(row=14, column=1, padx=1, pady=2)
-SP_14_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_14_E3_EntryField.grid(row=14, column=2, padx=1, pady=2)
-SP_14_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_14_E4_EntryField.grid(row=14, column=3, padx=1, pady=2)
-SP_14_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_14_E5_EntryField.grid(row=14, column=4, padx=1, pady=2)
-SP_14_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_14_E6_EntryField.grid(row=14, column=5, padx=1, pady=2)
-SP14Lab = Label(posRegistersFrame, text="PR14")
-SP14Lab.grid(row=14, column=6, sticky="w", padx=2, pady=2)
-
-# PR15
-SP_15_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_15_E1_EntryField.grid(row=15, column=0, padx=1, pady=2)
-SP_15_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_15_E2_EntryField.grid(row=15, column=1, padx=1, pady=2)
-SP_15_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_15_E3_EntryField.grid(row=15, column=2, padx=1, pady=2)
-SP_15_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_15_E4_EntryField.grid(row=15, column=3, padx=1, pady=2)
-SP_15_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_15_E5_EntryField.grid(row=15, column=4, padx=1, pady=2)
-SP_15_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_15_E6_EntryField.grid(row=15, column=5, padx=1, pady=2)
-SP15Lab = Label(posRegistersFrame, text="PR15")
-SP15Lab.grid(row=15, column=6, sticky="w", padx=2, pady=2)
-
-# PR16
-SP_16_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_16_E1_EntryField.grid(row=16, column=0, padx=1, pady=2)
-SP_16_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_16_E2_EntryField.grid(row=16, column=1, padx=1, pady=2)
-SP_16_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_16_E3_EntryField.grid(row=16, column=2, padx=1, pady=2)
-SP_16_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_16_E4_EntryField.grid(row=16, column=3, padx=1, pady=2)
-SP_16_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_16_E5_EntryField.grid(row=16, column=4, padx=1, pady=2)
-SP_16_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
-SP_16_E6_EntryField.grid(row=16, column=5, padx=1, pady=2)
-SP16Lab = Label(posRegistersFrame, text="PR16")
-SP16Lab.grid(row=16, column=6, sticky="w", padx=2, pady=2)
-
-program_register_entry_fields.update({
-  register: entry
-  for register, entry in enumerate(
-    (
-      R1EntryField,
-      R2EntryField,
-      R3EntryField,
-      R4EntryField,
-      R5EntryField,
-      R6EntryField,
-      R7EntryField,
-      R8EntryField,
-      R9EntryField,
-      R10EntryField,
-      R11EntryField,
-      R12EntryField,
-      R13EntryField,
-      R14EntryField,
-      R15EntryField,
-      R16EntryField,
-    ),
-    start=1,
-  )
-})
-program_position_register_entry_fields.update({
-  (register, element): entry
-  for register, entries in enumerate(
-    (
-      (
-        SP_1_E1_EntryField,
-        SP_1_E2_EntryField,
-        SP_1_E3_EntryField,
-        SP_1_E4_EntryField,
-        SP_1_E5_EntryField,
-        SP_1_E6_EntryField,
-      ),
-      (
-        SP_2_E1_EntryField,
-        SP_2_E2_EntryField,
-        SP_2_E3_EntryField,
-        SP_2_E4_EntryField,
-        SP_2_E5_EntryField,
-        SP_2_E6_EntryField,
-      ),
-      (
-        SP_3_E1_EntryField,
-        SP_3_E2_EntryField,
-        SP_3_E3_EntryField,
-        SP_3_E4_EntryField,
-        SP_3_E5_EntryField,
-        SP_3_E6_EntryField,
-      ),
-      (
-        SP_4_E1_EntryField,
-        SP_4_E2_EntryField,
-        SP_4_E3_EntryField,
-        SP_4_E4_EntryField,
-        SP_4_E5_EntryField,
-        SP_4_E6_EntryField,
-      ),
-      (
-        SP_5_E1_EntryField,
-        SP_5_E2_EntryField,
-        SP_5_E3_EntryField,
-        SP_5_E4_EntryField,
-        SP_5_E5_EntryField,
-        SP_5_E6_EntryField,
-      ),
-      (
-        SP_6_E1_EntryField,
-        SP_6_E2_EntryField,
-        SP_6_E3_EntryField,
-        SP_6_E4_EntryField,
-        SP_6_E5_EntryField,
-        SP_6_E6_EntryField,
-      ),
-      (
-        SP_7_E1_EntryField,
-        SP_7_E2_EntryField,
-        SP_7_E3_EntryField,
-        SP_7_E4_EntryField,
-        SP_7_E5_EntryField,
-        SP_7_E6_EntryField,
-      ),
-      (
-        SP_8_E1_EntryField,
-        SP_8_E2_EntryField,
-        SP_8_E3_EntryField,
-        SP_8_E4_EntryField,
-        SP_8_E5_EntryField,
-        SP_8_E6_EntryField,
-      ),
-      (
-        SP_9_E1_EntryField,
-        SP_9_E2_EntryField,
-        SP_9_E3_EntryField,
-        SP_9_E4_EntryField,
-        SP_9_E5_EntryField,
-        SP_9_E6_EntryField,
-      ),
-      (
-        SP_10_E1_EntryField,
-        SP_10_E2_EntryField,
-        SP_10_E3_EntryField,
-        SP_10_E4_EntryField,
-        SP_10_E5_EntryField,
-        SP_10_E6_EntryField,
-      ),
-      (
-        SP_11_E1_EntryField,
-        SP_11_E2_EntryField,
-        SP_11_E3_EntryField,
-        SP_11_E4_EntryField,
-        SP_11_E5_EntryField,
-        SP_11_E6_EntryField,
-      ),
-      (
-        SP_12_E1_EntryField,
-        SP_12_E2_EntryField,
-        SP_12_E3_EntryField,
-        SP_12_E4_EntryField,
-        SP_12_E5_EntryField,
-        SP_12_E6_EntryField,
-      ),
-      (
-        SP_13_E1_EntryField,
-        SP_13_E2_EntryField,
-        SP_13_E3_EntryField,
-        SP_13_E4_EntryField,
-        SP_13_E5_EntryField,
-        SP_13_E6_EntryField,
-      ),
-      (
-        SP_14_E1_EntryField,
-        SP_14_E2_EntryField,
-        SP_14_E3_EntryField,
-        SP_14_E4_EntryField,
-        SP_14_E5_EntryField,
-        SP_14_E6_EntryField,
-      ),
-      (
-        SP_15_E1_EntryField,
-        SP_15_E2_EntryField,
-        SP_15_E3_EntryField,
-        SP_15_E4_EntryField,
-        SP_15_E5_EntryField,
-        SP_15_E6_EntryField,
-      ),
-      (
-        SP_16_E1_EntryField,
-        SP_16_E2_EntryField,
-        SP_16_E3_EntryField,
-        SP_16_E4_EntryField,
-        SP_16_E5_EntryField,
-        SP_16_E6_EntryField,
-      ),
-    ),
-    start=1,
-  )
-  for element, entry in enumerate(entries, start=1)
-})
-
-
-####TAB 6
-
-
-
-
-### 6 LABELS#################################################################
-#############################################################################
-
-
-#VisBackdropImg = ImageTk.PhotoImage(Image.open('VisBackdrop.png'))
-
-VisBackdropImg = Image.open("VisBackdrop.png")
-VisBackdropTk = ImageTk.PhotoImage(VisBackdropImg)
-VisBackdromLbl = Label(tab6, image = VisBackdropTk)
-VisBackdromLbl.place(x=15, y=215)
-
-
-#RUN['cam_on']= cv2.VideoCapture(0)
-video_frame = Frame(tab6,width=640,height=480)
-video_frame.place(x=50, y=250)
-
-
-vid_lbl = Label(video_frame)
-vid_lbl.place(x=0, y=0)
-
-vid_lbl.bind('<Button-1>', motion)
-
-
-LiveLab = Label(tab6, text = "LIVE VIDEO FEED")
-LiveLab.place(x=750, y=390)
-liveCanvas = Canvas(tab6, width=490, height=330)
-liveCanvas.place(x=750, y=410)
-live_frame = Frame(tab6,width=480,height=320)
-live_frame.place(x=757, y=417)
-live_lbl = Label(live_frame)
-live_lbl.place(x=0, y=0)
-
-
-template_frame = Frame(tab6,width=150,height=150)
-template_frame.place(x=565, y=50)
-
-template_lbl = Label(template_frame)
-template_lbl.place(x=0, y=0)
-
-FoundValuesLab = Label(tab6, text = "FOUND VALUES")
-FoundValuesLab.place(x=750, y=30)
-
-CalValuesLab = Label(tab6, text = "CALIBRATION VALUES")
-CalValuesLab.place(x=900, y=30)
-
-
-
-
-
-### 6 BUTTONS################################################################
-#############################################################################
-
-match CE['Platform']['OS']:
-
-  case "Windows":
+      if target_menu is not None and menu is not target_menu:
+        continue
+      menu_widget = menu['menu']
+      menu_widget.delete(0, 'end')
+      for label, device in (("None", "None"),) + entries:
+        menu_widget.add_command(
+          label=label,
+          command=tk._setit(variable, device, callback),
+        )
+
+  def refresh_serial_ports():
+    global serial_port_inventory
+    serial_port_inventory = normalize_serial_ports(())
     try:
-      graph = FilterGraph()
-      allcams = graph.get_input_devices()
+      replacement = enumerate_serial_ports()
+      entries = selector_entries(replacement)
+      rebuild_serial_port_menus(entries)
     except Exception:
-      logger.exception("Unable to enumerate Windows cameras")
-      allcams = []
-    if not isinstance(allcams, (tuple, list)) or any(
-      not isinstance(camera_name, str)
-      or not camera_name
-      or camera_name != camera_name.strip()
-      or "\r" in camera_name
-      or "\n" in camera_name
-      or "\x00" in camera_name
-      or len(camera_name) > MAX_CAMERA_PREVIEW_EVENT_DETAIL
-      for camera_name in allcams
-    ):
-      logger.error("Windows camera enumeration returned invalid data")
-      allcams = []
+      logger.warning("Passive serial-port refresh failed")
+      for menu in (com1Select, com2Select):
+        try:
+          rebuild_serial_port_menus((), target_menu=menu)
+        except Exception:
+          logger.warning("Unable to reset a serial-port menu")
+      refreshSerialPorts.configure(text="Refresh Failed - Retry")
+      return False
+    serial_port_inventory = replacement
+    refreshSerialPorts.configure(text="Refresh COM Ports")
+    return True
 
-    # --- filter out virtual/fake cameras (case-insensitive) ---
-    _ban = ("iriun", "droidcam", "obs", "virtual", "manycam", "snap camera", "ndi", "xsplit", "mmhmm")
-    indexed_cameras = [
-      (index, name)
-      for index, name in enumerate(allcams)
-      if not any(blocked in name.lower() for blocked in _ban)
-    ]
-    if not indexed_cameras:
-      indexed_cameras = list(enumerate(allcams))
-    camList, label_to_id = _camera_labels_for_sources(
-      indexed_cameras
+  # Teensy COM Port
+  ComPortLab = Label(commFrame, text="TEENSY COM PORT:")
+  ComPortLab.grid(row=0, column=0, sticky="w", padx=5, pady=(5, 2))
+
+  com1SelectedValue = tk.StringVar(value="None")
+  com1Select = tk.OptionMenu(commFrame, com1SelectedValue, "None", command=setCom)
+  com1Select.grid(row=1, column=0, sticky="ew", padx=5, pady=2)
+
+  AuxiliaryBoardLab = Label(commFrame, text="5v IO BOARD PROFILE:")
+  AuxiliaryBoardLab.grid(row=2, column=0, sticky="w", padx=5, pady=(15, 2))
+
+  auxiliaryBoardSelectedValue = tk.StringVar(value=AUXILIARY_BOARD_NONE)
+  auxiliaryBoardSelect = tk.OptionMenu(
+    commFrame,
+    auxiliaryBoardSelectedValue,
+    AUXILIARY_BOARD_NONE,
+    AUXILIARY_BOARD_NANO,
+    AUXILIARY_BOARD_MEGA,
+    command=setCom2,
+  )
+  auxiliaryBoardSelect.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
+
+  # 5v IO Board COM Port
+  ComPortLab2 = Label(commFrame, text="5v IO BOARD COM PORT:")
+  ComPortLab2.grid(row=4, column=0, sticky="w", padx=5, pady=(15, 2))
+
+  com2SelectedValue = tk.StringVar(value="None")
+  com2Select = tk.OptionMenu(commFrame, com2SelectedValue, "None", command=setCom2)
+  com2Select.grid(row=5, column=0, sticky="ew", padx=5, pady=2)
+
+  entries = selector_entries(serial_port_inventory)
+  rebuild_serial_port_menus(entries)
+  refreshSerialPorts = Button(
+    commFrame,
+    text="Refresh Failed - Retry" if serial_discovery_failed else "Refresh COM Ports",
+    command=refresh_serial_ports,
+  )
+  refreshSerialPorts.grid(row=6, column=0, sticky="ew", padx=5, pady=(15, 2))
+
+  # ============================================================================
+  # ROW 1, COLUMN 1: Robot Calibration Frame
+  # ============================================================================
+  calFrame = LabelFrame(tab2, text="Robot Calibration", padding=10)
+  calFrame.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
+
+  calFrame.grid_columnconfigure(0, weight=1)
+
+  # Auto Calibrate button
+  autoCalBut = Button(calFrame, text="  Auto Calibrate  ", command=startCalRobotAll)
+  autoCalBut.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+
+  # First set of checkboxes (J1-J9)
+  checkFrame1 = Frame(calFrame)
+  checkFrame1.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
+
+  checkFrame1.grid_columnconfigure(0, weight=1)
+  checkFrame1.grid_columnconfigure(1, weight=1)
+  checkFrame1.grid_columnconfigure(2, weight=1)
+
+  J1calCbut = Checkbutton(checkFrame1, text="J1", variable=CAL['J1CalStatVal'])
+  J1calCbut.grid(row=0, column=0, sticky="w", padx=2)
+
+  J2calCbut = Checkbutton(checkFrame1, text="J2", variable=CAL['J2CalStatVal'])
+  J2calCbut.grid(row=0, column=1, sticky="w", padx=2)
+
+  J3calCbut = Checkbutton(checkFrame1, text="J3", variable=CAL['J3CalStatVal'])
+  J3calCbut.grid(row=0, column=2, sticky="w", padx=2)
+
+  J4calCbut = Checkbutton(checkFrame1, text="J4", variable=CAL['J4CalStatVal'])
+  J4calCbut.grid(row=1, column=0, sticky="w", padx=2)
+
+  J5calCbut = Checkbutton(checkFrame1, text="J5", variable=CAL['J5CalStatVal'])
+  J5calCbut.grid(row=1, column=1, sticky="w", padx=2)
+
+  J6calCbut = Checkbutton(checkFrame1, text="J6", variable=CAL['J6CalStatVal'])
+  J6calCbut.grid(row=1, column=2, sticky="w", padx=2)
+
+  J7calCbut = Checkbutton(checkFrame1, text="J7", variable=CAL['J7CalStatVal'])
+  J7calCbut.grid(row=2, column=0, sticky="w", padx=2)
+
+  J8calCbut = Checkbutton(checkFrame1, text="J8", variable=CAL['J8CalStatVal'])
+  J8calCbut.grid(row=2, column=1, sticky="w", padx=2)
+
+  J9calCbut = Checkbutton(checkFrame1, text="J9", variable=CAL['J9CalStatVal'])
+  J9calCbut.grid(row=2, column=2, sticky="w", padx=2)
+
+  # Second set of checkboxes (J1-J9)
+  checkFrame2 = Frame(calFrame)
+  checkFrame2.grid(row=2, column=0, sticky="ew", padx=5, pady=(10, 5))
+
+  checkFrame2.grid_columnconfigure(0, weight=1)
+  checkFrame2.grid_columnconfigure(1, weight=1)
+  checkFrame2.grid_columnconfigure(2, weight=1)
+
+  J1calCbut2 = Checkbutton(checkFrame2, text="J1", variable=CAL['J1CalStatVal2'])
+  J1calCbut2.grid(row=0, column=0, sticky="w", padx=2)
+
+  J2calCbut2 = Checkbutton(checkFrame2, text="J2", variable=CAL['J2CalStatVal2'])
+  J2calCbut2.grid(row=0, column=1, sticky="w", padx=2)
+
+  J3calCbut2 = Checkbutton(checkFrame2, text="J3", variable=CAL['J3CalStatVal2'])
+  J3calCbut2.grid(row=0, column=2, sticky="w", padx=2)
+
+  J4calCbut2 = Checkbutton(checkFrame2, text="J4", variable=CAL['J4CalStatVal2'])
+  J4calCbut2.grid(row=1, column=0, sticky="w", padx=2)
+
+  J5calCbut2 = Checkbutton(checkFrame2, text="J5", variable=CAL['J5CalStatVal2'])
+  J5calCbut2.grid(row=1, column=1, sticky="w", padx=2)
+
+  J6calCbut2 = Checkbutton(checkFrame2, text="J6", variable=CAL['J6CalStatVal2'])
+  J6calCbut2.grid(row=1, column=2, sticky="w", padx=2)
+
+  J7calCbut2 = Checkbutton(checkFrame2, text="J7", variable=CAL['J7CalStatVal2'])
+  J7calCbut2.grid(row=2, column=0, sticky="w", padx=2)
+
+  J8calCbut2 = Checkbutton(checkFrame2, text="J8", variable=CAL['J8CalStatVal2'])
+  J8calCbut2.grid(row=2, column=1, sticky="w", padx=2)
+
+  J9calCbut2 = Checkbutton(checkFrame2, text="J9", variable=CAL['J9CalStatVal2'])
+  J9calCbut2.grid(row=2, column=2, sticky="w", padx=2)
+
+  # Individual calibration buttons (EXACT names from original)
+  CalJ1But = Button(calFrame, text="Calibrate J1 Only", command=startCalRobotJ1)
+  CalJ1But.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
+
+  CalJ2But = Button(calFrame, text="Calibrate J2 Only", command=startCalRobotJ2)
+  CalJ2But.grid(row=4, column=0, sticky="ew", padx=5, pady=2)
+
+  CalJ3But = Button(calFrame, text="Calibrate J3 Only", command=startCalRobotJ3)
+  CalJ3But.grid(row=5, column=0, sticky="ew", padx=5, pady=2)
+
+  CalJ4But = Button(calFrame, text="Calibrate J4 Only", command=startCalRobotJ4)
+  CalJ4But.grid(row=6, column=0, sticky="ew", padx=5, pady=2)
+
+  CalJ5But = Button(calFrame, text="Calibrate J5 Only", command=startCalRobotJ5)
+  CalJ5But.grid(row=7, column=0, sticky="ew", padx=5, pady=2)
+
+  CalJ6But = Button(calFrame, text="Calibrate J6 Only", command=startCalRobotJ6)
+  CalJ6But.grid(row=8, column=0, sticky="ew", padx=5, pady=(5,20))
+
+  ForceCalHomeBut = Button(calFrame, text="Force Cal Home", command=CalZeroPos)
+  ForceCalHomeBut.grid(row=9, column=0, sticky="ew", padx=5, pady=2)
+
+  ForceCalHomeBut = Button(calFrame, text="Force Cal Rest", command=CalRestPos)
+  ForceCalHomeBut.grid(row=10, column=0, sticky="ew", padx=5, pady=2)
+
+
+  # ============================================================================
+  # ROW 1, COLUMN 2: Calibration Offsets Frame
+  # ============================================================================
+  calOffsetFrame = LabelFrame(tab2, text="Calibration Offsets", padding=10)
+  calOffsetFrame.grid(row=1, column=2, sticky="nsew", padx=5, pady=5)
+
+  calOffsetFrame.grid_columnconfigure(0, weight=1)
+  calOffsetFrame.grid_columnconfigure(1, weight=1)
+
+  # J1 Offset
+  J1calLab = Label(calOffsetFrame, text="J1 Offset")
+  J1calLab.grid(row=0, column=0, sticky="e", padx=2, pady=2)
+  J1calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
+  J1calOffEntryField.grid(row=0, column=1, sticky="w", padx=2, pady=2)
+
+  # J2 Offset
+  J2calLab = Label(calOffsetFrame, text="J2 Offset")
+  J2calLab.grid(row=1, column=0, sticky="e", padx=2, pady=2)
+  J2calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
+  J2calOffEntryField.grid(row=1, column=1, sticky="w", padx=2, pady=2)
+
+  # J3 Offset
+  J3calLab = Label(calOffsetFrame, text="J3 Offset")
+  J3calLab.grid(row=2, column=0, sticky="e", padx=2, pady=2)
+  J3calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
+  J3calOffEntryField.grid(row=2, column=1, sticky="w", padx=2, pady=2)
+
+  # J4 Offset
+  J4calLab = Label(calOffsetFrame, text="J4 Offset")
+  J4calLab.grid(row=3, column=0, sticky="e", padx=2, pady=2)
+  J4calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
+  J4calOffEntryField.grid(row=3, column=1, sticky="w", padx=2, pady=2)
+
+  # J5 Offset
+  J5calLab = Label(calOffsetFrame, text="J5 Offset")
+  J5calLab.grid(row=4, column=0, sticky="e", padx=2, pady=2)
+  J5calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
+  J5calOffEntryField.grid(row=4, column=1, sticky="w", padx=2, pady=2)
+
+  # J6 Offset
+  J6calLab = Label(calOffsetFrame, text="J6 Offset")
+  J6calLab.grid(row=5, column=0, sticky="e", padx=2, pady=2)
+  J6calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
+  J6calOffEntryField.grid(row=5, column=1, sticky="w", padx=2, pady=2)
+
+  # J7 Offset
+  J7calLab = Label(calOffsetFrame, text="J7 Offset")
+  J7calLab.grid(row=6, column=0, sticky="e", padx=2, pady=2)
+  J7calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
+  J7calOffEntryField.grid(row=6, column=1, sticky="w", padx=2, pady=2)
+
+  # J8 Offset
+  J8calLab = Label(calOffsetFrame, text="J8 Offset")
+  J8calLab.grid(row=7, column=0, sticky="e", padx=2, pady=2)
+  J8calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
+  J8calOffEntryField.grid(row=7, column=1, sticky="w", padx=2, pady=2)
+
+  # J9 Offset
+  J9calLab = Label(calOffsetFrame, text="J9 Offset")
+  J9calLab.grid(row=8, column=0, sticky="e", padx=2, pady=2)
+  J9calOffEntryField = Entry(calOffsetFrame, width=5, justify="center")
+  J9calOffEntryField.grid(row=8, column=1, sticky="w", padx=2, pady=2)
+
+
+  # ============================================================================
+  # ROW 1, COLUMN 3: Encoder Control Frame
+  # ============================================================================
+  encoderFrame = LabelFrame(tab2, text="Encoder Control", padding=10)
+  encoderFrame.grid(row=1, column=3, sticky="nsew", padx=5, pady=5)
+
+  encoderFrame.grid_columnconfigure(0, weight=1)
+
+  # J1 Open Loop
+  J1OpenLoopCbut = Checkbutton(encoderFrame, text="J1 Open Loop (disable encoder)", variable=CAL['J1OpenLoopVal'])
+  J1OpenLoopCbut.grid(row=0, column=0, sticky="w", padx=5, pady=2)
+
+  # J2 Open Loop
+  J2OpenLoopCbut = Checkbutton(encoderFrame, text="J2 Open Loop (disable encoder)", variable=CAL['J2OpenLoopVal'])
+  J2OpenLoopCbut.grid(row=1, column=0, sticky="w", padx=5, pady=2)
+
+  # J3 Open Loop
+  J3OpenLoopCbut = Checkbutton(encoderFrame, text="J3 Open Loop (disable encoder)", variable=CAL['J3OpenLoopVal'])
+  J3OpenLoopCbut.grid(row=2, column=0, sticky="w", padx=5, pady=2)
+
+  # J4 Open Loop
+  J4OpenLoopCbut = Checkbutton(encoderFrame, text="J4 Open Loop (disable encoder)", variable=CAL['J4OpenLoopVal'])
+  J4OpenLoopCbut.grid(row=3, column=0, sticky="w", padx=5, pady=2)
+
+  # J5 Open Loop
+  J5OpenLoopCbut = Checkbutton(encoderFrame, text="J5 Open Loop (disable encoder)", variable=CAL['J5OpenLoopVal'])
+  J5OpenLoopCbut.grid(row=4, column=0, sticky="w", padx=5, pady=2)
+
+  # J6 Open Loop
+  J6OpenLoopCbut = Checkbutton(encoderFrame, text="J6 Open Loop (disable encoder)", variable=CAL['J6OpenLoopVal'])
+  J6OpenLoopCbut.grid(row=5, column=0, sticky="w", padx=5, pady=2)
+
+
+
+  # ============================================================================
+  # Color Configuration for Robot Visualization
+  # ============================================================================
+
+  main_color_parts = ["Link Base-2.STL", "Link 2-2.STL", "Link 4-2.STL"]
+  logo_color_parts = ["Link 2-3.STL", "Link 4-3.STL"]
+
+  def update_main_color(*args):
+      selected = main_color_var.get()
+      CAL['setColor'] = selected
+      for part in main_color_parts:
+          RUN['color_map'][part] = selected
+          RUN['actors'][part].GetProperty().SetColor(vtk.vtkNamedColors().GetColor3d(selected))
+      RUN['render_window'].Render()
+
+  # Color options
+  color_options = [
+      "Red", "IndianRed", "Crimson", "FireBrick", "DarkRed", "Maroon",
+      "RosyBrown", "MediumVioletRed", "DeepPink", "HotPink", "Orchid", "Magenta",
+      "Orange", "DarkOrange", "Tomato", "Gold", "Yellow", "Chartreuse", "YellowGreen",
+      "Green", "LimeGreen", "MediumSpringGreen", "DarkOliveGreen",
+      "Teal", "DarkTurquoise", "Turquoise", "CadetBlue",
+      "DodgerBlue", "Blue", "RoyalBlue", "SlateBlue", "MediumSlateBlue",
+      "Navy", "MidnightBlue", "SteelBlue",
+      "Black", "DimGray", "DarkGray", "Gray", "Silver",
+      "LightSlateGray", "LightSteelBlue",
+      "White", "Gainsboro", "AntiqueWhite", "Cornsilk"
+  ]
+
+  # Initialize color variable
+  main_color_var = tk.StringVar(value="Royal Blue")
+
+
+  # ============================================================================
+  # ROW 1, COLUMN 5: Theme Frame
+  # ============================================================================
+  themeFrame = LabelFrame(tab2, text="Theme", padding=10)
+  themeFrame.grid(row=1, column=5, sticky="nsew", padx=5, pady=5)
+
+  themeFrame.grid_columnconfigure(0, weight=1)
+  themeFrame.grid_columnconfigure(1, weight=1)
+
+  # Theme buttons
+  lightBut = Button(themeFrame, text="  Light  ", command=lightTheme)
+  lightBut.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
+
+  darkBut = Button(themeFrame, text="  Dark   ", command=darkTheme)
+  darkBut.grid(row=0, column=1, sticky="ew", padx=2, pady=2)
+
+  # Robot Color label and dropdown
+  robotColorLab = Label(themeFrame, text="Robot Color", font=("Arial", 10, "bold"))
+  robotColorLab.grid(row=1, column=0, columnspan=2, sticky="w", padx=2, pady=(10, 2))
+
+  main_color_dropdown = ttk.OptionMenu(themeFrame, main_color_var, main_color_var.get(), *color_options, command=update_main_color)
+  main_color_dropdown.grid(row=2, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+
+
+
+
+  # ============================================================================
+  # ROW 1, COLUMN 4: External Axes Frame
+  # ============================================================================
+  externalAxesFrame = LabelFrame(tab2, text="External Axes", padding=10)
+  externalAxesFrame.grid(row=1, column=4, sticky="nsew", padx=5, pady=5)
+
+  externalAxesFrame.grid_columnconfigure(0, weight=0)  # Labels
+  externalAxesFrame.grid_columnconfigure(1, weight=1)  # Entry fields
+
+  # --- 7th Axis Calibration ---
+  axis7Lab = Label(externalAxesFrame, font=("Arial 10 bold"), text="7th Axis Calibration")
+  axis7Lab.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 10))
+
+  axis7lengthLab = Label(externalAxesFrame, text="7th Axis Length:")
+  axis7lengthLab.grid(row=1, column=0, sticky="e", padx=5, pady=2)
+  axis7lengthEntryField = Entry(externalAxesFrame, width=5, justify="center")
+  axis7lengthEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+
+  axis7rotLab = Label(externalAxesFrame, text="MM per Rotation:")
+  axis7rotLab.grid(row=2, column=0, sticky="e", padx=5, pady=2)
+  axis7rotEntryField = Entry(externalAxesFrame, width=5, justify="center")
+  axis7rotEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+
+  axis7stepsLab = Label(externalAxesFrame, text="Drive Steps:")
+  axis7stepsLab.grid(row=3, column=0, sticky="e", padx=5, pady=2)
+  axis7stepsEntryField = Entry(externalAxesFrame, width=5, justify="center")
+  axis7stepsEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+
+  J7zerobut = Button(externalAxesFrame, text="Set Axis 7 Calibration to Zero", width=28, command=zeroAxis7)
+  J7zerobut.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  J7calbut = Button(externalAxesFrame, text="Autocalibrate Axis 7", width=28, command=startCalRobotJ7)
+  J7calbut.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  axis7pinsetLab = Label(externalAxesFrame, font=("Arial", 8), text="StepPin = 12 / DirPin = 13 / CalPin = 36")
+  axis7pinsetLab.grid(row=6, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 15))
+
+  # --- 8th Axis Calibration ---
+  axis8Lab = Label(externalAxesFrame, font=("Arial 10 bold"), text="8th Axis Calibration")
+  axis8Lab.grid(row=7, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 10))
+
+  axis8lengthLab = Label(externalAxesFrame, text="8th Axis Length:")
+  axis8lengthLab.grid(row=8, column=0, sticky="e", padx=5, pady=2)
+  axis8lengthEntryField = Entry(externalAxesFrame, width=5, justify="center")
+  axis8lengthEntryField.grid(row=8, column=1, sticky="w", padx=5, pady=2)
+
+  axis8rotLab = Label(externalAxesFrame, text="MM per Rotation:")
+  axis8rotLab.grid(row=9, column=0, sticky="e", padx=5, pady=2)
+  axis8rotEntryField = Entry(externalAxesFrame, width=5, justify="center")
+  axis8rotEntryField.grid(row=9, column=1, sticky="w", padx=5, pady=2)
+
+  axis8stepsLab = Label(externalAxesFrame, text="Drive Steps:")
+  axis8stepsLab.grid(row=10, column=0, sticky="e", padx=5, pady=2)
+  axis8stepsEntryField = Entry(externalAxesFrame, width=5, justify="center")
+  axis8stepsEntryField.grid(row=10, column=1, sticky="w", padx=5, pady=2)
+
+  J8zerobut = Button(externalAxesFrame, text="Set Axis 8 Calibration to Zero", width=28, command=zeroAxis8)
+  J8zerobut.grid(row=11, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  J8calbut = Button(externalAxesFrame, text="Autocalibrate Axis 8", width=28, command=startCalRobotJ8)
+  J8calbut.grid(row=12, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  axis8pinsetLab = Label(externalAxesFrame, font=("Arial", 8), text="StepPin = 32 / DirPin = 33 / CalPin = 37")
+  axis8pinsetLab.grid(row=13, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 15))
+
+  # --- 9th Axis Calibration ---
+  axis9Lab = Label(externalAxesFrame, font=("Arial 10 bold"), text="9th Axis Calibration")
+  axis9Lab.grid(row=14, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 10))
+
+  axis9lengthLab = Label(externalAxesFrame, text="9th Axis Length:")
+  axis9lengthLab.grid(row=15, column=0, sticky="e", padx=5, pady=2)
+  axis9lengthEntryField = Entry(externalAxesFrame, width=5, justify="center")
+  axis9lengthEntryField.grid(row=15, column=1, sticky="w", padx=5, pady=2)
+
+  axis9rotLab = Label(externalAxesFrame, text="MM per Rotation:")
+  axis9rotLab.grid(row=16, column=0, sticky="e", padx=5, pady=2)
+  axis9rotEntryField = Entry(externalAxesFrame, width=5, justify="center")
+  axis9rotEntryField.grid(row=16, column=1, sticky="w", padx=5, pady=2)
+
+  axis9stepsLab = Label(externalAxesFrame, text="Drive Steps:")
+  axis9stepsLab.grid(row=17, column=0, sticky="e", padx=5, pady=2)
+  axis9stepsEntryField = Entry(externalAxesFrame, width=5, justify="center")
+  axis9stepsEntryField.grid(row=17, column=1, sticky="w", padx=5, pady=2)
+
+  J9zerobut = Button(externalAxesFrame, text="Set Axis 9 Calibration to Zero", width=28, command=zeroAxis9)
+  J9zerobut.grid(row=18, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  J9calbut = Button(externalAxesFrame, text="Autocalibrate Axis 9", width=28, command=startCalRobotJ9)
+  J9calbut.grid(row=19, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  axis9pinsetLab = Label(externalAxesFrame, font=("Arial", 8), text="StepPin = 34 / DirPin = 35 / CalPin = 38")
+  axis9pinsetLab.grid(row=20, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 5))
+
+
+  # ============================================================================
+  # ROW 1, COLUMN 6: Virtual Import Frame
+  # ============================================================================
+  virtualImportFrame = LabelFrame(tab2, text="Virtual Import", padding=10)
+  virtualImportFrame.grid(row=1, column=6, sticky="nsew", padx=5, pady=5)
+
+  virtualImportFrame.grid_columnconfigure(0, weight=1)
+
+  # Import STL button
+  importSTLBut = ttk.Button(virtualImportFrame, text="Import STL", command=import_stl_file)
+  importSTLBut.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+
+  # File Name
+  fileNameLab = Label(virtualImportFrame, text="File Name")
+  fileNameLab.grid(row=1, column=0, sticky="w", padx=5, pady=(10, 2))
+  stl_name_entry = Entry(virtualImportFrame, textvariable=stl_name_var, width=20)
+  stl_name_entry.grid(row=2, column=0, sticky="ew", padx=5, pady=2)
+
+  # X Position
+  xPosLab = Label(virtualImportFrame, text="X Position")
+  xPosLab.grid(row=3, column=0, sticky="w", padx=5, pady=(10, 2))
+  x_entry = Entry(virtualImportFrame, textvariable=x_var, width=10)
+  x_entry.grid(row=4, column=0, sticky="w", padx=5, pady=2)
+
+  # Y Position
+  yPosLab = Label(virtualImportFrame, text="Y Position")
+  yPosLab.grid(row=5, column=0, sticky="w", padx=5, pady=(10, 2))
+  y_entry = Entry(virtualImportFrame, textvariable=y_var, width=10)
+  y_entry.grid(row=6, column=0, sticky="w", padx=5, pady=2)
+
+  # Z Position
+  zPosLab = Label(virtualImportFrame, text="Z Position")
+  zPosLab.grid(row=7, column=0, sticky="w", padx=5, pady=(10, 2))
+  z_entry = Entry(virtualImportFrame, textvariable=z_var, width=10)
+  z_entry.grid(row=8, column=0, sticky="w", padx=5, pady=2)
+
+  # Z Rotation
+  zRotLab = Label(virtualImportFrame, text="Z Rotation")
+  zRotLab.grid(row=9, column=0, sticky="w", padx=5, pady=(10, 2))
+  rot_entry = Entry(virtualImportFrame, textvariable=rot_var, width=10)
+  rot_entry.grid(row=10, column=0, sticky="w", padx=5, pady=2)
+
+  # Update Position button
+  updatePosBut = ttk.Button(virtualImportFrame, text="Update Position", command=update_stl_transform)
+  updatePosBut.grid(row=11, column=0, sticky="ew", padx=5, pady=(10, 5))
+
+  # ============================================================================
+  # ROW 2, COLUMN 5: Save Frame (below and right of Commands)
+  # ============================================================================
+  saveFrame = LabelFrame(tab2, text="Save", padding=10)
+  saveFrame.grid(row=2, column=5, columnspan=2, sticky="ew", padx=5, pady=5)
+
+  saveFrame.grid_columnconfigure(0, weight=1)
+  saveFrame.grid_rowconfigure(0, weight=1)  # Center vertically
+
+  # Save All button
+  saveCalBut = Button(saveFrame, text="SAVE ALL", width=15, command=SaveAndApplyCalibration)
+  saveCalBut.grid(row=0, column=0, sticky="", padx=5, pady=5)
+
+  # ============================================================================
+  # ROW 2: Commands Frame (spans all columns)
+  # ============================================================================
+  cmdFrame = LabelFrame(tab2, text="Commands", padding=10)
+  cmdFrame.grid(row=2, column=0, columnspan=5, sticky="ew", padx=5, pady=5)
+
+  cmdFrame.grid_columnconfigure(0, weight=1)
+
+  cmdSentLab = Label(cmdFrame, text="Last Requested Command")
+  cmdSentLab.grid(row=0, column=0, sticky="w", padx=5, pady=(0, 2))
+
+  cmdSentEntryField = Entry(cmdFrame, width=120, justify="center")
+  cmdSentEntryField.grid(row=1, column=0, sticky="ew", padx=5, pady=2)
+
+  cmdRecLab = Label(cmdFrame, text="Last Response From Controller")
+  cmdRecLab.grid(row=2, column=0, sticky="w", padx=5, pady=(10, 2))
+
+  cmdRecEntryField = Entry(cmdFrame, width=120, justify="center")
+  cmdRecEntryField.grid(row=3, column=0, sticky="ew", padx=5, pady=2)
+
+  ####TAB 3
+
+  # ============================================================================
+  # Tab 3 Grid Layout Configuration
+  # ============================================================================
+  tab3.grid_rowconfigure(0, weight=1)
+  tab3.grid_rowconfigure(1, weight=1)
+  tab3.grid_columnconfigure(0, weight=0, minsize=300)  # Motor Dir, Cal Dir/Switch
+  tab3.grid_columnconfigure(1, weight=0, minsize=180)  # Pos Limits, Steps/Deg
+  tab3.grid_columnconfigure(2, weight=0, minsize=220)  # Drive MS, Encoder CPR
+  tab3.grid_columnconfigure(3, weight=0, minsize=280)  # DH Parameters, Tool Frame
+  tab3.grid_columnconfigure(4, weight=0, minsize=200)  # Defaults
+  tab3.grid_columnconfigure(5, weight=1)  # Remaining .place() widgets
+
+  # ============================================================================
+  # Motor Direction Frame (Row 0, Column 0)
+  # ============================================================================
+  motorDirFrame = LabelFrame(tab3, text="Motor Direction", padding=10)
+  motorDirFrame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+  motorDirFrame.grid_columnconfigure(0, weight=0)
+  motorDirFrame.grid_columnconfigure(1, weight=1)
+
+  J1MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J1 Motor Direction")
+  J1MotDirLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
+  J1MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
+  J1MotDirEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+
+  J2MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J2 Motor Direction")
+  J2MotDirLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
+  J2MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
+  J2MotDirEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+
+  J3MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J3 Motor Direction")
+  J3MotDirLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
+  J3MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
+  J3MotDirEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+
+  J4MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J4 Motor Direction")
+  J4MotDirLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
+  J4MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
+  J4MotDirEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+
+  J5MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J5 Motor Direction")
+  J5MotDirLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
+  J5MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
+  J5MotDirEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+
+  J6MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J6 Motor Direction")
+  J6MotDirLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
+  J6MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
+  J6MotDirEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
+
+  J7MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J7 Motor Direction")
+  J7MotDirLab_grid.grid(row=6, column=0, sticky="w", padx=5, pady=2)
+  J7MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
+  J7MotDirEntryField.grid(row=6, column=1, sticky="w", padx=5, pady=2)
+
+  J8MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J8 Motor Direction")
+  J8MotDirLab_grid.grid(row=7, column=0, sticky="w", padx=5, pady=2)
+  J8MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
+  J8MotDirEntryField.grid(row=7, column=1, sticky="w", padx=5, pady=2)
+
+  J9MotDirLab_grid = Label(motorDirFrame, font=("Arial", 8), text="J9 Motor Direction")
+  J9MotDirLab_grid.grid(row=8, column=0, sticky="w", padx=5, pady=2)
+  J9MotDirEntryField = Entry(motorDirFrame, width=5, justify="center")
+  J9MotDirEntryField.grid(row=8, column=1, sticky="w", padx=5, pady=2)
+
+  # ============================================================================
+  # Calibration Direction Frame (Row 1, Column 0)
+  # ============================================================================
+  calDirFrame = LabelFrame(
+    tab3,
+    text="Calibration Direction / Active Switch",
+    padding=10,
+  )
+  calDirFrame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+  calDirFrame.grid_columnconfigure(0, weight=0)
+  calDirFrame.grid_columnconfigure(1, weight=0)
+  calDirFrame.grid_columnconfigure(2, weight=0)
+  calDirFrame.grid_columnconfigure(3, weight=1)
+
+
+  def _create_calibration_switch_field(parent, row):
+    active_label = Label(parent, font=("Arial", 8), text="Active")
+    active_label.grid(row=row, column=2, sticky="e", padx=(8, 2), pady=2)
+    field = ttk.Combobox(
+      parent,
+      values=("HIGH", "LOW"),
+      state="readonly",
+      width=6,
     )
-    if not camList:
-      camList = ["Select a Camera"]
-    # ----------------------------------------------------------
+    field.grid(row=row, column=3, sticky="w", padx=(2, 5), pady=2)
+    return field
 
-    visoptions = StringVar(tab6)
-    visoptions.set("Select a Camera")
+  J1CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J1 Calibration Dir.")
+  J1CalDirLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
+  J1CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
+  J1CalDirEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+  J1CalSwitchField = _create_calibration_switch_field(calDirFrame, 0)
 
-    try:
-      # If we have real cams, preselect the first real one; otherwise keep the placeholder
-      if camList and camList[0] != "Select a Camera":
+  J2CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J2 Calibration Dir.")
+  J2CalDirLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
+  J2CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
+  J2CalDirEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+  J2CalSwitchField = _create_calibration_switch_field(calDirFrame, 1)
+
+  J3CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J3 Calibration Dir.")
+  J3CalDirLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
+  J3CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
+  J3CalDirEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+  J3CalSwitchField = _create_calibration_switch_field(calDirFrame, 2)
+
+  J4CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J4 Calibration Dir.")
+  J4CalDirLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
+  J4CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
+  J4CalDirEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+  J4CalSwitchField = _create_calibration_switch_field(calDirFrame, 3)
+
+  J5CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J5 Calibration Dir.")
+  J5CalDirLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
+  J5CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
+  J5CalDirEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+  J5CalSwitchField = _create_calibration_switch_field(calDirFrame, 4)
+
+  J6CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J6 Calibration Dir.")
+  J6CalDirLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
+  J6CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
+  J6CalDirEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
+  J6CalSwitchField = _create_calibration_switch_field(calDirFrame, 5)
+
+  J7CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J7 Calibration Dir.")
+  J7CalDirLab_grid.grid(row=6, column=0, sticky="w", padx=5, pady=2)
+  J7CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
+  J7CalDirEntryField.grid(row=6, column=1, sticky="w", padx=5, pady=2)
+  J7CalSwitchField = _create_calibration_switch_field(calDirFrame, 6)
+
+  J8CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J8 Calibration Dir.")
+  J8CalDirLab_grid.grid(row=7, column=0, sticky="w", padx=5, pady=2)
+  J8CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
+  J8CalDirEntryField.grid(row=7, column=1, sticky="w", padx=5, pady=2)
+  J8CalSwitchField = _create_calibration_switch_field(calDirFrame, 7)
+
+  J9CalDirLab_grid = Label(calDirFrame, font=("Arial", 8), text="J9 Calibration Dir.")
+  J9CalDirLab_grid.grid(row=8, column=0, sticky="w", padx=5, pady=2)
+  J9CalDirEntryField = Entry(calDirFrame, width=5, justify="center")
+  J9CalDirEntryField.grid(row=8, column=1, sticky="w", padx=5, pady=2)
+  J9CalSwitchField = _create_calibration_switch_field(calDirFrame, 8)
+
+  # ============================================================================
+  # Position Limits Frame (Row 0, Column 1)
+  # ============================================================================
+  posLimFrame = LabelFrame(tab3, text="Position Limits", padding=10)
+  posLimFrame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
+  posLimFrame.grid_columnconfigure(0, weight=0)
+  posLimFrame.grid_columnconfigure(1, weight=1)
+
+  J1PosLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J1 Pos Limit")
+  J1PosLimLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
+  J1PosLimEntryField = Entry(posLimFrame, width=5, justify="center")
+  J1PosLimEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+
+  J1NegLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J1 Neg Limit")
+  J1NegLimLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
+  J1NegLimEntryField = Entry(posLimFrame, width=5, justify="center")
+  J1NegLimEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+
+  J2PosLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J2 Pos Limit")
+  J2PosLimLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
+  J2PosLimEntryField = Entry(posLimFrame, width=5, justify="center")
+  J2PosLimEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+
+  J2NegLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J2 Neg Limit")
+  J2NegLimLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
+  J2NegLimEntryField = Entry(posLimFrame, width=5, justify="center")
+  J2NegLimEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+
+  J3PosLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J3 Pos Limit")
+  J3PosLimLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
+  J3PosLimEntryField = Entry(posLimFrame, width=5, justify="center")
+  J3PosLimEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+
+  J3NegLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J3 Neg Limit")
+  J3NegLimLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
+  J3NegLimEntryField = Entry(posLimFrame, width=5, justify="center")
+  J3NegLimEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
+
+  J4PosLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J4 Pos Limit")
+  J4PosLimLab_grid.grid(row=6, column=0, sticky="w", padx=5, pady=2)
+  J4PosLimEntryField = Entry(posLimFrame, width=5, justify="center")
+  J4PosLimEntryField.grid(row=6, column=1, sticky="w", padx=5, pady=2)
+
+  J4NegLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J4 Neg Limit")
+  J4NegLimLab_grid.grid(row=7, column=0, sticky="w", padx=5, pady=2)
+  J4NegLimEntryField = Entry(posLimFrame, width=5, justify="center")
+  J4NegLimEntryField.grid(row=7, column=1, sticky="w", padx=5, pady=2)
+
+  J5PosLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J5 Pos Limit")
+  J5PosLimLab_grid.grid(row=8, column=0, sticky="w", padx=5, pady=2)
+  J5PosLimEntryField = Entry(posLimFrame, width=5, justify="center")
+  J5PosLimEntryField.grid(row=8, column=1, sticky="w", padx=5, pady=2)
+
+  J5NegLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J5 Neg Limit")
+  J5NegLimLab_grid.grid(row=9, column=0, sticky="w", padx=5, pady=2)
+  J5NegLimEntryField = Entry(posLimFrame, width=5, justify="center")
+  J5NegLimEntryField.grid(row=9, column=1, sticky="w", padx=5, pady=2)
+
+  J6PosLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J6 Pos Limit")
+  J6PosLimLab_grid.grid(row=10, column=0, sticky="w", padx=5, pady=2)
+  J6PosLimEntryField = Entry(posLimFrame, width=5, justify="center")
+  J6PosLimEntryField.grid(row=10, column=1, sticky="w", padx=5, pady=2)
+
+  J6NegLimLab_grid = Label(posLimFrame, font=("Arial", 8), text="J6 Neg Limit")
+  J6NegLimLab_grid.grid(row=11, column=0, sticky="w", padx=5, pady=2)
+  J6NegLimEntryField = Entry(posLimFrame, width=5, justify="center")
+  J6NegLimEntryField.grid(row=11, column=1, sticky="w", padx=5, pady=2)
+
+  # ============================================================================
+  # Steps per Degree Frame (Row 1, Column 1)
+  # ============================================================================
+  stepDegFrame = LabelFrame(tab3, text="Steps per Degree", padding=10)
+  stepDegFrame.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
+  stepDegFrame.grid_columnconfigure(0, weight=0)
+  stepDegFrame.grid_columnconfigure(1, weight=1)
+
+  J1StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J1 Step/Deg")
+  J1StepDegLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
+  J1StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
+  J1StepDegEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+
+  J2StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J2 Step/Deg")
+  J2StepDegLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
+  J2StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
+  J2StepDegEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+
+  J3StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J3 Step/Deg")
+  J3StepDegLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
+  J3StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
+  J3StepDegEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+
+  J4StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J4 Step/Deg")
+  J4StepDegLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
+  J4StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
+  J4StepDegEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+
+  J5StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J5 Step/Deg")
+  J5StepDegLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
+  J5StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
+  J5StepDegEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+
+  J6StepDegLab_grid = Label(stepDegFrame, font=("Arial", 8), text="J6 Step/Deg")
+  J6StepDegLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
+  J6StepDegEntryField = Entry(stepDegFrame, width=8, justify="center")
+  J6StepDegEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
+
+  # ============================================================================
+  # Drive Microsteps Frame (Row 0, Column 2)
+  # ============================================================================
+  driveMSFrame = LabelFrame(tab3, text="Drive Microsteps", padding=10)
+  driveMSFrame.grid(row=0, column=2, sticky="nsew", padx=5, pady=5)
+  driveMSFrame.grid_columnconfigure(0, weight=0)
+  driveMSFrame.grid_columnconfigure(1, weight=1)
+
+  J1DriveMSLab_grid = Label(driveMSFrame, font=("Arial", 8), text="J1 Drive Microstep")
+  J1DriveMSLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
+  J1DriveMSEntryField = Entry(driveMSFrame, width=5, justify="center")
+  J1DriveMSEntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+
+  J2DriveMSLab_grid = Label(driveMSFrame, font=("Arial", 8), text="J2 Drive Microstep")
+  J2DriveMSLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
+  J2DriveMSEntryField = Entry(driveMSFrame, width=5, justify="center")
+  J2DriveMSEntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+
+  J3DriveMSLab_grid = Label(driveMSFrame, font=("Arial", 8), text="J3 Drive Microstep")
+  J3DriveMSLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
+  J3DriveMSEntryField = Entry(driveMSFrame, width=5, justify="center")
+  J3DriveMSEntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+
+  J4DriveMSLab_grid = Label(driveMSFrame, font=("Arial", 8), text="J4 Drive Microstep")
+  J4DriveMSLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
+  J4DriveMSEntryField = Entry(driveMSFrame, width=5, justify="center")
+  J4DriveMSEntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+
+  J5DriveMSLab_grid = Label(driveMSFrame, font=("Arial", 8), text="J5 Drive Microstep")
+  J5DriveMSLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
+  J5DriveMSEntryField = Entry(driveMSFrame, width=5, justify="center")
+  J5DriveMSEntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+
+  J6DriveMSLab_grid = Label(driveMSFrame, font=("Arial", 8), text="J6 Drive Microstep")
+  J6DriveMSLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
+  J6DriveMSEntryField = Entry(driveMSFrame, width=5, justify="center")
+  J6DriveMSEntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
+
+  # ============================================================================
+  # Encoder CPR Frame (Row 1, Column 2)
+  # ============================================================================
+  encCPRFrame = LabelFrame(tab3, text="Encoder CPR", padding=10)
+  encCPRFrame.grid(row=1, column=2, sticky="nsew", padx=5, pady=5)
+  encCPRFrame.grid_columnconfigure(0, weight=0)
+  encCPRFrame.grid_columnconfigure(1, weight=1)
+
+  J1EncCPRLab_grid = Label(encCPRFrame, font=("Arial", 8), text="J1 Encoder CPR")
+  J1EncCPRLab_grid.grid(row=0, column=0, sticky="w", padx=5, pady=2)
+  J1EncCPREntryField = Entry(encCPRFrame, width=5, justify="center")
+  J1EncCPREntryField.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+
+  J2EncCPRLab_grid = Label(encCPRFrame, font=("Arial", 8), text="J2 Encoder CPR")
+  J2EncCPRLab_grid.grid(row=1, column=0, sticky="w", padx=5, pady=2)
+  J2EncCPREntryField = Entry(encCPRFrame, width=5, justify="center")
+  J2EncCPREntryField.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+
+  J3EncCPRLab_grid = Label(encCPRFrame, font=("Arial", 8), text="J3 Encoder CPR")
+  J3EncCPRLab_grid.grid(row=2, column=0, sticky="w", padx=5, pady=2)
+  J3EncCPREntryField = Entry(encCPRFrame, width=5, justify="center")
+  J3EncCPREntryField.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+
+  J4EncCPRLab_grid = Label(encCPRFrame, font=("Arial", 8), text="J4 Encoder CPR")
+  J4EncCPRLab_grid.grid(row=3, column=0, sticky="w", padx=5, pady=2)
+  J4EncCPREntryField = Entry(encCPRFrame, width=5, justify="center")
+  J4EncCPREntryField.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+
+  J5EncCPRLab_grid = Label(encCPRFrame, font=("Arial", 8), text="J5 Encoder CPR")
+  J5EncCPRLab_grid.grid(row=4, column=0, sticky="w", padx=5, pady=2)
+  J5EncCPREntryField = Entry(encCPRFrame, width=5, justify="center")
+  J5EncCPREntryField.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+
+  J6EncCPRLab_grid = Label(encCPRFrame, font=("Arial", 8), text="J6 Encoder CPR")
+  J6EncCPRLab_grid.grid(row=5, column=0, sticky="w", padx=5, pady=2)
+  J6EncCPREntryField = Entry(encCPRFrame, width=5, justify="center")
+  J6EncCPREntryField.grid(row=5, column=1, sticky="w", padx=5, pady=2)
+
+  # ============================================================================
+  # DH Parameters Frame (Row 0, Column 3)
+  # ============================================================================
+  dhParamsFrame = LabelFrame(tab3, text="DH Parameters", padding=10)
+  dhParamsFrame.grid(row=0, column=3, sticky="nsew", padx=5, pady=5)
+
+  # Column headers
+  dhParamsFrame.grid_columnconfigure(0, weight=0, minsize=30)   # J1-J6 labels
+  dhParamsFrame.grid_columnconfigure(1, weight=0, minsize=50)   # DH-Θ
+  dhParamsFrame.grid_columnconfigure(2, weight=0, minsize=50)   # DH-α
+  dhParamsFrame.grid_columnconfigure(3, weight=0, minsize=50)   # DH-d
+  dhParamsFrame.grid_columnconfigure(4, weight=0, minsize=50)   # DH-a
+
+  # Header row
+  Label(dhParamsFrame, font=("Arial", 8), text="").grid(row=0, column=0)
+  Label(dhParamsFrame, font=("Arial", 8), text="DH-Θ").grid(row=0, column=1)
+  Label(dhParamsFrame, font=("Arial", 8), text="DH-α").grid(row=0, column=2)
+  Label(dhParamsFrame, font=("Arial", 8), text="DH-d").grid(row=0, column=3)
+  Label(dhParamsFrame, font=("Arial", 8), text="DH-a").grid(row=0, column=4)
+
+  # J1 row
+  Label(dhParamsFrame, font=("Arial", 8), text="J1").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+  J1ΘEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J1ΘEntryField.grid(row=1, column=1, padx=2, pady=2)
+  J1αEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J1αEntryField.grid(row=1, column=2, padx=2, pady=1)
+  J1dEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J1dEntryField.grid(row=1, column=3, padx=2, pady=2)
+  J1aEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J1aEntryField.grid(row=1, column=4, padx=2, pady=2)
+
+  # J2 row
+  Label(dhParamsFrame, font=("Arial", 8), text="J2").grid(row=2, column=0, sticky="w", padx=5, pady=2)
+  J2ΘEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J2ΘEntryField.grid(row=2, column=1, padx=2, pady=2)
+  J2αEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J2αEntryField.grid(row=2, column=2, padx=2, pady=1)
+  J2dEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J2dEntryField.grid(row=2, column=3, padx=2, pady=2)
+  J2aEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J2aEntryField.grid(row=2, column=4, padx=2, pady=2)
+
+  # J3 row
+  Label(dhParamsFrame, font=("Arial", 8), text="J3").grid(row=3, column=0, sticky="w", padx=5, pady=2)
+  J3ΘEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J3ΘEntryField.grid(row=3, column=1, padx=2, pady=2)
+  J3αEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J3αEntryField.grid(row=3, column=2, padx=2, pady=1)
+  J3dEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J3dEntryField.grid(row=3, column=3, padx=2, pady=2)
+  J3aEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J3aEntryField.grid(row=3, column=4, padx=2, pady=2)
+
+  # J4 row
+  Label(dhParamsFrame, font=("Arial", 8), text="J4").grid(row=4, column=0, sticky="w", padx=5, pady=2)
+  J4ΘEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J4ΘEntryField.grid(row=4, column=1, padx=2, pady=2)
+  J4αEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J4αEntryField.grid(row=4, column=2, padx=2, pady=1)
+  J4dEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J4dEntryField.grid(row=4, column=3, padx=2, pady=2)
+  J4aEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J4aEntryField.grid(row=4, column=4, padx=2, pady=2)
+
+  # J5 row
+  Label(dhParamsFrame, font=("Arial", 8), text="J5").grid(row=5, column=0, sticky="w", padx=5, pady=2)
+  J5ΘEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J5ΘEntryField.grid(row=5, column=1, padx=2, pady=2)
+  J5αEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J5αEntryField.grid(row=5, column=2, padx=2, pady=1)
+  J5dEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J5dEntryField.grid(row=5, column=3, padx=2, pady=2)
+  J5aEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J5aEntryField.grid(row=5, column=4, padx=2, pady=2)
+
+  # J6 row
+  Label(dhParamsFrame, font=("Arial", 8), text="J6").grid(row=6, column=0, sticky="w", padx=5, pady=2)
+  J6ΘEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J6ΘEntryField.grid(row=6, column=1, padx=2, pady=2)
+  J6αEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J6αEntryField.grid(row=6, column=2, padx=2, pady=1)
+  J6dEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J6dEntryField.grid(row=6, column=3, padx=2, pady=2)
+  J6aEntryField = Entry(dhParamsFrame, width=5, justify="center")
+  J6aEntryField.grid(row=6, column=4, padx=2, pady=2)
+
+  # ============================================================================
+  # Tool Frame Offset Frame (Row 1, Column 3)
+  # ============================================================================
+  toolFrameFrame = LabelFrame(tab3, text="Tool Frame Offset", padding=10)
+  toolFrameFrame.grid(row=1, column=3, sticky="nsew", padx=5, pady=5)
+
+  toolFrameFrame.grid_columnconfigure(0, weight=1)
+  toolFrameFrame.grid_columnconfigure(1, weight=1)
+  toolFrameFrame.grid_columnconfigure(2, weight=1)
+  toolFrameFrame.grid_columnconfigure(3, weight=1)
+  toolFrameFrame.grid_columnconfigure(4, weight=1)
+  toolFrameFrame.grid_columnconfigure(5, weight=1)
+
+  # Header row
+  Label(toolFrameFrame, font=("Arial", 11), text="X").grid(row=0, column=0, padx=2, pady=2)
+  Label(toolFrameFrame, font=("Arial", 11), text="Y").grid(row=0, column=1, padx=2, pady=2)
+  Label(toolFrameFrame, font=("Arial", 11), text="Z").grid(row=0, column=2, padx=2, pady=1)
+  Label(toolFrameFrame, font=("Arial", 11), text="Rz").grid(row=0, column=3, padx=2, pady=2)
+  Label(toolFrameFrame, font=("Arial", 11), text="Ry").grid(row=0, column=4, padx=2, pady=2)
+  Label(toolFrameFrame, font=("Arial", 11), text="Rx").grid(row=0, column=5, padx=2, pady=2)
+
+  # Entry fields row
+  TFxEntryField = Entry(toolFrameFrame, width=4, justify="center")
+  TFxEntryField.grid(row=1, column=0, padx=2, pady=2)
+  TFyEntryField = Entry(toolFrameFrame, width=4, justify="center")
+  TFyEntryField.grid(row=1, column=1, padx=2, pady=2)
+  TFzEntryField = Entry(toolFrameFrame, width=4, justify="center")
+  TFzEntryField.grid(row=1, column=2, padx=2, pady=1)
+  TFrzEntryField = Entry(toolFrameFrame, width=4, justify="center")
+  TFrzEntryField.grid(row=1, column=3, padx=2, pady=2)
+  TFryEntryField = Entry(toolFrameFrame, width=4, justify="center")
+  TFryEntryField.grid(row=1, column=4, padx=2, pady=2)
+  TFrxEntryField = Entry(toolFrameFrame, width=4, justify="center")
+  TFrxEntryField.grid(row=1, column=5, padx=2, pady=2)
+
+  # Checkbox row
+  DisableWristCbut = Checkbutton(toolFrameFrame, text="Disable Wrist Rotation - Linear Moves", variable=CAL['DisableWristRotVal'])
+  DisableWristCbut.grid(row=2, column=0, columnspan=6, sticky="w", padx=5, pady=5)
+
+  # ============================================================================
+  # Defaults Frame (Row 0-1, Column 4)
+  # ============================================================================
+  defaultsFrame = LabelFrame(tab3, text="Defaults", padding=10)
+  defaultsFrame.grid(row=0, column=4, rowspan=2, sticky="nsew", padx=5, pady=5)
+
+  defaultsFrame.grid_columnconfigure(0, weight=1)
+
+  loadAR4Mk4But = Button(defaultsFrame, text="Load AR4-MK4 Defaults", width=26, command=LoadAR4Mk3default)
+  loadAR4Mk4But.grid(row=0, column=0, padx=5, pady=5)
+
+  loadAR4Mk3But = Button(defaultsFrame, text="Load AR4-MK3 Defaults", width=26, command=LoadAR4Mk3default)
+  loadAR4Mk3But.grid(row=1, column=0, padx=5, pady=5)
+
+  loadAR4Mk2But = Button(defaultsFrame, text="Load AR4-MK2 Defaults", width=26, command=LoadAR4Mk2default)
+  loadAR4Mk2But.grid(row=2, column=0, padx=5, pady=5)
+
+  loadAR4But = Button(defaultsFrame, text="Load AR4-MK1 Defaults", width=26, command=LoadAR4default)
+  loadAR4But.grid(row=3, column=0, padx=5, pady=5)
+
+  loadAR3But = Button(defaultsFrame, text="Load AR3 Defaults", width=26, command=LoadAR3default)
+  loadAR3But.grid(row=4, column=0, padx=5, pady=5)
+
+  saveCalBut = Button(defaultsFrame, text="SAVE", width=26, command=SaveAndApplyCalibration)
+  saveCalBut.grid(row=5, column=0, padx=5, pady=(10, 30)) # 10 pixels above, 30 below
+
+
+  loadCustomBut = Button(defaultsFrame, text="Load Custom Calibration", width=26, command=load_custom_calibration)
+  loadCustomBut .grid(row=6, column=0, padx=5, pady=(30, 5))
+
+  saveCustomBut = Button(defaultsFrame, text="Save Custom Calibration", width=26, command=save_custom_calibration)
+  saveCustomBut.grid(row=7, column=0, padx=5, pady=5)
+
+  loadMaxStepBut = Button(defaultsFrame, text="Load Max Microsteps", width=26, command=LoadMaxdefault)
+  loadMaxStepBut.grid(row=8, column=0, padx=5, pady=5)
+
+
+
+  # #### TOOL FRAME ####
+  # ToolFrameLab = Label(tab3, text = "Tool Frame Offset")
+  # ToolFrameLab.place(x=970, y=60)
+  #
+  # UFxLab = Label(tab3, font=("Arial", 11), text = "X")
+  # UFxLab.place(x=920, y=90)
+  #
+  # UFyLab = Label(tab3, font=("Arial", 11), text = "Y")
+  # UFyLab.place(x=960, y=90)
+  #
+  # UFzLab = Label(tab3, font=("Arial", 11), text = "Z")
+  # UFzLab.place(x=1000, y=90)
+  #
+  # UFRxLab = Label(tab3, font=("Arial", 11), text = "Rz")
+  # UFRxLab.place(x=1040, y=90)
+  #
+  # UFRyLab = Label(tab3, font=("Arial", 11), text = "Ry")
+  # UFRyLab.place(x=1080, y=90)
+  #
+  # UFRzLab = Label(tab3, font=("Arial", 11), text = "Rx")
+  # UFRzLab.place(x=1120, y=90)
+  #
+  # TFxEntryField = Entry(tab3,width=4,justify="center")
+  # TFxEntryField.place(x=910, y=115)
+  # TFyEntryField = Entry(tab3,width=4,justify="center")
+  # TFyEntryField.place(x=950, y=115)
+  # TFzEntryField = Entry(tab3,width=4,justify="center")
+  # TFzEntryField.place(x=990, y=115)
+  # TFrzEntryField = Entry(tab3,width=4,justify="center")
+  # TFrzEntryField.place(x=1030, y=115)
+  # TFryEntryField = Entry(tab3,width=4,justify="center")
+  # TFryEntryField.place(x=1070, y=115)
+  # TFrxEntryField = Entry(tab3,width=4,justify="center")
+  # TFrxEntryField.place(x=1110, y=115)
+  #
+  # DisableWristCbut = Checkbutton(tab3, text="Disable Wrist Rotation - Linear Moves",variable = CAL['DisableWristRotVal'])
+  # DisableWristCbut.place(x=910, y=150)
+
+
+  # # ####  MOTOR DIRECTIONS ####
+
+  # # J1MotDirLab = Label(tab3, font=("Arial", 8), text = "J1 Motor Direction")
+  # # J1MotDirLab.place(x=10, y=20)
+  # # J2MotDirLab = Label(tab3, font=("Arial", 8), text = "J2 Motor Direction")
+  # # J2MotDirLab.place(x=10, y=45)
+  # # J3MotDirLab = Label(tab3, font=("Arial", 8), text = "J3 Motor Direction")
+  # # J3MotDirLab.place(x=10, y=70)
+  # # J4MotDirLab = Label(tab3, font=("Arial", 8), text = "J4 Motor Direction")
+  # # J4MotDirLab.place(x=10, y=95)
+  # # J5MotDirLab = Label(tab3, font=("Arial", 8), text = "J5 Motor Direction")
+  # # J5MotDirLab.place(x=10, y=120)
+  # # J6MotDirLab = Label(tab3, font=("Arial", 8), text = "J6 Motor Direction")
+  # # J6MotDirLab.place(x=10, y=145)
+  # # J7MotDirLab = Label(tab3, font=("Arial", 8), text = "J7 Motor Direction")
+  # # J7MotDirLab.place(x=10, y=170)
+  # # J8MotDirLab = Label(tab3, font=("Arial", 8), text = "J8 Motor Direction")
+  # # J8MotDirLab.place(x=10, y=195)
+  # # J9MotDirLab = Label(tab3, font=("Arial", 8), text = "J9 Motor Direction")
+  # # J9MotDirLab.place(x=10, y=220)
+
+  # # J1MotDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J1MotDirEntryField.place(x=110, y=20)
+  # # J2MotDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J2MotDirEntryField.place(x=110, y=45)
+  # # J3MotDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J3MotDirEntryField.place(x=110, y=70)
+  # # J4MotDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J4MotDirEntryField.place(x=110, y=95)
+  # # J5MotDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J5MotDirEntryField.place(x=110, y=120)
+  # # J6MotDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J6MotDirEntryField.place(x=110, y=145)
+  # # J7MotDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J7MotDirEntryField.place(x=110, y=170)
+  # # J8MotDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J8MotDirEntryField.place(x=110, y=195)
+  # # J9MotDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J9MotDirEntryField.place(x=110, y=220)
+
+
+  # # ####  CALIBRATION DIRECTIONS ####
+
+  # # J1CalDirLab = Label(tab3, font=("Arial", 8), text = "J1 Calibration Dir.")
+  # # J1CalDirLab.place(x=10, y=280)
+  # # J2CalDirLab = Label(tab3, font=("Arial", 8), text = "J2 Calibration Dir.")
+  # # J2CalDirLab.place(x=10, y=305)
+  # # J3CalDirLab = Label(tab3, font=("Arial", 8), text = "J3 Calibration Dir.")
+  # # J3CalDirLab.place(x=10, y=330)
+  # # J4CalDirLab = Label(tab3, font=("Arial", 8), text = "J4 Calibration Dir.")
+  # # J4CalDirLab.place(x=10, y=355)
+  # # J5CalDirLab = Label(tab3, font=("Arial", 8), text = "J5 Calibration Dir.")
+  # # J5CalDirLab.place(x=10, y=380)
+  # # J6CalDirLab = Label(tab3, font=("Arial", 8), text = "J6 Calibration Dir.")
+  # # J6CalDirLab.place(x=10, y=405)
+  # # J7CalDirLab = Label(tab3, font=("Arial", 8), text = "J7 Calibration Dir.")
+  # # J7CalDirLab.place(x=10, y=430)
+  # # J8CalDirLab = Label(tab3, font=("Arial", 8), text = "J8 Calibration Dir.")
+  # # J8CalDirLab.place(x=10, y=455)
+  # # J9CalDirLab = Label(tab3, font=("Arial", 8), text = "J9 Calibration Dir.")
+  # # J9CalDirLab.place(x=10, y=480)
+
+  # # J1CalDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J1CalDirEntryField.place(x=110, y=280)
+  # # J2CalDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J2CalDirEntryField.place(x=110, y=305)
+  # # J3CalDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J3CalDirEntryField.place(x=110, y=330)
+  # # J4CalDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J4CalDirEntryField.place(x=110, y=355)
+  # # J5CalDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J5CalDirEntryField.place(x=110, y=380)
+  # # J6CalDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J6CalDirEntryField.place(x=110, y=405)
+  # # J7CalDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J7CalDirEntryField.place(x=110, y=430)
+  # # J8CalDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J8CalDirEntryField.place(x=110, y=455)
+  # # J9CalDirEntryField = Entry(tab3,width=5,justify="center")
+  # # J9CalDirEntryField.place(x=110, y=480)
+
+  # # ### axis limits
+  # # J1PosLimLab = Label(tab3, font=("Arial", 8), text = "J1 Pos Limit")
+  # # J1PosLimLab.place(x=200, y=20)
+  # # J1NegLimLab = Label(tab3, font=("Arial", 8), text = "J1 Neg Limit")
+  # # J1NegLimLab.place(x=200, y=45)
+  # # J2PosLimLab = Label(tab3, font=("Arial", 8), text = "J2 Pos Limit")
+  # # J2PosLimLab.place(x=200, y=70)
+  # # J2NegLimLab = Label(tab3, font=("Arial", 8), text = "J2 Neg Limit")
+  # # J2NegLimLab.place(x=200, y=95)
+  # # J3PosLimLab = Label(tab3, font=("Arial", 8), text = "J3 Pos Limit")
+  # # J3PosLimLab.place(x=200, y=120)
+  # # J3NegLimLab = Label(tab3, font=("Arial", 8), text = "J3 Neg Limit")
+  # # J3NegLimLab.place(x=200, y=145)
+  # # J4PosLimLab = Label(tab3, font=("Arial", 8), text = "J4 Pos Limit")
+  # # J4PosLimLab.place(x=200, y=170)
+  # # J4NegLimLab = Label(tab3, font=("Arial", 8), text = "J4 Neg Limit")
+  # # J4NegLimLab.place(x=200, y=195)
+  # # J5PosLimLab = Label(tab3, font=("Arial", 8), text = "J5 Pos Limit")
+  # # J5PosLimLab.place(x=200, y=220)
+  # # J5NegLimLab = Label(tab3, font=("Arial", 8), text = "J5 Neg Limit")
+  # # J5NegLimLab.place(x=200, y=245)
+  # # J6PosLimLab = Label(tab3, font=("Arial", 8), text = "J6 Pos Limit")
+  # # J6PosLimLab.place(x=200, y=270)
+  # # J6NegLimLab = Label(tab3, font=("Arial", 8), text = "J6 Neg Limit")
+  # # J6NegLimLab.place(x=200, y=295)
+
+  # # J1PosLimEntryField = Entry(tab3,width=5,justify="center")
+  # # J1PosLimEntryField.place(x=280, y=20)
+  # # J1NegLimEntryField = Entry(tab3,width=5,justify="center")
+  # # J1NegLimEntryField.place(x=280, y=45)
+  # # J2PosLimEntryField = Entry(tab3,width=5,justify="center")
+  # # J2PosLimEntryField.place(x=280, y=70)
+  # # J2NegLimEntryField = Entry(tab3,width=5,justify="center")
+  # # J2NegLimEntryField.place(x=280, y=95)
+  # # J3PosLimEntryField = Entry(tab3,width=5,justify="center")
+  # # J3PosLimEntryField.place(x=280, y=120)
+  # # J3NegLimEntryField = Entry(tab3,width=5,justify="center")
+  # # J3NegLimEntryField.place(x=280, y=145)
+  # # J4PosLimEntryField = Entry(tab3,width=5,justify="center")
+  # # J4PosLimEntryField.place(x=280, y=170)
+  # # J4NegLimEntryField = Entry(tab3,width=5,justify="center")
+  # # J4NegLimEntryField.place(x=280, y=195)
+  # # J5PosLimEntryField = Entry(tab3,width=5,justify="center")
+  # # J5PosLimEntryField.place(x=280, y=220)
+  # # J5NegLimEntryField = Entry(tab3,width=5,justify="center")
+  # # J5NegLimEntryField.place(x=280, y=245)
+  # # J6PosLimEntryField = Entry(tab3,width=5,justify="center")
+  # # J6PosLimEntryField.place(x=280, y=270)
+  # # J6NegLimEntryField = Entry(tab3,width=5,justify="center")
+  # # J6NegLimEntryField.place(x=280, y=295)
+
+
+  ### steps per degress
+  # # J1StepDegLab = Label(tab3, font=("Arial", 8), text = "J1 Step/Deg")
+  # # J1StepDegLab.place(x=200, y=345)
+  # # J2StepDegLab = Label(tab3, font=("Arial", 8), text = "J2 Step/Deg")
+  # # J2StepDegLab.place(x=200, y=370)
+  # # J3StepDegLab = Label(tab3, font=("Arial", 8), text = "J3 Step/Deg")
+  # # J3StepDegLab.place(x=200, y=395)
+  # # J4StepDegLab = Label(tab3, font=("Arial", 8), text = "J4 Step/Deg")
+  # # J4StepDegLab.place(x=200, y=420)
+  # # J5StepDegLab = Label(tab3, font=("Arial", 8), text = "J5 Step/Deg")
+  # # J5StepDegLab.place(x=200, y=445)
+  # # J6StepDegLab = Label(tab3, font=("Arial", 8), text = "J6 Step/Deg")
+  # # J6StepDegLab.place(x=200, y=470)
+
+  # # J1StepDegEntryField = Entry(tab3,width=5,justify="center")
+  # # J1StepDegEntryField.place(x=280, y=345)
+  # # J2StepDegEntryField = Entry(tab3,width=5,justify="center")
+  # # J2StepDegEntryField.place(x=280, y=370)
+  # # J3StepDegEntryField = Entry(tab3,width=5,justify="center")
+  # # J3StepDegEntryField.place(x=280, y=395)
+  # # J4StepDegEntryField = Entry(tab3,width=5,justify="center")
+  # # J4StepDegEntryField.place(x=280, y=420)
+  # # J5StepDegEntryField = Entry(tab3,width=5,justify="center")
+  # # J5StepDegEntryField.place(x=280, y=445)
+  # # J6StepDegEntryField = Entry(tab3,width=5,justify="center")
+  # # J6StepDegEntryField.place(x=280, y=470)
+
+
+  ### DRIVER STEPS
+  # # J1DriveMSLab = Label(tab3, font=("Arial", 8), text = "J1 Drive Microstep")
+  # # J1DriveMSLab.place(x=390, y=20)
+  # # J2DriveMSLab = Label(tab3, font=("Arial", 8), text = "J2 Drive Microstep")
+  # # J2DriveMSLab.place(x=390, y=45)
+  # # J3DriveMSLab = Label(tab3, font=("Arial", 8), text = "J3 Drive Microstep")
+  # # J3DriveMSLab.place(x=390, y=70)
+  # # J4DriveMSLab = Label(tab3, font=("Arial", 8), text = "J4 Drive Microstep")
+  # # J4DriveMSLab.place(x=390, y=95)
+  # # J5DriveMSLab = Label(tab3, font=("Arial", 8), text = "J5 Drive Microstep")
+  # # J5DriveMSLab.place(x=390, y=120)
+  # # J6DriveMSLab = Label(tab3, font=("Arial", 8), text = "J6 Drive Microstep")
+  # # J6DriveMSLab.place(x=390, y=145)
+
+  # # J1DriveMSEntryField = Entry(tab3,width=5,justify="center")
+  # # J1DriveMSEntryField.place(x=500, y=20)
+  # # J2DriveMSEntryField = Entry(tab3,width=5,justify="center")
+  # # J2DriveMSEntryField.place(x=500, y=45)
+  # # J3DriveMSEntryField = Entry(tab3,width=5,justify="center")
+  # # J3DriveMSEntryField.place(x=500, y=70)
+  # # J4DriveMSEntryField = Entry(tab3,width=5,justify="center")
+  # # J4DriveMSEntryField.place(x=500, y=95)
+  # # J5DriveMSEntryField = Entry(tab3,width=5,justify="center")
+  # # J5DriveMSEntryField.place(x=500, y=120)
+  # # J6DriveMSEntryField = Entry(tab3,width=5,justify="center")
+  # # J6DriveMSEntryField.place(x=500, y=145)
+
+
+  ###ENCODER CPR
+  # # J1EncCPRLab = Label(tab3, font=("Arial", 8), text = "J1 Encoder CPR")
+  # # J1EncCPRLab.place(x=390, y=195)
+  # # J2EncCPRLab = Label(tab3, font=("Arial", 8), text = "J2 Encoder CPR")
+  # # J2EncCPRLab.place(x=390, y=220)
+  # # J3EncCPRLab = Label(tab3, font=("Arial", 8), text = "J3 Encoder CPR")
+  # # J3EncCPRLab.place(x=390, y=245)
+  # # J4EncCPRLab = Label(tab3, font=("Arial", 8), text = "J4 Encoder CPR")
+  # # J4EncCPRLab.place(x=390, y=270)
+  # # J5EncCPRLab = Label(tab3, font=("Arial", 8), text = "J5 Encoder CPR")
+  # # J5EncCPRLab.place(x=390, y=295)
+  # # J6EncCPRLab = Label(tab3, font=("Arial", 8), text = "J6 Encoder CPR")
+  # # J6EncCPRLab.place(x=390, y=320)
+
+  # # J1EncCPREntryField = Entry(tab3,width=5,justify="center")
+  # # J1EncCPREntryField.place(x=500, y=195)
+  # # J2EncCPREntryField = Entry(tab3,width=5,justify="center")
+  # # J2EncCPREntryField.place(x=500, y=220)
+  # # J3EncCPREntryField = Entry(tab3,width=5,justify="center")
+  # # J3EncCPREntryField.place(x=500, y=245)
+  # # J4EncCPREntryField = Entry(tab3,width=5,justify="center")
+  # # J4EncCPREntryField.place(x=500, y=270)
+  # # J5EncCPREntryField = Entry(tab3,width=5,justify="center")
+  # # J5EncCPREntryField.place(x=500, y=295)
+  # # J6EncCPREntryField = Entry(tab3,width=5,justify="center")
+  # # J6EncCPREntryField.place(x=500, y=320)
+
+
+  # ### DH PARAMS
+  #
+  # ### DRIVER STEPS
+  # J1DHparamLab = Label(tab3, font=("Arial", 8), text = "J1")
+  # J1DHparamLab.place(x=600, y=45)
+  # J1DHparamLab = Label(tab3, font=("Arial", 8), text = "J2")
+  # J1DHparamLab.place(x=600, y=70)
+  # J1DHparamLab = Label(tab3, font=("Arial", 8), text = "J3")
+  # J1DHparamLab.place(x=600, y=95)
+  # J1DHparamLab = Label(tab3, font=("Arial", 8), text = "J4")
+  # J1DHparamLab.place(x=600, y=120)
+  # J1DHparamLab = Label(tab3, font=("Arial", 8), text = "J5")
+  # J1DHparamLab.place(x=600, y=145)
+  # J1DHparamLab = Label(tab3, font=("Arial", 8), text = "J6")
+  # J1DHparamLab.place(x=600, y=170)
+  #
+  # ΘDHparamLab = Label(tab3, font=("Arial", 8), text = "DH-Θ")
+  # ΘDHparamLab.place(x=645, y=20)
+  # αDHparamLab = Label(tab3, font=("Arial", 8), text = "DH-α")
+  # αDHparamLab.place(x=700, y=20)
+  # dDHparamLab = Label(tab3, font=("Arial", 8), text = "DH-d")
+  # dDHparamLab.place(x=755, y=20)
+  # aDHparamLab = Label(tab3, font=("Arial", 8), text = "DH-a")
+  # aDHparamLab.place(x=810, y=20)
+  #
+  #
+  # J1ΘEntryField = Entry(tab3,width=5,justify="center")
+  # J1ΘEntryField.place(x=630, y=45)
+  # J2ΘEntryField = Entry(tab3,width=5,justify="center")
+  # J2ΘEntryField.place(x=630, y=70)
+  # J3ΘEntryField = Entry(tab3,width=5,justify="center")
+  # J3ΘEntryField.place(x=630, y=95)
+  # J4ΘEntryField = Entry(tab3,width=5,justify="center")
+  # J4ΘEntryField.place(x=630, y=120)
+  # J5ΘEntryField = Entry(tab3,width=5,justify="center")
+  # J5ΘEntryField.place(x=630, y=145)
+  # J6ΘEntryField = Entry(tab3,width=5,justify="center")
+  # J6ΘEntryField.place(x=630, y=170)
+  #
+  # J1αEntryField = Entry(tab3,width=5,justify="center")
+  # J1αEntryField.place(x=685, y=45)
+  # J2αEntryField = Entry(tab3,width=5,justify="center")
+  # J2αEntryField.place(x=685, y=70)
+  # J3αEntryField = Entry(tab3,width=5,justify="center")
+  # J3αEntryField.place(x=685, y=95)
+  # J4αEntryField = Entry(tab3,width=5,justify="center")
+  # J4αEntryField.place(x=685, y=120)
+  # J5αEntryField = Entry(tab3,width=5,justify="center")
+  # J5αEntryField.place(x=685, y=145)
+  # J6αEntryField = Entry(tab3,width=5,justify="center")
+  # J6αEntryField.place(x=685, y=170)
+  #
+  # J1dEntryField = Entry(tab3,width=5,justify="center")
+  # J1dEntryField.place(x=740, y=45)
+  # J2dEntryField = Entry(tab3,width=5,justify="center")
+  # J2dEntryField.place(x=740, y=70)
+  # J3dEntryField = Entry(tab3,width=5,justify="center")
+  # J3dEntryField.place(x=740, y=95)
+  # J4dEntryField = Entry(tab3,width=5,justify="center")
+  # J4dEntryField.place(x=740, y=120)
+  # J5dEntryField = Entry(tab3,width=5,justify="center")
+  # J5dEntryField.place(x=740, y=145)
+  # J6dEntryField = Entry(tab3,width=5,justify="center")
+  # J6dEntryField.place(x=740, y=170)
+  #
+  # J1aEntryField = Entry(tab3,width=5,justify="center")
+  # J1aEntryField.place(x=795, y=45)
+  # J2aEntryField = Entry(tab3,width=5,justify="center")
+  # J2aEntryField.place(x=795, y=70)
+  # J3aEntryField = Entry(tab3,width=5,justify="center")
+  # J3aEntryField.place(x=795, y=95)
+  # J4aEntryField = Entry(tab3,width=5,justify="center")
+  # J4aEntryField.place(x=795, y=120)
+  # J5aEntryField = Entry(tab3,width=5,justify="center")
+  # J5aEntryField.place(x=795, y=145)
+  # J6aEntryField = Entry(tab3,width=5,justify="center")
+  # J6aEntryField.place(x=795, y=170)
+
+
+  # ### LOAD DEFAULT ###
+  #
+  # loadAR4Mk2But = Button(tab3,  text="Load AR4-MK3 Defaults",  width=26, command = LoadAR4Mk3default)
+  # loadAR4Mk2But.place(x=1150, y=470)
+  #
+  # loadAR4Mk2But = Button(tab3,  text="Load AR4-MK2 Defaults",  width=26, command = LoadAR4Mk2default)
+  # loadAR4Mk2But.place(x=1150, y=510)
+  #
+  # loadAR4But = Button(tab3,  text="Load AR4 Defaults",  width=26, command = LoadAR4default)
+  # loadAR4But.place(x=1150, y=550)
+  #
+  # loadAR3But = Button(tab3,  text="Load AR3 Defaults",  width=26, command = LoadAR3default)
+  # loadAR3But.place(x=1150, y=590)
+  #
+  #
+  #
+  #
+  #
+  #
+  # #### SAVE ####
+  #
+  # saveCalBut = Button(tab3,  text="SAVE",  width=26, command = SaveAndApplyCalibration)
+  # saveCalBut.place(x=1150, y=630)
+
+
+
+  ####################################################################################################################################################
+  ####################################################################################################################################################
+  ####################################################################################################################################################
+  ####TAB 4
+
+  # ============================================================================
+  # Tab 4 Grid Layout Configuration
+  # ============================================================================
+  tab4.grid_rowconfigure(0, weight=1)
+  tab4.grid_rowconfigure(1, weight=0)
+  tab4.grid_columnconfigure(0, weight=0, minsize=300)  # 5v IO BOARD
+  tab4.grid_columnconfigure(1, weight=0, minsize=250)  # AUX COM DEVICE
+  tab4.grid_columnconfigure(2, weight=0, minsize=400)  # MODBUS DEVICE
+  tab4.grid_columnconfigure(3, weight=1)  # Remaining space
+
+  # ============================================================================
+  # 5v IO BOARD Frame (Row 0, Column 0)
+  # ============================================================================
+  ioBoardFrame = LabelFrame(tab4, text="5v IO BOARD", padding=10)
+  ioBoardFrame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+
+  ioBoardFrame.grid_columnconfigure(0, weight=0, minsize=60)   # Servo buttons
+  ioBoardFrame.grid_columnconfigure(1, weight=0, minsize=10)   # = labels
+  ioBoardFrame.grid_columnconfigure(2, weight=0, minsize=35)   # Entry fields
+  ioBoardFrame.grid_columnconfigure(3, weight=0, minsize=10)   # Spacer between columns
+  ioBoardFrame.grid_columnconfigure(4, weight=0, minsize=60)   # DO buttons
+  ioBoardFrame.grid_columnconfigure(5, weight=0, minsize=10)   # = labels
+  ioBoardFrame.grid_columnconfigure(6, weight=0, minsize=35)   # Entry fields (no expansion)
+
+  # Configure all rows to have uniform minimum height
+  for row in range(12):
+      ioBoardFrame.grid_rowconfigure(row, minsize=25)
+
+  # Servo 0 on
+  servo0onBut = Button(ioBoardFrame, text="Servo 0", command=lambda: _request_manual_servo(0, True, servo0onEntryField))
+  servo0onBut.grid(row=0, column=0, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=0, column=1, padx=2, pady=1)
+  servo0onEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  servo0onEntryField.grid(row=0, column=2, padx=2, pady=1)
+
+  # DO on (row 0)
+  DO1onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(1, True, DO1onEntryField))
+  DO1onBut.grid(row=0, column=4, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=0, column=5, padx=2, pady=1)
+  DO1onEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  DO1onEntryField.grid(row=0, column=6, padx=2, pady=1)
+
+  # Servo 0 off
+  servo0offBut = Button(ioBoardFrame, text="Servo 0", command=lambda: _request_manual_servo(0, False, servo0offEntryField))
+  servo0offBut.grid(row=1, column=0, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=1, column=1, padx=2, pady=1)
+  servo0offEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  servo0offEntryField.grid(row=1, column=2, padx=2, pady=1)
+
+  # DO off (row 1)
+  DO1offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(1, False, DO1offEntryField))
+  DO1offBut.grid(row=1, column=4, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=1, column=5, padx=2, pady=1)
+  DO1offEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  DO1offEntryField.grid(row=1, column=6, padx=2, pady=1)
+
+  # Servo 1 on
+  servo1onBut = Button(ioBoardFrame, text="Servo 1", command=lambda: _request_manual_servo(1, True, servo1onEntryField))
+  servo1onBut.grid(row=2, column=0, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=2, column=1, padx=2, pady=1)
+  servo1onEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  servo1onEntryField.grid(row=2, column=2, padx=2, pady=1)
+
+  # DO on (row 2)
+  DO2onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(2, True, DO2onEntryField))
+  DO2onBut.grid(row=2, column=4, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=2, column=5, padx=2, pady=1)
+  DO2onEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  DO2onEntryField.grid(row=2, column=6, padx=2, pady=1)
+
+  # Servo 1 off
+  servo1offBut = Button(ioBoardFrame, text="Servo 1", command=lambda: _request_manual_servo(1, False, servo1offEntryField))
+  servo1offBut.grid(row=3, column=0, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=3, column=1, padx=2, pady=1)
+  servo1offEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  servo1offEntryField.grid(row=3, column=2, padx=2, pady=1)
+
+  # DO off (row 3)
+  DO2offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(2, False, DO2offEntryField))
+  DO2offBut.grid(row=3, column=4, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=3, column=5, padx=2, pady=1)
+  DO2offEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  DO2offEntryField.grid(row=3, column=6, padx=2, pady=1)
+
+  # Servo 2 on
+  servo2onBut = Button(ioBoardFrame, text="Servo 2", command=lambda: _request_manual_servo(2, True, servo2onEntryField))
+  servo2onBut.grid(row=4, column=0, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=4, column=1, padx=2, pady=1)
+  servo2onEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  servo2onEntryField.grid(row=4, column=2, padx=2, pady=1)
+
+  # DO on (row 4)
+  DO3onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(3, True, DO3onEntryField))
+  DO3onBut.grid(row=4, column=4, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=4, column=5, padx=2, pady=1)
+  DO3onEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  DO3onEntryField.grid(row=4, column=6, padx=2, pady=1)
+
+  # Servo 2 off
+  servo2offBut = Button(ioBoardFrame, text="Servo 2", command=lambda: _request_manual_servo(2, False, servo2offEntryField))
+  servo2offBut.grid(row=5, column=0, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=5, column=1, padx=2, pady=1)
+  servo2offEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  servo2offEntryField.grid(row=5, column=2, padx=2, pady=1)
+
+  # DO off (row 5)
+  DO3offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(3, False, DO3offEntryField))
+  DO3offBut.grid(row=5, column=4, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=5, column=5, padx=2, pady=1)
+  DO3offEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  DO3offEntryField.grid(row=5, column=6, padx=2, pady=1)
+
+  # Servo 3 on
+  servo3onBut = Button(ioBoardFrame, text="Servo 3", command=lambda: _request_manual_servo(3, True, servo3onEntryField))
+  servo3onBut.grid(row=6, column=0, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=6, column=1, padx=2, pady=1)
+  servo3onEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  servo3onEntryField.grid(row=6, column=2, padx=2, pady=1)
+
+  # DO on (row 6)
+  DO4onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(4, True, DO4onEntryField))
+  DO4onBut.grid(row=6, column=4, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=6, column=5, padx=2, pady=1)
+  DO4onEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  DO4onEntryField.grid(row=6, column=6, padx=2, pady=1)
+
+  # Servo 3 off
+  servo3offBut = Button(ioBoardFrame, text="Servo 3", command=lambda: _request_manual_servo(3, False, servo3offEntryField))
+  servo3offBut.grid(row=7, column=0, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=7, column=1, padx=2, pady=1)
+  servo3offEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  servo3offEntryField.grid(row=7, column=2, padx=2, pady=1)
+
+  # DO off (row 7)
+  DO4offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(4, False, DO4offEntryField))
+  DO4offBut.grid(row=7, column=4, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=7, column=5, padx=2, pady=1)
+  DO4offEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  DO4offEntryField.grid(row=7, column=6, padx=2, pady=1)
+
+
+
+  # DO on (row 8) - no servo
+  DO5onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(5, True, DO5onEntryField))
+  DO5onBut.grid(row=8, column=4, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=8, column=5, padx=2, pady=1)
+  DO5onEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  DO5onEntryField.grid(row=8, column=6, padx=2, pady=1)
+
+
+
+  # DO off (row 9)
+  DO5offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(5, False, DO5offEntryField))
+  DO5offBut.grid(row=9, column=4, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=9, column=5, padx=2, pady=1)
+  DO5offEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  DO5offEntryField.grid(row=9, column=6, padx=2, pady=1)
+
+
+
+  # DO on (row 10)
+  DO6onBut = Button(ioBoardFrame, text="DO on", command=lambda: _request_manual_output(6, True, DO6onEntryField))
+  DO6onBut.grid(row=10, column=4, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=10, column=5, padx=2, pady=1)
+  DO6onEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  DO6onEntryField.grid(row=10, column=6, padx=2, pady=1)
+
+
+
+  # DO off (row 11)
+  DO6offBut = Button(ioBoardFrame, text="DO off", command=lambda: _request_manual_output(6, False, DO6offEntryField))
+  DO6offBut.grid(row=11, column=4, sticky="ew", padx=2, pady=1)
+  Label(ioBoardFrame, text="=").grid(row=11, column=5, padx=2, pady=1)
+  DO6offEntryField = Entry(ioBoardFrame, width=4, justify="center")
+  DO6offEntryField.grid(row=11, column=6, padx=2, pady=1)
+
+  # ============================================================================
+  # AUX COM DEVICE Frame (Row 0, Column 1)
+  # ============================================================================
+  auxComFrame = LabelFrame(tab4, text="AUX COM DEVICE", padding=10)
+  auxComFrame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
+
+  auxComFrame.grid_columnconfigure(0, weight=1)
+
+  # Aux Com Port
+  Label(auxComFrame, text="Aux Com Port").grid(row=0, column=0, sticky="w", padx=(5,2), pady=5)
+  com3PortEntryField = Entry(auxComFrame, width=10, justify="left")
+  com3PortEntryField.grid(row=0, column=1, sticky="w", padx=(2,5), pady=5)
+
+  # Char to Read
+  Label(auxComFrame, text="Char to Read").grid(row=1, column=0, sticky="w", padx=(5,2), pady=5)
+  com3charPortEntryField = Entry(auxComFrame, width=10, justify="left")
+  com3charPortEntryField.grid(row=1, column=1, sticky="w", padx=(2,5), pady=5)
+
+  # Test button
+  comPortBut3 = Button(auxComFrame, text="Test Aux COM Device", command=TestAuxCom)
+  comPortBut3.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+
+  # Output
+  com3outPortEntryField = Entry(auxComFrame, width=25, justify="center")
+  com3outPortEntryField.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+
+  # ============================================================================
+  # MODBUS DEVICE Frame (Row 0, Column 2)
+  # ============================================================================
+  modbusFrame = LabelFrame(tab4, text="MODBUS DEVICE", padding=10)
+  modbusFrame.grid(row=0, column=2, sticky="nsew", padx=5, pady=5)
+
+  modbusFrame.grid_columnconfigure(0, weight=1)
+
+  # Slave ID
+  Label(modbusFrame, text="Slave ID").grid(row=0, column=0, sticky="w", padx=(5,2), pady=5)
+  MBslaveEntryField = Entry(modbusFrame, width=10, justify="left")
+  MBslaveEntryField.grid(row=0, column=1, sticky="w", padx=(2,5), pady=5)
+
+  # Modbus Address
+  Label(modbusFrame, text="Modbus Address").grid(row=1, column=0, sticky="w", padx=(5,2), pady=5)
+  MBaddressEntryField = Entry(modbusFrame, width=10, justify="left")
+  MBaddressEntryField.grid(row=1, column=1, sticky="w", padx=(2,5), pady=5)
+
+  # Operation Value
+  Label(modbusFrame, text="Operation Value").grid(row=2, column=0, sticky="w", padx=(5,2), pady=5)
+  MBoperValEntryField = Entry(modbusFrame, width=10, justify="left")
+  MBoperValEntryField.grid(row=2, column=1, sticky="w", padx=(2,5), pady=5)
+
+  # Buttons
+  MBreadCoilBut = Button(modbusFrame, text="Read Coil", width=30, command=partial(_request_manual_modbus, "BB"))
+  MBreadCoilBut.grid(row=3, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  MBreadDinputBut = Button(modbusFrame, text="Read Discrete Input", width=30, command=partial(_request_manual_modbus, "BC"))
+  MBreadDinputBut.grid(row=4, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  MBreadHoldRegBut = Button(modbusFrame, text="Read Holding Register", width=30, command=partial(_request_manual_modbus, "BA"))
+  MBreadHoldRegBut.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  MBreadInputRegBut = Button(modbusFrame, text="Read Input Register", width=30, command=partial(_request_manual_modbus, "BD"))
+  MBreadInputRegBut.grid(row=6, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  MBwriteCoilBut = Button(modbusFrame, text="Write Coil", width=30, command=partial(_request_manual_modbus, "BE"))
+  MBwriteCoilBut.grid(row=7, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  MBwriteRegBut = Button(modbusFrame, text="Write Register", width=30, command=partial(_request_manual_modbus, "BF"))
+  MBwriteRegBut.grid(row=8, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  # Output Response
+  Label(modbusFrame, text="Output Response:").grid(row=9, column=0, columnspan=2, sticky="w", padx=5, pady=(10,2))
+  MBoutputEntryField = Entry(modbusFrame, width=33, justify="center")
+  MBoutputEntryField.grid(row=10, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+  # ============================================================================
+  # Information Frame (Row 1, Column 0-2, spans 3 columns)
+  # ============================================================================
+  infoFrame = LabelFrame(tab4, text="Information", padding=10)
+  infoFrame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=5, pady=5)
+
+  infoFrame.grid_columnconfigure(0, weight=1)
+
+  Label(infoFrame, text="The following IO are available when using the default 5v Nano board for IO:   Inputs = 2-7  /  Outputs = 8-13  /  Servos = A0-A5").grid(row=0, column=0, sticky="w", padx=5, pady=2)
+
+  Label(infoFrame, text="The following IO are available when using the default 5v Mega board for IO:   Inputs = 2-27  /  Outputs = 28-53  /  Servos = A0-A6").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+
+  Label(infoFrame, text="Please review this tutorial video on using 5v IO boards:").grid(row=2, column=0, sticky="w", padx=5, pady=2)
+
+  link2 = Label(infoFrame, font=("Arial", 8), text="https://youtu.be/76F6dS4ar8Y?si=Z6NstZy1zNeHgtCF", foreground="blue", cursor="hand2")
+  link2.bind("<Button-1>", lambda event: webbrowser.open(link2.cget("text")))
+  link2.grid(row=3, column=0, sticky="w", padx=5, pady=2)
+
+  Label(infoFrame, text="5v board inputs are high impedance and susceptable to floating voltage - inputs use a pullup resistor and will read high when nothing is connected - its best to connect your input signal to GND and if/wait for the input signal to = 0").grid(row=4, column=0, sticky="w", padx=5, pady=2)
+
+
+
+
+
+  ####TAB 5
+
+  # ============================================================================
+  # Tab 5 Grid Layout Configuration
+  # ============================================================================
+  tab5.grid_rowconfigure(0, weight=1)
+  tab5.grid_columnconfigure(0, weight=0, minsize=150)  # Registers
+  tab5.grid_columnconfigure(1, weight=0, minsize=300)  # Position Registers
+
+  # ============================================================================
+  # Registers Container (Column 0)
+  # ============================================================================
+  registersFrame = LabelFrame(tab5, text="Registers", padding=10)
+  registersFrame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+
+  registersFrame.grid_columnconfigure(0, weight=0)  # Entry field column
+  registersFrame.grid_columnconfigure(1, weight=1)  # Label column
+
+  # R1
+  R1EntryField = Entry(registersFrame, width=4, justify="center")
+  R1EntryField.grid(row=0, column=0, padx=2, pady=2)
+  R1Lab = Label(registersFrame, text="R1")
+  R1Lab.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+
+  # R2
+  R2EntryField = Entry(registersFrame, width=4, justify="center")
+  R2EntryField.grid(row=1, column=0, padx=2, pady=2)
+  R2Lab = Label(registersFrame, text="R2")
+  R2Lab.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+
+  # R3
+  R3EntryField = Entry(registersFrame, width=4, justify="center")
+  R3EntryField.grid(row=2, column=0, padx=2, pady=2)
+  R3Lab = Label(registersFrame, text="R3")
+  R3Lab.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+
+  # R4
+  R4EntryField = Entry(registersFrame, width=4, justify="center")
+  R4EntryField.grid(row=3, column=0, padx=2, pady=2)
+  R4Lab = Label(registersFrame, text="R4")
+  R4Lab.grid(row=3, column=1, sticky="w", padx=5, pady=2)
+
+  # R5
+  R5EntryField = Entry(registersFrame, width=4, justify="center")
+  R5EntryField.grid(row=4, column=0, padx=2, pady=2)
+  R5Lab = Label(registersFrame, text="R5")
+  R5Lab.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+
+  # R6
+  R6EntryField = Entry(registersFrame, width=4, justify="center")
+  R6EntryField.grid(row=5, column=0, padx=2, pady=2)
+  R6Lab = Label(registersFrame, text="R6")
+  R6Lab.grid(row=5, column=1, sticky="w", padx=5, pady=2)
+
+  # R7
+  R7EntryField = Entry(registersFrame, width=4, justify="center")
+  R7EntryField.grid(row=6, column=0, padx=2, pady=2)
+  R7Lab = Label(registersFrame, text="R7")
+  R7Lab.grid(row=6, column=1, sticky="w", padx=5, pady=2)
+
+  # R8
+  R8EntryField = Entry(registersFrame, width=4, justify="center")
+  R8EntryField.grid(row=7, column=0, padx=2, pady=2)
+  R8Lab = Label(registersFrame, text="R8")
+  R8Lab.grid(row=7, column=1, sticky="w", padx=5, pady=2)
+
+  # R9
+  R9EntryField = Entry(registersFrame, width=4, justify="center")
+  R9EntryField.grid(row=8, column=0, padx=2, pady=2)
+  R9Lab = Label(registersFrame, text="R9")
+  R9Lab.grid(row=8, column=1, sticky="w", padx=5, pady=2)
+
+  # R10
+  R10EntryField = Entry(registersFrame, width=4, justify="center")
+  R10EntryField.grid(row=9, column=0, padx=2, pady=2)
+  R10Lab = Label(registersFrame, text="R10")
+  R10Lab.grid(row=9, column=1, sticky="w", padx=5, pady=2)
+
+  # R11
+  R11EntryField = Entry(registersFrame, width=4, justify="center")
+  R11EntryField.grid(row=10, column=0, padx=2, pady=2)
+  R11Lab = Label(registersFrame, text="R11")
+  R11Lab.grid(row=10, column=1, sticky="w", padx=5, pady=2)
+
+  # R12
+  R12EntryField = Entry(registersFrame, width=4, justify="center")
+  R12EntryField.grid(row=11, column=0, padx=2, pady=2)
+  R12Lab = Label(registersFrame, text="R12")
+  R12Lab.grid(row=11, column=1, sticky="w", padx=5, pady=2)
+
+  # R13
+  R13EntryField = Entry(registersFrame, width=4, justify="center")
+  R13EntryField.grid(row=12, column=0, padx=2, pady=2)
+  R13Lab = Label(registersFrame, text="R13")
+  R13Lab.grid(row=12, column=1, sticky="w", padx=5, pady=2)
+
+  # R14
+  R14EntryField = Entry(registersFrame, width=4, justify="center")
+  R14EntryField.grid(row=13, column=0, padx=2, pady=2)
+  R14Lab = Label(registersFrame, text="R14")
+  R14Lab.grid(row=13, column=1, sticky="w", padx=5, pady=2)
+
+  # R15
+  R15EntryField = Entry(registersFrame, width=4, justify="center")
+  R15EntryField.grid(row=14, column=0, padx=2, pady=2)
+  R15Lab = Label(registersFrame, text="R15")
+  R15Lab.grid(row=14, column=1, sticky="w", padx=5, pady=2)
+
+  # R16
+  R16EntryField = Entry(registersFrame, width=4, justify="center")
+  R16EntryField.grid(row=15, column=0, padx=2, pady=2)
+  R16Lab = Label(registersFrame, text="R16")
+  R16Lab.grid(row=15, column=1, sticky="w", padx=5, pady=2)
+
+  # ============================================================================
+  # Position Registers Container (Column 1)
+  # ============================================================================
+  posRegistersFrame = LabelFrame(tab5, text="Position Registers", padding=10)
+  posRegistersFrame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
+
+  posRegistersFrame.grid_columnconfigure(0, weight=0, minsize=35)  # X
+  posRegistersFrame.grid_columnconfigure(1, weight=0, minsize=35)  # Y
+  posRegistersFrame.grid_columnconfigure(2, weight=0, minsize=35)  # Z
+  posRegistersFrame.grid_columnconfigure(3, weight=0, minsize=35)  # Rz
+  posRegistersFrame.grid_columnconfigure(4, weight=0, minsize=35)  # Ry
+  posRegistersFrame.grid_columnconfigure(5, weight=0, minsize=35)  # Rx
+  posRegistersFrame.grid_columnconfigure(6, weight=0, minsize=40)  # PR label
+
+  # Header row
+  Label(posRegistersFrame, text="X").grid(row=0, column=0, padx=1, pady=2)
+  Label(posRegistersFrame, text="Y").grid(row=0, column=1, padx=1, pady=2)
+  Label(posRegistersFrame, text="Z").grid(row=0, column=2, padx=1, pady=2)
+  Label(posRegistersFrame, text="Rz").grid(row=0, column=3, padx=1, pady=2)
+  Label(posRegistersFrame, text="Ry").grid(row=0, column=4, padx=1, pady=2)
+  Label(posRegistersFrame, text="Rx").grid(row=0, column=5, padx=1, pady=2)
+
+  # PR1
+  SP_1_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_1_E1_EntryField.grid(row=1, column=0, padx=1, pady=2)
+  SP_1_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_1_E2_EntryField.grid(row=1, column=1, padx=1, pady=2)
+  SP_1_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_1_E3_EntryField.grid(row=1, column=2, padx=1, pady=2)
+  SP_1_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_1_E4_EntryField.grid(row=1, column=3, padx=1, pady=2)
+  SP_1_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_1_E5_EntryField.grid(row=1, column=4, padx=1, pady=2)
+  SP_1_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_1_E6_EntryField.grid(row=1, column=5, padx=1, pady=2)
+  SP1Lab = Label(posRegistersFrame, text="PR1")
+  SP1Lab.grid(row=1, column=6, sticky="w", padx=2, pady=2)
+
+  # PR2
+  SP_2_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_2_E1_EntryField.grid(row=2, column=0, padx=1, pady=2)
+  SP_2_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_2_E2_EntryField.grid(row=2, column=1, padx=1, pady=2)
+  SP_2_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_2_E3_EntryField.grid(row=2, column=2, padx=1, pady=2)
+  SP_2_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_2_E4_EntryField.grid(row=2, column=3, padx=1, pady=2)
+  SP_2_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_2_E5_EntryField.grid(row=2, column=4, padx=1, pady=2)
+  SP_2_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_2_E6_EntryField.grid(row=2, column=5, padx=1, pady=2)
+  SP2Lab = Label(posRegistersFrame, text="PR2")
+  SP2Lab.grid(row=2, column=6, sticky="w", padx=2, pady=2)
+
+  # PR3
+  SP_3_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_3_E1_EntryField.grid(row=3, column=0, padx=1, pady=2)
+  SP_3_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_3_E2_EntryField.grid(row=3, column=1, padx=1, pady=2)
+  SP_3_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_3_E3_EntryField.grid(row=3, column=2, padx=1, pady=2)
+  SP_3_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_3_E4_EntryField.grid(row=3, column=3, padx=1, pady=2)
+  SP_3_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_3_E5_EntryField.grid(row=3, column=4, padx=1, pady=2)
+  SP_3_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_3_E6_EntryField.grid(row=3, column=5, padx=1, pady=2)
+  SP3Lab = Label(posRegistersFrame, text="PR3")
+  SP3Lab.grid(row=3, column=6, sticky="w", padx=2, pady=2)
+
+  # PR4
+  SP_4_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_4_E1_EntryField.grid(row=4, column=0, padx=1, pady=2)
+  SP_4_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_4_E2_EntryField.grid(row=4, column=1, padx=1, pady=2)
+  SP_4_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_4_E3_EntryField.grid(row=4, column=2, padx=1, pady=2)
+  SP_4_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_4_E4_EntryField.grid(row=4, column=3, padx=1, pady=2)
+  SP_4_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_4_E5_EntryField.grid(row=4, column=4, padx=1, pady=2)
+  SP_4_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_4_E6_EntryField.grid(row=4, column=5, padx=1, pady=2)
+  SP4Lab = Label(posRegistersFrame, text="PR4")
+  SP4Lab.grid(row=4, column=6, sticky="w", padx=2, pady=2)
+
+  # PR5
+  SP_5_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_5_E1_EntryField.grid(row=5, column=0, padx=1, pady=2)
+  SP_5_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_5_E2_EntryField.grid(row=5, column=1, padx=1, pady=2)
+  SP_5_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_5_E3_EntryField.grid(row=5, column=2, padx=1, pady=2)
+  SP_5_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_5_E4_EntryField.grid(row=5, column=3, padx=1, pady=2)
+  SP_5_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_5_E5_EntryField.grid(row=5, column=4, padx=1, pady=2)
+  SP_5_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_5_E6_EntryField.grid(row=5, column=5, padx=1, pady=2)
+  SP5Lab = Label(posRegistersFrame, text="PR5")
+  SP5Lab.grid(row=5, column=6, sticky="w", padx=2, pady=2)
+
+  # PR6
+  SP_6_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_6_E1_EntryField.grid(row=6, column=0, padx=1, pady=2)
+  SP_6_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_6_E2_EntryField.grid(row=6, column=1, padx=1, pady=2)
+  SP_6_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_6_E3_EntryField.grid(row=6, column=2, padx=1, pady=2)
+  SP_6_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_6_E4_EntryField.grid(row=6, column=3, padx=1, pady=2)
+  SP_6_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_6_E5_EntryField.grid(row=6, column=4, padx=1, pady=2)
+  SP_6_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_6_E6_EntryField.grid(row=6, column=5, padx=1, pady=2)
+  SP6Lab = Label(posRegistersFrame, text="PR6")
+  SP6Lab.grid(row=6, column=6, sticky="w", padx=2, pady=2)
+
+  # PR7
+  SP_7_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_7_E1_EntryField.grid(row=7, column=0, padx=1, pady=2)
+  SP_7_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_7_E2_EntryField.grid(row=7, column=1, padx=1, pady=2)
+  SP_7_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_7_E3_EntryField.grid(row=7, column=2, padx=1, pady=2)
+  SP_7_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_7_E4_EntryField.grid(row=7, column=3, padx=1, pady=2)
+  SP_7_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_7_E5_EntryField.grid(row=7, column=4, padx=1, pady=2)
+  SP_7_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_7_E6_EntryField.grid(row=7, column=5, padx=1, pady=2)
+  SP7Lab = Label(posRegistersFrame, text="PR7")
+  SP7Lab.grid(row=7, column=6, sticky="w", padx=2, pady=2)
+
+  # PR8
+  SP_8_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_8_E1_EntryField.grid(row=8, column=0, padx=1, pady=2)
+  SP_8_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_8_E2_EntryField.grid(row=8, column=1, padx=1, pady=2)
+  SP_8_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_8_E3_EntryField.grid(row=8, column=2, padx=1, pady=2)
+  SP_8_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_8_E4_EntryField.grid(row=8, column=3, padx=1, pady=2)
+  SP_8_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_8_E5_EntryField.grid(row=8, column=4, padx=1, pady=2)
+  SP_8_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_8_E6_EntryField.grid(row=8, column=5, padx=1, pady=2)
+  SP8Lab = Label(posRegistersFrame, text="PR8")
+  SP8Lab.grid(row=8, column=6, sticky="w", padx=2, pady=2)
+
+  # PR9
+  SP_9_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_9_E1_EntryField.grid(row=9, column=0, padx=1, pady=2)
+  SP_9_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_9_E2_EntryField.grid(row=9, column=1, padx=1, pady=2)
+  SP_9_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_9_E3_EntryField.grid(row=9, column=2, padx=1, pady=2)
+  SP_9_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_9_E4_EntryField.grid(row=9, column=3, padx=1, pady=2)
+  SP_9_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_9_E5_EntryField.grid(row=9, column=4, padx=1, pady=2)
+  SP_9_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_9_E6_EntryField.grid(row=9, column=5, padx=1, pady=2)
+  SP9Lab = Label(posRegistersFrame, text="PR9")
+  SP9Lab.grid(row=9, column=6, sticky="w", padx=2, pady=2)
+
+  # PR10
+  SP_10_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_10_E1_EntryField.grid(row=10, column=0, padx=1, pady=2)
+  SP_10_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_10_E2_EntryField.grid(row=10, column=1, padx=1, pady=2)
+  SP_10_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_10_E3_EntryField.grid(row=10, column=2, padx=1, pady=2)
+  SP_10_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_10_E4_EntryField.grid(row=10, column=3, padx=1, pady=2)
+  SP_10_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_10_E5_EntryField.grid(row=10, column=4, padx=1, pady=2)
+  SP_10_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_10_E6_EntryField.grid(row=10, column=5, padx=1, pady=2)
+  SP10Lab = Label(posRegistersFrame, text="PR10")
+  SP10Lab.grid(row=10, column=6, sticky="w", padx=2, pady=2)
+
+  # PR11
+  SP_11_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_11_E1_EntryField.grid(row=11, column=0, padx=1, pady=2)
+  SP_11_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_11_E2_EntryField.grid(row=11, column=1, padx=1, pady=2)
+  SP_11_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_11_E3_EntryField.grid(row=11, column=2, padx=1, pady=2)
+  SP_11_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_11_E4_EntryField.grid(row=11, column=3, padx=1, pady=2)
+  SP_11_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_11_E5_EntryField.grid(row=11, column=4, padx=1, pady=2)
+  SP_11_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_11_E6_EntryField.grid(row=11, column=5, padx=1, pady=2)
+  SP11Lab = Label(posRegistersFrame, text="PR11")
+  SP11Lab.grid(row=11, column=6, sticky="w", padx=2, pady=2)
+
+  # PR12
+  SP_12_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_12_E1_EntryField.grid(row=12, column=0, padx=1, pady=2)
+  SP_12_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_12_E2_EntryField.grid(row=12, column=1, padx=1, pady=2)
+  SP_12_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_12_E3_EntryField.grid(row=12, column=2, padx=1, pady=2)
+  SP_12_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_12_E4_EntryField.grid(row=12, column=3, padx=1, pady=2)
+  SP_12_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_12_E5_EntryField.grid(row=12, column=4, padx=1, pady=2)
+  SP_12_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_12_E6_EntryField.grid(row=12, column=5, padx=1, pady=2)
+  SP12Lab = Label(posRegistersFrame, text="PR12")
+  SP12Lab.grid(row=12, column=6, sticky="w", padx=2, pady=2)
+
+  # PR13
+  SP_13_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_13_E1_EntryField.grid(row=13, column=0, padx=1, pady=2)
+  SP_13_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_13_E2_EntryField.grid(row=13, column=1, padx=1, pady=2)
+  SP_13_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_13_E3_EntryField.grid(row=13, column=2, padx=1, pady=2)
+  SP_13_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_13_E4_EntryField.grid(row=13, column=3, padx=1, pady=2)
+  SP_13_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_13_E5_EntryField.grid(row=13, column=4, padx=1, pady=2)
+  SP_13_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_13_E6_EntryField.grid(row=13, column=5, padx=1, pady=2)
+  SP13Lab = Label(posRegistersFrame, text="PR13")
+  SP13Lab.grid(row=13, column=6, sticky="w", padx=2, pady=2)
+
+  # PR14
+  SP_14_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_14_E1_EntryField.grid(row=14, column=0, padx=1, pady=2)
+  SP_14_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_14_E2_EntryField.grid(row=14, column=1, padx=1, pady=2)
+  SP_14_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_14_E3_EntryField.grid(row=14, column=2, padx=1, pady=2)
+  SP_14_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_14_E4_EntryField.grid(row=14, column=3, padx=1, pady=2)
+  SP_14_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_14_E5_EntryField.grid(row=14, column=4, padx=1, pady=2)
+  SP_14_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_14_E6_EntryField.grid(row=14, column=5, padx=1, pady=2)
+  SP14Lab = Label(posRegistersFrame, text="PR14")
+  SP14Lab.grid(row=14, column=6, sticky="w", padx=2, pady=2)
+
+  # PR15
+  SP_15_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_15_E1_EntryField.grid(row=15, column=0, padx=1, pady=2)
+  SP_15_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_15_E2_EntryField.grid(row=15, column=1, padx=1, pady=2)
+  SP_15_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_15_E3_EntryField.grid(row=15, column=2, padx=1, pady=2)
+  SP_15_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_15_E4_EntryField.grid(row=15, column=3, padx=1, pady=2)
+  SP_15_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_15_E5_EntryField.grid(row=15, column=4, padx=1, pady=2)
+  SP_15_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_15_E6_EntryField.grid(row=15, column=5, padx=1, pady=2)
+  SP15Lab = Label(posRegistersFrame, text="PR15")
+  SP15Lab.grid(row=15, column=6, sticky="w", padx=2, pady=2)
+
+  # PR16
+  SP_16_E1_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_16_E1_EntryField.grid(row=16, column=0, padx=1, pady=2)
+  SP_16_E2_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_16_E2_EntryField.grid(row=16, column=1, padx=1, pady=2)
+  SP_16_E3_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_16_E3_EntryField.grid(row=16, column=2, padx=1, pady=2)
+  SP_16_E4_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_16_E4_EntryField.grid(row=16, column=3, padx=1, pady=2)
+  SP_16_E5_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_16_E5_EntryField.grid(row=16, column=4, padx=1, pady=2)
+  SP_16_E6_EntryField = Entry(posRegistersFrame, width=4, justify="center")
+  SP_16_E6_EntryField.grid(row=16, column=5, padx=1, pady=2)
+  SP16Lab = Label(posRegistersFrame, text="PR16")
+  SP16Lab.grid(row=16, column=6, sticky="w", padx=2, pady=2)
+
+  program_register_entry_fields.update({
+    register: entry
+    for register, entry in enumerate(
+      (
+        R1EntryField,
+        R2EntryField,
+        R3EntryField,
+        R4EntryField,
+        R5EntryField,
+        R6EntryField,
+        R7EntryField,
+        R8EntryField,
+        R9EntryField,
+        R10EntryField,
+        R11EntryField,
+        R12EntryField,
+        R13EntryField,
+        R14EntryField,
+        R15EntryField,
+        R16EntryField,
+      ),
+      start=1,
+    )
+  })
+  program_position_register_entry_fields.update({
+    (register, element): entry
+    for register, entries in enumerate(
+      (
+        (
+          SP_1_E1_EntryField,
+          SP_1_E2_EntryField,
+          SP_1_E3_EntryField,
+          SP_1_E4_EntryField,
+          SP_1_E5_EntryField,
+          SP_1_E6_EntryField,
+        ),
+        (
+          SP_2_E1_EntryField,
+          SP_2_E2_EntryField,
+          SP_2_E3_EntryField,
+          SP_2_E4_EntryField,
+          SP_2_E5_EntryField,
+          SP_2_E6_EntryField,
+        ),
+        (
+          SP_3_E1_EntryField,
+          SP_3_E2_EntryField,
+          SP_3_E3_EntryField,
+          SP_3_E4_EntryField,
+          SP_3_E5_EntryField,
+          SP_3_E6_EntryField,
+        ),
+        (
+          SP_4_E1_EntryField,
+          SP_4_E2_EntryField,
+          SP_4_E3_EntryField,
+          SP_4_E4_EntryField,
+          SP_4_E5_EntryField,
+          SP_4_E6_EntryField,
+        ),
+        (
+          SP_5_E1_EntryField,
+          SP_5_E2_EntryField,
+          SP_5_E3_EntryField,
+          SP_5_E4_EntryField,
+          SP_5_E5_EntryField,
+          SP_5_E6_EntryField,
+        ),
+        (
+          SP_6_E1_EntryField,
+          SP_6_E2_EntryField,
+          SP_6_E3_EntryField,
+          SP_6_E4_EntryField,
+          SP_6_E5_EntryField,
+          SP_6_E6_EntryField,
+        ),
+        (
+          SP_7_E1_EntryField,
+          SP_7_E2_EntryField,
+          SP_7_E3_EntryField,
+          SP_7_E4_EntryField,
+          SP_7_E5_EntryField,
+          SP_7_E6_EntryField,
+        ),
+        (
+          SP_8_E1_EntryField,
+          SP_8_E2_EntryField,
+          SP_8_E3_EntryField,
+          SP_8_E4_EntryField,
+          SP_8_E5_EntryField,
+          SP_8_E6_EntryField,
+        ),
+        (
+          SP_9_E1_EntryField,
+          SP_9_E2_EntryField,
+          SP_9_E3_EntryField,
+          SP_9_E4_EntryField,
+          SP_9_E5_EntryField,
+          SP_9_E6_EntryField,
+        ),
+        (
+          SP_10_E1_EntryField,
+          SP_10_E2_EntryField,
+          SP_10_E3_EntryField,
+          SP_10_E4_EntryField,
+          SP_10_E5_EntryField,
+          SP_10_E6_EntryField,
+        ),
+        (
+          SP_11_E1_EntryField,
+          SP_11_E2_EntryField,
+          SP_11_E3_EntryField,
+          SP_11_E4_EntryField,
+          SP_11_E5_EntryField,
+          SP_11_E6_EntryField,
+        ),
+        (
+          SP_12_E1_EntryField,
+          SP_12_E2_EntryField,
+          SP_12_E3_EntryField,
+          SP_12_E4_EntryField,
+          SP_12_E5_EntryField,
+          SP_12_E6_EntryField,
+        ),
+        (
+          SP_13_E1_EntryField,
+          SP_13_E2_EntryField,
+          SP_13_E3_EntryField,
+          SP_13_E4_EntryField,
+          SP_13_E5_EntryField,
+          SP_13_E6_EntryField,
+        ),
+        (
+          SP_14_E1_EntryField,
+          SP_14_E2_EntryField,
+          SP_14_E3_EntryField,
+          SP_14_E4_EntryField,
+          SP_14_E5_EntryField,
+          SP_14_E6_EntryField,
+        ),
+        (
+          SP_15_E1_EntryField,
+          SP_15_E2_EntryField,
+          SP_15_E3_EntryField,
+          SP_15_E4_EntryField,
+          SP_15_E5_EntryField,
+          SP_15_E6_EntryField,
+        ),
+        (
+          SP_16_E1_EntryField,
+          SP_16_E2_EntryField,
+          SP_16_E3_EntryField,
+          SP_16_E4_EntryField,
+          SP_16_E5_EntryField,
+          SP_16_E6_EntryField,
+        ),
+      ),
+      start=1,
+    )
+    for element, entry in enumerate(entries, start=1)
+  })
+
+
+  ####TAB 6
+
+
+
+
+  ### 6 LABELS#################################################################
+  #############################################################################
+
+
+  #VisBackdropImg = ImageTk.PhotoImage(Image.open('VisBackdrop.png'))
+
+  VisBackdropImg = Image.open("VisBackdrop.png")
+  VisBackdropTk = ImageTk.PhotoImage(VisBackdropImg)
+  VisBackdromLbl = Label(tab6, image = VisBackdropTk)
+  VisBackdromLbl.place(x=15, y=215)
+
+
+  #RUN['cam_on']= cv2.VideoCapture(0)
+  video_frame = Frame(tab6,width=640,height=480)
+  video_frame.place(x=50, y=250)
+
+
+  vid_lbl = Label(video_frame)
+  vid_lbl.place(x=0, y=0)
+
+  vid_lbl.bind('<Button-1>', motion)
+
+
+  LiveLab = Label(tab6, text = "LIVE VIDEO FEED")
+  LiveLab.place(x=750, y=390)
+  liveCanvas = Canvas(tab6, width=490, height=330)
+  liveCanvas.place(x=750, y=410)
+  live_frame = Frame(tab6,width=480,height=320)
+  live_frame.place(x=757, y=417)
+  live_lbl = Label(live_frame)
+  live_lbl.place(x=0, y=0)
+
+
+  template_frame = Frame(tab6,width=150,height=150)
+  template_frame.place(x=565, y=50)
+
+  template_lbl = Label(template_frame)
+  template_lbl.place(x=0, y=0)
+
+  FoundValuesLab = Label(tab6, text = "FOUND VALUES")
+  FoundValuesLab.place(x=750, y=30)
+
+  CalValuesLab = Label(tab6, text = "CALIBRATION VALUES")
+  CalValuesLab.place(x=900, y=30)
+
+
+
+
+
+  ### 6 BUTTONS################################################################
+  #############################################################################
+
+  match CE['Platform']['OS']:
+
+    case "Windows":
+      try:
+        graph = FilterGraph()
+        allcams = graph.get_input_devices()
+      except Exception:
+        logger.exception("Unable to enumerate Windows cameras")
+        allcams = []
+      if not isinstance(allcams, (tuple, list)) or any(
+        not isinstance(camera_name, str)
+        or not camera_name
+        or camera_name != camera_name.strip()
+        or "\r" in camera_name
+        or "\n" in camera_name
+        or "\x00" in camera_name
+        or len(camera_name) > MAX_CAMERA_PREVIEW_EVENT_DETAIL
+        for camera_name in allcams
+      ):
+        logger.error("Windows camera enumeration returned invalid data")
+        allcams = []
+
+      # --- filter out virtual/fake cameras (case-insensitive) ---
+      _ban = ("iriun", "droidcam", "obs", "virtual", "manycam", "snap camera", "ndi", "xsplit", "mmhmm")
+      indexed_cameras = [
+        (index, name)
+        for index, name in enumerate(allcams)
+        if not any(blocked in name.lower() for blocked in _ban)
+      ]
+      if not indexed_cameras:
+        indexed_cameras = list(enumerate(allcams))
+      camList, label_to_id = _camera_labels_for_sources(
+        indexed_cameras
+      )
+      if not camList:
+        camList = ["Select a Camera"]
+      # ----------------------------------------------------------
+
+      visoptions = StringVar(tab6)
+      visoptions.set("Select a Camera")
+
+      try:
+        # If we have real cams, preselect the first real one; otherwise keep the placeholder
+        if camList and camList[0] != "Select a Camera":
+          vismenu = OptionMenu(
+            tab6,
+            visoptions,
+            camList[0],
+            *camList,
+            command=_on_vision_camera_select,
+          )
+          visoptions.set(camList[0])  # ensures the real cam (e.g., Logi C270) is selected
+        else:
+          vismenu = OptionMenu(
+            tab6,
+            visoptions,
+            "Select a Camera",
+            command=_on_vision_camera_select,
+          )
+        vismenu.config(width=20)
+        vismenu.place(x=10, y=10)
+      except Exception:
+        logger.error("no camera")
+
+    case "Linux":
+      try:
+        camera_entries = [
+          (camera.id, camera.label)
+          for camera in CE['Cameras']['Enum']
+        ]
+        camList, label_to_id = _camera_labels_for_sources(camera_entries)
+      except Exception:
+        logger.exception("Unable to enumerate Linux cameras")
+        camList = []
+        label_to_id = {}
+
+      selected_label = camList[0] if camList else "Select a Camera"
+
+      visoptions = StringVar(tab6)
+      visoptions.set("Select a Camera")
+
+      try:
         vismenu = OptionMenu(
           tab6,
           visoptions,
-          camList[0],
+          selected_label,
           *camList,
           command=_on_vision_camera_select,
         )
-        visoptions.set(camList[0])  # ensures the real cam (e.g., Logi C270) is selected
-      else:
-        vismenu = OptionMenu(
-          tab6,
-          visoptions,
-          "Select a Camera",
-          command=_on_vision_camera_select,
-        )
-      vismenu.config(width=20)
-      vismenu.place(x=10, y=10)
-    except Exception:
-      logger.error("no camera")
+        vismenu.config(width=20)
+        vismenu.place(x=10, y=10)
+      except Exception:
+        logger.error("no camera")
 
-  case "Linux":
-    try:
-      camera_entries = [
-        (camera.id, camera.label)
-        for camera in CE['Cameras']['Enum']
-      ]
-      camList, label_to_id = _camera_labels_for_sources(camera_entries)
-    except Exception:
-      logger.exception("Unable to enumerate Linux cameras")
-      camList = []
-      label_to_id = {}
 
-    selected_label = camList[0] if camList else "Select a Camera"
 
-    visoptions = StringVar(tab6)
-    visoptions.set("Select a Camera")
 
-    try:
-      vismenu = OptionMenu(
-        tab6,
-        visoptions,
-        selected_label,
-        *camList,
-        command=_on_vision_camera_select,
-      )
-      vismenu.config(width=20)
-      vismenu.place(x=10, y=10)
-    except Exception:
-      logger.error("no camera")
 
+  StartCamBut = Button(tab6,  text="Start Camera",  width=12, command = start_vid)
+  StartCamBut.place(x=200, y=10)
 
+  StopCamBut = Button(tab6,  text="Stop Camera",  width=12, command = stop_vid)
+  StopCamBut.place(x=315, y=10)
 
-
-
-StartCamBut = Button(tab6,  text="Start Camera",  width=12, command = start_vid)
-StartCamBut.place(x=200, y=10)
-
-StopCamBut = Button(tab6,  text="Stop Camera",  width=12, command = stop_vid)
-StopCamBut.place(x=315, y=10)
-
-CapImgBut = Button(
-  tab6,
-  text="Snap Image",
-  width=12,
-  command=request_vision_capture,
-)
-CapImgBut.place(x=10, y=50)
-
-TeachImgBut = Button(tab6,  text="Teach Object",  width=12, command = selectTemplate)
-TeachImgBut.place(x=140, y=50)
-
-FindVisBut = Button(tab6,  text="Snap & Find",  width=12, command = snapFind)
-FindVisBut.place(x=270, y=50)
-
-
-ZeroBrCnBut = Button(tab6, text="Zero",  width=5, command = zeroBrCn)
-ZeroBrCnBut.place(x=10, y=110)
-
-maskBut = Button(tab6, text="Mask",  width=5, command = selectMask)
-maskBut.place(x=10, y=150)
-
-
-
-
-
-
-
-VisZoomSlide = Scale(tab6, from_=50, to=1,  length=250, orient=HORIZONTAL)
-VisZoomSlide.bind("<ButtonRelease-1>", VisUpdateBriCon)
-VisZoomSlide.place(x=75, y=95)
-VisZoomSlide.set(50)
-
-VisZoomLab = Label(tab6, text = "Zoom")
-VisZoomLab.place(x=75, y=110)
-
-VisBrightSlide = Scale(tab6, from_=-127, to=127,  length=250, orient=HORIZONTAL)
-VisBrightSlide.bind("<ButtonRelease-1>", VisUpdateBriCon)
-VisBrightSlide.place(x=75, y=130)
-
-VisBrightLab = Label(tab6, text = "Brightness")
-VisBrightLab.place(x=75, y=145)
-
-VisContrastSlide = Scale(tab6, from_=-127, to=127,  length=250, orient=HORIZONTAL)
-VisContrastSlide.bind("<ButtonRelease-1>", VisUpdateBriCon)
-VisContrastSlide.place(x=75, y=165)
-
-VisContrastLab = Label(tab6, text = "Contrast")
-VisContrastLab.place(x=75, y=180)
-
-
-fullRotCbut = Checkbutton(tab6, text="Full Rotation Search",variable = RUN['fullRot'])
-fullRotCbut.place(x=900, y=255)
-
-pick180Cbut = Checkbutton(tab6, text="Pick Closest 180°",variable = RUN['pick180'])
-pick180Cbut.place(x=900, y=275)
-
-pickClosestCbut = Checkbutton(tab6, text="Try Closest When Out of Range",variable = RUN['pickClosest'])
-pickClosestCbut.place(x=900, y=295)
-
-
-
-
-
-saveCalBut = Button(tab6,  text="SAVE VISION DATA",  width=26, command = SaveAndApplyCalibration)
-saveCalBut.place(x=915, y=340)
-
-
-
-
-
-#### 6 ENTRY FIELDS##########################################################
-#############################################################################
-
-VisSelObjLab = Label(tab6, text = "Select Object")
-VisSelObjLab.place(x=390, y=82)
-
-VisBacColorEntryField = Entry(tab6,width=14,justify="center")
-VisBacColorEntryField.place(x=390, y=115)
-VisBacColorLab = Label(tab6, text = "Background Color")
-VisBacColorLab.place(x=390, y=135)
-
-bgAutoCbut = Checkbutton(tab6, command=checkAutoBG, text="Auto",variable = RUN['autoBG'])
-bgAutoCbut.place(x=490, y=116)
-
-VisScoreEntryField = Entry(tab6,width=12,justify="center")
-VisScoreEntryField.place(x=390, y=165)
-VisScoreLab = Label(tab6, text = "Score Threshold")
-VisScoreLab.place(x=390, y=185)
-
-
-
-
-VisRetScoreEntryField = Entry(tab6,width=12,justify="center")
-VisRetScoreEntryField.place(x=750, y=55)
-VisRetScoreLab = Label(tab6, text = "Scored Value")
-VisRetScoreLab.place(x=750, y=75)
-
-VisRetAngleEntryField = Entry(tab6,width=12,justify="center")
-VisRetAngleEntryField.place(x=750, y=105)
-VisRetAngleLab = Label(tab6, text = "Found Angle")
-VisRetAngleLab.place(x=750, y=125)
-
-VisRetXpixEntryField = Entry(tab6,width=12,justify="center")
-VisRetXpixEntryField.place(x=750, y=155)
-VisRetXpixLab = Label(tab6, text = "Pixel X Position")
-VisRetXpixLab.place(x=750, y=175)
-
-VisRetYpixEntryField = Entry(tab6,width=12,justify="center")
-VisRetYpixEntryField.place(x=750, y=205)
-VisRetYpixLab = Label(tab6, text = "Pixel Y Position")
-VisRetYpixLab.place(x=750, y=225)
-
-VisRetXrobEntryField = Entry(tab6,width=12,justify="center")
-VisRetXrobEntryField.place(x=750, y=255)
-VisRetXrobLab = Label(tab6, text = "Robot X Position")
-VisRetXrobLab.place(x=750, y=275)
-
-VisRetYrobEntryField = Entry(tab6,width=12,justify="center")
-VisRetYrobEntryField.place(x=750, y=305)
-VisRetYrobLab = Label(tab6, text = "Robot Y Position")
-VisRetYrobLab.place(x=750, y=325)
-
-
-
-
-
-
-
-VisX1PixEntryField = Entry(tab6,width=12,justify="center")
-VisX1PixEntryField.place(x=900, y=55)
-VisX1PixLab = Label(tab6, text = "X1 Pixel Pos")
-VisX1PixLab.place(x=900, y=75)
-
-VisY1PixEntryField = Entry(tab6,width=12,justify="center")
-VisY1PixEntryField.place(x=900, y=105)
-VisY1PixLab = Label(tab6, text = "Y1 Pixel Pos")
-VisY1PixLab.place(x=900, y=125)
-
-VisX2PixEntryField = Entry(tab6,width=12,justify="center")
-VisX2PixEntryField.place(x=900, y=155)
-VisX2PixLab = Label(tab6, text = "X2 Pixel Pos")
-VisX2PixLab.place(x=900, y=175)
-
-VisY2PixEntryField = Entry(tab6,width=12,justify="center")
-VisY2PixEntryField.place(x=900, y=205)
-VisY2PixLab = Label(tab6, text = "Y2 Pixel Pos")
-VisY2PixLab.place(x=900, y=225)
-
-
-VisX1RobEntryField = Entry(tab6,width=12,justify="center")
-VisX1RobEntryField.place(x=1010, y=55)
-VisX1RobLab = Label(tab6, text = "X1 Robot Pos")
-VisX1RobLab.place(x=1010, y=75)
-
-VisY1RobEntryField = Entry(tab6,width=12,justify="center")
-VisY1RobEntryField.place(x=1010, y=105)
-VisY1RobLab = Label(tab6, text = "Y1 Robot Pos")
-VisY1RobLab.place(x=1010, y=125)
-
-VisX2RobEntryField = Entry(tab6,width=12,justify="center")
-VisX2RobEntryField.place(x=1010, y=155)
-VisX2RobLab = Label(tab6, text = "X2 Robot Pos")
-VisX2RobLab.place(x=1010, y=175)
-
-VisY2RobEntryField = Entry(tab6,width=12,justify="center")
-VisY2RobEntryField.place(x=1010, y=205)
-VisY2RobLab = Label(tab6, text = "Y2 Robot Pos")
-VisY2RobLab.place(x=1010, y=225)
-
-
-
-
-
-####################################################################################################################################################
-####################################################################################################################################################
-####################################################################################################################################################
-####TAB 7
-
-GcodeProgEntryField = Entry(
-  tab7,
-  width=60,
-  justify="center",
-  state="readonly",
-)
-GcodeProgEntryField.place(x=20, y=55)
-
-GcodCurRowEntryField = Entry(tab7,width=10,justify="center")
-GcodCurRowEntryField.place(x=1175, y=20)
-
-GC_ST_E1_EntryField = Entry(tab7,width=5,justify="center")
-GC_ST_E1_EntryField.place(x=20, y=140)
-
-GC_ST_E2_EntryField = Entry(tab7,width=5,justify="center")
-GC_ST_E2_EntryField.place(x=75, y=140)
-
-GC_ST_E3_EntryField = Entry(tab7,width=5,justify="center")
-GC_ST_E3_EntryField.place(x=130, y=140)
-
-GC_ST_E4_EntryField = Entry(tab7,width=5,justify="center")
-GC_ST_E4_EntryField.place(x=185, y=140)
-
-GC_ST_E5_EntryField = Entry(tab7,width=5,justify="center")
-GC_ST_E5_EntryField.place(x=240, y=140)
-
-GC_ST_E6_EntryField = Entry(tab7,width=5,justify="center")
-GC_ST_E6_EntryField.place(x=295, y=140)
-
-GC_ST_WC_EntryField = Entry(tab7,width=3,justify="center")
-GC_ST_WC_EntryField.place(x=350, y=140)
-
-
-GC_SToff_E1_EntryField = Entry(tab7,width=5,justify="center")
-GC_SToff_E1_EntryField.place(x=20, y=205)
-
-GC_SToff_E2_EntryField = Entry(tab7,width=5,justify="center")
-GC_SToff_E2_EntryField.place(x=75, y=205)
-
-GC_SToff_E3_EntryField = Entry(tab7,width=5,justify="center")
-GC_SToff_E3_EntryField.place(x=130, y=205)
-
-GC_SToff_E4_EntryField = Entry(tab7,width=5,justify="center")
-GC_SToff_E4_EntryField.place(x=185, y=205)
-
-GC_SToff_E5_EntryField = Entry(tab7,width=5,justify="center")
-GC_SToff_E5_EntryField.place(x=240, y=205)
-
-GC_SToff_E6_EntryField = Entry(tab7,width=5,justify="center")
-GC_SToff_E6_EntryField.place(x=295, y=205)
-
-GcodeFilenameField = Entry(tab7,width=40,justify="center")
-GcodeFilenameField.place(x=20, y=340)
-
-
-GCalmStatusLab = Label(tab7, text = "GCODE IDLE", style="OK.TLabel")
-GCalmStatusLab.place(x=400, y=20)
-
-
-gcodeframe=Frame(tab7)
-gcodeframe.place(x=400,y=53)
-gcodescrollbar = Scrollbar(gcodeframe) 
-gcodescrollbar.pack(side=RIGHT, fill=Y)
-tab7.gcodeView = Listbox(gcodeframe,exportselection=0,width=105,height=43, yscrollcommand=gcodescrollbar.set)
-tab7.gcodeView.pack()
-gcodescrollbar.config(command=tab7.gcodeView.yview)
-
-def GCcallback(event):
-    try:
-      selection = event.widget.curselection()
-      if not selection:
-        _set_gcode_current_row("---")
-        return False
-      index = selection[0]
-      _set_gcode_current_row(str(index))
-    except Exception as exc:
-      logger.error("Unable to select G-code row: %s", exc)
-      return False
-    try:
-      filename = _gcode_storage_selection_name(
-        event.widget.get(index)
-      )
-    except MotionInputError:
-      return True
-    except Exception as exc:
-      logger.error("Unable to select G-code storage file: %s", exc)
-      return False
-    GcodeFilenameField.delete(0, 'end')
-    GcodeFilenameField.insert(0, filename)
-    PlayGCEntryField.delete(0, 'end')
-    PlayGCEntryField.insert(0, filename)
-    return True
-      
-tab7.gcodeView.bind("<<ListboxSelect>>", GCcallback)
-
-
-LoadGcodeBut = Button(tab7,  text="Load Program", width=25, command = loadGcodeProg)
-LoadGcodeBut.place(x=20, y=20)
-
-GcodeStartPosBut = Button(tab7,  text="Set Start Position", width=25, command = SetGcodeStartPos)
-GcodeStartPosBut.place(x=20, y=100)
-
-GcodeMoveStartPosBut = Button(tab7,  text="Move to Start Offset", width=25, command = MoveGcodeStartPos)
-GcodeMoveStartPosBut.place(x=20, y=240)
-
-runGcodeBut = Button(tab7, text="Convert & Upload to SD", width=25,   command = GCconvertProg)
-#playGPhoto=PhotoImage(file="play-icon.gif")
-#runGcodeBut.config(image=playGPhoto)
-runGcodeBut.place(x=20, y=375)
-
-stopGcodeBut = Button(tab7, text="Stop Conversion & Upload", width=25,  command = GCstopProg)
-#stopGPhoto=PhotoImage(file="stop-icon.gif")
-#stopGcodeBut.config(image=stopGPhoto)
-stopGcodeBut.place(x=190, y=375)
-
-delGcodeBut = Button(tab7, text="Delete File from SD", width=25,   command = GCdelete)
-delGcodeBut.place(x=20, y=415)
-
-readGcodeBut = Button(tab7, text="Read Files from SD", width=25,   command = partial(GCread, "yes"))
-readGcodeBut.place(x=20, y=455)
-
-playGPhoto=PhotoImage(file="play-icon.png")
-readGcodeBut = Button(tab7, text="Play Gcode File", width=20,   command = GCplay, image = playGPhoto, compound=LEFT)
-readGcodeBut.place(x=20, y=495)
-
-#revGcodeBut = Button(tab7,  text="REV ",  command = stepRev)
-#revGcodeBut.place(x=180, y=290)
-
-#fwdGcodeBut = Button(tab7,  text="FWD", command = GCstepFwd)
-#fwdGcodeBut.place(x=230, y=290)
-
-saveGCBut = Button(tab7,  text="SAVE DATA",  width=26, command = SaveAndApplyCalibration)
-saveGCBut.place(x=20, y=600)
-
-
-
-
-
-
-
-
-
-
-
-gcodeCurRowLab = Label(tab7, text = "Current Row: ")
-gcodeCurRowLab.place(x=1100, y=21)
-
-gcodeStartPosOFfLab = Label(tab7, text = "Start Position Offset")
-gcodeStartPosOFfLab.place(x=20, y=180)
-
-gcodeFilenameLab = Label(tab7, text = "Filename:")
-gcodeFilenameLab.place(x=20, y=320)
-
-
-
-
-
-
-
-####################################################################################################################################################
-####################################################################################################################################################
-####################################################################################################################################################
-####TAB 8
-
-Elogframe=Frame(tab8)
-Elogframe.place(x=40,y=15)
-scrollbar = Scrollbar(Elogframe) 
-scrollbar.pack(side=RIGHT, fill=Y)
-tab8.ElogView = Listbox(Elogframe,width=230,height=40, yscrollcommand=scrollbar.set)
-try:
-  Elog = pickle.load(open("ErrorLog","rb"))
-except:
-  Elog = ['##BEGINNING OF LOG##']
-  pickle.dump(Elog,open("ErrorLog","wb"))
-time.sleep(.1)
-for item in Elog:
-  tab8.ElogView.insert(END,item) 
-tab8.ElogView.pack()
-scrollbar.config(command=tab8.ElogView.yview)
-
-def clearLog():
- tab8.ElogView.delete(1,END)
- value=tab8.ElogView.get(0,END)
- pickle.dump(value,open("ErrorLog","wb"))
-
-clearLogBut = Button(tab8,  text="Clear Log",  width=26, command = clearLog)
-clearLogBut.place(x=40, y=690)
-
-
-
-
-####################################################################################################################################################
-####################################################################################################################################################
-####################################################################################################################################################
-####TAB 9
-
-link = Label(tab9, font='12', text="https://www.anninrobotics.com/tutorials",  cursor="hand2")
-link.bind("<Button-1>", lambda event: webbrowser.open(link.cget("text")))
-link.place(x=10, y=9)
-
-def callback():
-    webbrowser.open_new(r"https://www.paypal.me/ChrisAnnin")
-
-donateBut = Button(tab9,  command = callback)
-donatePhoto=PhotoImage(file="pp.gif")
-donateBut.config(image=donatePhoto)
-donateBut.place(x=1250, y=2)
-
-
-scroll = Scrollbar(tab9)
-scroll.pack(side=RIGHT, fill=Y)
-configfile = Text(tab9, wrap=WORD, width=166, height=40, yscrollcommand=scroll.set)
-filename='information.txt'
-with open(filename, 'r', encoding='utf-8-sig') as file:
-  configfile.insert(INSERT, file.read())
-configfile.pack(side="left")
-scroll.config(command=configfile.yview)
-configfile.place(x=10, y=40)
-
-
-
-
-
-
-##############################################################################################################################################################
-### OPEN CAL FILE AND LOAD LIST ##############################################################################################################################
-##############################################################################################################################################################
-
-
-loaded_calibration = _load_startup_calibration()
-apply_calibration(loaded_calibration, CAL)
-
-logger.debug(f"Comport 1 restored value is: {CAL['comPort']}")
-logger.debug(f"Comport 1 restored value is: {CAL['com2Port']}")
-
-saved_main_port, saved_auxiliary_port = _startup_port_selector_values(CAL)
-com1SelectedValue.set(saved_main_port)
-com2SelectedValue.set(saved_auxiliary_port)
-
-try:
-  restored_auxiliary_board = normalize_auxiliary_board_profile(
-    CAL.get('auxiliaryBoard', AUXILIARY_BOARD_NONE),
-    allow_none=True,
+  CapImgBut = Button(
+    tab6,
+    text="Snap Image",
+    width=12,
+    command=request_vision_capture,
   )
-except MotionInputError as exc:
-  logger.error("Invalid saved auxiliary-board profile: %s", exc)
-  restored_auxiliary_board = None
-CAL['auxiliaryBoard'] = restored_auxiliary_board or AUXILIARY_BOARD_NONE
-auxiliaryBoardSelectedValue.set(CAL['auxiliaryBoard'])
+  CapImgBut.place(x=10, y=50)
+
+  TeachImgBut = Button(tab6,  text="Teach Object",  width=12, command = selectTemplate)
+  TeachImgBut.place(x=140, y=50)
+
+  FindVisBut = Button(tab6,  text="Snap & Find",  width=12, command = snapFind)
+  FindVisBut.place(x=270, y=50)
 
 
-incrementEntryField.insert(0,"10")
-speedEntryField.insert(0,"25")
-ACCspeedField.insert(0,"15")
-DECspeedField.insert(0,"15")
-ACCrampField.insert(0,"80")
-roundEntryField.insert(0,"0")
-#ProgEntryField.insert(0,(Prog))
-SavePosEntryField.insert(0,"1")
-R1EntryField.insert(0,"0")
-R2EntryField.insert(0,"0")
-R3EntryField.insert(0,"0")
-R4EntryField.insert(0,"0")
-R5EntryField.insert(0,"0")
-R6EntryField.insert(0,"0")
-R7EntryField.insert(0,"0")
-R8EntryField.insert(0,"0")
-R9EntryField.insert(0,"0")
-R10EntryField.insert(0,"0")
-R11EntryField.insert(0,"0")
-R12EntryField.insert(0,"0")
-R13EntryField.insert(0,"0")
-R14EntryField.insert(0,"0")
-R15EntryField.insert(0,"0")
-R16EntryField.insert(0,"0")
-SP_1_E1_EntryField.insert(0,"0")
-SP_2_E1_EntryField.insert(0,"0")
-SP_3_E1_EntryField.insert(0,"0")
-SP_4_E1_EntryField.insert(0,"0")
-SP_5_E1_EntryField.insert(0,"0")
-SP_6_E1_EntryField.insert(0,"0")
-SP_7_E1_EntryField.insert(0,"0")
-SP_8_E1_EntryField.insert(0,"0")
-SP_9_E1_EntryField.insert(0,"0")
-SP_10_E1_EntryField.insert(0,"0")
-SP_11_E1_EntryField.insert(0,"0")
-SP_12_E1_EntryField.insert(0,"0")
-SP_13_E1_EntryField.insert(0,"0")
-SP_14_E1_EntryField.insert(0,"0")
-SP_15_E1_EntryField.insert(0,"0")
-SP_16_E1_EntryField.insert(0,"0")
-SP_1_E2_EntryField.insert(0,"0")
-SP_2_E2_EntryField.insert(0,"0")
-SP_3_E2_EntryField.insert(0,"0")
-SP_4_E2_EntryField.insert(0,"0")
-SP_5_E2_EntryField.insert(0,"0")
-SP_6_E2_EntryField.insert(0,"0")
-SP_7_E2_EntryField.insert(0,"0")
-SP_8_E2_EntryField.insert(0,"0")
-SP_9_E2_EntryField.insert(0,"0")
-SP_10_E2_EntryField.insert(0,"0")
-SP_11_E2_EntryField.insert(0,"0")
-SP_12_E2_EntryField.insert(0,"0")
-SP_13_E2_EntryField.insert(0,"0")
-SP_14_E2_EntryField.insert(0,"0")
-SP_15_E2_EntryField.insert(0,"0")
-SP_16_E2_EntryField.insert(0,"0")
-SP_1_E3_EntryField.insert(0,"0")
-SP_2_E3_EntryField.insert(0,"0")
-SP_3_E3_EntryField.insert(0,"0")
-SP_4_E3_EntryField.insert(0,"0")
-SP_5_E3_EntryField.insert(0,"0")
-SP_6_E3_EntryField.insert(0,"0")
-SP_7_E3_EntryField.insert(0,"0")
-SP_8_E3_EntryField.insert(0,"0")
-SP_9_E3_EntryField.insert(0,"0")
-SP_10_E3_EntryField.insert(0,"0")
-SP_11_E3_EntryField.insert(0,"0")
-SP_12_E3_EntryField.insert(0,"0")
-SP_13_E3_EntryField.insert(0,"0")
-SP_14_E3_EntryField.insert(0,"0")
-SP_15_E3_EntryField.insert(0,"0")
-SP_16_E3_EntryField.insert(0,"0")
-SP_1_E4_EntryField.insert(0,"0")
-SP_2_E4_EntryField.insert(0,"0")
-SP_3_E4_EntryField.insert(0,"0")
-SP_4_E4_EntryField.insert(0,"0")
-SP_5_E4_EntryField.insert(0,"0")
-SP_6_E4_EntryField.insert(0,"0")
-SP_7_E4_EntryField.insert(0,"0")
-SP_8_E4_EntryField.insert(0,"0")
-SP_9_E4_EntryField.insert(0,"0")
-SP_10_E4_EntryField.insert(0,"0")
-SP_11_E4_EntryField.insert(0,"0")
-SP_12_E4_EntryField.insert(0,"0")
-SP_13_E4_EntryField.insert(0,"0")
-SP_14_E4_EntryField.insert(0,"0")
-SP_15_E4_EntryField.insert(0,"0")
-SP_16_E4_EntryField.insert(0,"0")
-SP_1_E5_EntryField.insert(0,"0")
-SP_2_E5_EntryField.insert(0,"0")
-SP_3_E5_EntryField.insert(0,"0")
-SP_4_E5_EntryField.insert(0,"0")
-SP_5_E5_EntryField.insert(0,"0")
-SP_6_E5_EntryField.insert(0,"0")
-SP_7_E5_EntryField.insert(0,"0")
-SP_8_E5_EntryField.insert(0,"0")
-SP_9_E5_EntryField.insert(0,"0")
-SP_10_E5_EntryField.insert(0,"0")
-SP_11_E5_EntryField.insert(0,"0")
-SP_12_E5_EntryField.insert(0,"0")
-SP_13_E5_EntryField.insert(0,"0")
-SP_14_E5_EntryField.insert(0,"0")
-SP_15_E5_EntryField.insert(0,"0")
-SP_16_E5_EntryField.insert(0,"0")
-SP_1_E6_EntryField.insert(0,"0")
-SP_2_E6_EntryField.insert(0,"0")
-SP_3_E6_EntryField.insert(0,"0")
-SP_4_E6_EntryField.insert(0,"0")
-SP_5_E6_EntryField.insert(0,"0")
-SP_6_E6_EntryField.insert(0,"0")
-SP_7_E6_EntryField.insert(0,"0")
-SP_8_E6_EntryField.insert(0,"0")
-SP_9_E6_EntryField.insert(0,"0")
-SP_10_E6_EntryField.insert(0,"0")
-SP_11_E6_EntryField.insert(0,"0")
-SP_12_E6_EntryField.insert(0,"0")
-SP_13_E6_EntryField.insert(0,"0")
-SP_14_E6_EntryField.insert(0,"0")
-SP_15_E6_EntryField.insert(0,"0")
-SP_16_E6_EntryField.insert(0,"0")
-servo0onEntryField.insert(0,str(CAL['Servo0on']))
-servo0offEntryField.insert(0,str(CAL['Servo0off']))
-servo1onEntryField.insert(0,str(CAL['Servo1on']))
-servo1offEntryField.insert(0,str(CAL['Servo1off']))
-servo2onEntryField.insert(0,str(CAL.get('Servo2on', '')))
-servo2offEntryField.insert(0,str(CAL.get('Servo2off', '')))
-servo3onEntryField.insert(0,str(CAL.get('Servo3on', '')))
-servo3offEntryField.insert(0,str(CAL.get('Servo3off', '')))
-DO1onEntryField.insert(0,str(CAL['DO1on']))
-DO1offEntryField.insert(0,str(CAL['DO1off']))
-DO2onEntryField.insert(0,str(CAL['DO2on']))
-DO2offEntryField.insert(0,str(CAL['DO2off']))
-DO3onEntryField.insert(0,str(CAL.get('DO3on', '')))
-DO3offEntryField.insert(0,str(CAL.get('DO3off', '')))
-DO4onEntryField.insert(0,str(CAL.get('DO4on', '')))
-DO4offEntryField.insert(0,str(CAL.get('DO4off', '')))
-DO5onEntryField.insert(0,str(CAL.get('DO5on', '')))
-DO5offEntryField.insert(0,str(CAL.get('DO5off', '')))
-DO6onEntryField.insert(0,str(CAL.get('DO6on', '')))
-DO6offEntryField.insert(0,str(CAL.get('DO6off', '')))
-TFxEntryField.insert(0,str(CAL['TFx']))
-TFyEntryField.insert(0,str(CAL['TFy']))
-TFzEntryField.insert(0,str(CAL['TFz']))
-TFrxEntryField.insert(0,str(CAL['TFrx']))
-TFryEntryField.insert(0,str(CAL['TFry']))
-TFrzEntryField.insert(0,str(CAL['TFrz']))
-J7curAngEntryField.insert(0,str(CAL['J7PosCur']))
-J8curAngEntryField.insert(0,str(CAL['J8PosCur']))
-J9curAngEntryField.insert(0,str(CAL['J9PosCur']))
-J1calOffEntryField.insert(0,str(CAL['J1calOff']))
-J2calOffEntryField.insert(0,str(CAL['J2calOff']))
-J3calOffEntryField.insert(0,str(CAL['J3calOff']))
-J4calOffEntryField.insert(0,str(CAL['J4calOff']))
-J5calOffEntryField.insert(0,str(CAL['J5calOff']))
-J6calOffEntryField.insert(0,str(CAL['J6calOff']))
-J7calOffEntryField.insert(0,str(CAL['J7calOff']))
-J8calOffEntryField.insert(0,str(CAL['J8calOff']))
-J9calOffEntryField.insert(0,str(CAL['J9calOff']))
+  ZeroBrCnBut = Button(tab6, text="Zero",  width=5, command = zeroBrCn)
+  ZeroBrCnBut.place(x=10, y=110)
 
-if (CAL['curTheme'] == 1): 
-  lightTheme()
-else:
-  darkTheme()
-'''
+  maskBut = Button(tab6, text="Mask",  width=5, command = selectMask)
+  maskBut.place(x=10, y=150)
+
+
+
+
+
+
+
+  VisZoomSlide = Scale(tab6, from_=50, to=1,  length=250, orient=HORIZONTAL)
+  VisZoomSlide.bind("<ButtonRelease-1>", VisUpdateBriCon)
+  VisZoomSlide.place(x=75, y=95)
+  VisZoomSlide.set(50)
+
+  VisZoomLab = Label(tab6, text = "Zoom")
+  VisZoomLab.place(x=75, y=110)
+
+  VisBrightSlide = Scale(tab6, from_=-127, to=127,  length=250, orient=HORIZONTAL)
+  VisBrightSlide.bind("<ButtonRelease-1>", VisUpdateBriCon)
+  VisBrightSlide.place(x=75, y=130)
+
+  VisBrightLab = Label(tab6, text = "Brightness")
+  VisBrightLab.place(x=75, y=145)
+
+  VisContrastSlide = Scale(tab6, from_=-127, to=127,  length=250, orient=HORIZONTAL)
+  VisContrastSlide.bind("<ButtonRelease-1>", VisUpdateBriCon)
+  VisContrastSlide.place(x=75, y=165)
+
+  VisContrastLab = Label(tab6, text = "Contrast")
+  VisContrastLab.place(x=75, y=180)
+
+
+  fullRotCbut = Checkbutton(tab6, text="Full Rotation Search",variable = RUN['fullRot'])
+  fullRotCbut.place(x=900, y=255)
+
+  pick180Cbut = Checkbutton(tab6, text="Pick Closest 180°",variable = RUN['pick180'])
+  pick180Cbut.place(x=900, y=275)
+
+  pickClosestCbut = Checkbutton(tab6, text="Try Closest When Out of Range",variable = RUN['pickClosest'])
+  pickClosestCbut.place(x=900, y=295)
+
+
+
+
+
+  saveCalBut = Button(tab6,  text="SAVE VISION DATA",  width=26, command = SaveAndApplyCalibration)
+  saveCalBut.place(x=915, y=340)
+
+
+
+
+
+  #### 6 ENTRY FIELDS##########################################################
+  #############################################################################
+
+  VisSelObjLab = Label(tab6, text = "Select Object")
+  VisSelObjLab.place(x=390, y=82)
+
+  VisBacColorEntryField = Entry(tab6,width=14,justify="center")
+  VisBacColorEntryField.place(x=390, y=115)
+  VisBacColorLab = Label(tab6, text = "Background Color")
+  VisBacColorLab.place(x=390, y=135)
+
+  bgAutoCbut = Checkbutton(tab6, command=checkAutoBG, text="Auto",variable = RUN['autoBG'])
+  bgAutoCbut.place(x=490, y=116)
+
+  VisScoreEntryField = Entry(tab6,width=12,justify="center")
+  VisScoreEntryField.place(x=390, y=165)
+  VisScoreLab = Label(tab6, text = "Score Threshold")
+  VisScoreLab.place(x=390, y=185)
+
+
+
+
+  VisRetScoreEntryField = Entry(tab6,width=12,justify="center")
+  VisRetScoreEntryField.place(x=750, y=55)
+  VisRetScoreLab = Label(tab6, text = "Scored Value")
+  VisRetScoreLab.place(x=750, y=75)
+
+  VisRetAngleEntryField = Entry(tab6,width=12,justify="center")
+  VisRetAngleEntryField.place(x=750, y=105)
+  VisRetAngleLab = Label(tab6, text = "Found Angle")
+  VisRetAngleLab.place(x=750, y=125)
+
+  VisRetXpixEntryField = Entry(tab6,width=12,justify="center")
+  VisRetXpixEntryField.place(x=750, y=155)
+  VisRetXpixLab = Label(tab6, text = "Pixel X Position")
+  VisRetXpixLab.place(x=750, y=175)
+
+  VisRetYpixEntryField = Entry(tab6,width=12,justify="center")
+  VisRetYpixEntryField.place(x=750, y=205)
+  VisRetYpixLab = Label(tab6, text = "Pixel Y Position")
+  VisRetYpixLab.place(x=750, y=225)
+
+  VisRetXrobEntryField = Entry(tab6,width=12,justify="center")
+  VisRetXrobEntryField.place(x=750, y=255)
+  VisRetXrobLab = Label(tab6, text = "Robot X Position")
+  VisRetXrobLab.place(x=750, y=275)
+
+  VisRetYrobEntryField = Entry(tab6,width=12,justify="center")
+  VisRetYrobEntryField.place(x=750, y=305)
+  VisRetYrobLab = Label(tab6, text = "Robot Y Position")
+  VisRetYrobLab.place(x=750, y=325)
+
+
+
+
+
+
+
+  VisX1PixEntryField = Entry(tab6,width=12,justify="center")
+  VisX1PixEntryField.place(x=900, y=55)
+  VisX1PixLab = Label(tab6, text = "X1 Pixel Pos")
+  VisX1PixLab.place(x=900, y=75)
+
+  VisY1PixEntryField = Entry(tab6,width=12,justify="center")
+  VisY1PixEntryField.place(x=900, y=105)
+  VisY1PixLab = Label(tab6, text = "Y1 Pixel Pos")
+  VisY1PixLab.place(x=900, y=125)
+
+  VisX2PixEntryField = Entry(tab6,width=12,justify="center")
+  VisX2PixEntryField.place(x=900, y=155)
+  VisX2PixLab = Label(tab6, text = "X2 Pixel Pos")
+  VisX2PixLab.place(x=900, y=175)
+
+  VisY2PixEntryField = Entry(tab6,width=12,justify="center")
+  VisY2PixEntryField.place(x=900, y=205)
+  VisY2PixLab = Label(tab6, text = "Y2 Pixel Pos")
+  VisY2PixLab.place(x=900, y=225)
+
+
+  VisX1RobEntryField = Entry(tab6,width=12,justify="center")
+  VisX1RobEntryField.place(x=1010, y=55)
+  VisX1RobLab = Label(tab6, text = "X1 Robot Pos")
+  VisX1RobLab.place(x=1010, y=75)
+
+  VisY1RobEntryField = Entry(tab6,width=12,justify="center")
+  VisY1RobEntryField.place(x=1010, y=105)
+  VisY1RobLab = Label(tab6, text = "Y1 Robot Pos")
+  VisY1RobLab.place(x=1010, y=125)
+
+  VisX2RobEntryField = Entry(tab6,width=12,justify="center")
+  VisX2RobEntryField.place(x=1010, y=155)
+  VisX2RobLab = Label(tab6, text = "X2 Robot Pos")
+  VisX2RobLab.place(x=1010, y=175)
+
+  VisY2RobEntryField = Entry(tab6,width=12,justify="center")
+  VisY2RobEntryField.place(x=1010, y=205)
+  VisY2RobLab = Label(tab6, text = "Y2 Robot Pos")
+  VisY2RobLab.place(x=1010, y=225)
+
+
+
+
+
+  ####################################################################################################################################################
+  ####################################################################################################################################################
+  ####################################################################################################################################################
+  ####TAB 7
+
+  GcodeProgEntryField = Entry(
+    tab7,
+    width=60,
+    justify="center",
+    state="readonly",
+  )
+  GcodeProgEntryField.place(x=20, y=55)
+
+  GcodCurRowEntryField = Entry(tab7,width=10,justify="center")
+  GcodCurRowEntryField.place(x=1175, y=20)
+
+  GC_ST_E1_EntryField = Entry(tab7,width=5,justify="center")
+  GC_ST_E1_EntryField.place(x=20, y=140)
+
+  GC_ST_E2_EntryField = Entry(tab7,width=5,justify="center")
+  GC_ST_E2_EntryField.place(x=75, y=140)
+
+  GC_ST_E3_EntryField = Entry(tab7,width=5,justify="center")
+  GC_ST_E3_EntryField.place(x=130, y=140)
+
+  GC_ST_E4_EntryField = Entry(tab7,width=5,justify="center")
+  GC_ST_E4_EntryField.place(x=185, y=140)
+
+  GC_ST_E5_EntryField = Entry(tab7,width=5,justify="center")
+  GC_ST_E5_EntryField.place(x=240, y=140)
+
+  GC_ST_E6_EntryField = Entry(tab7,width=5,justify="center")
+  GC_ST_E6_EntryField.place(x=295, y=140)
+
+  GC_ST_WC_EntryField = Entry(tab7,width=3,justify="center")
+  GC_ST_WC_EntryField.place(x=350, y=140)
+
+
+  GC_SToff_E1_EntryField = Entry(tab7,width=5,justify="center")
+  GC_SToff_E1_EntryField.place(x=20, y=205)
+
+  GC_SToff_E2_EntryField = Entry(tab7,width=5,justify="center")
+  GC_SToff_E2_EntryField.place(x=75, y=205)
+
+  GC_SToff_E3_EntryField = Entry(tab7,width=5,justify="center")
+  GC_SToff_E3_EntryField.place(x=130, y=205)
+
+  GC_SToff_E4_EntryField = Entry(tab7,width=5,justify="center")
+  GC_SToff_E4_EntryField.place(x=185, y=205)
+
+  GC_SToff_E5_EntryField = Entry(tab7,width=5,justify="center")
+  GC_SToff_E5_EntryField.place(x=240, y=205)
+
+  GC_SToff_E6_EntryField = Entry(tab7,width=5,justify="center")
+  GC_SToff_E6_EntryField.place(x=295, y=205)
+
+  GcodeFilenameField = Entry(tab7,width=40,justify="center")
+  GcodeFilenameField.place(x=20, y=340)
+
+
+  GCalmStatusLab = Label(tab7, text = "GCODE IDLE", style="OK.TLabel")
+  GCalmStatusLab.place(x=400, y=20)
+
+
+  gcodeframe=Frame(tab7)
+  gcodeframe.place(x=400,y=53)
+  gcodescrollbar = Scrollbar(gcodeframe)
+  gcodescrollbar.pack(side=RIGHT, fill=Y)
+  tab7.gcodeView = Listbox(gcodeframe,exportselection=0,width=105,height=43, yscrollcommand=gcodescrollbar.set)
+  tab7.gcodeView.pack()
+  gcodescrollbar.config(command=tab7.gcodeView.yview)
+
+  def GCcallback(event):
+      try:
+        selection = event.widget.curselection()
+        if not selection:
+          _set_gcode_current_row("---")
+          return False
+        index = selection[0]
+        _set_gcode_current_row(str(index))
+      except Exception as exc:
+        logger.error("Unable to select G-code row: %s", exc)
+        return False
+      try:
+        filename = _gcode_storage_selection_name(
+          event.widget.get(index)
+        )
+      except MotionInputError:
+        return True
+      except Exception as exc:
+        logger.error("Unable to select G-code storage file: %s", exc)
+        return False
+      GcodeFilenameField.delete(0, 'end')
+      GcodeFilenameField.insert(0, filename)
+      PlayGCEntryField.delete(0, 'end')
+      PlayGCEntryField.insert(0, filename)
+      return True
+      
+  tab7.gcodeView.bind("<<ListboxSelect>>", GCcallback)
+
+
+  LoadGcodeBut = Button(tab7,  text="Load Program", width=25, command = loadGcodeProg)
+  LoadGcodeBut.place(x=20, y=20)
+
+  GcodeStartPosBut = Button(tab7,  text="Set Start Position", width=25, command = SetGcodeStartPos)
+  GcodeStartPosBut.place(x=20, y=100)
+
+  GcodeMoveStartPosBut = Button(tab7,  text="Move to Start Offset", width=25, command = MoveGcodeStartPos)
+  GcodeMoveStartPosBut.place(x=20, y=240)
+
+  runGcodeBut = Button(tab7, text="Convert & Upload to SD", width=25,   command = GCconvertProg)
+  #playGPhoto=PhotoImage(file="play-icon.gif")
+  #runGcodeBut.config(image=playGPhoto)
+  runGcodeBut.place(x=20, y=375)
+
+  stopGcodeBut = Button(tab7, text="Stop Conversion & Upload", width=25,  command = GCstopProg)
+  #stopGPhoto=PhotoImage(file="stop-icon.gif")
+  #stopGcodeBut.config(image=stopGPhoto)
+  stopGcodeBut.place(x=190, y=375)
+
+  delGcodeBut = Button(tab7, text="Delete File from SD", width=25,   command = GCdelete)
+  delGcodeBut.place(x=20, y=415)
+
+  readGcodeBut = Button(tab7, text="Read Files from SD", width=25,   command = partial(GCread, "yes"))
+  readGcodeBut.place(x=20, y=455)
+
+  playGPhoto=PhotoImage(file="play-icon.png")
+  readGcodeBut = Button(tab7, text="Play Gcode File", width=20,   command = GCplay, image = playGPhoto, compound=LEFT)
+  readGcodeBut.place(x=20, y=495)
+
+  #revGcodeBut = Button(tab7,  text="REV ",  command = stepRev)
+  #revGcodeBut.place(x=180, y=290)
+
+  #fwdGcodeBut = Button(tab7,  text="FWD", command = GCstepFwd)
+  #fwdGcodeBut.place(x=230, y=290)
+
+  saveGCBut = Button(tab7,  text="SAVE DATA",  width=26, command = SaveAndApplyCalibration)
+  saveGCBut.place(x=20, y=600)
+
+
+
+
+
+
+
+
+
+
+
+  gcodeCurRowLab = Label(tab7, text = "Current Row: ")
+  gcodeCurRowLab.place(x=1100, y=21)
+
+  gcodeStartPosOFfLab = Label(tab7, text = "Start Position Offset")
+  gcodeStartPosOFfLab.place(x=20, y=180)
+
+  gcodeFilenameLab = Label(tab7, text = "Filename:")
+  gcodeFilenameLab.place(x=20, y=320)
+
+
+
+
+
+
+
+  ####################################################################################################################################################
+  ####################################################################################################################################################
+  ####################################################################################################################################################
+  ####TAB 8
+
+  Elogframe=Frame(tab8)
+  Elogframe.place(x=40,y=15)
+  scrollbar = Scrollbar(Elogframe)
+  scrollbar.pack(side=RIGHT, fill=Y)
+  tab8.ElogView = Listbox(Elogframe,width=230,height=40, yscrollcommand=scrollbar.set)
+  try:
+    Elog = pickle.load(open("ErrorLog","rb"))
+  except:
+    Elog = ['##BEGINNING OF LOG##']
+    pickle.dump(Elog,open("ErrorLog","wb"))
+  time.sleep(.1)
+  for item in Elog:
+    tab8.ElogView.insert(END,item)
+  tab8.ElogView.pack()
+  scrollbar.config(command=tab8.ElogView.yview)
+
+  def clearLog():
+   tab8.ElogView.delete(1,END)
+   value=tab8.ElogView.get(0,END)
+   pickle.dump(value,open("ErrorLog","wb"))
+
+  clearLogBut = Button(tab8,  text="Clear Log",  width=26, command = clearLog)
+  clearLogBut.place(x=40, y=690)
+
+
+
+
+  ####################################################################################################################################################
+  ####################################################################################################################################################
+  ####################################################################################################################################################
+  ####TAB 9
+
+  link = Label(tab9, font='12', text="https://www.anninrobotics.com/tutorials",  cursor="hand2")
+  link.bind("<Button-1>", lambda event: webbrowser.open(link.cget("text")))
+  link.place(x=10, y=9)
+
+  def callback():
+      webbrowser.open_new(r"https://www.paypal.me/ChrisAnnin")
+
+  donateBut = Button(tab9,  command = callback)
+  donatePhoto=PhotoImage(file="pp.gif")
+  donateBut.config(image=donatePhoto)
+  donateBut.place(x=1250, y=2)
+
+
+  scroll = Scrollbar(tab9)
+  scroll.pack(side=RIGHT, fill=Y)
+  configfile = Text(tab9, wrap=WORD, width=166, height=40, yscrollcommand=scroll.set)
+  filename='information.txt'
+  with open(filename, 'r', encoding='utf-8-sig') as file:
+    configfile.insert(INSERT, file.read())
+  configfile.pack(side="left")
+  scroll.config(command=configfile.yview)
+  configfile.place(x=10, y=40)
+
+
+
+
+
+
+  ##############################################################################################################################################################
+  ### OPEN CAL FILE AND LOAD LIST ##############################################################################################################################
+  ##############################################################################################################################################################
+
+
+  loaded_calibration = _load_startup_calibration()
+  apply_calibration(loaded_calibration, CAL)
+
+  logger.debug(f"Comport 1 restored value is: {CAL['comPort']}")
+  logger.debug(f"Comport 1 restored value is: {CAL['com2Port']}")
+
+  saved_main = resolve_main_identity(
+    serial_port_inventory,
+    CAL['mainControllerPortIdentity'],
+  )
+  saved_auxiliary = resolve_auxiliary_identity(
+    serial_port_inventory, CAL['auxiliaryControllerPortIdentity'],
+  )
+  com1SelectedValue.set(
+    saved_main.record.device if saved_main.record else "None"
+  )
+  com2SelectedValue.set(
+    saved_auxiliary.record.device if saved_auxiliary.record else "None"
+  )
+
+  try:
+    restored_auxiliary_board = normalize_auxiliary_board_profile(
+      CAL.get('auxiliaryBoard', AUXILIARY_BOARD_NONE),
+      allow_none=True,
+    )
+  except MotionInputError as exc:
+    logger.error("Invalid saved auxiliary-board profile: %s", exc)
+    restored_auxiliary_board = None
+  CAL['auxiliaryBoard'] = restored_auxiliary_board or AUXILIARY_BOARD_NONE
+  auxiliaryBoardSelectedValue.set(CAL['auxiliaryBoard'])
+
+
+  incrementEntryField.insert(0,"10")
+  speedEntryField.insert(0,"25")
+  ACCspeedField.insert(0,"15")
+  DECspeedField.insert(0,"15")
+  ACCrampField.insert(0,"80")
+  roundEntryField.insert(0,"0")
+  #ProgEntryField.insert(0,(Prog))
+  SavePosEntryField.insert(0,"1")
+  R1EntryField.insert(0,"0")
+  R2EntryField.insert(0,"0")
+  R3EntryField.insert(0,"0")
+  R4EntryField.insert(0,"0")
+  R5EntryField.insert(0,"0")
+  R6EntryField.insert(0,"0")
+  R7EntryField.insert(0,"0")
+  R8EntryField.insert(0,"0")
+  R9EntryField.insert(0,"0")
+  R10EntryField.insert(0,"0")
+  R11EntryField.insert(0,"0")
+  R12EntryField.insert(0,"0")
+  R13EntryField.insert(0,"0")
+  R14EntryField.insert(0,"0")
+  R15EntryField.insert(0,"0")
+  R16EntryField.insert(0,"0")
+  SP_1_E1_EntryField.insert(0,"0")
+  SP_2_E1_EntryField.insert(0,"0")
+  SP_3_E1_EntryField.insert(0,"0")
+  SP_4_E1_EntryField.insert(0,"0")
+  SP_5_E1_EntryField.insert(0,"0")
+  SP_6_E1_EntryField.insert(0,"0")
+  SP_7_E1_EntryField.insert(0,"0")
+  SP_8_E1_EntryField.insert(0,"0")
+  SP_9_E1_EntryField.insert(0,"0")
+  SP_10_E1_EntryField.insert(0,"0")
+  SP_11_E1_EntryField.insert(0,"0")
+  SP_12_E1_EntryField.insert(0,"0")
+  SP_13_E1_EntryField.insert(0,"0")
+  SP_14_E1_EntryField.insert(0,"0")
+  SP_15_E1_EntryField.insert(0,"0")
+  SP_16_E1_EntryField.insert(0,"0")
+  SP_1_E2_EntryField.insert(0,"0")
+  SP_2_E2_EntryField.insert(0,"0")
+  SP_3_E2_EntryField.insert(0,"0")
+  SP_4_E2_EntryField.insert(0,"0")
+  SP_5_E2_EntryField.insert(0,"0")
+  SP_6_E2_EntryField.insert(0,"0")
+  SP_7_E2_EntryField.insert(0,"0")
+  SP_8_E2_EntryField.insert(0,"0")
+  SP_9_E2_EntryField.insert(0,"0")
+  SP_10_E2_EntryField.insert(0,"0")
+  SP_11_E2_EntryField.insert(0,"0")
+  SP_12_E2_EntryField.insert(0,"0")
+  SP_13_E2_EntryField.insert(0,"0")
+  SP_14_E2_EntryField.insert(0,"0")
+  SP_15_E2_EntryField.insert(0,"0")
+  SP_16_E2_EntryField.insert(0,"0")
+  SP_1_E3_EntryField.insert(0,"0")
+  SP_2_E3_EntryField.insert(0,"0")
+  SP_3_E3_EntryField.insert(0,"0")
+  SP_4_E3_EntryField.insert(0,"0")
+  SP_5_E3_EntryField.insert(0,"0")
+  SP_6_E3_EntryField.insert(0,"0")
+  SP_7_E3_EntryField.insert(0,"0")
+  SP_8_E3_EntryField.insert(0,"0")
+  SP_9_E3_EntryField.insert(0,"0")
+  SP_10_E3_EntryField.insert(0,"0")
+  SP_11_E3_EntryField.insert(0,"0")
+  SP_12_E3_EntryField.insert(0,"0")
+  SP_13_E3_EntryField.insert(0,"0")
+  SP_14_E3_EntryField.insert(0,"0")
+  SP_15_E3_EntryField.insert(0,"0")
+  SP_16_E3_EntryField.insert(0,"0")
+  SP_1_E4_EntryField.insert(0,"0")
+  SP_2_E4_EntryField.insert(0,"0")
+  SP_3_E4_EntryField.insert(0,"0")
+  SP_4_E4_EntryField.insert(0,"0")
+  SP_5_E4_EntryField.insert(0,"0")
+  SP_6_E4_EntryField.insert(0,"0")
+  SP_7_E4_EntryField.insert(0,"0")
+  SP_8_E4_EntryField.insert(0,"0")
+  SP_9_E4_EntryField.insert(0,"0")
+  SP_10_E4_EntryField.insert(0,"0")
+  SP_11_E4_EntryField.insert(0,"0")
+  SP_12_E4_EntryField.insert(0,"0")
+  SP_13_E4_EntryField.insert(0,"0")
+  SP_14_E4_EntryField.insert(0,"0")
+  SP_15_E4_EntryField.insert(0,"0")
+  SP_16_E4_EntryField.insert(0,"0")
+  SP_1_E5_EntryField.insert(0,"0")
+  SP_2_E5_EntryField.insert(0,"0")
+  SP_3_E5_EntryField.insert(0,"0")
+  SP_4_E5_EntryField.insert(0,"0")
+  SP_5_E5_EntryField.insert(0,"0")
+  SP_6_E5_EntryField.insert(0,"0")
+  SP_7_E5_EntryField.insert(0,"0")
+  SP_8_E5_EntryField.insert(0,"0")
+  SP_9_E5_EntryField.insert(0,"0")
+  SP_10_E5_EntryField.insert(0,"0")
+  SP_11_E5_EntryField.insert(0,"0")
+  SP_12_E5_EntryField.insert(0,"0")
+  SP_13_E5_EntryField.insert(0,"0")
+  SP_14_E5_EntryField.insert(0,"0")
+  SP_15_E5_EntryField.insert(0,"0")
+  SP_16_E5_EntryField.insert(0,"0")
+  SP_1_E6_EntryField.insert(0,"0")
+  SP_2_E6_EntryField.insert(0,"0")
+  SP_3_E6_EntryField.insert(0,"0")
+  SP_4_E6_EntryField.insert(0,"0")
+  SP_5_E6_EntryField.insert(0,"0")
+  SP_6_E6_EntryField.insert(0,"0")
+  SP_7_E6_EntryField.insert(0,"0")
+  SP_8_E6_EntryField.insert(0,"0")
+  SP_9_E6_EntryField.insert(0,"0")
+  SP_10_E6_EntryField.insert(0,"0")
+  SP_11_E6_EntryField.insert(0,"0")
+  SP_12_E6_EntryField.insert(0,"0")
+  SP_13_E6_EntryField.insert(0,"0")
+  SP_14_E6_EntryField.insert(0,"0")
+  SP_15_E6_EntryField.insert(0,"0")
+  SP_16_E6_EntryField.insert(0,"0")
+  servo0onEntryField.insert(0,str(CAL['Servo0on']))
+  servo0offEntryField.insert(0,str(CAL['Servo0off']))
+  servo1onEntryField.insert(0,str(CAL['Servo1on']))
+  servo1offEntryField.insert(0,str(CAL['Servo1off']))
+  servo2onEntryField.insert(0,str(CAL.get('Servo2on', '')))
+  servo2offEntryField.insert(0,str(CAL.get('Servo2off', '')))
+  servo3onEntryField.insert(0,str(CAL.get('Servo3on', '')))
+  servo3offEntryField.insert(0,str(CAL.get('Servo3off', '')))
+  DO1onEntryField.insert(0,str(CAL['DO1on']))
+  DO1offEntryField.insert(0,str(CAL['DO1off']))
+  DO2onEntryField.insert(0,str(CAL['DO2on']))
+  DO2offEntryField.insert(0,str(CAL['DO2off']))
+  DO3onEntryField.insert(0,str(CAL.get('DO3on', '')))
+  DO3offEntryField.insert(0,str(CAL.get('DO3off', '')))
+  DO4onEntryField.insert(0,str(CAL.get('DO4on', '')))
+  DO4offEntryField.insert(0,str(CAL.get('DO4off', '')))
+  DO5onEntryField.insert(0,str(CAL.get('DO5on', '')))
+  DO5offEntryField.insert(0,str(CAL.get('DO5off', '')))
+  DO6onEntryField.insert(0,str(CAL.get('DO6on', '')))
+  DO6offEntryField.insert(0,str(CAL.get('DO6off', '')))
+  TFxEntryField.insert(0,str(CAL['TFx']))
+  TFyEntryField.insert(0,str(CAL['TFy']))
+  TFzEntryField.insert(0,str(CAL['TFz']))
+  TFrxEntryField.insert(0,str(CAL['TFrx']))
+  TFryEntryField.insert(0,str(CAL['TFry']))
+  TFrzEntryField.insert(0,str(CAL['TFrz']))
+  J7curAngEntryField.insert(0,str(CAL['J7PosCur']))
+  J8curAngEntryField.insert(0,str(CAL['J8PosCur']))
+  J9curAngEntryField.insert(0,str(CAL['J9PosCur']))
+  J1calOffEntryField.insert(0,str(CAL['J1calOff']))
+  J2calOffEntryField.insert(0,str(CAL['J2calOff']))
+  J3calOffEntryField.insert(0,str(CAL['J3calOff']))
+  J4calOffEntryField.insert(0,str(CAL['J4calOff']))
+  J5calOffEntryField.insert(0,str(CAL['J5calOff']))
+  J6calOffEntryField.insert(0,str(CAL['J6calOff']))
+  J7calOffEntryField.insert(0,str(CAL['J7calOff']))
+  J8calOffEntryField.insert(0,str(CAL['J8calOff']))
+  J9calOffEntryField.insert(0,str(CAL['J9calOff']))
+
+  if (CAL['curTheme'] == 1):
+    lightTheme()
+  else:
+    darkTheme()
+  '''
 if (CAL['J1CalStatVal'] == 1):
   RUN['J1CalStat1'].set(True)
 if (CAL['J2CalStatVal'] == 1):
@@ -39883,188 +40201,188 @@ if (CAL['J8CalStatVal2'] == 1):
 if (CAL['J9CalStatVal2'] == 1):
   RUN['J9CalStat2'].set(True)
 '''          
-axis7lengthEntryField.insert(0,str(CAL['J7PosLim']))
-axis7rotEntryField.insert(0,str(CAL['J7rotation']))
-axis7stepsEntryField.insert(0,str(CAL['J7steps']))
-VisBrightSlide.set(CAL['VisBrightVal'])
-VisContrastSlide.set(CAL['VisContVal'])
-VisBacColorEntryField.insert(0,str(CAL['VisBacColor']))
-VisScoreEntryField.insert(0,str(CAL['VisScore']))
-VisX1PixEntryField.insert(0,str(CAL['VisX1Val']))
-VisY1PixEntryField.insert(0,str(CAL['VisY1Val']))
-VisX2PixEntryField.insert(0,str(CAL['VisX2Val']))
-VisY2PixEntryField.insert(0,str(CAL['VisY2Val']))
-VisX1RobEntryField.insert(0,str(CAL['VisRobX1Val']))
-VisY1RobEntryField.insert(0,str(CAL['VisRobY1Val']))
-VisX2RobEntryField.insert(0,str(CAL['VisRobX2Val']))
-VisY2RobEntryField.insert(0,str(CAL['VisRobY2Val']))
-VisZoomSlide.set(CAL['zoom'])
-if (CAL['pickClosestVal'] == 1):
-  RUN['pickClosest'].set(True)
-if (CAL['pick180Val'] == 1):
-  RUN['pick180'].set(True)  
-visoptions.set(CAL['curCam'])
-try:
-  _cache_vision_camera_selection(visoptions.get())
-except MotionInputError:
-  logger.warning(
-    "Configured camera selection is unavailable: %r",
-    visoptions.get(),
-  )
-if (CAL['fullRotVal'] == 1):
-  RUN['fullRot'].set(True)
-if (CAL['autoBGVal'] == 1):
-  RUN['autoBG'].set(True)  
-RUN['mX1'] = CAL['mX1val']
-RUN['mY1'] = CAL['mY1val']
-RUN['mX2'] = CAL['mX2val']
-RUN['mY2'] = CAL['mY2val']
-axis8lengthEntryField.insert(0,str(CAL['J8length']))
-axis8rotEntryField.insert(0,str(CAL['J8rotation']))
-axis8stepsEntryField.insert(0,str(CAL['J8steps']))
-axis9lengthEntryField.insert(0,str(CAL['J9length']))
-axis9rotEntryField.insert(0,str(CAL['J9rotation']))
-axis9stepsEntryField.insert(0,str(CAL['J9steps']))
-GC_ST_E1_EntryField.insert(0,str(CAL['GC_ST_E1']))
-GC_ST_E2_EntryField.insert(0,str(CAL['GC_ST_E2']))
-GC_ST_E3_EntryField.insert(0,str(CAL['GC_ST_E3']))
-GC_ST_E4_EntryField.insert(0,str(CAL['GC_ST_E4']))
-GC_ST_E5_EntryField.insert(0,str(CAL['GC_ST_E5']))
-GC_ST_E6_EntryField.insert(0,str(CAL['GC_ST_E6']))
-GC_ST_WC_EntryField.insert(0,str(CAL['GC_ST_WC']))
-GC_SToff_E1_EntryField.insert(0,str(CAL['GC_SToff_E1']))
-GC_SToff_E2_EntryField.insert(0,str(CAL['GC_SToff_E2']))
-GC_SToff_E3_EntryField.insert(0,str(CAL['GC_SToff_E3']))
-GC_SToff_E4_EntryField.insert(0,str(CAL['GC_SToff_E4']))
-GC_SToff_E5_EntryField.insert(0,str(CAL['GC_SToff_E5']))
-GC_SToff_E6_EntryField.insert(0,str(CAL['GC_SToff_E6']))
-J1MotDirEntryField.insert(0,str(CAL['J1MotDir']))
-J2MotDirEntryField.insert(0,str(CAL['J2MotDir']))
-J3MotDirEntryField.insert(0,str(CAL['J3MotDir']))
-J4MotDirEntryField.insert(0,str(CAL['J4MotDir']))
-J5MotDirEntryField.insert(0,str(CAL['J5MotDir']))
-J6MotDirEntryField.insert(0,str(CAL['J6MotDir']))
-J7MotDirEntryField.insert(0,str(CAL['J7MotDir']))
-J8MotDirEntryField.insert(0,str(CAL['J8MotDir']))
-J9MotDirEntryField.insert(0,str(CAL['J9MotDir']))
-J1CalDirEntryField.insert(0,str(CAL['J1CalDir']))
-J2CalDirEntryField.insert(0,str(CAL['J2CalDir']))
-J3CalDirEntryField.insert(0,str(CAL['J3CalDir']))
-J4CalDirEntryField.insert(0,str(CAL['J4CalDir']))
-J5CalDirEntryField.insert(0,str(CAL['J5CalDir']))
-J6CalDirEntryField.insert(0,str(CAL['J6CalDir']))
-J7CalDirEntryField.insert(0,str(CAL['J7CalDir']))
-J8CalDirEntryField.insert(0,str(CAL['J8CalDir']))
-J9CalDirEntryField.insert(0,str(CAL['J9CalDir']))
-J1CalSwitchField.set(CAL['J1CalSwitch'])
-J2CalSwitchField.set(CAL['J2CalSwitch'])
-J3CalSwitchField.set(CAL['J3CalSwitch'])
-J4CalSwitchField.set(CAL['J4CalSwitch'])
-J5CalSwitchField.set(CAL['J5CalSwitch'])
-J6CalSwitchField.set(CAL['J6CalSwitch'])
-J7CalSwitchField.set(CAL['J7CalSwitch'])
-J8CalSwitchField.set(CAL['J8CalSwitch'])
-J9CalSwitchField.set(CAL['J9CalSwitch'])
-J1PosLimEntryField.insert(0,str(CAL['J1PosLim']))
-J1NegLimEntryField.insert(0,str(CAL['J1NegLim']))
-J2PosLimEntryField.insert(0,str(CAL['J2PosLim']))
-J2NegLimEntryField.insert(0,str(CAL['J2NegLim']))
-J3PosLimEntryField.insert(0,str(CAL['J3PosLim']))
-J3NegLimEntryField.insert(0,str(CAL['J3NegLim']))
-J4PosLimEntryField.insert(0,str(CAL['J4PosLim']))
-J4NegLimEntryField.insert(0,str(CAL['J4NegLim']))
-J5PosLimEntryField.insert(0,str(CAL['J5PosLim']))
-J5NegLimEntryField.insert(0,str(CAL['J5NegLim']))
-J6PosLimEntryField.insert(0,str(CAL['J6PosLim']))
-J6NegLimEntryField.insert(0,str(CAL['J6NegLim']))  
-J1StepDegEntryField.insert(0,str(CAL['J1StepDeg']))
-J2StepDegEntryField.insert(0,str(CAL['J2StepDeg'])) 
-J3StepDegEntryField.insert(0,str(CAL['J3StepDeg'])) 
-J4StepDegEntryField.insert(0,str(CAL['J4StepDeg'])) 
-J5StepDegEntryField.insert(0,str(CAL['J5StepDeg'])) 
-J6StepDegEntryField.insert(0,str(CAL['J6StepDeg']))
-J1DriveMSEntryField.insert(0,str(CAL['J1DriveMS']))
-J2DriveMSEntryField.insert(0,str(CAL['J2DriveMS']))  
-J3DriveMSEntryField.insert(0,str(CAL['J3DriveMS']))  
-J4DriveMSEntryField.insert(0,str(CAL['J4DriveMS']))  
-J5DriveMSEntryField.insert(0,str(CAL['J5DriveMS']))  
-J6DriveMSEntryField.insert(0,str(CAL['J6DriveMS']))
-J1EncCPREntryField.insert(0,str(CAL['J1EncCPR']))
-J2EncCPREntryField.insert(0,str(CAL['J2EncCPR']))
-J3EncCPREntryField.insert(0,str(CAL['J3EncCPR']))
-J4EncCPREntryField.insert(0,str(CAL['J4EncCPR']))
-J5EncCPREntryField.insert(0,str(CAL['J5EncCPR']))
-J6EncCPREntryField.insert(0,str(CAL['J6EncCPR']))
-J1ΘEntryField.insert(0,str(CAL['J1ΘDHpar']))
-J2ΘEntryField.insert(0,str(CAL['J2ΘDHpar']))
-J3ΘEntryField.insert(0,str(CAL['J3ΘDHpar']))
-J4ΘEntryField.insert(0,str(CAL['J4ΘDHpar']))
-J5ΘEntryField.insert(0,str(CAL['J5ΘDHpar']))
-J6ΘEntryField.insert(0,str(CAL['J6ΘDHpar']))
-J1αEntryField.insert(0,str(CAL['J1αDHpar']))
-J2αEntryField.insert(0,str(CAL['J2αDHpar']))
-J3αEntryField.insert(0,str(CAL['J3αDHpar']))
-J4αEntryField.insert(0,str(CAL['J4αDHpar']))
-J5αEntryField.insert(0,str(CAL['J5αDHpar']))
-J6αEntryField.insert(0,str(CAL['J6αDHpar']))
-J1dEntryField.insert(0,str(CAL['J1dDHpar']))
-J2dEntryField.insert(0,str(CAL['J2dDHpar']))
-J3dEntryField.insert(0,str(CAL['J3dDHpar']))
-J4dEntryField.insert(0,str(CAL['J4dDHpar']))
-J5dEntryField.insert(0,str(CAL['J5dDHpar']))
-J6dEntryField.insert(0,str(CAL['J6dDHpar']))
-J1aEntryField.insert(0,str(CAL['J1aDHpar']))
-J2aEntryField.insert(0,str(CAL['J2aDHpar']))
-J3aEntryField.insert(0,str(CAL['J3aDHpar']))
-J4aEntryField.insert(0,str(CAL['J4aDHpar']))
-J5aEntryField.insert(0,str(CAL['J5aDHpar']))
-J6aEntryField.insert(0,str(CAL['J6aDHpar']))
+  axis7lengthEntryField.insert(0,str(CAL['J7PosLim']))
+  axis7rotEntryField.insert(0,str(CAL['J7rotation']))
+  axis7stepsEntryField.insert(0,str(CAL['J7steps']))
+  VisBrightSlide.set(CAL['VisBrightVal'])
+  VisContrastSlide.set(CAL['VisContVal'])
+  VisBacColorEntryField.insert(0,str(CAL['VisBacColor']))
+  VisScoreEntryField.insert(0,str(CAL['VisScore']))
+  VisX1PixEntryField.insert(0,str(CAL['VisX1Val']))
+  VisY1PixEntryField.insert(0,str(CAL['VisY1Val']))
+  VisX2PixEntryField.insert(0,str(CAL['VisX2Val']))
+  VisY2PixEntryField.insert(0,str(CAL['VisY2Val']))
+  VisX1RobEntryField.insert(0,str(CAL['VisRobX1Val']))
+  VisY1RobEntryField.insert(0,str(CAL['VisRobY1Val']))
+  VisX2RobEntryField.insert(0,str(CAL['VisRobX2Val']))
+  VisY2RobEntryField.insert(0,str(CAL['VisRobY2Val']))
+  VisZoomSlide.set(CAL['zoom'])
+  if (CAL['pickClosestVal'] == 1):
+    RUN['pickClosest'].set(True)
+  if (CAL['pick180Val'] == 1):
+    RUN['pick180'].set(True)
+  visoptions.set(CAL['curCam'])
+  try:
+    _cache_vision_camera_selection(visoptions.get())
+  except MotionInputError:
+    logger.warning(
+      "Configured camera selection is unavailable: %r",
+      visoptions.get(),
+    )
+  if (CAL['fullRotVal'] == 1):
+    RUN['fullRot'].set(True)
+  if (CAL['autoBGVal'] == 1):
+    RUN['autoBG'].set(True)
+  RUN['mX1'] = CAL['mX1val']
+  RUN['mY1'] = CAL['mY1val']
+  RUN['mX2'] = CAL['mX2val']
+  RUN['mY2'] = CAL['mY2val']
+  axis8lengthEntryField.insert(0,str(CAL['J8length']))
+  axis8rotEntryField.insert(0,str(CAL['J8rotation']))
+  axis8stepsEntryField.insert(0,str(CAL['J8steps']))
+  axis9lengthEntryField.insert(0,str(CAL['J9length']))
+  axis9rotEntryField.insert(0,str(CAL['J9rotation']))
+  axis9stepsEntryField.insert(0,str(CAL['J9steps']))
+  GC_ST_E1_EntryField.insert(0,str(CAL['GC_ST_E1']))
+  GC_ST_E2_EntryField.insert(0,str(CAL['GC_ST_E2']))
+  GC_ST_E3_EntryField.insert(0,str(CAL['GC_ST_E3']))
+  GC_ST_E4_EntryField.insert(0,str(CAL['GC_ST_E4']))
+  GC_ST_E5_EntryField.insert(0,str(CAL['GC_ST_E5']))
+  GC_ST_E6_EntryField.insert(0,str(CAL['GC_ST_E6']))
+  GC_ST_WC_EntryField.insert(0,str(CAL['GC_ST_WC']))
+  GC_SToff_E1_EntryField.insert(0,str(CAL['GC_SToff_E1']))
+  GC_SToff_E2_EntryField.insert(0,str(CAL['GC_SToff_E2']))
+  GC_SToff_E3_EntryField.insert(0,str(CAL['GC_SToff_E3']))
+  GC_SToff_E4_EntryField.insert(0,str(CAL['GC_SToff_E4']))
+  GC_SToff_E5_EntryField.insert(0,str(CAL['GC_SToff_E5']))
+  GC_SToff_E6_EntryField.insert(0,str(CAL['GC_SToff_E6']))
+  J1MotDirEntryField.insert(0,str(CAL['J1MotDir']))
+  J2MotDirEntryField.insert(0,str(CAL['J2MotDir']))
+  J3MotDirEntryField.insert(0,str(CAL['J3MotDir']))
+  J4MotDirEntryField.insert(0,str(CAL['J4MotDir']))
+  J5MotDirEntryField.insert(0,str(CAL['J5MotDir']))
+  J6MotDirEntryField.insert(0,str(CAL['J6MotDir']))
+  J7MotDirEntryField.insert(0,str(CAL['J7MotDir']))
+  J8MotDirEntryField.insert(0,str(CAL['J8MotDir']))
+  J9MotDirEntryField.insert(0,str(CAL['J9MotDir']))
+  J1CalDirEntryField.insert(0,str(CAL['J1CalDir']))
+  J2CalDirEntryField.insert(0,str(CAL['J2CalDir']))
+  J3CalDirEntryField.insert(0,str(CAL['J3CalDir']))
+  J4CalDirEntryField.insert(0,str(CAL['J4CalDir']))
+  J5CalDirEntryField.insert(0,str(CAL['J5CalDir']))
+  J6CalDirEntryField.insert(0,str(CAL['J6CalDir']))
+  J7CalDirEntryField.insert(0,str(CAL['J7CalDir']))
+  J8CalDirEntryField.insert(0,str(CAL['J8CalDir']))
+  J9CalDirEntryField.insert(0,str(CAL['J9CalDir']))
+  J1CalSwitchField.set(CAL['J1CalSwitch'])
+  J2CalSwitchField.set(CAL['J2CalSwitch'])
+  J3CalSwitchField.set(CAL['J3CalSwitch'])
+  J4CalSwitchField.set(CAL['J4CalSwitch'])
+  J5CalSwitchField.set(CAL['J5CalSwitch'])
+  J6CalSwitchField.set(CAL['J6CalSwitch'])
+  J7CalSwitchField.set(CAL['J7CalSwitch'])
+  J8CalSwitchField.set(CAL['J8CalSwitch'])
+  J9CalSwitchField.set(CAL['J9CalSwitch'])
+  J1PosLimEntryField.insert(0,str(CAL['J1PosLim']))
+  J1NegLimEntryField.insert(0,str(CAL['J1NegLim']))
+  J2PosLimEntryField.insert(0,str(CAL['J2PosLim']))
+  J2NegLimEntryField.insert(0,str(CAL['J2NegLim']))
+  J3PosLimEntryField.insert(0,str(CAL['J3PosLim']))
+  J3NegLimEntryField.insert(0,str(CAL['J3NegLim']))
+  J4PosLimEntryField.insert(0,str(CAL['J4PosLim']))
+  J4NegLimEntryField.insert(0,str(CAL['J4NegLim']))
+  J5PosLimEntryField.insert(0,str(CAL['J5PosLim']))
+  J5NegLimEntryField.insert(0,str(CAL['J5NegLim']))
+  J6PosLimEntryField.insert(0,str(CAL['J6PosLim']))
+  J6NegLimEntryField.insert(0,str(CAL['J6NegLim']))
+  J1StepDegEntryField.insert(0,str(CAL['J1StepDeg']))
+  J2StepDegEntryField.insert(0,str(CAL['J2StepDeg']))
+  J3StepDegEntryField.insert(0,str(CAL['J3StepDeg']))
+  J4StepDegEntryField.insert(0,str(CAL['J4StepDeg']))
+  J5StepDegEntryField.insert(0,str(CAL['J5StepDeg']))
+  J6StepDegEntryField.insert(0,str(CAL['J6StepDeg']))
+  J1DriveMSEntryField.insert(0,str(CAL['J1DriveMS']))
+  J2DriveMSEntryField.insert(0,str(CAL['J2DriveMS']))
+  J3DriveMSEntryField.insert(0,str(CAL['J3DriveMS']))
+  J4DriveMSEntryField.insert(0,str(CAL['J4DriveMS']))
+  J5DriveMSEntryField.insert(0,str(CAL['J5DriveMS']))
+  J6DriveMSEntryField.insert(0,str(CAL['J6DriveMS']))
+  J1EncCPREntryField.insert(0,str(CAL['J1EncCPR']))
+  J2EncCPREntryField.insert(0,str(CAL['J2EncCPR']))
+  J3EncCPREntryField.insert(0,str(CAL['J3EncCPR']))
+  J4EncCPREntryField.insert(0,str(CAL['J4EncCPR']))
+  J5EncCPREntryField.insert(0,str(CAL['J5EncCPR']))
+  J6EncCPREntryField.insert(0,str(CAL['J6EncCPR']))
+  J1ΘEntryField.insert(0,str(CAL['J1ΘDHpar']))
+  J2ΘEntryField.insert(0,str(CAL['J2ΘDHpar']))
+  J3ΘEntryField.insert(0,str(CAL['J3ΘDHpar']))
+  J4ΘEntryField.insert(0,str(CAL['J4ΘDHpar']))
+  J5ΘEntryField.insert(0,str(CAL['J5ΘDHpar']))
+  J6ΘEntryField.insert(0,str(CAL['J6ΘDHpar']))
+  J1αEntryField.insert(0,str(CAL['J1αDHpar']))
+  J2αEntryField.insert(0,str(CAL['J2αDHpar']))
+  J3αEntryField.insert(0,str(CAL['J3αDHpar']))
+  J4αEntryField.insert(0,str(CAL['J4αDHpar']))
+  J5αEntryField.insert(0,str(CAL['J5αDHpar']))
+  J6αEntryField.insert(0,str(CAL['J6αDHpar']))
+  J1dEntryField.insert(0,str(CAL['J1dDHpar']))
+  J2dEntryField.insert(0,str(CAL['J2dDHpar']))
+  J3dEntryField.insert(0,str(CAL['J3dDHpar']))
+  J4dEntryField.insert(0,str(CAL['J4dDHpar']))
+  J5dEntryField.insert(0,str(CAL['J5dDHpar']))
+  J6dEntryField.insert(0,str(CAL['J6dDHpar']))
+  J1aEntryField.insert(0,str(CAL['J1aDHpar']))
+  J2aEntryField.insert(0,str(CAL['J2aDHpar']))
+  J3aEntryField.insert(0,str(CAL['J3aDHpar']))
+  J4aEntryField.insert(0,str(CAL['J4aDHpar']))
+  J5aEntryField.insert(0,str(CAL['J5aDHpar']))
+  J6aEntryField.insert(0,str(CAL['J6aDHpar']))
 
-if not update_CPP_kin_from_entries():
-  message = "MOTION DISABLED: NATIVE KINEMATICS CONFIGURATION FAILED"
-  logger.error(message)
-  _set_application_status(text=message, style="Alarm.TLabel")
-RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
-RUN['JangleOut'] = np.array([float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])])
-RUN['negLim'] = [float(CAL['J1NegLim']), float(CAL['J2NegLim']), float(CAL['J3NegLim']), float(CAL['J4NegLim']), float(CAL['J5NegLim']), float(CAL['J6NegLim'])]
+  if not update_CPP_kin_from_entries():
+    message = "MOTION DISABLED: NATIVE KINEMATICS CONFIGURATION FAILED"
+    logger.error(message)
+    _set_application_status(text=message, style="Alarm.TLabel")
+  RUN['VR_angles'] = [float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])]
+  RUN['JangleOut'] = np.array([float(CAL['J1AngCur']), float(CAL['J2AngCur']), float(CAL['J3AngCur']), float(CAL['J4AngCur']), float(CAL['J5AngCur']), float(CAL['J6AngCur'])])
+  RUN['negLim'] = [float(CAL['J1NegLim']), float(CAL['J2NegLim']), float(CAL['J3NegLim']), float(CAL['J4NegLim']), float(CAL['J5NegLim']), float(CAL['J6NegLim'])]
 
-#axis limits in each direction
-RUN['J1axisLimNeg'] = float(CAL['J1NegLim'])
-RUN['J2axisLimNeg'] = float(CAL['J2NegLim'])
-RUN['J3axisLimNeg'] = float(CAL['J3NegLim'])
-RUN['J4axisLimNeg'] = float(CAL['J4NegLim'])
-RUN['J5axisLimNeg'] = float(CAL['J5NegLim'])
-RUN['J6axisLimNeg'] = float(CAL['J6NegLim'])
-J1axisLimPos = float(CAL['J1PosLim'])
-J2axisLimPos = float(CAL['J2PosLim'])
-J3axisLimPos = float(CAL['J3PosLim'])
-J4axisLimPos = float(CAL['J4PosLim'])
-J5axisLimPos = float(CAL['J5PosLim'])
-J6axisLimPos = float(CAL['J6PosLim'])
-
-
-#degrees full movement of each axis
-J1axisLim = J1axisLimPos + RUN['J1axisLimNeg'];
-J2axisLim = J2axisLimPos + RUN['J2axisLimNeg'];
-J3axisLim = J3axisLimPos + RUN['J3axisLimNeg'];
-J4axisLim = J4axisLimPos + RUN['J4axisLimNeg'];
-J5axisLim = J5axisLimPos + RUN['J5axisLimNeg'];
-J6axisLim = J6axisLimPos + RUN['J6axisLimNeg'];
-#steps full movement of each axis
-J1StepLim = J1axisLim * float(CAL['J1StepDeg'])
-J2StepLim = J2axisLim * float(CAL['J2StepDeg'])
-J3StepLim = J3axisLim * float(CAL['J3StepDeg'])
-J4StepLim = J4axisLim * float(CAL['J4StepDeg'])
-J5StepLim = J5axisLim * float(CAL['J5StepDeg'])
-J6StepLim = J6axisLim * float(CAL['J6StepDeg'])
-RUN['stepDeg'] = [float(CAL['J1StepDeg']), float(CAL['J2StepDeg']), float(CAL['J3StepDeg']), float(CAL['J4StepDeg']), float(CAL['J5StepDeg']), float(CAL['J6StepDeg'])]
-setStepMonitorsVR()
-main_color_var.set(CAL['setColor'])
+  #axis limits in each direction
+  RUN['J1axisLimNeg'] = float(CAL['J1NegLim'])
+  RUN['J2axisLimNeg'] = float(CAL['J2NegLim'])
+  RUN['J3axisLimNeg'] = float(CAL['J3NegLim'])
+  RUN['J4axisLimNeg'] = float(CAL['J4NegLim'])
+  RUN['J5axisLimNeg'] = float(CAL['J5NegLim'])
+  RUN['J6axisLimNeg'] = float(CAL['J6NegLim'])
+  J1axisLimPos = float(CAL['J1PosLim'])
+  J2axisLimPos = float(CAL['J2PosLim'])
+  J3axisLimPos = float(CAL['J3PosLim'])
+  J4axisLimPos = float(CAL['J4PosLim'])
+  J5axisLimPos = float(CAL['J5PosLim'])
+  J6axisLimPos = float(CAL['J6PosLim'])
 
 
+  #degrees full movement of each axis
+  J1axisLim = J1axisLimPos + RUN['J1axisLimNeg'];
+  J2axisLim = J2axisLimPos + RUN['J2axisLimNeg'];
+  J3axisLim = J3axisLimPos + RUN['J3axisLimNeg'];
+  J4axisLim = J4axisLimPos + RUN['J4axisLimNeg'];
+  J5axisLim = J5axisLimPos + RUN['J5axisLimNeg'];
+  J6axisLim = J6axisLimPos + RUN['J6axisLimNeg'];
+  #steps full movement of each axis
+  J1StepLim = J1axisLim * float(CAL['J1StepDeg'])
+  J2StepLim = J2axisLim * float(CAL['J2StepDeg'])
+  J3StepLim = J3axisLim * float(CAL['J3StepDeg'])
+  J4StepLim = J4axisLim * float(CAL['J4StepDeg'])
+  J5StepLim = J5axisLim * float(CAL['J5StepDeg'])
+  J6StepLim = J6axisLim * float(CAL['J6StepDeg'])
+  RUN['stepDeg'] = [float(CAL['J1StepDeg']), float(CAL['J2StepDeg']), float(CAL['J3StepDeg']), float(CAL['J4StepDeg']), float(CAL['J5StepDeg']), float(CAL['J6StepDeg'])]
+  setStepMonitorsVR()
+  main_color_var.set(CAL['setColor'])
 
 
-msg = "ANNIN ROBOTICS SOFTWARE AND DESIGNS ARE FREE:\n\
+
+
+  msg = "ANNIN ROBOTICS SOFTWARE AND DESIGNS ARE FREE:\n\
 \n\
 *for personal use.\n\
 *for educational use.\n\
@@ -40087,27 +40405,11 @@ AR3 and AR4 are registered trademarks of Annin Robotics\n\
 Copyright © 2022 by Annin Robotics. All Rights Reserved"
 
 
-#tkinter.messagebox.showwarning("AR4 License / Copyright notice", msg)
-RUN['xboxUse'] = 0
+  #tkinter.messagebox.showwarning("AR4 License / Copyright notice", msg)
+  RUN['xboxUse'] = 0
 
-tab1.lastProg = ""
-_schedule_event_poll("camera-preview")
-_schedule_event_poll("joint-motion")
-_schedule_event_poll("serial")
-_schedule_event_poll("manual-controller")
-_schedule_event_poll("calibration")
-_schedule_event_poll("auxiliary-serial")
-_schedule_event_poll("manual-auxiliary")
-_schedule_event_poll("auxiliary-device")
-_schedule_event_poll("gcode-storage")
-_schedule_event_poll("called-program")
-_schedule_event_poll("program-selection")
-_schedule_event_poll("xbox-auxiliary")
-_schedule_event_poll("virtual-motion")
-tab1.after(100, setCom)
-
-#tab1.mainloop()
-root.mainloop()
+  tab1.lastProg = ""
+  run_application(root, tab1, EVENT_POLL_CALLBACK_NAMES, _schedule_event_poll, setCom)
 
 
 

@@ -306,7 +306,204 @@ def _load_legacy_calibration_pickle(filename):
 
 
 class _LegacyCalibrationValues:
-    FIELD_COUNT = 195
+    FIELD_ORDER = (
+        'J1AngCur',
+        'J2AngCur',
+        'J3AngCur',
+        'J4AngCur',
+        'J5AngCur',
+        'J6AngCur',
+        'XcurPos',
+        'YcurPos',
+        'ZcurPos',
+        'RxcurPos',
+        'RycurPos',
+        'RzcurPos',
+        'comPort',
+        'Prog',
+        'Servo0on',
+        'Servo0off',
+        'Servo1on',
+        'Servo1off',
+        'DO1on',
+        'DO1off',
+        'DO2on',
+        'DO2off',
+        'TFx',
+        'TFy',
+        'TFz',
+        'TFrx',
+        'TFry',
+        'TFrz',
+        'J7PosCur',
+        'J8PosCur',
+        'J9PosCur',
+        'VisFileLoc',
+        'VisProg',
+        'VisOrigXpix',
+        'VisOrigXmm',
+        'VisOrigYpix',
+        'VisOrigYmm',
+        'VisEndXpix',
+        'VisEndXmm',
+        'VisEndYpix',
+        'VisEndYmm',
+        'J1calOff',
+        'J2calOff',
+        'J3calOff',
+        'J4calOff',
+        'J5calOff',
+        'J6calOff',
+        'J1OpenLoopVal',
+        'J2OpenLoopVal',
+        'J3OpenLoopVal',
+        'J4OpenLoopVal',
+        'J5OpenLoopVal',
+        'J6OpenLoopVal',
+        'com2Port',
+        'curTheme',
+        'J1CalStatVal',
+        'J2CalStatVal',
+        'J3CalStatVal',
+        'J4CalStatVal',
+        'J5CalStatVal',
+        'J6CalStatVal',
+        'J7PosLim',
+        'J7rotation',
+        'J7steps',
+        'J7StepCur',
+        'J1CalStatVal2',
+        'J2CalStatVal2',
+        'J3CalStatVal2',
+        'J4CalStatVal2',
+        'J5CalStatVal2',
+        'J6CalStatVal2',
+        'VisBrightVal',
+        'VisContVal',
+        'VisBacColor',
+        'VisScore',
+        'VisX1Val',
+        'VisY1Val',
+        'VisX2Val',
+        'VisY2Val',
+        'VisRobX1Val',
+        'VisRobY1Val',
+        'VisRobX2Val',
+        'VisRobY2Val',
+        'zoom',
+        'pick180Val',
+        'pickClosestVal',
+        'curCam',
+        'fullRotVal',
+        'autoBGVal',
+        'mX1val',
+        'mY1val',
+        'mX2val',
+        'mY2val',
+        'J8length',
+        'J8rotation',
+        'J8steps',
+        'J9length',
+        'J9rotation',
+        'J9steps',
+        'J7calOff',
+        'J8calOff',
+        'J9calOff',
+        'GC_ST_E1',
+        'GC_ST_E2',
+        'GC_ST_E3',
+        'GC_ST_E4',
+        'GC_ST_E5',
+        'GC_ST_E6',
+        'GC_SToff_E1',
+        'GC_SToff_E2',
+        'GC_SToff_E3',
+        'GC_SToff_E4',
+        'GC_SToff_E5',
+        'GC_SToff_E6',
+        'DisableWristRotVal',
+        'J1MotDir',
+        'J2MotDir',
+        'J3MotDir',
+        'J4MotDir',
+        'J5MotDir',
+        'J6MotDir',
+        'J7MotDir',
+        'J8MotDir',
+        'J9MotDir',
+        'J1CalDir',
+        'J2CalDir',
+        'J3CalDir',
+        'J4CalDir',
+        'J5CalDir',
+        'J6CalDir',
+        'J7CalDir',
+        'J8CalDir',
+        'J9CalDir',
+        'J1PosLim',
+        'J1NegLim',
+        'J2PosLim',
+        'J2NegLim',
+        'J3PosLim',
+        'J3NegLim',
+        'J4PosLim',
+        'J4NegLim',
+        'J5PosLim',
+        'J5NegLim',
+        'J6PosLim',
+        'J6NegLim',
+        'J1StepDeg',
+        'J2StepDeg',
+        'J3StepDeg',
+        'J4StepDeg',
+        'J5StepDeg',
+        'J6StepDeg',
+        'J1DriveMS',
+        'J2DriveMS',
+        'J3DriveMS',
+        'J4DriveMS',
+        'J5DriveMS',
+        'J6DriveMS',
+        'J1EncCPR',
+        'J2EncCPR',
+        'J3EncCPR',
+        'J4EncCPR',
+        'J5EncCPR',
+        'J6EncCPR',
+        'J1ΘDHpar',
+        'J2ΘDHpar',
+        'J3ΘDHpar',
+        'J4ΘDHpar',
+        'J5ΘDHpar',
+        'J6ΘDHpar',
+        'J1αDHpar',
+        'J2αDHpar',
+        'J3αDHpar',
+        'J4αDHpar',
+        'J5αDHpar',
+        'J6αDHpar',
+        'J1dDHpar',
+        'J2dDHpar',
+        'J3dDHpar',
+        'J4dDHpar',
+        'J5dDHpar',
+        'J6dDHpar',
+        'J1aDHpar',
+        'J2aDHpar',
+        'J3aDHpar',
+        'J4aDHpar',
+        'J5aDHpar',
+        'J6aDHpar',
+        'GC_ST_WC',
+        'J7CalStatVal',
+        'J8CalStatVal',
+        'J9CalStatVal',
+        'J7CalStatVal2',
+        'J8CalStatVal2',
+        'J9CalStatVal2',
+        'setColor',
+    )
+    FIELD_COUNT = len(FIELD_ORDER)
 
     def __init__(self, values):
         if not isinstance(values, (list, tuple)):
@@ -362,8 +559,6 @@ def convert_calibration(
     backup_file="ARbot.cal.bak",
 ) -> dict | None:
     ''' Convert old ARbot.cal pickle file to new dictionary format and save as ARconfig.json '''
-    CAL = {}
-
     if os.path.exists(legacy_file):
         logger.info(f"Converting {legacy_file} to JSON format")
         try:
@@ -377,202 +572,12 @@ def convert_calibration(
         return None
     
     try:
-        # The index order is the on-disk legacy format and cannot be inferred.
-        CAL['J1AngCur'] = calibration.get("0")
-        CAL['J2AngCur'] = calibration.get("1")
-        CAL['J3AngCur'] = calibration.get("2")
-        CAL['J4AngCur'] = calibration.get("3")
-        CAL['J5AngCur'] = calibration.get("4")
-        CAL['J6AngCur'] = calibration.get("5")
-        CAL['XcurPos'] = calibration.get("6")
-        CAL['YcurPos'] = calibration.get("7")
-        CAL['ZcurPos'] = calibration.get("8")
-        CAL['RxcurPos'] = calibration.get("9")
-        CAL['RycurPos'] = calibration.get("10")
-        CAL['RzcurPos'] = calibration.get("11")
-        CAL['comPort'] = calibration.get("12")
-        CAL['Prog'] = calibration.get("13")
-        CAL['Servo0on'] = calibration.get("14")
-        CAL['Servo0off'] = calibration.get("15")
-        CAL['Servo1on'] = calibration.get("16")
-        CAL['Servo1off'] = calibration.get("17")
-        CAL['DO1on'] = calibration.get("18")
-        CAL['DO1off'] = calibration.get("19")
-        CAL['DO2on'] = calibration.get("20")
-        CAL['DO2off'] = calibration.get("21")
-        CAL['TFx'] = calibration.get("22")
-        CAL['TFy'] = calibration.get("23")
-        CAL['TFz'] = calibration.get("24")
-        CAL['TFrx'] = calibration.get("25")
-        CAL['TFry'] = calibration.get("26")
-        CAL['TFrz'] = calibration.get("27")
-        CAL['J7PosCur'] = calibration.get("28")
-        CAL['J8PosCur'] = calibration.get("29")
-        CAL['J9PosCur'] = calibration.get("30")
-        CAL['VisFileLoc'] = calibration.get("31")
-        CAL['VisProg'] = calibration.get("32")
-        CAL['VisOrigXpix'] = calibration.get("33")
-        CAL['VisOrigXmm'] = calibration.get("34")
-        CAL['VisOrigYpix'] = calibration.get("35")
-        CAL['VisOrigYmm'] = calibration.get("36")
-        CAL['VisEndXpix'] = calibration.get("37")
-        CAL['VisEndXmm'] = calibration.get("38")
-        CAL['VisEndYpix'] = calibration.get("39")
-        CAL['VisEndYmm'] = calibration.get("40")
-        CAL['J1calOff'] = calibration.get("41")
-        CAL['J2calOff'] = calibration.get("42")
-        CAL['J3calOff'] = calibration.get("43")
-        CAL['J4calOff'] = calibration.get("44")
-        CAL['J5calOff'] = calibration.get("45")
-        CAL['J6calOff'] = calibration.get("46")
-        CAL['J1OpenLoopVal'] = calibration.get("47")
-        CAL['J2OpenLoopVal'] = calibration.get("48")
-        CAL['J3OpenLoopVal'] = calibration.get("49")
-        CAL['J4OpenLoopVal'] = calibration.get("50")
-        CAL['J5OpenLoopVal'] = calibration.get("51")
-        CAL['J6OpenLoopVal'] = calibration.get("52")
-        CAL['com2Port'] = calibration.get("53")
-        CAL['curTheme'] = calibration.get("54")
-        CAL['J1CalStatVal'] = calibration.get("55")
-        CAL['J2CalStatVal'] = calibration.get("56")
-        CAL['J3CalStatVal'] = calibration.get("57")
-        CAL['J4CalStatVal'] = calibration.get("58")
-        CAL['J5CalStatVal'] = calibration.get("59")
-        CAL['J6CalStatVal'] = calibration.get("60")
-        CAL['J7PosLim'] = calibration.get("61")
-        CAL['J7rotation'] = calibration.get("62")
-        CAL['J7steps'] = calibration.get("63")
-        CAL['J7StepCur'] = calibration.get("64")
-        CAL['J1CalStatVal2'] = calibration.get("65")
-        CAL['J2CalStatVal2'] = calibration.get("66")
-        CAL['J3CalStatVal2'] = calibration.get("67")
-        CAL['J4CalStatVal2'] = calibration.get("68")
-        CAL['J5CalStatVal2'] = calibration.get("69")
-        CAL['J6CalStatVal2'] = calibration.get("70")
-        CAL['VisBrightVal'] = calibration.get("71")
-        CAL['VisContVal'] = calibration.get("72")
-        CAL['VisBacColor'] = calibration.get("73")
-        CAL['VisScore'] = calibration.get("74")
-        CAL['VisX1Val'] = calibration.get("75")
-        CAL['VisY1Val'] = calibration.get("76")
-        CAL['VisX2Val'] = calibration.get("77")
-        CAL['VisY2Val'] = calibration.get("78")
-        CAL['VisRobX1Val'] = calibration.get("79")
-        CAL['VisRobY1Val'] = calibration.get("80")
-        CAL['VisRobX2Val'] = calibration.get("81")
-        CAL['VisRobY2Val'] = calibration.get("82")
-        CAL['zoom'] = calibration.get("83")
-        CAL['pick180Val'] = calibration.get("84")
-        CAL['pickClosestVal'] = calibration.get("85")
-        CAL['curCam'] = calibration.get("86")
-        CAL['fullRotVal'] = calibration.get("87")
-        CAL['autoBGVal'] = calibration.get("88")
-        CAL['mX1val'] = calibration.get("89")
-        CAL['mY1val'] = calibration.get("90")
-        CAL['mX2val'] = calibration.get("91")
-        CAL['mY2val'] = calibration.get("92")
-        CAL['J8length'] = calibration.get("93")
-        CAL['J8rotation'] = calibration.get("94")
-        CAL['J8steps'] = calibration.get("95")
-        CAL['J9length'] = calibration.get("96")
-        CAL['J9rotation'] = calibration.get("97")
-        CAL['J9steps'] = calibration.get("98")
-        CAL['J7calOff'] = calibration.get("99")
-        CAL['J8calOff'] = calibration.get("100")
-        CAL['J9calOff'] = calibration.get("101")
-        CAL['GC_ST_E1'] = calibration.get("102")
-        CAL['GC_ST_E2'] = calibration.get("103")
-        CAL['GC_ST_E3'] = calibration.get("104")
-        CAL['GC_ST_E4'] = calibration.get("105")
-        CAL['GC_ST_E5'] = calibration.get("106")
-        CAL['GC_ST_E6'] = calibration.get("107")
-        CAL['GC_SToff_E1'] = calibration.get("108")
-        CAL['GC_SToff_E2'] = calibration.get("109")
-        CAL['GC_SToff_E3'] = calibration.get("110")
-        CAL['GC_SToff_E4'] = calibration.get("111")
-        CAL['GC_SToff_E5'] = calibration.get("112")
-        CAL['GC_SToff_E6'] = calibration.get("113")
-        CAL['DisableWristRotVal'] = calibration.get("114")
-        CAL['J1MotDir'] = calibration.get("115")
-        CAL['J2MotDir'] = calibration.get("116")
-        CAL['J3MotDir'] = calibration.get("117")
-        CAL['J4MotDir'] = calibration.get("118")
-        CAL['J5MotDir'] = calibration.get("119")
-        CAL['J6MotDir'] = calibration.get("120")
-        CAL['J7MotDir'] = calibration.get("121")
-        CAL['J8MotDir'] = calibration.get("122")
-        CAL['J9MotDir'] = calibration.get("123")
-        CAL['J1CalDir'] = calibration.get("124")
-        CAL['J2CalDir'] = calibration.get("125")
-        CAL['J3CalDir'] = calibration.get("126")
-        CAL['J4CalDir'] = calibration.get("127")
-        CAL['J5CalDir'] = calibration.get("128")
-        CAL['J6CalDir'] = calibration.get("129")
-        CAL['J7CalDir'] = calibration.get("130")
-        CAL['J8CalDir'] = calibration.get("131")
-        CAL['J9CalDir'] = calibration.get("132")
-        CAL['J1PosLim'] = calibration.get("133")
-        CAL['J1NegLim'] = calibration.get("134")
-        CAL['J2PosLim'] = calibration.get("135")
-        CAL['J2NegLim'] = calibration.get("136")
-        CAL['J3PosLim'] = calibration.get("137")
-        CAL['J3NegLim'] = calibration.get("138")
-        CAL['J4PosLim'] = calibration.get("139")
-        CAL['J4NegLim'] = calibration.get("140")
-        CAL['J5PosLim'] = calibration.get("141")
-        CAL['J5NegLim'] = calibration.get("142")
-        CAL['J6PosLim'] = calibration.get("143")
-        CAL['J6NegLim'] = calibration.get("144")
-        CAL['J1StepDeg'] = calibration.get("145")
-        CAL['J2StepDeg'] = calibration.get("146")
-        CAL['J3StepDeg'] = calibration.get("147")
-        CAL['J4StepDeg'] = calibration.get("148")
-        CAL['J5StepDeg'] = calibration.get("149")
-        CAL['J6StepDeg'] = calibration.get("150")
-        CAL['J1DriveMS'] = calibration.get("151")
-        CAL['J2DriveMS'] = calibration.get("152")
-        CAL['J3DriveMS'] = calibration.get("153")
-        CAL['J4DriveMS'] = calibration.get("154")
-        CAL['J5DriveMS'] = calibration.get("155")
-        CAL['J6DriveMS'] = calibration.get("156")
-        CAL['J1EncCPR'] = calibration.get("157")
-        CAL['J2EncCPR'] = calibration.get("158")
-        CAL['J3EncCPR'] = calibration.get("159")
-        CAL['J4EncCPR'] = calibration.get("160")
-        CAL['J5EncCPR'] = calibration.get("161")
-        CAL['J6EncCPR'] = calibration.get("162")
-        CAL['J1ΘDHpar'] = calibration.get("163")
-        CAL['J2ΘDHpar'] = calibration.get("164")
-        CAL['J3ΘDHpar'] = calibration.get("165")
-        CAL['J4ΘDHpar'] = calibration.get("166")
-        CAL['J5ΘDHpar'] = calibration.get("167")
-        CAL['J6ΘDHpar'] = calibration.get("168")
-        CAL['J1αDHpar'] = calibration.get("169")
-        CAL['J2αDHpar'] = calibration.get("170")
-        CAL['J3αDHpar'] = calibration.get("171")
-        CAL['J4αDHpar'] = calibration.get("172")
-        CAL['J5αDHpar'] = calibration.get("173")
-        CAL['J6αDHpar'] = calibration.get("174")
-        CAL['J1dDHpar'] = calibration.get("175")
-        CAL['J2dDHpar'] = calibration.get("176")
-        CAL['J3dDHpar'] = calibration.get("177")
-        CAL['J4dDHpar'] = calibration.get("178")
-        CAL['J5dDHpar'] = calibration.get("179")
-        CAL['J6dDHpar'] = calibration.get("180")
-        CAL['J1aDHpar'] = calibration.get("181")
-        CAL['J2aDHpar'] = calibration.get("182")
-        CAL['J3aDHpar'] = calibration.get("183")
-        CAL['J4aDHpar'] = calibration.get("184")
-        CAL['J5aDHpar'] = calibration.get("185")
-        CAL['J6aDHpar'] = calibration.get("186")
-        CAL['GC_ST_WC'] = calibration.get("187")
-        CAL['J7CalStatVal'] = calibration.get("188")
-        CAL['J8CalStatVal'] = calibration.get("189")
-        CAL['J9CalStatVal'] = calibration.get("190")
-        CAL['J7CalStatVal2'] = calibration.get("191")
-        CAL['J8CalStatVal2'] = calibration.get("192")
-        CAL['J9CalStatVal2'] = calibration.get("193")
-        CAL['setColor'] = calibration.get("194")
+        CAL = {
+            field_name: calibration.get(str(index))
+            for index, field_name in enumerate(
+                _LegacyCalibrationValues.FIELD_ORDER
+            )
+        }
     except Exception as e:
         logger.error(f"Error converting calibration: {e}")
         return None

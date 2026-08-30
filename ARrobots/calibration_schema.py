@@ -58,6 +58,7 @@ _LEGACY_PARENTHESIZED_RGB = re.compile(
 _LEGACY_BARE_RGB = re.compile(
     r"(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\Z"
 )
+_CONTROLLER_PORT_IDENTITY = re.compile(r"usb-v1:[0-9a-f]{64}\Z")
 
 CALIBRATION_SWITCH_STATES = ("LOW", "HIGH")
 LEGACY_CALIBRATION_SWITCH_STATE = "HIGH"
@@ -221,6 +222,8 @@ _REQUIRED_RUNTIME_KEYS = frozenset(
         "VisBacColor",
         "comPort",
         "com2Port",
+        "mainControllerPortIdentity",
+        "auxiliaryControllerPortIdentity",
         "auxiliaryBoard",
     )
 )
@@ -237,6 +240,8 @@ _KNOWN_KEYS = frozenset(
         "VisBacColor",
         "comPort",
         "com2Port",
+        "mainControllerPortIdentity",
+        "auxiliaryControllerPortIdentity",
         "auxiliaryBoard",
     )
 )
@@ -396,6 +401,17 @@ def _validate_text_field(key, value):
         raise CalibrationSchemaError(f"{key} must be text")
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise CalibrationSchemaError(f"{key} contains control characters")
+    return value
+
+
+def _validate_controller_port_identity(key, value):
+    if not isinstance(value, str) or (
+        value != "None"
+        and not _CONTROLLER_PORT_IDENTITY.fullmatch(value)
+    ):
+        raise CalibrationSchemaError(
+            f"{key} must be None or a canonical usb-v1 identity"
+        )
     return value
 
 
@@ -682,7 +698,12 @@ def normalize_calibration_data(
         if inferred_board is not None:
             normalized["auxiliaryBoard"] = inferred_board
     if require_runtime_fields:
-        for key in ("comPort", "com2Port"):
+        for key in (
+            "comPort",
+            "com2Port",
+            "mainControllerPortIdentity",
+            "auxiliaryControllerPortIdentity",
+        ):
             if normalized.get(key) is None:
                 normalized[key] = "None"
         normalized.setdefault("auxiliaryBoard", AUXILIARY_BOARD_NONE)
@@ -706,6 +727,15 @@ def normalize_calibration_data(
     for key in ("comPort", "com2Port"):
         if key in normalized:
             normalized[key] = _validate_text_field(key, normalized[key])
+    for key in (
+        "mainControllerPortIdentity",
+        "auxiliaryControllerPortIdentity",
+    ):
+        if key in normalized:
+            normalized[key] = _validate_controller_port_identity(
+                key,
+                normalized[key],
+            )
     for key in _GENERAL_RUNTIME_TEXT_KEYS:
         if key in normalized:
             normalized[key] = _validate_text_field(key, normalized[key])

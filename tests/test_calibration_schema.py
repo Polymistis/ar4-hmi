@@ -1,4 +1,3 @@
-import ast
 import copy
 import ctypes
 from decimal import Decimal
@@ -36,48 +35,6 @@ from ARrobots.calibration_schema import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULTS_PATH = PROJECT_ROOT / "defaults.json"
-CALIBRATION_SOURCE = PROJECT_ROOT / "ARrobots" / "Calibration.py"
-
-
-def _legacy_values_from_defaults(defaults):
-    tree = ast.parse(
-        CALIBRATION_SOURCE.read_text(encoding="utf-8"),
-        filename=str(CALIBRATION_SOURCE),
-    )
-    conversion = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "convert_calibration"
-    )
-    indexed_keys = {}
-    for node in ast.walk(conversion):
-        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-            continue
-        target = node.targets[0]
-        value = node.value
-        if not (
-            isinstance(target, ast.Subscript)
-            and isinstance(target.value, ast.Name)
-            and target.value.id == "CAL"
-            and isinstance(value, ast.Call)
-            and isinstance(value.func, ast.Attribute)
-            and isinstance(value.func.value, ast.Name)
-            and value.func.value.id == "calibration"
-            and value.func.attr == "get"
-            and len(value.args) == 1
-        ):
-            continue
-        indexed_keys[int(ast.literal_eval(value.args[0]))] = ast.literal_eval(
-            target.slice
-        )
-    expected_indices = set(range(195))
-    if set(indexed_keys) != expected_indices:
-        raise AssertionError("legacy calibration mapping is incomplete")
-    return [
-        str(defaults[indexed_keys[index]])
-        for index in range(195)
-    ]
 
 
 class CalibrationSchemaTests(unittest.TestCase):
@@ -91,6 +48,8 @@ class CalibrationSchemaTests(unittest.TestCase):
         self.assertEqual(normalized, self.defaults)
         self.assertEqual(normalized["comPort"], "None")
         self.assertEqual(normalized["com2Port"], "None")
+        self.assertEqual(normalized["mainControllerPortIdentity"], "None")
+        self.assertEqual(normalized["auxiliaryControllerPortIdentity"], "None")
         self.assertEqual(normalized["auxiliaryBoard"], "None")
         self.assertIsInstance(normalized["J1DriveMS"], int)
         self.assertIsInstance(normalized["J1PosLim"], float)
@@ -102,12 +61,23 @@ class CalibrationSchemaTests(unittest.TestCase):
         self.assertTrue(
             all(normalized[key] == "HIGH" for key in CALIBRATION_SWITCH_KEYS)
         )
+        for key in (
+            "mainControllerPortIdentity",
+            "auxiliaryControllerPortIdentity",
+        ):
+            malformed = dict(self.defaults)
+            malformed[key] = "usb-v1:" + "A" * 64
+            with self.subTest(key=key):
+                with self.assertRaises(CalibrationSchemaError):
+                    normalize_calibration_data(malformed)
 
     def test_legacy_runtime_profile_adds_compatibility_defaults(self):
         legacy = dict(self.defaults)
         for key in CALIBRATION_SWITCH_KEYS:
             del legacy[key]
         del legacy["auxiliaryBoard"]
+        del legacy["mainControllerPortIdentity"]
+        del legacy["auxiliaryControllerPortIdentity"]
         for key in (
             "DO3off",
             "DO3on",
@@ -138,6 +108,8 @@ class CalibrationSchemaTests(unittest.TestCase):
         self.assertEqual(legacy, original)
         self.assertEqual(normalized["auxiliaryBoard"], "None")
         self.assertEqual(normalized["com2Port"], "None")
+        self.assertEqual(normalized["mainControllerPortIdentity"], "None")
+        self.assertEqual(normalized["auxiliaryControllerPortIdentity"], "None")
         self.assertEqual(normalized["J1PosLim"], 170.0)
         self.assertEqual(normalized["J1MotDir"], 0)
         self.assertEqual(normalized["TFx"], 0.0)
@@ -885,7 +857,10 @@ class LegacyCalibrationConversionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.defaults = json.loads(DEFAULTS_PATH.read_text(encoding="utf-8"))
-        cls.legacy_values = _legacy_values_from_defaults(cls.defaults)
+        cls.legacy_values = [
+            str(cls.defaults[field_name])
+            for field_name in _LegacyCalibrationValues.FIELD_ORDER
+        ]
 
     def test_legacy_value_adapter_rejects_invalid_container_and_scalar_types(self):
         valid = list(self.legacy_values)

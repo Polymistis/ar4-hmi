@@ -40,16 +40,21 @@ class AR4_Configuration(object):
         self.Calibration = {}                                   # Calibration Related Variables
         self.RuntimeState = {}                                  # Runtime Related Variables
 
-        self._detect_platform()
-        self._enumerate_cameras()
+    @classmethod
+    def discover(cls) -> "AR4_Configuration":
+        """Return a configuration populated from the current host environment."""
+        config = cls()
+        config._detect_platform()
+        config._enumerate_cameras()
 
-        logger.debug(f"OS Platform is: {self.Environment['Platform']['OS']}")
-        logger.debug(f"Raspberry Pi Detected!") if self.Environment['Platform']['IS_RPI'] else None
-        logger.debug(f"CSI Camera Detected!") if self.Environment['Cameras']['HAS_CSI_CAMERA'] else None
-        logger.debug(f"USB Camera Detected!") if self.Environment['Cameras']['HAS_USB_CAMERA'] else None
-        logger.debug(f"Detected Cameras: {self.Environment['Cameras']['Enum']}")
-        logger.debug(f"Supported Platform: {str(self.Environment['Platform']['IS_SUPPORTED'])}")
-        logger.debug(f"Headless Platform: {str(self.Environment['Platform']['IS_HEADLESS'])}")
+        logger.debug(f"OS Platform is: {config.Environment['Platform']['OS']}")
+        logger.debug(f"Raspberry Pi Detected!") if config.Environment['Platform']['IS_RPI'] else None
+        logger.debug(f"CSI Camera Detected!") if config.Environment['Cameras']['HAS_CSI_CAMERA'] else None
+        logger.debug(f"USB Camera Detected!") if config.Environment['Cameras']['HAS_USB_CAMERA'] else None
+        logger.debug(f"Detected Cameras: {config.Environment['Cameras']['Enum']}")
+        logger.debug(f"Supported Platform: {str(config.Environment['Platform']['IS_SUPPORTED'])}")
+        logger.debug(f"Headless Platform: {str(config.Environment['Platform']['IS_HEADLESS'])}")
+        return config
 
     def _detect_platform(self) -> None:
         self.Environment['Platform']['OS'] = platform.system()
@@ -109,6 +114,7 @@ class AR4_Configuration(object):
                     )
                     if "usb" in out.lower():
                         return True
+                    return False
                 except Exception as e:
                     return False
                 
