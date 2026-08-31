@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 from PyInstaller.utils.hooks import get_package_paths
 ROOT = Path(SPECPATH).resolve().parents[1]
-APP_NAMES = sorted("AR.png|defaults.json|information.txt|LICENSE.txt|VisBackdrop.png|xbox.png|play-icon.png|stop-icon.png|pp.gif|block.jpg|display setting.jpg|keystone jack.jpg|Link Base-1.STL|Link Base-2.STL|Link Base-3.STL|Link 1-1.STL|Link 1-2.STL|Link 2-1.STL|Link 2-2.STL|Link 2-3.STL|Link 3-1.STL|Link 3-2.STL|Link 4-1.STL|Link 4-2.STL|Link 4-3.STL|Link 5-1.STL|Link 5-2.STL|Link 6-1.STL|Link 6-2.STL".split("|"))
+APP_NAMES = sorted("AR.png|defaults.json|information.txt|LICENSE.txt|VisBackdrop.png|xbox.png|play-icon.png|stop-icon.png|pp.gif|block.jpg|display setting.jpg|keystone jack.jpg|Link Base-1.STL|Link Base-2.STL|Link Base-3.STL|Link 1-1.STL|Link 1-2.STL|Link 2-1.STL|Link 2-2.STL|Link 2-3.STL|Link 3-1.STL|Link 3-2.STL|Link 4-1.STL|Link 4-2.STL|Link 4-3.STL|Link 5-1.STL|Link 5-2.STL|Link 6-1.STL|Link 6-2.STL|Servo Gripper.STL|Welding Torch.STL".split("|"))
 TTK_ROOT = Path(get_package_paths("ttkbootstrap")[1])
 if not isinstance(manifest := json.loads((TTK_ROOT / "assets/elements/manifest.json").read_text(encoding="utf-8")), dict) or not isinstance(images := manifest.get("images"), dict) or not images or any(not isinstance(item, dict) or not isinstance(item.get("file"), str) or Path(item["file"]).name != item["file"] or not item["file"].lower().endswith(".png") for item in images.values()):
     raise ValueError("ttkbootstrap element manifest has an invalid images table")

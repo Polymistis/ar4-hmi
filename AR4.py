@@ -207,6 +207,7 @@ from ARrobots.serial_discovery import (
 from ARrobots.HMI.Calibration import apply_calibration
 from ARrobots.HMI.application import create_application_shell, run_application
 from ARrobots.HMI.cad_scene import CadSceneError, PersistentCadScene
+from ARrobots.HMI.robot_link_view import RobotLinkView
 from ARrobots.HMI.step_conversion import (
   StepConversionControl,
   StepConversionError,
@@ -215,7 +216,9 @@ from ARrobots.HMI.step_conversion import (
 )
 from ARrobots.HMI.program_model import (
   decode_program_row_content as _decode_program_row_content,
+  format_virtual_scene_row as _format_virtual_scene_row,
   normalize_program_tab_number as _normalize_program_tab_number,
+  parse_virtual_scene_row as _parse_virtual_scene_row,
   program_bounded_index as _program_bounded_index,
   program_row_error_detail as _program_row_error_detail,
   program_row_index as _program_row_index,
@@ -980,6 +983,7 @@ PROGRAM_SELECTION_PREPARE_RUN = "prepare-run"
 PROGRAM_SELECTION_ADVANCE = "advance"
 PROGRAM_SELECTION_CAPTURE_SPAN = "capture-span"
 PROGRAM_SELECTION_COMMIT_SPAN = "commit-span"
+PROGRAM_SELECTION_EXECUTE_VIRTUAL_SCENE = "execute-virtual-scene"
 PROGRAM_SELECTION_ACTIONS = frozenset(
   (
     PROGRAM_SELECTION_INITIALIZE_RUN,
@@ -987,6 +991,7 @@ PROGRAM_SELECTION_ACTIONS = frozenset(
     PROGRAM_SELECTION_ADVANCE,
     PROGRAM_SELECTION_CAPTURE_SPAN,
     PROGRAM_SELECTION_COMMIT_SPAN,
+    PROGRAM_SELECTION_EXECUTE_VIRTUAL_SCENE,
   )
 )
 GCODE_STORAGE_OPERATIONS = frozenset(("delete", "list"))
@@ -1494,6 +1499,9 @@ class ProgramSelectionEvent:
         or not span_snapshot.selected_row <= final_row < len(span_snapshot.rows)
       ):
         raise ValueError("program span commitment is invalid")
+    elif action == PROGRAM_SELECTION_EXECUTE_VIRTUAL_SCENE:
+      if not isinstance(span_snapshot, ProgramRowSpanSnapshot) or final_row is not None:
+        raise ValueError("virtual scene execution snapshot is invalid")
     elif span_snapshot is not None or final_row is not None:
       raise ValueError(
         "program span data requires a span-commitment action"
@@ -5490,8 +5498,6 @@ if __name__ == "__main__":
   RUN['progRunning'] = False
   RUN['offlineMode'] = False
 
-  RUN['color_map'] = {}
-
   RUN['J1StepM'] = None
   RUN['J2StepM'] = None
   RUN['J3StepM'] = None
@@ -5581,11 +5587,7 @@ if __name__ == "__main__":
 
   # 3D Visualization
   RUN['vtk_running'] = False
-  RUN['actors'] = {}
-  RUN['assemblies'] = {}
-  RUN['base_transforms'] = {}
-  RUN['joint_transforms'] = {}
-  RUN['composite_transforms'] = {}
+  RUN['robot_link_view'] = None
   RUN['interactor'] = None
   RUN['render_window'] = None
 
@@ -7077,16 +7079,6 @@ def live_tool_jog(in_data, original_tool_frame, stop_event):
 ### VIRTUAL ROBOT ###########################################################################
 #############################################################################################
 
-# Global storage
-if __name__ == "__main__":
-  RUN['vtk_running'] = False
-  RUN['actors'] = {}
-  RUN['assemblies'] = {}
-  RUN['base_transforms'] = {}
-  RUN['joint_transforms'] = {}
-  RUN['composite_transforms'] = {}
-
-
 def _mode_change_is_blocked(request_lease=None, transport_reserved=False):
     if not isinstance(transport_reserved, bool):
         raise TypeError("mode-transition transport reservation flag must be boolean")
@@ -7202,120 +7194,6 @@ def toggle_offline_mode():
     finally:
         _finish_motion_request(request_lease)
 
-def build_robot_actors(renderer):
-    # global RUN['actors'], RUN['assemblies'], RUN['base_transforms'], RUN['joint_transforms'], RUN['composite_transforms']
-    #global color_map
-
-    # Named colors setup
-    colors = vtk.vtkNamedColors()
-
-    # STL files including Link 4-2.STL
-    stl_files = [
-        "Link Base-1.STL", "Link Base-2.STL", "Link Base-3.STL",
-        "Link 1-1.STL", "Link 1-2.STL",
-        "Link 2-1.STL", "Link 2-2.STL", "Link 2-3.STL",
-        "Link 3-1.STL", "Link 3-2.STL",
-        "Link 4-1.STL", "Link 4-2.STL", "Link 4-3.STL",
-        "Link 5-1.STL", "Link 5-2.STL",
-        "Link 6-1.STL", "Link 6-2.STL"
-    ]
-
-    # Clear and initialize the global color map
-    RUN['color_map'].clear()
-    RUN['color_map'].update({stl: "Silver" for stl in stl_files})
-    RUN['color_map'].update({
-        "Link Base-2.STL": "Orange",
-        "Link Base-3.STL": "DimGray",
-        "Link 1-2.STL": "DimGray",
-        "Link 2-2.STL": "Orange", "Link 2-3.STL": "DimGray",
-        "Link 3-2.STL": "DimGray",
-        "Link 4-2.STL": "Orange", "Link 4-3.STL": "DimGray",
-        "Link 5-2.STL": "DimGray",
-        "Link 6-2.STL": "DimGray"
-    })
-
-    # Storage reset
-    RUN['actors'].clear()
-    RUN['assemblies'].clear()
-    RUN['base_transforms'].clear()
-    RUN['joint_transforms'].clear()
-    RUN['composite_transforms'].clear()
-
-    # Load STL files and create actors
-    for stl in stl_files:
-        reader = vtk.vtkSTLReader()
-        reader.SetFileName(stl)
-        reader.Update()
-
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(reader.GetOutputPort())
-
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-
-        # Apply initial color from the shared color_map
-        actor.GetProperty().SetColor(colors.GetColor3d(RUN['color_map'][stl]))
-
-        base_tf = vtk.vtkTransform()
-        joint_tf = vtk.vtkTransform()
-        comp_tf = vtk.vtkTransform()
-
-        # Alignment transforms
-        if stl == "Link 1-1.STL":
-            base_tf.RotateX(180)
-            base_tf.Translate(0, 0, -87.5)
-        elif stl == "Link 2-1.STL":
-            base_tf.RotateZ(180)
-            base_tf.RotateX(270)
-            base_tf.Translate(-64.15, 77.78, 8.87)
-        elif stl == "Link 3-1.STL":
-            base_tf.RotateZ(180)
-            base_tf.RotateX(180)
-            base_tf.Translate(0, 305, -27.84)
-        elif stl == "Link 4-1.STL":
-            base_tf.RotateY(90)
-            base_tf.RotateX(180)
-            base_tf.Translate(-36.7, 0, -75.94)
-        elif stl == "Link 5-1.STL":
-            base_tf.RotateZ(180)
-            base_tf.RotateY(90)
-            base_tf.Translate(147, 0, 44.88)
-        elif stl == "Link 6-1.STL":
-            base_tf.RotateY(90)
-            base_tf.Translate(43.3, 0, 25)
-
-        comp_tf.Concatenate(base_tf)
-        comp_tf.Concatenate(joint_tf)
-
-        asm = vtk.vtkAssembly()
-        asm.AddPart(actor)
-        asm.SetUserTransform(comp_tf)
-
-        RUN['actors'][stl] = actor
-        RUN['assemblies'][stl] = asm
-        RUN['base_transforms'][stl] = base_tf
-        RUN['joint_transforms'][stl] = joint_tf
-        RUN['composite_transforms'][stl] = comp_tf
-
-    for parent, child in zip(stl_files, stl_files[1:]):
-        RUN['assemblies'][parent].AddPart(RUN['assemblies'][child])
-    RUN['tool_mount'] = vtk.vtkAssembly()
-    RUN['assemblies']["Link 6-1.STL"].AddPart(RUN['tool_mount'])
-    renderer.AddActor(RUN['assemblies'][stl_files[0]])
-
-
-def _tool_mount_world_matrix():
-    world = vtk.vtkMatrix4x4()
-    world.Identity()
-    for stl in tuple(RUN['composite_transforms'])[:-1]:
-        product = vtk.vtkMatrix4x4()
-        vtk.vtkMatrix4x4.Multiply4x4(
-            world, RUN['composite_transforms'][stl].GetMatrix(), product
-        )
-        world = product
-    return world
-
-
 class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
     def __init__(self, renderer):
         self.AddObserver("LeftButtonReleaseEvent", self.on_left_button_up)
@@ -7323,25 +7201,6 @@ class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
 
     def on_left_button_up(self, obj, event):
         self.OnLeftButtonUp()  # <-- CORRECT way to call the base method
-
-def update_joint_angles():
-    angles = {
-        "Link 1-1.STL": -RUN['VR_angles'][0],
-        "Link 2-1.STL": RUN['VR_angles'][1],
-        "Link 3-1.STL": -RUN['VR_angles'][2],
-        "Link 4-1.STL": -RUN['VR_angles'][3],
-        "Link 5-1.STL": -RUN['VR_angles'][4],
-        "Link 6-1.STL": RUN['VR_angles'][5]
-    }
-
-    for stl, angle in angles.items():
-        jt = RUN['joint_transforms'][stl]
-        jt.Identity()
-        jt.RotateZ(angle)
-        ct = RUN['composite_transforms'][stl]
-        ct.Identity()
-        ct.Concatenate(RUN['base_transforms'][stl])
-        ct.Concatenate(jt)
 
 def add_floor_grid(renderer, size=1000, spacing=50):
     grid = vtk.vtkPolyData()
@@ -7388,6 +7247,7 @@ def on_close_event(obj, event):
     except Exception:
         logger.exception("CAD scene unbind failed during viewer close")
     finally:
+        RUN['robot_link_view'] = None
         try:
             obj.GetRenderWindow().Finalize()
             obj.TerminateApp()
@@ -7406,7 +7266,7 @@ def update_vtk(render_window, root_widget):
     )
     angles_changed = angles != RUN.get('lastRenderedAngles')
     if angles_changed:
-        update_joint_angles()
+        RUN['robot_link_view'].update_joint_angles(angles)
         render_window.Render()
         RUN['lastRenderedAngles'] = angles
 
@@ -7422,6 +7282,17 @@ def launch_vtk_nonblocking(root_widget):
         logger.warning("Virtual robot viewer is already active")
         return False
 
+    try:
+        robot_link_view = RobotLinkView(
+            DIR,
+            selected_bundled_tool=bundled_tool_var.get() or None,
+        )
+    except (OSError, ValueError) as exc:
+        message = f"Virtual robot viewer unavailable: {exc}"
+        logger.error(message)
+        _set_application_status(text=message, style="Warn.TLabel")
+        return False
+    RUN['robot_link_view'] = robot_link_view
     RUN['vtk_running'] = True
 
     RUN['renderer'] = vtk.vtkRenderer()
@@ -7437,12 +7308,12 @@ def launch_vtk_nonblocking(root_widget):
     RUN['render_window'].SetSize(1024, 768)
     RUN['renderer'].SetBackground(vtk.vtkNamedColors().GetColor3d("LightSlateGray"))
 
-    build_robot_actors(RUN['renderer'])
+    RUN['renderer'].AddActor(robot_link_view.root)
     scene = RUN.get('cad_scene')
     if scene is not None:
         try:
             scene.bind_vtk(
-                RUN['renderer'], anchors={'tool_mount': RUN['tool_mount']}
+                RUN['renderer'], anchors={'tool_mount': robot_link_view.tool_mount}
             )
             if 'cad_status_var' in globals():
                 cad_status_var.set("CAD scene ready")
@@ -7590,6 +7461,64 @@ def _cad_scene_for_action():
     if scene is None or error:
         raise CadSceneError(error or "CAD scene is unavailable")
     return scene
+
+
+def _reparent_cad_scene_at_current_pose(scene, object_id, parent):
+    request_lease = _acquire_motion_request("CAD reparenting", requires_kinematics=False)
+    if request_lease is None:
+        raise CadSceneError(_motion_request_rejection_message(
+            "CAD reparenting requires idle motion",
+        ))
+    try:
+        if _virtual_motion_active(request_lease):
+            raise CadSceneError("CAD reparenting requires idle motion")
+        robot_link_view = RUN['robot_link_view']
+        angles = _validated_virtual_six_vector(RUN['VR_angles'], "virtual robot pose")
+        RUN['lastRenderedAngles'] = None
+        robot_link_view.update_joint_angles(angles)
+        anchor = {'tool_mount': robot_link_view.tool_mount_world_matrix()}
+        item = scene.reparent(object_id, parent, anchor_world_matrices=anchor)
+        try:
+            RUN['render_window'].Render()
+        except Exception:
+            logger.exception("CAD reparent committed; pose render failed")
+        else:
+            RUN['lastRenderedAngles'] = angles
+        return item
+    finally:
+        _finish_motion_request(request_lease)
+
+
+def _execute_virtual_scene_program_row(command):
+    try:
+        scene = _cad_scene_for_action()
+        renderer = RUN.get('renderer')
+        render_window = RUN.get('render_window')
+        robot_link_view = RUN.get('robot_link_view')
+        if (
+            RUN.get('vtk_running') is not True
+            or not isinstance(scene, PersistentCadScene)
+            or not isinstance(robot_link_view, RobotLinkView)
+            or renderer is None
+            or render_window is None
+            or not scene.is_bound_to(renderer)
+        ):
+            raise CadSceneError("Virtual Pick/Place requires an active bound viewer")
+        action, object_id = _parse_virtual_scene_row(command)
+        parent = {'Pick': 'tool_mount', 'Place': 'world'}[action]
+        item = _reparent_cad_scene_at_current_pose(scene, object_id, parent)
+    except (CadSceneError, MotionInputError) as exc:
+        message = f"Virtual scene row rejected: {exc}"
+        logger.error(message)
+        _set_application_status(text=message, style="Alarm.TLabel")
+        cad_status_var.set(message)
+        return False
+    try:
+        _refresh_cad_controls(item.object_id)
+        cad_status_var.set(f"CAD object parent is {item.parent}")
+    except Exception:
+        logger.exception("Virtual scene row committed; display refresh failed")
+    return True
 
 def _selected_cad_object():
     selected = cad_tree.selection()
@@ -7812,9 +7741,7 @@ def reparent_cad_object(parent):
     def reparent(scene, object_id):
         if not RUN['vtk_running'] or not scene.is_bound_to(RUN.get('renderer')):
             raise CadSceneError("attach and detach require the active viewer")
-        return scene.reparent(object_id, parent, anchor_world_matrices={
-            'tool_mount': _tool_mount_world_matrix(),
-        })
+        return _reparent_cad_scene_at_current_pose(scene, object_id, parent)
     _run_cad_mutation(reparent, f"CAD object moved to {parent}", requires_selection=True)
 
 
@@ -12193,6 +12120,12 @@ def _finish_step_reverse_selection(sel_row):
     curRowEntryField.insert(0, "---")
 
 
+def _validated_program_row_content(command):
+  if re.match(r"Virtual(?:\s|$)", command.strip()) and not _program_row_is_supported(command):
+    raise MotionInputError("Virtual scene program row is not canonical")
+  return command
+
+
 def _tk_program_rows_snapshot():
   if threading.get_ident() != application_tk_thread_id:
     raise RuntimeError("program rows must be captured on the Tk event thread")
@@ -12203,7 +12136,8 @@ def _tk_program_rows_snapshot():
   ):
     raise RuntimeError("robot program rows are not a sequence")
   return tuple(
-    _decode_program_row_content(row).strip() for row in raw_rows
+    _validated_program_row_content(_decode_program_row_content(row)).strip()
+    for row in raw_rows
   )
 
 
@@ -12238,6 +12172,16 @@ def _apply_program_selection_event(event):
     or not 0 <= selected_rows[0] < last_row
   ):
     raise RuntimeError("robot program selection is out of range")
+
+  if event.action == PROGRAM_SELECTION_EXECUTE_VIRTUAL_SCENE:
+    snapshot = event.span_snapshot
+    if tuple(selected_rows) != (snapshot.selected_row,):
+      raise RuntimeError("program selection changed before Virtual scene execution")
+    if _tk_program_rows_snapshot() != snapshot.rows:
+      raise RuntimeError("robot program changed before Virtual scene execution")
+    return ProgramSelectionResult(
+      _execute_virtual_scene_program_row(snapshot.selected_command)
+    )
 
   if event.action == PROGRAM_SELECTION_CAPTURE_SPAN:
     if len(selected_rows) != 1:
@@ -17320,6 +17264,23 @@ def executeRow(motion_complete=None, execution_request=None):
   except Exception as exc:
     return _reject_program_row_before_execution(exc)
 
+  if command.startswith("Virtual "):
+    try:
+      result = _dispatch_program_selection(
+        ProgramSelectionEvent(
+          execution_request,
+          PROGRAM_SELECTION_EXECUTE_VIRTUAL_SCENE,
+          span_snapshot=snapshot,
+        )
+      )
+    except Exception as exc:
+      return _reject_program_row_before_execution(exc)
+    if not result.ready:
+      _abort_program_row_execution()
+      return ROW_EXECUTION_REJECTED
+    _finish_execute_row()
+    return ROW_EXECUTION_COMPLETE
+
   RUN['cmdType'] = command[:6]
   RUN['cmdTypeLong'] = command[:11]
   if not _program_row_is_supported(command):
@@ -19123,7 +19084,7 @@ if __name__ == "__main__":
                 _set_application_status(text='JOGGING TRACK', style="Warn.TLabel")
               ##TEACH POS
               elif (event.code == 'BTN_NORTH' and event.state == 1):
-                teachInsertBelSelected()
+                root.after(0, teachInsertBelSelected)
               ##GRIPPER
               elif (event.code == 'BTN_SELECT' and event.state == 1):
                 if grip == 0:
@@ -26120,8 +26081,26 @@ def TRzjogPos(value):
 ### TEACH DEFS ################################################################################################################################ TEACH DEFS ###
 ##############################################################################################################################################################  
 
+def _teach_virtual_scene_row(replace_selected=False):
+  try:
+    _cad_scene_for_action()
+    item = _selected_cad_object()
+    if item is None:
+      raise MotionInputError("select one imported CAD object")
+    row = _format_virtual_scene_row(options.get()[len("Virtual "):], item.object_id)
+    return _edit_virtual_scene_program_row(row, replace_selected)
+  except Exception as exc:
+    message = f"Virtual scene teaching failed: {_program_row_error_detail(exc)}"
+    logger.error(message)
+    _set_application_status(text=message, style="Alarm.TLabel")
+    return False
+
+
 def teachInsertBelSelected():
   # global WC
+  movetype = options.get()
+  if movetype in ("Virtual Pick", "Virtual Place"):
+    return _teach_virtual_scene_row()
   checkSpeedVals()
   try:
     selRow = tab1.progView.curselection()[0]
@@ -26142,7 +26121,6 @@ def teachInsertBelSelected():
   DECspd = DECspeedField.get()
   ACCramp = ACCrampField.get()
   Rounding = roundEntryField.get()
-  movetype = options.get()
   if(movetype == "OFF J"):
     movetype = movetype+" [ PR: "+str(SavePosEntryField.get())+" ]"
     newPos = movetype + " [*] X "+CAL['XcurPos']+" Y "+CAL['YcurPos']+" Z "+CAL['ZcurPos']+" Rz "+CAL['RzcurPos']+" Ry "+CAL['RycurPos']+" Rx "+CAL['RxcurPos']+" J7 "+str(CAL['J7PosCur'])+" J8 "+str(CAL['J8PosCur'])+" J9 "+str(CAL['J9PosCur'])+" "+speedPrefix+" "+Speed+" Ac "+ACCspd+ " Dc "+DECspd+" Rm "+ACCramp+" $ "+RUN['WC']              
@@ -26351,6 +26329,8 @@ def teachInsertBelSelected():
       f.close()
 
 def teachReplaceSelected():
+  if options.get() in ("Virtual Pick", "Virtual Place"):
+    return _teach_virtual_scene_row(True)
   try:
     deleteitem()
     selRow = tab1.progView.curselection()[0]
@@ -26383,8 +26363,52 @@ def deleteitem():
       f.write(str(item.strip(), encoding='utf-8'))
       f.write('\n')
     f.close()  
-  
+
+
+def _edit_virtual_scene_program_row(value, replace_selected):
+  snapshot = _capture_robot_program_view()
+  selected_rows = snapshot.selected_rows
+  if replace_selected and len(selected_rows) != 1:
+    raise MotionInputError("select one robot program row to replace")
+  if not replace_selected and len(selected_rows) > 1:
+    raise MotionInputError("select at most one robot program row")
+  selRow = selected_rows[0] if selected_rows else tab1.progView.index('end')
+  if selected_rows and not replace_selected:
+    selRow += 1
+  try:
+    if replace_selected:
+      tab1.progView.delete(selRow)
+    tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8'))
+    tab1.progView.selection_clear(0, END)
+    tab1.progView.select_set(selRow)
+    curRowEntryField.delete(0, 'end')
+    curRowEntryField.insert(0, selRow)
+    tab1.progView.itemconfig(selRow, {'fg': "#8264B8"})
+    _write_program_items_atomically(
+      path.relpath(snapshot.program_path),
+      tab1.progView.get(0, END),
+    )
+  except Exception as exc:
+    try:
+      _restore_robot_program_view(snapshot)
+    except Exception as rollback_exc:
+      raise RuntimeError(f"Virtual scene program edit rollback failed: {rollback_exc}") from exc
+    raise
+  return True
+
+
+def _run_program_editor_callback(action, callback):
+  try:
+    return callback()
+  except Exception as exc:
+    message = f"{action} failed: {_program_row_error_detail(exc)}"
+    logger.exception(message)
+    _set_application_status(message, "Alarm.TLabel")
+    return False
+
+
 def manInsItem():
+  value = _validated_program_row_content(manEntryField.get())
   try:
     selRow = tab1.progView.curselection()[0]
     selRow += 1
@@ -26392,7 +26416,7 @@ def manInsItem():
     last = tab1.progView.index('end')
     selRow = last
     tab1.progView.select_set(selRow) 
-  tab1.progView.insert(selRow, bytes(manEntryField.get() + '\n', 'utf-8')) 
+  tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8'))
   tab1.progView.selection_clear(0, END)
   tab1.progView.select_set(selRow) 
   selRow = tab1.progView.curselection()[0]
@@ -26409,9 +26433,10 @@ def manInsItem():
   
 def manReplItem():
   #selRow = curRowEntryField.get()
+  value = _validated_program_row_content(manEntryField.get())
   selRow = tab1.progView.curselection()[0]
   tab1.progView.delete(selRow) 
-  tab1.progView.insert(selRow, bytes(manEntryField.get() + '\n', 'utf-8')) 
+  tab1.progView.insert(selRow, bytes(value + '\n', 'utf-8'))
   tab1.progView.selection_clear(0, END)
   tab1.progView.select_set(selRow)
   tab1.progView.itemconfig(selRow, {'fg': "#8264B8"})  
@@ -28486,7 +28511,7 @@ def _parse_local_robot_program(program_file, execution_request=None):
       raise MotionInputError(
         "robot program row exceeds the supported source length"
       )
-    text = _decode_program_row_content(raw_row)
+    text = _validated_program_row_content(_decode_program_row_content(raw_row))
     if "\x00" in text or any(
       (ord(character) < 32 and character != "\t")
       or ord(character) == 127
@@ -28530,6 +28555,7 @@ def loadProg():
     save_calibration(CAL)
   except Exception as exc:
     logger.exception(f"Unable to load robot program: {exc}")
+    _set_application_status(f"Unable to load robot program: {_program_row_error_detail(exc)}", "Alarm.TLabel")
     return False
   return True
 
@@ -28813,14 +28839,9 @@ def openText():
 
 def reloadProg():
   file_path = path.relpath(ProgEntryField.get())
-  ProgEntryField.delete(0, 'end')
-  ProgEntryField.insert(0,file_path)
-  tab1.progView.delete(0,END)
-  with open(file_path,"rb") as program_file:
-    time.sleep(.1)
-    for item in program_file:
-      tab1.progView.insert(END,item)
-  _clear_robot_program_return_state()
+  with _open_local_robot_program(file_path) as program_file:
+    program_rows = _parse_local_robot_program(program_file)
+  _replace_robot_program_view(file_path, program_rows, clear_return_state=True)
   tab1.progView.pack()
   scrollbar.config(command=tab1.progView.yview)
   save_calibration(CAL)      
@@ -29958,6 +29979,9 @@ def _handle_calibration_result_application_failure(snapshot, failure):
 
 
 def _calibration_shutdown_pending():
+  motion_owner = motion_request_registry.active_name
+  if isinstance(motion_owner, str) and motion_owner.endswith(" calibration"):
+    return True
   if (
     calibration_terminal_response_pending.is_set()
     or calibration_serial_write_committed.is_set()
@@ -36309,7 +36333,7 @@ if __name__ == "__main__":
 
   posFrame.grid_columnconfigure(0, weight=1)
 
-  moveSelMenu = OptionMenu(posFrame, options, "Move J", "Move J", "Move L", "Move R", "OFF J", "Move PR", "OFF PR ", "Teach PR", "Move A Mid", "Move A End", "Move C Center", "Move C Start", "Move C Plane", "Start Spline", "End Spline", "Move Vis", command=posRegFieldVisible)
+  moveSelMenu = OptionMenu(posFrame, options, "Move J", "Move J", "Move L", "Move R", "OFF J", "Move PR", "OFF PR ", "Teach PR", "Move A Mid", "Move A End", "Move C Center", "Move C Start", "Move C Plane", "Start Spline", "End Spline", "Move Vis", "Virtual Pick", "Virtual Place", command=posRegFieldVisible)
   moveSelMenu.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
 
   # Position Register Entry Field (hidden by default, shown when PR moves selected)
@@ -36475,16 +36499,16 @@ if __name__ == "__main__":
   getSelBut = ttk.Button(manEntryFrame, text="Copy", command=getSel)
   getSelBut.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
 
-  insertBut = ttk.Button(manEntryFrame, text="Paste", command=manInsItem)
+  insertBut = ttk.Button(manEntryFrame, text="Paste", command=lambda: _run_program_editor_callback("Program row insertion", manInsItem))
   insertBut.grid(row=1, column=1, sticky="ew", padx=2, pady=2)
 
-  replaceBut = ttk.Button(manEntryFrame, text="Replace", command=manReplItem)
+  replaceBut = ttk.Button(manEntryFrame, text="Replace", command=lambda: _run_program_editor_callback("Program row replacement", manReplItem))
   replaceBut.grid(row=1, column=2, sticky="ew", padx=2, pady=2)
 
   openTextBut = ttk.Button(manEntryFrame, text="Open .txt File", command=openText)
   openTextBut.grid(row=1, column=3, sticky="ew", padx=2, pady=2)
 
-  reloadBut = ttk.Button(manEntryFrame, text="Reload", command=reloadProg)
+  reloadBut = ttk.Button(manEntryFrame, text="Reload", command=lambda: _run_program_editor_callback("Robot program reload", reloadProg))
   reloadBut.grid(row=1, column=4, sticky="ew", padx=2, pady=2)
 
   # Row 3: Position controls
@@ -37587,15 +37611,68 @@ if __name__ == "__main__":
   # Color Configuration for Robot Visualization
   # ============================================================================
 
-  main_color_parts = ["Link Base-2.STL", "Link 2-2.STL", "Link 4-2.STL"]
-  logo_color_parts = ["Link 2-3.STL", "Link 4-3.STL"]
-
   def update_main_color(*args):
       selected = main_color_var.get()
       CAL['setColor'] = selected
-      for part in main_color_parts:
-          RUN['color_map'][part] = selected
-          RUN['actors'][part].GetProperty().SetColor(vtk.vtkNamedColors().GetColor3d(selected))
+      robot_link_view = RUN.get('robot_link_view')
+      if robot_link_view is None:
+          return
+      robot_link_view.update_main_color(selected)
+      RUN['render_window'].Render()
+
+  cleared_bundled_tool = ""
+  bundled_tool_states = (cleared_bundled_tool,) + RobotLinkView.BUNDLED_TOOL_OPTIONS
+
+  def persist_bundled_tool(selected):
+      previous = CAL['EOATVisual']
+      if selected not in bundled_tool_states:
+          logger.error("Visual tool selection is unsupported")
+          bundled_tool_var.set(previous)
+          return False
+      if _calibration_shutdown_pending():
+          bundled_tool_var.set(previous)
+          _set_application_status("Visual tool selection is unavailable during calibration", "Warn.TLabel")
+          return False
+      pending_snapshot = _calibration_save_snapshot
+      persistence_source = CAL if pending_snapshot is None else pending_snapshot
+      try:
+          candidate = snapshot_calibration_values(persistence_source)
+          candidate['EOATVisual'] = selected
+          persisted = save_calibration(candidate)
+      except Exception:
+          logger.exception("Unable to persist visual tool selection")
+          persisted = False
+      if persisted is not True:
+          if persisted is not False:
+              logger.error("Visual tool persistence returned an invalid result")
+          bundled_tool_var.set(previous)
+          _set_application_status(
+              "Visual tool selection was not saved", "Warn.TLabel"
+          )
+          return False
+      CAL['EOATVisual'] = selected
+      if pending_snapshot is not None and not _retain_calibration_persistence_retry(candidate):
+          logger.error("Visual tool persistence retry could not be scheduled")
+      return True
+
+  def update_bundled_tool(*args):
+      selected = bundled_tool_var.get()
+      if not persist_bundled_tool(selected):
+          return
+      robot_link_view = RUN.get('robot_link_view')
+      if robot_link_view is None:
+          return
+      robot_link_view.select_bundled_tool(selected)
+      RUN['render_window'].Render()
+
+  def clear_bundled_tool():
+      if not persist_bundled_tool(cleared_bundled_tool):
+          return
+      bundled_tool_var.set(cleared_bundled_tool)
+      robot_link_view = RUN.get('robot_link_view')
+      if robot_link_view is None:
+          return
+      robot_link_view.clear_bundled_tool()
       RUN['render_window'].Render()
 
   # Color options
@@ -37638,6 +37715,27 @@ if __name__ == "__main__":
 
   main_color_dropdown = ttk.OptionMenu(themeFrame, main_color_var, main_color_var.get(), *color_options, command=update_main_color)
   main_color_dropdown.grid(row=2, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+
+  Label(themeFrame, text="Visual Tool", font=("Arial", 10, "bold")).grid(
+      row=3, column=0, columnspan=2, sticky="w", padx=2, pady=(10, 2)
+  )
+  bundled_tool_var = tk.StringVar(value=RobotLinkView.DEFAULT_BUNDLED_TOOL)
+  bundled_tool_dropdown = ttk.OptionMenu(
+      themeFrame,
+      bundled_tool_var,
+      bundled_tool_var.get(),
+      *RobotLinkView.BUNDLED_TOOL_OPTIONS,
+      command=update_bundled_tool,
+  )
+  bundled_tool_dropdown.grid(
+      row=4, column=0, columnspan=2, sticky="ew", padx=2, pady=2
+  )
+  clear_bundled_tool_button = Button(
+      themeFrame, text="Clear Visual Tool", command=clear_bundled_tool
+  )
+  clear_bundled_tool_button.grid(
+      row=5, column=0, columnspan=2, sticky="ew", padx=2, pady=2
+  )
 
 
 
@@ -40070,6 +40168,12 @@ if __name__ == "__main__":
 
   loaded_calibration = _load_startup_calibration()
   apply_calibration(loaded_calibration, CAL)
+  configured_bundled_tool = CAL['EOATVisual']
+  if configured_bundled_tool not in bundled_tool_states:
+    logger.warning("Unsupported saved visual tool; restoring the Servo default")
+    configured_bundled_tool = RobotLinkView.DEFAULT_BUNDLED_TOOL
+    CAL['EOATVisual'] = configured_bundled_tool
+  bundled_tool_var.set(configured_bundled_tool)
 
   logger.debug(f"Comport 1 restored value is: {CAL['comPort']}")
   logger.debug(f"Comport 1 restored value is: {CAL['com2Port']}")

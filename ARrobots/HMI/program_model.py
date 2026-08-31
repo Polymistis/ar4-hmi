@@ -19,6 +19,7 @@ PROGRAM_ROW_LONG_COMMAND_PREFIXES = frozenset({
     "Wait 5v Inp", "Wait MBcoil", "Wait MBhold", "Wait MBinpu", "Set 5v Outp",
     "Set MBcoil ", "Set MBoutpu",
 })
+_VIRTUAL_SCENE_ROW_PATTERN = re.compile(r"Virtual (Pick|Place) - ([0-9a-f]{32})\Z")
 
 
 def decode_program_row_content(row):
@@ -82,6 +83,23 @@ def program_bounded_index(value, label, maximum):
     return int(value)
 
 
+def parse_virtual_scene_row(command):
+    if not isinstance(command, str):
+        raise MotionInputError("virtual scene program row must be text")
+    match = _VIRTUAL_SCENE_ROW_PATTERN.fullmatch(command)
+    if match is None:
+        raise MotionInputError("virtual scene row must contain a canonical action and object ID")
+    return match.group(1), match.group(2)
+
+
+def format_virtual_scene_row(action, object_id):
+    if not isinstance(action, str) or action not in ("Pick", "Place"):
+        raise MotionInputError("virtual scene action must be Pick or Place")
+    if not isinstance(object_id, str) or re.fullmatch(r"[0-9a-f]{32}", object_id) is None:
+        raise MotionInputError("virtual scene object ID must be 32 lowercase hex characters")
+    return f"Virtual {action} - {object_id}"
+
+
 def program_row_is_supported(command):
     if not isinstance(command, str):
         raise TypeError("robot program command must be text")
@@ -94,6 +112,8 @@ def program_row_is_supported(command):
         except MotionInputError:
             return False
         return tab_number == normalized
+    if command.startswith("Virtual "):
+        return _VIRTUAL_SCENE_ROW_PATTERN.fullmatch(command) is not None
     return (
         command[:6] in PROGRAM_ROW_COMMAND_PREFIXES
         or command[:11] in PROGRAM_ROW_LONG_COMMAND_PREFIXES

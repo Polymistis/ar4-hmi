@@ -95,6 +95,7 @@ _GENERAL_RUNTIME_TEXT_KEYS = frozenset(
         "VisProg",
         "curCam",
         "setColor",
+        "EOATVisual",
     )
 )
 _VISION_MAPPING_SENTINELS = {
@@ -707,6 +708,7 @@ def normalize_calibration_data(
             if normalized.get(key) is None:
                 normalized[key] = "None"
         normalized.setdefault("auxiliaryBoard", AUXILIARY_BOARD_NONE)
+        normalized.setdefault("EOATVisual", "Servo Gripper")
 
         missing = sorted(_REQUIRED_RUNTIME_KEYS.difference(normalized))
         if missing:

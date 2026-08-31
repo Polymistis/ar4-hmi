@@ -221,5 +221,6 @@
     "J7CalStatVal2": 0,
     "J8CalStatVal2": 0,
     "J9CalStatVal2": 0,
-    "setColor": "RoyalBlue"
+    "setColor": "RoyalBlue",
+    "EOATVisual": "Servo Gripper"
 }
