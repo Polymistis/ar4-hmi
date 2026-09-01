@@ -1,5 +1,5 @@
 # AR4HMI STEP release profile for CPython 3.14.7 x64 on Windows.
-# Resolved from PyPI with pip 26.2.1; every selected artifact is wheel-only.
+# Public artifacts use PyPI; NLopt is project-built; every selected artifact is wheel-only.
 --index-url https://pypi.org/simple
 --only-binary=:all:
 --require-hashes
@@ -28,7 +28,7 @@ more-itertools==11.1.0 --hash=sha256:4b65538ae22f6fed0ce4874efd317463a7489796a09
 msgpack==1.2.2 --hash=sha256:1510f24612d4b983dff6935d9273e02c320cfd525727fbcb58836a75f589fdbc  # wheel: msgpack-1.2.2-cp314-cp314-win_amd64.whl
 multidict==6.7.1 --hash=sha256:5e01429a929600e7dab7b166062d9bb54a5eed752384c7384c968c2afab8f50f  # wheel: multidict-6.7.1-cp314-cp314-win_amd64.whl
 multimethod==1.12 --hash=sha256:fd0c473c43558908d97cc06e4d68e8f69202f167db46f7b4e4058893e7dbdf60  # wheel: multimethod-1.12-py3-none-any.whl
-nlopt==2.11.0 --hash=sha256:00d74c7c9fb63489973901f372c501541a2509c6d9f2d1a4089fee8193b8fd51  # wheel: nlopt-2.11.0-cp314-cp314-win_amd64.whl
+nlopt==2.11.0.post1+ar4hmi.1 --hash=sha256:be580c5695c1afad3fddbf6497978fed5d544a6b9fab26c346bcc689a2c178bc  # wheel: nlopt-2.11.0.post1+ar4hmi.1-cp314-cp314-win_amd64.whl
 numba==0.67.0 --hash=sha256:4d576e62bf2c9370f61312b51573c4bb1f3fe96798bbab56730847a368a316c4  # wheel: numba-0.67.0-cp314-cp314-win_amd64.whl
 numpy==2.5.2 --hash=sha256:7587f53dfbd5edc0f7b87c6217b4c6d2d1f2ef9c3da70bc1315e7db5f8d7ec9d  # wheel: numpy-2.5.2-cp314-cp314-win_amd64.whl
 opencv-python==5.0.0.93 --hash=sha256:f90ba04b8f73bc5c3814037699739f0156f597338a98f05956c684e7c3ca10d2  # wheel: opencv_python-5.0.0.93-cp37-abi3-win_amd64.whl

@@ -1,16 +1,22 @@
 #Requires -Version 5.1
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$PythonPath, [Parameter(Mandatory)][string]$PythonInstallerPath,
-  [Parameter(Mandatory)][string]$BuildRoot, [Parameter(Mandatory)][long]$SourceDateEpoch)
+  [Parameter(Mandatory)][string]$BuildRoot, [Parameter(Mandatory)][string]$WheelhouseRoot,
+  [Parameter(Mandatory)][long]$SourceDateEpoch)
 Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.ToString() -notlike '5.1.*') { throw 'Windows PowerShell 5.1 is required' }
 $Utf8NoBom = [Text.UTF8Encoding]::new($false)
+$StrictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+$AcceptedSourceDateEpoch = [long]1788115725
+$BaseFileStreamHash = 'de2b6b21241d9d1b55f84fb06959f175604d87e4cb3126e6b11f24b2acf2e8e5'
+$LockHashes = @{ base = '470b487a3c88e9fa7ee51f2d51c62548df47166cb02ed1d68268484208da7862';
+  step = 'a2760fbcf583066dcb8f61e83887dd4b24bec89c57a2abaf79754486fd8e9810' }
 $NativeHash = '6bb0d8cfe8b43317077f942f0ec87f7afaf7424af456c8d230d70985cf81272f'
 $InstallerHash = '9d9eb2709ef81bf5cd30db3c2096bdbc4ea10087c22e62f27d356b36f6ae9649'
 $RuntimeHashes = @{ 'python.exe' = '4942b86a6597e5aee0128daa00050ed79bc21f6e709a78eb19cbfeb0c2f39ac9'; 'python314.dll' = '0f9857ffdfe010fe6b99328d58c2e3c7472ce75f336bf9c2ad9bd5bca3bce700' }
 $RuntimeSigner = '847785B686B2D3879731FA9AA3F1F5D48E85D99E'
 $Expected = @{ base = @{ graph = '2be92961a76765f1e2b9970619e45fe062eea7501ea660e130ad3d6272482c2c'; notices = '91a6474646699a8881bcfe76102cddc20300178bb793c57a30e67ef124186670'; warnings = @{ 'WARNING: Ignoring /System/Library/Frameworks/CoreFoundation.framework/CoreFoundation imported from' = 'Pyserial macOS discovery is unreachable on Windows; output and graph checks reject accidental macOS collection.'; 'WARNING: Ignoring /System/Library/Frameworks/IOKit.framework/IOKit imported from' = 'Pyserial macOS discovery is unreachable on Windows; output and graph checks reject accidental macOS collection.' } };
-  step = @{ graph = '8707db2b1a85388ed689dcc1ca5f1877d506ffb341ab75ea2e8fe4be4742c2be'; notices = '89d670ae972af975c837d69133e6dd05f07184ca30f8553e13dc2d1e9c1768bc'; warnings = @{ 'WARNING: Ignoring /System/Library/Frameworks/CoreFoundation.framework/CoreFoundation imported from' = 'Pyserial macOS discovery is unreachable on Windows; output and graph checks reject accidental macOS collection.'; 'WARNING: Ignoring /System/Library/Frameworks/IOKit.framework/IOKit imported from' = 'Pyserial macOS discovery is unreachable on Windows; output and graph checks reject accidental macOS collection.'; 'WARNING: Timed out while waiting for the child process to exit!' = 'The isolated OCP dependency scan hits the known child-exit timeout; exact wheel-native closure and packaged worker status checks pass.' } } }
+  step = @{ graph = '8707db2b1a85388ed689dcc1ca5f1877d506ffb341ab75ea2e8fe4be4742c2be'; notices = 'b662a7ce687a25bc7cc2abe64a9d06471d62bb3ca76ece4b8093e83f6365aabc'; warnings = @{ 'WARNING: Ignoring /System/Library/Frameworks/CoreFoundation.framework/CoreFoundation imported from' = 'Pyserial macOS discovery is unreachable on Windows; output and graph checks reject accidental macOS collection.'; 'WARNING: Ignoring /System/Library/Frameworks/IOKit.framework/IOKit imported from' = 'Pyserial macOS discovery is unreachable on Windows; output and graph checks reject accidental macOS collection.'; 'WARNING: Timed out while waiting for the child process to exit!' = 'The isolated OCP dependency scan hits the known child-exit timeout; exact wheel-native closure and packaged worker status checks pass.' } } }
 $AppData = @('AR.png', 'defaults.json', 'information.txt', 'LICENSE.txt', 'VisBackdrop.png', 'xbox.png', 'play-icon.png', 'stop-icon.png', 'pp.gif', 'block.jpg', 'display setting.jpg', 'keystone jack.jpg', 'Link Base-1.STL', 'Link Base-2.STL', 'Link Base-3.STL', 'Link 1-1.STL', 'Link 1-2.STL', 'Link 2-1.STL', 'Link 2-2.STL', 'Link 2-3.STL', 'Link 3-1.STL', 'Link 3-2.STL', 'Link 4-1.STL', 'Link 4-2.STL', 'Link 4-3.STL', 'Link 5-1.STL', 'Link 5-2.STL', 'Link 6-1.STL', 'Link 6-2.STL', 'Servo Gripper.STL', 'Welding Torch.STL')
 $TtkFixed = @('ttkbootstrap/assets/elements/manifest.json', 'ttkbootstrap/assets/icons/bootstrap.ttf', 'ttkbootstrap/assets/icons/glyphmap.json', 'ttkbootstrap/assets/icons/icon_metrics.json', 'ttkbootstrap/assets/icons/LICENSE')
 $StepSolverClosure = @('casadi/_casadi.pyd', 'casadi/libcasadi.dll', 'casadi/libgcc_s_seh-1.dll', 'casadi/libstdc++-6.dll', 'casadi/libwinpthread-1.dll', 'nlopt/_nlopt.pyd')
@@ -21,7 +27,8 @@ $WorkerExcludes = @('IPython', 'adodbapi', 'aiohappyeyeballs', 'aiohttp', 'aiosi
 function Assert-Condition([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Invoke-GitText([object[]]$Arguments) { $global:LASTEXITCODE = $null; $rows = @(& $GitPath @Arguments); Assert-Condition ($global:LASTEXITCODE -eq 0) 'Git source query failed'; return ($rows -join "`n") }
 function Get-Hash([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
-function Get-TextHash([string]$Value) { ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($Utf8NoBom.GetBytes($Value)))).Replace('-', '').ToLowerInvariant() }
+function Get-BytesHash([byte[]]$Value) { ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($Value))).Replace('-', '').ToLowerInvariant() }
+function Get-TextHash([string]$Value) { Get-BytesHash ($Utf8NoBom.GetBytes($Value)) }
 function Write-Json([string]$Path, $Value) { [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 12 -Compress), $Utf8NoBom) }
 function Invoke-Logged([string]$File, [object[]]$Arguments, [string]$Stdout, [string]$Stderr) {
   $prior = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; $global:LASTEXITCODE = $null
@@ -33,12 +40,74 @@ function Invoke-Logged([string]$File, [object[]]$Arguments, [string]$Stdout, [st
   }
 }
 function Get-NormalName([string]$Name) { $Name.ToLowerInvariant().Replace('_', '-').Replace('.', '-') }
-function Get-LockInventory([string]$Path) {
-  $result = @{}
-  foreach ($line in Get-Content -LiteralPath $Path) { if ($line -match '^([A-Za-z0-9_.-]+)==([^\s]+)\s') {
-    $name = Get-NormalName $Matches[1]; Assert-Condition (-not $result.ContainsKey($name)) "Duplicate lock entry: $name"; $result[$name] = $Matches[2]
-  } }
-  Assert-Condition ($result.Count -gt 0) "No packages found in $Path"; return $result
+function Read-Lock([string]$Path, [string]$Profile) {
+  $bytes = [IO.File]::ReadAllBytes($Path)
+  Assert-Condition (-not ($bytes.Length -ge 3 -and $bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf)) "Lock must be UTF-8 without BOM: $Path"
+  $rawHash = Get-BytesHash $bytes; $text = $StrictUtf8.GetString($bytes)
+  Assert-Condition ($text.Length -gt 0 -and $text.EndsWith("`n")) "Lock must end with LF or CRLF: $Path"
+  if ($text.Contains("`r")) {
+    $unpaired = $text.Replace("`r`n", '')
+    Assert-Condition (-not ($unpaired.Contains("`r") -or $unpaired.Contains("`n"))) "Lock contains bare or mixed line endings: $Path"
+    $text = $text.Replace("`r`n", "`n")
+  }
+  $label = if ($Profile -ceq 'base') { 'base' } elseif ($Profile -ceq 'step') { 'STEP' } else { throw "Unknown lock profile: $Profile" }
+  $origin = if ($Profile -ceq 'base') { '# Resolved from PyPI with pip 26.2.1; every selected artifact is wheel-only.' } else { '# Public artifacts use PyPI; NLopt is project-built; every selected artifact is wheel-only.' }
+  $header = @(
+    "# AR4HMI $label release profile for CPython 3.14.7 x64 on Windows.",
+    $origin,
+    '--index-url https://pypi.org/simple', '--only-binary=:all:', '--require-hashes', '')
+  $lines = @($text.Substring(0, $text.Length - 1).Split([char]10))
+  Assert-Condition ($lines.Count -gt $header.Count) "Lock contains no package rows: $Path"
+  foreach ($index in 0..($header.Count - 1)) { Assert-Condition ($lines[$index] -ceq $header[$index]) "Lock header differs at row $($index + 1): $Path" }
+  $inventory = @{}; $wheels = [Collections.Generic.SortedDictionary[string,string]]::new([StringComparer]::Ordinal)
+  foreach ($line in @($lines[$header.Count..($lines.Count - 1)])) {
+    Assert-Condition ($line -cmatch '^([a-z0-9][a-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9.!+_-]*) --hash=sha256:([0-9a-f]{64})  # wheel: ([A-Za-z0-9][A-Za-z0-9_.+-]*\.whl)$') "Malformed lock row: $line"
+    $package = $Matches[1]; $version = $Matches[2]; $hash = $Matches[3]; $wheel = $Matches[4]
+    $wheelPrefix = (($package -replace '[-_.]+', '_') + '-' + $version + '-')
+    Assert-Condition $wheel.StartsWith($wheelPrefix, [StringComparison]::Ordinal) "Wheel filename differs from lock requirement: $wheel"
+    $name = Get-NormalName $package
+    Assert-Condition (-not $inventory.ContainsKey($name)) "Duplicate lock entry: $name"
+    Assert-Condition (-not $wheels.ContainsKey($wheel)) "Duplicate wheel filename in lock: $wheel"
+    $inventory[$name] = $version; $wheels.Add($wheel, $hash)
+  }
+  $canonicalHash = Get-TextHash $text
+  return [pscustomobject]@{ inventory = $inventory; wheels = $wheels; sha256 = $canonicalHash; rawSha256 = $rawHash }
+}
+function Get-WheelhouseDigest([string]$Root, $ExpectedWheels) {
+  $records = [Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::Ordinal)
+  foreach ($item in @(Get-ChildItem -LiteralPath $Root -Force)) {
+    Assert-Condition (-not $item.PSIsContainer -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Wheelhouse child is not a normal file: $($item.Name)"
+    Assert-Condition $ExpectedWheels.ContainsKey($item.Name) "Unexpected or case-mismatched wheelhouse child: $($item.Name)"
+    $hash = Get-Hash $item.FullName
+    Assert-Condition ($hash -ceq [string]$ExpectedWheels[$item.Name]) "Wheelhouse hash differs: $($item.Name)"
+    $records.Add($item.Name, [ordered]@{ name = $item.Name; size = $item.Length; sha256 = $hash })
+  }
+  Assert-Condition ($records.Count -eq $ExpectedWheels.Count) 'Wheelhouse does not equal the lock union'
+  $stream = (@($records.Values | ForEach-Object { "$($_.name)|$(([long]$_.size).ToString([Globalization.CultureInfo]::InvariantCulture))|$($_.sha256)`n" }) -join '')
+  return Get-TextHash $stream
+}
+function Get-RecordStreamHash($Records) {
+  $rows = [Collections.Generic.SortedDictionary[string,string]]::new([StringComparer]::Ordinal)
+  $caseNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  foreach ($record in @($Records)) {
+    Assert-Condition ($record -is [pscustomobject]) 'Malformed package file row type'
+    [string[]]$properties = @($record.PSObject.Properties | ForEach-Object Name)
+    [Array]::Sort($properties, [StringComparer]::Ordinal)
+    Assert-Condition (($properties -join '|') -ceq 'path|sha256|size') 'Malformed package file row fields'
+    Assert-Condition ($record.path -is [string] -and $record.sha256 -is [string] -and
+      ($record.size -is [int] -or $record.size -is [long])) 'Malformed package file row types'
+    $path = $record.path; $hash = $record.sha256; $sizeValue = $record.size
+    Assert-Condition ($sizeValue -ge 0) "Malformed package file size: $path"
+    $size = $sizeValue.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $components = @($path.Split([char]'/'))
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($path) -and $path -notmatch '[|\\\r\n]' -and
+      -not ([IO.Path]::IsPathRooted($path)) -and -not ($components -contains '' -or $components -contains '.' -or $components -contains '..')) "Malformed package file path: $path"
+    Assert-Condition ($hash -cmatch '^[0-9a-f]{64}$') "Malformed package file hash: $path"
+    Assert-Condition $caseNames.Add($path) "Duplicate package file path: $path"
+    $rows.Add($path, "$path|$size|$hash`n")
+  }
+  Assert-Condition ($rows.Count -gt 0) 'Package file stream is empty'
+  return Get-TextHash ((@($rows.Values)) -join '')
 }
 function Assert-Inventory($ExpectedInventory, [string]$JsonPath) {
   $actual = @{}; foreach ($item in (Get-Content -LiteralPath $JsonPath -Raw | ConvertFrom-Json)) {
@@ -117,23 +186,29 @@ function Invoke-Worker([string]$Executable, [string]$Directory, [string]$Argumen
   } finally { $process.Dispose() }
 }
 $Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
-foreach ($path in @($PythonPath, $PythonInstallerPath, $BuildRoot)) {
+foreach ($path in @($PythonPath, $PythonInstallerPath, $BuildRoot, $WheelhouseRoot)) {
   Assert-Condition ($path -match '^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)') "Path must be fully qualified: $path"
 }
 $PythonPath = [IO.Path]::GetFullPath($PythonPath); $PythonHome = Split-Path -Parent $PythonPath; $PythonInstallerPath = [IO.Path]::GetFullPath($PythonInstallerPath)
 $BuildRoot = [IO.Path]::GetFullPath($BuildRoot); Assert-Condition (-not $BuildRoot.Equals([IO.Path]::GetPathRoot($BuildRoot), [StringComparison]::OrdinalIgnoreCase)) 'Build root cannot be a filesystem root'; $BuildRoot = $BuildRoot.TrimEnd('\')
+$WheelhouseRoot = [IO.Path]::GetFullPath($WheelhouseRoot); Assert-Condition (-not $WheelhouseRoot.Equals([IO.Path]::GetPathRoot($WheelhouseRoot), [StringComparison]::OrdinalIgnoreCase)) 'Wheelhouse root cannot be a filesystem root'; $WheelhouseRoot = $WheelhouseRoot.TrimEnd('\')
 for ($cursor = Split-Path -Parent $BuildRoot; $cursor; $cursor = Split-Path -Parent $cursor) { $ancestor = Get-Item -LiteralPath $cursor -Force; Assert-Condition (-not ($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Build root ancestor is a reparse point: $cursor"; if ($cursor.Equals([IO.Path]::GetPathRoot($cursor), [StringComparison]::OrdinalIgnoreCase)) { break } }
 Assert-Condition (Test-Path -LiteralPath $PythonPath -PathType Leaf) 'Python executable is missing'
 Assert-Condition (Test-Path -LiteralPath $PythonInstallerPath -PathType Leaf) 'Python installer is missing'
+Assert-Condition (Test-Path -LiteralPath $WheelhouseRoot -PathType Container) 'Wheelhouse root is missing'
+for ($cursor = $WheelhouseRoot; $cursor; $cursor = Split-Path -Parent $cursor) { $ancestor = Get-Item -LiteralPath $cursor -Force; Assert-Condition (-not ($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Wheelhouse root or ancestor is a reparse point: $cursor"; if ($cursor.Equals([IO.Path]::GetPathRoot($cursor), [StringComparison]::OrdinalIgnoreCase)) { break } }
 $WindowsRoot = [Environment]::GetEnvironmentVariable('SystemRoot'); Assert-Condition (Test-Path -LiteralPath $WindowsRoot -PathType Container) 'Windows system root is unavailable'
 $comparison = [StringComparison]::OrdinalIgnoreCase
 Assert-Condition (-not ($BuildRoot.StartsWith($Repo + '\', $comparison) -or $Repo.StartsWith($BuildRoot + '\', $comparison) -or $BuildRoot -eq $Repo)) 'Build root must be external to the checkout'
+Assert-Condition (-not ($WheelhouseRoot.StartsWith($Repo + '\', $comparison) -or $Repo.StartsWith($WheelhouseRoot + '\', $comparison) -or $WheelhouseRoot -eq $Repo)) 'Wheelhouse root must be external to the checkout'
+Assert-Condition (-not ($BuildRoot.StartsWith($WheelhouseRoot + '\', $comparison) -or $WheelhouseRoot.StartsWith($BuildRoot + '\', $comparison) -or $BuildRoot.Equals($WheelhouseRoot, $comparison))) 'Build and wheelhouse roots cannot overlap'
 if (Test-Path -LiteralPath $BuildRoot) {
   $rootItem = Get-Item -LiteralPath $BuildRoot -Force
   Assert-Condition ($rootItem.PSIsContainer -and -not ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) 'Build root must be a normal directory'
   Assert-Condition (@(Get-ChildItem -LiteralPath $BuildRoot -Force).Count -eq 0) 'Build root must be empty'
 } else { New-Item -ItemType Directory -Path $BuildRoot | Out-Null }
 [void][DateTimeOffset]::FromUnixTimeSeconds($SourceDateEpoch)
+Assert-Condition ($SourceDateEpoch -eq $AcceptedSourceDateEpoch) "SourceDateEpoch must equal $AcceptedSourceDateEpoch"
 Assert-Condition ((Get-Hash $PythonInstallerPath) -eq $InstallerHash) 'CPython installer hash differs'
 $RuntimeFiles = @{ $PythonPath = $RuntimeHashes['python.exe']; (Join-Path $PythonHome 'python314.dll') = $RuntimeHashes['python314.dll'] }
 foreach ($path in $RuntimeFiles.Keys) { $signature = Get-AuthenticodeSignature -LiteralPath $path; Assert-Condition ((Get-Hash $path) -eq $RuntimeFiles[$path] -and $signature.Status -eq 'Valid' -and $signature.SignerCertificate.Thumbprint -eq $RuntimeSigner) "Official CPython runtime differs: $path" }
@@ -146,9 +221,25 @@ Assert-Condition ([IO.Path]::GetFullPath($probe.executable) -eq $PythonPath) 'Py
 $DriverHash = Get-Hash $PSCommandPath; $GitPath = (Get-Command git -CommandType Application).Source; Assert-Condition (Test-Path -LiteralPath $GitPath -PathType Leaf) 'Git executable is unavailable'
 $Profiles = @{ base = @{ lock = Join-Path $Repo 'requirements-windows-base.lock'; spec = Join-Path $PSScriptRoot 'AR4HMI-base.spec' };
   step = @{ lock = Join-Path $Repo 'requirements-windows-step.lock'; spec = Join-Path $PSScriptRoot 'AR4HMI-step.spec' } }
-foreach ($profile in $Profiles.Values) { Assert-Condition (Test-Path -LiteralPath $profile.lock -PathType Leaf) 'Profile lock is missing'; Assert-Condition (Test-Path -LiteralPath $profile.spec -PathType Leaf) 'Profile spec is missing' }
-Assert-Condition ((Get-Hash $Profiles.base.lock) -eq '470b487a3c88e9fa7ee51f2d51c62548df47166cb02ed1d68268484208da7862') 'Base lock hash differs'
-Assert-Condition ((Get-Hash $Profiles.step.lock) -eq '1aaeed5972586d1b8b83c9f9e5a7c0c1ebf280c1fb8955ea4e98dc4395122a2e') 'STEP lock hash differs'
+$WheelUnion = [Collections.Generic.SortedDictionary[string,string]]::new([StringComparer]::Ordinal)
+$WheelNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($profileName in @('base', 'step')) {
+  $profile = $Profiles[$profileName]
+  Assert-Condition (Test-Path -LiteralPath $profile.lock -PathType Leaf) 'Profile lock is missing'
+  Assert-Condition (Test-Path -LiteralPath $profile.spec -PathType Leaf) 'Profile spec is missing'
+  $profile['data'] = Read-Lock $profile.lock $profileName
+  Assert-Condition ($profile.data.sha256 -ceq $LockHashes[$profileName]) "$profileName lock hash differs"
+  foreach ($entry in $profile.data.wheels.GetEnumerator()) {
+    $name = [string]$entry.Key; $hash = [string]$entry.Value
+    if ($WheelUnion.ContainsKey($name)) {
+      Assert-Condition ($WheelUnion[$name] -ceq $hash) "Conflicting lock hashes for wheel: $name"
+    } else {
+      Assert-Condition $WheelNames.Add($name) "Lock wheel names differ only by case: $name"
+      $WheelUnion.Add($name, $hash)
+    }
+  }
+}
+$WheelhouseSha256 = Get-WheelhouseDigest $WheelhouseRoot $WheelUnion
 $SpecHashes = @{ base = Get-Hash $Profiles.base.spec; step = Get-Hash $Profiles.step.spec }
 $NoticeProgram = @'
 import hashlib, importlib.metadata as md, json, os, re, sys
@@ -201,12 +292,17 @@ try { foreach ($name in @($environmentNames | Where-Object { $_ -like 'PYTHON*' 
     Invoke-Logged $PythonPath @('-I', '-m', 'venv', $venv) (Join-Path $logs 'venv.stdout') (Join-Path $logs 'venv.stderr')
     $venvPython = Join-Path $venv 'Scripts\python.exe'
     Invoke-Logged $venvPython @('-s', '-m', 'pip', '--isolated', 'install', '--disable-pip-version-check',
-      '--require-hashes', '--only-binary=:all:', '--no-deps', '--no-compile', '-r', $profile.lock) (Join-Path $logs 'pip-install.stdout') (Join-Path $logs 'pip-install.stderr')
-    Invoke-Logged $venvPython @('-s', '-m', 'pip', '--isolated', 'check') (Join-Path $logs 'pip-check.stdout') (Join-Path $logs 'pip-check.stderr')
+      '--no-index', '--find-links', $WheelhouseRoot, '--no-cache-dir', '--require-hashes', '--only-binary=:all:', '--no-deps', '--no-compile', '-r', $profile.lock) (Join-Path $logs 'pip-install.stdout') (Join-Path $logs 'pip-install.stderr')
+    Invoke-Logged $venvPython @('-s', '-m', 'pip', '--isolated', '--disable-pip-version-check', 'check') (Join-Path $logs 'pip-check.stdout') (Join-Path $logs 'pip-check.stderr')
     $listPath = Join-Path $logs 'pip-list.json'
-    Invoke-Logged $venvPython @('-s', '-m', 'pip', '--isolated', 'list', '--format=json') $listPath (Join-Path $logs 'pip-list.stderr')
-    $versions = Assert-Inventory (Get-LockInventory $profile.lock) $listPath
-    $States[$profileName] = @{ python = $venvPython; versions = $versions; sitePackages = Join-Path $venv 'Lib\site-packages' }
+    Invoke-Logged $venvPython @('-s', '-m', 'pip', '--isolated', '--disable-pip-version-check', 'list', '--format=json') $listPath (Join-Path $logs 'pip-list.stderr')
+    $versions = Assert-Inventory $profile.data.inventory $listPath
+    $sitePackages = Join-Path $venv 'Lib\site-packages'; $numpyRecord = Join-Path $sitePackages "numpy-$($profile.data.inventory['numpy']).dist-info\RECORD"
+    $recordLines = @(Get-Content -LiteralPath $numpyRecord); $scriptPattern = '^\.\./\.\./Scripts/(?:f2py|numpy-config)\.exe,sha256=[A-Za-z0-9_-]{43},[1-9][0-9]*$'
+    $scriptRows = @($recordLines | Where-Object { $_ -cmatch $scriptPattern }); Assert-SameStrings @($scriptRows | ForEach-Object { $_.Split(',')[0] }) @('../../Scripts/f2py.exe', '../../Scripts/numpy-config.exe') 'NumPy generated-script RECORD rows'
+    $portableRecord = (@($recordLines | ForEach-Object { if ($_ -cmatch $scriptPattern) { $_.Split(',')[0] + ',,' } else { $_ } }) -join "`n") + "`n"
+    [IO.File]::WriteAllText($numpyRecord, $portableRecord, $Utf8NoBom); Assert-Condition ((Get-Hash $numpyRecord) -eq '8bb13f07c69d845dac4d867496b264bd01ee57d0d23993a183dc6a403859635a') 'Portable NumPy RECORD differs'
+    $States[$profileName] = @{ python = $venvPython; versions = $versions; sitePackages = $sitePackages }
   }
   foreach ($pass in 1..2) { foreach ($profileName in @('base', 'step')) {
     $profile = $Profiles[$profileName]; $state = $States[$profileName]; $passRoot = Join-Path $BuildRoot "pass-$pass\$profileName"
@@ -266,7 +362,7 @@ try { foreach ($name in @($environmentNames | Where-Object { $_ -like 'PYTHON*' 
     $Results += [pscustomobject]@{ pass = $pass; profile = $profileName; root = $passRoot;
       package = $package; records = $records; graphHash = Get-Hash $normalizedPath;
       noticeHash = Get-Hash $noticePath; warnings = @(Get-Warnings $buildErr $passRoot);
-      versions = $state.versions; lockHash = Get-Hash $profile.lock; specHash = Get-Hash $profile.spec }
+      versions = $state.versions; lockHash = $profile.data.sha256; specHash = Get-Hash $profile.spec }
   } }
 $observed = [ordered]@{}
 foreach ($profileName in @('base', 'step')) {
@@ -292,14 +388,19 @@ foreach ($result in $Results) {
   $manifest = [ordered]@{ schema = 1; profile = $result.profile;
     source = [ordered]@{ commit = $StartCommit; tree = $StartTree; trackedDiffSha256 = $TrackedDiffHash };
     python = [ordered]@{ version = '3.14.7'; installerSha256 = $InstallerHash; executableSha256 = $RuntimeHashes['python.exe']; dllSha256 = $RuntimeHashes['python314.dll']; signerThumbprint = $RuntimeSigner };
-    inputs = [ordered]@{ lockSha256 = $result.lockHash; specSha256 = $result.specHash; driverSha256 = $DriverHash };
+    inputs = [ordered]@{ lockSha256 = $result.lockHash; specSha256 = $result.specHash; driverSha256 = $DriverHash; wheelhouseSha256 = $WheelhouseSha256 };
     tools = [ordered]@{ pyinstaller = $result.versions['pyinstaller']; hooks = $result.versions['pyinstaller-hooks-contrib'] };
     build = [ordered]@{ canonicalRoot = $BuildRoot.Replace('\', '/'); sourceDateEpoch = $SourceDateEpoch;
       environment = [ordered]@{ PATH = '<PYTHON_ROOT>;<WINDOWS_ROOT>/System32;<WINDOWS_ROOT>'; PIP_CONFIG_FILE = 'NUL'; GIT_IDENTITY_OVERRIDES = '<UNSET>'; PYTHONHASHSEED = '1'; PYTHONOPTIMIZE = '0'; PYTHONNODEBUGRANGES = '<UNSET>'; TEMP = '<PASS>/temp'; TMP = '<PASS>/temp'; TMPDIR = '<PASS>/temp'; SOURCE_DATE_EPOCH = [string]$SourceDateEpoch } };
     diagnostics = [ordered]@{ analysisSha256 = $result.graphHash; noticeReportSha256 = $result.noticeHash;
       warnings = $warningRows; redistributionApproved = $false };
     files = $result.records }
-  Write-Json (Join-Path $result.root 'manifest.json') $manifest
+  $manifestPath = Join-Path $result.root 'manifest.json'; Write-Json $manifestPath $manifest
+  if ($result.profile -eq 'base') {
+    $baseManifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-Condition ($baseManifest.schema -eq 1 -and $baseManifest.profile -ceq 'base' -and $baseManifest.build.sourceDateEpoch -eq $AcceptedSourceDateEpoch) "Base manifest identity differs in pass $($result.pass)"
+    Assert-Condition ((Get-RecordStreamHash @($baseManifest.files)) -eq $BaseFileStreamHash) "Base package byte contract differs in pass $($result.pass)"
+  }
 }
 foreach ($profileName in @('base', 'step')) {
   $runs = @($Results | Where-Object profile -eq $profileName | Sort-Object pass)
@@ -309,10 +410,14 @@ foreach ($profileName in @('base', 'step')) {
 Assert-Condition ((Invoke-GitText @('--no-replace-objects', '-C', $Repo, 'rev-parse', 'HEAD')).Trim() -eq $StartCommit -and
   (Invoke-GitText @('--no-replace-objects', '-C', $Repo, 'rev-parse', 'HEAD^{tree}')).Trim() -eq $StartTree) 'Git source identity changed during build'
 Assert-Condition ((Get-Hash $PSCommandPath) -eq $DriverHash -and (Get-Hash $PythonInstallerPath) -eq $InstallerHash) 'Build driver or CPython installer changed during build'
+Assert-Condition ((Get-WheelhouseDigest $WheelhouseRoot $WheelUnion) -eq $WheelhouseSha256) 'Wheelhouse changed during build'
 Assert-Condition ((Get-TextHash (Invoke-GitText @('--no-replace-objects', '-C', $Repo, 'diff', '--binary', '--no-ext-diff', 'HEAD', '--'))) -eq $TrackedDiffHash -and (Get-Hash $Profiles.base.spec) -eq $SpecHashes.base -and (Get-Hash $Profiles.step.spec) -eq $SpecHashes.step) 'Source inputs changed during build'
 foreach ($path in $RuntimeFiles.Keys) { Assert-Condition ((Get-Hash $path) -eq $RuntimeFiles[$path]) "CPython runtime changed during build: $path" }
-Assert-Condition ((Get-Hash $Profiles.base.lock) -eq '470b487a3c88e9fa7ee51f2d51c62548df47166cb02ed1d68268484208da7862' -and
-  (Get-Hash $Profiles.step.lock) -eq '1aaeed5972586d1b8b83c9f9e5a7c0c1ebf280c1fb8955ea4e98dc4395122a2e') 'Lock changed during build'
+foreach ($profileName in @('base', 'step')) {
+  $lockState = Read-Lock $Profiles[$profileName].lock $profileName
+  Assert-Condition ($lockState.sha256 -ceq $LockHashes[$profileName] -and
+    $lockState.rawSha256 -ceq $Profiles[$profileName].data.rawSha256) "$profileName lock changed during build"
+}
 Write-Output "Windows package evidence complete: $BuildRoot"
 } finally {
   foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process') }

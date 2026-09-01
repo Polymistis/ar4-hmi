@@ -27,4 +27,3 @@ python -m unittest -v tests.test_native_kinematics
 ```
 
 The tests do not import `AR4.py` and do not communicate with a controller.
-

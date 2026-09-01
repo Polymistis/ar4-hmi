@@ -19,6 +19,12 @@ conflict.
 
 ## Hardware side effects
 
+Tracked Teensy firmware is `6.7.1-ar4hmi.38`. Powered named-position and
+Shutdown testing is prohibited on `.37`; deploy `.38` first. Deployment of
+`.38` and live verification of the changed Shutdown-position behavior remain
+outstanding. A tracked firmware version or successful build does not establish
+deployment or live-arm acceptance.
+
 Starting `AR4.py` is explicit operator admission for automatic connection only to previously enrolled main and auxiliary controllers resolved unambiguously from passive USB identity, validated configuration and position synchronization, auxiliary-board reset, and firmware-defined startup effects. Explicit manual port selection is separate admission to open the selected controller and run the same role-validation and startup boundary. The main-controller sequence sends no motor-drive command. Opening an auxiliary port, automatically or manually, can reset the board. The tracked Mega firmware preloads pins 28-35 high before configuring output pins 28-53 as outputs; the tracked Nano firmware configures output pins 8-13 without an explicit startup write. Both firmware profiles leave servos detached until a validated `servo` request supplies a target.
 
 Passing an already-open serial handle to `ARRobot.connect` or `ARAuxiliary.connect` transfers close ownership to the automation facade at call entry. `ARRobot.connect` performs the normal main-controller startup contract; `ARAuxiliary.connect` performs strict controller-role and board-profile validation. Each side-effecting facade call is separate operator admission for the named command only. Physical output or motion still requires an operator-approved live procedure.
