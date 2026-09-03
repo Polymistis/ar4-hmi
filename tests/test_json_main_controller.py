@@ -1,8 +1,12 @@
 from dataclasses import replace
 import json
 import threading
-import tempfile
 import unittest
+
+if __package__:
+    from .bounded_temp import BoundedTemporaryDirectory
+else:
+    from bounded_temp import BoundedTemporaryDirectory
 
 import ARrobots.protocol as protocol
 from ARrobots.protocol import (
@@ -1347,7 +1351,15 @@ class JsonMainControllerClientTests(unittest.TestCase):
                 )
 
     def test_complete_motion_trace_assembly_writes_one_artifact(self):
-        result = sample_main_motion_trace_result(motion_request_id=47)
+        configuration = sample_main_startup_configuration()
+        result = sample_main_motion_trace_result(
+            motion_request_id=47,
+            total_records=2,
+        )
+        result["configuration_fingerprint"] = (
+            configuration.configuration_fingerprint
+        )
+        result["records"][1]["encoder_counts"][0] = -10
         assembly = JsonMainMotionTraceAssembly(
             motion_request_id=47,
             source_session_id=result["source_session_id"],
@@ -1365,6 +1377,7 @@ class JsonMainControllerClientTests(unittest.TestCase):
         })
         artifact = assembly.artifact(
             controller_identity=sample_main_hello_result()["identity"],
+            measurement_scale=configuration.motion_trace_scale,
             motion_parameters=motion_parameters,
             host_times_ns={
                 "retrieved": 4,
@@ -1376,6 +1389,7 @@ class JsonMainControllerClientTests(unittest.TestCase):
         with self.assertRaises(JsonCommandSchemaError):
             assembly.artifact(
                 controller_identity=sample_main_hello_result()["identity"],
+                measurement_scale=configuration.motion_trace_scale,
                 motion_parameters=motion_parameters,
                 host_times_ns={
                     "armed": 2,
@@ -1384,8 +1398,46 @@ class JsonMainControllerClientTests(unittest.TestCase):
                     "retrieved": 4,
                 },
             )
+        invalid_scale = dict(configuration.motion_trace_scale)
+        invalid_scale["encoder_counts_per_step"] = (0,) * 6
+        with self.assertRaises(JsonCommandSchemaError):
+            assembly.artifact(
+                controller_identity=sample_main_hello_result()["identity"],
+                measurement_scale=invalid_scale,
+                motion_parameters=motion_parameters,
+                host_times_ns={
+                    "armed": 1,
+                    "admitted": 2,
+                    "terminal": 3,
+                    "retrieved": 4,
+                },
+            )
+        self.assertEqual(artifact["artifact_version"], 2)
+        self.assertEqual(
+            artifact["measurement_scale"],
+            {
+                "encoder_counts_per_step": [5, 5, 5, 5, 2.5, 5],
+                "steps_per_degree": list(configuration.steps_per_degree),
+            },
+        )
+        self.assertEqual(artifact["analysis"]["sample_count"], 2)
+        self.assertEqual(
+            artifact["analysis"]["controller_duration_microseconds"],
+            1,
+        )
+        joint_1 = artifact["analysis"]["joint_following_error"][0]
+        self.assertEqual(joint_1["initial_following_error_steps"], 1.0)
+        self.assertEqual(joint_1["terminal_following_error_steps"], -2.0)
+        self.assertEqual(
+            joint_1["maximum_absolute_following_error_steps"],
+            2.0,
+        )
+        self.assertAlmostEqual(
+            joint_1["terminal_following_error_degrees"],
+            -2.0 / configuration.steps_per_degree[0],
+        )
 
-        with tempfile.TemporaryDirectory(dir=".") as directory:
+        with BoundedTemporaryDirectory() as directory:
             path = write_main_motion_trace_artifact(directory, artifact)
             stored = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(list(path.parent.iterdir()), [path])

@@ -19,7 +19,6 @@ from .schemas import (
     JsonMainHomeReferenceResult,
     JsonMainPositionResult,
     parse_main_motion_position_result,
-    validate_main_configuration_fingerprint,
     validate_main_config_ext_axis_request,
     validate_main_set_position_request,
     validate_main_update_params_request,
@@ -367,6 +366,13 @@ class JsonMainControllerStartupConfiguration:
         }
 
     @property
+    def motion_trace_scale(self):
+        return {
+            "encoder_counts_per_step": self.encoder_counts_per_step,
+            "steps_per_degree": self.steps_per_degree,
+        }
+
+    @property
     def configuration_fingerprint(self):
         digest = hashlib.sha256(_JSON_CONFIGURATION_FINGERPRINT_DOMAIN)
         parameters = {
@@ -386,7 +392,7 @@ class JsonMainControllerPersistentStartupResult:
 
     startup: JsonMainControllerStartupResult
     client: JsonMainControllerClient
-    configuration_fingerprint: str
+    configuration: JsonMainControllerStartupConfiguration
 
     def __post_init__(self):
         if type(self.startup) is not JsonMainControllerStartupResult:
@@ -397,15 +403,10 @@ class JsonMainControllerPersistentStartupResult:
             raise JsonMainControllerStartupError(
                 "persistent startup client is invalid"
             )
-        try:
-            validate_main_configuration_fingerprint(
-                self.configuration_fingerprint,
-                "persistent startup configuration fingerprint",
-            )
-        except JsonCommandSchemaError as exc:
+        if type(self.configuration) is not JsonMainControllerStartupConfiguration:
             raise JsonMainControllerStartupError(
-                str(exc)
-            ) from exc
+                "persistent startup configuration is invalid"
+            )
         if (
             self.client.closed
             or self.client.closing
@@ -425,6 +426,10 @@ class JsonMainControllerPersistentStartupResult:
     @property
     def hello(self):
         return self.startup.hello
+
+    @property
+    def configuration_fingerprint(self):
+        return self.configuration.configuration_fingerprint
 
     @property
     def position(self):
@@ -1114,7 +1119,7 @@ def run_main_controller_json_startup(
                 persistent_result = JsonMainControllerPersistentStartupResult(
                     startup,
                     client,
-                    configuration.configuration_fingerprint,
+                    configuration,
                 )
         if cancelled:
             drain_main_controller_input(

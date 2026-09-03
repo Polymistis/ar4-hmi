@@ -2575,7 +2575,11 @@ def validate_main_motion_trace_request(params):
     _require_unsigned_integer(
         payload["page_index"],
         "motion-trace page index",
-        maximum=JSON_MOTION_TRACE_RECORD_CAPACITY - 1,
+        maximum=(
+            JSON_MOTION_TRACE_RECORD_CAPACITY
+            + JSON_MOTION_TRACE_PAGE_RECORDS
+            - 1
+        ) // JSON_MOTION_TRACE_PAGE_RECORDS - 1,
     )
 
 

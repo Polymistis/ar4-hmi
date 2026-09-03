@@ -22,6 +22,7 @@ from .schemas import (
     JSON_LIVE_MOTION_LEASE_MINIMUM_MILLISECONDS,
     JSON_MAIN_FIRMWARE_FRAME_RECEIVE_TIMEOUT_SECONDS,
     JSON_MAIN_COMMAND_MANIFEST,
+    JSON_POSITION_ROBOT_JOINT_COUNT,
     MAIN_CALIBRATE_COMMAND_CONTRACT,
     MAIN_CONFIG_EXT_AXIS_COMMAND_CONTRACT,
     MAIN_CONTROLLER_WAIT_COMMAND_CONTRACT,
@@ -564,7 +565,14 @@ class JsonMainMotionTraceAssembly:
             self._complete = True
         return self._complete
 
-    def artifact(self, *, controller_identity, motion_parameters, host_times_ns):
+    def artifact(
+        self,
+        *,
+        controller_identity,
+        measurement_scale,
+        motion_parameters,
+        host_times_ns,
+    ):
         if not self._complete or self._identity is None:
             raise JsonCommandSchemaError(
                 "motion-trace artifact requires a complete assembly"
@@ -619,8 +627,13 @@ class JsonMainMotionTraceAssembly:
             raise JsonCommandSchemaError(
                 "motion-trace motion parameters do not select this capture"
             )
+        scale, analysis = _analyze_main_motion_trace(
+            self._records,
+            measurement_scale,
+        )
         return {
-            "artifact_version": 1,
+            "artifact_version": 2,
+            "analysis": analysis,
             "capture_generation": capture_generation,
             "configuration_fingerprint": configuration_fingerprint,
             "controller_identity": dict(controller_identity),
@@ -632,14 +645,80 @@ class JsonMainMotionTraceAssembly:
                 "id": motion_request_id,
                 "params": dict(motion_parameters),
             },
+            "measurement_scale": scale,
             "records": [asdict(record) for record in self._records],
             "source_session_id": source_session_id,
         }
 
 
+def _analyze_main_motion_trace(records, measurement_scale):
+    scale_names = ("encoder_counts_per_step", "steps_per_degree")
+    if (
+        type(measurement_scale) is not dict
+        or frozenset(measurement_scale) != frozenset(scale_names)
+    ):
+        raise JsonCommandSchemaError("motion-trace measurement scale is invalid")
+    scale = {}
+    for name in scale_names:
+        values = measurement_scale[name]
+        if (
+            type(values) is not tuple
+            or len(values) != JSON_POSITION_ROBOT_JOINT_COUNT
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+                for value in values
+            )
+        ):
+            raise JsonCommandSchemaError(
+                f"motion-trace {name.replace('_', ' ')} is invalid"
+            )
+        scale[name] = list(values)
+    if not records:
+        raise JsonCommandSchemaError("motion-trace records are empty")
+    controller_times = [record.controller_microseconds for record in records]
+    if any(
+        earlier > later
+        for earlier, later in zip(controller_times, controller_times[1:])
+    ):
+        raise JsonCommandSchemaError("motion-trace controller time regressed")
+    duration = controller_times[-1] - controller_times[0]
+    joint_summaries = []
+    for joint_index in range(JSON_POSITION_ROBOT_JOINT_COUNT):
+        counts_per_step = scale["encoder_counts_per_step"][joint_index]
+        steps_per_degree = scale["steps_per_degree"][joint_index]
+        errors_steps = [
+            record.encoder_counts[joint_index] / counts_per_step
+            - record.commanded_steps[joint_index]
+            for record in records
+        ]
+        joint_summaries.append({
+            "initial_following_error_degrees": errors_steps[0] / steps_per_degree,
+            "initial_following_error_steps": errors_steps[0],
+            "joint": f"J{joint_index + 1}",
+            "maximum_absolute_following_error_degrees": (
+                max(abs(error) for error in errors_steps) / steps_per_degree
+            ),
+            "maximum_absolute_following_error_steps": max(
+                abs(error) for error in errors_steps
+            ),
+            "terminal_following_error_degrees": (
+                errors_steps[-1] / steps_per_degree
+            ),
+            "terminal_following_error_steps": errors_steps[-1],
+        })
+    return scale, {
+        "controller_duration_microseconds": duration,
+        "joint_following_error": joint_summaries,
+        "sample_count": len(records),
+    }
+
+
 def write_main_motion_trace_artifact(directory, artifact):
     """Atomically publish one validated local trace artifact."""
-    if type(artifact) is not dict or artifact.get("artifact_version") != 1:
+    if type(artifact) is not dict or artifact.get("artifact_version") != 2:
         raise JsonCommandSchemaError("motion-trace artifact is invalid")
     capture_generation = artifact.get("capture_generation")
     motion_request = artifact.get("motion_request")

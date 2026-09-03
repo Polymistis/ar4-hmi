@@ -232,6 +232,16 @@ flags. Every page repeats immutable identity and disposition
 metadata. Host assembly accepts exact page order from one generation only.
 Physical-stop and untrusted-session paths never retrieve a trace. Only a
 complete validated assembly can become one atomically promoted local artifact.
+Artifact version 2 binds the exact synchronized J1-J6 `steps_per_degree` and
+`encoder_counts_per_step` values to the capture configuration fingerprint. The
+artifact preserves every raw record and derives encoder-equivalent following
+error as `(encoder_counts / encoder_counts_per_step) - commanded_steps`. Its
+unit-labeled summary records sample count, controller-clock duration, and each
+joint's signed initial and terminal error plus maximum absolute error in steps
+and degrees. Capture `disposition` remains authoritative: incomplete,
+capacity-limited, clock-wrapped, and timing-overrun data are measurements, not
+validated performance results. Local capture artifacts are disposable; no
+reader or migration path supports the superseded artifact shape.
 
 `move_linear` wraps the exact `move_cartesian` parameters under `motion` and
 requires `rounding_millimeters: 0` plus `disable_wrist_rotation: false`. The

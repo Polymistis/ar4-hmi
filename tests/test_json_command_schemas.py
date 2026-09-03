@@ -1073,6 +1073,86 @@ class MainExternalAxisZeroSchemaTests(unittest.TestCase):
                 self.assert_invalid_response(response)
 
 
+class MainMotionTraceSchemaTests(unittest.TestCase):
+    def test_family_accepts_bounded_requests_and_exact_terminals(self):
+        contract = protocol_schemas.MAIN_GET_MOTION_TRACE_COMMAND_CONTRACT
+        maximum_page = (
+            protocol_schemas.JSON_MOTION_TRACE_RECORD_CAPACITY
+            + protocol_schemas.JSON_MOTION_TRACE_PAGE_RECORDS
+            - 1
+        ) // protocol_schemas.JSON_MOTION_TRACE_PAGE_RECORDS - 1
+        for page_index in (0, maximum_page):
+            with self.subTest(page_index=page_index):
+                self.assertIsNone(contract.request_validator({
+                    "motion_request_id": 17,
+                    "page_index": page_index,
+                }))
+        with self.assertRaises(JsonCommandSchemaError):
+            contract.request_validator({
+                "motion_request_id": 17,
+                "page_index": maximum_page + 1,
+            })
+
+        available = {
+            "capture_generation": 1,
+            "capture_state": "available",
+            "configuration_fingerprint": "sha256:" + "a" * 64,
+            "disposition": {
+                "capacity_limited": False,
+                "clock_wrapped": False,
+                "complete": True,
+                "motion_outcome": "completed",
+                "timing_overrun": False,
+            },
+            "firmware": sample_main_hello_result()["firmware"],
+            "page_count": 1,
+            "page_index": 0,
+            "record_start": 0,
+            "records": [{
+                "commanded_steps": [0] * 6,
+                "controller_microseconds": 1,
+                "encoder_counts": [0] * 6,
+                "flags": 0,
+                "master_index": 0,
+                "phase": 0,
+                "scheduled_delay_microseconds": 1,
+            }],
+            "source_motion_request_id": 17,
+            "source_session_id": sample_main_hello_result()["session_id"],
+            "total_records": 1,
+        }
+        for result in (
+            {"capture_state": "no_capture", "source_motion_request_id": 17},
+            available,
+        ):
+            with self.subTest(capture_state=result["capture_state"]):
+                self.assertIsNone(contract.response_validator(
+                    Response(18, "get_motion_trace", "completed", result)
+                ))
+        self.assertIsNone(contract.response_validator(Response(
+            18,
+            "get_motion_trace",
+            "rejected",
+            error=ProtocolFailure(
+                "session_not_established",
+                "request rejected",
+            ),
+        )))
+
+        malformed = Response(
+            18,
+            "get_motion_trace",
+            "rejected",
+            error=ProtocolFailure(
+                "invalid_parameter",
+                "request rejected",
+                {"field": "params", "unexpected": True},
+            ),
+        )
+        with self.assertRaises(JsonCommandSchemaError):
+            contract.response_validator(malformed)
+
+
 class MainControllerWaitSchemaTests(unittest.TestCase):
     def test_contract_accepts_only_the_exact_request_and_terminal_domain(self):
         self.assertEqual(MAIN_CONTROLLER_WAIT_COMMAND_CONTRACT.name, "controller_wait")

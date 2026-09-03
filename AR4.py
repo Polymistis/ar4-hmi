@@ -2071,9 +2071,9 @@ class ManualControllerCleanup:
 class MainControllerIdentityBinding:
   serial_port: object
   identity: ControllerIdentity
-  home_reference: Optional[PrimaryHomeReference] = None
-  configuration_fingerprint: Optional[str] = None
-  json_client: object = None
+  home_reference: PrimaryHomeReference
+  configuration: JsonMainControllerStartupConfiguration
+  json_client: JsonMainControllerClient
 
   def __post_init__(self):
     if self.serial_port is None or not getattr(self.serial_port, "is_open", False):
@@ -2082,28 +2082,15 @@ class MainControllerIdentityBinding:
       )
     if not isinstance(self.identity, ControllerIdentity):
       raise MotionInputError("main controller identity binding is invalid")
-    if (
-      self.home_reference is not None
-      and not isinstance(self.home_reference, PrimaryHomeReference)
-    ):
+    if not isinstance(self.home_reference, PrimaryHomeReference):
       raise MotionInputError(
         "main controller home-reference binding is invalid"
-      )
-    if self.home_reference is None:
-      raise MotionInputError(
-        "main controller home-reference binding is missing"
       )
     validate_controller_hardware_id(
       self.identity.controller_hardware_id
     )
-    if self.configuration_fingerprint is not None:
-      try:
-        validate_main_configuration_fingerprint(
-          self.configuration_fingerprint,
-          "main controller configuration fingerprint",
-        )
-      except JsonCommandSchemaError as exc:
-        raise MotionInputError(str(exc)) from exc
+    if type(self.configuration) is not JsonMainControllerStartupConfiguration:
+      raise MotionInputError("main controller configuration binding is invalid")
     if (
       type(self.json_client) is not JsonMainControllerClient
       or self.json_client.serial_port is not self.serial_port
@@ -2131,6 +2118,10 @@ class MainControllerIdentityBinding:
       raise MotionInputError(
         "main controller JSON identity is inconsistent"
       )
+
+  @property
+  def configuration_fingerprint(self):
+    return self.configuration.configuration_fingerprint
 
 
 class GCodeStorageStateLockError(RuntimeError):
@@ -4329,9 +4320,9 @@ def _request_manual_output(row, on_state, entry):
 def _bind_main_controller_identity(
   serial_port,
   identity,
-  home_reference=None,
-  configuration_fingerprint=None,
-  json_client=None,
+  home_reference,
+  configuration,
+  json_client,
 ):
   global main_controller_connection_epoch
   global main_controller_identity_binding
@@ -4342,7 +4333,7 @@ def _bind_main_controller_identity(
     serial_port,
     identity,
     home_reference,
-    configuration_fingerprint,
+    configuration,
     json_client,
   )
   with controller_identity_state_lock:
@@ -4391,7 +4382,7 @@ def _bind_main_controller_home_reference(serial_port, home_reference):
       serial_port,
       binding.identity,
       home_reference,
-      binding.configuration_fingerprint,
+      binding.configuration,
       binding.json_client,
     )
     return main_controller_identity_binding
@@ -4531,7 +4522,6 @@ def _bind_main_controller_configuration(serial_port, configuration):
 
   if not isinstance(configuration, JsonMainControllerStartupConfiguration):
     raise MotionInputError("main controller configuration binding is invalid")
-  fingerprint = configuration.configuration_fingerprint
   current_binding = _current_main_controller_identity(serial_port)
   if current_binding is None:
     raise ConnectionError(
@@ -4552,10 +4542,10 @@ def _bind_main_controller_configuration(serial_port, configuration):
       serial_port,
       binding.identity,
       binding.home_reference,
-      fingerprint,
+      configuration,
       binding.json_client,
     )
-  return fingerprint
+  return configuration.configuration_fingerprint
 
 
 def _current_primary_home_reference(serial_port=None):
@@ -4594,7 +4584,7 @@ def _invalidate_bound_primary_home_reference(serial_port):
           (False, False, False),
           (0.0, 0.0, 0.0),
         ),
-        binding.configuration_fingerprint,
+        binding.configuration,
         binding.json_client,
       )
     except ConnectionError as exc:
@@ -8812,7 +8802,7 @@ def _apply_controller_startup_result(
       startup_serial,
       result.controller_identity,
       result.home_reference,
-      json_bootstrap.configuration_fingerprint,
+      json_bootstrap.configuration,
       json_bootstrap.client,
     )
     _clear_controller_fault_latches_after_confirmed_startup(
@@ -22851,7 +22841,6 @@ def _toggle_next_joint_motion_trace():
   if (
     binding is None
     or not isinstance(binding.json_client, JsonMainControllerClient)
-    or binding.configuration_fingerprint is None
   ):
     _set_application_status(
       "JOINT MOTION CAPTURE REQUIRES A READY MAIN CONTROLLER",
@@ -22956,6 +22945,7 @@ def _retrieve_json_joint_motion_trace(
   host_times_ns["retrieved"] = time.time_ns()
   artifact = assembly.artifact(
     controller_identity=_motion_trace_controller_identity(binding),
+    measurement_scale=binding.configuration.motion_trace_scale,
     motion_parameters=motion_parameters,
     host_times_ns=host_times_ns,
   )
