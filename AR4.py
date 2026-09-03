@@ -79,6 +79,7 @@
 import sys
 import os
 import json
+import hashlib
 import secrets
 from datetime import datetime
 
@@ -183,16 +184,6 @@ from ARrobots.calibration_schema import (
   normalize_calibration_data,
   normalize_vision_background_color,
   reconcile_auxiliary_output_assignments,
-)
-from ARrobots.controller_trace import (
-  ControllerMotionProfile,
-  ControllerTraceMetadata,
-)
-from ARrobots.controller_trace_capture import (
-  ControllerTraceCapture,
-  ControllerTracePersistenceEvent,
-  ControllerTraceStore,
-  controller_configuration_fingerprint,
 )
 from ARrobots.serial_discovery import (
   MAIN_CONTROLLER_USB_ID,
@@ -450,7 +441,6 @@ if __name__ == "__main__":
 
 
   _joint_motion_shutdown_cleanup_diagnostics = set()
-JOINT_MOTION_TRACE_SHUTDOWN_WAIT_SECONDS = 1.0
 
 
 def _report_joint_motion_shutdown_cleanup_once(
@@ -561,31 +551,6 @@ def _close_joint_motion_dispatcher_for_shutdown():
       fault_detail,
     )
     return False
-  return False
-
-
-def _close_joint_motion_trace_store_for_shutdown():
-  store = globals().get('joint_motion_trace_store')
-  if store is None:
-    return True
-  try:
-    cleanup_complete = store.close(
-      JOINT_MOTION_TRACE_SHUTDOWN_WAIT_SECONDS
-    )
-  except Exception:
-    logger.exception("Controller trace store shutdown failed")
-    return False
-  _poll_joint_motion_trace_events()
-  if cleanup_complete is True:
-    return True
-  if cleanup_complete is not False:
-    logger.error(
-      "Controller trace store returned an invalid shutdown state"
-    )
-    return False
-  logger.error(
-    "Controller trace persistence remained active at process shutdown"
-  )
   return False
 
 
@@ -4555,9 +4520,7 @@ def _current_main_controller_identity(serial_port=None):
 def _bind_main_controller_configuration(serial_port, command):
   global main_controller_identity_binding
 
-  fingerprint = controller_configuration_fingerprint(
-    _validated_startup_command(command, "UP")
-  )
+  fingerprint = _controller_configuration_fingerprint(command)
   current_binding = _current_main_controller_identity(serial_port)
   if current_binding is None:
     raise ConnectionError(
@@ -5448,7 +5411,6 @@ def _poll_application_close():
     root.after(SERIAL_SHUTDOWN_RETRY_MS, _poll_application_close)
     return False
 
-  _close_joint_motion_trace_store_for_shutdown()
   if RUN['vtk_running']:
     on_close_event(RUN['interactor'], None)
   cv2.destroyAllWindows()
@@ -8835,7 +8797,7 @@ def _apply_controller_startup_result(
       startup_serial,
       result.controller_identity,
       result.home_reference,
-      controller_configuration_fingerprint(
+      _controller_configuration_fingerprint(
         startup_request.update_parameters_command
       ),
       (
@@ -20969,88 +20931,9 @@ def _current_joint_motion_profile():
   )
 
 
-if __name__ == "__main__":
-  joint_motion_trace_store = ControllerTraceStore()
-
-
-def _start_joint_motion_trace(command, binding):
-  try:
-    if not isinstance(binding, MainControllerIdentityBinding):
-      raise MotionInputError(
-        "controller trace requires a bound main-controller identity"
-      )
-    if binding.configuration_fingerprint is None:
-      raise MotionInputError(
-        "controller trace requires a bound configuration fingerprint"
-      )
-    snapshot = joint_motion_dispatcher.current_exchange_snapshot(command)
-    if snapshot is None:
-      raise MotionQueueFault(
-        "controller trace requires an active joint exchange snapshot"
-      )
-    profile = snapshot.profile
-    speed_mode = {
-      "Sp": "p",
-      "Ss": "s",
-    }.get(profile.speed_prefix)
-    if speed_mode is None:
-      raise MotionInputError(
-        "controller trace encountered an unsupported RJ speed mode"
-      )
-    metadata = ControllerTraceMetadata(
-      controller_hardware_id=(
-        binding.identity.controller_hardware_id
-      ),
-      firmware_version=binding.identity.firmware_version,
-      configuration_fingerprint=binding.configuration_fingerprint,
-      start_positions=snapshot.start_positions[:6],
-      target_positions=snapshot.target_positions[:6],
-      motion_profile=ControllerMotionProfile(
-        speed_mode=speed_mode,
-        speed_value=profile.speed,
-        acceleration_percent=profile.acceleration,
-        deceleration_percent=profile.deceleration,
-        ramp_percent=profile.ramp,
-      ),
-    )
-    return ControllerTraceCapture(metadata)
-  except Exception as exc:
-    joint_motion_trace_store.report_failure(
-      "Controller trace capture unavailable for the current joint exchange",
-      exc,
-    )
-    return None
-
-
-def _finish_joint_motion_trace(capture, response):
-  if capture is None:
-    return False
-  if not isinstance(response, JointMotionExchangeResult):
-    return capture.fail("JSON joint motion returned an invalid result")
-  position = response.position
-  if response.confirmed_position_unchanged:
-    return capture.fail(response.error)
-  if position_response_is_physical_estop(position):
-    return capture.stop(
-      position.joints,
-      response.error or "physical E-stop response",
-    )
-  if response.error is not None:
-    return capture.fail(response.error, position.joints)
-  return capture.complete(position.joints)
-
-
-def _submit_joint_motion_trace(capture):
-  if capture is None:
-    return False
-  try:
-    return joint_motion_trace_store.submit(capture)
-  except Exception as exc:
-    joint_motion_trace_store.report_failure(
-      "Controller trace could not enter the background persistence queue",
-      exc,
-    )
-    return False
+def _controller_configuration_fingerprint(command):
+  command = _validated_startup_command(command, "UP")
+  return "sha256:" + hashlib.sha256(command.encode("ascii")).hexdigest()
 
 
 def _canonical_json_message_text(message):
@@ -21934,7 +21817,6 @@ def _exchange_json_controller_diagnostic(
     terminal, stop_published = _await_json_joint_motion_terminal(
       client,
       ticket,
-      None,
       _capture_main_controller_stop_context(client.serial_port),
       False,
       command_name=command_name,
@@ -22011,7 +21893,6 @@ def _exchange_main_controller_diagnostic(
 def _await_json_joint_motion_terminal(
   client,
   ticket,
-  trace_capture,
   stop_context,
   telemetry_enabled,
   command_name="move_joints",
@@ -22048,8 +21929,6 @@ def _await_json_joint_motion_terminal(
         )
       sample = parse_main_joint_position_telemetry(delivery.telemetry)
       raw = _canonical_json_message_text(delivery.telemetry)
-      if trace_capture is not None:
-        trace_capture.record_telemetry(sample.robot_joints_degrees)
       joint_motion_dispatcher.publish_position_telemetry(
         raw,
         sample.robot_joints_degrees,
@@ -22169,7 +22048,6 @@ def _exchange_json_controller_correction(
     terminal, stop_published = _await_json_joint_motion_terminal(
       client,
       ticket,
-      None,
       stop_context,
       False,
       command_name="correct_position",
@@ -22337,7 +22215,6 @@ def _exchange_json_completed_request(
     terminal, stop_published = _await_json_joint_motion_terminal(
       client,
       ticket,
-      None,
       stop_context,
       False,
       command_name=command_name,
@@ -22794,7 +22671,6 @@ def _exchange_json_controller_position(binding, response_timeout):
     terminal, stop_published = _await_json_joint_motion_terminal(
       client,
       ticket,
-      None,
       stop_context,
       False,
       command_name="get_position_disposition",
@@ -22900,7 +22776,6 @@ def _exchange_json_joint_motion_request(
   stop_context,
   response_timeout,
   telemetry_enabled,
-  trace_capture,
   write_admission,
 ):
   client = binding.json_client
@@ -22925,7 +22800,6 @@ def _exchange_json_joint_motion_request(
     terminal, stop_published = _await_json_joint_motion_terminal(
       client,
       ticket,
-      trace_capture,
       stop_context,
       telemetry_enabled,
     )
@@ -22970,7 +22844,6 @@ def _exchange_json_joint_motion(
   stop_context,
   response_timeout,
   telemetry_enabled,
-  trace_capture,
 ):
   return _exchange_json_joint_motion_request(
     _json_joint_motion_parameters(command, telemetry_enabled),
@@ -22978,8 +22851,7 @@ def _exchange_json_joint_motion(
     stop_context,
     response_timeout,
     telemetry_enabled,
-    trace_capture,
-    trace_capture,
+    None,
   )
 
 
@@ -23001,7 +22873,6 @@ def _exchange_json_program_joint_motion(
     stop_context,
     response_timeout,
     False,
-    None,
     _json_motion_write_admission(
       write_started_event,
       write_cancellation_boundary,
@@ -23105,7 +22976,6 @@ def _exchange_json_cartesian_motion(
     terminal, stop_published = _await_json_joint_motion_terminal(
       client,
       ticket,
-      None,
       stop_context,
       False,
       command_name=command_name,
@@ -23178,7 +23048,6 @@ def _exchange_json_tool_jog(
     terminal, stop_published = _await_json_joint_motion_terminal(
       client,
       ticket,
-      None,
       stop_context,
       False,
       command_name="jog_tool",
@@ -23336,14 +23205,11 @@ def _exchange_program_joint_motion(
 
 def _exchange_joint_motion(command):
   serial_port = RUN.get('ser')
-  trace_capture = None
   try:
     binding = _current_main_controller_identity(serial_port)
     stop_context = _capture_main_controller_stop_context(serial_port)
     telemetry_enabled = True
     response_timeout = _controller_response_timeout(command)
-    if telemetry_enabled:
-      trace_capture = _start_joint_motion_trace(command, binding)
 
     if binding is None or not isinstance(
       binding.json_client,
@@ -23356,26 +23222,13 @@ def _exchange_joint_motion(command):
       stop_context,
       response_timeout,
       telemetry_enabled,
-      trace_capture,
     )
-    _finish_joint_motion_trace(trace_capture, result)
     return result
-  except Exception as exc:
-    if trace_capture is not None:
-      trace_capture.fail(exc)
-    raise
   finally:
-    try:
-      _submit_joint_motion_trace(trace_capture)
-    finally:
-      if (
-        RUN.get('ser') is serial_port
-        and not getattr(serial_port, "is_open", False)
-      ):
-        _require_main_controller_identity_cleanup(
-          serial_port,
-          "joint-motion controller exchange cleanup",
-        )
+    if RUN.get('ser') is serial_port and not getattr(serial_port, "is_open", False):
+      _require_main_controller_identity_cleanup(
+        serial_port, "joint-motion controller exchange cleanup",
+      )
 
 
 if __name__ == "__main__":
@@ -23707,28 +23560,6 @@ def _start_offline_joint_motion(command):
   return True
 
 
-def _poll_joint_motion_trace_events():
-  try:
-    events = joint_motion_trace_store.drain_events()
-  except Exception:
-    logger.exception("Unable to drain controller trace persistence events")
-    return False
-  for event in events:
-    if not isinstance(event, ControllerTracePersistenceEvent):
-      logger.error("Controller trace store returned an invalid event")
-      continue
-    if event.kind == "saved":
-      if event.analysis is None:
-        logger.warning("%s: %s", event.detail, event.path)
-      else:
-        logger.info("%s: %s", event.detail, event.path)
-    elif event.kind == "dropped":
-      logger.warning("%s", event.detail)
-    else:
-      logger.error("%s", event.detail)
-  return len(events)
-
-
 def _poll_joint_motion_events():
   try:
     for event in joint_motion_dispatcher.drain_events():
@@ -23930,10 +23761,7 @@ def _poll_joint_motion_events():
       _try_dispatch_deferred_joint_adjustments()
     _refresh_joint_motion_visualization()
   finally:
-    try:
-      _poll_joint_motion_trace_events()
-    finally:
-      _reschedule_event_poll("joint-motion")
+    _reschedule_event_poll("joint-motion")
 
 
 def _queue_joint_motion(axis, value, absolute):
@@ -29183,7 +29011,6 @@ def _exchange_json_calibration(
     terminal, stop_published = _await_json_joint_motion_terminal(
       client,
       ticket,
-      None,
       stop_context,
       False,
       command_name="calibrate",
