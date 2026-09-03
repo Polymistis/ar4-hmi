@@ -1,5 +1,5 @@
 # AR4 Control Software
-**Host source 7.0 — tracked Teensy derivative 6.7.1-ar4hmi.38**
+**Host source 7.0 — tracked Teensy derivative 6.7.1-ar4hmi.39**
 
 ![AR4 Logo](AR.png)
 
@@ -90,8 +90,8 @@ auxiliary activity settles. Failure after write admission is diagnosed without
 automatic retry.
 
 ## 🧠 Troubleshooting
-- **Serial connection issues** → Verify the correct COM port and matched JSON-only firmware: Teensy `6.7.1-ar4hmi.38` plus Nano/Mega `2.0`. Startup requires the exact command manifests defined by the [JSON protocol](docs/json-protocol-v1.md); legacy serial commands and fallback are not supported.
-- **Motion tracking shows estimates only** → Request-scoped J1-J6 encoder telemetry is selected by JSON `move_joints`. J7-J9 remain estimated because no matching encoder sources are configured.
+- **Serial connection issues** → Verify the correct COM port and matched JSON-only firmware: Teensy `6.7.1-ar4hmi.39` plus Nano/Mega `2.0`. Startup requires the exact command manifests defined by the [JSON protocol](docs/json-protocol-v1.md); legacy serial commands and fallback are not supported.
+- **Motion tracking shows estimates only** → Request-scoped J1-J6 encoder telemetry is selected by ordinary JSON `move_joints`. The one-shot **Capture next joint move** control disables live telemetry for the selected manual move, retrieves the controller-clock trace after trusted settlement, and writes a local artifact under `logs/motion-traces/`. J7-J9 remain estimated because no matching encoder sources are configured.
 - **Shutdown Position unavailable** → JSON startup obtains the J1-J3 home reference after configuration. Complete J2 and J3 homing after controller startup or parameter and forced-position updates.
 - **Display lag in visualization** → Disable real-time rendering under *Settings → Viewer Options*.
 

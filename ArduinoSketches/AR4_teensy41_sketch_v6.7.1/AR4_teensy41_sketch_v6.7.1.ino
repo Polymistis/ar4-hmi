@@ -66,7 +66,7 @@
 // 6.6 - 2/22/26 - update kinematic solver to reduce J4/6 wrap | reimplement wrist N/F config
 // 6.7 - 3/11/26 MB holding reg bug fix
 // 6.7.1 - 3/11/26 bug fix calibration debounce
-const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.38";
+const char *FIRMWARE_VERSION = "6.7.1-ar4hmi.39";
 const char *JSON_FIRMWARE_NAME = "AR4 Teensy";
 const char *JSON_FIRMWARE_BUILD = "tracked";
 
@@ -116,7 +116,8 @@ constexpr size_t PROTOCOL_CAPABILITY_COUNT =
 const char *const JSON_COMMANDS[] = {
   "hello", "get_home_reference", "get_position_disposition",
   "correct_position", "set_position", "test_limit_switches", "set_encoders",
-  "read_encoders", "update_params", "config_ext_axis", "zero_j7", "zero_j8",
+  "read_encoders", "get_motion_trace", "update_params", "config_ext_axis",
+  "zero_j7", "zero_j8",
   "zero_j9", "controller_wait", "calibrate", "move_joints", "move_cartesian",
   "move_linear", "move_vision", "jog_tool", "live_joint_jog", "live_cart_jog",
   "live_tool_jog", "stop", "renew_live_motion", "modbus_read_holding_register",
@@ -164,6 +165,13 @@ ar4_protocol::JsonMainControllerFrameView jsonResponseWriteView = {};
 ar4_protocol::JsonEventFrameView jsonEventWriteView = {};
 ar4_protocol::JsonMainControllerRequestOwner jsonMainControllerOwner;
 ar4_protocol::JsonControllerEventOutputOwner jsonControllerEventOwner;
+DMAMEM uint8_t controllerMotionTraceStorage[
+  ar4_protocol::kControllerMotionTraceBufferBytes
+] __attribute__((aligned(4)));
+ar4_protocol::ControllerMotionTraceCapture controllerMotionTrace(
+  controllerMotionTraceStorage,
+  sizeof(controllerMotionTraceStorage)
+);
 uint32_t jsonJointTelemetrySequence = 0;
 using ar4_protocol::JsonLiveMotionRuntimeState;
 struct JsonLiveMotionRuntime {
@@ -2514,6 +2522,36 @@ void begin_telemetry_response_ownership(bool telemetryRequested) {
   interrupts();
 }
 
+void record_controller_motion_trace_state(
+  ar4_protocol::ControllerMotionTraceCapture &capture,
+  uint32_t masterIndex,
+  uint32_t scheduledDelayMicroseconds,
+  const int (&commandedSteps)[9],
+  uint8_t phase
+) {
+  if (!capture.needs_state(masterIndex)) return;
+  const int32_t commanded[ROBOT_nDOFs] = {
+    commandedSteps[0], commandedSteps[1], commandedSteps[2],
+    commandedSteps[3], commandedSteps[4], commandedSteps[5],
+  };
+  const int32_t encoders[ROBOT_nDOFs] = {
+    static_cast<int32_t>(J1encPos.read()),
+    static_cast<int32_t>(J2encPos.read()),
+    static_cast<int32_t>(J3encPos.read()),
+    static_cast<int32_t>(J4encPos.read()),
+    static_cast<int32_t>(J5encPos.read()),
+    static_cast<int32_t>(J6encPos.read()),
+  };
+  capture.record_state(
+    masterIndex,
+    scheduledDelayMicroseconds,
+    commanded,
+    encoders,
+    phase,
+    static_cast<uint32_t>(micros())
+  );
+}
+
 bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, int J6step, int J7step, int J8step, int J9step,
                   int J1dir, int J2dir, int J3dir, int J4dir, int J5dir, int J6dir, int J7dir, int J8dir, int J9dir,
                   String SpeedType, float SpeedVal, float ACCspd, float DCCspd, float ACCramp,
@@ -2521,7 +2559,9 @@ bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
                   bool telemetryRequested,
                   const ar4_protocol::JsonLiveMotionContinuationSource *
                     continuationSource = nullptr,
-                  bool roundingContinuationEnabled = true) {
+                  bool roundingContinuationEnabled = true,
+                  const ar4_protocol::ControllerMotionTraceRequest *
+                    traceRequest = nullptr) {
   if (!roundingContinuationEnabled) {
     ar4_protocol::consume_motion_rounding_continuation(false, rndTrue);
   }
@@ -2658,6 +2698,28 @@ bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
   )) return false;
   if (motionModes != nullptr) motionModes->commit();
 
+  ar4_protocol::ControllerMotionTraceCapture *traceCapture = nullptr;
+  if (traceRequest != nullptr) {
+    if (
+      traceRequest->capture == nullptr
+      || !traceRequest->capture->begin(
+        traceRequest->source_motion_request_id,
+        traceRequest->source_session_id,
+        traceRequest->configuration_fingerprint,
+        static_cast<uint32_t>(HighStep),
+        static_cast<uint32_t>(micros())
+      )
+    ) return false;
+    traceCapture = traceRequest->capture;
+    record_controller_motion_trace_state(
+      *traceCapture,
+      0,
+      0,
+      stepMonitors,
+      0
+    );
+  }
+
   // Timing rejection must precede every output-pin mutation.
   for (int i = 0; i < numJoints; i++) {
     digitalWrite(dirPins[i], dirs[i] == motDirs[i] ? HIGH : LOW);
@@ -2705,7 +2767,6 @@ bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
 
     float distDelay = 30;
     float disDelayCur = 0;
-
     for (int i = 0; i < 9; i++) {
       if (cur[i] < steps[i]) {
         PE[i] = (HighStep / steps[i]);
@@ -2787,8 +2848,24 @@ bool driveMotorsJ(int J1step, int J2step, int J3step, int J4step, int J5step, in
       lastTelemetryAttempt = pulseWaitStarted;
       emit_joint_telemetry();
     }
+    if (traceCapture != nullptr) {
+      const uint8_t tracePhase = highStepCur - 1 < ACCStep
+        ? 0
+        : highStepCur - 1 >= (HighStep - DCCStep) ? 2 : 1;
+      record_controller_motion_trace_state(
+        *traceCapture,
+        static_cast<uint32_t>(highStepCur),
+        pulseDelay,
+        stepMonitors,
+        tracePhase
+      );
+    }
     const uint32_t telemetryWorkMicroseconds =
       static_cast<uint32_t>(micros() - pulseWaitStarted);
+    if (
+      traceCapture != nullptr
+      && telemetryWorkMicroseconds >= pulseDelay
+    ) traceCapture->note_timing_overrun();
     if (continuationSource == nullptr) {
       if (telemetryWorkMicroseconds < pulseDelay) {
         delayMicroseconds(pulseDelay - telemetryWorkMicroseconds);
@@ -3998,12 +4075,21 @@ bool execute_prepared_json_motion(
   PreparedJsonMotionResult &result,
   const ar4_protocol::JsonLiveMotionContinuationSource *
     continuationSource,
-  bool gcodeTiming = false
+  bool gcodeTiming = false,
+  const ar4_protocol::ControllerMotionTraceRequest *traceRequest = nullptr
 ) {
   result = {};
   if (!ar4_protocol::json_live_motion_continuation_source_valid(
       continuationSource
   )) return false;
+  if (
+    traceRequest != nullptr
+    && (
+      gcodeTiming
+      || continuationSource != nullptr
+      || telemetryRequested
+    )
+  ) return false;
   const int currentSteps[numJoints] = {
     J1StepM,
     J2StepM,
@@ -4133,7 +4219,9 @@ bool execute_prepared_json_motion(
     rampPercent,
     &motionModes,
     telemetryRequested,
-    continuationSource
+    continuationSource,
+    true,
+    traceRequest
   );
   const bool telemetryOwnershipCompleted =
     complete_json_telemetry_ownership(
@@ -4174,6 +4262,16 @@ bool execute_prepared_json_motion(
   }
   speedViolation = "0";
   flag = "";
+  if (traceRequest != nullptr && traceRequest->capture != nullptr) {
+    ar4_protocol::ControllerMotionTraceOutcome traceOutcome =
+      ar4_protocol::ControllerMotionTraceOutcome::kFailed;
+    if (result.outcome == PreparedJsonMotionOutcome::kCompleted) {
+      traceOutcome = ar4_protocol::ControllerMotionTraceOutcome::kCompleted;
+    } else if (result.outcome == PreparedJsonMotionOutcome::kEmergencyStop) {
+      traceOutcome = ar4_protocol::ControllerMotionTraceOutcome::kCancelled;
+    }
+    traceRequest->capture->finalize(traceOutcome);
+  }
   return true;
 }
 
@@ -4536,6 +4634,7 @@ bool execute_json_move_cartesian(
 
 
 bool execute_json_move_joints(
+  uint32_t requestId,
   const ar4_protocol::JsonMainMoveJointsParameters &params,
   ar4_protocol::JsonMainMoveJointsExecutionResult &result,
   void *context
@@ -4547,6 +4646,15 @@ bool execute_json_move_joints(
   if (!ar4_protocol::json_live_motion_continuation_source_valid(
       continuationSource
   )) return false;
+  const bool traceRequested =
+    params.trace_configuration_fingerprint[0] != '\0';
+  if (traceRequested && requestId == 0) return false;
+  const ar4_protocol::ControllerMotionTraceRequest traceRequest = {
+    &controllerMotionTrace,
+    requestId,
+    json_session_id,
+    params.trace_configuration_fingerprint,
+  };
   result = {};
 
   float positions[numJoints] = {};
@@ -4678,7 +4786,9 @@ bool execute_json_move_joints(
     loopModes,
     params.telemetry_enabled,
     prepared,
-    continuationSource
+    continuationSource,
+    false,
+    traceRequested ? &traceRequest : nullptr
   )) {
     return false;
   }
@@ -4835,6 +4945,7 @@ bool execute_json_jog_tool_with_telemetry(
 
   ar4_protocol::JsonMainMoveJointsExecutionResult jointResult = {};
   if (!execute_json_move_joints(
+      0,
       jointParams,
       jointResult,
       continuationSource
@@ -5235,6 +5346,7 @@ bool execute_json_live_joint_segment() {
     nullptr,
   };
   const bool executed = execute_json_move_joints(
+    0,
     params,
     result,
     &continuation
@@ -5921,6 +6033,13 @@ void process_json_serial_frame(const String &frame) {
     execute_json_diagnostic,
     nullptr,
   };
+  const ar4_protocol::JsonMainMotionTraceResponseSource motionTrace = {
+    &controllerMotionTrace,
+    json_session_id,
+    JSON_FIRMWARE_NAME,
+    FIRMWARE_VERSION,
+    JSON_FIRMWARE_BUILD,
+  };
   const ar4_protocol::JsonMainCalibrationCommandSource calibration = {
     execute_json_calibration,
     nullptr,
@@ -5968,6 +6087,7 @@ void process_json_serial_frame(const String &frame) {
     &jogTool,
     &liveJog,
     &diagnostics,
+    &motionTrace,
     &calibration,
     &correctPosition,
     &zeroExternalAxis,

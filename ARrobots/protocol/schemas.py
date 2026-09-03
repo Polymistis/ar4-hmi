@@ -34,6 +34,8 @@ JSON_POSITION_CARTESIAN_TRANSLATION_COUNT = 3
 JSON_POSITION_CARTESIAN_ORIENTATION_COUNT = 3
 JSON_POSITION_SOURCE_CONTROLLER_STEP_STATE = "controller_step_state"
 JSON_HOME_REFERENCE_AXIS_COUNT = 3
+JSON_MOTION_TRACE_RECORD_CAPACITY = 1024
+JSON_MOTION_TRACE_PAGE_RECORDS = 8
 
 _SIGNED_INT32_MINIMUM = -(2 ** 31)
 _SIGNED_INT32_MAXIMUM = 2 ** 31 - 1
@@ -47,7 +49,7 @@ JSON_CONTROLLER_WAIT_MAXIMUM_SECONDS = 2147483
 JSON_LIVE_MOTION_LEASE_MINIMUM_MILLISECONDS = 1000
 JSON_LIVE_MOTION_LEASE_MAXIMUM_MILLISECONDS = 5000
 JSON_MAIN_FIRMWARE_FRAME_RECEIVE_TIMEOUT_SECONDS = 5.0
-_JSON_MAIN_FIRMWARE_IDENTITY = ("AR4 Teensy", "6.7.1-ar4hmi.38", "tracked")
+_JSON_MAIN_FIRMWARE_IDENTITY = ("AR4 Teensy", "6.7.1-ar4hmi.39", "tracked")
 _JSON_AUXILIARY_FIRMWARE_IDENTITIES = {
     "nano": ("AR4 Nano IO", "2.0", "ar4hmi"),
     "mega": ("AR4 Mega IO", "2.0", "ar4hmi"),
@@ -76,6 +78,9 @@ _SESSION_IDENTIFIER_PATTERN = re.compile(
 )
 _CONTROLLER_MEDIA_IDENTIFIER_PATTERN = re.compile(
     rf"[0-9A-F]{{{JSON_CONTROLLER_MEDIA_IDENTIFIER_LENGTH}}}\Z"
+)
+_CONFIGURATION_FINGERPRINT_PATTERN = re.compile(
+    r"sha256:[0-9a-f]{64}\Z"
 )
 _CONTROLLER_FILENAME_RESERVED_CHARACTERS = frozenset('"*/,:<>?\\|')
 _POSITION_CONTROLLER_DEBUG_PATTERN = re.compile(
@@ -249,6 +254,7 @@ _MOVE_JOINTS_REQUEST_FIELDS = frozenset(
         "speed_mode",
         "speed_value",
         "telemetry_enabled",
+        "trace_configuration_fingerprint",
         "wrist_configuration",
     )
 )
@@ -343,6 +349,48 @@ _MOVE_JOINTS_LIMIT_REJECTION_FIELDS = frozenset(("axes",))
 _MOVE_JOINTS_TELEMETRY_FIELDS = frozenset(
     ("robot_joints_millidegrees",)
 )
+_MOTION_TRACE_REQUEST_FIELDS = frozenset(
+    ("motion_request_id", "page_index")
+)
+_MOTION_TRACE_NO_CAPTURE_RESULT_FIELDS = frozenset(
+    ("capture_state", "source_motion_request_id")
+)
+_MOTION_TRACE_PAGE_RESULT_FIELDS = frozenset(
+    (
+        "capture_generation",
+        "capture_state",
+        "configuration_fingerprint",
+        "disposition",
+        "firmware",
+        "page_count",
+        "page_index",
+        "record_start",
+        "records",
+        "source_motion_request_id",
+        "source_session_id",
+        "total_records",
+    )
+)
+_MOTION_TRACE_DISPOSITION_FIELDS = frozenset(
+    (
+        "capacity_limited",
+        "clock_wrapped",
+        "complete",
+        "motion_outcome",
+        "timing_overrun",
+    )
+)
+_MOTION_TRACE_RECORD_FIELDS = frozenset(
+    (
+        "commanded_steps",
+        "controller_microseconds",
+        "encoder_counts",
+        "flags",
+        "master_index",
+        "phase",
+        "scheduled_delay_microseconds",
+    )
+)
 _MAIN_REJECTED_ERROR_DETAILS = MappingProxyType(
     {
         "malformed_frame": MappingProxyType({}),
@@ -395,6 +443,11 @@ _DIAGNOSTIC_REJECTED_ERROR_DETAILS = MappingProxyType(
 _MOVE_JOINTS_EMPTY_REJECTED_ERROR_DETAILS = MappingProxyType(
     {
         "configuration_sync_required": MappingProxyType({}),
+        "session_not_established": MappingProxyType({}),
+    }
+)
+_MOTION_TRACE_REJECTED_ERROR_DETAILS = MappingProxyType(
+    {
         "session_not_established": MappingProxyType({}),
     }
 )
@@ -490,6 +543,24 @@ def _require_request_identifier(value, field_name):
         type(value) is not int
         or value < 1
         or value > JSON_PROTOCOL_MAXIMUM_IDENTIFIER
+    ):
+        raise JsonCommandSchemaError(f"{field_name} is invalid")
+    return value
+
+
+def _require_unsigned_integer(value, field_name, *, maximum):
+    if type(value) is not int or value < 0 or value > maximum:
+        raise JsonCommandSchemaError(f"{field_name} is invalid")
+    return value
+
+
+def validate_main_configuration_fingerprint(
+    value,
+    field_name="configuration fingerprint",
+):
+    if (
+        type(value) is not str
+        or _CONFIGURATION_FINGERPRINT_PATTERN.fullmatch(value) is None
     ):
         raise JsonCommandSchemaError(f"{field_name} is invalid")
     return value
@@ -1065,6 +1136,196 @@ class JsonMainJointMotionResult:
 
 
 @dataclass(frozen=True)
+class JsonMainMotionTraceRecord:
+    controller_microseconds: int
+    master_index: int
+    scheduled_delay_microseconds: int
+    commanded_steps: tuple
+    encoder_counts: tuple
+    phase: int
+    flags: int
+
+    def __post_init__(self):
+        _require_unsigned_integer(
+            self.controller_microseconds,
+            "motion-trace controller time",
+            maximum=0xFFFFFFFF,
+        )
+        _require_unsigned_integer(
+            self.master_index,
+            "motion-trace master index",
+            maximum=0xFFFFFFFF,
+        )
+        _require_unsigned_integer(
+            self.scheduled_delay_microseconds,
+            "motion-trace scheduled delay",
+            maximum=0xFFFFFFFF,
+        )
+        if type(self.commanded_steps) is not tuple:
+            raise JsonCommandSchemaError(
+                "motion-trace commanded steps must be immutable"
+            )
+        _require_signed_int32_tuple(
+            self.commanded_steps,
+            JSON_POSITION_ROBOT_JOINT_COUNT,
+            "motion-trace commanded steps",
+        )
+        if type(self.encoder_counts) is not tuple:
+            raise JsonCommandSchemaError(
+                "motion-trace encoder counts must be immutable"
+            )
+        _require_signed_int32_tuple(
+            self.encoder_counts,
+            JSON_POSITION_ROBOT_JOINT_COUNT,
+            "motion-trace encoder counts",
+        )
+        _require_unsigned_integer(
+            self.phase,
+            "motion-trace phase",
+            maximum=2,
+        )
+        _require_unsigned_integer(
+            self.flags,
+            "motion-trace flags",
+            maximum=0x03,
+        )
+
+
+@dataclass(frozen=True)
+class JsonMainMotionTraceDisposition:
+    complete: bool
+    capacity_limited: bool
+    clock_wrapped: bool
+    motion_outcome: str
+    timing_overrun: bool
+
+    def __post_init__(self):
+        if any(
+            type(value) is not bool
+            for value in (
+                self.complete,
+                self.capacity_limited,
+                self.clock_wrapped,
+                self.timing_overrun,
+            )
+        ):
+            raise JsonCommandSchemaError(
+                "motion-trace disposition flags must be boolean"
+            )
+        if self.motion_outcome not in ("cancelled", "completed", "failed"):
+            raise JsonCommandSchemaError(
+                "motion-trace motion outcome is invalid"
+            )
+
+
+@dataclass(frozen=True)
+class JsonMainMotionTraceNoCaptureResult:
+    source_motion_request_id: int
+    capture_state: str = "no_capture"
+
+    def __post_init__(self):
+        if self.capture_state != "no_capture":
+            raise JsonCommandSchemaError(
+                "motion-trace empty capture state is invalid"
+            )
+        _require_request_identifier(
+            self.source_motion_request_id,
+            "motion-trace source request identifier",
+        )
+
+
+@dataclass(frozen=True)
+class JsonMainMotionTracePageResult:
+    capture_generation: int
+    configuration_fingerprint: str
+    disposition: JsonMainMotionTraceDisposition
+    firmware: JsonHelloFirmware
+    page_count: int
+    page_index: int
+    record_start: int
+    records: tuple
+    source_motion_request_id: int
+    source_session_id: str
+    total_records: int
+    capture_state: str = "available"
+
+    def __post_init__(self):
+        if self.capture_state != "available":
+            raise JsonCommandSchemaError(
+                "motion-trace available capture state is invalid"
+            )
+        _require_request_identifier(
+            self.capture_generation,
+            "motion-trace capture generation",
+        )
+        validate_main_configuration_fingerprint(
+            self.configuration_fingerprint,
+            "motion-trace configuration fingerprint",
+        )
+        if type(self.disposition) is not JsonMainMotionTraceDisposition:
+            raise JsonCommandSchemaError(
+                "motion-trace disposition is invalid"
+            )
+        if (
+            type(self.firmware) is not JsonHelloFirmware
+            or (
+                self.firmware.name,
+                self.firmware.version,
+                self.firmware.build,
+            ) != _JSON_MAIN_FIRMWARE_IDENTITY
+        ):
+            raise JsonCommandSchemaError(
+                "motion-trace firmware identity is invalid"
+            )
+        _require_unsigned_integer(
+            self.total_records,
+            "motion-trace total record count",
+            maximum=JSON_MOTION_TRACE_RECORD_CAPACITY,
+        )
+        if self.total_records < 1:
+            raise JsonCommandSchemaError(
+                "motion-trace total record count is invalid"
+            )
+        expected_page_count = (
+            self.total_records + JSON_MOTION_TRACE_PAGE_RECORDS - 1
+        ) // JSON_MOTION_TRACE_PAGE_RECORDS
+        if self.page_count != expected_page_count:
+            raise JsonCommandSchemaError(
+                "motion-trace page count is invalid"
+            )
+        if (
+            type(self.page_index) is not int
+            or self.page_index < 0
+            or self.page_index >= self.page_count
+            or self.record_start
+            != self.page_index * JSON_MOTION_TRACE_PAGE_RECORDS
+        ):
+            raise JsonCommandSchemaError(
+                "motion-trace page bounds are invalid"
+            )
+        expected_records = min(
+            JSON_MOTION_TRACE_PAGE_RECORDS,
+            self.total_records - self.record_start,
+        )
+        if (
+            type(self.records) is not tuple
+            or len(self.records) != expected_records
+            or any(
+                type(record) is not JsonMainMotionTraceRecord
+                for record in self.records
+            )
+        ):
+            raise JsonCommandSchemaError(
+                "motion-trace page records are invalid"
+            )
+        _require_request_identifier(
+            self.source_motion_request_id,
+            "motion-trace source request identifier",
+        )
+        _require_session_identifier(self.source_session_id)
+
+
+@dataclass(frozen=True)
 class JsonMainCalibrationResult:
     position: JsonMainPositionResult
     speed_limited: bool
@@ -1490,6 +1751,99 @@ def parse_main_move_joints_result(result):
             "move-joints controller debug value",
             maximum_length=JSON_HELLO_MAXIMUM_TEXT_LENGTH,
         ),
+    )
+
+
+def parse_main_motion_trace_result(result):
+    if type(result) not in (dict, MappingProxyType):
+        raise JsonCommandSchemaError(
+            "motion-trace result must be an object"
+        )
+    capture_state = result.get("capture_state")
+    if capture_state == "no_capture":
+        payload = _require_exact_object(
+            result,
+            _MOTION_TRACE_NO_CAPTURE_RESULT_FIELDS,
+            "motion-trace empty result",
+        )
+        return JsonMainMotionTraceNoCaptureResult(
+            source_motion_request_id=_require_request_identifier(
+                payload["source_motion_request_id"],
+                "motion-trace source request identifier",
+            ),
+        )
+    if capture_state != "available":
+        raise JsonCommandSchemaError("motion-trace capture state is invalid")
+    payload = _require_exact_object(
+        result,
+        _MOTION_TRACE_PAGE_RESULT_FIELDS,
+        "motion-trace page result",
+    )
+    disposition_payload = _require_exact_object(
+        payload["disposition"],
+        _MOTION_TRACE_DISPOSITION_FIELDS,
+        "motion-trace disposition",
+    )
+    disposition = JsonMainMotionTraceDisposition(
+        complete=disposition_payload["complete"],
+        capacity_limited=disposition_payload["capacity_limited"],
+        clock_wrapped=disposition_payload["clock_wrapped"],
+        motion_outcome=disposition_payload["motion_outcome"],
+        timing_overrun=disposition_payload["timing_overrun"],
+    )
+    firmware_payload = _require_exact_object(
+        payload["firmware"],
+        _HELLO_FIRMWARE_FIELDS,
+        "motion-trace firmware",
+    )
+    firmware = JsonHelloFirmware(
+        name=firmware_payload["name"],
+        version=firmware_payload["version"],
+        build=firmware_payload["build"],
+    )
+    records_payload = payload["records"]
+    if type(records_payload) not in (list, tuple):
+        raise JsonCommandSchemaError(
+            "motion-trace records must be an array"
+        )
+    records = []
+    for record_payload in records_payload:
+        record = _require_exact_object(
+            record_payload,
+            _MOTION_TRACE_RECORD_FIELDS,
+            "motion-trace record",
+        )
+        records.append(JsonMainMotionTraceRecord(
+            controller_microseconds=record["controller_microseconds"],
+            master_index=record["master_index"],
+            scheduled_delay_microseconds=(
+                record["scheduled_delay_microseconds"]
+            ),
+            commanded_steps=_require_signed_int32_tuple(
+                record["commanded_steps"],
+                JSON_POSITION_ROBOT_JOINT_COUNT,
+                "motion-trace commanded steps",
+            ),
+            encoder_counts=_require_signed_int32_tuple(
+                record["encoder_counts"],
+                JSON_POSITION_ROBOT_JOINT_COUNT,
+                "motion-trace encoder counts",
+            ),
+            phase=record["phase"],
+            flags=record["flags"],
+        ))
+    return JsonMainMotionTracePageResult(
+        capture_generation=payload["capture_generation"],
+        configuration_fingerprint=payload["configuration_fingerprint"],
+        disposition=disposition,
+        firmware=firmware,
+        page_count=payload["page_count"],
+        page_index=payload["page_index"],
+        record_start=payload["record_start"],
+        records=tuple(records),
+        source_motion_request_id=payload["source_motion_request_id"],
+        source_session_id=payload["source_session_id"],
+        total_records=payload["total_records"],
     )
 
 
@@ -2196,6 +2550,33 @@ def validate_main_move_joints_request(params):
         raise JsonCommandSchemaError(
             "move-joints telemetry state must be boolean"
         )
+    trace_fingerprint = payload["trace_configuration_fingerprint"]
+    if trace_fingerprint is not None:
+        validate_main_configuration_fingerprint(
+            trace_fingerprint,
+            "move-joints trace configuration fingerprint",
+        )
+        if payload["telemetry_enabled"]:
+            raise JsonCommandSchemaError(
+                "traced move-joints telemetry must be disabled"
+            )
+
+
+def validate_main_motion_trace_request(params):
+    payload = _require_exact_object(
+        params,
+        _MOTION_TRACE_REQUEST_FIELDS,
+        "motion-trace request parameters",
+    )
+    _require_request_identifier(
+        payload["motion_request_id"],
+        "motion-trace source request identifier",
+    )
+    _require_unsigned_integer(
+        payload["page_index"],
+        "motion-trace page index",
+        maximum=JSON_MOTION_TRACE_RECORD_CAPACITY - 1,
+    )
 
 
 def validate_main_move_cartesian_request(params):
@@ -3157,6 +3538,26 @@ def validate_main_move_joints_response(response):
     )
 
 
+def validate_main_motion_trace_response(response):
+    if type(response) is not Response or response.cmd != "get_motion_trace":
+        raise JsonCommandSchemaError(
+            "motion-trace response envelope is invalid"
+        )
+    if response.status == "completed":
+        parse_main_motion_trace_result(response.result)
+        return
+    if response.status == "rejected":
+        _validate_main_rejection(
+            response.error,
+            "motion-trace",
+            _MOTION_TRACE_REJECTED_ERROR_DETAILS,
+        )
+        return
+    raise JsonCommandSchemaError(
+        "motion-trace response status is invalid"
+    )
+
+
 def _validate_main_cartesian_motion_response(
     response,
     *,
@@ -3907,6 +4308,12 @@ MAIN_READ_ENCODERS_COMMAND_CONTRACT = JsonCommandContract(
     partial(validate_main_diagnostic_response, command="read_encoders"),
 )
 
+MAIN_GET_MOTION_TRACE_COMMAND_CONTRACT = JsonCommandContract(
+    "get_motion_trace",
+    validate_main_motion_trace_request,
+    validate_main_motion_trace_response,
+)
+
 MAIN_SET_POSITION_COMMAND_CONTRACT = JsonCommandContract(
     "set_position",
     validate_main_set_position_request,
@@ -4216,6 +4623,8 @@ __all__ = (
     "JSON_LIVE_MOTION_LEASE_MINIMUM_MILLISECONDS",
     "JSON_MAIN_FIRMWARE_FRAME_RECEIVE_TIMEOUT_SECONDS",
     "JSON_MAIN_COMMAND_MANIFEST",
+    "JSON_MOTION_TRACE_PAGE_RECORDS",
+    "JSON_MOTION_TRACE_RECORD_CAPACITY",
     "JSON_HOME_REFERENCE_AXIS_COUNT",
     "JSON_POSITION_CARTESIAN_ORIENTATION_COUNT",
     "JSON_POSITION_CARTESIAN_TRANSLATION_COUNT",
@@ -4230,6 +4639,7 @@ __all__ = (
     "MAIN_HELLO_COMMAND_CONTRACT",
     "MAIN_CONFIG_EXT_AXIS_COMMAND_CONTRACT",
     "MAIN_GET_HOME_REFERENCE_COMMAND_CONTRACT",
+    "MAIN_GET_MOTION_TRACE_COMMAND_CONTRACT",
     "MAIN_GET_POSITION_DISPOSITION_COMMAND_CONTRACT",
     "MAIN_CORRECT_POSITION_COMMAND_CONTRACT",
     "MAIN_DELETE_SD_PROGRAM_COMMAND_CONTRACT",
@@ -4280,6 +4690,10 @@ __all__ = (
     "JsonMainHomeReferenceResult",
     "JsonMainCartesianMotionResult",
     "JsonMainJointMotionResult",
+    "JsonMainMotionTraceDisposition",
+    "JsonMainMotionTraceNoCaptureResult",
+    "JsonMainMotionTracePageResult",
+    "JsonMainMotionTraceRecord",
     "JsonMainJointTelemetrySample",
     "JsonMainLiveJogResult",
     "JsonMainRenewLiveMotionResult",
@@ -4300,6 +4714,7 @@ __all__ = (
     "parse_main_live_jog_result",
     "parse_main_renew_live_motion_result",
     "parse_main_move_joints_result",
+    "parse_main_motion_trace_result",
     "parse_main_modbus_read_result",
     "parse_main_modbus_wait_result",
     "parse_main_delete_sd_program_result",
@@ -4310,6 +4725,7 @@ __all__ = (
     "parse_main_position_correction_result",
     "parse_main_tool_jog_result",
     "parse_main_stop_result",
+    "validate_main_configuration_fingerprint",
     "validate_main_get_position_disposition_request",
     "validate_main_get_position_disposition_response",
     "validate_main_correct_position_request",
@@ -4340,6 +4756,8 @@ __all__ = (
     "validate_main_move_vision_response",
     "validate_main_move_joints_request",
     "validate_main_move_joints_response",
+    "validate_main_motion_trace_request",
+    "validate_main_motion_trace_response",
     "validate_main_live_cart_jog_request",
     "validate_main_live_cart_jog_response",
     "validate_main_live_joint_jog_request",

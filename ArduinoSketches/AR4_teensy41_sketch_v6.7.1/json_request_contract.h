@@ -27,6 +27,7 @@
 #include <type_traits>
 
 #include "controller_domain_contract.h"
+#include "controller_motion_trace_contract.h"
 #include "json_bounded_allocator_contract.h"
 #include "json_calibration_contract.h"
 #include "json_cartesian_motion_contract.h"
@@ -75,6 +76,7 @@ enum class JsonMainRequestCommand {
   kTestLimitSwitches,
   kSetEncoders,
   kReadEncoders,
+  kGetMotionTrace,
   kCorrectPosition,
   kZeroJ7,
   kZeroJ8,
@@ -129,6 +131,8 @@ inline const char *json_main_request_command_name(
       return "set_encoders";
     case JsonMainRequestCommand::kReadEncoders:
       return "read_encoders";
+    case JsonMainRequestCommand::kGetMotionTrace:
+      return "get_motion_trace";
     case JsonMainRequestCommand::kCorrectPosition:
       return "correct_position";
     case JsonMainRequestCommand::kZeroJ7:
@@ -226,6 +230,9 @@ inline JsonMainRequestCommand json_main_request_command_from_name(
   }
   if (strcmp(command, "read_encoders") == 0) {
     return JsonMainRequestCommand::kReadEncoders;
+  }
+  if (strcmp(command, "get_motion_trace") == 0) {
+    return JsonMainRequestCommand::kGetMotionTrace;
   }
   if (strcmp(command, "correct_position") == 0) {
     return JsonMainRequestCommand::kCorrectPosition;
@@ -464,6 +471,7 @@ class JsonMainRequestPayload {
         command_kind_ = command_kind;
         return true;
       case JsonMainRequestCommand::kSetPosition:
+      case JsonMainRequestCommand::kGetMotionTrace:
       case JsonMainRequestCommand::kUpdateParams:
       case JsonMainRequestCommand::kConfigExtAxis:
       case JsonMainRequestCommand::kControllerWait:
@@ -587,6 +595,11 @@ class JsonMainRequestPayload {
     command_kind_ = JsonMainRequestCommand::kMoveJoints;
   }
 
+  void assign_motion_trace(const JsonMainMotionTraceParameters &parameters) {
+    assign_parameters(&storage_.motion_trace, parameters);
+    command_kind_ = JsonMainRequestCommand::kGetMotionTrace;
+  }
+
   void assign_direct(
     JsonMainRequestCommand command_kind,
     const JsonMainDirectParameters &parameters
@@ -666,6 +679,11 @@ class JsonMainRequestPayload {
       ? &storage_.move_joints : nullptr;
   }
 
+  const JsonMainMotionTraceParameters *motion_trace() const {
+    return command_kind_ == JsonMainRequestCommand::kGetMotionTrace
+      ? &storage_.motion_trace : nullptr;
+  }
+
   const JsonMainDirectParameters *direct() const {
     switch (command_kind_) {
       case JsonMainRequestCommand::kMoveLinear:
@@ -710,6 +728,7 @@ class JsonMainRequestPayload {
     JsonMainLiveJogParameters live_jog;
     JsonMainMoveCartesianParameters move_cartesian;
     JsonMainMoveJointsParameters move_joints;
+    JsonMainMotionTraceParameters motion_trace;
     JsonMainDirectParameters direct;
     JsonMainStopParameters stop;
     JsonMainRenewLiveMotionParameters renew_live_motion;
@@ -2299,6 +2318,15 @@ inline JsonMainRequestParseStatus parse_main_json_request(
         parameters
       );
       if (parameters_valid) result.payload.assign_move_joints(parameters);
+      break;
+    }
+    case JsonMainRequestCommand::kGetMotionTrace: {
+      JsonMainMotionTraceParameters parameters = {};
+      parameters_valid = extract_main_motion_trace_parameters(
+        params,
+        parameters
+      );
+      if (parameters_valid) result.payload.assign_motion_trace(parameters);
       break;
     }
     case JsonMainRequestCommand::kMoveLinear:

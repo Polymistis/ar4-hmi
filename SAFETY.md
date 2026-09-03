@@ -19,9 +19,9 @@ conflict.
 
 ## Hardware side effects
 
-Tracked Teensy firmware is `6.7.1-ar4hmi.38`. Powered named-position and
-Shutdown testing is prohibited on `.37`; deploy `.38` first. Deployment of
-`.38` and live verification of the changed Shutdown-position behavior remain
+Tracked Teensy firmware is `6.7.1-ar4hmi.39`. Powered named-position and
+Shutdown testing is prohibited on `.37`; deploy `.39` first. Deployment of
+`.39` and live verification of the changed Shutdown-position behavior remain
 outstanding. A tracked firmware version or successful build does not establish
 deployment or live-arm acceptance.
 
@@ -57,6 +57,18 @@ publishes `JsonMainControllerPhysicalStop` with source
 `emergency_stop_terminal` before terminal acknowledgement, and
 `JsonMainControllerPhysicalStopError.position` retains the parsed
 `JsonMainPositionResult` from the terminal.
+
+The HMI **Capture next joint move** control opts one manual `move_joints`
+request into volatile controller-clock capture. Selection is consumed only at
+serial write admission. A selected request disables live telemetry, preserves
+the normal motion terminal as authoritative when the bound session remains
+intact, and retrieves pages only after terminal acknowledgement, event
+draining, and reader release. Transport loss during retrieval propagates
+through normal controller cleanup. Any physical stop or untrusted session skips
+retrieval. Complete validated pages are
+atomically assembled and written under the local ignored
+`logs/motion-traces/` directory. Captures from incomplete motion or bounded
+sub-sampling remain explicit through the artifact disposition flags.
 
 `ARRobot.move_cartesian`, `ARRobot.move_linear`, `ARRobot.move_vision`,
 `ARRobot.jog_tool`, `ARRobot.move_arc`, `ARRobot.move_circle`, and

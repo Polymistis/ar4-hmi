@@ -170,6 +170,7 @@ struct JsonMainCalibrationCommandSource {
 };
 
 using JsonMainMoveJointsExecute = bool (*)(
+  uint32_t,
   const JsonMainMoveJointsParameters &,
   JsonMainMoveJointsExecutionResult &,
   void *
@@ -248,6 +249,14 @@ struct JsonMainDiagnosticCommandSource {
   void *context;
 };
 
+struct JsonMainMotionTraceResponseSource {
+  const ControllerMotionTraceCapture *capture;
+  const char *session_id;
+  const char *firmware_name;
+  const char *firmware_version;
+  const char *firmware_build;
+};
+
 enum class JsonMainControllerWaitOutcome : uint8_t {
   kInvalid,
   kCompleted,
@@ -313,6 +322,7 @@ struct JsonMainControllerDispatchSources {
   const JsonMainToolJogCommandSource *jog_tool;
   const JsonMainLiveJogCommandSource *live_jog;
   const JsonMainDiagnosticCommandSource *diagnostics;
+  const JsonMainMotionTraceResponseSource *motion_trace;
   const JsonMainCalibrationCommandSource *calibration;
   const JsonMainCorrectPositionCommandSource *correct_position;
   const JsonMainExternalAxisZeroCommandSource *zero_external_axis;
@@ -339,6 +349,8 @@ enum class JsonMainControllerResponseKind {
   kDiagnosticCompleted,
   kDiagnosticRejected,
   kDiagnosticFailed,
+  kMotionTraceCompleted,
+  kMotionTraceRejected,
   kSetPositionCompleted,
   kSetPositionRejected,
   kUpdateParamsCompleted,
@@ -616,6 +628,13 @@ class JsonMainControllerRequestOwner {
       case JsonMainRequestParseResponseStatus::kDispatchReadEncoders:
         return process_diagnostic(
           result, sources.diagnostics, sources.admission,
+          maximum_payload_bytes
+        );
+      case JsonMainRequestParseResponseStatus::kDispatchGetMotionTrace:
+        return process_motion_trace(
+          result,
+          sources.motion_trace,
+          sources.admission,
           maximum_payload_bytes
         );
       case JsonMainRequestParseResponseStatus::kDispatchSetPosition:
@@ -1149,6 +1168,7 @@ class JsonMainControllerRequestOwner {
       case JsonMainRequestParseResponseStatus::kDispatchTestLimitSwitches:
       case JsonMainRequestParseResponseStatus::kDispatchSetEncoders:
       case JsonMainRequestParseResponseStatus::kDispatchReadEncoders:
+      case JsonMainRequestParseResponseStatus::kDispatchGetMotionTrace:
       case JsonMainRequestParseResponseStatus::kDispatchSetPosition:
       case JsonMainRequestParseResponseStatus::kDispatchUpdateParams:
       case JsonMainRequestParseResponseStatus::kDispatchConfigExtAxis:
@@ -1242,6 +1262,10 @@ class JsonMainControllerRequestOwner {
         sizeof(JsonMainDiagnosticCommandSource)
       )
       || range_aliases_internal_storage(
+        sources.motion_trace,
+        sizeof(JsonMainMotionTraceResponseSource)
+      )
+      || range_aliases_internal_storage(
         sources.calibration,
         sizeof(JsonMainCalibrationCommandSource)
       )
@@ -1316,6 +1340,13 @@ class JsonMainControllerRequestOwner {
         sources.diagnostics != nullptr
         && range_aliases_internal_storage(
           sources.diagnostics->context,
+          1
+        )
+      )
+      || (
+        sources.motion_trace != nullptr
+        && range_aliases_internal_storage(
+          sources.motion_trace->capture,
           1
         )
       )
@@ -2312,6 +2343,69 @@ class JsonMainControllerRequestOwner {
     }
     return finish_response(
       JsonMainControllerResponseKind::kHomeReferenceCompleted,
+      maximum_payload_bytes
+    );
+  }
+
+  JsonMainControllerProcessStatus process_motion_trace(
+    const JsonMainRequestParseResult &result,
+    const JsonMainMotionTraceResponseSource *source,
+    JsonMainControllerAdmissionStatus admission,
+    size_t maximum_payload_bytes
+  ) {
+    JsonMainControllerProcessStatus status =
+      JsonMainControllerProcessStatus::kControllerFault;
+    if (!process_admission(
+        result,
+        admission,
+        maximum_payload_bytes,
+        status
+    )) return status;
+    if (!session_bound_) {
+      if (!build_rejected_response(
+          result.request_id,
+          result.command,
+          "session_not_established",
+          "hello must complete before motion-trace retrieval",
+          maximum_payload_bytes
+      )) {
+        return fault_process(
+          JsonMainControllerFault::kResponseSerializationFailure
+        );
+      }
+      return finish_response(
+        JsonMainControllerResponseKind::kMotionTraceRejected,
+        maximum_payload_bytes
+      );
+    }
+    const JsonMainMotionTraceParameters *parameters =
+      result.payload.motion_trace();
+    if (
+      source == nullptr
+      || source->capture == nullptr
+      || parameters == nullptr
+      || range_aliases_internal_storage(source->capture, 1)
+    ) {
+      return fault_process(JsonMainControllerFault::kInvalidCommandSource);
+    }
+    if (!build_main_json_motion_trace_response(
+        result.request_id,
+        *parameters,
+        *source->capture,
+        source->session_id,
+        source->firmware_name,
+        source->firmware_version,
+        source->firmware_build,
+        maximum_payload_bytes,
+        output_,
+        sizeof(output_)
+    )) {
+      return fault_process(
+        JsonMainControllerFault::kResponseSerializationFailure
+      );
+    }
+    return finish_response(
+      JsonMainControllerResponseKind::kMotionTraceCompleted,
       maximum_payload_bytes
     );
   }
@@ -3776,6 +3870,7 @@ class JsonMainControllerRequestOwner {
     }
     JsonMainMoveJointsExecutionResult execution_result = {};
     if (!source->execute(
+        result.request_id,
         *parameters,
         execution_result,
         source->context

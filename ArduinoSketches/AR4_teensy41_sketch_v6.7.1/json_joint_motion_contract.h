@@ -35,6 +35,9 @@ constexpr size_t kJsonJointMotionControllerDebugCapacity =
   kJsonJointMotionControllerDebugMaximumLength + 1;
 constexpr size_t kJsonJointPositionTelemetryFrameCapacity = 256;
 constexpr size_t kJsonJointMotionTerminalPayloadReservationBytes = 1024;
+constexpr size_t kJsonConfigurationFingerprintLength = 71;
+constexpr size_t kJsonConfigurationFingerprintCapacity =
+  kJsonConfigurationFingerprintLength + 1;
 
 enum class JsonJointMotionSpeedMode : uint8_t {
   kPercent,
@@ -59,6 +62,9 @@ struct JsonMainMoveJointsParameters {
   JsonJointMotionWristConfiguration wrist_configuration;
   bool loop_modes[kJsonJointMotionPrimaryAxisCount];
   bool telemetry_enabled;
+  char trace_configuration_fingerprint[
+    kJsonConfigurationFingerprintCapacity
+  ];
 };
 
 enum class JsonMainMoveJointsOutcome : uint8_t {
@@ -91,6 +97,24 @@ inline bool string_equals(
   const size_t expected_length = strlen(expected);
   return value.size() == expected_length
     && memcmp(value.c_str(), expected, expected_length) == 0;
+}
+
+inline bool configuration_fingerprint_valid(const char *value) {
+  if (value == nullptr) return false;
+  constexpr char prefix[] = "sha256:";
+  if (strncmp(value, prefix, sizeof(prefix) - 1) != 0) return false;
+  for (
+    size_t index = sizeof(prefix) - 1;
+    index < kJsonConfigurationFingerprintLength;
+    ++index
+  ) {
+    const char character = value[index];
+    if (
+      !((character >= '0' && character <= '9')
+        || (character >= 'a' && character <= 'f'))
+    ) return false;
+  }
+  return value[kJsonConfigurationFingerprintLength] == '\0';
 }
 
 inline bool extract_controller_float(
@@ -199,7 +223,20 @@ inline bool move_joints_parameters_valid(
     && static_cast<float>(combined_profile) <= 100.0f
     && params.ramp_percent > 0.0f
     && params.ramp_percent <= 100.0f;
-  return speed_valid && profile_valid && wrist_configuration_valid;
+  const bool trace_enabled =
+    params.trace_configuration_fingerprint[0] != '\0';
+  return speed_valid
+    && profile_valid
+    && wrist_configuration_valid
+    && (
+      !trace_enabled
+      || (
+        !params.telemetry_enabled
+        && configuration_fingerprint_valid(
+          params.trace_configuration_fingerprint
+        )
+      )
+    );
 }
 
 inline bool position_snapshot_empty(
@@ -454,7 +491,7 @@ inline bool extract_main_move_joints_parameters(
   ArduinoJson::JsonObjectConst params,
   JsonMainMoveJointsParameters &output
 ) {
-  if (params.size() != 10) return false;
+  if (params.size() != 11) return false;
   JsonMainMoveJointsParameters staged = {};
   bool robot_joints_present = false;
   bool external_axes_present = false;
@@ -466,6 +503,7 @@ inline bool extract_main_move_joints_parameters(
   bool wrist_present = false;
   bool loop_modes_present = false;
   bool telemetry_present = false;
+  bool trace_fingerprint_present = false;
   for (ArduinoJson::JsonPairConst pair : params) {
     const ArduinoJson::JsonString key = pair.key();
     if (json_joint_motion_detail::string_equals(
@@ -594,6 +632,33 @@ inline bool extract_main_move_joints_parameters(
       if (telemetry_present || !pair.value().is<bool>()) return false;
       staged.telemetry_enabled = pair.value().as<bool>();
       telemetry_present = true;
+    } else if (json_joint_motion_detail::string_equals(
+        key,
+        "trace_configuration_fingerprint"
+    )) {
+      if (trace_fingerprint_present) return false;
+      if (pair.value().isNull()) {
+        staged.trace_configuration_fingerprint[0] = '\0';
+      } else {
+        const ArduinoJson::JsonString value =
+          pair.value().as<ArduinoJson::JsonString>();
+        if (
+          !value
+          || value.size() != kJsonConfigurationFingerprintLength
+        ) return false;
+        memcpy(
+          staged.trace_configuration_fingerprint,
+          value.c_str(),
+          kJsonConfigurationFingerprintLength
+        );
+        staged.trace_configuration_fingerprint[
+          kJsonConfigurationFingerprintLength
+        ] = '\0';
+        if (!json_joint_motion_detail::configuration_fingerprint_valid(
+            staged.trace_configuration_fingerprint
+        )) return false;
+      }
+      trace_fingerprint_present = true;
     } else {
       return false;
     }
@@ -609,6 +674,7 @@ inline bool extract_main_move_joints_parameters(
     || !wrist_present
     || !loop_modes_present
     || !telemetry_present
+    || !trace_fingerprint_present
     || !json_joint_motion_detail::move_joints_parameters_valid(staged)
   ) {
     return false;

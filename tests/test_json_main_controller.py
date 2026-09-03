@@ -1,4 +1,7 @@
+from dataclasses import replace
+import json
 import threading
+import tempfile
 import unittest
 
 import ARrobots.protocol as protocol
@@ -9,6 +12,7 @@ from ARrobots.protocol import (
     JsonCommandSchemaError,
     JsonMainControllerClient,
     JsonMainControllerClientStateError,
+    JsonMainControllerStartupConfiguration,
     JsonMainControllerTerminal,
     JsonMainCalibrationResult,
     JsonMainCartesianMotionResult,
@@ -16,6 +20,9 @@ from ARrobots.protocol import (
     JsonMainHomeReferenceResult,
     JsonMainJointMotionResult,
     JsonMainLiveJogResult,
+    JsonMainMotionTraceArm,
+    JsonMainMotionTraceAssembly,
+    JsonMainMotionTracePageResult,
     JsonMainPositionResult,
     JsonMainRenewLiveMotionResult,
     JsonMainToolJogResult,
@@ -28,6 +35,7 @@ from ARrobots.protocol import (
     Request,
     Response,
     encode_message,
+    write_main_motion_trace_artifact,
 )
 class FakeClock:
     def __init__(self, value=10.0):
@@ -100,7 +108,7 @@ def sample_main_hello_result():
         "firmware": {
             "build": "tracked",
             "name": "AR4 Teensy",
-            "version": "6.7.1-ar4hmi.38",
+            "version": "6.7.1-ar4hmi.39",
         },
         "identity": {
             "asset_tag": "Lab",
@@ -165,6 +173,7 @@ def sample_main_move_joints_params():
         "speed_mode": "percent",
         "speed_value": 50.0,
         "telemetry_enabled": True,
+        "trace_configuration_fingerprint": None,
         "wrist_configuration": "near",
     }
 
@@ -286,6 +295,57 @@ def sample_main_update_params():
     }
 
 
+def sample_main_startup_configuration():
+    return JsonMainControllerStartupConfiguration(
+        **sample_main_update_params(),
+        external_axis_travel_units=(3450, 3450, 3450),
+        external_axis_drive_rotations=(280, 280, 280),
+        external_axis_motor_steps=(4000, 4000, 4000),
+        robot_joints_millidegrees=(0,) * 6,
+        external_axes_milliunits=(0,) * 3,
+    )
+
+
+def sample_main_motion_trace_result(
+    *, motion_request_id, capture_generation=1, page_index=0, total_records=1
+):
+    record_start = page_index * protocol.JSON_MOTION_TRACE_PAGE_RECORDS
+    page_records = min(
+        protocol.JSON_MOTION_TRACE_PAGE_RECORDS,
+        total_records - record_start,
+    )
+    return {
+        "capture_generation": capture_generation,
+        "capture_state": "available",
+        "configuration_fingerprint": "sha256:" + "a" * 64,
+        "disposition": {
+            "capacity_limited": False,
+            "clock_wrapped": False,
+            "complete": True,
+            "motion_outcome": "completed",
+            "timing_overrun": False,
+        },
+        "firmware": sample_main_hello_result()["firmware"],
+        "page_count": (
+            total_records + protocol.JSON_MOTION_TRACE_PAGE_RECORDS - 1
+        ) // protocol.JSON_MOTION_TRACE_PAGE_RECORDS,
+        "page_index": page_index,
+        "record_start": record_start,
+        "records": [{
+            "commanded_steps": [0, 1, 2, 3, 4, 5],
+            "controller_microseconds": 100 + master_index,
+            "encoder_counts": [5, 4, 3, 2, 1, 0],
+            "flags": 0,
+            "master_index": master_index,
+            "phase": 0,
+            "scheduled_delay_microseconds": 200,
+        } for master_index in range(record_start, record_start + page_records)],
+        "source_motion_request_id": motion_request_id,
+        "source_session_id": sample_main_hello_result()["session_id"],
+        "total_records": total_records,
+    }
+
+
 class JsonMainControllerClientTests(unittest.TestCase):
     def make_client(self, reads=(), **client_options):
         serial_port = FakeSerial(reads)
@@ -321,6 +381,59 @@ class JsonMainControllerClientTests(unittest.TestCase):
         client.acknowledge_terminal(ticket)
         self.assertTrue(client.session_ready)
         return terminal
+
+    def test_configuration_fingerprint_is_deterministic_and_scoped(self):
+        configuration = sample_main_startup_configuration()
+        fingerprint = configuration.configuration_fingerprint
+
+        self.assertEqual(
+            fingerprint,
+            sample_main_startup_configuration().configuration_fingerprint,
+        )
+        self.assertRegex(fingerprint, r"\Asha256:[0-9a-f]{64}\Z")
+        self.assertNotEqual(
+            fingerprint,
+            replace(
+                configuration,
+                motor_directions=(1,) * 9,
+            ).configuration_fingerprint,
+        )
+        self.assertNotEqual(
+            fingerprint,
+            replace(
+                configuration,
+                external_axis_motor_steps=(8000, 4000, 4000),
+            ).configuration_fingerprint,
+        )
+        self.assertEqual(
+            fingerprint,
+            replace(
+                configuration,
+                robot_joints_millidegrees=(1000,) * 6,
+            ).configuration_fingerprint,
+        )
+
+    def test_motion_trace_arm_consumes_only_current_reservation(self):
+        arm = JsonMainMotionTraceArm()
+        fingerprint = (
+            sample_main_startup_configuration().configuration_fingerprint
+        )
+
+        self.assertIsNone(arm.reserve(fingerprint))
+        first_generation = arm.arm()
+        reservation = arm.reserve(fingerprint)
+        self.assertEqual(reservation.generation, first_generation)
+        self.assertEqual(reservation.configuration_fingerprint, fingerprint)
+        self.assertTrue(arm.armed)
+        self.assertTrue(arm.consume(reservation))
+        self.assertFalse(arm.armed)
+        self.assertFalse(arm.consume(reservation))
+
+        arm.arm()
+        stale_reservation = arm.reserve(fingerprint)
+        arm.arm()
+        self.assertFalse(arm.consume(stale_reservation))
+        self.assertTrue(arm.armed)
 
     def test_client_starts_idle_without_public_submit(self):
         client, serial_port, _clock, _scheduler = self.make_client()
@@ -1082,6 +1195,248 @@ class JsonMainControllerClientTests(unittest.TestCase):
         client.acknowledge_terminal(ticket)
         self.assertIsNone(client.pending_joint_motion_ticket)
         self.assertTrue(client.session_ready)
+
+    def test_traced_move_joints_requires_disabled_telemetry(self):
+        hello_result = sample_main_hello_result()
+        responses = (
+            encode_message(Response(1, "hello", "completed", hello_result)),
+            encode_message(
+                Response(
+                    2,
+                    "move_joints",
+                    "completed",
+                    sample_main_move_joints_result(),
+                )
+            ),
+        )
+        client, serial_port, _clock, _scheduler = self.make_client(responses)
+        self.establish_session(client)
+        params = sample_main_move_joints_params()
+        params.update({
+            "telemetry_enabled": False,
+            "trace_configuration_fingerprint": (
+                sample_main_startup_configuration().configuration_fingerprint
+            ),
+        })
+
+        ticket = client.request_move_joints(**params, timeout=2.0)
+        self.assertEqual(
+            serial_port.writes[-1],
+            encode_message(Request(2, "move_joints", params)),
+        )
+        self.poll_until_delivery(client)
+        client.pop_delivery()
+        client.acknowledge_terminal(ticket)
+
+        writes_before_rejection = tuple(serial_port.writes)
+        params["telemetry_enabled"] = True
+        with self.assertRaises(JsonSessionAdmissionError):
+            client.request_move_joints(**params, timeout=2.0)
+        self.assertEqual(tuple(serial_port.writes), writes_before_rejection)
+
+    def test_motion_trace_page_is_correlated_and_typed(self):
+        hello_result = sample_main_hello_result()
+        source_motion_request_id = 47
+        responses = (
+            encode_message(Response(1, "hello", "completed", hello_result)),
+            encode_message(
+                Response(
+                    2,
+                    "get_motion_trace",
+                    "completed",
+                    sample_main_motion_trace_result(
+                        motion_request_id=source_motion_request_id
+                    ),
+                )
+            ),
+        )
+        client, serial_port, _clock, _scheduler = self.make_client(responses)
+        self.establish_session(client)
+
+        ticket = client.request_motion_trace(
+            motion_request_id=source_motion_request_id,
+            page_index=0,
+            timeout=2.0,
+        )
+        self.assertEqual(
+            serial_port.writes[-1],
+            encode_message(Request(2, "get_motion_trace", {
+                "motion_request_id": source_motion_request_id,
+                "page_index": 0,
+            })),
+        )
+        self.poll_until_delivery(client)
+        delivery = client.pop_delivery()
+        terminal = client.take_terminal(ticket)
+
+        self.assertIs(delivery.ticket, ticket)
+        self.assertIsInstance(
+            terminal.parsed_result,
+            JsonMainMotionTracePageResult,
+        )
+        self.assertEqual(
+            terminal.parsed_result.source_motion_request_id,
+            source_motion_request_id,
+        )
+        self.assertEqual(
+            terminal.parsed_result.records[0].commanded_steps,
+            (0, 1, 2, 3, 4, 5),
+        )
+        no_capture = protocol.parse_main_motion_trace_result({
+            "capture_state": "no_capture",
+            "source_motion_request_id": source_motion_request_id,
+        })
+        self.assertIsInstance(
+            no_capture,
+            protocol.JsonMainMotionTraceNoCaptureResult,
+        )
+        self.assertEqual(
+            no_capture.source_motion_request_id,
+            source_motion_request_id,
+        )
+
+    def test_motion_trace_retrieval_requires_settled_position_without_stop(self):
+        completed = JsonMainControllerTerminal(
+            Response(
+                1,
+                "move_joints",
+                "completed",
+                sample_main_move_joints_result(),
+            )
+        )
+        failed_with_position = JsonMainControllerTerminal(
+            Response(
+                2,
+                "move_joints",
+                "failed",
+                error=ProtocolFailure(
+                    "motion_execution_failed",
+                    "motion failed",
+                    {"position": sample_main_motion_position_result()},
+                ),
+            )
+        )
+        failed_without_position = JsonMainControllerTerminal(
+            Response(
+                3,
+                "move_joints",
+                "failed",
+                error=ProtocolFailure(
+                    "position_unavailable",
+                    "position unavailable",
+                ),
+            )
+        )
+        cases = (
+            (completed, False, True),
+            (failed_with_position, False, True),
+            (failed_without_position, False, False),
+            (completed, True, False),
+        )
+        for terminal, stop_observed, expected in cases:
+            with self.subTest(
+                status=terminal.response.status,
+                stop_observed=stop_observed,
+            ):
+                self.assertIs(
+                    protocol.main_motion_trace_retrieval_eligible(
+                        terminal,
+                        stop_observed,
+                    ),
+                    expected,
+                )
+
+    def test_complete_motion_trace_assembly_writes_one_artifact(self):
+        result = sample_main_motion_trace_result(motion_request_id=47)
+        assembly = JsonMainMotionTraceAssembly(
+            motion_request_id=47,
+            source_session_id=result["source_session_id"],
+            configuration_fingerprint=result["configuration_fingerprint"],
+        )
+        self.assertTrue(
+            assembly.accept(protocol.parse_main_motion_trace_result(result))
+        )
+        motion_parameters = sample_main_move_joints_params()
+        motion_parameters.update({
+            "telemetry_enabled": False,
+            "trace_configuration_fingerprint": result[
+                "configuration_fingerprint"
+            ],
+        })
+        artifact = assembly.artifact(
+            controller_identity=sample_main_hello_result()["identity"],
+            motion_parameters=motion_parameters,
+            host_times_ns={
+                "retrieved": 4,
+                "terminal": 3,
+                "admitted": 2,
+                "armed": 1,
+            },
+        )
+        with self.assertRaises(JsonCommandSchemaError):
+            assembly.artifact(
+                controller_identity=sample_main_hello_result()["identity"],
+                motion_parameters=motion_parameters,
+                host_times_ns={
+                    "armed": 2,
+                    "admitted": 1,
+                    "terminal": 3,
+                    "retrieved": 4,
+                },
+            )
+
+        with tempfile.TemporaryDirectory(dir=".") as directory:
+            path = write_main_motion_trace_artifact(directory, artifact)
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(list(path.parent.iterdir()), [path])
+            self.assertEqual(stored, json.loads(json.dumps(artifact)))
+            with self.assertRaises(FileExistsError):
+                write_main_motion_trace_artifact(directory, artifact)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_motion_trace_assembly_rejects_page_discontinuity(self):
+        first = protocol.parse_main_motion_trace_result(
+            sample_main_motion_trace_result(
+                motion_request_id=47,
+                total_records=9,
+            )
+        )
+        cases = (
+            (
+                "generation changed",
+                True,
+                sample_main_motion_trace_result(
+                    motion_request_id=47,
+                    capture_generation=2,
+                    page_index=1,
+                    total_records=9,
+                ),
+            ),
+            (
+                "first page skipped",
+                False,
+                sample_main_motion_trace_result(
+                    motion_request_id=47,
+                    page_index=1,
+                    total_records=9,
+                ),
+            ),
+        )
+        for name, accept_first, result in cases:
+            with self.subTest(name=name):
+                assembly = JsonMainMotionTraceAssembly(
+                    motion_request_id=47,
+                    source_session_id=result["source_session_id"],
+                    configuration_fingerprint=result[
+                        "configuration_fingerprint"
+                    ],
+                )
+                if accept_first:
+                    self.assertFalse(assembly.accept(first))
+                with self.assertRaises(JsonCommandSchemaError):
+                    assembly.accept(
+                        protocol.parse_main_motion_trace_result(result)
+                    )
 
     def test_interrupted_move_joints_return_retains_recoverable_ticket(self):
         hello_result = sample_main_hello_result()

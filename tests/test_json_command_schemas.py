@@ -119,7 +119,7 @@ def sample_main_hello_result():
         "device": "main_controller",
         "firmware": {
             "name": "AR4 Teensy",
-            "version": "6.7.1-ar4hmi.38",
+            "version": "6.7.1-ar4hmi.39",
             "build": "tracked",
         },
         "protocol": {
@@ -540,7 +540,7 @@ class MainHelloSchemaTests(unittest.TestCase):
             )
         valid_firmware = JsonHelloFirmware(
             "AR4 Teensy",
-            "6.7.1-ar4hmi.38",
+            "6.7.1-ar4hmi.39",
             "tracked",
         )
         valid_protocol = JsonHelloProtocol("ar4_json", 1, 4094)

@@ -26,6 +26,7 @@ AUXILIARY_HELLO = {
 }
 MOVE_PARAMS = fixtures.sample_main_move_joints_params()
 del MOVE_PARAMS["telemetry_enabled"]
+del MOVE_PARAMS["trace_configuration_fingerprint"]
 MOVE_RESULT = fixtures.sample_main_move_joints_result()
 CALIBRATION_PARAMS = fixtures.sample_main_calibration_params()
 CALIBRATION_RESULT = fixtures.sample_main_calibration_result()
@@ -194,8 +195,14 @@ class RobotApiTests(unittest.TestCase):
                          (COMMANDS + ("calibrate",) * 2, []))
         robot.move_joints(**MOVE_PARAMS, timeout=0.2)
         message = protocol.decode_message(serial_port.writes[-1])
-        self.assertEqual((message.cmd, dict(message.params)),
-                         ("move_joints", dict(MOVE_PARAMS, telemetry_enabled=False)))
+        self.assertEqual((message.cmd, dict(message.params)), (
+            "move_joints",
+            dict(
+                MOVE_PARAMS,
+                telemetry_enabled=False,
+                trace_configuration_fingerprint=None,
+            ),
+        ))
         robot.close()
 
     def test_calibration_timeout_closes_without_stop_claim(self):

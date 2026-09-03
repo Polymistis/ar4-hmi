@@ -79,7 +79,6 @@
 import sys
 import os
 import json
-import hashlib
 import secrets
 from datetime import datetime
 
@@ -321,22 +320,31 @@ from ARrobots.protocol import (
   JsonMainControllerPhysicalStop,
   JsonMainControllerStartupCleanupError,
   JsonMainControllerStartupConfiguration,
+  JsonCommandSchemaError,
   JsonMainCalibrationResult,
   JsonMainCartesianMotionResult,
   JsonMainDeleteSdProgramResult,
   JsonMainHomeReferenceResult,
+  JsonMainMotionTraceArm,
+  JsonMainMotionTraceAssembly,
+  JsonMainMotionTraceNoCaptureResult,
+  JsonMainMotionTracePageResult,
   JsonMainPositionResult,
   JsonMainSdProgramListResult,
   JsonScalarResult,
   JsonResponseDelivery,
+  JsonSessionAdmissionError,
   JsonTelemetryDelivery,
   SerialWriteCancellationBoundary,
   controller_identity_from_json_hello,
   encode_message,
   parse_main_joint_position_telemetry,
   parse_main_motion_position_result,
+  main_motion_trace_retrieval_eligible,
   retain_main_controller_startup_disposition_error,
   run_main_controller_json_startup,
+  validate_main_configuration_fingerprint,
+  write_main_motion_trace_artifact,
 )
 from ARrobots.HMI.vision_io import (
   MAX_CAMERA_PREVIEW_EVENT_DETAIL,
@@ -569,6 +577,9 @@ def on_closing():
   runtime_state = globals().get('RUN')
   if isinstance(runtime_state, dict):
     runtime_state['xboxUse'] = 0
+  trace_arm = globals().get("motion_trace_arm")
+  if isinstance(trace_arm, JsonMainMotionTraceArm):
+    trace_arm.cancel()
 
   try:
     _cancel_active_program_execution()
@@ -2085,16 +2096,14 @@ class MainControllerIdentityBinding:
     validate_controller_hardware_id(
       self.identity.controller_hardware_id
     )
-    if (
-      self.configuration_fingerprint is not None
-      and re.fullmatch(
-        r"sha256:[0-9a-f]{64}",
-        self.configuration_fingerprint,
-      ) is None
-    ):
-      raise MotionInputError(
-        "main controller configuration fingerprint is invalid"
-      )
+    if self.configuration_fingerprint is not None:
+      try:
+        validate_main_configuration_fingerprint(
+          self.configuration_fingerprint,
+          "main controller configuration fingerprint",
+        )
+      except JsonCommandSchemaError as exc:
+        raise MotionInputError(str(exc)) from exc
     if (
       type(self.json_client) is not JsonMainControllerClient
       or self.json_client.serial_port is not self.serial_port
@@ -4517,10 +4526,12 @@ def _current_main_controller_identity(serial_port=None):
   return binding
 
 
-def _bind_main_controller_configuration(serial_port, command):
+def _bind_main_controller_configuration(serial_port, configuration):
   global main_controller_identity_binding
 
-  fingerprint = _controller_configuration_fingerprint(command)
+  if not isinstance(configuration, JsonMainControllerStartupConfiguration):
+    raise MotionInputError("main controller configuration binding is invalid")
+  fingerprint = configuration.configuration_fingerprint
   current_binding = _current_main_controller_identity(serial_port)
   if current_binding is None:
     raise ConnectionError(
@@ -8793,19 +8804,16 @@ def _apply_controller_startup_result(
     CAL['auxiliaryBoard'] = (
       startup_request.auxiliary_board or AUXILIARY_BOARD_NONE
     )
+    if type(json_bootstrap) is not JsonMainControllerPersistentStartupResult:
+      raise ProtocolResponseError(
+        "controller startup lacks a persistent JSON binding"
+      )
     _bind_main_controller_identity(
       startup_serial,
       result.controller_identity,
       result.home_reference,
-      _controller_configuration_fingerprint(
-        startup_request.update_parameters_command
-      ),
-      (
-        getattr(result, "json_bootstrap", None).client
-        if type(getattr(result, "json_bootstrap", None))
-          is JsonMainControllerPersistentStartupResult
-        else None
-      ),
+      json_bootstrap.configuration_fingerprint,
+      json_bootstrap.client,
     )
     _clear_controller_fault_latches_after_confirmed_startup(
       startup_serial,
@@ -20931,11 +20939,6 @@ def _current_joint_motion_profile():
   )
 
 
-def _controller_configuration_fingerprint(command):
-  command = _validated_startup_command(command, "UP")
-  return "sha256:" + hashlib.sha256(command.encode("ascii")).hexdigest()
-
-
 def _canonical_json_message_text(message):
   frame = encode_message(message)
   if (
@@ -21037,6 +21040,7 @@ def _json_joint_position_response(
 def _json_joint_motion_target_parameters(
   target,
   telemetry_enabled,
+  trace_configuration_fingerprint=None,
 ):
   if type(telemetry_enabled) is not bool:
     raise MotionInputError("JSON joint telemetry selection is invalid")
@@ -21072,6 +21076,18 @@ def _json_joint_motion_target_parameters(
     raise MotionInputError("JSON joint motion profile is unsupported")
   if any(type(value) is not bool for value in target.loop_modes):
     raise MotionInputError("JSON joint loop modes are invalid")
+  if trace_configuration_fingerprint is not None:
+    try:
+      validate_main_configuration_fingerprint(
+        trace_configuration_fingerprint,
+        "JSON joint trace configuration fingerprint",
+      )
+    except JsonCommandSchemaError as exc:
+      raise MotionInputError(str(exc)) from exc
+  if trace_configuration_fingerprint is not None and telemetry_enabled:
+    raise MotionInputError(
+      "JSON traced joint motion cannot enable live telemetry"
+    )
   return {
     "robot_joints_degrees": target.robot_joints_degrees,
     "external_axes_units": target.external_axes_units,
@@ -21083,10 +21099,15 @@ def _json_joint_motion_target_parameters(
     "wrist_configuration": wrist_configuration,
     "loop_modes": target.loop_modes,
     "telemetry_enabled": telemetry_enabled,
+    "trace_configuration_fingerprint": trace_configuration_fingerprint,
   }
 
 
-def _json_joint_motion_parameters(command, telemetry_enabled):
+def _json_joint_motion_parameters(
+  command,
+  telemetry_enabled,
+  trace_configuration_fingerprint=None,
+):
   snapshot = joint_motion_dispatcher.current_exchange_snapshot(command)
   if snapshot is None:
     raise MotionQueueFault(
@@ -21116,6 +21137,7 @@ def _json_joint_motion_parameters(command, telemetry_enabled):
       tuple(value == "1" for value in profile.loop_mode),
     ),
     telemetry_enabled,
+    trace_configuration_fingerprint,
   )
 
 
@@ -22770,6 +22792,196 @@ def _exchange_main_controller_position():
       )
 
 
+def _set_motion_trace_arm_display():
+  arm = globals().get("motion_trace_arm")
+  button = globals().get("captureNextJointMoveBut")
+  if not isinstance(arm, JsonMainMotionTraceArm) or button is None:
+    return False
+  armed = arm.armed
+  button.config(
+    text=(
+      "Cancel next joint capture"
+      if armed
+      else "Capture next joint move"
+    ),
+  )
+  return armed
+
+
+def _schedule_motion_trace_arm_display():
+  application_root = globals().get("root")
+  if application_root is None:
+    return False
+  try:
+    application_root.after(0, _set_motion_trace_arm_display)
+  except Exception:
+    logger.exception("Unable to schedule motion-trace control refresh")
+    return False
+  return True
+
+
+def _schedule_motion_trace_status(message, style):
+  application_root = globals().get("root")
+  if application_root is None:
+    return False
+  try:
+    application_root.after(
+      0,
+      partial(_set_application_status, message, style),
+    )
+  except Exception:
+    logger.exception("Unable to schedule motion-trace status")
+    return False
+  return True
+
+
+def _toggle_next_joint_motion_trace():
+  arm = globals().get("motion_trace_arm")
+  if not isinstance(arm, JsonMainMotionTraceArm):
+    raise RuntimeError("motion-trace arm state is unavailable")
+  if arm.armed:
+    arm.cancel()
+    _set_motion_trace_arm_display()
+    _set_application_status(
+      "JOINT MOTION CAPTURE CANCELLED",
+      "Warn.TLabel",
+    )
+    return False
+  binding = _current_main_controller_identity(RUN.get('ser'))
+  if (
+    binding is None
+    or not isinstance(binding.json_client, JsonMainControllerClient)
+    or binding.configuration_fingerprint is None
+  ):
+    _set_application_status(
+      "JOINT MOTION CAPTURE REQUIRES A READY MAIN CONTROLLER",
+      "Alarm.TLabel",
+    )
+    return False
+  arm.arm()
+  _set_motion_trace_arm_display()
+  _set_application_status(
+    "NEXT MANUAL JOINT MOVE WILL BE CAPTURED",
+    "OK.TLabel",
+  )
+  return True
+
+
+def _motion_trace_controller_identity(binding):
+  identity = binding.identity
+  return {
+    "asset_tag": identity.asset_tag,
+    "controller_hardware_id": identity.controller_hardware_id,
+    "driver_model": identity.driver_model,
+    "protocol_capabilities": identity.protocol_capabilities,
+    "robot_model": identity.robot_model,
+    "robot_version": identity.robot_version,
+    "serial_number": identity.serial_number,
+  }
+
+
+def _fail_json_motion_trace_session(binding, message):
+  try:
+    quarantine_serial_transport(binding.json_client.serial_port, message)
+  finally:
+    _require_main_controller_identity_cleanup(
+      binding.json_client.serial_port,
+      "motion-trace protocol failure cleanup",
+    )
+  raise ProtocolResponseError(message)
+
+
+def _retrieve_json_joint_motion_trace(
+  binding,
+  motion_request_id,
+  motion_parameters,
+  host_times_ns,
+):
+  client = binding.json_client
+  session = client.session_binding
+  assembly = JsonMainMotionTraceAssembly(
+    motion_request_id=motion_request_id,
+    source_session_id=session.session_id,
+    configuration_fingerprint=binding.configuration_fingerprint,
+  )
+  page_index = 0
+  while True:
+    terminal = _exchange_json_completed_request(
+      binding,
+      client.request_motion_trace,
+      {
+        "motion_request_id": motion_request_id,
+        "page_index": page_index,
+      },
+      SERIAL_BASE_RESPONSE_TIMEOUT_SECONDS,
+      None,
+      "get_motion_trace",
+      "motion-trace retrieval",
+    )
+    page = terminal.parsed_result
+    if type(page) is JsonMainMotionTraceNoCaptureResult:
+      if page_index != 0 or page.source_motion_request_id != motion_request_id:
+        _fail_json_motion_trace_session(
+          binding,
+          "controller motion-trace absence does not match the requested motion"
+        )
+      logger.error(
+        "Controller returned no capture for traced motion request %s",
+        motion_request_id,
+      )
+      _schedule_motion_trace_status(
+        "JOINT MOTION CAPTURE WAS NOT AVAILABLE",
+        "Alarm.TLabel",
+      )
+      return None
+    if type(page) is not JsonMainMotionTracePageResult:
+      _fail_json_motion_trace_session(
+        binding,
+        "controller returned an invalid motion-trace page"
+      )
+    try:
+      complete = assembly.accept(page)
+    except Exception as exc:
+      try:
+        _fail_json_motion_trace_session(
+          binding,
+          "controller motion-trace page assembly failed",
+        )
+      except ProtocolResponseError as protocol_error:
+        raise protocol_error from exc
+    if complete:
+      break
+    page_index += 1
+
+  host_times_ns["retrieved"] = time.time_ns()
+  artifact = assembly.artifact(
+    controller_identity=_motion_trace_controller_identity(binding),
+    motion_parameters=motion_parameters,
+    host_times_ns=host_times_ns,
+  )
+  try:
+    artifact_path = write_main_motion_trace_artifact(
+      os.path.join("logs", "motion-traces"),
+      artifact,
+    )
+  except (OSError, TypeError, ValueError):
+    logger.exception(
+      "Unable to finalize motion-trace artifact for request %s",
+      motion_request_id,
+    )
+    _schedule_motion_trace_status(
+      "JOINT MOTION CAPTURE COULD NOT BE SAVED",
+      "Alarm.TLabel",
+    )
+    return None
+  logger.info("Motion trace saved to %s", artifact_path)
+  _schedule_motion_trace_status(
+    f"JOINT MOTION CAPTURE SAVED: {artifact_path}",
+    "OK.TLabel",
+  )
+  return artifact_path
+
+
 def _exchange_json_joint_motion_request(
   parameters,
   binding,
@@ -22777,6 +22989,7 @@ def _exchange_json_joint_motion_request(
   response_timeout,
   telemetry_enabled,
   write_admission,
+  trace_host_times_ns=None,
 ):
   client = binding.json_client
   if not isinstance(client, JsonMainControllerClient):
@@ -22790,6 +23003,10 @@ def _exchange_json_joint_motion_request(
     or parameters.get("telemetry_enabled") is not telemetry_enabled
   ):
     raise MotionInputError("JSON joint motion telemetry contract is invalid")
+  trace_fingerprint = parameters.get("trace_configuration_fingerprint")
+  trace_requested = trace_fingerprint is not None
+  if trace_requested != (trace_host_times_ns is not None):
+    raise MotionInputError("JSON joint motion trace context is invalid")
   ticket = None
   try:
     ticket = client.request_move_joints(
@@ -22835,6 +23052,49 @@ def _exchange_json_joint_motion_request(
         client.serial_port,
         "JSON joint-motion physical-stop quarantine",
       )
+  if trace_requested:
+    trace_host_times_ns["terminal"] = time.time_ns()
+    try:
+      trace_retrieval_eligible = main_motion_trace_retrieval_eligible(
+        terminal,
+        stop_published or position_response_is_physical_estop(result.position),
+      )
+      if trace_retrieval_eligible:
+        _retrieve_json_joint_motion_trace(
+          binding,
+          ticket.request_id,
+          parameters,
+          trace_host_times_ns,
+        )
+      elif not (
+        stop_published or position_response_is_physical_estop(result.position)
+      ):
+        logger.warning(
+          "Motion trace skipped for ineligible terminal on request %s",
+          ticket.request_id,
+        )
+        _schedule_motion_trace_status(
+          "JOINT MOTION CAPTURE SKIPPED AFTER TERMINAL",
+          "Alarm.TLabel",
+        )
+    except Exception:
+      # Local diagnostic failures preserve the terminal; transport loss remains
+      # a controller failure so connection cleanup reaches the motion caller.
+      logger.exception(
+        "Unable to retrieve motion trace for settled request %s",
+        ticket.request_id,
+      )
+      _schedule_motion_trace_status(
+        "JOINT MOTION CAPTURE COULD NOT BE RETRIEVED",
+        "Alarm.TLabel",
+      )
+      if (
+        _current_main_controller_identity(client.serial_port) is not binding
+        or client.closed
+        or client.closing
+        or client.quarantined
+      ):
+        raise
   return result
 
 
@@ -22845,12 +23105,63 @@ def _exchange_json_joint_motion(
   response_timeout,
   telemetry_enabled,
 ):
+  arm = globals().get("motion_trace_arm")
+  if not isinstance(arm, JsonMainMotionTraceArm):
+    raise RuntimeError("motion-trace arm state is unavailable")
+  reservation = (
+    arm.reserve(binding.configuration_fingerprint)
+    if arm.armed
+    else None
+  )
+  trace_host_times_ns = None
+  write_admission = None
+  trace_fingerprint = None
+  ordinary_telemetry_enabled = telemetry_enabled
+  trace_admission_cancelled = False
+  if reservation is not None:
+    telemetry_enabled = False
+    trace_fingerprint = reservation.configuration_fingerprint
+    trace_host_times_ns = {"armed": reservation.armed_at_ns}
+
+    def admit_trace_write():
+      nonlocal trace_admission_cancelled
+      if not arm.consume(reservation):
+        trace_admission_cancelled = True
+        return False
+      trace_host_times_ns["admitted"] = time.time_ns()
+      _schedule_motion_trace_arm_display()
+      return True
+
+    write_admission = admit_trace_write
+  try:
+    return _exchange_json_joint_motion_request(
+      _json_joint_motion_parameters(
+        command,
+        telemetry_enabled,
+        trace_fingerprint,
+      ),
+      binding,
+      stop_context,
+      response_timeout,
+      telemetry_enabled,
+      write_admission,
+      trace_host_times_ns,
+    )
+  except JsonSessionAdmissionError:
+    if not trace_admission_cancelled:
+      raise
+  # A refused write admission proves that no motion frame started. Cancellation
+  # therefore downgrades safely to the ordinary manual request.
   return _exchange_json_joint_motion_request(
-    _json_joint_motion_parameters(command, telemetry_enabled),
+    _json_joint_motion_parameters(
+      command,
+      ordinary_telemetry_enabled,
+      None,
+    ),
     binding,
     stop_context,
     response_timeout,
-    telemetry_enabled,
+    ordinary_telemetry_enabled,
     None,
   )
 
@@ -23232,6 +23543,7 @@ def _exchange_joint_motion(command):
 
 
 if __name__ == "__main__":
+  motion_trace_arm = JsonMainMotionTraceArm()
   joint_motion_dispatcher = CoalescingJointDispatcher(
     _exchange_joint_motion,
     _current_controller_joint_calibration,
@@ -30936,7 +31248,7 @@ def _exchange_controller_calibration_acknowledgement(
   json_preparation = _prepare_bound_main_controller_json_configuration(
     serial_port
   )
-  binding, json_configuration, _ = json_preparation
+  binding, json_configuration = json_preparation
   try:
     if command.startswith("UP"):
       command_name = "update_params"
@@ -31214,7 +31526,7 @@ def _prepare_bound_main_controller_json_configuration(
     raise ProtocolResponseError(
       "JSON controller configuration lost controller ownership"
     )
-  update_values, update_command = _prepare_update_parameters_from_values(CAL)
+  update_values, _ = _prepare_update_parameters_from_values(CAL)
   external_values, _ = _prepare_external_axis_parameters_from_values(
     CAL,
     CAL,
@@ -31227,7 +31539,7 @@ def _prepare_bound_main_controller_json_configuration(
     position_target,
     CAL,
   )
-  return binding, configuration, update_command
+  return binding, configuration
 
 
 def _apply_controller_calibration(update_values, external_values):
@@ -31485,7 +31797,7 @@ def _exchange_position_acknowledgement(command, position_target=None):
     serial_port,
     position_target
   )
-  binding, json_configuration, configuration_command = json_preparation
+  binding, json_configuration = json_preparation
   configuration_sync_required = False
   try:
     configuration_sync_required = (
@@ -31525,7 +31837,7 @@ def _exchange_position_acknowledgement(command, position_target=None):
   if acknowledged and configuration_sync_required:
     _bind_main_controller_configuration(
       serial_port,
-      configuration_command,
+      json_configuration,
     )
   return acknowledged
 
@@ -36525,6 +36837,19 @@ if __name__ == "__main__":
     columnspan=2,
     sticky="w",
     pady=(2, 0),
+  )
+
+  captureNextJointMoveBut = Button(
+    motionTrackingFrame,
+    text="Capture next joint move",
+    command=_toggle_next_joint_motion_trace,
+  )
+  captureNextJointMoveBut.grid(
+    row=2,
+    column=0,
+    columnspan=2,
+    sticky="ew",
+    pady=(4, 0),
   )
 
   namedPositionFrame = Frame(jointFrame)

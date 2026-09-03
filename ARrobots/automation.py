@@ -401,6 +401,7 @@ class ARRobot(_AutomationSession):
             "speed_mode": speed_mode,
             "speed_value": speed_value,
             "telemetry_enabled": False,
+            "trace_configuration_fingerprint": None,
             "wrist_configuration": wrist_configuration,
         }
         return self._call(

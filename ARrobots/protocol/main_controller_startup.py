@@ -1,6 +1,7 @@
 """Bounded JSON-only startup for the main controller."""
 
 from dataclasses import dataclass
+import hashlib
 import math
 import threading
 import time
@@ -10,6 +11,7 @@ from .main_controller import (
     JsonMainControllerClient,
     JsonMainControllerTerminal,
 )
+from .messages import Request, encode_message
 from .schemas import (
     JSON_MAIN_COMMAND_MANIFEST,
     JsonCommandSchemaError,
@@ -17,6 +19,7 @@ from .schemas import (
     JsonMainHomeReferenceResult,
     JsonMainPositionResult,
     parse_main_motion_position_result,
+    validate_main_configuration_fingerprint,
     validate_main_config_ext_axis_request,
     validate_main_set_position_request,
     validate_main_update_params_request,
@@ -55,6 +58,14 @@ _JSON_TERMINAL_POSITION_PHYSICAL_STOP_COMMANDS = frozenset(
         "move_spline",
         "move_vision",
     )
+)
+
+_JSON_CONFIGURATION_FINGERPRINT_DOMAIN = (
+    b"ar4-json-main-configuration-v1\0"
+)
+_JSON_CONFIGURATION_FINGERPRINT_REQUESTS = (
+    (1, "update_params"),
+    (2, "config_ext_axis"),
 )
 
 
@@ -355,6 +366,19 @@ class JsonMainControllerStartupConfiguration:
             "robot_joints_millidegrees": self.robot_joints_millidegrees,
         }
 
+    @property
+    def configuration_fingerprint(self):
+        digest = hashlib.sha256(_JSON_CONFIGURATION_FINGERPRINT_DOMAIN)
+        parameters = {
+            "update_params": self.update_params,
+            "config_ext_axis": self.config_ext_axis,
+        }
+        for request_id, command in _JSON_CONFIGURATION_FINGERPRINT_REQUESTS:
+            digest.update(
+                encode_message(Request(request_id, command, parameters[command]))
+            )
+        return "sha256:" + digest.hexdigest()
+
 
 @dataclass(frozen=True)
 class JsonMainControllerPersistentStartupResult:
@@ -362,6 +386,7 @@ class JsonMainControllerPersistentStartupResult:
 
     startup: JsonMainControllerStartupResult
     client: JsonMainControllerClient
+    configuration_fingerprint: str
 
     def __post_init__(self):
         if type(self.startup) is not JsonMainControllerStartupResult:
@@ -372,6 +397,15 @@ class JsonMainControllerPersistentStartupResult:
             raise JsonMainControllerStartupError(
                 "persistent startup client is invalid"
             )
+        try:
+            validate_main_configuration_fingerprint(
+                self.configuration_fingerprint,
+                "persistent startup configuration fingerprint",
+            )
+        except JsonCommandSchemaError as exc:
+            raise JsonMainControllerStartupError(
+                str(exc)
+            ) from exc
         if (
             self.client.closed
             or self.client.closing
@@ -1080,6 +1114,7 @@ def run_main_controller_json_startup(
                 persistent_result = JsonMainControllerPersistentStartupResult(
                     startup,
                     client,
+                    configuration.configuration_fingerprint,
                 )
         if cancelled:
             drain_main_controller_input(

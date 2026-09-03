@@ -125,7 +125,7 @@ invented substitute value.
 `MAIN_HELLO_COMMAND_CONTRACT` and `parse_main_hello_result` and contains only:
 
 - `device: "main_controller"`;
-- `firmware: {"name":"AR4 Teensy","version":"6.7.1-ar4hmi.38",
+- `firmware: {"name":"AR4 Teensy","version":"6.7.1-ar4hmi.39",
   "build":"tracked"}`;
 - `protocol: {"name":"ar4_json","version":1,
   "max_payload_bytes":4094}`;
@@ -189,6 +189,7 @@ Teensy `JSON_COMMANDS` array must remain order-identical.
 | `correct_position` | `MAIN_CORRECT_POSITION_COMMAND_CONTRACT` |
 | `set_position` | `MAIN_SET_POSITION_COMMAND_CONTRACT` |
 | `test_limit_switches`, `set_encoders`, `read_encoders` | `MAIN_TEST_LIMIT_SWITCHES_COMMAND_CONTRACT`, `MAIN_SET_ENCODERS_COMMAND_CONTRACT`, `MAIN_READ_ENCODERS_COMMAND_CONTRACT` |
+| `get_motion_trace` | `MAIN_GET_MOTION_TRACE_COMMAND_CONTRACT` |
 | `update_params`, `config_ext_axis` | `MAIN_UPDATE_PARAMS_COMMAND_CONTRACT`, `MAIN_CONFIG_EXT_AXIS_COMMAND_CONTRACT` |
 | `zero_j7`, `zero_j8`, `zero_j9` | `MAIN_ZERO_J7_COMMAND_CONTRACT`, `MAIN_ZERO_J8_COMMAND_CONTRACT`, `MAIN_ZERO_J9_COMMAND_CONTRACT` |
 | `controller_wait` | `MAIN_CONTROLLER_WAIT_COMMAND_CONTRACT` |
@@ -212,6 +213,25 @@ Only the retained motion owner can accept correlated live control. Motion
 success, interruption, and known execution-failure terminals carry typed
 position disposition when available; `position_unavailable` prevents pose
 manufacture and requires state recovery.
+
+`move_joints` requires `trace_configuration_fingerprint`. Ordinary requests
+send `null`. One opted-in manual request sends the synchronized
+`sha256:<lowercase hexadecimal>` configuration fingerprint and must set
+`telemetry_enabled` to `false`. The fingerprint covers canonical validated
+`update_params` and `config_ext_axis` requests; position synchronization and
+motion input remain separate evidence.
+
+After an eligible authoritative terminal, `get_motion_trace` accepts exactly
+`{"motion_request_id":ID,"page_index":INDEX}`. A missing capture returns
+`{"capture_state":"no_capture","source_motion_request_id":ID}`. An available
+page identifies the capture generation, source session and motion request,
+configuration fingerprint, firmware, disposition, page bounds, and records.
+Records contain controller-relative microseconds, master index, scheduled
+delay, J1-J6 commanded steps and encoder counts, motion phase, and capture
+flags. Every page repeats immutable identity and disposition
+metadata. Host assembly accepts exact page order from one generation only.
+Physical-stop and untrusted-session paths never retrieve a trace. Only a
+complete validated assembly can become one atomically promoted local artifact.
 
 `move_linear` wraps the exact `move_cartesian` parameters under `motion` and
 requires `rounding_millimeters: 0` plus `disable_wrist_rotation: false`. The

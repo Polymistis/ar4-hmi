@@ -6,7 +6,7 @@ supported.
 
 The matched firmware identities are:
 
-- Teensy 4.1 main controller: `6.7.1-ar4hmi.38`
+- Teensy 4.1 main controller: `6.7.1-ar4hmi.39`
 - Nano auxiliary controller: `2.0`
 - Mega auxiliary controller: `2.0`
 
@@ -30,7 +30,8 @@ emergency-stop ordering. The interrupt path latches stop state without writing
 serial bytes. Main-loop arbitration finishes an owned response before
 publishing the JSON emergency-stop event.
 
-Main commands cover identity and state, configuration, diagnostics,
+Main commands cover identity and state, configuration, diagnostics and
+post-motion controller-clock trace retrieval,
 calibration, joint/Cartesian/linear/vision/arc/circle/spline motion, tool and
 live jog, stop, Modbus reads/writes/waits, and SD program
 delete/list/write/playback. Arc, circle, and spline requests are atomic,

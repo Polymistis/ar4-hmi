@@ -13,6 +13,7 @@ enum class JsonMainRequestDispositionKind {
   kDispatchTestLimitSwitches,
   kDispatchSetEncoders,
   kDispatchReadEncoders,
+  kDispatchGetMotionTrace,
   kDispatchCorrectPosition,
   kDispatchZeroExternalAxis,
   kDispatchSetPosition,
@@ -51,6 +52,7 @@ enum class JsonMainRequestParseResponseStatus {
   kDispatchTestLimitSwitches,
   kDispatchSetEncoders,
   kDispatchReadEncoders,
+  kDispatchGetMotionTrace,
   kDispatchCorrectPosition,
   kDispatchZeroExternalAxis,
   kDispatchSetPosition,
@@ -176,6 +178,8 @@ inline bool json_main_request_parse_result_shape_valid(
         return result.payload.move_cartesian() != nullptr;
       case JsonMainRequestCommand::kMoveJoints:
         return result.payload.move_joints() != nullptr;
+      case JsonMainRequestCommand::kGetMotionTrace:
+        return result.payload.motion_trace() != nullptr;
       case JsonMainRequestCommand::kMoveLinear:
       case JsonMainRequestCommand::kMoveVision:
       case JsonMainRequestCommand::kWaitModbusCoil:
@@ -273,6 +277,16 @@ inline JsonMainRequestDisposition classify_main_json_request_disposition(
       case JsonMainRequestCommand::kGetPositionDisposition: {
         const JsonMainRequestDisposition disposition = {
           JsonMainRequestDispositionKind::kDispatchGetPositionDisposition,
+          nullptr,
+          nullptr,
+          nullptr,
+          nullptr,
+        };
+        return disposition;
+      }
+      case JsonMainRequestCommand::kGetMotionTrace: {
+        const JsonMainRequestDisposition disposition = {
+          JsonMainRequestDispositionKind::kDispatchGetMotionTrace,
           nullptr,
           nullptr,
           nullptr,
@@ -627,6 +641,10 @@ inline JsonMainRequestParseResponseStatus build_main_json_parse_response(
   if (
     disposition.kind == JsonMainRequestDispositionKind::kDispatchReadEncoders
   ) return JsonMainRequestParseResponseStatus::kDispatchReadEncoders;
+  if (
+    disposition.kind
+      == JsonMainRequestDispositionKind::kDispatchGetMotionTrace
+  ) return JsonMainRequestParseResponseStatus::kDispatchGetMotionTrace;
   if (
     disposition.kind
       == JsonMainRequestDispositionKind::kDispatchSetPosition

@@ -47,6 +47,7 @@ MAIN_CONTROLLER_COMMANDS = (
     _main("test_limit_switches", "state"),
     _main("set_encoders", "state"),
     _main("read_encoders", "state"),
+    _main("get_motion_trace", "diagnostics"),
     _main("update_params", "configuration"),
     _main("config_ext_axis", "configuration"),
     _main("zero_j7", "configuration"),

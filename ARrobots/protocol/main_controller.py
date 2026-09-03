@@ -1,8 +1,12 @@
 """Device-bound client for the main-controller JSON session."""
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import partial
+import json
 import math
+import os
+from pathlib import Path
+import tempfile
 import threading
 import time
 
@@ -24,6 +28,7 @@ from .schemas import (
     MAIN_CORRECT_POSITION_COMMAND_CONTRACT,
     MAIN_DELETE_SD_PROGRAM_COMMAND_CONTRACT,
     MAIN_GET_HOME_REFERENCE_COMMAND_CONTRACT,
+    MAIN_GET_MOTION_TRACE_COMMAND_CONTRACT,
     MAIN_GET_POSITION_DISPOSITION_COMMAND_CONTRACT,
     MAIN_HELLO_COMMAND_CONTRACT,
     MAIN_READ_ENCODERS_COMMAND_CONTRACT,
@@ -60,6 +65,7 @@ from .schemas import (
     MAIN_ZERO_J8_COMMAND_CONTRACT,
     MAIN_ZERO_J9_COMMAND_CONTRACT,
     JsonCommandSchemaError,
+    JsonMainMotionTracePageResult,
     parse_main_hello_result,
     parse_main_calibration_result,
     parse_main_encoder_counts_result,
@@ -69,6 +75,8 @@ from .schemas import (
     parse_main_list_sd_programs_result,
     parse_main_move_cartesian_result,
     parse_main_move_joints_result,
+    parse_main_motion_position_result,
+    parse_main_motion_trace_result,
     parse_main_modbus_read_result,
     parse_main_modbus_wait_result,
     parse_main_delete_sd_program_result,
@@ -78,6 +86,7 @@ from .schemas import (
     parse_main_renew_live_motion_result,
     parse_main_stop_result,
     parse_main_tool_jog_result,
+    validate_main_configuration_fingerprint,
 )
 from .session import (
     JSON_SESSION_MAXIMUM_PENDING_REQUESTS,
@@ -123,6 +132,10 @@ _MAIN_COMMANDS = (
     (
         MAIN_GET_HOME_REFERENCE_COMMAND_CONTRACT,
         parse_main_home_reference_result,
+    ),
+    (
+        MAIN_GET_MOTION_TRACE_COMMAND_CONTRACT,
+        parse_main_motion_trace_result,
     ),
     (
         MAIN_GET_POSITION_DISPOSITION_COMMAND_CONTRACT,
@@ -269,6 +282,7 @@ _MAIN_DIAGNOSTIC_COMMANDS = frozenset((
 _MAIN_EXTERNAL_AXIS_ZERO_COMMANDS = frozenset(("zero_j7", "zero_j8", "zero_j9"))
 _MAIN_BLOCKING_COMMANDS = frozenset((
     "controller_wait",
+    "get_motion_trace",
     *_MAIN_MODBUS_READ_COMMANDS,
     *_MAIN_MODBUS_WRITE_COMMANDS,
     "wait_modbus_coil",
@@ -402,6 +416,311 @@ class _JsonMainMotionState:
     motion_request_id: int = 0
     lease_milliseconds: int = 0
     terminal_order_faulted: bool = False
+
+
+@dataclass(frozen=True)
+class JsonMainMotionTraceReservation:
+    generation: int
+    configuration_fingerprint: str
+    armed_at_ns: int
+
+
+class JsonMainMotionTraceArm:
+    """Own the one-shot admission state for a manual joint trace."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._armed = False
+        self._armed_at_ns = 0
+
+    @property
+    def armed(self):
+        with self._lock:
+            return self._armed
+
+    def arm(self):
+        with self._lock:
+            self._generation += 1
+            self._armed = True
+            self._armed_at_ns = time.time_ns()
+            return self._generation
+
+    def cancel(self):
+        with self._lock:
+            self._armed = False
+            self._armed_at_ns = 0
+
+    def reserve(self, configuration_fingerprint):
+        validate_main_configuration_fingerprint(
+            configuration_fingerprint,
+            "motion-trace configuration fingerprint",
+        )
+        with self._lock:
+            if not self._armed:
+                return None
+            return JsonMainMotionTraceReservation(
+                self._generation,
+                configuration_fingerprint,
+                self._armed_at_ns,
+            )
+
+    def consume(self, reservation):
+        if type(reservation) is not JsonMainMotionTraceReservation:
+            return False
+        with self._lock:
+            if (
+                not self._armed
+                or reservation.generation != self._generation
+            ):
+                return False
+            self._armed = False
+            self._armed_at_ns = 0
+            return True
+
+
+class JsonMainMotionTraceAssembly:
+    """Validate and assemble one immutable paged controller trace."""
+
+    def __init__(
+        self,
+        *,
+        motion_request_id,
+        source_session_id,
+        configuration_fingerprint,
+    ):
+        if (
+            isinstance(motion_request_id, bool)
+            or not isinstance(motion_request_id, int)
+            or motion_request_id <= 0
+        ):
+            raise JsonCommandSchemaError(
+                "motion-trace source request identifier is invalid"
+            )
+        if not isinstance(source_session_id, str) or not source_session_id:
+            raise JsonCommandSchemaError(
+                "motion-trace source session identifier is invalid"
+            )
+        validate_main_configuration_fingerprint(
+            configuration_fingerprint,
+            "motion-trace configuration fingerprint",
+        )
+        self._motion_request_id = motion_request_id
+        self._source_session_id = source_session_id
+        self._configuration_fingerprint = configuration_fingerprint
+        self._identity = None
+        self._records = []
+        self._next_page = 0
+        self._complete = False
+
+    def accept(self, page):
+        if self._complete:
+            raise JsonCommandSchemaError(
+                "motion-trace assembly already contains every page"
+            )
+        if type(page) is not JsonMainMotionTracePageResult:
+            raise JsonCommandSchemaError(
+                "motion-trace assembly requires an available page"
+            )
+        if (
+            page.source_motion_request_id != self._motion_request_id
+            or page.source_session_id != self._source_session_id
+            or page.configuration_fingerprint
+            != self._configuration_fingerprint
+        ):
+            raise JsonCommandSchemaError(
+                "motion-trace page does not match the requested motion"
+            )
+        identity = (
+            page.capture_generation,
+            page.configuration_fingerprint,
+            page.disposition,
+            page.firmware,
+            page.page_count,
+            page.source_motion_request_id,
+            page.source_session_id,
+            page.total_records,
+        )
+        if self._identity is None:
+            self._identity = identity
+        elif identity != self._identity:
+            raise JsonCommandSchemaError(
+                "motion-trace page identity changed during assembly"
+            )
+        if (
+            page.page_index != self._next_page
+            or page.record_start != len(self._records)
+        ):
+            raise JsonCommandSchemaError(
+                "motion-trace page sequence is discontinuous"
+            )
+        self._records.extend(page.records)
+        self._next_page += 1
+        if self._next_page == page.page_count:
+            if len(self._records) != page.total_records:
+                raise JsonCommandSchemaError(
+                    "motion-trace record total changed during assembly"
+                )
+            self._complete = True
+        return self._complete
+
+    def artifact(self, *, controller_identity, motion_parameters, host_times_ns):
+        if not self._complete or self._identity is None:
+            raise JsonCommandSchemaError(
+                "motion-trace artifact requires a complete assembly"
+            )
+        if type(controller_identity) is not dict or not controller_identity:
+            raise JsonCommandSchemaError(
+                "motion-trace controller identity is invalid"
+            )
+        if type(motion_parameters) is not dict or not motion_parameters:
+            raise JsonCommandSchemaError(
+                "motion-trace motion parameters are invalid"
+            )
+        required_times = ("armed", "admitted", "terminal", "retrieved")
+        timestamp_values = tuple(
+            host_times_ns.get(name) for name in required_times
+        ) if type(host_times_ns) is dict else ()
+        if (
+            type(host_times_ns) is not dict
+            or frozenset(host_times_ns) != frozenset(required_times)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in timestamp_values
+            )
+            or any(
+                earlier > later
+                for earlier, later in zip(
+                    timestamp_values,
+                    timestamp_values[1:],
+                )
+            )
+        ):
+            raise JsonCommandSchemaError(
+                "motion-trace host timestamps are invalid"
+            )
+        (
+            capture_generation,
+            configuration_fingerprint,
+            disposition,
+            firmware,
+            _page_count,
+            motion_request_id,
+            source_session_id,
+            _total_records,
+        ) = self._identity
+        if (
+            motion_parameters.get("trace_configuration_fingerprint")
+            != configuration_fingerprint
+            or motion_parameters.get("telemetry_enabled") is not False
+        ):
+            raise JsonCommandSchemaError(
+                "motion-trace motion parameters do not select this capture"
+            )
+        return {
+            "artifact_version": 1,
+            "capture_generation": capture_generation,
+            "configuration_fingerprint": configuration_fingerprint,
+            "controller_identity": dict(controller_identity),
+            "disposition": asdict(disposition),
+            "firmware": asdict(firmware),
+            "host_times_ns": dict(host_times_ns),
+            "motion_request": {
+                "cmd": "move_joints",
+                "id": motion_request_id,
+                "params": dict(motion_parameters),
+            },
+            "records": [asdict(record) for record in self._records],
+            "source_session_id": source_session_id,
+        }
+
+
+def write_main_motion_trace_artifact(directory, artifact):
+    """Atomically publish one validated local trace artifact."""
+    if type(artifact) is not dict or artifact.get("artifact_version") != 1:
+        raise JsonCommandSchemaError("motion-trace artifact is invalid")
+    capture_generation = artifact.get("capture_generation")
+    motion_request = artifact.get("motion_request")
+    source_session_id = artifact.get("source_session_id")
+    if (
+        isinstance(capture_generation, bool)
+        or not isinstance(capture_generation, int)
+        or capture_generation <= 0
+        or type(motion_request) is not dict
+        or isinstance(motion_request.get("id"), bool)
+        or not isinstance(motion_request.get("id"), int)
+        or motion_request["id"] <= 0
+        or not isinstance(source_session_id, str)
+        or len(source_session_id) != 32
+        or any(
+            character not in "0123456789ABCDEF"
+            for character in source_session_id
+        )
+    ):
+        raise JsonCommandSchemaError("motion-trace artifact identity is invalid")
+    destination_directory = Path(directory)
+    destination_directory.mkdir(parents=True, exist_ok=True)
+    destination = destination_directory / (
+        f"session-{source_session_id}-motion-{motion_request['id']}-"
+        f"capture-{capture_generation}.json"
+    )
+    if destination.exists():
+        raise FileExistsError(f"motion-trace artifact already exists: {destination}")
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            prefix=f".{destination.name}.",
+            suffix=".partial",
+            dir=destination_directory,
+            delete=False,
+        ) as stream:
+            temporary_name = stream.name
+            json.dump(
+                artifact,
+                stream,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, destination)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+    return destination
+
+
+def main_motion_trace_retrieval_eligible(terminal, stop_observed):
+    """Return whether a settled traced move can safely enter retrieval."""
+    if type(terminal) is not JsonMainControllerTerminal:
+        raise JsonCommandSchemaError("motion-trace terminal is invalid")
+    if type(stop_observed) is not bool:
+        raise JsonCommandSchemaError("motion-trace stop state is invalid")
+    if stop_observed:
+        return False
+    if terminal.response.status == "completed":
+        return True
+    if terminal.response.status != "failed" or terminal.failure is None:
+        return False
+    position = terminal.failure.details.get("position")
+    if position is None:
+        return False
+    try:
+        parse_main_motion_position_result(position)
+    except JsonCommandSchemaError:
+        return False
+    return True
 
 
 class JsonMainControllerClientStateError(RuntimeError):
@@ -1073,6 +1392,30 @@ class JsonMainControllerClient:
             write_admission=write_admission,
         )
 
+    def request_motion_trace(
+        self,
+        *,
+        motion_request_id,
+        page_index,
+        timeout,
+        write_admission=None,
+    ):
+        """Request one immutable controller-clock trace page."""
+        with _JsonMainSubmissionReservation(
+            self,
+            "get_motion_trace",
+        ) as reservation:
+            return self._coordinator.submit(
+                "get_motion_trace",
+                {
+                    "motion_request_id": motion_request_id,
+                    "page_index": page_index,
+                },
+                timeout=timeout,
+                write_admission=write_admission,
+                maximum_payload_bytes=reservation.maximum_payload_bytes,
+            )
+
     def request_set_encoders(self, *, timeout, write_admission=None):
         return self._request_diagnostic(
             "set_encoders",
@@ -1299,6 +1642,7 @@ class JsonMainControllerClient:
         wrist_configuration,
         loop_modes,
         telemetry_enabled,
+        trace_configuration_fingerprint,
         timeout,
         write_admission=None,
     ):
@@ -1314,6 +1658,9 @@ class JsonMainControllerClient:
                 "speed_mode": speed_mode,
                 "speed_value": speed_value,
                 "telemetry_enabled": telemetry_enabled,
+                "trace_configuration_fingerprint": (
+                    trace_configuration_fingerprint
+                ),
                 "wrist_configuration": wrist_configuration,
             },
             timeout=timeout,
@@ -1876,4 +2223,9 @@ __all__ = (
     "JsonMainControllerClient",
     "JsonMainControllerClientStateError",
     "JsonMainControllerTerminal",
+    "JsonMainMotionTraceArm",
+    "JsonMainMotionTraceAssembly",
+    "JsonMainMotionTraceReservation",
+    "main_motion_trace_retrieval_eligible",
+    "write_main_motion_trace_artifact",
 )
