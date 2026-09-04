@@ -546,6 +546,13 @@ class JsonSerialTransportReadTests(unittest.TestCase):
         self.assertEqual(self.poll_and_acknowledge(transport), frame)
         self.assertEqual(serial_port.read_sizes, [len(frame)])
 
+    def test_default_read_drains_a_fully_pending_maximum_frame(self):
+        frame = b"x" * JSON_PROTOCOL_MAXIMUM_PAYLOAD_BYTES + b"\r\n"
+        transport, serial_port = self.transport((frame,))
+
+        self.assertEqual(self.poll_and_acknowledge(transport), frame)
+        self.assertEqual(serial_port.read_sizes, [len(frame)])
+
     def test_frame_handoff_requires_exact_acknowledgement(self):
         frame = b'{"type":"event","v":1}\n'
         transport, _serial_port = self.transport((frame,))

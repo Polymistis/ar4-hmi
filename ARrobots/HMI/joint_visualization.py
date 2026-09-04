@@ -567,6 +567,15 @@ class JointMotionVisualization:
         self._actual_position_source = source
         return True
 
+    def clear_actual(self):
+        self._hide_marker_group(
+            self._encoder_markers,
+            "_encoder_markers_visible",
+            "encoder",
+        )
+        self._actual_joint_positions = None
+        self._actual_position_source = None
+
     def start(
         self,
         start_positions,

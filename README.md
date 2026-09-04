@@ -91,7 +91,7 @@ automatic retry.
 
 ## 🧠 Troubleshooting
 - **Serial connection issues** → Verify the correct COM port and matched JSON-only firmware: Teensy `6.7.1-ar4hmi.39` plus Nano/Mega `2.0`. Startup requires the exact command manifests defined by the [JSON protocol](docs/json-protocol-v1.md); legacy serial commands and fallback are not supported.
-- **Motion tracking shows estimates only** → Request-scoped J1-J6 encoder telemetry is selected by ordinary JSON `move_joints`. The one-shot **Capture next joint move** control disables live telemetry for the selected manual move, retrieves the controller-clock trace after trusted settlement, and writes a local artifact under `logs/motion-traces/`. J7-J9 remain estimated because no matching encoder sources are configured.
+- **Motion tracking shows estimates only** → Request-scoped J1-J6 encoder telemetry is selected by ordinary JSON `move_joints`. While joint motion is idle, the one-shot **Capture next joint move** control clears the prior amber sample, disables live telemetry for the selected manual move, retrieves the controller-clock trace after trusted settlement, and writes a local artifact under `logs/motion-traces/`. Amber markers remain absent until later validated live telemetry arrives. J7-J9 remain estimated because no matching encoder sources are configured.
 - **Shutdown Position unavailable** → JSON startup obtains the J1-J3 home reference after configuration. Complete J2 and J3 homing after controller startup or parameter and forced-position updates.
 - **Display lag in visualization** → Disable real-time rendering under *Settings → Viewer Options*.
 

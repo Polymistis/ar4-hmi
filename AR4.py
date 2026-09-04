@@ -23122,6 +23122,21 @@ def _toggle_next_joint_motion_trace():
       "Alarm.TLabel",
     )
     return False
+  if joint_motion_dispatcher.active:
+    _set_application_status(
+      "WAIT FOR THE CURRENT JOINT MOVE BEFORE ARMING CAPTURE",
+      "Warn.TLabel",
+    )
+    return False
+  try:
+    joint_motion_visualization.clear_actual()
+  except Exception:
+    logger.exception("Unable to clear the obsolete encoder-sample display")
+    _set_application_status(
+      "JOINT MOTION CAPTURE NOT ARMED: ENCODER DISPLAY COULD NOT BE CLEARED",
+      "Alarm.TLabel",
+    )
+    return False
   arm.arm()
   _set_motion_trace_arm_display()
   _set_application_status(
@@ -23163,6 +23178,10 @@ def _retrieve_json_joint_motion_trace(
 ):
   client = binding.json_client
   session = client.session_binding
+  _schedule_motion_trace_status(
+    "RETRIEVING JOINT MOTION CAPTURE",
+    "Warn.TLabel",
+  )
   assembly = JsonMainMotionTraceAssembly(
     motion_request_id=motion_request_id,
     source_session_id=session.session_id,

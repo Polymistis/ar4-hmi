@@ -60,13 +60,16 @@ publishes `JsonMainControllerPhysicalStop` with source
 `JsonMainPositionResult` from the terminal.
 
 The HMI **Capture next joint move** control opts one manual `move_joints`
-request into volatile controller-clock capture. Selection is consumed only at
-serial write admission. A selected request disables live telemetry, preserves
-the normal motion terminal as authoritative when the bound session remains
-intact, and retrieves pages only after terminal acknowledgement, event
-draining, and reader release. Transport loss during retrieval propagates
-through normal controller cleanup. Any physical stop or untrusted session skips
-retrieval. Complete validated pages are
+request into volatile controller-clock capture. Arming is limited to an idle
+joint dispatcher and clears the prior amber encoder sample. Selection is
+consumed only at serial write admission. A selected request disables live
+telemetry, so amber markers remain absent until a later validated live sample;
+trace records never masquerade as live telemetry. The normal motion terminal
+remains authoritative when the bound session remains intact, and pages are
+retrieved only after terminal acknowledgement, event draining, and reader
+release. Transport loss during retrieval propagates through normal controller
+cleanup. Any physical stop or untrusted session skips retrieval. Complete
+validated pages are
 atomically assembled and written under the local ignored
 `logs/motion-traces/` directory. Captures from incomplete motion or bounded
 sub-sampling remain explicit through the artifact disposition flags.

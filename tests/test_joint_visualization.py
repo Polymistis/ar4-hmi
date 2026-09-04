@@ -1031,6 +1031,27 @@ class JointMotionVisualizationTests(unittest.TestCase):
             any(marker.visible for marker in self.encoder_markers)
         )
 
+    def test_clear_actual_hides_only_the_obsolete_encoder_sample(self):
+        self.visualization.start(
+            (0,) * 9,
+            joint_move(),
+            200,
+        )
+        self.visualization.observe_actual((1, 2, 3, 4, 5, 6))
+        self.visualization.refresh()
+
+        self.assertIsNone(self.visualization.clear_actual())
+        self.assertTrue(self.visualization.active)
+        self.assertFalse(any(marker.visible for marker in self.encoder_markers))
+        self.assertTrue(all(marker.visible for marker in self.target_markers))
+        self.assertTrue(
+            self.visualization.observe_actual((6, 5, 4, 3, 2, 1))
+        )
+        self.visualization.refresh()
+        self.assertTrue(
+            all(marker.visible for marker in self.encoder_markers)
+        )
+
     def test_finish_rejects_non_boolean_preservation_before_mutation(self):
         self.visualization.start((0,) * 9, joint_move(), 200)
 
