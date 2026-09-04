@@ -793,6 +793,7 @@ if __name__ == "__main__":
   controller_identity_state_lock = threading.Lock()
   main_controller_identity_binding = None
   main_controller_connection_epoch = 0
+  current_session_calibrated_primary_axes = None
   joint_actual_position_source_snapshot = None
   gcode_storage_media_binding = None
   gcode_view_generation = 0
@@ -910,6 +911,7 @@ SERIAL_EVENT_APPLICATION_MARGIN_SECONDS = 5
 SERIAL_WRITE_TIMEOUT_SECONDS = 5
 SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS = 5
 SERIAL_AUXILIARY_WAIT_MARGIN_SECONDS = 5
+AUXILIARY_CONTROLLER_RESET_SETTLE_SECONDS = 2.0
 AUXILIARY_DEVICE_BAUD_RATE = 9600
 AUXILIARY_DEVICE_READ_TIMEOUT_SECONDS = 5
 AUXILIARY_DEVICE_PROGRAM_READ_TIMEOUT_SECONDS = 10
@@ -2894,10 +2896,13 @@ def _synchronous_motion_request(
   name,
   rejection_result=False,
   requires_kinematics=True,
+  allow_uncalibrated=False,
   inherited_lease_keyword=None,
 ):
   if not isinstance(requires_kinematics, bool):
     raise TypeError("kinematics admission flag must be boolean")
+  if not isinstance(allow_uncalibrated, bool):
+    raise TypeError("uncalibrated admission flag must be boolean")
   if (
     inherited_lease_keyword is not None
     and (
@@ -2926,6 +2931,7 @@ def _synchronous_motion_request(
       request_lease = _acquire_motion_request(
         name,
         requires_kinematics=requires_kinematics,
+        allow_uncalibrated=allow_uncalibrated,
       )
       if request_lease is None:
         return rejection_result
@@ -4326,6 +4332,7 @@ def _bind_main_controller_identity(
 ):
   global main_controller_connection_epoch
   global main_controller_identity_binding
+  global current_session_calibrated_primary_axes
   global joint_actual_position_source_snapshot
   global gcode_storage_media_binding
 
@@ -4350,6 +4357,7 @@ def _bind_main_controller_identity(
         "main controller connection epoch is invalid"
       )
     main_controller_connection_epoch += 1
+    current_session_calibrated_primary_axes = (False,) * 6
     joint_actual_position_source_snapshot = None
     main_controller_identity_binding = binding
     gcode_storage_media_binding = None
@@ -4446,6 +4454,7 @@ def _require_persistent_json_client_cleanup(
 
 def _require_main_controller_identity_cleanup(serial_port, context):
   global main_controller_identity_binding
+  global current_session_calibrated_primary_axes
   global joint_actual_position_source_snapshot
   global gcode_storage_media_binding
 
@@ -4498,6 +4507,7 @@ def _require_main_controller_identity_cleanup(serial_port, context):
     ):
       gcode_storage_media_binding = None
     main_controller_identity_binding = None
+    current_session_calibrated_primary_axes = None
     if current_port is serial_port:
       RUN['ser'] = None
   return True
@@ -4515,6 +4525,47 @@ def _current_main_controller_identity(serial_port=None):
   ):
     return None
   return binding
+
+
+def _current_session_primary_calibration_ready():
+  with controller_identity_state_lock:
+    binding = main_controller_identity_binding
+    calibrated_axes = current_session_calibrated_primary_axes
+    return (
+      isinstance(binding, MainControllerIdentityBinding)
+      and RUN.get('ser') is binding.serial_port
+      and getattr(binding.serial_port, "is_open", False)
+      and calibrated_axes == (True,) * 6
+    )
+
+
+def _record_current_session_calibration(serial_port, axes):
+  global current_session_calibrated_primary_axes
+
+  if (
+    type(axes) is not tuple
+    or len(axes) != 9
+    or any(type(selected) is not bool for selected in axes)
+  ):
+    raise MotionInputError("calibration result axes are invalid")
+  with controller_identity_state_lock:
+    binding = main_controller_identity_binding
+    if (
+      not isinstance(binding, MainControllerIdentityBinding)
+      or binding.serial_port is not serial_port
+      or RUN.get('ser') is not serial_port
+      or not getattr(serial_port, "is_open", False)
+    ):
+      raise ConnectionError(
+        "main controller changed before calibration readiness was recorded"
+      )
+    current_session_calibrated_primary_axes = tuple(
+      established or selected
+      for established, selected in zip(
+        current_session_calibrated_primary_axes,
+        axes[:6],
+      )
+    )
 
 
 def _bind_main_controller_configuration(serial_port, configuration):
@@ -7088,7 +7139,10 @@ def _set_offline_mode_status(offline):
 
 
 def toggle_offline_mode():
-    request_lease = _acquire_motion_request("Mode transition")
+    request_lease = _acquire_motion_request(
+        "Mode transition",
+        allow_uncalibrated=True,
+    )
     if request_lease is None:
         message = _motion_request_rejection_message(
             "Mode change rejected while motion or recovery ownership is active"
@@ -8040,25 +8094,38 @@ def _retain_json_startup_disposition_error(
   )
 
 
-def _close_startup_auxiliary(serial_port):
+def _close_startup_auxiliary(serial_port, json_client=None):
     if serial_port is None:
         return True
     if not auxiliary_serial_lock.acquire(blocking=False):
         logger.error("Auxiliary startup cleanup could not reserve the transport")
         return False
     try:
-        if RUN.get('ser2') is serial_port:
+        if RUN.get('ser2') is serial_port and json_client is None:
             return _close_serial_port('ser2', "auxiliary startup cleanup")
-        if getattr(serial_port, "is_open", None) is False:
+        if (
+            getattr(serial_port, "is_open", None) is False
+            and (json_client is None or json_client.closed)
+        ):
             return True
         try:
-            serial_port.close()
+            if json_client is None:
+                serial_port.close()
+            else:
+                _require_persistent_json_client_cleanup(
+                    json_client,
+                    serial_port,
+                    "retained auxiliary cleanup",
+                )
         except Exception:
             logger.exception("Unable to close the auxiliary startup connection")
             return False
         if getattr(serial_port, "is_open", False):
             logger.error("Auxiliary startup connection remained open during cleanup")
             return False
+        if RUN.get('ser2') is serial_port:
+            RUN['ser2'] = None
+            _clear_auxiliary_board_profile(serial_port)
         return True
     finally:
         auxiliary_serial_lock.release()
@@ -8069,18 +8136,26 @@ def _run_startup_auxiliary_cleanup():
 
     while True:
         with startup_auxiliary_cleanup_lock:
-            serial_ports = tuple(startup_auxiliary_cleanup_pending.values())
-            if not serial_ports:
+            pending_connections = tuple(
+                startup_auxiliary_cleanup_pending.values()
+            )
+            if not pending_connections:
                 startup_auxiliary_cleanup_worker = None
                 return
 
         closed_any = False
-        for serial_port in serial_ports:
-            if not _close_startup_auxiliary(serial_port):
+        for serial_port, json_client in pending_connections:
+            if not _close_startup_auxiliary(serial_port, json_client):
                 continue
             with startup_auxiliary_cleanup_lock:
                 key = id(serial_port)
-                if startup_auxiliary_cleanup_pending.get(key) is serial_port:
+                pending = startup_auxiliary_cleanup_pending.get(key)
+                if (
+                    isinstance(pending, tuple)
+                    and len(pending) == 2
+                    and pending[0] is serial_port
+                    and pending[1] is json_client
+                ):
                     del startup_auxiliary_cleanup_pending[key]
             closed_any = True
 
@@ -8112,20 +8187,36 @@ def _ensure_startup_auxiliary_cleanup():
     return True
 
 
-def _request_startup_auxiliary_cleanup(serial_port):
+def _request_startup_auxiliary_cleanup(serial_port, json_client=None):
     if serial_port is None:
         return True
-    if _close_startup_auxiliary(serial_port):
+    if json_client is None and RUN.get('ser2') is serial_port:
+        binding = RUN.get('ser2BoardProfile')
+        if (
+            isinstance(binding, tuple)
+            and len(binding) == 3
+            and binding[0] is serial_port
+        ):
+            json_client = binding[2]
+    if _close_startup_auxiliary(serial_port, json_client):
         with startup_auxiliary_cleanup_lock:
             key = id(serial_port)
-            if startup_auxiliary_cleanup_pending.get(key) is serial_port:
+            pending = startup_auxiliary_cleanup_pending.get(key)
+            if (
+                isinstance(pending, tuple)
+                and len(pending) == 2
+                and pending[0] is serial_port
+            ):
                 del startup_auxiliary_cleanup_pending[key]
         return True
 
     # Retain the failed handle until a retry closes it; dropping the last
     # reference can leave an open OS handle outside shutdown ownership.
     with startup_auxiliary_cleanup_lock:
-        startup_auxiliary_cleanup_pending[id(serial_port)] = serial_port
+        startup_auxiliary_cleanup_pending[id(serial_port)] = (
+            serial_port,
+            json_client,
+        )
     _ensure_startup_auxiliary_cleanup()
     return False
 
@@ -9166,22 +9257,27 @@ def _set_com_admitted(
         ):
           if result.auxiliary_error is not None:
             set_startup_status(
-              "SYSTEM READY; AUXILIARY CONTROLLER UNAVAILABLE",
+              "CONTROLLER CALIBRATION REQUIRED; "
+              "AUXILIARY CONTROLLER UNAVAILABLE",
               "Warn.TLabel",
             )
           elif auxiliary_discovery_status not in (None, "selected"):
             set_startup_status(
-              "SYSTEM READY; AUXILIARY CONTROLLER "
+              "CONTROLLER CALIBRATION REQUIRED; AUXILIARY CONTROLLER "
               f"{auxiliary_discovery_status.upper()}",
               "Warn.TLabel",
             )
           elif startup_request.auxiliary_port is None:
             set_startup_status(
-              "SYSTEM READY; AUXILIARY CONTROLLER NOT CONFIGURED",
+              "CONTROLLER CALIBRATION REQUIRED; "
+              "AUXILIARY CONTROLLER NOT CONFIGURED",
               "Warn.TLabel",
             )
           else:
-            set_startup_status("SYSTEM READY", "OK.TLabel")
+            set_startup_status(
+              "CONTROLLER CALIBRATION REQUIRED",
+              "Warn.TLabel",
+            )
         _commit_main_port_enrollment(
           selected_main_port,
           selected_main_identity,
@@ -9220,7 +9316,17 @@ def _set_com_admitted(
         finish_startup,
         report_startup_timeout,
         abandon_startup,
-        timeout=SERIAL_STARTUP_READ_TIMEOUT_SECONDS,
+        timeout=(
+          SERIAL_STARTUP_READ_TIMEOUT_SECONDS
+          + (
+            AUXILIARY_CONTROLLER_RESET_SETTLE_SECONDS
+            if (
+              startup_request.auxiliary_port is not None
+              and startup_request.auxiliary_board is not None
+            )
+            else 0.0
+          )
+        ),
       )
       request_state["transferred"] = True
     except Exception:
@@ -9260,20 +9366,57 @@ def _set_com_admitted(
       _release_async_main_serial_transport(activity_lease, request_lease)
 
 
-def _replace_auxiliary_serial(port, board_profile):
+def _close_auxiliary_replacement(serial_port, json_client, context):
+  cleanup_error = None
+  try:
+    if json_client is None:
+      serial_port.close()
+    else:
+      _require_persistent_json_client_cleanup(
+        json_client,
+        serial_port,
+        context,
+      )
+  except Exception as exc:
+    cleanup_error = exc
+    try:
+      serial_port.close()
+    except Exception:
+      logger.exception("Unable to close the auxiliary replacement transport")
+    if json_client is not None:
+      try:
+        _require_persistent_json_client_cleanup(
+          json_client,
+          serial_port,
+          f"{context} retry",
+        )
+      except Exception:
+        logger.exception("Auxiliary replacement cleanup retry failed")
+  if (
+    (json_client is not None and not json_client.closed)
+    or getattr(serial_port, "is_open", False)
+  ):
+    _request_startup_auxiliary_cleanup(serial_port, json_client)
+  if (
+    (json_client is not None and not json_client.closed)
+    or getattr(serial_port, "is_open", False)
+  ):
+    raise OSError("Auxiliary replacement cleanup remained incomplete") from cleanup_error
+  if cleanup_error is not None:
+    logger.error(
+      "Auxiliary replacement cleanup recovered after an initial failure",
+      exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
+    )
+  return True
+
+
+def _prepare_auxiliary_serial(port, board_profile):
   if not isinstance(port, str):
     raise MotionInputError("auxiliary controller port must be text")
   port = port.strip()
   if port in ("", "None"):
     raise MotionInputError("no auxiliary controller port selected")
   board_profile = normalize_auxiliary_board_profile(board_profile)
-
-  existing_serial = RUN.get('ser2')
-  if existing_serial is not None and not _close_serial_port(
-    'ser2', "auxiliary connection replacement",
-  ):
-    raise OSError("Existing auxiliary serial connection remained open")
-
   replacement = serial.Serial(
     port=port,
     baudrate=9600,
@@ -9285,9 +9428,13 @@ def _replace_auxiliary_serial(port, board_profile):
       replacement.close()
     finally:
       raise OSError("Auxiliary serial connection did not open")
-  RUN['ser2'] = replacement
   json_client = None
   try:
+    # Arduino USB serial adapters reset the controller when the port opens.
+    # Discard bootloader-era bytes before the first strict JSON request.
+    time.sleep(AUXILIARY_CONTROLLER_RESET_SETTLE_SECONDS)
+    replacement.reset_input_buffer()
+    replacement.reset_output_buffer()
     json_client = JsonAuxiliaryControllerClient(replacement)
     hello_ticket = json_client.request_hello(
       timeout=SERIAL_AUXILIARY_RESPONSE_TIMEOUT_SECONDS,
@@ -9297,53 +9444,91 @@ def _replace_auxiliary_serial(port, board_profile):
       hello_ticket,
       "hello",
     )
+  except BaseException:
+    try:
+      _close_auxiliary_replacement(
+        replacement,
+        json_client,
+        "auxiliary preparation failure",
+      )
+    except Exception as cleanup_error:
+      raise OSError(
+        "Auxiliary preparation failed and cleanup remained incomplete"
+      ) from cleanup_error
+    raise
+  return replacement, board_profile, json_client
+
+
+def _publish_auxiliary_serial(replacement, board_profile, json_client):
+  existing_serial = RUN.get('ser2')
+  if existing_serial is not None and not _close_serial_port(
+    'ser2', "auxiliary connection replacement",
+  ):
+    try:
+      _close_auxiliary_replacement(
+        replacement,
+        json_client,
+        "unpublished auxiliary replacement",
+      )
+    except Exception as cleanup_error:
+      raise OSError(
+        "Existing auxiliary connection remained open and replacement cleanup failed"
+      ) from cleanup_error
+    raise OSError("Existing auxiliary serial connection remained open")
+
+  RUN['ser2'] = replacement
+  try:
     _bind_auxiliary_board_profile(
       replacement,
       board_profile,
       json_client,
     )
-  except Exception as bind_error:
-    cleanup_error = None
-    try:
-      if json_client is None:
-        replacement.close()
-      else:
-        _require_persistent_json_client_cleanup(
-          json_client, replacement, "auxiliary profile binding failure",
-        )
-    except Exception as exc:
-      cleanup_error = exc
-      logger.exception(
-        "Unable to close auxiliary replacement after profile binding failed"
-      )
-      if json_client is not None:
-        try:
-          replacement.close()
-        except Exception:
-          logger.exception("Unable to close the auxiliary transport fallback")
-        try:
-          _require_persistent_json_client_cleanup(
-            json_client, replacement, "auxiliary profile binding retry",
-          )
-        except Exception as retry_error:
-          cleanup_error = retry_error
-          logger.exception("Auxiliary JSON cleanup retry remained incomplete")
-    cleanup_complete = (
-      (json_client is None or json_client.closed)
-      and not getattr(replacement, "is_open", False)
+  except Exception:
+    _close_auxiliary_replacement(
+      replacement,
+      json_client,
+      "auxiliary publication failure",
     )
-    if not cleanup_complete:
-      if json_client is not None:
-        # Preserve the cleanup owner; semantic access still requires a ready session.
-        RUN['ser2BoardProfile'] = (replacement, board_profile, json_client)
-      raise OSError(
-        "Auxiliary profile binding failed and cleanup remained incomplete"
-      ) from (cleanup_error or bind_error)
     _clear_auxiliary_board_profile(replacement)
     if RUN.get('ser2') is replacement:
       RUN['ser2'] = None
     raise
   return replacement
+
+
+def _replace_auxiliary_serial(port, board_profile):
+  normalized_board = normalize_auxiliary_board_profile(board_profile)
+  existing_serial = RUN.get('ser2')
+  if (
+    isinstance(port, str)
+    and existing_serial is not None
+    and getattr(existing_serial, "is_open", False)
+    and getattr(existing_serial, "port", None) == port.strip()
+  ):
+    try:
+      existing_board = _connected_auxiliary_board_profile(existing_serial)
+    except (ConnectionError, MotionInputError) as exc:
+      logger.warning(
+        "Existing auxiliary connection cannot be reused: %s",
+        exc,
+      )
+      existing_board = None
+    if existing_board == normalized_board:
+      return existing_serial
+    if existing_board is not None:
+      logger.warning(
+        "Existing auxiliary board %s does not match selected board %s",
+        existing_board,
+        normalized_board,
+      )
+    if not _close_serial_port(
+      'ser2',
+      "same-port auxiliary reconnection",
+    ):
+      raise OSError("Existing auxiliary serial connection remained open")
+  return _publish_auxiliary_serial(
+    *_prepare_auxiliary_serial(port, normalized_board)
+  )
 
 
 def _auxiliary_output_field_bindings():
@@ -9779,6 +9964,7 @@ def setCom2(misc=None):
   previous_serial = RUN.get('ser2')
   staged_calibration = None
   connection_change_completed = False
+  prepared_auxiliary_connection = None
   try:
     if selected_port in ("", "None"):
       selected_port = None
@@ -9802,6 +9988,38 @@ def setCom2(misc=None):
       committed_board,
     )
     staged_calibration = normalize_calibration_data(staged_calibration)
+    if selected_port is not None and selected_board is not None:
+      if (
+        previous_serial is not None
+        and getattr(previous_serial, "is_open", False)
+        and getattr(previous_serial, "port", None) == selected_port
+      ):
+        with manual_auxiliary_state_lock:
+          with auxiliary_stop_state_lock:
+            with program_stop_state_lock:
+              stop_reason = _stop_admission_reason_locked(
+                "AUXILIARY CONFIGURATION"
+              )
+              if stop_reason is not None:
+                raise MotionInputError(stop_reason)
+              if RUN.get('ser2') is not previous_serial:
+                raise RuntimeError(
+                  "auxiliary connection changed before same-port reconnect"
+                )
+              if not _close_serial_port(
+                'ser2',
+                "same-port auxiliary reconnection",
+              ):
+                raise OSError(
+                  "Existing auxiliary serial connection remained open"
+                )
+          previous_serial = None
+      # Opening an Arduino serial adapter resets the controller. Complete
+      # boot settlement before entering the physical-stop publication lock.
+      prepared_auxiliary_connection = _prepare_auxiliary_serial(
+        selected_port,
+        selected_board,
+      )
     with manual_auxiliary_state_lock:
       with auxiliary_stop_state_lock:
         with program_stop_state_lock:
@@ -9823,7 +10041,13 @@ def setCom2(misc=None):
             _clear_auxiliary_board_profile()
             connection_change_completed = True
           else:
-            _replace_auxiliary_serial(selected_port, selected_board)
+            replacement, profile, json_client = prepared_auxiliary_connection
+            prepared_auxiliary_connection = None
+            _publish_auxiliary_serial(
+              replacement,
+              profile,
+              json_client,
+            )
             connection_change_completed = True
 
           _apply_auxiliary_configuration_snapshot_contents(
@@ -9850,6 +10074,20 @@ def setCom2(misc=None):
         selected_board,
         selected_port,
       )
+      if RUN['offlineMode']:
+        _set_offline_mode_status(True)
+      elif _current_main_controller_identity() is None:
+        _set_application_status(
+          "AUXILIARY CONTROLLER CONNECTED; MAIN CONTROLLER UNAVAILABLE",
+          "Warn.TLabel",
+        )
+      elif not _current_session_primary_calibration_ready():
+        _set_application_status(
+          "CONTROLLER CALIBRATION REQUIRED",
+          "Warn.TLabel",
+        )
+      else:
+        _set_application_status("SYSTEM READY", "OK.TLabel")
 
     _finish_auxiliary_calibration_persistence_fence(
       previous_persistence_dirty,
@@ -9864,6 +10102,16 @@ def setCom2(misc=None):
       logger.exception("Unable to persist the auxiliary connection log")
     return True
   except Exception as e:
+    if prepared_auxiliary_connection is not None:
+      replacement, _profile, json_client = prepared_auxiliary_connection
+      try:
+        _close_auxiliary_replacement(
+          replacement,
+          json_client,
+          "abandoned auxiliary replacement",
+        )
+      except Exception:
+        logger.exception("Unable to close the abandoned auxiliary replacement")
     try:
       _cancel_auxiliary_calibration_persistence_job()
     except Exception:
@@ -12347,9 +12595,20 @@ def _motion_request_rejection_message(fallback):
   return fallback
 
 
-def _reject_motion_request(name, reason):
+def _motion_request_rejection_is_deferrable():
+  return getattr(
+    motion_request_admission_state,
+    "rejection_deferrable",
+    True,
+  ) is True
+
+
+def _reject_motion_request(name, reason, *, deferrable=True):
+  if not isinstance(deferrable, bool):
+    raise TypeError("motion rejection deferral flag must be boolean")
   message = f"{name} not started; {reason}"
   motion_request_admission_state.rejection_reason = message
+  motion_request_admission_state.rejection_deferrable = deferrable
   logger.warning(message)
   return None
 
@@ -12359,6 +12618,7 @@ def _acquire_motion_request(
   allow_position_recovery=False,
   requires_kinematics=True,
   allow_gcode_conversion=False,
+  allow_uncalibrated=False,
 ):
   if not isinstance(allow_position_recovery, bool):
     raise TypeError("position-recovery admission flag must be boolean")
@@ -12366,7 +12626,10 @@ def _acquire_motion_request(
     raise TypeError("kinematics admission flag must be boolean")
   if not isinstance(allow_gcode_conversion, bool):
     raise TypeError("G-code conversion admission flag must be boolean")
+  if not isinstance(allow_uncalibrated, bool):
+    raise TypeError("uncalibrated admission flag must be boolean")
   motion_request_admission_state.rejection_reason = None
+  motion_request_admission_state.rejection_deferrable = True
   if application_closing.is_set():
     return _reject_motion_request(name, "application shutdown is active")
   conversion_active = gcode_conversion_active.is_set()
@@ -12384,6 +12647,18 @@ def _acquire_motion_request(
     return _reject_motion_request(
       name,
       "native kinematics configuration is unavailable",
+    )
+  if (
+    requires_kinematics
+    and not allow_uncalibrated
+    and not RUN['offlineMode']
+    and _current_main_controller_identity() is not None
+    and not _current_session_primary_calibration_ready()
+  ):
+    return _reject_motion_request(
+      name,
+      "current controller session requires J1-J6 calibration",
+      deferrable=False,
     )
   if not allow_position_recovery and (
     manual_motion_pose_pending.is_set()
@@ -23734,9 +24009,15 @@ def _try_dispatch_deferred_joint_adjustments(allow_current_generation=False):
       submit_deferred,
       allow_current_generation=allow_current_generation,
     )
-  except MotionTransportBusy:
+  except MotionTransportBusy as exc:
     if lease_created and not joint_motion_dispatcher.active:
       _abandon_joint_motion_request(request_lease)
+    if not _motion_request_rejection_is_deferrable():
+      _clear_deferred_joint_adjustments()
+      message = f"Deferred joint jog rejected: {exc}"
+      logger.error(message)
+      _set_manual_auxiliary_status(message, "Alarm.TLabel")
+      return DeferredJointDispatchOutcome.REJECTED
     return DeferredJointDispatchOutcome.BLOCKED
   except (KeyError, TypeError, ValueError, MotionInputError, MotionQueueFault) as exc:
     if (
@@ -24142,16 +24423,14 @@ def _queue_joint_motion(axis, value, absolute):
             profile,
           )
         coalesced = submission.coalesced
-      except MotionTransportBusy:
+      except MotionTransportBusy as exc:
         if lease_created and not joint_motion_dispatcher.active:
           _abandon_joint_motion_request(request_lease)
         if (
           not serial_result_pending.is_set()
           and not motion_request_registry.active
         ):
-          raise MotionQueueFault(
-            "controller transport is busy outside the motion queue"
-          )
+          raise MotionQueueFault(str(exc)) from exc
         deferred = True
         if absolute:
           coalesced = _defer_joint_target(axis, normalized_value, profile)
@@ -24362,21 +24641,21 @@ def _queue_primary_joint_position(
           profile,
         )
         coalesced = submission.coalesced
-      except MotionTransportBusy:
+      except MotionTransportBusy as exc:
         if lease_created and not joint_motion_dispatcher.active:
           _abandon_joint_motion_request(request_lease)
         if not allow_unrelated_defer:
           raise MotionQueueFault(
-            "controller-reference position cannot be deferred during "
-            "another motion request"
-          )
+            "controller-reference position cannot be deferred: "
+            f"{exc}"
+          ) from exc
         if (
           not serial_result_pending.is_set()
           and not motion_request_registry.active
         ):
           raise MotionQueueFault(
-            "controller transport is busy outside the motion queue"
-          )
+            f"controller transport unavailable: {exc}"
+          ) from exc
         deferred = True
         coalesced = deferred_joint_adjustments.set_targets(
           target_updates,
@@ -30336,7 +30615,10 @@ def _start_calibration_sequence(name, stages, completion_callback=None):
   if completion_callback is not None and not callable(completion_callback):
     raise MotionInputError("calibration completion callback must be callable")
 
-  request_lease = _acquire_motion_request(name)
+  request_lease = _acquire_motion_request(
+    name,
+    allow_uncalibrated=True,
+  )
   if request_lease is None:
     message = _motion_request_rejection_message(
       f"{name} not started; another motion request is active"
@@ -30580,6 +30862,10 @@ def _apply_calibration_worker_result(event):
       )
     if not succeeded or not reference_synchronized:
       return _finish_calibration_operation(operation, False)
+    _record_current_session_calibration(
+      operation.serial_port,
+      stage.command.axes,
+    )
 
     with calibration_operation_lock:
       if calibration_operation is not operation or operation.settled:
@@ -30725,7 +31011,10 @@ def _execute_calibration_command(
           None,
           home_reference_error,
         )
-      return succeeded and reference_synchronized
+      if succeeded and reference_synchronized:
+        _record_current_session_calibration(serial_port, command.axes)
+        return True
+      return False
     except Exception as exc:
       if write_commitment.is_set():
         _handle_calibration_result_application_failure(
@@ -30738,7 +31027,10 @@ def _execute_calibration_command(
     calibration_serial_write_committed.clear()
 
 
-@_synchronous_motion_request("Automatic calibration")
+@_synchronous_motion_request(
+  "Automatic calibration",
+  allow_uncalibrated=True,
+)
 @_tracked_serial_operation("ser")
 def _run_program_calibration_all():
   if not _calibration_available():
@@ -30776,7 +31068,7 @@ def _run_program_calibration_all():
   )
 
 
-@_synchronous_motion_request("J1 calibration")
+@_synchronous_motion_request("J1 calibration", allow_uncalibrated=True)
 @_tracked_serial_operation("ser")
 def _run_program_calibration_j1():
   if not _calibration_available():
@@ -30789,7 +31081,7 @@ def _run_program_calibration_j1():
   )
 
 
-@_synchronous_motion_request("J2 calibration")
+@_synchronous_motion_request("J2 calibration", allow_uncalibrated=True)
 @_tracked_serial_operation("ser")
 def _run_program_calibration_j2():
   if not _calibration_available():
@@ -30802,7 +31094,7 @@ def _run_program_calibration_j2():
   )
 
 
-@_synchronous_motion_request("J3 calibration")
+@_synchronous_motion_request("J3 calibration", allow_uncalibrated=True)
 @_tracked_serial_operation("ser")
 def _run_program_calibration_j3():
   if not _calibration_available():
@@ -30815,7 +31107,7 @@ def _run_program_calibration_j3():
   )
 
 
-@_synchronous_motion_request("J4 calibration")
+@_synchronous_motion_request("J4 calibration", allow_uncalibrated=True)
 @_tracked_serial_operation("ser")
 def _run_program_calibration_j4():
   if not _calibration_available():
@@ -30828,7 +31120,7 @@ def _run_program_calibration_j4():
   )
 
 
-@_synchronous_motion_request("J5 calibration")
+@_synchronous_motion_request("J5 calibration", allow_uncalibrated=True)
 @_tracked_serial_operation("ser")
 def _run_program_calibration_j5():
   if not _calibration_available():
@@ -30841,7 +31133,7 @@ def _run_program_calibration_j5():
   )
 
 
-@_synchronous_motion_request("J6 calibration")
+@_synchronous_motion_request("J6 calibration", allow_uncalibrated=True)
 @_tracked_serial_operation("ser")
 def _run_program_calibration_j6():
   if not _calibration_available():
@@ -30854,7 +31146,7 @@ def _run_program_calibration_j6():
   )
 
 
-@_synchronous_motion_request("J7 calibration")
+@_synchronous_motion_request("J7 calibration", allow_uncalibrated=True)
 @_tracked_serial_operation("ser")
 def _run_program_calibration_j7():
   if not _calibration_available():
@@ -30868,7 +31160,7 @@ def _run_program_calibration_j7():
   )
 
 
-@_synchronous_motion_request("J8 calibration")
+@_synchronous_motion_request("J8 calibration", allow_uncalibrated=True)
 @_tracked_serial_operation("ser")
 def _run_program_calibration_j8():
   if not _calibration_available():
@@ -30882,7 +31174,7 @@ def _run_program_calibration_j8():
   )
 
 
-@_synchronous_motion_request("J9 calibration")
+@_synchronous_motion_request("J9 calibration", allow_uncalibrated=True)
 @_tracked_serial_operation("ser")
 def _run_program_calibration_j9():
   if not _calibration_available():
@@ -31606,7 +31898,10 @@ def _start_external_axis_zero(axis):
     logger.warning(message)
     _set_application_status(message, "Warn.TLabel")
     return False
-  request_lease = _acquire_motion_request(motion_name)
+  request_lease = _acquire_motion_request(
+    motion_name,
+    allow_uncalibrated=True,
+  )
   if request_lease is None:
     message = _motion_request_rejection_message(
       f"{motion_name} not started; another motion request is active"
@@ -31832,7 +32127,10 @@ def _exchange_position_acknowledgement(command, position_target=None):
   return acknowledged
 
 
-@_synchronous_motion_request("Set controller position")
+@_synchronous_motion_request(
+  "Set controller position",
+  allow_uncalibrated=True,
+)
 @_tracked_serial_operation(
   "ser",
   operation_required=_main_serial_transmit_required,
@@ -31845,7 +32143,10 @@ def sendPos(transmit=True):
     return command
   return _exchange_position_acknowledgement(command)
 
-@_synchronous_motion_request("Force calibration home position")
+@_synchronous_motion_request(
+  "Force calibration home position",
+  allow_uncalibrated=True,
+)
 @_tracked_serial_operation("ser")
 def CalZeroPos():
   # global RUN['VR_angles']
@@ -31862,7 +32163,10 @@ def CalZeroPos():
   setStepMonitorsVR()
   return True
 
-@_synchronous_motion_request("Force calibration rest position")
+@_synchronous_motion_request(
+  "Force calibration rest position",
+  allow_uncalibrated=True,
+)
 @_tracked_serial_operation("ser")
 def CalRestPos():
   # global RUN['VR_angles']
@@ -35699,6 +36003,7 @@ def GCconvertProg():
             ConversionMotionLease = _acquire_motion_request(
               "G-code conversion",
               allow_gcode_conversion=True,
+              allow_uncalibrated=True,
             )
             start_worker = ConversionMotionLease is not None
             motion_rejection = (
