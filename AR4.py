@@ -37153,19 +37153,6 @@ if __name__ == "__main__":
     pady=(2, 0),
   )
 
-  captureNextJointMoveBut = Button(
-    motionTrackingFrame,
-    text="Capture next joint move",
-    command=_toggle_next_joint_motion_trace,
-  )
-  captureNextJointMoveBut.grid(
-    row=2,
-    column=0,
-    columnspan=2,
-    sticky="ew",
-    pady=(4, 0),
-  )
-
   namedPositionFrame = Frame(jointFrame)
   namedPositionFrame.grid(
     row=7,
@@ -37190,6 +37177,32 @@ if __name__ == "__main__":
     command=MoveToShutdownPosition,
   )
   shutdownPositionBut.grid(row=0, column=1, sticky="ew", padx=(2, 0))
+
+  motionTraceDiagnosticFrame = LabelFrame(
+    jointFrame,
+    text="DIAGNOSTIC",
+    padding=4,
+  )
+  motionTraceDiagnosticFrame.grid(
+    row=8,
+    column=0,
+    sticky="ew",
+    padx=2,
+    pady=(4, 2),
+  )
+  motionTraceDiagnosticFrame.grid_columnconfigure(0, weight=1)
+
+  Label(
+    motionTraceDiagnosticFrame,
+    text="Records commanded motion and encoder feedback for one manual move.",
+  ).grid(row=0, column=0, sticky="w", pady=(0, 2))
+
+  captureNextJointMoveBut = Button(
+    motionTraceDiagnosticFrame,
+    text="Capture next joint move",
+    command=_toggle_next_joint_motion_trace,
+  )
+  captureNextJointMoveBut.grid(row=1, column=0, sticky="ew")
 
   CartjogFrame.grid_columnconfigure(0, weight=1)
 
