@@ -286,6 +286,7 @@ from ARrobots.HMI.joint_motion import (
   primary_shutdown_position,
   quarantine_serial_transport,
   serial_transport_quarantined,
+  submit_primary_joint_target,
   validate_auxiliary_output_command,
   validate_auxiliary_gripper_current_command,
   validate_auxiliary_input_command,
@@ -24633,12 +24634,15 @@ def _queue_primary_joint_position(
   primary_positions,
   *,
   allow_unrelated_defer=True,
+  rejection_label="Named joint position",
 ):
   try:
     if not isinstance(allow_unrelated_defer, bool):
       raise TypeError(
         "named-position unrelated-defer state must be boolean"
       )
+    if not isinstance(rejection_label, str) or not rejection_label.strip():
+      raise TypeError("joint-position rejection label must be non-empty")
     if application_closing.is_set():
       raise MotionQueueFault(
         "joint motion is unavailable during application shutdown"
@@ -24775,7 +24779,7 @@ def _queue_primary_joint_position(
     MotionInputError,
     MotionQueueFault,
   ) as exc:
-    message = f"Named joint position rejected: {exc}"
+    message = f"{rejection_label} rejected: {exc}"
     logger.error(message)
     _set_application_status(text=message, style="Alarm.TLabel")
     return False
@@ -24803,6 +24807,40 @@ def MoveToShutdownPosition():
     target,
     allow_unrelated_defer=False,
   )
+
+
+def _submit_diagnostic_joint_target():
+  try:
+    if RUN.get('offlineMode') is True:
+      raise MotionInputError(
+        "diagnostic joint target requires online controller mode"
+      )
+    entries = diagnosticJointTargetEntries
+    if not isinstance(entries, tuple) or len(entries) != 6:
+      raise MotionInputError(
+        "diagnostic joint target fields are unavailable"
+      )
+    values = []
+    for axis, entry in enumerate(entries, start=1):
+      getter = getattr(entry, "get", None)
+      if not callable(getter):
+        raise MotionInputError(
+          f"diagnostic J{axis} target field is unavailable"
+        )
+      values.append(getter())
+    return submit_primary_joint_target(
+      values,
+      lambda target: _queue_primary_joint_position(
+        target,
+        allow_unrelated_defer=False,
+        rejection_label="Diagnostic joint target",
+      ),
+    )
+  except (TypeError, ValueError, MotionInputError) as exc:
+    message = f"Diagnostic joint target rejected: {exc}"
+    logger.error(message)
+    _set_application_status(text=message, style="Alarm.TLabel")
+    return False
 
 
 PRIMARY_JOINT_COUNT = 6
@@ -37253,15 +37291,50 @@ if __name__ == "__main__":
 
   Label(
     motionTraceDiagnosticFrame,
-    text="Records commanded motion and encoder feedback for one manual move.",
+    text="Enter one complete J1-J6 target; capture remains separately armed.",
   ).grid(row=0, column=0, sticky="w", pady=(0, 2))
+
+  diagnosticJointTargetFrame = Frame(motionTraceDiagnosticFrame)
+  diagnosticJointTargetFrame.grid(row=1, column=0, sticky="ew")
+  diagnosticJointTargetEntries = []
+  for axis in range(1, 7):
+    column = (axis - 1) * 2
+    Label(
+      diagnosticJointTargetFrame,
+      text=f"J{axis}",
+    ).grid(row=0, column=column, padx=(0, 2))
+    entry = Entry(
+      diagnosticJointTargetFrame,
+      width=7,
+      justify="center",
+    )
+    entry.grid(row=0, column=column + 1, padx=(0, 4))
+    diagnosticJointTargetEntries.append(entry)
+  diagnosticJointTargetEntries = tuple(diagnosticJointTargetEntries)
+
+  submitDiagnosticJointTargetBut = Button(
+    motionTraceDiagnosticFrame,
+    text="Submit J1-J6 target",
+    command=_submit_diagnostic_joint_target,
+  )
+  submitDiagnosticJointTargetBut.grid(
+    row=2,
+    column=0,
+    sticky="ew",
+    pady=(2, 0),
+  )
 
   captureNextJointMoveBut = Button(
     motionTraceDiagnosticFrame,
     text="Capture next joint move",
     command=_toggle_next_joint_motion_trace,
   )
-  captureNextJointMoveBut.grid(row=1, column=0, sticky="ew")
+  captureNextJointMoveBut.grid(
+    row=3,
+    column=0,
+    sticky="ew",
+    pady=(2, 0),
+  )
 
   CartjogFrame.grid_columnconfigure(0, weight=1)
 

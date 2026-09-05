@@ -1465,6 +1465,13 @@ def _finite_tuple(values, expected_length, field_name):
     return tuple(normalized)
 
 
+def submit_primary_joint_target(values, submit):
+    if not callable(submit):
+        raise MotionInputError("primary joint target submit must be callable")
+    normalized = _finite_tuple(values, 6, "primary joint target")
+    return submit(normalized)
+
+
 def _optional_finite_tuple(values, expected_length, field_name):
     if isinstance(values, (str, bytes)):
         raise MotionInputError(

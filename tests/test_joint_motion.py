@@ -83,6 +83,7 @@ from ARrobots.HMI.joint_motion import (
     parse_tool_jog_command,
     parse_virtual_command_timing,
     primary_shutdown_position,
+    submit_primary_joint_target,
     validate_controller_filename,
     validate_auxiliary_output_command,
     validate_auxiliary_gripper_current_command,
@@ -2038,6 +2039,48 @@ class CommandResponseTimeoutTests(unittest.TestCase):
         )
         with self.assertRaises(MotionInputError):
             motion_timing_response_timeout("invalid", 120, 100, 1000)
+
+
+class PrimaryJointTargetSubmissionTests(unittest.TestCase):
+    def test_normalizes_complete_target_and_submits_once(self):
+        submissions = []
+
+        def submit(target):
+            submissions.append(target)
+            return "submitted"
+
+        result = submit_primary_joint_target(
+            ("1", "-2.5", 3, 4.25, "5.0", 6),
+            submit,
+        )
+
+        self.assertEqual(result, "submitted")
+        self.assertEqual(
+            submissions,
+            [(1.0, -2.5, 3.0, 4.25, 5.0, 6.0)],
+        )
+
+    def test_rejects_incomplete_target_before_submission(self):
+        submissions = []
+
+        with self.assertRaisesRegex(MotionInputError, "must contain 6 values"):
+            submit_primary_joint_target(
+                (1, 2, 3, 4, 5),
+                submissions.append,
+            )
+
+        self.assertEqual(submissions, [])
+
+    def test_rejects_invalid_target_before_submission(self):
+        submissions = []
+
+        with self.assertRaisesRegex(MotionInputError, "must be finite"):
+            submit_primary_joint_target(
+                (1, 2, 3, 4, math.nan, 6),
+                submissions.append,
+            )
+
+        self.assertEqual(submissions, [])
 
 
 class NamedJointPositionTests(unittest.TestCase):
