@@ -24635,14 +24635,9 @@ def _queue_primary_joint_position(
   *,
   allow_unrelated_defer=True,
   rejection_label="Named joint position",
+  defer_rejection_label="controller-reference position",
 ):
   try:
-    if not isinstance(allow_unrelated_defer, bool):
-      raise TypeError(
-        "named-position unrelated-defer state must be boolean"
-      )
-    if not isinstance(rejection_label, str) or not rejection_label.strip():
-      raise TypeError("joint-position rejection label must be non-empty")
     if application_closing.is_set():
       raise MotionQueueFault(
         "joint motion is unavailable during application shutdown"
@@ -24651,25 +24646,6 @@ def _queue_primary_joint_position(
       raise MotionQueueFault(
         "joint motion is unavailable during controller correction"
       )
-    if isinstance(primary_positions, (str, bytes)):
-      raise MotionInputError(
-        "primary joint position must be a numeric sequence"
-      )
-    try:
-      primary_positions = tuple(primary_positions)
-    except TypeError as exc:
-      raise MotionInputError(
-        "primary joint position must be a numeric sequence"
-      ) from exc
-    if len(primary_positions) != 6:
-      raise MotionInputError(
-        "primary joint position must contain 6 values"
-      )
-    primary_positions = tuple(
-      finite_number(value, f"J{axis} named position")
-      for axis, value in enumerate(primary_positions, start=1)
-    )
-
     current_positions = _current_joint_positions()
     _current_controller_joint_calibration().validate_positions(
       primary_positions + current_positions[6:]
@@ -24699,7 +24675,7 @@ def _queue_primary_joint_position(
     ):
       if not allow_unrelated_defer:
         raise MotionQueueFault(
-          "controller-reference position cannot be deferred during "
+          f"{defer_rejection_label} cannot be deferred during "
           "another motion request"
         )
       deferred = True
@@ -24728,7 +24704,7 @@ def _queue_primary_joint_position(
           _abandon_joint_motion_request(request_lease)
         if not allow_unrelated_defer:
           raise MotionQueueFault(
-            "controller-reference position cannot be deferred: "
+            f"{defer_rejection_label} cannot be deferred: "
             f"{exc}"
           ) from exc
         if (
@@ -24786,7 +24762,10 @@ def _queue_primary_joint_position(
 
 
 def MoveToStartPosition():
-  return _queue_primary_joint_position(PRIMARY_START_POSITION)
+  return submit_primary_joint_target(
+    PRIMARY_START_POSITION,
+    _queue_primary_joint_position,
+  )
 
 
 def MoveToShutdownPosition():
@@ -24803,9 +24782,12 @@ def MoveToShutdownPosition():
     logger.error(message)
     _set_application_status(text=message, style="Alarm.TLabel")
     return False
-  return _queue_primary_joint_position(
+  return submit_primary_joint_target(
     target,
-    allow_unrelated_defer=False,
+    partial(
+      _queue_primary_joint_position,
+      allow_unrelated_defer=False,
+    ),
   )
 
 
@@ -24815,25 +24797,14 @@ def _submit_diagnostic_joint_target():
       raise MotionInputError(
         "diagnostic joint target requires online controller mode"
       )
-    entries = diagnosticJointTargetEntries
-    if not isinstance(entries, tuple) or len(entries) != 6:
-      raise MotionInputError(
-        "diagnostic joint target fields are unavailable"
-      )
-    values = []
-    for axis, entry in enumerate(entries, start=1):
-      getter = getattr(entry, "get", None)
-      if not callable(getter):
-        raise MotionInputError(
-          f"diagnostic J{axis} target field is unavailable"
-        )
-      values.append(getter())
+    values = tuple(entry.get() for entry in diagnosticJointTargetEntries)
     return submit_primary_joint_target(
       values,
       lambda target: _queue_primary_joint_position(
         target,
         allow_unrelated_defer=False,
         rejection_label="Diagnostic joint target",
+        defer_rejection_label="diagnostic joint target",
       ),
     )
   except (TypeError, ValueError, MotionInputError) as exc:
@@ -37291,7 +37262,7 @@ if __name__ == "__main__":
 
   Label(
     motionTraceDiagnosticFrame,
-    text="Enter one complete J1-J6 target; capture remains separately armed.",
+    text="Enter one complete J1-J6 target; arm capture separately when needed.",
   ).grid(row=0, column=0, sticky="w", pady=(0, 2))
 
   diagnosticJointTargetFrame = Frame(motionTraceDiagnosticFrame)
