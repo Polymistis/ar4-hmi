@@ -232,6 +232,7 @@ from ARrobots.HMI.joint_motion import (
   JointMotionCommand,
   ToolJogCommand,
   JointMotionExchangeResult,
+  JointTelemetryMeasurement,
   DeferredJointDispatchOutcome,
   DeferredLiveMotionArbiter,
   LiveMotionScheduleResult,
@@ -244,6 +245,7 @@ from ARrobots.HMI.joint_motion import (
   MotionRequestLease,
   MotionRequestRegistry,
   MotionTransportBusy,
+  ordinary_joint_telemetry_measurement,
   PRIMARY_START_POSITION,
   PositionResponse,
   PrimaryHomeReference,
@@ -22186,6 +22188,7 @@ def _await_json_joint_motion_terminal(
   motion_name="joint",
   stop_publication_callback=None,
   retain_failed_modbus_terminal=False,
+  telemetry_measurement=None,
 ):
   if type(telemetry_enabled) is not bool:
     raise MotionInputError(
@@ -22201,6 +22204,13 @@ def _await_json_joint_motion_terminal(
     raise MotionInputError(
       f"JSON {motion_name}-motion terminal-retention selection is invalid"
     )
+  if telemetry_measurement is not None and not isinstance(
+    telemetry_measurement,
+    JointTelemetryMeasurement,
+  ):
+    raise MotionInputError(
+      f"JSON {motion_name}-motion telemetry measurement is invalid"
+    )
   terminal = None
   stop_published = False
   while terminal is None:
@@ -22214,12 +22224,21 @@ def _await_json_joint_motion_terminal(
         raise ProtocolResponseError(
           f"JSON {motion_name} motion received unsolicited telemetry"
         )
+      received_at_ns = time.monotonic_ns()
       sample = parse_main_joint_position_telemetry(delivery.telemetry)
       raw = _canonical_json_message_text(delivery.telemetry)
-      joint_motion_dispatcher.publish_position_telemetry(
+      accepted = joint_motion_dispatcher.publish_position_telemetry(
         raw,
         sample.robot_joints_degrees,
       )
+      if telemetry_measurement is not None:
+        telemetry_measurement.observe(
+          delivery.telemetry.seq,
+          delivery.sequence_contiguous,
+          raw,
+          accepted,
+          received_at_ns,
+        )
       continue
     if type(delivery) is JsonEventDelivery:
       _validate_json_joint_motion_event(delivery, motion_name)
@@ -22245,6 +22264,7 @@ def _await_json_joint_motion_terminal(
       )
     if delivery.response.status == "accepted":
       continue
+    terminal_received_at_ns = time.monotonic_ns()
     terminal_physical_stop = (
       delivery.response.error is not None
       and delivery.response.error.code == "emergency_stop_active"
@@ -22261,6 +22281,8 @@ def _await_json_joint_motion_terminal(
         stop_publication_callback()
       stop_published = True
     terminal = client.take_terminal(ticket)
+    if telemetry_measurement is not None:
+      telemetry_measurement.observe_terminal(terminal_received_at_ns)
     retain_terminal = (
       retain_failed_modbus_terminal
       and terminal.response.status == "failed"
@@ -23291,8 +23313,16 @@ def _exchange_json_joint_motion_request(
   trace_requested = trace_fingerprint is not None
   if trace_requested != (trace_host_times_ns is not None):
     raise MotionInputError("JSON joint motion trace context is invalid")
+  telemetry_measurement = ordinary_joint_telemetry_measurement(
+    telemetry_enabled, trace_requested
+  )
+  if telemetry_measurement is not None:
+    if write_admission is not None:
+      raise MotionInputError("measured joint motion has conflicting admission")
   ticket = None
   try:
+    if telemetry_measurement is not None:
+      telemetry_measurement.admit(time.monotonic_ns())
     ticket = client.request_move_joints(
       **parameters,
       timeout=response_timeout,
@@ -23303,6 +23333,7 @@ def _exchange_json_joint_motion_request(
       ticket,
       stop_context,
       telemetry_enabled,
+      telemetry_measurement=telemetry_measurement,
     )
     result = _json_joint_motion_terminal_result(
       terminal,
@@ -23324,6 +23355,34 @@ def _exchange_json_joint_motion_request(
         "JSON joint-motion failure cleanup",
       )
     raise
+
+  if telemetry_measurement is not None:
+    try:
+      if (
+        terminal.response.status == "completed"
+        and result.error is None
+        and not position_response_is_physical_estop(result.position)
+      ):
+        logger.info(
+          "Joint telemetry measurement: %s",
+          json.dumps(
+            telemetry_measurement.finalize(ticket.request_id),
+            sort_keys=True,
+            separators=(",", ":"),
+          ),
+        )
+      else:
+        logger.info(
+          "Joint telemetry measurement omitted for request %s: "
+          "terminal did not qualify",
+          ticket.request_id,
+        )
+    except Exception:
+      # Local measurement diagnostics cannot invalidate a settled motion.
+      logger.exception(
+        "Unable to finalize joint telemetry measurement for request %s",
+        ticket.request_id,
+      )
 
   if position_response_is_physical_estop(result.position):
     try:

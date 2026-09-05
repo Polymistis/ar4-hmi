@@ -3123,6 +3123,212 @@ class JointTelemetry:
     joints: Tuple[float, ...]
 
 
+class JointTelemetryMeasurement:
+    """Single-threaded bounded aggregate owned by one joint-motion exchange."""
+
+    def __init__(self, clock=time.monotonic_ns):
+        if not callable(clock):
+            raise MotionInputError("telemetry measurement clock must be callable")
+        self._clock = clock
+        self._admitted_at_ns = None
+        self._terminal_at_ns = None
+        self._first_receipt_at_ns = None
+        self._last_receipt_at_ns = None
+        self._frame_count = 0
+        self._interval_count = 0
+        self._minimum_interval_ns = None
+        self._maximum_interval_ns = None
+        self._first_sequence = None
+        self._last_sequence = None
+        self._first_without_baseline = None
+        self._gap_events = 0
+        self._canonical_bytes = 0
+        self._dispatcher_accepted_frames = 0
+        self._dispatcher_rejected_frames = 0
+
+    def _read_time(self, supplied=None):
+        if supplied is None:
+            try:
+                value = self._clock()
+            except Exception as exc:
+                raise MotionInputError(
+                    "telemetry measurement clock failed"
+                ) from exc
+            invalid_detail = "clock returned invalid time"
+        else:
+            value = supplied
+            invalid_detail = "received an invalid supplied time"
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise MotionInputError(f"telemetry measurement {invalid_detail}")
+        return value
+
+    def admit(self, admitted_at_ns=None):
+        if self._admitted_at_ns is not None:
+            raise MotionInputError("telemetry measurement admission is already recorded")
+        self._admitted_at_ns = self._read_time(admitted_at_ns)
+
+    def observe(
+        self,
+        sequence,
+        sequence_contiguous,
+        canonical_payload,
+        accepted,
+        received_at_ns=None,
+    ):
+        if self._admitted_at_ns is None or self._terminal_at_ns is not None:
+            raise MotionInputError("telemetry measurement is outside an active request")
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence < 0
+        ):
+            raise MotionInputError("telemetry measurement sequence is invalid")
+        if (
+            sequence_contiguous is not None
+            and type(sequence_contiguous) is not bool
+        ):
+            raise MotionInputError("telemetry sequence continuity is invalid")
+        if self._frame_count and sequence_contiguous is None:
+            raise MotionInputError("telemetry sequence baseline changed during a move")
+        if (
+            not isinstance(canonical_payload, str)
+            or not canonical_payload
+            or not canonical_payload.isascii()
+            or "\r" in canonical_payload
+            or "\n" in canonical_payload
+        ):
+            raise MotionInputError("canonical telemetry payload is invalid")
+        payload_bytes = len(canonical_payload) + 1
+        if type(accepted) is not bool:
+            raise MotionInputError("telemetry dispatcher acceptance is invalid")
+
+        received_at_ns = self._read_time(received_at_ns)
+        previous_at_ns = (
+            self._admitted_at_ns
+            if self._last_receipt_at_ns is None
+            else self._last_receipt_at_ns
+        )
+        if received_at_ns < previous_at_ns:
+            raise MotionInputError("telemetry measurement clock moved backwards")
+        if not self._frame_count:
+            self._first_sequence = sequence
+            self._first_without_baseline = sequence_contiguous is None
+            self._first_receipt_at_ns = received_at_ns
+        else:
+            interval_ns = received_at_ns - self._last_receipt_at_ns
+            self._interval_count += 1
+            self._minimum_interval_ns = (
+                interval_ns
+                if self._minimum_interval_ns is None
+                else min(self._minimum_interval_ns, interval_ns)
+            )
+            self._maximum_interval_ns = (
+                interval_ns
+                if self._maximum_interval_ns is None
+                else max(self._maximum_interval_ns, interval_ns)
+            )
+        self._last_sequence = sequence
+        self._last_receipt_at_ns = received_at_ns
+        self._frame_count += 1
+        if sequence_contiguous is False:
+            self._gap_events += 1
+        self._canonical_bytes += payload_bytes
+        if accepted:
+            self._dispatcher_accepted_frames += 1
+        else:
+            self._dispatcher_rejected_frames += 1
+
+    def observe_terminal(self, received_at_ns=None):
+        if self._admitted_at_ns is None:
+            raise MotionInputError("telemetry measurement lacks request admission")
+        if self._terminal_at_ns is not None:
+            raise MotionInputError("telemetry terminal is already recorded")
+        terminal_at_ns = self._read_time(received_at_ns)
+        previous_at_ns = (
+            self._admitted_at_ns
+            if self._last_receipt_at_ns is None
+            else self._last_receipt_at_ns
+        )
+        if terminal_at_ns < previous_at_ns:
+            boundary = (
+                "last telemetry receipt"
+                if self._last_receipt_at_ns is not None
+                else "measurement admission"
+            )
+            raise MotionInputError(f"telemetry terminal precedes {boundary}")
+        self._terminal_at_ns = terminal_at_ns
+
+    def finalize(self, request_id):
+        if (
+            isinstance(request_id, bool)
+            or not isinstance(request_id, int)
+            or request_id < 1
+        ):
+            raise MotionInputError("telemetry measurement request identity is invalid")
+        if self._terminal_at_ns is None:
+            raise MotionInputError("telemetry measurement lacks terminal settlement")
+        receipt_window_ns = (
+            self._last_receipt_at_ns - self._first_receipt_at_ns
+            if self._frame_count > 1
+            else None
+        )
+        payload_window_ns = (
+            self._last_receipt_at_ns - self._admitted_at_ns
+            if self._last_receipt_at_ns is not None
+            else None
+        )
+        interval_distribution = (
+            {
+                "count": self._interval_count,
+                "minimum": self._minimum_interval_ns,
+                "mean": receipt_window_ns / self._interval_count,
+                "maximum": self._maximum_interval_ns,
+            }
+            if self._interval_count
+            else None
+        )
+        return {
+            "request_id": request_id,
+            "admitted_at_monotonic_ns": self._admitted_at_ns,
+            "terminal_at_monotonic_ns": self._terminal_at_ns,
+            "frame_count": self._frame_count,
+            "first_sequence": self._first_sequence,
+            "last_sequence": self._last_sequence,
+            "first_sequence_without_prior_baseline": self._first_without_baseline,
+            "sequence_gap_events": self._gap_events,
+            "canonical_json_lf_bytes": self._canonical_bytes,
+            "first_receipt_at_monotonic_ns": self._first_receipt_at_ns,
+            "last_receipt_at_monotonic_ns": self._last_receipt_at_ns,
+            "receipt_window_ns": receipt_window_ns,
+            "payload_window_ns": payload_window_ns,
+            "canonical_json_lf_bytes_per_second": (
+                self._canonical_bytes * 1_000_000_000 / payload_window_ns
+                if payload_window_ns
+                else None
+            ),
+            "receipt_interval_ns": interval_distribution,
+            "final_telemetry_to_terminal_ns": (
+                self._terminal_at_ns - self._last_receipt_at_ns
+                if self._last_receipt_at_ns is not None
+                else None
+            ),
+            "dispatcher_accepted_frames": self._dispatcher_accepted_frames,
+            "dispatcher_rejected_frames": self._dispatcher_rejected_frames,
+        }
+
+
+def ordinary_joint_telemetry_measurement(
+    telemetry_enabled,
+    trace_requested,
+    clock=time.monotonic_ns,
+):
+    if type(telemetry_enabled) is not bool or type(trace_requested) is not bool:
+        raise MotionInputError("telemetry measurement selection is invalid")
+    if telemetry_enabled and trace_requested:
+        raise MotionInputError("trace capture cannot measure ordinary telemetry")
+    return JointTelemetryMeasurement(clock) if telemetry_enabled else None
+
+
 def parse_position_response(response):
     if not isinstance(response, str):
         raise ProtocolResponseError("controller response must be text")

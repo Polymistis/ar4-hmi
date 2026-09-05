@@ -67,6 +67,7 @@ from ARrobots.HMI.joint_motion import (
     finite_number,
     motion_timing_response_timeout,
     normalize_auxiliary_board_profile,
+    ordinary_joint_telemetry_measurement,
     parse_auxiliary_output_command,
     parse_auxiliary_gripper_current_response,
     parse_auxiliary_input_command,
@@ -2692,6 +2693,139 @@ class CommandedJointTrajectoryTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(MotionInputError, "non-negative"):
             trajectory.positions_at(-0.1)
+
+
+class JointTelemetryMeasurementTests(unittest.TestCase):
+    @staticmethod
+    def measurement(*ticks):
+        clock = iter(ticks)
+        return ordinary_joint_telemetry_measurement(
+            True,
+            False,
+            lambda: next(clock),
+        )
+
+    def test_selection_excludes_disabled_and_trace_requests(self):
+        self.assertIsNone(
+            ordinary_joint_telemetry_measurement(False, False)
+        )
+        self.assertIsNone(
+            ordinary_joint_telemetry_measurement(False, True)
+        )
+        with self.assertRaisesRegex(MotionInputError, "trace capture"):
+            ordinary_joint_telemetry_measurement(True, True)
+        for telemetry_enabled, trace_requested in ((1, False), (True, 0)):
+            with self.subTest(
+                telemetry_enabled=telemetry_enabled,
+                trace_requested=trace_requested,
+            ):
+                with self.assertRaisesRegex(MotionInputError, "selection"):
+                    ordinary_joint_telemetry_measurement(
+                        telemetry_enabled,
+                        trace_requested,
+                    )
+
+    def test_empty_move_reports_admission_and_terminal_without_sample_claims(self):
+        measurement = self.measurement(100, 160)
+        measurement.admit()
+        measurement.observe_terminal()
+
+        summary = measurement.finalize(7)
+
+        self.assertEqual(summary["request_id"], 7)
+        self.assertEqual(summary["admitted_at_monotonic_ns"], 100)
+        self.assertEqual(summary["terminal_at_monotonic_ns"], 160)
+        self.assertEqual(summary["frame_count"], 0)
+        self.assertEqual(summary["canonical_json_lf_bytes"], 0)
+        self.assertIsNone(summary["receipt_interval_ns"])
+        self.assertIsNone(summary["final_telemetry_to_terminal_ns"])
+        self.assertEqual(summary["dispatcher_accepted_frames"], 0)
+        self.assertEqual(summary["dispatcher_rejected_frames"], 0)
+
+    def test_single_sample_preserves_baseline_and_dispatcher_disposition(self):
+        measurement = self.measurement(100, 120, 170)
+        measurement.admit()
+        measurement.observe(4, None, "{}", False)
+        measurement.observe_terminal()
+
+        summary = measurement.finalize(8)
+
+        self.assertEqual(summary["first_sequence"], 4)
+        self.assertEqual(summary["last_sequence"], 4)
+        self.assertTrue(summary["first_sequence_without_prior_baseline"])
+        self.assertEqual(summary["canonical_json_lf_bytes"], 3)
+        self.assertEqual(summary["first_receipt_at_monotonic_ns"], 120)
+        self.assertEqual(summary["last_receipt_at_monotonic_ns"], 120)
+        self.assertIsNone(summary["receipt_window_ns"])
+        self.assertEqual(summary["payload_window_ns"], 20)
+        self.assertEqual(
+            summary["canonical_json_lf_bytes_per_second"],
+            150_000_000,
+        )
+        self.assertEqual(summary["final_telemetry_to_terminal_ns"], 50)
+        self.assertEqual(summary["dispatcher_accepted_frames"], 0)
+        self.assertEqual(summary["dispatcher_rejected_frames"], 1)
+
+    def test_contiguous_and_gap_samples_report_bounded_distribution(self):
+        measurement = self.measurement(100, 120, 150, 210, 250)
+        measurement.admit()
+        measurement.observe(10, True, "{}", False)
+        measurement.observe(11, True, "{}", True)
+        measurement.observe(13, False, "{}", True)
+        measurement.observe_terminal()
+
+        summary = measurement.finalize(9)
+
+        self.assertEqual(summary["frame_count"], 3)
+        self.assertEqual(summary["first_sequence"], 10)
+        self.assertEqual(summary["last_sequence"], 13)
+        self.assertFalse(summary["first_sequence_without_prior_baseline"])
+        self.assertEqual(summary["sequence_gap_events"], 1)
+        self.assertEqual(summary["receipt_window_ns"], 90)
+        self.assertEqual(summary["payload_window_ns"], 110)
+        self.assertEqual(
+            summary["receipt_interval_ns"],
+            {"count": 2, "minimum": 30, "mean": 45, "maximum": 60},
+        )
+        self.assertEqual(summary["canonical_json_lf_bytes"], 9)
+        self.assertEqual(
+            summary["canonical_json_lf_bytes_per_second"],
+            9 * 1_000_000_000 / 110,
+        )
+        self.assertEqual(summary["final_telemetry_to_terminal_ns"], 40)
+        self.assertEqual(summary["dispatcher_accepted_frames"], 2)
+        self.assertEqual(summary["dispatcher_rejected_frames"], 1)
+
+    def test_unsettled_or_out_of_order_measurement_cannot_finalize(self):
+        measurement = self.measurement(100, 120)
+        with self.assertRaisesRegex(MotionInputError, "active request"):
+            measurement.observe(1, None, "{}", True)
+        measurement.admit()
+        measurement.observe(1, None, "{}", True)
+        with self.assertRaisesRegex(MotionInputError, "terminal settlement"):
+            measurement.finalize(10)
+
+        backwards = self.measurement(100, 90)
+        backwards.admit()
+        with self.assertRaisesRegex(MotionInputError, "backwards"):
+            backwards.observe(1, None, "{}", True)
+
+    def test_explicit_times_validate_the_production_boundary(self):
+        measurement = self.measurement()
+        measurement.admit(100)
+        measurement.observe(1, None, "{}", True, 120)
+        measurement.observe_terminal(150)
+
+        summary = measurement.finalize(11)
+
+        self.assertEqual(summary["admitted_at_monotonic_ns"], 100)
+        self.assertEqual(summary["last_receipt_at_monotonic_ns"], 120)
+        self.assertEqual(summary["terminal_at_monotonic_ns"], 150)
+        for invalid_time in (True, -1, 1.5):
+            invalid = self.measurement()
+            with self.subTest(invalid_time=invalid_time):
+                with self.assertRaisesRegex(MotionInputError, "supplied time"):
+                    invalid.admit(invalid_time)
 
 
 class CoalescingJointDispatcherTests(unittest.TestCase):
