@@ -2413,6 +2413,74 @@ class JointMotionProtocolTests(unittest.TestCase):
                 calibration,
             )
 
+    def test_controller_reports_use_the_step_quantized_endpoint(self):
+        calibration = controller_calibration(
+            negative_limits=(100, 100, 89) + (100,) * 6,
+            positive_limits=(100, 100, 52) + (100,) * 6,
+            steps_per_unit=(100, 100, 111.111) + (100,) * 6,
+        )
+        reported = (0, 0, 52.002, 0, 0, 0, 0, 0, 0)
+
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "outside the calibrated limits",
+        ):
+            calibration.validate_positions(reported)
+        self.assertEqual(
+            calibration.validate_reported_positions(reported),
+            reported,
+        )
+        self.assertEqual(
+            calibration.fixed_point_command_positions_from_current(reported),
+            (0.0, 0.0, 52.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        )
+        with self.assertRaisesRegex(
+            MotionInputError,
+            "outside the calibrated limits",
+        ):
+            calibration.validate_reported_positions(
+                (0, 0, 52.003, 0, 0, 0, 0, 0, 0)
+            )
+
+        decimal_boundary = controller_calibration(
+            negative_limits=(89,) * 9,
+            positive_limits=(52,) * 9,
+            steps_per_unit=(100.01,) * 9,
+        )
+        self.assertEqual(
+            decimal_boundary.validate_reported_positions((52.005,) * 9),
+            (52.005,) * 9,
+        )
+        negative_boundary = controller_calibration(
+            negative_limits=(89.0008,) * 9,
+            positive_limits=(52,) * 9,
+            steps_per_unit=(10000,) * 9,
+        )
+        self.assertEqual(
+            negative_boundary.command_positions_from_report((-89.001,) * 9),
+            (-89.0008,) * 9,
+        )
+        mixed_current = (1.2345, -89.001) + (0,) * 7
+        self.assertEqual(
+            negative_boundary.command_positions_from_current(mixed_current)[:2],
+            (1.2345, -89.0008),
+        )
+        self.assertEqual(
+            negative_boundary.fixed_point_command_positions_from_current(
+                (-89.001,) * 9
+            ),
+            (-89.0,) * 9,
+        )
+        wide_report = controller_calibration(
+            negative_limits=(0,) * 9,
+            positive_limits=(3_000_000,) * 9,
+            steps_per_unit=(1,) * 9,
+        )
+        self.assertEqual(
+            wide_report.validate_reported_positions((0,) * 9),
+            (0.0,) * 9,
+        )
+
     def test_rejects_calibration_that_overflows_controller_step_counters(self):
         with self.assertRaisesRegex(MotionInputError, "controller step range"):
             controller_calibration(
@@ -3032,6 +3100,12 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         self.assertIn("failed JSON", events[-1].error)
 
     def test_positionless_rejection_preserves_confirmed_dispatch_state(self):
+        self.calibration = controller_calibration(
+            negative_limits=(100, 100, 89) + (100,) * 6,
+            positive_limits=(100, 100, 52) + (100,) * 6,
+            steps_per_unit=(100, 100, 111.111) + (100,) * 6,
+        )
+        reported = (0, 0, 52.002, 0, 0, 0, 0, 0, 0)
         canonical_raw = '{"cmd":"move_joints","error":{},"id":2,"status":"rejected","type":"response","v":1}'
         rejection = JointMotionExchangeResult(
             canonical_raw,
@@ -3049,8 +3123,8 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
 
         dispatcher = self.make_dispatcher(exchange)
         dispatcher.submit_positions(
-            (1, 2, 3, 4, 5, 6, 0, 0, 0),
-            self.actual,
+            (1, 2, 52, 4, 5, 6, 0, 0, 0),
+            reported,
             self.profile,
         )
         rejected_events = collect_events_until_idle(dispatcher)
@@ -3064,7 +3138,10 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         )
         self.assertIsNone(rejected_events[-1].position)
         self.assertIsNone(dispatcher.fault_reason)
-        self.assertEqual(dispatcher.desired_target, self.actual)
+        self.assertEqual(
+            dispatcher.desired_target,
+            (0.0, 0.0, 52.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        )
 
         dispatcher.submit_positions(
             (2, 3, 4, 5, 6, 7, 0, 0, 0),
@@ -3076,6 +3153,28 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
             [event.kind for event in completed_events],
             ["started", "completed"],
         )
+
+        exchange_started = threading.Event()
+        release_exchange = threading.Event()
+
+        def closing_exchange(_command):
+            exchange_started.set()
+            if not release_exchange.wait(2):
+                raise TimeoutError("test did not release closing exchange")
+            return rejection
+
+        closing_dispatcher = self.make_dispatcher(closing_exchange)
+        closing_dispatcher.submit_positions(
+            (1, 0, 52, 0, 0, 0, 0, 0, 0),
+            reported,
+            self.profile,
+        )
+        self.assertTrue(exchange_started.wait(2))
+        self.assertFalse(closing_dispatcher.close())
+        release_exchange.set()
+        closed_events = collect_events_until_idle(closing_dispatcher)
+        self.assertEqual(closed_events[-1].kind, "failed")
+        self.assertFalse(closing_dispatcher.active)
 
     def test_typed_exchange_result_validates_raw_position_ownership(self):
         position = parse_position_response(position_response((0,) * 6))
@@ -3411,6 +3510,11 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         self.assertTrue(commands[1].startswith("RJA6B0C0D0E0F0J70J80J90"))
 
     def test_success_acknowledgement_can_discard_pending_target_and_rebase(self):
+        self.calibration = controller_calibration(
+            negative_limits=(100, 100, 89) + (100,) * 6,
+            positive_limits=(100, 100, 52) + (100,) * 6,
+            steps_per_unit=(100, 100, 111.111) + (100,) * 6,
+        )
         first_started = threading.Event()
         release_first = threading.Event()
         commands = []
@@ -3422,10 +3526,10 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
                 if not release_first.wait(2):
                     raise TimeoutError("test did not release first exchange")
                 return position_response(
-                    (1, 0, 0, 0, 0, 0),
+                    (1, 0, 52.002, 0, 0, 0),
                     speed_violation=1,
                 )
-            return position_response((2, 0, 0, 0, 0, 0))
+            return position_response((2, 0, 52.002, 0, 0, 0))
 
         dispatcher = self.make_dispatcher(exchange)
         dispatcher.submit_delta(0, 1, self.actual, self.profile)
@@ -3454,7 +3558,10 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
             dispatcher.discard_pending_after_completion(confirmed)
         )
         self.assertFalse(dispatcher.pending)
-        self.assertEqual(dispatcher.desired_target, confirmed)
+        self.assertEqual(
+            dispatcher.desired_target,
+            (1.0, 0.0, 52.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        )
         completed.acknowledge()
 
         deadline = time.monotonic() + 2
@@ -3467,7 +3574,7 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
         self.assertEqual(followup.target[0], 2.0)
         collect_events_until_idle(dispatcher)
         self.assertEqual(len(commands), 2)
-        self.assertTrue(commands[1].startswith("RJA2B0C0D0E0F0J70J80J90"))
+        self.assertTrue(commands[1].startswith("RJA2B0C52D0E0F0J70J80J90"))
 
         with self.assertRaises(MotionQueueFault):
             dispatcher.discard_pending_after_completion(confirmed)
@@ -3534,6 +3641,48 @@ class CoalescingJointDispatcherTests(unittest.TestCase):
                     "outside the calibrated limits",
                     dispatcher.fault_reason,
                 )
+
+    def test_step_quantized_endpoint_response_completes_motion(self):
+        self.calibration = controller_calibration(
+            negative_limits=(100, 100, 89) + (100,) * 6,
+            positive_limits=(100, 100, 52) + (100,) * 6,
+            steps_per_unit=(100, 100, 111.111) + (100,) * 6,
+        )
+        responses = iter((
+            position_response((0, 0, 52.002, 0, 0, 0)),
+            position_response((1, 0, 52.002, 0, 0, 0)),
+        ))
+        dispatcher = self.make_dispatcher(lambda _command: next(responses))
+        reported = (0, 0, 52.002, 0, 0, 0, 0, 0, 0)
+
+        self.assertTrue(dispatcher.synchronize(reported))
+        self.assertEqual(
+            dispatcher.desired_target,
+            (0.0, 0.0, 52.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        )
+        move = JointMove(
+            (1, 0, 52, 0, 0, 0, 0, 0, 0),
+            self.profile,
+            self.calibration,
+        )
+        trajectory = estimate_commanded_joint_trajectory(reported, move, 30)
+        self.assertEqual(trajectory.start_positions, reported)
+
+        dispatcher.submit_positions(
+            (0, 0, 52, 0, 0, 0, 0, 0, 0),
+            self.actual,
+            self.profile,
+        )
+        events = collect_events_until_idle(dispatcher)
+
+        self.assertEqual(events[-1].kind, "completed")
+        self.assertEqual(events[-1].position.joints[2], 52.002)
+        self.assertIsNone(dispatcher.fault_reason)
+
+        submission = dispatcher.submit_delta(0, 1, reported, self.profile)
+        self.assertEqual(submission.target[2], 52.0)
+        followup_events = collect_events_until_idle(dispatcher)
+        self.assertEqual(followup_events[-1].kind, "completed")
 
     def test_position_response_fault_flag_stops_pending_motion(self):
         first_started = threading.Event()

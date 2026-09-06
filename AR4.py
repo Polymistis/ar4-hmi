@@ -8852,7 +8852,7 @@ def _apply_controller_startup_result(
     staged_values.update(update_values)
     staged_values.update(external_values)
     staged_calibration = _controller_joint_calibration_from_values(staged_values)
-    staged_calibration.validate_positions(
+    staged_calibration.validate_reported_positions(
       result.position.joints + result.position.external
     )
     _apply_controller_calibration(update_values, external_values)
@@ -21161,7 +21161,7 @@ def _controller_joint_calibration_from_values(values):
 
 def _validate_controller_pose(values):
   calibration = _controller_joint_calibration_from_values(values)
-  return calibration.validate_positions(
+  return calibration.validate_current_positions(
     _controller_joint_positions_from_values(values)
   )
 
@@ -24068,6 +24068,11 @@ def _try_dispatch_deferred_joint_adjustments(allow_current_generation=False):
   lease_created = False
   try:
     actual_positions = _current_joint_positions()
+    command_positions = (
+      _current_controller_joint_calibration().command_positions_from_report(
+        actual_positions
+      )
+    )
 
     def submit_deferred(target_positions, profile):
       nonlocal request_lease, lease_created
@@ -24083,7 +24088,7 @@ def _try_dispatch_deferred_joint_adjustments(allow_current_generation=False):
       )
 
     submission = deferred_joint_adjustments.consume(
-      actual_positions,
+      command_positions,
       confirmed_position_generation,
       submit_deferred,
       allow_current_generation=allow_current_generation,
@@ -24645,10 +24650,11 @@ def _queue_primary_joint_position(
     if controller_correction_requested.is_set():
       raise MotionQueueFault(
         "joint motion is unavailable during controller correction"
-      )
+    )
+    calibration = _current_controller_joint_calibration()
     current_positions = _current_joint_positions()
-    _current_controller_joint_calibration().validate_positions(
-      primary_positions + current_positions[6:]
+    calibration.validate_axis_positions(
+      dict(enumerate(primary_positions, start=1))
     )
     profile = _current_joint_motion_profile()
     target_updates = primary_positions + (None, None, None)
@@ -26584,9 +26590,48 @@ def _teach_virtual_scene_row(replace_selected=False):
     if item is None:
       raise MotionInputError("select one imported CAD object")
     row = _format_virtual_scene_row(options.get()[len("Virtual "):], item.object_id)
-    return _edit_virtual_scene_program_row(row, replace_selected)
+    return _edit_taught_program_row(row, replace_selected)
   except Exception as exc:
     message = f"Virtual scene teaching failed: {_program_row_error_detail(exc)}"
+    logger.error(message)
+    _set_application_status(text=message, style="Alarm.TLabel")
+    return False
+
+
+def _teach_move_r_row(replace_selected=False):
+  try:
+    checkSpeedVals()
+    speed_type = speedOption.get()
+    if speed_type == "Seconds":
+      speed_prefix = "Ss"
+    elif speed_type == "mm per Sec":
+      speed_prefix = "Sm"
+    elif speed_type == "Percent":
+      speed_prefix = "Sp"
+    else:
+      raise MotionInputError(f"unsupported Move R speed type: {speed_type!r}")
+
+    calibration = _current_controller_joint_calibration()
+    taught_positions = calibration.command_positions_from_current(
+      _current_joint_positions()
+    )
+    taught_position_text = tuple(
+      controller_protocol_decimal(position, f"taught J{axis} position")
+      for axis, position in enumerate(taught_positions, start=1)
+    )
+    row = (
+      f"Move R [*] J1 {taught_position_text[0]}"
+      f" J2 {taught_position_text[1]} J3 {taught_position_text[2]}"
+      f" J4 {taught_position_text[3]} J5 {taught_position_text[4]}"
+      f" J6 {taught_position_text[5]} J7 {taught_position_text[6]}"
+      f" J8 {taught_position_text[7]} J9 {taught_position_text[8]}"
+      f" {speed_prefix} {speedEntryField.get()}"
+      f" Ac {ACCspeedField.get()} Dc {DECspeedField.get()}"
+      f" Rm {ACCrampField.get()} $ {RUN['WC']}"
+    )
+    return _edit_taught_program_row(row, replace_selected)
+  except Exception as exc:
+    message = f"Move R teaching failed: {_program_row_error_detail(exc)}"
     logger.error(message)
     _set_application_status(text=message, style="Alarm.TLabel")
     return False
@@ -26597,6 +26642,8 @@ def teachInsertBelSelected():
   movetype = options.get()
   if movetype in ("Virtual Pick", "Virtual Place"):
     return _teach_virtual_scene_row()
+  if movetype == "Move R":
+    return _teach_move_r_row()
   checkSpeedVals()
   try:
     selRow = tab1.progView.curselection()[0]
@@ -26716,18 +26763,6 @@ def teachInsertBelSelected():
         f.write(str(item.strip(), encoding='utf-8'))
         f.write('\n')
       f.close()
-  elif(movetype == "Move R"):
-    newPos = movetype + " [*] J1 "+CAL['J1AngCur']+" J2 "+CAL['J2AngCur']+" J3 "+CAL['J3AngCur']+" J4 "+CAL['J4AngCur']+" J5 "+CAL['J5AngCur']+" J6 "+CAL['J6AngCur']+" J7 "+str(CAL['J7PosCur'])+" J8 "+str(CAL['J8PosCur'])+" J9 "+str(CAL['J9PosCur'])+" "+speedPrefix+" "+Speed+" Ac "+ACCspd+ " Dc "+DECspd+" Rm "+ACCramp+" $ "+RUN['WC']            
-    tab1.progView.insert(selRow, bytes(newPos + '\n', 'utf-8')) 
-    tab1.progView.selection_clear(0, END)
-    tab1.progView.select_set(selRow)
-    items = tab1.progView.get(0,END)
-    file_path = path.relpath(ProgEntryField.get())
-    with open(file_path,'w', encoding='utf-8') as f:
-      for item in items:
-        f.write(str(item.strip(), encoding='utf-8'))
-        f.write('\n')
-      f.close()
   elif(movetype == "Move A Mid"):
     newPos = movetype + " [*] X "+CAL['XcurPos']+" Y "+CAL['YcurPos']+" Z "+CAL['ZcurPos']+" Rz "+CAL['RzcurPos']+" Ry "+CAL['RycurPos']+" Rx "+CAL['RxcurPos']+" J7 "+str(CAL['J7PosCur'])+" J8 "+str(CAL['J8PosCur'])+" J9 "+str(CAL['J9PosCur'])+" "+speedPrefix+" "+Speed+" Ac "+ACCspd+ " Dc "+DECspd+" Rm "+ACCramp+" $ "+RUN['WC']             
     tab1.progView.insert(selRow, bytes(newPos + '\n', 'utf-8')) 
@@ -26827,6 +26862,8 @@ def teachInsertBelSelected():
 def teachReplaceSelected():
   if options.get() in ("Virtual Pick", "Virtual Place"):
     return _teach_virtual_scene_row(True)
+  if options.get() == "Move R":
+    return _teach_move_r_row(True)
   try:
     deleteitem()
     selRow = tab1.progView.curselection()[0]
@@ -26861,7 +26898,7 @@ def deleteitem():
     f.close()  
 
 
-def _edit_virtual_scene_program_row(value, replace_selected):
+def _edit_taught_program_row(value, replace_selected):
   snapshot = _capture_robot_program_view()
   selected_rows = snapshot.selected_rows
   if replace_selected and len(selected_rows) != 1:
@@ -26888,7 +26925,7 @@ def _edit_virtual_scene_program_row(value, replace_selected):
     try:
       _restore_robot_program_view(snapshot)
     except Exception as rollback_exc:
-      raise RuntimeError(f"Virtual scene program edit rollback failed: {rollback_exc}") from exc
+      raise RuntimeError(f"Program edit rollback failed: {rollback_exc}") from exc
     raise
   return True
 
@@ -30003,7 +30040,7 @@ def _record_calibration_response(
     raise TypeError("calibration response has an invalid type")
   if parsed_position is not None:
     try:
-      _current_controller_joint_calibration().validate_positions(
+      _current_controller_joint_calibration().validate_reported_positions(
         parsed_position.joints + parsed_position.external
       )
     except MotionInputError:
@@ -32081,15 +32118,17 @@ def _clear_acknowledged_forced_position_target():
 
 
 def _prepare_position_target(calibration_values=None):
-  positions = _acknowledged_forced_position_target_value()
-  if positions is None:
-    positions = _current_joint_positions()
   calibration = (
     _current_controller_joint_calibration()
     if calibration_values is None
     else _controller_joint_calibration_from_values(calibration_values)
   )
-  return calibration.validate_positions(positions)
+  acknowledged_target = _acknowledged_forced_position_target_value()
+  if acknowledged_target is not None:
+    return calibration.validate_positions(acknowledged_target)
+  return calibration.fixed_point_command_positions_from_current(
+    _current_joint_positions()
+  )
 
 
 def _position_command_from_target(positions):
@@ -32126,19 +32165,24 @@ def _prepare_forced_position_request(primary_positions):
     ) from exc
   if len(primary_positions) != 6:
     raise MotionInputError("forced primary positions must contain 6 values")
-  positions = primary_positions + _current_joint_positions()[6:]
   calibration = _current_controller_joint_calibration()
-  normalized = calibration.validate_positions(positions)
-  encoded_target = tuple(
-    float(controller_protocol_decimal(value, f"J{axis} forced position"))
-    for axis, value in enumerate(normalized, start=1)
+  current_positions = _current_joint_positions()
+  external_positions = (
+    calibration.fixed_point_command_axis_positions_from_current({
+      axis: current_positions[axis - 1]
+      for axis in range(7, 10)
+    })
   )
-  calibration.validate_positions(encoded_target)
+  positions = primary_positions + tuple(
+    external_positions[axis]
+    for axis in range(7, 10)
+  )
+  normalized = calibration.validate_positions(positions)
   command = _build_startup_numeric_command(
     "SP",
-    zip(tuple("ABCDEFGHI"), encoded_target),
+    zip(tuple("ABCDEFGHI"), normalized),
   )
-  return command, encoded_target
+  return command, normalized
 
 
 def _prepare_forced_position_command(primary_positions):
@@ -32372,7 +32416,7 @@ def displayPosition(response, parsed=None, synchronize_dispatcher=True):
       raise ProtocolResponseError("parsed response has an invalid type")
     elif not isinstance(response, str) or parsed.raw != response:
       raise ProtocolResponseError("parsed response does not match the raw response")
-    _current_controller_joint_calibration().validate_positions(
+    _current_controller_joint_calibration().validate_reported_positions(
       parsed.joints + parsed.external
     )
   except (MotionInputError, ProtocolResponseError) as exc:
@@ -40687,7 +40731,14 @@ if __name__ == "__main__":
   Elogframe.place(x=40,y=15)
   scrollbar = Scrollbar(Elogframe)
   scrollbar.pack(side=RIGHT, fill=Y)
-  tab8.ElogView = Listbox(Elogframe,width=230,height=40, yscrollcommand=scrollbar.set)
+  tab8.ElogView = Listbox(
+    Elogframe,
+    width=230,
+    height=40,
+    yscrollcommand=scrollbar.set,
+    selectmode=EXTENDED,
+    exportselection=False,
+  )
   try:
     Elog = pickle.load(open("ErrorLog","rb"))
   except:
@@ -40699,10 +40750,25 @@ if __name__ == "__main__":
   tab8.ElogView.pack()
   scrollbar.config(command=tab8.ElogView.yview)
 
+  def copyLogSelection(_event=None):
+   selection = tab8.ElogView.curselection()
+   if not selection:
+    return "break"
+   entries = [tab8.ElogView.get(index) for index in selection]
+   root.clipboard_clear()
+   root.clipboard_append(os.linesep.join(entries))
+   _set_application_status(text="LOG SELECTION COPIED", style="OK.TLabel")
+   return "break"
+
+  tab8.ElogView.bind("<Control-c>", copyLogSelection)
+
   def clearLog():
    tab8.ElogView.delete(1,END)
    value=tab8.ElogView.get(0,END)
    pickle.dump(value,open("ErrorLog","wb"))
+
+  copyLogBut = Button(tab8, text="Copy Selected", width=26, command=copyLogSelection)
+  copyLogBut.place(x=250, y=690)
 
   clearLogBut = Button(tab8,  text="Clear Log",  width=26, command = clearLog)
   clearLogBut.place(x=40, y=690)

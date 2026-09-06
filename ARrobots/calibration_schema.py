@@ -16,7 +16,6 @@ from ARrobots.HMI.joint_motion import (
     MotionInputError,
     controller_degree_to_native_radians,
     controller_number,
-    controller_protocol_decimal,
     controller_ratio,
     validate_controller_encoder_scale,
 )
@@ -385,7 +384,10 @@ def _normalize_position_text(key, value):
             number,
             key,
         )
-    return _controller_contract(controller_protocol_decimal, number, key)
+    text = format(Decimal(str(number)), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text
 
 
 def _normalize_switch_state(key, value):
@@ -625,7 +627,7 @@ def _validate_controller_fields(normalized):
             )
         if position_key in normalized:
             _controller_contract(
-                calibration.validate_axis_positions,
+                calibration.validate_current_axis_positions,
                 {axis: normalized[position_key]},
             )
 
@@ -658,7 +660,7 @@ def _validate_controller_fields(normalized):
         )
         if position_key in normalized:
             _controller_contract(
-                calibration.validate_axis_positions,
+                calibration.validate_current_axis_positions,
                 {axis: normalized[position_key]},
             )
 

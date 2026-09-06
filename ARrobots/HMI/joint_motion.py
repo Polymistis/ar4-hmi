@@ -1401,6 +1401,33 @@ def _controller_float_product(left, right, field_name):
     return _controller_float(left * right, field_name)
 
 
+def _controller_json_position_milliunits(value, field_name):
+    position = _controller_float(value, field_name)
+    scaled = position * 1000.0
+    rounded = (
+        math.floor(scaled + 0.5)
+        if scaled >= 0.0
+        else math.ceil(scaled - 0.5)
+    )
+    return int(rounded)
+
+
+def _reported_position_milliunits(value, field_name):
+    position = finite_number(value, field_name)
+    scaled = Decimal(str(position)) * 1000
+    integral = scaled.to_integral_value()
+    if scaled != integral:
+        raise MotionInputError(
+            f"{field_name} exceeds the controller report resolution"
+        )
+    if (
+        integral < -CONTROLLER_SIGNED_INT_MAX - 1
+        or integral > CONTROLLER_SIGNED_INT_MAX
+    ):
+        raise MotionInputError(f"{field_name} exceeds the controller report range")
+    return position, int(integral)
+
+
 def controller_ratio(numerator, denominator, field_name):
     numerator_float = _controller_float(numerator, f"{field_name} numerator")
     denominator_float = _controller_float(
@@ -1654,7 +1681,8 @@ class ControllerJointCalibration:
         object.__setattr__(self, "positive_limits", positive_limits)
         object.__setattr__(self, "steps_per_unit", steps_per_unit)
 
-    def validate_axis_positions(self, positions):
+    @staticmethod
+    def _normalize_axis_positions(positions):
         if not isinstance(positions, Mapping) or not positions:
             raise MotionInputError(
                 "axis positions must be a non-empty mapping"
@@ -1671,18 +1699,85 @@ class ControllerJointCalibration:
             if axis in normalized:
                 raise MotionInputError(f"J{axis} position is duplicated")
             normalized[axis] = finite_number(position, f"J{axis} position")
+        return normalized
+
+    def _validate_axis_positions(self, positions, controller_report):
+        if type(controller_report) is not bool:
+            raise MotionInputError(
+                "controller-report selection must be boolean"
+            )
+        normalized = self._normalize_axis_positions(positions)
 
         for axis, position in normalized.items():
             negative = self.negative_limits[axis - 1]
             positive = self.positive_limits[axis - 1]
             scale = self.steps_per_unit[axis - 1]
-            position_float = _controller_float(position, f"J{axis} position")
             negative_float = _controller_float(negative, f"J{axis} negative limit")
             positive_float = _controller_float(positive, f"J{axis} positive limit")
             scale_float = _controller_float(scale, f"J{axis} steps per unit")
-            if position_float < -negative_float or position_float > positive_float:
+            if controller_report:
+                position_float, position_milliunits = _reported_position_milliunits(
+                    position,
+                    f"J{axis} position",
+                )
+                # Firmware reports signed integer milliunits derived from step
+                # state, so both the sample and bounds stay in that wire domain.
+                travel_float = _controller_float(
+                    negative_float + positive_float,
+                    f"J{axis} calibrated travel",
+                )
+                step_limit = int(_controller_float_product(
+                    travel_float,
+                    scale_float,
+                    f"J{axis} calibrated step limit",
+                ))
+                zero_step = int(_controller_float_product(
+                    negative_float,
+                    scale_float,
+                    f"J{axis} calibrated zero step",
+                ))
+                represented_minimum = controller_ratio(
+                    -zero_step,
+                    scale_float,
+                    f"J{axis} represented minimum position",
+                )
+                represented_maximum = controller_ratio(
+                    step_limit - zero_step,
+                    scale_float,
+                    f"J{axis} represented maximum position",
+                )
+                minimum_milliunits = _controller_json_position_milliunits(
+                    represented_minimum,
+                    f"J{axis} represented minimum position",
+                )
+                maximum_milliunits = _controller_json_position_milliunits(
+                    represented_maximum,
+                    f"J{axis} represented maximum position",
+                )
+                if not (
+                    minimum_milliunits
+                    <= position_milliunits
+                    <= maximum_milliunits
+                ):
+                    raise MotionInputError(
+                        f"J{axis} position is outside the calibrated limits: "
+                        f"{position_float:g} not in "
+                        f"[{minimum_milliunits / 1000:g}, "
+                        f"{maximum_milliunits / 1000:g}]"
+                    )
+                continue
+
+            position_float = _controller_float(position, f"J{axis} position")
+            minimum_position = -negative_float
+            maximum_position = positive_float
+            if (
+                position_float < minimum_position
+                or position_float > maximum_position
+            ):
                 raise MotionInputError(
-                    f"J{axis} position is outside the calibrated limits"
+                    f"J{axis} position is outside the calibrated limits: "
+                    f"{position_float:g} not in "
+                    f"[{minimum_position:g}, {maximum_position:g}]"
                 )
             shifted_position = _controller_float(
                 position_float + negative_float,
@@ -1699,6 +1794,12 @@ class ControllerJointCalibration:
                 )
         return normalized
 
+    def validate_axis_positions(self, positions):
+        return self._validate_axis_positions(positions, False)
+
+    def validate_reported_axis_positions(self, positions):
+        return self._validate_axis_positions(positions, True)
+
     def validate_positions(self, positions):
         normalized = _finite_tuple(positions, JOINT_COUNT, "positions")
         self.validate_axis_positions({
@@ -1706,6 +1807,106 @@ class ControllerJointCalibration:
             for axis, position in enumerate(normalized, start=1)
         })
         return normalized
+
+    def validate_reported_positions(self, positions):
+        normalized = _finite_tuple(positions, JOINT_COUNT, "positions")
+        self.validate_reported_axis_positions({
+            axis: position
+            for axis, position in enumerate(normalized, start=1)
+        })
+        return normalized
+
+    def validate_current_axis_positions(self, positions):
+        normalized = self._normalize_axis_positions(positions)
+        for axis, position in normalized.items():
+            try:
+                self.validate_axis_positions({axis: position})
+            except MotionInputError as command_error:
+                try:
+                    self.validate_reported_axis_positions({axis: position})
+                except MotionInputError as report_error:
+                    raise report_error from command_error
+        return normalized
+
+    def validate_current_positions(self, positions):
+        normalized = _finite_tuple(positions, JOINT_COUNT, "positions")
+        self.validate_current_axis_positions({
+            axis: position
+            for axis, position in enumerate(normalized, start=1)
+        })
+        return normalized
+
+    def _command_axis_position_from_report(self, axis, position):
+        self.validate_reported_axis_positions({axis: position})
+        return min(
+            max(position, -self.negative_limits[axis - 1]),
+            self.positive_limits[axis - 1],
+        )
+
+    def command_positions_from_report(self, positions):
+        normalized = self.validate_reported_positions(positions)
+        command_positions = tuple(
+            self._command_axis_position_from_report(axis, position)
+            for axis, position in enumerate(normalized, start=1)
+        )
+        return self.validate_positions(command_positions)
+
+    def command_positions_from_current(self, positions):
+        normalized = self.validate_current_positions(positions)
+        command_positions = []
+        for axis, position in enumerate(normalized, start=1):
+            try:
+                self.validate_axis_positions({axis: position})
+                command_positions.append(position)
+            except MotionInputError:
+                command_positions.append(
+                    self._command_axis_position_from_report(axis, position)
+                )
+        return self.validate_positions(tuple(command_positions))
+
+    def fixed_point_command_axis_positions_from_current(self, positions):
+        normalized = self.validate_current_axis_positions(positions)
+        fixed_positions = {}
+        for axis, position in normalized.items():
+            try:
+                self.validate_axis_positions({axis: position})
+            except MotionInputError:
+                _, milliunits = _reported_position_milliunits(
+                    position,
+                    f"J{axis} position",
+                )
+                negative = _controller_float(
+                    self.negative_limits[axis - 1],
+                    f"J{axis} negative limit",
+                )
+                positive = _controller_float(
+                    self.positive_limits[axis - 1],
+                    f"J{axis} positive limit",
+                )
+                minimum_milliunits = math.ceil(-negative * 1000.0)
+                maximum_milliunits = math.floor(positive * 1000.0)
+                fixed_positions[axis] = (
+                    min(max(milliunits, minimum_milliunits), maximum_milliunits)
+                    / 1000.0
+                )
+            else:
+                _, milliunits = _reported_position_milliunits(
+                    position,
+                    f"J{axis} position",
+                )
+                fixed_positions[axis] = milliunits / 1000.0
+        return self.validate_axis_positions(fixed_positions)
+
+    def fixed_point_command_positions_from_current(self, positions):
+        normalized = _finite_tuple(positions, JOINT_COUNT, "positions")
+        fixed_positions = self.fixed_point_command_axis_positions_from_current({
+            axis: position
+            for axis, position in enumerate(normalized, start=1)
+        })
+        return tuple(
+            fixed_positions[axis]
+            for axis in range(1, JOINT_COUNT + 1)
+        )
 
 
 def validate_controller_encoder_scale(
@@ -2144,7 +2345,8 @@ def estimate_commanded_joint_trajectory(
 
     if not isinstance(move, JointMove):
         raise MotionInputError("move must be a JointMove")
-    start = move.calibration.validate_positions(start_positions)
+    start = move.calibration.validate_reported_positions(start_positions)
+    command_start = move.calibration.command_positions_from_report(start)
     target = move.calibration.validate_positions(move.positions)
     minimum_delay = _controller_float(
         minimum_step_delay_microseconds,
@@ -2157,7 +2359,7 @@ def estimate_commanded_joint_trajectory(
 
     start_steps = tuple(
         _controller_calibrated_step(position, move.calibration, axis)
-        for axis, position in enumerate(start, start=1)
+        for axis, position in enumerate(command_start, start=1)
     )
     target_steps = tuple(
         _controller_calibrated_step(position, move.calibration, axis)
@@ -3731,7 +3933,7 @@ class CoalescingJointDispatcher:
 
             starting_worker = self._worker is None
             if starting_worker:
-                base = self._desired if self._desired is not None else actual
+                confirmed_start = self._confirmed
             else:
                 base = self._desired
                 if base is None:
@@ -3742,6 +3944,16 @@ class CoalescingJointDispatcher:
                 raise MotionInputError(
                     "calibration_provider must return a ControllerJointCalibration"
                 )
+            if starting_worker:
+                if self._desired is None:
+                    confirmed_start = calibration.validate_reported_positions(actual)
+                    base = calibration.command_positions_from_report(confirmed_start)
+                else:
+                    base = self._desired
+                    if confirmed_start is None:
+                        raise MotionQueueFault(
+                            "joint-motion queue lost confirmed-state synchronization"
+                        )
             target = calibration.validate_positions(resolve_target(base))
             move = JointMove(target, profile, calibration)
             coalesced = self._inflight is not None or self._pending is not None
@@ -3795,7 +4007,7 @@ class CoalescingJointDispatcher:
 
             self._desired = target
             if starting_worker:
-                self._confirmed = base
+                self._confirmed = confirmed_start
             self._pending = move
             if starting_worker:
                 self._worker = worker_to_start
@@ -3899,7 +4111,8 @@ class CoalescingJointDispatcher:
             raise MotionInputError(
                 "calibration_provider must return a ControllerJointCalibration"
             )
-        normalized = calibration.validate_positions(positions)
+        normalized = calibration.validate_reported_positions(positions)
+        command_positions = calibration.command_positions_from_report(normalized)
         with self._lock:
             if self._closed or self._worker is not None:
                 return False
@@ -3909,7 +4122,7 @@ class CoalescingJointDispatcher:
                 except Exception as exc:
                     self._publish_transport_release_fault_locked(exc)
                     return False
-            self._desired = normalized
+            self._desired = command_positions
             self._confirmed = normalized
             self._fault_reason = None
             self._transport_release_event_reason = None
@@ -3921,7 +4134,8 @@ class CoalescingJointDispatcher:
             raise MotionInputError(
                 "calibration_provider must return a ControllerJointCalibration"
             )
-        normalized = calibration.validate_positions(confirmed_positions)
+        normalized = calibration.validate_reported_positions(confirmed_positions)
+        command_positions = calibration.command_positions_from_report(normalized)
         with self._lock:
             if self._closed:
                 return False
@@ -3936,7 +4150,7 @@ class CoalescingJointDispatcher:
                 )
             pending_discarded = self._pending is not None
             self._pending = None
-            self._desired = normalized
+            self._desired = command_positions
             self._confirmed = normalized
             return pending_discarded
 
@@ -4108,7 +4322,7 @@ class CoalescingJointDispatcher:
                     )
                 if confirmed_position_unchanged:
                     raise ProtocolResponseError(exchange_error)
-                move.calibration.validate_positions(
+                move.calibration.validate_reported_positions(
                     parsed_position.joints + parsed_position.external
                 )
                 position = parsed_position
@@ -4124,7 +4338,23 @@ class CoalescingJointDispatcher:
                     pending_discarded = self._pending is not None
                     self._pending = None
                     if confirmed_position_unchanged:
-                        self._desired = self._confirmed
+                        if self._closed:
+                            self._desired = None
+                        else:
+                            try:
+                                self._desired = (
+                                    move.calibration.command_positions_from_report(
+                                        self._confirmed
+                                    )
+                                )
+                            except Exception as settlement_error:
+                                confirmed_position_unchanged = False
+                                exc = MotionQueueFault(
+                                    "joint-motion rejection settlement failed: "
+                                    f"{settlement_error}"
+                                )
+                                self._desired = None
+                                self._confirmed = None
                     else:
                         self._desired = None
                         self._confirmed = None
@@ -4166,7 +4396,9 @@ class CoalescingJointDispatcher:
                 self._inflight_start = None
                 self._confirmed = position.joints + position.external
                 if self._pending is None:
-                    self._desired = position.joints + position.external
+                    self._desired = move.calibration.command_positions_from_report(
+                        self._confirmed
+                    )
                 if not self._closed:
                     self._result_acknowledgement = acknowledgement
                 else:

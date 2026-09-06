@@ -334,10 +334,20 @@ class CalibrationSchemaTests(unittest.TestCase):
             normalize_calibration_data(outside)
 
         numeric = copy.deepcopy(self.defaults)
-        numeric["J1AngCur"] = 1.25
+        numeric["J1AngCur"] = 1.2345
         self.assertEqual(
             normalize_calibration_data(numeric)["J1AngCur"],
-            "1.25",
+            "1.2345",
+        )
+
+        endpoint = copy.deepcopy(self.defaults)
+        endpoint["J3NegLim"] = 89
+        endpoint["J3PosLim"] = 52
+        endpoint["J3StepDeg"] = 111.111
+        endpoint["J3AngCur"] = 52.002
+        self.assertEqual(
+            normalize_calibration_data(endpoint)["J3AngCur"],
+            "52.002",
         )
 
     def test_auxiliary_values_are_optional_bounded_and_board_specific(self):
