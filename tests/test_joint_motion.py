@@ -84,6 +84,7 @@ from ARrobots.HMI.joint_motion import (
     parse_virtual_command_timing,
     primary_shutdown_position,
     submit_primary_joint_target,
+    submit_primary_joint_target_text,
     validate_controller_filename,
     validate_auxiliary_output_command,
     validate_auxiliary_gripper_current_command,
@@ -2079,6 +2080,30 @@ class PrimaryJointTargetSubmissionTests(unittest.TestCase):
                 (1, 2, 3, 4, math.nan, 6),
                 submissions.append,
             )
+
+        self.assertEqual(submissions, [])
+
+    def test_pasted_target_accepts_supported_formats(self):
+        expected = (1.0, -2.5, 3.0, 4.25, 5.0, 6.0)
+
+        for text in ("(1, -2.5, 3, 4.25, 5.0, 6)", "[1 -2.5 3 4.25 5.0 6]"):
+            with self.subTest(text=text):
+                submissions = []
+                result = submit_primary_joint_target_text(
+                    text,
+                    lambda target: submissions.append(target) or "submitted",
+                )
+
+                self.assertEqual(result, "submitted")
+                self.assertEqual(submissions, [expected])
+
+    def test_pasted_target_rejects_malformed_text_before_submission(self):
+        submissions = []
+
+        for text in ("(1, 2, 3, 4, 5, 6]", "1, 2, 3, , 5, 6", "1 " * 257):
+            with self.subTest(text=text):
+                with self.assertRaises(MotionInputError):
+                    submit_primary_joint_target_text(text, submissions.append)
 
         self.assertEqual(submissions, [])
 

@@ -287,6 +287,7 @@ from ARrobots.HMI.joint_motion import (
   quarantine_serial_transport,
   serial_transport_quarantined,
   submit_primary_joint_target,
+  submit_primary_joint_target_text,
   validate_auxiliary_output_command,
   validate_auxiliary_gripper_current_command,
   validate_auxiliary_input_command,
@@ -24803,9 +24804,8 @@ def _submit_diagnostic_joint_target():
       raise MotionInputError(
         "diagnostic joint target requires online controller mode"
       )
-    values = tuple(entry.get() for entry in diagnosticJointTargetEntries)
-    return submit_primary_joint_target(
-      values,
+    return submit_primary_joint_target_text(
+      diagnosticJointTargetEntry.get(),
       lambda target: _queue_primary_joint_position(
         target,
         allow_unrelated_defer=False,
@@ -37306,26 +37306,14 @@ if __name__ == "__main__":
 
   Label(
     motionTraceDiagnosticFrame,
-    text="Enter one complete J1-J6 target; arm capture separately when needed.",
+    text="Paste J1-J6 as comma- or space-separated values; arm capture separately.",
   ).grid(row=0, column=0, sticky="w", pady=(0, 2))
 
-  diagnosticJointTargetFrame = Frame(motionTraceDiagnosticFrame)
-  diagnosticJointTargetFrame.grid(row=1, column=0, sticky="ew")
-  diagnosticJointTargetEntries = []
-  for axis in range(1, 7):
-    column = (axis - 1) * 2
-    Label(
-      diagnosticJointTargetFrame,
-      text=f"J{axis}",
-    ).grid(row=0, column=column, padx=(0, 2))
-    entry = Entry(
-      diagnosticJointTargetFrame,
-      width=7,
-      justify="center",
-    )
-    entry.grid(row=0, column=column + 1, padx=(0, 4))
-    diagnosticJointTargetEntries.append(entry)
-  diagnosticJointTargetEntries = tuple(diagnosticJointTargetEntries)
+  diagnosticJointTargetEntry = Entry(
+    motionTraceDiagnosticFrame,
+    width=72,
+  )
+  diagnosticJointTargetEntry.grid(row=1, column=0, sticky="ew")
 
   submitDiagnosticJointTargetBut = Button(
     motionTraceDiagnosticFrame,

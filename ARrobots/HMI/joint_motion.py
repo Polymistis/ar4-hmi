@@ -1497,6 +1497,33 @@ def submit_primary_joint_target(values, submit):
     return submit(normalized)
 
 
+def submit_primary_joint_target_text(text, submit):
+    if not isinstance(text, str):
+        raise MotionInputError("primary joint target text must be text")
+    if len(text) > 512:
+        raise MotionInputError("primary joint target text is too long")
+    target_text = text.strip()
+    if not target_text:
+        raise MotionInputError("primary joint target text must not be empty")
+
+    opening = target_text[0]
+    closing = target_text[-1]
+    if opening in "([":
+        expected_closing = ")" if opening == "(" else "]"
+        if closing != expected_closing:
+            raise MotionInputError("primary joint target delimiters do not match")
+        target_text = target_text[1:-1].strip()
+    elif closing in ")]":
+        raise MotionInputError("primary joint target delimiters do not match")
+
+    values = (
+        tuple(value.strip() for value in target_text.split(","))
+        if "," in target_text
+        else tuple(target_text.split())
+    )
+    return submit_primary_joint_target(values, submit)
+
+
 def _optional_finite_tuple(values, expected_length, field_name):
     if isinstance(values, (str, bytes)):
         raise MotionInputError(
